@@ -1,19 +1,19 @@
 # Data Types (Rust API Mapping)
 
-> **Non-Normative Binding**: 本文档仅规定 `shell-chain` 的内部 Rust API 与 Trait 映射。有关链上数据结构的绝对通信规范依据（Wire-Level Truth），请参阅 `../../specs/protocol/` (如 `transaction-format.md`)。
+> **Non-Normative Binding**: This document dictates internal Rust API and Trait mappings for `shell-chain`. For absolute wire-level network truth, consult `../../specs/protocol/` (e.g., `transaction-format.md`).
 
-## 1. 领域驱动的语义类型映射
-不再穿透底层 `ssz_rs` 容器，而是用强类型的 Rust 结构体安全包裹，并赋予必须的派生约束：
+## 1. Domain-Driven Semantic Mapping
+Rather than exposing raw `ssz_rs` containers, we safely wrap fields using strongly typed Rust structures with mandatory derivation bounds:
 
 ```rust
 use ssz_rs::prelude::*;
 
-// 从字节别名为语义化指针
+// Aliasing raw bytes into semantic pointers
 pub type Root = Vector<u8, 32>;
 pub type Bytes32 = Vector<u8, 32>;
 pub type ExecutionAddress = Vector<u8, 20>;
 
-// 防出错模型 (明确要求派生 SimpleSerialize)
+// Error-prevention typing (SimpleSerialize derivation is mandatory)
 #[derive(Debug, Clone, PartialEq, Eq, Default, SimpleSerialize)]
 pub struct ChainId(pub U256);
 
@@ -33,17 +33,19 @@ pub struct BasicFeesPerGas {
 // ==========================================
 // ⚠️ IMPLEMENTATION PLACEHOLDER (Mock)
 // ==========================================
-// 协议规范要求这里是 EIP-7688 定义的 Progressive 结构。
-// 在当前客户端暂缺原生 Progressive 支持时，使用带 Mock 前缀的有限 List 进行模拟。
-// 任何依赖于此处具体边界值的准入或计费策略均视为实现 Bug，不等同于协议最终 merkleization。
-// 参见 `../../specs/protocol/transaction-format.md` 第 1 节 Mock 纪律约束
+// Protocol specs require EIP-7688 defined Progressive structures.
+// Due to current client dependency limits natively supporting Progressive Lists,
+// these Bounded Lists prefixed with "Mock" are temporary simulators.
+// Admission/Gas heuristics relying on exactly these limits are considered implementation bugs
+// and do not represent the final wire-level merkleization.
+// See `../../specs/protocol/transaction-format.md` Section 1: Mock Disciplinary Constraints
 pub type MockProgressiveByteList = List<u8, 1048576>;
 pub type MockProgressiveList<T> = List<T, 8192>;     
 ```
 
-## 2. Crate 级交易结构的承接
+## 2. Resolving Crate-Level Transactions
 
-通过 Rust API 承接 `Protocol SSZ Schema`：
+Connecting the `Protocol SSZ Schema` into the local Rust API:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
@@ -69,10 +71,11 @@ pub struct CreateTransactionPayload {
     pub access_commitment: Root,
 }
 
-// SSZ 编码契约落实点：
-// Rust Enum 默认并不等同于 SSZ Union。此处的实现必须提供定制的 wrapper 
-// 或专属 derive，以确保其在线缆层面产生符合 EIP-6493 的 CompatibleUnion 布局。
-// Tag 映射必须刚性锁定：0 => Basic, 1 => Create。严禁重排。
+// SSZ Encoding Contract Actualization:
+// Rust Enums do NOT automatically map to SSZ Unions. The implementation here
+// MUST provide custom wrappers or dedicated macros to ensure the emitted wire format
+// adheres exactly to an EIP-6493 CompatibleUnion memory layout.
+// Tag mapping is strictly locked: 0 => Basic, 1 => Create. Tag reordering is forbidden.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
 pub enum TransactionPayload {
     Basic(BasicTransactionPayload),
@@ -99,7 +102,7 @@ pub struct SigningData {
 }
 ```
 
-## 3. State 层 API Boundaries (`shell-state`)
+## 3. State Layer API Boundaries (`shell-state`)
 
 ```rust
 pub enum StateKey {
@@ -110,9 +113,10 @@ pub enum StateKey {
     Stem(Bytes31), 
 }
 
-/// 全局唯一地址规范化出口。
-/// Rust 实现层必须且仅能调用此函数将 20 字节 ExecutionAddress 转为 32 字节树键。
-/// 算法: Left-pad with 12 zero bytes.
+/// Globally canonical execution address formatter.
+/// The Rust implementation MUST exclusively invoke this helper to convert
+/// a 20-byte ExecutionAddress into a 32-byte standardized Tree key.
+/// Algorithm: Left-pad with 12 zero bytes.
 pub fn canonicalize_execution_address(addr: &ExecutionAddress) -> Bytes32 {
     let mut key = Bytes32::default();
     key[12..32].copy_from_slice(addr.as_ref());
@@ -123,7 +127,7 @@ pub fn canonicalize_execution_address(addr: &ExecutionAddress) -> Bytes32 {
 pub struct StateWitness {
     pub key: StateKey,
     pub leaf_value: MockProgressiveByteList,
-    pub proof: MockProgressiveList<Bytes32>, // Schema 以 protocol 为准
+    pub proof: MockProgressiveList<Bytes32>, // Schema adheres to protocol spec
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
@@ -137,7 +141,8 @@ pub trait StateAccumulator {
     
     fn apply_transition(&mut self, patch: StatePatch) -> Result<Root, StateError>;
     
-    /// 提取实际逻辑上的“状态累加器根”，区分于对象层面的 hash_tree_root
+    /// Extracts the logical "state accumulator tree root", strictly detached
+    /// from root structural hash_tree_root object mechanics.
     fn state_root(&self) -> Root;
 }
 ```
