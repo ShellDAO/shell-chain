@@ -9,14 +9,16 @@
 There is **no Rust workspace, no `Cargo.toml`, and no buildable crate tree checked in yet**.
 The repository exists to capture the implementation plan in a self-contained way so future code can be added against stable local documentation.
 
+At this stage, the core implementation specs in `specs/` are all at **draft** status and are intended to be detailed enough to drive initial implementation planning, including crate scaffolding, fixture planning, and validation/interface placement.
+
 ## shell-chain in One Page
 
 The planned implementation centers on a few protocol ideas that shape every crate and API boundary:
 
-- **Post-quantum-first authorization**: account and validator signing paths are designed around PQ-capable signature schemes instead of legacy ECDSA assumptions.
-- **Witness separation**: executable transaction envelopes stay separate from large cryptographic witness sidecars so cheap checks can happen before heavy proof processing.
+- **Post-quantum-first authorization**: account and validator signing paths are designed around post-quantum-capable (PQ) signature schemes instead of legacy ECDSA assumptions.
+- **Witness separation**: executable transaction envelopes stay separate from large cryptographic witness sidecars, meaning the heavier proof bundle travels alongside the core object instead of being folded into it.
 - **Dual-lane fee accounting**: normal execution pricing and witness-heavy pricing are tracked separately so expensive proof bandwidth does not hide inside one fee number.
-- **SSZ-first data model**: wire-facing objects are expected to keep canonical SSZ encoding and merkleization behavior.
+- **SSZ-first data model**: wire-facing objects are expected to keep canonical SSZ (SimpleSerialize) encoding and merkleization behavior.
 - **Stateless-friendly validation**: transaction admission, block import, and proof reconstruction are split into stages so light and full validation paths can share the same object model.
 - **Unified binary-tree state**: the state layer is intended to use a compressed binary-tree accumulator rather than a legacy fixed-depth sparse tree.
 
@@ -43,10 +45,22 @@ The crate layout below is **planned architecture**, not a statement that these c
 
 ## Documentation Map
 
-- Start with `docs/getting-started.md` for the current onboarding path.
-- Use `docs/api-reference.md` for the planned public API surface and stability expectations.
-- Use `docs/contributing.md` for the docs-first contribution workflow.
-- Use `specs/README.md` for implementation-oriented specifications.
+After this overview, continue through the repository in this order:
+
+1. `docs/getting-started.md` for the onboarding path and brief terminology orientation.
+2. `docs/api-reference.md` for the planned public API surface and stability expectations.
+3. `specs/README.md` for the implementation-spec index.
+
+### Recommended Spec Reading Order
+
+From there, continue through the core specs in this order:
+
+1. `specs/crate-structure.md`
+2. `specs/data-types.md`
+3. `specs/validation-rules.md`
+4. `specs/testing-vectors.md`
+
+When you are ready to make a repository change, continue with `docs/contributing.md`.
 
 ## Build and Test Status
 

@@ -32,6 +32,23 @@ This file is intentionally implementation-focused:
 - these assumptions define the protocol objects and validation gates that `shell-chain` currently builds against,
 - this file defines who validates what, in what order, and how failures are surfaced in Rust.
 
+### 1.1 Repository-local closure decisions
+
+To keep the first implementation pass stable, this repository treats the following as **closed local rules** even if adjacent protocol areas are still evolving elsewhere:
+
+| Area | Closed local rule in this repository | Notes |
+|---|---|---|
+| Transaction payload variants | Only tags `0` and `1` are accepted. Unknown tags are invalid. | Future variants may append, but are not locally supported until this spec set adopts them. |
+| Payload-root binding | `Authorization.payload_root` must match the canonical `hash_tree_root(TransactionPayload)` exactly. | No alternate in-memory root path is allowed. |
+| Cheap-first ordering | Structural checks and commitment checks must run before signature verification; signature verification must run before witness reconstruction. | This is a local implementation contract, not an optimization hint. |
+| User-path signature limit | Transaction-path authorization artifacts above 8 KB are rejected by default. | This is a deliberate local stress-control rule. |
+| Transaction authorization presence | The default transaction path requires `authorizations.len() >= 1`. | A future empty-authorization path would require an explicit local spec update, not a silent interpretation change. |
+| Block commitment checking | `transactions_root`, `sidecar.block_root`, and `execution_witnesses_root` must all bind before stateless execution. | These checks are mandatory on the local block-import path. |
+| Sidecar byte preservation | Committed witness ordering and bytes must be preserved through commitment verification. | Any deduplicated or indexed view is downstream and local-only. |
+| Unsupported schemes | Unsupported transaction-path or validator-path schemes fail validation rather than falling back. | Scheme agility does not imply permissive decoding. |
+
+Everything not listed as closed above should be treated as provisional if this file later describes it as configurable, pending, or subject to narrowing.
+
 ## 2. Validation Outcomes and Error Taxonomy
 
 Validation code should separate **object validity** from **peer consequences**.
@@ -231,7 +248,7 @@ This stage is optional for ordinary nodes and expected for builders, heavy valid
 Checks when `TransactionWitnessSidecar` is available:
 1. Verify `sidecar.tx_root == hash_tree_root(TransactionEnvelope)`.
 2. Verify any advertised sidecar byte ceiling before deep parsing.
-3. Verify `state_proofs` are canonically ordered by `StateKey` before reconstruction.
+3. Verify `state_proofs` are canonically ordered by `StateKey` before reconstruction (ordering is defined by the key, not by the provisional witness byte encoding).
 4. Use `shell-state` traits to verify proof paths and reconstruct a stateless read view.
 5. Validate nonce, balance, and capability-linked preconditions that cannot be checked from envelope data alone.
 
@@ -465,6 +482,10 @@ The following items must remain marked as pending in code comments, config surfa
 7. **Scheme-specific verification gas coefficients**
    - Still unset in the current protocol assumptions.
    - Implementation action: keep execution metering hooks configurable and clearly marked as provisional.
+
+Practical rule:
+
+- if an implementation choice would change wire bytes, change commitment inputs, reinterpret signature acceptance, or turn a configurable transport guard into a consensus-invalidating constant, it is **not** closed yet unless Section `1.1` says otherwise.
 
 ## 10. Implementation Checklist
 
