@@ -2,8 +2,8 @@
 
 ## Current Development Mode
 
-`shell-chain` is in a docs-first phase.
-Contributions today primarily improve repository-local understanding: architecture notes, implementation specs, onboarding guidance, and preparation for future Rust scaffolding.
+`shell-chain` is in a docs-first phase with an early Rust workspace bootstrap.
+Contributions today primarily improve repository-local understanding while extending the bootstrap carefully: architecture notes, implementation specs, onboarding guidance, fixtures, and low-risk foundational crate work.
 
 ## Core Expectations
 
@@ -20,26 +20,26 @@ Useful contributions at the current stage include:
 - tightening the API and validation docs,
 - removing ambiguity from terminology,
 - aligning docs with the local implementation specs,
-- adding initial scaffolding only when the supporting docs are updated at the same time.
+- extending the initial workspace bootstrap only when the supporting docs are updated at the same time.
 
 ## Workflow
 
 1. Create a branch for your change.
 2. Update the relevant local docs and specs first.
 3. Keep cross-file terminology consistent.
-4. If you add code scaffolding, add the corresponding repository-local build/test instructions in the same change.
+4. If you add code scaffolding, add or update the corresponding repository-local build/test instructions in the same change.
 5. Open a pull request with a clear explanation of what changed and why.
 
 ## Expectations for Future Code Changes
 
-Once the Rust workspace exists, code changes should also:
+With the current workspace bootstrap in place, code changes should also:
 
 - pass the repository's documented format, lint, and test commands,
 - include doc comments for public items where appropriate,
 - avoid unnecessary `.unwrap()` usage in production paths,
 - preserve the crate boundaries described in the local specs unless the specs are updated deliberately.
 
-Until that workspace exists, do not claim that `cargo test`, `cargo clippy`, or `cargo fmt --check` are available in this repository.
+At the moment, contributors can rely on `cargo fmt --all`, `cargo check --workspace`, and `cargo test --workspace`. Do not claim that stronger commands such as `cargo clippy` or generated API docs are available unless they are added locally in the same change.
 
 ## Review Guidance
 

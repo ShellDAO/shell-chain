@@ -5,8 +5,8 @@
 ## Current Status
 
 `shell-chain` is currently a **docs-first repository**.
-It does not yet include a Rust workspace, `Cargo.toml`, or runnable crates, so there is nothing to build with Cargo today.
-The current repository milestone is to make the local implementation specs detailed enough that the first Rust scaffold can follow them directly.
+It now includes a **minimal Rust workspace bootstrap** with `shell-primitives` and early `shell-crypto` / `shell-state` interface crates.
+It still does not provide a runnable node or a fully scaffolded crate tree, so the current repository milestone is to extend that bootstrap carefully from the documented specs.
 
 ## What You Can Do Today
 
@@ -14,8 +14,8 @@ You can use this repository to:
 
 1. understand the planned architecture,
 2. review the local implementation specs,
-3. refine documentation before code lands,
-4. prepare future crate scaffolding against documented boundaries.
+3. run the current bootstrap checks,
+4. refine documentation and early code together against documented boundaries.
 
 If terms like SSZ, witness sidecars, or PQ authorization are new, read them here as shorthand for canonical SimpleSerialize encoding, proof-heavy side data kept separate from core envelopes, and post-quantum-capable signature handling.
 
@@ -47,22 +47,21 @@ The intended workspace is organized around clear domain boundaries:
 - **`shell-network`** for propagation, fetch policy, and peer consequences
 - **`shell-cli`** for operator-facing entry points and RPC wiring
 
-This layout is a plan, not an already-scaffolded workspace.
+This layout is still the full plan, not a statement that every crate is implemented today. Right now the workspace bootstrap covers `shell-primitives` plus early `shell-crypto` and `shell-state` scaffolding.
 
 ## Build, Test, and Lint Expectations
 
-There are currently no repository-local Cargo commands to run because the workspace has not been created yet.
-If you are contributing documentation only, the main sanity check is to keep terminology, links, and stated repository status accurate.
+The current repository-local bootstrap commands are:
 
-The four core specs in `specs/` are currently all `draft` documents rather than stubs. They are already detailed enough to drive initial implementation planning while still clearly labeling any remaining pending-closure items.
+- `cargo fmt --all`
+- `cargo check --workspace`
+- `cargo test --workspace`
 
-If you introduce initial Rust scaffolding in the future, that change should also add and document the exact local commands for:
+If you are contributing documentation only, the main sanity check is still to keep terminology, links, and stated repository status accurate.
 
-- building,
-- testing,
-- formatting,
-- linting,
-- and generating API documentation.
+The four core specs in `specs/` are currently all `draft` documents rather than stubs. They are already detailed enough to drive the current workspace bootstrap while still clearly labeling any remaining pending-closure items.
+
+As the workspace expands, changes should also keep these commands accurate and add new ones only when they actually exist locally.
 
 ## First Contribution Checklist
 
