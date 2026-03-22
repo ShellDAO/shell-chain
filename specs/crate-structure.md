@@ -4,7 +4,7 @@
 
 ## 1. Design Principles
 - **Stateless Verification First**: Data primitives must be physically isolated from the networking stack and consensus execution, enabling extremely low-dependency target compilation for light clients.
-- **Protocol Mapping**: Module boundaries must strictly map to business domains defined in `specs/protocol/`.
+- **Protocol Mapping**: Module boundaries must strictly map to the local protocol domains defined by this spec set: data types, validation flow, state witnesses, execution, networking, and testing.
 - **Interface Anti-Corruption**: PQ cryptography library changes must not affect `shell-state` and `shell-mempool`. Isolation must be enforced via unified Traits.
 
 ## 2. Workspace Topology
@@ -28,7 +28,7 @@ shell-chain/
 - Assembly of `ExecutionWitnessSidecar` happens after `shell-execution` completes, with pairing performed by `shell-consensus` before passing downward to `shell-network` for broadcast.
 
 ## 4. Critical Third-Party Dependencies
-Driven by ADR-004 and ADR-005, the following third-party dependencies must be strictly controlled at the `Cargo.toml` workspace level:
+To keep protocol-sensitive code deterministic and replaceable, the following third-party dependencies must be strictly controlled at the `Cargo.toml` workspace level:
 - **SSZ**: `ssz_rs` (or equivalent Lighthouse/Ethereum macro), with extremely rigorous macro derivation restrictions.
 - **Hashing**: Standardization on high-performance `sha2` (pure Rust or SIMD accelerated). All legacy `keccak` usage is heavily isolated (used exclusively inside smart contract evaluation boundaries).
 - **PQ Signatures**: Cryptographic suites providing bindings that adhere to `shell-crypto` Traits.
