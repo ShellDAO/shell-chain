@@ -3,6 +3,7 @@ members = [
     "crates/shell-primitives",
     "crates/shell-crypto",
     "crates/shell-state",
+    "crates/shell-mempool",
 ]
 resolver = "2"
 
