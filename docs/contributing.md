@@ -1,24 +1,60 @@
 # Contributing to shell-chain
 
-## Status: STUB
+## Current Development Mode
 
-## Code Standards
+`shell-chain` is in a docs-first phase.
+Contributions today primarily improve repository-local understanding: architecture notes, implementation specs, onboarding guidance, and preparation for future Rust scaffolding.
 
-- All code must pass `cargo clippy -- -D warnings` and `cargo fmt --check`.
-- All public items must have `///` doc comments.
-- Avoid `.unwrap()` in production code; use `Result<T, E>`.
+## Core Expectations
+
+- Keep documentation self-contained inside this repository.
+- Label planned components as planned; do not imply that missing crates, binaries, or Cargo workflows already exist.
+- Prefer clarifying local architecture and interfaces before proposing large implementation changes.
+- Keep all prose, comments, identifiers, and filenames in English.
+
+## What Good Contributions Look Like
+
+Useful contributions at the current stage include:
+
+- clarifying the planned crate boundaries,
+- tightening the API and validation docs,
+- removing ambiguity from terminology,
+- aligning docs with the local implementation specs,
+- adding initial scaffolding only when the supporting docs are updated at the same time.
 
 ## Workflow
 
-1. Fork and create a feature branch.
-2. Make changes following the coding standards above.
-3. Run `cargo test` and `cargo clippy` locally.
-4. Submit a pull request with a clear description.
+1. Create a branch for your change.
+2. Update the relevant local docs and specs first.
+3. Keep cross-file terminology consistent.
+4. If you add code scaffolding, add the corresponding repository-local build/test instructions in the same change.
+5. Open a pull request with a clear explanation of what changed and why.
 
-## Commit Convention
+## Expectations for Future Code Changes
 
-> TODO: Define commit message convention (e.g., Conventional Commits).
+Once the Rust workspace exists, code changes should also:
 
-## Review Process
+- pass the repository's documented format, lint, and test commands,
+- include doc comments for public items where appropriate,
+- avoid unnecessary `.unwrap()` usage in production paths,
+- preserve the crate boundaries described in the local specs unless the specs are updated deliberately.
 
-> TODO: Define the code review process and approval requirements.
+Until that workspace exists, do not claim that `cargo test`, `cargo clippy`, or `cargo fmt --check` are available in this repository.
+
+## Review Guidance
+
+Reviewers should check that a contribution:
+
+- improves local clarity,
+- keeps the repository self-contained,
+- does not overstate implementation maturity,
+- and stays consistent with the docs-first direction of the project.
+
+## Commit Messages
+
+Use a clear, imperative summary that explains the user-visible or contributor-visible change.
+Examples:
+
+- `Clarify validation pipeline terminology`
+- `Document planned crate boundaries`
+- `Add initial workspace scaffold`

@@ -1,33 +1,63 @@
 # Getting Started
 
-> Quickstart guide for building and developing shell-chain.
+> Quickstart guide for understanding and contributing to `shell-chain`.
 
-## Status: STUB
+## Current Status
 
-## Prerequisites
+`shell-chain` is currently a **docs-first repository**.
+It does not yet include a Rust workspace, `Cargo.toml`, or runnable crates, so there is nothing to build with Cargo today.
 
-- Rust (stable toolchain, latest)
-- Cargo
+## What You Can Do Today
 
-## Build
+You can use this repository to:
 
-```bash
-cargo build
-```
+1. understand the planned architecture,
+2. review the local implementation specs,
+3. refine documentation before code lands,
+4. prepare future crate scaffolding against documented boundaries.
 
-## Test
+## Recommended Reading Path
 
-```bash
-cargo test
-```
+If you are starting fresh, read the repository in this order:
 
-## Lint
+1. `README.md` for the project overview and status
+2. `docs/api-reference.md` for the planned public API boundaries
+3. `specs/README.md` for the implementation-spec index
+4. `specs/data-types.md` and `specs/validation-rules.md` for the most concrete current design details
 
-```bash
-cargo clippy -- -D warnings
-cargo fmt --check
-```
+## Planned Workspace Overview
 
-## Project Structure
+The intended workspace is organized around clear domain boundaries:
 
-> TODO: Describe the crate/module layout once established. See `specs/crate-structure.md`.
+- **`shell-primitives`** for SSZ-facing types, roots, and canonical codec helpers
+- **`shell-crypto`** for hashing and signature-dispatch abstractions
+- **`shell-state`** for witnesses, state keys, and accumulator verification
+- **`shell-execution`** for state-transition execution logic
+- **`shell-mempool`** for transaction admission and fee-policy checks
+- **`shell-consensus`** for block assembly/import orchestration
+- **`shell-network`** for propagation, fetch policy, and peer consequences
+- **`shell-cli`** for operator-facing entry points and RPC wiring
+
+This layout is a plan, not an already-scaffolded workspace.
+
+## Build, Test, and Lint Expectations
+
+There are currently no repository-local Cargo commands to run because the workspace has not been created yet.
+If you are contributing documentation only, the main sanity check is to keep terminology, links, and stated repository status accurate.
+
+If you introduce initial Rust scaffolding in the future, that change should also add and document the exact local commands for:
+
+- building,
+- testing,
+- formatting,
+- linting,
+- and generating API documentation.
+
+## First Contribution Checklist
+
+Before opening a change, confirm that:
+
+- the explanation is self-contained inside this repository,
+- planned components are clearly labeled as planned,
+- current repository limitations are stated honestly,
+- and docs remain aligned with the implementation specs.
