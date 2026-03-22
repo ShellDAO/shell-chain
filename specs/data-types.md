@@ -18,10 +18,14 @@ The most important consequence is that Rust types may be richer than the wire sc
 
 ```rust
 use ssz_rs::prelude::*;
+// U256: sourced from the single workspace-level large-number crate declared
+// in the root Cargo.toml (see §2.2 and crate-structure.md §9).
+// Do not introduce a per-crate U256 alias or re-export.
 
 pub type Root = Vector<u8, 32>;
 pub type Bytes32 = Vector<u8, 32>;
 pub type Bytes31 = Vector<u8, 31>;
+pub type Bytes4   = Vector<u8, 4>;
 pub type ExecutionAddress = Vector<u8, 20>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SimpleSerialize)]
@@ -33,7 +37,11 @@ pub struct TxValue(pub U256);
 #[derive(Debug, Clone, PartialEq, Eq, Default, SimpleSerialize)]
 pub struct GasPrice(pub U256);
 
-#[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
+// Default is derivable because all three fields are GasPrice, which itself
+// derives Default (a zero-valued U256).  Any caller that requires a non-zero
+// fee floor must construct BasicFeesPerGas explicitly rather than relying on
+// this default.  See §2.2 for the rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Default, SimpleSerialize)]
 pub struct BasicFeesPerGas {
     pub regular: GasPrice,
     pub max_priority_fee_per_gas: GasPrice,
@@ -58,6 +66,14 @@ Rust implementation guidance:
 - keep the merkleization / gindex mental model tied to the upstream progressive semantics, not to the temporary bounded replacement.
 
 Within this spec set, mock container bounds are implementation-only adapters and are not part of frozen protocol behavior.
+
+### 2.2 `U256` dependency and `BasicFeesPerGas` default
+
+**`U256` source.**
+`U256` is not provided by the standard library.  Per `crate-structure.md §9`, large-number crates must be selected and versioned at the workspace level; `shell-primitives` is the single crate that re-exports the canonical `U256` type for the rest of the workspace.  Each crate that needs `U256` imports it from `shell-primitives`, not directly from a vendor crate.  This rule prevents version skew and ensures that SSZ round-trip tests cover exactly one numeric representation.
+
+**`BasicFeesPerGas` default.**
+`BasicFeesPerGas` derives `Default` because every field is a `GasPrice`, which itself derives `Default` (wrapping a zero-valued `U256`).  An all-zero `BasicFeesPerGas` is structurally valid but semantically meaningless as a fee floor: it expresses that any fee level is acceptable.  Callers that need a non-trivial fee floor must construct the struct explicitly.  Mempool admission code must never treat a derived default as an implicit protocol fee floor; that policy belongs in `shell-mempool` configuration, not in the default value of this type.
 
 ## 3. Transaction bindings
 
@@ -92,16 +108,25 @@ pub struct Authorization {
     pub signature: MockProgressiveByteList,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
+// TransactionEnvelope cannot derive SimpleSerialize because its payload
+// field must use TransactionPayloadSsz (the custom union wrapper described in
+// §3.1) rather than the plain TransactionPayload enum.  The SSZ
+// implementation of TransactionEnvelope must delegate encode, decode, and
+// hash_tree_root to TransactionPayloadSsz for the payload field.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionEnvelope {
-    pub payload: TransactionPayload,
+    pub payload: TransactionPayloadSsz,
     pub authorizations: MockProgressiveList<Authorization>,
 }
 
+// domain_type is a fixed 4-byte tag; see §3.3 for width guidance.
+// object_root carries the hash_tree_root of the signed object; when used
+// for transaction authorization, object_root must equal
+// Authorization.payload_root (see §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
 pub struct SigningData {
     pub object_root: Root,
-    pub domain_type: Bytes32,
+    pub domain_type: Bytes4,
 }
 ```
 
@@ -175,9 +200,29 @@ The Rust binding should therefore make it difficult to:
 - accept tag aliases,
 - or run sidecar logic through payload codecs that differ from the shared canonical path.
 
+### 3.3 `SigningData` field contracts
+
+**`domain_type` width.**
+`domain_type` is a fixed **4-byte** tag (`Bytes4 = Vector<u8, 4>`).  The 4-byte width is the established convention for domain-type tags in SSZ-based signing flows.  Using a wider type (e.g. `Bytes32`) for this field would produce a different `hash_tree_root(SigningData)` than any conforming counterparty and must be rejected.  The actual tag value for each domain is defined by the upstream domain constants, which are not frozen in this spec; only the 4-byte width is fixed here.
+
+**`object_root` and `Authorization.payload_root`.**
+When a signer constructs a `SigningData` to produce or verify an `Authorization`, the following identity must hold:
+
+```
+SigningData.object_root == Authorization.payload_root
+                       == hash_tree_root(TransactionPayloadSsz)
+```
+
+`Authorization.payload_root` stores the canonical Merkle root of the `TransactionPayload` union computed through `TransactionPayloadSsz` (see §3.1).  `SigningData.object_root` carries that same root as the "what is being signed" field.  Implementations must use the single shared `TransactionPayloadSsz` codec path for both root calculations; a mismatch between the codec used during signing and the one used during authorization verification is a correctness bug, not a configuration difference.
+
 ## 4. State-layer bindings
 
 ```rust
+// StateKey has no derive(SimpleSerialize).  Its enum shape (tuple variants,
+// struct variants) is not directly expressible by the ssz_rs derive macro.
+// Structs that include StateKey fields (StateWitness, StatePatch) require
+// custom SSZ implementations or an intermediate StateKeyBytes wrapper.
+// See §4.5 for encoding and crate-placement guidance.
 pub enum StateKey {
     AccountHeader(ExecutionAddress),
     StorageSlot { address: ExecutionAddress, slot: Bytes32 },
@@ -186,20 +231,29 @@ pub enum StateKey {
     Stem(Bytes31),
 }
 
+// Belongs in shell-state::keys; see §4.5 for placement rationale.
 pub fn canonicalize_execution_address(addr: &ExecutionAddress) -> Bytes32 {
     let mut key = Bytes32::default();
     key[12..32].copy_from_slice(addr.as_ref());
     key
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
+// StateWitness cannot derive SimpleSerialize because StateKey has no SSZ
+// derive.  The SSZ implementation must be custom or use a StateKeyBytes
+// wrapper (see §4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateWitness {
     pub key: StateKey,
     pub leaf_value: MockProgressiveByteList,
     pub proof: MockProgressiveList<Bytes32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SimpleSerialize)]
+// StatePatch cannot derive SimpleSerialize for two independent reasons:
+// 1. StateKey has no SSZ derive (see §4.5).
+// 2. new_values is a nested variable-length container
+//    (MockProgressiveList<MockProgressiveByteList> = List<List<u8,N>,M>);
+//    ssz_rs does not support this shape via plain derive (see §4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatePatch {
     pub accesses: MockProgressiveList<StateKey>,
     pub new_values: MockProgressiveList<MockProgressiveByteList>,
@@ -223,6 +277,23 @@ The Rust binding should separate already-closed assumptions from still-open ones
 | Witness transport containers | `StateWitness` exists as the witness unit referenced by tx sidecars and block sidecars. | Witness compression and canonical byte encoding are not yet frozen upstream. |
 | Proof verification flow | Validation requires canonical `StateKey` ordering before reconstruction and proof verification in `shell-state`. | Exact proof element layout inside `proof` is still placeholder-grade in the current upstream state-transition text. |
 | Block-sidecar handling | Commitment checks must preserve committed ordering and bytes before any optimized indexing or dedup-aware execution view is built. | Any normalized in-memory proof index is local-only and must not be treated as a new canonical protocol form. |
+
+### 4.1.1 Repository-local closure decisions
+
+For the first Rust scaffold, this repository treats the following binding choices as locally fixed:
+
+| Area | Closed local binding | Why it is safe to build against now |
+|---|---|---|
+| Address-to-tree-key mapping | `ExecutionAddress` canonicalizes to a 32-byte key by left-padding with 12 zero bytes. | This rule is already used consistently across the current spec set and does not depend on unresolved witness encoding details. |
+| Witness ordering key | One canonical `StateKey` comparator is the shared ordering rule for sidecar validation. | `validation-rules.md` already requires ordering checks before proof reconstruction. |
+| Transport vs. derived witness forms | `StateWitness` is the committed transport object; any optimized proof/index view is derived and local-only. | This preserves commitment semantics while leaving proof internals abstract. |
+| Mock progressive bounds | `MockProgressiveByteList` and `MockProgressiveList<T>` are codec adapters only, never consensus constants. | This prevents temporary Rust bounds from leaking into fee, gossip, or proof heuristics. |
+
+The following must remain abstract even during the first implementation pass:
+
+- the exact internal proof-node encoding behind `StateWitness.proof`,
+- canonical witness compression or normalization rules,
+- any stronger claim that `proof` is permanently a flat hash list on the wire.
 
 ### 4.2 `StateWitness.proof` should be treated as a proof-shape abstraction
 
@@ -274,6 +345,22 @@ Specifically:
 
 This matters because witness compression and canonical sidecar encoding are still open within this spec set, and `validation-rules.md` requires committed bytes to be preserved through the commitment-check stage.
 
+### 4.5 `StateKey` SSZ encoding, `StatePatch` nesting, and `canonicalize_execution_address` placement
+
+**`StateKey` SSZ encoding.**
+`StateKey` is a Rust enum with mixed variant shapes (unit-tuple and named-field variants).  The `ssz_rs` derive macro does not support this shape; deriving `SimpleSerialize` on `StateKey` directly is not possible.  Implementations must use one of the following approaches:
+
+1. **`StateKeyBytes` wrapper** — define a newtype that serializes `StateKey` to a canonical byte sequence (e.g. a tag byte followed by the variant fields), implements `SimpleSerialize` on the wrapper, and is the field type stored in `StateWitness` and `StatePatch` on the wire.  The ergonomic `StateKey` enum is then only used in memory after decoding.
+2. **Custom `SimpleSerialize` impl** — write a hand-rolled `ssz_rs::Serialize` / `Deserialize` / `HashTreeRoot` impl for `StateKey` directly if the encoding shape is stable enough to commit to.
+
+Either approach is acceptable at the first scaffold stage.  The canonical ordering comparator required by §4.3 must operate on the same byte key that the SSZ layer stores, so whichever encoding is chosen must be the one reflected in the ordering check.
+
+**`StatePatch.new_values` nesting.**
+`MockProgressiveList<MockProgressiveByteList>` expands to `List<List<u8, 1048576>, 8192>` — a variable-length list whose elements are themselves variable-length.  The SSZ specification allows this structure (outer list uses offset tables to encode variable-length elements), but `ssz_rs` does not support it via the derive macro.  `StatePatch` therefore requires a custom `SimpleSerialize` implementation.  The same mock-container discipline from §2.1 applies: do not interpret `1048576` or `8192` as protocol budget constants.
+
+**`canonicalize_execution_address` placement.**
+This function performs the state-key derivation for execution addresses (left-padding a 20-byte address to a 32-byte tree key).  It belongs in `shell-state::keys` (see `crate-structure.md §3.3` and `§6`).  It must not be re-implemented inline elsewhere; all address-to-tree-key conversions in `shell-state`, `shell-execution`, and `shell-consensus` must call the same shared function.  Placing it outside `shell-state` in a lower crate (e.g. `shell-primitives`) is also acceptable if the function is needed there first, provided it remains a single implementation that higher crates re-use rather than re-derive.
+
 ## 5. Practical implementation checklist
 
 For future Rust work, the binding is in good shape if it satisfies all of the following:
@@ -281,9 +368,17 @@ For future Rust work, the binding is in good shape if it satisfies all of the fo
 - `TransactionPayload` encode/decode/root logic is centralized and tag-frozen.
 - Unknown payload tags fail cleanly and early.
 - `payload_root` uses the same canonical codec path everywhere.
+- `TransactionEnvelope` delegates encode/decode/root for its payload field to `TransactionPayloadSsz`.
+- `SigningData.domain_type` is exactly 4 bytes; `object_root` equals `Authorization.payload_root` when signing a transaction authorization.
+- `U256` is imported from `shell-primitives`, not re-declared per crate.
+- `BasicFeesPerGas::default()` is never used as an implicit protocol fee floor; fee-floor policy lives in `shell-mempool` configuration.
+- `StateKey` SSZ encoding is implemented as a single shared path (wrapper or hand-rolled impl), not re-derived independently per struct.
+- `StatePatch.new_values` nested list is handled by a custom SSZ implementation, not a plain derive.
+- `canonicalize_execution_address` has exactly one implementation in `shell-state::keys` (or `shell-primitives` if needed lower) and is re-used rather than re-derived elsewhere.
 - `StateKey` ordering is implemented once and reused for sidecar checks.
 - `StateWitness` transport form is kept separate from any optimized proof index.
 - Commitment verification always sees the committed sidecar bytes / order first.
 - Temporary progressive mock bounds remain local implementation details, not consensus rules.
+- Open witness-proof shape questions remain isolated behind wrappers or traits rather than leaking into public type assumptions.
 
 That is the intended Rust-facing contract until upstream closes the remaining witness encoding details.
