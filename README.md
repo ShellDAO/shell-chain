@@ -64,6 +64,9 @@ When you are ready to make a repository change, continue with `docs/contributing
 
 ## Build and Test Status
 
-Because the Rust workspace has not been scaffolded yet, repository-local commands such as `cargo build`, `cargo test`, `cargo clippy`, and `cargo doc` are **not available yet**.
+A minimal Rust workspace is now scaffolded with the initial `shell-primitives` crate. The repository-local bootstrap commands are:
 
-Today, the repository's primary source of truth is the local documentation set. When code scaffolding is added, the build and test instructions should be added here and kept fully local to this repository.
+- `cargo fmt --all`
+- `cargo test --workspace`
+
+The remaining planned crates under `crates/` are still directory placeholders until their crate-specific scaffolding is introduced. The documentation set in `specs/` remains the source of truth for open protocol areas.
