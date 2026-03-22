@@ -1,0 +1,1 @@
+pub const DEFAULT_USER_PATH_MAX_SIGNATURE_SIZE: usize = 8 * 1024;
