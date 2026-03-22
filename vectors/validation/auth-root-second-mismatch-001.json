@@ -1,0 +1,29 @@
+{
+  "id": "auth-root-second-mismatch-001",
+  "category": "validation",
+  "rule": "authorization_payload_roots",
+  "description": "When multiple authorizations are provided the loop stops at the first mismatch; the second authorization carries a wrong root so the check fails on it.",
+  "input": {
+    "wire_hex": "0x0001000000000000000000000000000000000000000000000000000000000000002a00000000000000085200000000000002000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000011111111111111111111111111111111111111110500000000000000000000000000000000000000000000000000000000000000e80000002222222222222222222222222222222222222222222222222222222222222222deadbeef",
+    "authorizations": [
+      {
+        "scheme_id": 0,
+        "payload_root": "0xed88c8d3d9203ca32ac85bb3669c3ce93aff60599e0a9a1665319574c98d6060",
+        "signature_hex": "0x"
+      },
+      {
+        "scheme_id": 1,
+        "payload_root": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "signature_hex": "0x"
+      }
+    ]
+  },
+  "expected_outcome": "reject",
+  "expected_error": {
+    "kind": "PayloadRootMismatch",
+    "expected_root": "0xed88c8d3d9203ca32ac85bb3669c3ce93aff60599e0a9a1665319574c98d6060",
+    "actual_root": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "owned_by": "shell-primitives",
+  "notes": "First authorization is correct; the check must still catch the second mismatched one."
+}

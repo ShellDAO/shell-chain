@@ -1,0 +1,12 @@
+{
+  "id": "sig-size-at-limit-001",
+  "category": "validation",
+  "rule": "user_signature_size",
+  "description": "A signature of exactly 8192 bytes is at the closed 8 KB limit and must be accepted (the rule rejects strictly-greater-than).",
+  "input": {
+    "signature_size": 8192
+  },
+  "expected_outcome": "accept",
+  "owned_by": "shell-primitives",
+  "notes": "Exact boundary: len == MAX_USER_SIGNATURE_BYTES (8192) is the inclusive upper bound."
+}

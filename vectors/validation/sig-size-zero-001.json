@@ -1,0 +1,12 @@
+{
+  "id": "sig-size-zero-001",
+  "category": "validation",
+  "rule": "user_signature_size",
+  "description": "An empty signature (zero bytes) is well below the 8 KB limit and is accepted.",
+  "input": {
+    "signature_size": 0
+  },
+  "expected_outcome": "accept",
+  "owned_by": "shell-primitives",
+  "notes": "Edge case: zero-byte signature is valid from a sizing perspective; scheme-specific rules may further reject it."
+}

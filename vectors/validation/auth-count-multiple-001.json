@@ -1,0 +1,28 @@
+{
+  "id": "auth-count-multiple-001",
+  "category": "validation",
+  "rule": "authorization_count",
+  "description": "An authorization list with three entries clears the minimum-one rule; the count check does not impose an upper bound.",
+  "input": {
+    "authorizations": [
+      {
+        "scheme_id": 0,
+        "payload_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "signature_hex": "0x"
+      },
+      {
+        "scheme_id": 1,
+        "payload_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "signature_hex": "0x"
+      },
+      {
+        "scheme_id": 2,
+        "payload_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "signature_hex": "0x"
+      }
+    ]
+  },
+  "expected_outcome": "accept",
+  "owned_by": "shell-primitives",
+  "notes": "len > 1 is accepted; the rule is a floor, not a ceiling."
+}

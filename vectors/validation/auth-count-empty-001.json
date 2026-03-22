@@ -1,0 +1,17 @@
+{
+  "id": "auth-count-empty-001",
+  "category": "validation",
+  "rule": "authorization_count",
+  "description": "An empty authorization list is rejected by check_authorization_count because the closed rule requires at least one authorization.",
+  "input": {
+    "authorizations": []
+  },
+  "expected_outcome": "reject",
+  "expected_error": {
+    "kind": "AuthorizationCount",
+    "expected_at_least": 1,
+    "actual": 0
+  },
+  "owned_by": "shell-primitives",
+  "notes": "Closed T1 rule: zero authorizations must be caught before any signature dispatch."
+}
