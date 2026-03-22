@@ -14,7 +14,7 @@ They focus on implementation contracts such as:
 - future testing-vector responsibilities.
 
 When a protocol detail is still unsettled, the local specs mark it as pending rather than inventing a finalized rule.
-At the current repository milestone, the four core specs below are all `draft` documents intended to be detailed enough to drive initial implementation planning.
+At the current repository milestone, the four core specs below are all `draft` documents intended to be detailed enough to drive the current workspace bootstrap and the next implementation steps.
 
 ## Shared Protocol Context
 

@@ -4,13 +4,13 @@
 
 ## Current Status
 
-There is **no generated Rust API documentation yet** because the repository does not yet contain a buildable workspace.
-This document captures the public surfaces the planned crates are expected to expose so contributors can keep names, responsibilities, and layering consistent while the implementation is still being designed.
+There is **no generated Rust API documentation checked into the repository yet**, even though the repository now contains a buildable workspace bootstrap.
+Today, `shell-primitives` exists as a real crate and `shell-crypto` / `shell-state` exist as early interface crates, but this document still captures the broader public surfaces the workspace is expected to expose as implementation continues.
 
 ## Stability Note
 
-Everything below is a design contract for future work, not a promise that the exact item names already exist in code.
-Where implementation specs are still evolving, the intended responsibility is stable even if concrete type names change.
+Everything below should be read as a mix of **current early surface** and **forward-looking design contract**.
+Where implementation specs are still evolving, the intended responsibility is stable even if concrete type names, module placement, or crate maturity change.
 
 ## Planned Public Surface by Area
 
@@ -87,7 +87,7 @@ Those entry points are planned, not currently implemented.
 The repository does not yet provide:
 
 - generated `cargo doc` output,
-- a stable crate list in `Cargo.toml`,
+- a fully stable crate list in `Cargo.toml`,
 - versioned Rust APIs,
 - runnable node or CLI binaries.
 
