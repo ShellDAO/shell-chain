@@ -1,0 +1,17 @@
+{
+  "id": "sig-size-over-limit-001",
+  "category": "validation",
+  "rule": "user_signature_size",
+  "description": "A signature of 8193 bytes exceeds the closed 8 KB limit by one byte and is rejected before any cryptographic verification.",
+  "input": {
+    "signature_size": 8193
+  },
+  "expected_outcome": "reject",
+  "expected_error": {
+    "kind": "SignatureSizeExceeded",
+    "max_bytes": 8192,
+    "actual_bytes": 8193
+  },
+  "owned_by": "shell-primitives",
+  "notes": "Exact boundary: len == MAX_USER_SIGNATURE_BYTES + 1 is the first byte that must be refused."
+}

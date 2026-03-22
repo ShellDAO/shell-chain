@@ -1,0 +1,18 @@
+{
+  "id": "auth-count-single-001",
+  "category": "validation",
+  "rule": "authorization_count",
+  "description": "A single-entry authorization list satisfies the minimum-one closed rule and is accepted.",
+  "input": {
+    "authorizations": [
+      {
+        "scheme_id": 0,
+        "payload_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "signature_hex": "0x"
+      }
+    ]
+  },
+  "expected_outcome": "accept",
+  "owned_by": "shell-primitives",
+  "notes": "Exact lower boundary: len == 1 satisfies the >= 1 closed rule."
+}
