@@ -8,4 +8,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
 shell-primitives = { path = "../shell-primitives" }

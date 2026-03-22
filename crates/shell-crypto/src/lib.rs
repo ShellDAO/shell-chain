@@ -13,6 +13,7 @@ pub use crate::errors::{
     CryptoError, SignatureSizeExceededError, UnsupportedSchemeError, VerificationFailure,
 };
 pub use crate::schemes::DEFAULT_USER_PATH_MAX_SIGNATURE_SIZE;
+pub use crate::schemes::{Ed25519Verifier, SCHEME_ID_ED25519};
 pub use crate::traits::{
     SignatureDispatcher, SignatureVerificationRequest, SignatureVerifier, VerificationPath,
 };

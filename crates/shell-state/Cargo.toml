@@ -9,3 +9,4 @@ workspace = true
 
 [dependencies]
 shell-primitives = { path = "../shell-primitives" }
+sha2 = { version = "0.10", default-features = false }

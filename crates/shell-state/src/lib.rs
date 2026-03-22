@@ -10,7 +10,9 @@ pub mod transition;
 pub mod views;
 pub mod witness;
 
-pub use crate::accumulator::StateAccumulator;
+pub use crate::accumulator::{
+    InMemoryAccumulator, ReferenceProofLeaf, ReferenceProofPath, StateAccumulator,
+};
 pub use crate::errors::{StateError, WitnessOrderingError};
 pub use crate::keys::{
     canonicalize_execution_address, compare_state_keys, encode_state_key, StateKeyBytes,
@@ -23,32 +25,10 @@ pub use shell_primitives::{StateKey, StateMetadata, StateWitness};
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
+    use alloc::vec;
 
     use super::*;
-    use shell_primitives::{ExecutionAddress, Root, U256};
-
-    struct StubAccumulator {
-        root: Root,
-    }
-
-    impl StateAccumulator for StubAccumulator {
-        fn get_witness_for_accesses(
-            &self,
-            _accesses: &[StateKey],
-        ) -> Result<alloc::vec::Vec<StateWitness>, StateError> {
-            Ok(alloc::vec::Vec::new())
-        }
-
-        fn apply_transition(&mut self, patch: &StatePatch) -> Result<Root, StateError> {
-            patch.validate_shape()?;
-            self.root = [9; 32];
-            Ok(self.root)
-        }
-
-        fn state_root(&self) -> Root {
-            self.root
-        }
-    }
+    use shell_primitives::{ExecutionAddress, U256};
 
     struct StubView;
 
@@ -142,6 +122,109 @@ mod tests {
 
     #[test]
     fn accumulator_trait_is_object_safe() {
-        let _: Box<dyn StateAccumulator> = Box::new(StubAccumulator { root: [0; 32] });
+        let _: Box<dyn StateAccumulator> = Box::new(InMemoryAccumulator::new());
+    }
+
+    #[test]
+    fn in_memory_accumulator_rejects_non_canonical_access_sequences() {
+        let mut accumulator = InMemoryAccumulator::new();
+        let address: ExecutionAddress = [0xAB; 20];
+        let low_key = StateKey::AccountHeader(address);
+        let high_key = StateKey::StorageSlot {
+            address,
+            slot: [0xFF; 32],
+        };
+
+        accumulator
+            .apply_transition(&StatePatch {
+                accesses: vec![low_key.clone(), high_key.clone()],
+                new_values: vec![vec![1], vec![2]],
+            })
+            .expect("canonical transition must apply");
+
+        let err = accumulator
+            .get_witness_for_accesses(&[high_key, low_key])
+            .expect_err("descending access list must be rejected before proof shaping");
+
+        assert_eq!(
+            err,
+            StateError::NonCanonicalWitnessOrdering(WitnessOrderingError {
+                index: 1,
+                context: "access keys must be strictly increasing in canonical StateKey order",
+            })
+        );
+    }
+
+    #[test]
+    fn in_memory_accumulator_keeps_committed_witnesses_separate_from_derived_proof_paths() {
+        let address: ExecutionAddress = [0x22; 20];
+        let first_key = StateKey::AccountHeader(address);
+        let second_key = StateKey::StorageSlot {
+            address,
+            slot: [0x10; 32],
+        };
+        let mut accumulator = InMemoryAccumulator::new();
+
+        let first_root = accumulator
+            .apply_transition(&StatePatch {
+                accesses: vec![first_key.clone(), second_key.clone()],
+                new_values: vec![vec![1, 2, 3], vec![4, 5, 6]],
+            })
+            .expect("canonical transition must produce a reference root");
+
+        let witnesses = accumulator
+            .get_witness_for_accesses(&[first_key.clone(), second_key.clone()])
+            .expect("canonical accesses must materialize committed witnesses");
+
+        assert_eq!(witnesses.len(), 2);
+        assert!(witnesses.iter().all(|witness| witness.proof.is_empty()));
+        assert_eq!(witnesses[1].leaf_value, vec![4, 5, 6]);
+
+        let derived = accumulator
+            .derive_proof_path(&witnesses[1])
+            .expect("reference backend should derive a local proof path");
+
+        assert_eq!(derived.expected_root, first_root);
+        assert_eq!(derived.leaf.key, second_key);
+        assert_eq!(
+            derived
+                .left_neighbor
+                .as_ref()
+                .expect("neighbor on the left should exist")
+                .key,
+            first_key
+        );
+        assert!(derived.right_neighbor.is_none());
+
+        accumulator
+            .verify_witness(&witnesses[1], &accumulator.state_root())
+            .expect("derived proof path should verify against the current reference root");
+    }
+
+    #[test]
+    fn in_memory_accumulator_reference_root_changes_with_transition_contents() {
+        let address: ExecutionAddress = [0x44; 20];
+        let mut accumulator = InMemoryAccumulator::new();
+        let key = StateKey::CodeChunk {
+            address,
+            chunk_index: 7,
+        };
+
+        let root_before = accumulator.state_root();
+        let root_after_first = accumulator
+            .apply_transition(&StatePatch {
+                accesses: vec![key.clone()],
+                new_values: vec![vec![9, 9]],
+            })
+            .expect("first transition should update the root");
+        let root_after_second = accumulator
+            .apply_transition(&StatePatch {
+                accesses: vec![key],
+                new_values: vec![vec![9, 9, 9]],
+            })
+            .expect("updated leaf value should change the root again");
+
+        assert_ne!(root_before, root_after_first);
+        assert_ne!(root_after_first, root_after_second);
     }
 }

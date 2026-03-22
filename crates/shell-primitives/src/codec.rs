@@ -15,9 +15,9 @@ use alloc::vec::Vec;
 
 use crate::errors::{MalformedSszError, PrimitiveError};
 use crate::types::{
-    BasicFeesPerGas, BasicTransactionPayload, ChainId, CreateTransactionPayload, ExecutionAddress,
-    GasPrice, MockProgressiveByteList, Root, TransactionPayload, TransactionPayloadSsz, TxValue,
-    U256,
+    Authorization, BasicFeesPerGas, BasicTransactionPayload, ChainId, CreateTransactionPayload,
+    ExecutionAddress, GasPrice, MockProgressiveByteList, Root, TransactionEnvelope,
+    TransactionPayload, TransactionPayloadSsz, TxValue, U256,
 };
 
 // ─── Fixed serialized sizes (inner payload, without the leading tag byte) ───
@@ -31,6 +31,14 @@ pub const BASIC_FIXED_SIZE: usize = 32 + 8 + 8 + 96 + 20 + 32 + 4 + 32;
 /// chain_id(32) + nonce(8) + gas_limit(8) + fees(96) + value(32)
 ///   + initcode_offset(4) + access_commitment(32) = 212
 pub const CREATE_FIXED_SIZE: usize = 32 + 8 + 8 + 96 + 32 + 4 + 32;
+
+/// Fixed-part byte size of `Authorization`:
+/// scheme_id(1) + payload_root(32) + signature_offset(4) = 37
+pub const AUTHORIZATION_FIXED_SIZE: usize = 1 + 32 + 4;
+
+/// Fixed-part byte size of `TransactionEnvelope`:
+/// payload_offset(4) + authorizations_offset(4) = 8
+pub const ENVELOPE_FIXED_SIZE: usize = 4 + 4;
 
 // ─── Encode ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +61,10 @@ fn push_u256(bytes: &[u8; 32], out: &mut Vec<u8>) {
 }
 
 fn push_u64(v: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u32(v: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -114,6 +126,175 @@ pub fn decode_payload(bytes: &[u8]) -> Result<TransactionPayloadSsz, PrimitiveEr
         }
         _ => unreachable!("tag already validated above"),
     }
+}
+
+/// Encodes an [`Authorization`] to canonical SSZ bytes.
+pub fn encode_authorization(authorization: &Authorization) -> Result<Vec<u8>, PrimitiveError> {
+    let mut out = Vec::with_capacity(AUTHORIZATION_FIXED_SIZE + authorization.signature.len());
+    out.push(authorization.scheme_id);
+    out.extend_from_slice(&authorization.payload_root);
+    push_u32(AUTHORIZATION_FIXED_SIZE as u32, &mut out);
+    out.extend_from_slice(&authorization.signature);
+    Ok(out)
+}
+
+/// Decodes an [`Authorization`] from canonical SSZ bytes.
+pub fn decode_authorization(bytes: &[u8]) -> Result<Authorization, PrimitiveError> {
+    if bytes.len() < AUTHORIZATION_FIXED_SIZE {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "Authorization too short for fixed fields",
+        }));
+    }
+
+    let scheme_id = bytes[0];
+    let payload_root = read_bytes32(bytes, 1)?;
+    let signature_offset = read_u32(bytes, 33)? as usize;
+
+    if signature_offset != AUTHORIZATION_FIXED_SIZE {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "Authorization: signature offset must equal the fixed-part size",
+        }));
+    }
+
+    Ok(Authorization {
+        scheme_id,
+        payload_root,
+        signature: bytes[AUTHORIZATION_FIXED_SIZE..].to_vec(),
+    })
+}
+
+fn encode_authorization_list(authorizations: &[Authorization]) -> Result<Vec<u8>, PrimitiveError> {
+    let fixed_size = authorizations
+        .len()
+        .checked_mul(4)
+        .ok_or(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "Authorization list offset table overflowed usize",
+        }))?;
+    let mut out = Vec::new();
+    let mut variable_parts = Vec::with_capacity(authorizations.len());
+    let mut next_offset = fixed_size;
+
+    for authorization in authorizations {
+        let encoded = encode_authorization(authorization)?;
+        let offset = u32::try_from(next_offset).map_err(|_| {
+            PrimitiveError::MalformedSsz(MalformedSszError {
+                context: "Authorization list offset exceeds u32::MAX",
+            })
+        })?;
+        push_u32(offset, &mut out);
+        next_offset =
+            next_offset
+                .checked_add(encoded.len())
+                .ok_or(PrimitiveError::MalformedSsz(MalformedSszError {
+                    context: "Authorization list byte length overflowed usize",
+                }))?;
+        variable_parts.push(encoded);
+    }
+
+    for encoded in variable_parts {
+        out.extend_from_slice(&encoded);
+    }
+
+    Ok(out)
+}
+
+fn decode_authorization_list(bytes: &[u8]) -> Result<Vec<Authorization>, PrimitiveError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let first_offset = read_u32(bytes, 0)? as usize;
+    if first_offset == 0 || first_offset % 4 != 0 {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "Authorization list first offset must equal the offset-table size",
+        }));
+    }
+    if first_offset > bytes.len() {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "Authorization list offset table extends past the available bytes",
+        }));
+    }
+
+    let count = first_offset / 4;
+    let mut offsets = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = read_u32(bytes, index * 4)? as usize;
+        if offset < first_offset || offset > bytes.len() {
+            return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+                context: "Authorization list element offset points outside the variable section",
+            }));
+        }
+        offsets.push(offset);
+    }
+
+    let mut authorizations = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = offsets[index];
+        let end = offsets.get(index + 1).copied().unwrap_or(bytes.len());
+        if end < start {
+            return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+                context: "Authorization list element offsets must be monotonic",
+            }));
+        }
+        authorizations.push(decode_authorization(&bytes[start..end])?);
+    }
+
+    Ok(authorizations)
+}
+
+/// Encodes a [`TransactionEnvelope`] to canonical SSZ bytes.
+pub fn encode_envelope(envelope: &TransactionEnvelope) -> Result<Vec<u8>, PrimitiveError> {
+    let payload_bytes = encode_payload(&envelope.payload)?;
+    let authorizations_bytes = encode_authorization_list(&envelope.authorizations)?;
+    let authorizations_offset = ENVELOPE_FIXED_SIZE.checked_add(payload_bytes.len()).ok_or(
+        PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "TransactionEnvelope variable section overflowed usize",
+        }),
+    )?;
+
+    let mut out =
+        Vec::with_capacity(ENVELOPE_FIXED_SIZE + payload_bytes.len() + authorizations_bytes.len());
+    push_u32(ENVELOPE_FIXED_SIZE as u32, &mut out);
+    push_u32(
+        u32::try_from(authorizations_offset).map_err(|_| {
+            PrimitiveError::MalformedSsz(MalformedSszError {
+                context: "TransactionEnvelope authorizations offset exceeds u32::MAX",
+            })
+        })?,
+        &mut out,
+    );
+    out.extend_from_slice(&payload_bytes);
+    out.extend_from_slice(&authorizations_bytes);
+    Ok(out)
+}
+
+/// Decodes a [`TransactionEnvelope`] from canonical SSZ bytes.
+pub fn decode_envelope(bytes: &[u8]) -> Result<TransactionEnvelope, PrimitiveError> {
+    if bytes.len() < ENVELOPE_FIXED_SIZE {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "TransactionEnvelope too short for fixed fields",
+        }));
+    }
+
+    let payload_offset = read_u32(bytes, 0)? as usize;
+    let authorizations_offset = read_u32(bytes, 4)? as usize;
+
+    if payload_offset != ENVELOPE_FIXED_SIZE {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context: "TransactionEnvelope: payload offset must equal the fixed-part size",
+        }));
+    }
+    if authorizations_offset < payload_offset || authorizations_offset > bytes.len() {
+        return Err(PrimitiveError::MalformedSsz(MalformedSszError {
+            context:
+                "TransactionEnvelope: authorizations offset must point into the variable section",
+        }));
+    }
+
+    Ok(TransactionEnvelope {
+        payload: decode_payload(&bytes[payload_offset..authorizations_offset])?,
+        authorizations: decode_authorization_list(&bytes[authorizations_offset..])?,
+    })
 }
 
 // ─── Low-level read helpers ──────────────────────────────────────────────────

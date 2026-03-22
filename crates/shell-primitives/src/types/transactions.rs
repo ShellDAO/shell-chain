@@ -123,6 +123,18 @@ impl TransactionEnvelope {
     pub fn payload_root(&self) -> Result<Root, PrimitiveError> {
         self.payload.hash_tree_root()
     }
+
+    /// Encodes to canonical SSZ bytes with the payload delegated through
+    /// `TransactionPayloadSsz` and the authorization list encoded as the sole
+    /// closed list path for this repository state.
+    pub fn to_wire_bytes(&self) -> Result<crate::types::MockProgressiveByteList, PrimitiveError> {
+        crate::codec::encode_envelope(self)
+    }
+
+    /// Decodes from canonical SSZ bytes using the single shared envelope path.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, PrimitiveError> {
+        crate::codec::decode_envelope(bytes)
+    }
 }
 
 impl ProtocolObject for TransactionPayloadSsz {

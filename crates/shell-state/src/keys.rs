@@ -4,7 +4,7 @@ use core::cmp::Ordering;
 pub use shell_primitives::canonicalize_execution_address;
 use shell_primitives::StateKey;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateKeyBytes(Vec<u8>);
 
 impl StateKeyBytes {

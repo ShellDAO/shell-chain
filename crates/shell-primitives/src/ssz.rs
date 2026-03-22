@@ -3,9 +3,9 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::PrimitiveError;
 use crate::types::{
-    BasicFeesPerGas, BasicTransactionPayload, CreateTransactionPayload, Root, SigningData,
-    TransactionEnvelope, TransactionPayload, TransactionPayloadSsz,
-    MOCK_PROGRESSIVE_BYTE_LIST_LIMIT,
+    Authorization, BasicFeesPerGas, BasicTransactionPayload, CreateTransactionPayload, Root,
+    SigningData, TransactionEnvelope, TransactionPayload, TransactionPayloadSsz,
+    MOCK_PROGRESSIVE_BYTE_LIST_LIMIT, MOCK_PROGRESSIVE_LIST_LIMIT,
 };
 
 // ─── SHA-256 and Merkle helpers ──────────────────────────────────────────────
@@ -153,6 +153,22 @@ pub(crate) fn htr_create_payload(p: &CreateTransactionPayload) -> [u8; 32] {
     merkleize(&[f1, f2, f3, f4, f5, f6, f7, [0u8; 32]], 8)
 }
 
+/// hash_tree_root for Authorization (3 fields → padded to 4).
+pub(crate) fn htr_authorization(authorization: &Authorization) -> [u8; 32] {
+    let mut scheme_chunk = [0u8; 32];
+    scheme_chunk[0] = authorization.scheme_id;
+    let payload_root = authorization.payload_root;
+    let signature_root = htr_byte_list(&authorization.signature);
+    merkleize(&[scheme_chunk, payload_root, signature_root, [0u8; 32]], 4)
+}
+
+/// hash_tree_root for List<Authorization, MOCK_PROGRESSIVE_LIST_LIMIT>.
+pub(crate) fn htr_authorization_list(authorizations: &[Authorization]) -> [u8; 32] {
+    let roots: Vec<_> = authorizations.iter().map(htr_authorization).collect();
+    let tree_root = merkleize(&roots, MOCK_PROGRESSIVE_LIST_LIMIT);
+    mix_in_length(tree_root, authorizations.len())
+}
+
 // ─── CanonicalSsz trait ──────────────────────────────────────────────────────
 
 pub trait CanonicalSsz {
@@ -200,15 +216,13 @@ impl CanonicalSsz for TransactionPayloadSsz {
 
 impl CanonicalSsz for TransactionEnvelope {
     fn encode_ssz(&self) -> Result<Vec<u8>, PrimitiveError> {
-        Err(PrimitiveError::Unimplemented(
-            "TransactionEnvelope SSZ encoding requires Authorization list codec (not yet closed)",
-        ))
+        crate::codec::encode_envelope(self)
     }
 
     fn hash_tree_root(&self) -> Result<Root, PrimitiveError> {
-        Err(PrimitiveError::Unimplemented(
-            "TransactionEnvelope hash_tree_root requires Authorization list encoding (not yet closed)",
-        ))
+        let payload_root = self.payload.hash_tree_root()?;
+        let authorizations_root = htr_authorization_list(&self.authorizations);
+        Ok(merkleize(&[payload_root, authorizations_root], 2))
     }
 }
 
