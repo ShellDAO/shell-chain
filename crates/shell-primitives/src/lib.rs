@@ -230,6 +230,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authorization_round_trips_through_wire_encoding() {
+        let authorization = Authorization {
+            scheme_id: 7,
+            payload_root: [0xAB; 32],
+            signature: alloc::vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+
+        let wire = crate::codec::encode_authorization(&authorization).expect("encode must succeed");
+        let decoded =
+            crate::codec::decode_authorization(&wire).expect("decode must succeed on valid bytes");
+
+        assert_eq!(authorization, decoded);
+    }
+
+    #[test]
+    fn envelope_round_trips_through_wire_encoding() {
+        let payload =
+            TransactionPayloadSsz::new(TransactionPayload::Basic(BasicTransactionPayload {
+                nonce: 42,
+                gas_limit: 50_000,
+                ..Default::default()
+            }));
+        let payload_root = payload.hash_tree_root().expect("payload root must exist");
+        let envelope = TransactionEnvelope {
+            payload,
+            authorizations: alloc::vec![
+                Authorization {
+                    scheme_id: 1,
+                    payload_root,
+                    signature: alloc::vec![0x11, 0x22],
+                },
+                Authorization {
+                    scheme_id: 2,
+                    payload_root,
+                    signature: alloc::vec![0x33, 0x44, 0x55],
+                },
+            ],
+        };
+
+        let wire = envelope.to_wire_bytes().expect("encode must succeed");
+        let decoded = TransactionEnvelope::from_wire_bytes(&wire)
+            .expect("decode must succeed on valid envelope bytes");
+
+        assert_eq!(envelope, decoded);
+    }
+
+    #[test]
+    fn envelope_root_is_deterministic() {
+        let payload =
+            TransactionPayloadSsz::new(TransactionPayload::Create(CreateTransactionPayload {
+                nonce: 3,
+                initcode: alloc::vec![0x60, 0x00],
+                ..Default::default()
+            }));
+        let payload_root = payload.hash_tree_root().expect("payload root must exist");
+        let envelope = TransactionEnvelope {
+            payload,
+            authorizations: alloc::vec![Authorization {
+                scheme_id: 9,
+                payload_root,
+                signature: alloc::vec![0x99; 64],
+            }],
+        };
+
+        let root1 = envelope
+            .canonical_root()
+            .expect("first root call must succeed");
+        let root2 = envelope
+            .canonical_root()
+            .expect("second root call must succeed");
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn envelope_root_changes_when_authorization_signature_changes() {
+        let payload = TransactionPayloadSsz::new(TransactionPayload::Basic(
+            BasicTransactionPayload::default(),
+        ));
+        let payload_root = payload.hash_tree_root().expect("payload root must exist");
+        let first = TransactionEnvelope {
+            payload: payload.clone(),
+            authorizations: alloc::vec![Authorization {
+                scheme_id: 3,
+                payload_root,
+                signature: alloc::vec![0xAA],
+            }],
+        };
+        let second = TransactionEnvelope {
+            payload,
+            authorizations: alloc::vec![Authorization {
+                scheme_id: 3,
+                payload_root,
+                signature: alloc::vec![0xAA, 0xBB],
+            }],
+        };
+
+        assert_ne!(
+            first.canonical_root().unwrap(),
+            second.canonical_root().unwrap()
+        );
+    }
+
     // ─── SigningData root ─────────────────────────────────────────────────────
 
     #[test]

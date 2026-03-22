@@ -128,10 +128,7 @@ fn validation_vectors_match_the_closed_t1_rules() {
         match fixture.expected_outcome.as_str() {
             "accept" => assert_accept(&fixture),
             "reject" => assert_reject(&fixture),
-            other => panic!(
-                "unsupported expected_outcome {:?} in {}",
-                other, fixture.id
-            ),
+            other => panic!("unsupported expected_outcome {:?} in {}", other, fixture.id),
         }
     }
 }
@@ -142,22 +139,19 @@ fn assert_accept(fixture: &ValidationVector) {
     match fixture.rule.as_str() {
         "authorization_count" => {
             let auths = build_authorizations(fixture);
-            check_authorization_count(&auths).unwrap_or_else(|err| {
-                panic!("{} should accept but got {err:?}", fixture.id)
-            });
+            check_authorization_count(&auths)
+                .unwrap_or_else(|err| panic!("{} should accept but got {err:?}", fixture.id));
         }
         "authorization_payload_roots" => {
             let payload = decode_payload(fixture);
             let auths = build_authorizations(fixture);
-            check_authorization_payload_roots(&payload, &auths).unwrap_or_else(|err| {
-                panic!("{} should accept but got {err:?}", fixture.id)
-            });
+            check_authorization_payload_roots(&payload, &auths)
+                .unwrap_or_else(|err| panic!("{} should accept but got {err:?}", fixture.id));
         }
         "user_signature_size" => {
             let sig = build_signature(fixture);
-            check_user_signature_size(&sig).unwrap_or_else(|err| {
-                panic!("{} should accept but got {err:?}", fixture.id)
-            });
+            check_user_signature_size(&sig)
+                .unwrap_or_else(|err| panic!("{} should accept but got {err:?}", fixture.id));
         }
         rule => panic!("{} has unrecognised rule {:?}", fixture.id, rule),
     }
@@ -269,8 +263,7 @@ fn assert_signature_size_error(
                     fixture.id
                 );
                 assert_eq!(
-                    actual.max_bytes,
-                    MAX_USER_SIGNATURE_BYTES,
+                    actual.max_bytes, MAX_USER_SIGNATURE_BYTES,
                     "{} max_bytes must equal MAX_USER_SIGNATURE_BYTES",
                     fixture.id
                 );
