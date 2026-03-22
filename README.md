@@ -6,7 +6,7 @@
 ## Current Status
 
 `shell-chain` is still primarily a documentation-and-specification repository, but it now also includes a **minimal Rust workspace bootstrap**.
-The repository has a root `Cargo.toml`, a working `shell-primitives` crate, early `shell-crypto` and `shell-state` interface crates, and shared fixtures under `vectors/`.
+The repository has a root `Cargo.toml`, a working `shell-primitives` crate, early `shell-crypto`, `shell-state`, and `shell-mempool` crates, and shared fixtures under `vectors/`.
 It does **not** yet provide a runnable node, a full crate tree, or a production-ready implementation of the protocol.
 
 At this stage, the core implementation specs in `specs/` are all at **draft** status and are intended to be detailed enough to drive initial implementation planning, including crate scaffolding, fixture planning, and validation/interface placement.
@@ -32,7 +32,7 @@ The planned implementation centers on a few protocol ideas that shape every crat
 
 ## Planned Workspace Shape
 
-The crate layout below describes the intended full architecture. Today, `shell-primitives`, `shell-crypto`, and `shell-state` are scaffolded in the workspace, while the remaining crates are still placeholders:
+The crate layout below describes the intended full architecture. Today, `shell-primitives`, `shell-crypto`, `shell-state`, and `shell-mempool` are scaffolded in the workspace, while the remaining crates are still placeholders:
 
 - `shell-primitives`: SSZ-facing types, roots, aliases, and canonical codec helpers
 - `shell-crypto`: signature dispatch, hashing boundaries, and scheme-specific verification adapters
@@ -64,7 +64,7 @@ When you are ready to make a repository change, continue with `docs/contributing
 
 ## Build and Test Status
 
-A minimal Rust workspace is now scaffolded with `shell-primitives` plus early `shell-crypto` and `shell-state` interfaces. The repository-local bootstrap commands are:
+A minimal Rust workspace is now scaffolded with `shell-primitives` plus early `shell-crypto`, `shell-state`, and `shell-mempool` interfaces. The repository-local bootstrap commands are:
 
 - `cargo fmt --all`
 - `cargo check --workspace`

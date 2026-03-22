@@ -259,6 +259,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-mempool"
+version = "0.1.0"
+dependencies = [
+ "shell-crypto",
+ "shell-primitives",
+]
+
+[[package]]
 name = "shell-primitives"
 version = "0.1.0"
 dependencies = [
