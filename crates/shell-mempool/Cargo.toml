@@ -1,0 +1,12 @@
+[package]
+name = "shell-mempool"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shell-crypto = { path = "../shell-crypto" }
+shell-primitives = { path = "../shell-primitives" }

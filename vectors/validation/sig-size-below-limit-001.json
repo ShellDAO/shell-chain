@@ -1,0 +1,12 @@
+{
+  "id": "sig-size-below-limit-001",
+  "category": "validation",
+  "rule": "user_signature_size",
+  "description": "A signature of 8191 bytes is one byte below the closed 8 KB limit and is accepted.",
+  "input": {
+    "signature_size": 8191
+  },
+  "expected_outcome": "accept",
+  "owned_by": "shell-primitives",
+  "notes": "Boundary: MAX_USER_SIGNATURE_BYTES - 1 must pass the strict less-than-or-equal check."
+}
