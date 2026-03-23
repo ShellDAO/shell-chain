@@ -204,7 +204,7 @@ fn decode_authorization_list(bytes: &[u8]) -> Result<Vec<Authorization>, Primiti
     }
 
     let first_offset = read_u32(bytes, 0)? as usize;
-    if first_offset == 0 || first_offset % 4 != 0 {
+    if first_offset == 0 || !first_offset.is_multiple_of(4) {
         return Err(PrimitiveError::MalformedSsz(MalformedSszError {
             context: "Authorization list first offset must equal the offset-table size",
         }));
