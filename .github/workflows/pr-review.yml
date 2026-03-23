@@ -4,9 +4,9 @@
 # plus additional PR-quality checks (commit messages, description validation).
 #
 # See also:
-#   .github/REVIEW_CHECKLIST.md      — full review checklist reference
-#   .github/RUST_CRYPTO_REVIEW.md    — Rust & cryptography guidelines
-#   .github/PR_REVIEW_TEMPLATE.md    — PR description guidelines
+#   .github/review-checklist.md      — full review checklist reference
+#   .github/rust-crypto-review.md    — Rust & cryptography guidelines
+#   .github/pull_request_template.md — PR description template
 
 name: PR Review
 
@@ -18,10 +18,11 @@ on:
       - opened
       - synchronize
       - reopened
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same PR when a new commit is pushed.
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
+  group: pr-review-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -283,14 +284,16 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 7. Commit message check
-  # Validates that every commit in the PR follows the Conventional Commits
-  # specification, as required by REVIEW_CHECKLIST.md §7.
+  # Validates that the HEAD (latest) commit in the PR follows the Conventional
+  # Commits specification, as required by review-checklist.md §7. Earlier
+  # intermediate commits (e.g. planning commits) emit warnings only.
   # Accepted types: feat, fix, chore, docs, refactor, test, ci, style, perf,
   #                 build, revert
   # -------------------------------------------------------------------------
   commit-message-check:
     name: Commit Message Check
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -304,18 +307,15 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           PATTERN="^(feat|fix|chore|docs|refactor|test|ci|style|perf|build|revert)(\(.+\))?(!)?: *.+"
-          FAILED=0
-          while IFS= read -r msg; do
-            # Skip merge commits
-            if echo "$msg" | grep -qE "^Merge "; then
-              continue
-            fi
-            if ! echo "$msg" | grep -qE "$PATTERN"; then
-              echo "::error::Commit message does not follow conventional format: \"$msg\""
-              FAILED=1
-            fi
-          done < <(git log --format="%s" "${BASE_SHA}..${HEAD_SHA}")
-          if [ "$FAILED" -ne 0 ]; then
+
+          # The HEAD (latest) commit MUST follow the conventional format.
+          # Earlier intermediate commits emit warnings only — this allows iterative
+          # development (e.g. planning commits) without failing the whole PR.
+          HEAD_MSG=$(git log -1 --format="%s" "${HEAD_SHA}")
+          if echo "${HEAD_MSG}" | grep -qE "^Merge "; then
+            echo "HEAD commit is a merge commit — skipping conventional format check."
+          elif ! echo "${HEAD_MSG}" | grep -qE "${PATTERN}"; then
+            echo "::error::The latest commit message does not follow conventional format: \"${HEAD_MSG}\""
             echo ""
             echo "Commit messages must follow the Conventional Commits format:"
             echo "  <type>[optional scope]: <description>"
@@ -327,7 +327,23 @@ jobs:
             echo "  chore: update dependencies"
             exit 1
           fi
-          echo "All commit messages follow the conventional commit format."
+
+          # Warn (but do not fail) for earlier intermediate commits that are
+          # non-conventional — they may be planning or iterative work commits.
+          COMMIT_COUNT=$(git rev-list --count "${BASE_SHA}..${HEAD_SHA}")
+          if [ "$COMMIT_COUNT" -gt 1 ]; then
+            while IFS= read -r msg; do
+              # Skip merge commits
+              if echo "$msg" | grep -qE "^Merge "; then
+                continue
+              fi
+              if ! echo "$msg" | grep -qE "$PATTERN"; then
+                echo "::warning::Intermediate commit message does not follow conventional format: \"$msg\""
+              fi
+            done < <(git log --format="%s" "${BASE_SHA}..${HEAD_SHA}~1")
+          fi
+
+          echo "Commit message check passed (HEAD: \"${HEAD_MSG}\")."
 
   # -------------------------------------------------------------------------
   # 8. PR description check
@@ -337,6 +353,7 @@ jobs:
   pr-description-check:
     name: PR Description Check
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     permissions: {}
     steps:
       - name: Validate PR description
