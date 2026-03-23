@@ -12,17 +12,9 @@ use crate::errors::{
 use crate::fees::{gas_price_covers, payload_lane_fee, witness_lane_fee, FeeLane, FeeSchedule};
 use crate::outcomes::{AuthorizationValidated, TentativeAccepted};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoncePolicy {
     pub max_future_nonce_gap: u64,
-}
-
-impl Default for NoncePolicy {
-    fn default() -> Self {
-        Self {
-            max_future_nonce_gap: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
