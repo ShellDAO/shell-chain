@@ -1,0 +1,412 @@
+# PR Review Workflow
+# Automatically triggered when a pull request is opened, updated, or reopened
+# targeting the main branch. Runs the same checks as scripts/pr-review-checks.sh
+# plus additional PR-quality checks (commit messages, description validation).
+#
+# See also:
+#   .github/REVIEW_CHECKLIST.md      — full review checklist reference
+#   .github/RUST_CRYPTO_REVIEW.md    — Rust & cryptography guidelines
+#   .github/PR_REVIEW_TEMPLATE.md    — PR description guidelines
+
+name: PR Review
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+# Cancel in-progress runs for the same PR when a new commit is pushed.
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# Limit the default GITHUB_TOKEN permissions for all jobs.
+# Individual jobs that need no repository access override with permissions: {}.
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------------
+# Helper: detect whether a Cargo workspace / package is present.
+# All Rust jobs use `if: steps.cargo_check.outputs.exists == 'true'` so that
+# the workflow still passes on PRs that only touch docs or scripts.
+# ---------------------------------------------------------------------------
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Formatting check
+  # -------------------------------------------------------------------------
+  format:
+    name: Formatting Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping Rust formatting check."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run cargo fmt
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo fmt -- --check
+
+  # -------------------------------------------------------------------------
+  # 2. Lint check
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping Clippy lint check."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run cargo clippy
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo clippy -- -D warnings
+
+  # -------------------------------------------------------------------------
+  # 3. Tests
+  # -------------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping cargo test."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run cargo test
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo test
+
+  # -------------------------------------------------------------------------
+  # 4. Documentation build
+  # -------------------------------------------------------------------------
+  docs:
+    name: Documentation Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping cargo doc."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build documentation
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo doc --no-deps
+
+  # -------------------------------------------------------------------------
+  # 5. Security audit
+  # -------------------------------------------------------------------------
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping cargo audit."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Install cargo-audit
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo audit
+
+  # -------------------------------------------------------------------------
+  # 6. Build verification
+  # -------------------------------------------------------------------------
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Cargo.toml
+        id: cargo_check
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml found — skipping release build."
+          fi
+
+      - name: Install Rust stable toolchain
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: steps.cargo_check.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build release
+        if: steps.cargo_check.outputs.exists == 'true'
+        run: cargo build --release
+
+  # -------------------------------------------------------------------------
+  # 7. Commit message check
+  # Validates that every commit in the PR follows the Conventional Commits
+  # specification, as required by REVIEW_CHECKLIST.md §7.
+  # Accepted types: feat, fix, chore, docs, refactor, test, ci, style, perf,
+  #                 build, revert
+  # -------------------------------------------------------------------------
+  commit-message-check:
+    name: Commit Message Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch enough history to inspect all commits in the PR.
+          fetch-depth: 0
+
+      - name: Validate conventional commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PATTERN="^(feat|fix|chore|docs|refactor|test|ci|style|perf|build|revert)(\(.+\))?(!)?: *.+"
+          FAILED=0
+          while IFS= read -r msg; do
+            # Skip merge commits
+            if echo "$msg" | grep -qE "^Merge "; then
+              continue
+            fi
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "::error::Commit message does not follow conventional format: \"$msg\""
+              FAILED=1
+            fi
+          done < <(git log --format="%s" "${BASE_SHA}..${HEAD_SHA}")
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "Commit messages must follow the Conventional Commits format:"
+            echo "  <type>[optional scope]: <description>"
+            echo ""
+            echo "Accepted types: feat, fix, chore, docs, refactor, test, ci, style, perf, build, revert"
+            echo "Examples:"
+            echo "  feat: add new transaction validation"
+            echo "  fix(crypto): correct key derivation edge case"
+            echo "  chore: update dependencies"
+            exit 1
+          fi
+          echo "All commit messages follow the conventional commit format."
+
+  # -------------------------------------------------------------------------
+  # 8. PR description check
+  # Ensures the PR body is not empty and contains an Overview section,
+  # consistent with pull_request_template.md.
+  # -------------------------------------------------------------------------
+  pr-description-check:
+    name: PR Description Check
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate PR description
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          MIN_LENGTH=50
+
+          if [ -z "$PR_BODY" ]; then
+            echo "::error::PR description is empty. Please fill in the pull request template."
+            exit 1
+          fi
+
+          BODY_LENGTH=${#PR_BODY}
+          if [ "$BODY_LENGTH" -lt "$MIN_LENGTH" ]; then
+            echo "::error::PR description is too short (${BODY_LENGTH} chars). Please provide a meaningful description (minimum ${MIN_LENGTH} characters)."
+            exit 1
+          fi
+
+          if ! echo "$PR_BODY" | grep -qi "overview\|description\|summary\|changes"; then
+            echo "::error::PR description must contain an overview or description of the changes. Please fill in the pull request template."
+            exit 1
+          fi
+
+          echo "PR description looks good (${BODY_LENGTH} characters)."
+
+  # -------------------------------------------------------------------------
+  # 9. Summary (branch protection gate)
+  # This job depends on every other job. Branch protection rules can require
+  # only this single job instead of listing each check individually.
+  # -------------------------------------------------------------------------
+  summary:
+    name: PR Review Summary
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs:
+      - format
+      - lint
+      - test
+      - docs
+      - security-audit
+      - build
+      - commit-message-check
+      - pr-description-check
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          results='${{ toJSON(needs) }}'
+          failed=0
+
+          for job in format lint test docs security_audit build commit_message_check pr_description_check; do
+            result=$(echo "$results" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          key = '$job'
+          if key in data:
+              print(data[key]['result'])
+          else:
+              print('unknown')
+          ")
+            echo "Job '$job': $result"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more PR review checks failed. Please fix the issues above."
+            exit 1
+          fi
+
+          echo "All PR review checks passed successfully!"

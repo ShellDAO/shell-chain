@@ -1,4 +1,15 @@
 #!/bin/bash
+#
+# pr-review-checks.sh — Local pre-push PR review checks
+#
+# This script runs the same checks that are automatically executed by the
+# GitHub Actions workflow at .github/workflows/pr-review.yml whenever a pull
+# request is opened or updated. You can run it locally before pushing to catch
+# issues early:
+#
+#   bash scripts/pr-review-checks.sh
+#
+# Requirements: cargo, cargo-audit (install with `cargo install cargo-audit`)
 
 set -e
 
