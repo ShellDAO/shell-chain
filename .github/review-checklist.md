@@ -1,5 +1,7 @@
 # PR Review Checklist
 
+> **Note:** This checklist is used as a reference during both manual and automated PR reviews. Automated checks are run via GitHub Actions on every PR (see `.github/workflows/pr-review.yml`).
+
 This document outlines the comprehensive checklist for reviewing pull requests to ensure high standards of quality across various aspects of the codebase.
 
 ## 1. Code Quality
@@ -14,7 +16,7 @@ This document outlines the comprehensive checklist for reviewing pull requests t
 - [ ] All public-facing functions/modules have corresponding doc comments.
 
 ## 3. Rust Best Practices
-- [ ] Use of idiomatic Rust constructs (e.g., ownership, borrowing)._ 
+- [ ] Use of idiomatic Rust constructs (e.g., ownership, borrowing).
 - [ ] Proper error handling practices.
 - [ ] Avoiding unnecessary clones or references.
 - [ ] Utilization of Rust's powerful type system effectively.
@@ -45,6 +47,18 @@ This document outlines the comprehensive checklist for reviewing pull requests t
 - [ ] Package metadata is correctly filled out (name, version, author).
 - [ ] Ensure compatibility settings are verified (e.g., Rust edition).
 
+## 9. CI/CD Integration
+
+Automated checks are run via GitHub Actions on every PR. See `.github/workflows/pr-review.yml` for the full configuration. The following checks are enforced automatically:
+
+- [ ] `cargo fmt --check` passes (code formatting)
+- [ ] `cargo clippy -- -D warnings` passes (lint checks)
+- [ ] `cargo test` passes (unit tests)
+- [ ] `cargo doc --no-deps` passes (documentation builds)
+- [ ] `cargo audit` passes (security audit — no known vulnerabilities in dependencies)
+- [ ] `cargo build --release` passes (release build succeeds)
+- [ ] Commit messages follow the conventional commit format
+
 ---
 
-_Last updated on: 2026-03-22 09:53:20 UTC_  
+_Last updated on: 2026-03-23_

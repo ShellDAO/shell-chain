@@ -1,32 +1,26 @@
 ## Overview
-
-<!-- Provide a brief description of the changes in this PR and the motivation behind them. -->
+<!-- Provide a brief description of the changes in this PR -->
 
 ## Type of Change
-
-<!-- Mark the relevant option with an [x]. -->
-
-- [ ] Bug Fix
-- [ ] New Feature
-- [ ] Documentation Update
-- [ ] Refactor
+- [ ] 🐛 Bug Fix
+- [ ] ✨ New Feature
+- [ ] 📝 Documentation Update
+- [ ] ♻️ Refactor
+- [ ] 🔧 Configuration/CI
 - [ ] Other (please specify):
 
 ## Checklist
-
-<!-- Verify each item before requesting a review. See .github/REVIEW_CHECKLIST.md for details. -->
-
-- [ ] Code follows the project's style guidelines (`cargo fmt` passes)
-- [ ] No Clippy warnings (`cargo clippy -- -D warnings` passes)
-- [ ] Unit tests have been added or modified (`cargo test` passes)
-- [ ] Documentation has been updated (`cargo doc --no-deps` passes)
-- [ ] No sensitive information (keys, secrets, PII) is exposed
-- [ ] Commit messages follow the conventional commit format (e.g., `feat:`, `fix:`, `chore:`)
+<!-- Review the checklist before submitting. See .github/review-checklist.md for details -->
+- [ ] Code follows the project's style guidelines (`cargo fmt`)
+- [ ] Code passes lint checks (`cargo clippy`)
+- [ ] Unit tests have been added/modified for changes
+- [ ] Documentation has been updated (code comments, README, API docs)
+- [ ] No sensitive information is exposed
+- [ ] Commit messages follow [conventional format](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.)
+- [ ] For crypto changes: reviewed against [Rust Crypto Review Guidelines](.github/rust-crypto-review.md)
 
 ## Related Issues
-
-<!-- Link any related issues here, e.g. "Closes #123" or "Relates to #456". -->
+<!-- Link any related issues: Fixes #123, Closes #456 -->
 
 ## Additional Notes
-
-<!-- Any extra context, screenshots, or information for the reviewer. -->
+<!-- Any additional context, screenshots, or information for reviewers -->
