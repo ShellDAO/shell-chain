@@ -4,9 +4,9 @@
 # plus additional PR-quality checks (commit messages, description validation).
 #
 # See also:
-#   .github/REVIEW_CHECKLIST.md      — full review checklist reference
-#   .github/RUST_CRYPTO_REVIEW.md    — Rust & cryptography guidelines
-#   .github/PR_REVIEW_TEMPLATE.md    — PR description guidelines
+#   .github/review-checklist.md      — full review checklist reference
+#   .github/rust-crypto-review.md    — Rust & cryptography guidelines
+#   .github/pull_request_template.md — PR description template
 
 name: PR Review
 
@@ -284,7 +284,7 @@ jobs:
   # -------------------------------------------------------------------------
   # 7. Commit message check
   # Validates that every commit in the PR follows the Conventional Commits
-  # specification, as required by REVIEW_CHECKLIST.md §7.
+  # specification, as required by review-checklist.md §7.
   # Accepted types: feat, fix, chore, docs, refactor, test, ci, style, perf,
   #                 build, revert
   # -------------------------------------------------------------------------
