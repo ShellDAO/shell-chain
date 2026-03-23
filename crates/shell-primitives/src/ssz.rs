@@ -59,7 +59,7 @@ pub(crate) fn pack_bytes(bytes: &[u8]) -> Vec<[u8; 32]> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    let num_chunks = (bytes.len() + 31) / 32;
+    let num_chunks = bytes.len().div_ceil(32);
     let mut chunks = Vec::with_capacity(num_chunks);
     for i in 0..num_chunks {
         let mut chunk = [0u8; 32];
