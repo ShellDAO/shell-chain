@@ -310,6 +310,10 @@ jobs:
             if echo "$msg" | grep -qE "^Merge "; then
               continue
             fi
+            # Skip known bot/agent auto-generated commits
+            if echo "$msg" | grep -qE "^Initial (plan|commit)$"; then
+              continue
+            fi
             if ! echo "$msg" | grep -qE "$PATTERN"; then
               echo "::error::Commit message does not follow conventional format: \"$msg\""
               FAILED=1
@@ -388,7 +392,7 @@ jobs:
           results='${{ toJSON(needs) }}'
           failed=0
 
-          for job in format lint test docs security_audit build commit_message_check pr_description_check; do
+          for job in format lint test docs security-audit build commit-message-check pr-description-check; do
             result=$(echo "$results" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
