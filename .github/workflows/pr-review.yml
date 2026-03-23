@@ -283,8 +283,9 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 7. Commit message check
-  # Validates that every commit in the PR follows the Conventional Commits
-  # specification, as required by review-checklist.md §7.
+  # Validates that the HEAD (latest) commit in the PR follows the Conventional
+  # Commits specification, as required by review-checklist.md §7. Earlier
+  # intermediate commits (e.g. planning commits) emit warnings only.
   # Accepted types: feat, fix, chore, docs, refactor, test, ci, style, perf,
   #                 build, revert
   # -------------------------------------------------------------------------
@@ -304,18 +305,15 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           PATTERN="^(feat|fix|chore|docs|refactor|test|ci|style|perf|build|revert)(\(.+\))?(!)?: *.+"
-          FAILED=0
-          while IFS= read -r msg; do
-            # Skip merge commits
-            if echo "$msg" | grep -qE "^Merge "; then
-              continue
-            fi
-            if ! echo "$msg" | grep -qE "$PATTERN"; then
-              echo "::error::Commit message does not follow conventional format: \"$msg\""
-              FAILED=1
-            fi
-          done < <(git log --format="%s" "${BASE_SHA}..${HEAD_SHA}")
-          if [ "$FAILED" -ne 0 ]; then
+
+          # The HEAD (latest) commit MUST follow the conventional format.
+          # Earlier intermediate commits emit warnings only — this allows iterative
+          # development (e.g. planning commits) without failing the whole PR.
+          HEAD_MSG=$(git log -1 --format="%s" "${HEAD_SHA}")
+          if echo "${HEAD_MSG}" | grep -qE "^Merge "; then
+            echo "HEAD commit is a merge commit — skipping conventional format check."
+          elif ! echo "${HEAD_MSG}" | grep -qE "${PATTERN}"; then
+            echo "::error::The latest commit message does not follow conventional format: \"${HEAD_MSG}\""
             echo ""
             echo "Commit messages must follow the Conventional Commits format:"
             echo "  <type>[optional scope]: <description>"
@@ -327,7 +325,20 @@ jobs:
             echo "  chore: update dependencies"
             exit 1
           fi
-          echo "All commit messages follow the conventional commit format."
+
+          # Warn (but do not fail) for earlier intermediate commits that are
+          # non-conventional — they may be planning or iterative work commits.
+          while IFS= read -r msg; do
+            # Skip merge commits
+            if echo "$msg" | grep -qE "^Merge "; then
+              continue
+            fi
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "::warning::Intermediate commit message does not follow conventional format: \"$msg\""
+            fi
+          done < <(git log --format="%s" "${BASE_SHA}..${HEAD_SHA}~1")
+
+          echo "Commit message check passed (HEAD: \"${HEAD_MSG}\")."
 
   # -------------------------------------------------------------------------
   # 8. PR description check

@@ -38,7 +38,7 @@ This document outlines the comprehensive checklist for reviewing pull requests t
 - [ ] Ensure that tests can run in the CI/CD pipeline without issues.
 
 ## 7. Commit Message Standards
-- [ ] Commit messages follow the conventional format (e.g., `feat:`, `fix:`, `chore:`).
+- [ ] The **latest (HEAD) commit** message follows the conventional format (e.g., `feat:`, `fix:`, `chore:`). This is enforced as a hard failure by CI.
 - [ ] Each commit message is clear and explains the purpose of the change.
 - [ ] For multiple commits, ensure they are squashed into a single coherent commit where applicable.
 
