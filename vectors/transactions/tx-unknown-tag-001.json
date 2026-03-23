@@ -1,0 +1,15 @@
+{
+  "id": "tx-unknown-tag-001",
+  "category": "transaction",
+  "description": "A transaction payload tag outside the locally supported set is rejected before any payload decode.",
+  "input": {
+    "wire_hex": "0x02"
+  },
+  "expected_outcome": "reject",
+  "expected_error": {
+    "kind": "UnsupportedPayloadVariant",
+    "tag": 2
+  },
+  "owned_by": "shell-primitives",
+  "notes": "This fixture stays focused on the closed tag gate without inventing future payload semantics."
+}

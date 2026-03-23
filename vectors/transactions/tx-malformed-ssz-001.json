@@ -1,0 +1,15 @@
+{
+  "id": "tx-malformed-ssz-001",
+  "category": "transaction",
+  "description": "A tag-only transaction payload is structurally malformed because the fixed SSZ fields are missing.",
+  "input": {
+    "wire_hex": "0x00"
+  },
+  "expected_outcome": "reject",
+  "expected_error": {
+    "kind": "MalformedSsz",
+    "context": "BasicTransactionPayload too short for fixed fields"
+  },
+  "owned_by": "shell-primitives",
+  "notes": "This fixture exercises the low-level decode failure path for truncated SSZ bytes."
+}
