@@ -99,7 +99,7 @@ http-body-util = "0.1"
 rayon = "1.10"
 
 # --- caching ---
-lru = "0.12"
+lru = "0.16"
 
 # --- benchmarks ---
 criterion = { version = "0.5", features = ["html_reports"] }
