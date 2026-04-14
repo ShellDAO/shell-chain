@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use shell_consensus::PoaConfig;
-use shell_evm::ParallelEvmConfig;
+pub use shell_evm::ParallelEvmConfig;
 use shell_mempool::MempoolConfig;
 use shell_network::NetworkConfig;
 use shell_primitives::Address;

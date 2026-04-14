@@ -63,7 +63,8 @@ impl TxConflictGraph {
 
         for left in 0..rwsets.len() {
             for right in (left + 1)..rwsets.len() {
-                if let Some(conflict) = detect_conflict(left, right, &rwsets[left], &rwsets[right]) {
+                if let Some(conflict) = detect_conflict(left, right, &rwsets[left], &rwsets[right])
+                {
                     conflicts.push(conflict);
                 }
             }
@@ -259,11 +260,12 @@ fn detect_conflict(
     let reason = if !shared_paths.is_empty() {
         if !left.complete || !right.complete {
             ConflictReason::Incomplete
-        } else if left
-            .writes
-            .iter()
-            .any(|left_path| right.writes.iter().any(|right_path| access_paths_conflict(left_path, right_path)))
-        {
+        } else if left.writes.iter().any(|left_path| {
+            right
+                .writes
+                .iter()
+                .any(|right_path| access_paths_conflict(left_path, right_path))
+        }) {
             ConflictReason::WriteWrite
         } else {
             ConflictReason::ReadWrite
@@ -361,7 +363,10 @@ mod tests {
     #[test]
     fn graph_detects_conflicting_native_balance_writes() {
         let shared = Address::from([0x22; 20]);
-        let txs = vec![signed_tx(shared, 1, Vec::new()), signed_tx(shared, 2, Vec::new())];
+        let txs = vec![
+            signed_tx(shared, 1, Vec::new()),
+            signed_tx(shared, 2, Vec::new()),
+        ];
         let scheduler = ParallelScheduler::new(ParallelEvmConfig {
             enabled: true,
             ..ParallelEvmConfig::default()

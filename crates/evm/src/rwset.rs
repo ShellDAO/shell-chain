@@ -106,7 +106,13 @@ impl ReadWriteSetExtractor for HeuristicRwSetExtractor {
                 classify_system_contract(&mut rwset, sender, target, tx.tx.data.as_ref());
             }
             Some(target) => {
-                classify_user_contract(&mut rwset, sender, target, tx.tx.data.as_ref(), !tx.tx.value.is_zero());
+                classify_user_contract(
+                    &mut rwset,
+                    sender,
+                    target,
+                    tx.tx.data.as_ref(),
+                    !tx.tx.value.is_zero(),
+                );
             }
         }
 
@@ -267,8 +273,12 @@ mod tests {
         assert!(rwset.reads.contains(&TxAccessPath::NativeNonce(tx.from)));
         assert!(rwset.writes.contains(&TxAccessPath::NativeBalance(tx.from)));
         assert!(rwset.writes.contains(&TxAccessPath::NativeNonce(tx.from)));
-        assert!(rwset.reads.contains(&TxAccessPath::NativeBalance(recipient)));
-        assert!(rwset.writes.contains(&TxAccessPath::NativeBalance(recipient)));
+        assert!(rwset
+            .reads
+            .contains(&TxAccessPath::NativeBalance(recipient)));
+        assert!(rwset
+            .writes
+            .contains(&TxAccessPath::NativeBalance(recipient)));
     }
 
     #[test]
@@ -350,7 +360,11 @@ mod tests {
         let rwset = HeuristicRwSetExtractor.extract(&tx);
 
         assert!(!rwset.complete);
-        assert!(rwset.reads.contains(&TxAccessPath::ContractStorageAny(target)));
-        assert!(rwset.writes.contains(&TxAccessPath::ContractStorageAny(target)));
+        assert!(rwset
+            .reads
+            .contains(&TxAccessPath::ContractStorageAny(target)));
+        assert!(rwset
+            .writes
+            .contains(&TxAccessPath::ContractStorageAny(target)));
     }
 }

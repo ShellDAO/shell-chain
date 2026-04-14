@@ -480,6 +480,7 @@ async fn run_with_store<S: KvStore + 'static>(
         },
         max_idle_interval_ms: args.max_idle_interval * 1000,
         state_cache_size_mb: args.state_cache_size_mb.unwrap_or(64),
+        parallel_evm: shell_node::config::ParallelEvmConfig::default(),
     };
 
     // Build the node (auto-detects existing state via NodeBuilder).
