@@ -234,19 +234,21 @@ pub fn compute_intrinsic_gas(
 ) -> u64 {
     let mut gas = INTRINSIC_GAS_TX;
     if is_create {
-        gas += GAS_CONTRACT_CREATION;
+        gas = gas.saturating_add(GAS_CONTRACT_CREATION);
     }
     for &byte in data {
         if byte == 0 {
-            gas += GAS_PER_ZERO_BYTE;
+            gas = gas.saturating_add(GAS_PER_ZERO_BYTE);
         } else {
-            gas += GAS_PER_NONZERO_BYTE;
+            gas = gas.saturating_add(GAS_PER_NONZERO_BYTE);
         }
     }
     if let Some(ref list) = access_list {
         for item in list {
-            gas += ACCESS_LIST_ADDRESS_COST;
-            gas += ACCESS_LIST_STORAGE_KEY_COST * item.storage_keys.len() as u64;
+            gas = gas.saturating_add(ACCESS_LIST_ADDRESS_COST);
+            gas = gas.saturating_add(
+                ACCESS_LIST_STORAGE_KEY_COST.saturating_mul(item.storage_keys.len() as u64),
+            );
         }
     }
     gas

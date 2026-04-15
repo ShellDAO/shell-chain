@@ -126,7 +126,7 @@ impl FinalityState {
         if total_validators <= 1 {
             return 1;
         }
-        (total_validators * 2).div_ceil(3)
+        (total_validators.saturating_mul(2)).div_ceil(3)
     }
 
     /// Last finalized block number.
@@ -221,8 +221,12 @@ impl FinalityState {
                 .ok_or(CryptoError::VerificationFailed)?;
             items.push(VerifyItem {
                 pubkey: pk.as_slice(),
-                message: &messages[i],
-                signature: &sigs[i],
+                message: messages
+                    .get(i)
+                    .unwrap_or_else(|| unreachable!("i < attestations.len() == messages.len()")),
+                signature: sigs
+                    .get(i)
+                    .unwrap_or_else(|| unreachable!("i < attestations.len() == sigs.len()")),
             });
         }
 

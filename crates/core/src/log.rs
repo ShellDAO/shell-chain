@@ -60,7 +60,7 @@ impl Encodable for Log {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -79,14 +79,14 @@ impl Decodable for Log {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut topics = Vec::new();
-        let topics_end = buf.len() - topics_header.payload_length;
+        let topics_end = buf.len().saturating_sub(topics_header.payload_length);
         while buf.len() > topics_end {
             topics.push(ShellHash::decode(buf)?);
         }
 
         let data = Bytes::decode(buf)?;
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,
@@ -110,8 +110,11 @@ impl Log {
             payload_length: topics_payload,
         }
         .length()
-            + topics_payload;
-        self.address.length() + topics_list_len + self.data.length()
+        .saturating_add(topics_payload);
+        self.address
+            .length()
+            .saturating_add(topics_list_len)
+            .saturating_add(self.data.length())
     }
 }
 

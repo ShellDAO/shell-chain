@@ -167,8 +167,10 @@ impl<W: Write> SnapshotWriter<W> {
             .write_all(b"\n")
             .map_err(|e| StorageError::Database(format!("write newline: {e}")))?;
 
-        self.entry_count += 1;
-        self.data_size += (key.len() + value.len()) as u64;
+        self.entry_count = self.entry_count.saturating_add(1);
+        self.data_size = self
+            .data_size
+            .saturating_add((key.len().saturating_add(value.len())) as u64);
         // Feed data into SHA-256 hasher for integrity checksum (F-089).
         self.hasher.update(key);
         self.hasher.update(value);
@@ -284,8 +286,11 @@ impl SnapshotReader {
     /// Read the next entry. Returns None when all entries have been read.
     pub fn next_entry(&mut self) -> Result<Option<SnapshotEntry>, StorageError> {
         while self.current_line < self.lines.len() {
-            let line = &self.lines[self.current_line];
-            self.current_line += 1;
+            let line = self
+                .lines
+                .get(self.current_line)
+                .unwrap_or_else(|| unreachable!("current_line < lines.len() checked above"));
+            self.current_line = self.current_line.saturating_add(1);
 
             // Skip metadata line and empty lines
             if line.starts_with("META:") || line.is_empty() {

@@ -66,7 +66,7 @@ impl DilithiumSigner {
     fn secret_key(&self) -> dilithium3::SecretKey {
         // Safe: bytes were validated at construction time
         dilithium3::SecretKey::from_bytes(&self.secret_key_bytes)
-            .expect("secret key bytes validated at construction")
+            .unwrap_or_else(|_| unreachable!("secret key bytes validated at construction"))
     }
 }
 

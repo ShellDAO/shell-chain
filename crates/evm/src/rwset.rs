@@ -228,7 +228,7 @@ fn decode_erc20_transfer_recipient(data: &[u8]) -> Option<Address> {
         return None;
     }
 
-    Address::try_from_slice(&data[16..36]).ok()
+    Address::try_from_slice(data.get(16..36).unwrap_or_default()).ok()
 }
 
 #[cfg(test)]

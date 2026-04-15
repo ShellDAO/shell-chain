@@ -273,12 +273,22 @@ fn encode_validate_transaction_calldata(
     signature: &[u8],
     pubkey: &[u8],
 ) -> Vec<u8> {
-    let sig_offset = 32 * 3;
-    let sig_len = 32 + padded_len(signature.len());
-    let pubkey_offset = sig_offset + sig_len;
+    let sig_offset: usize = 32usize.saturating_mul(3);
+    let sig_len = 32usize.saturating_add(padded_len(signature.len()));
+    let pubkey_offset = sig_offset.saturating_add(sig_len);
 
-    let mut out = Vec::with_capacity(4 + 32 * 3 + sig_len + 32 + padded_len(pubkey.len()));
-    out.extend_from_slice(&keccak256(VALIDATE_TRANSACTION_SIGNATURE).as_bytes()[..4]);
+    let capacity = 4usize
+        .saturating_add(32usize.saturating_mul(3))
+        .saturating_add(sig_len)
+        .saturating_add(32)
+        .saturating_add(padded_len(pubkey.len()));
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(
+        keccak256(VALIDATE_TRANSACTION_SIGNATURE)
+            .as_bytes()
+            .get(..4)
+            .unwrap_or_else(|| unreachable!("keccak256 is 32 bytes")),
+    );
     out.extend_from_slice(tx_hash.as_bytes());
     out.extend_from_slice(&abi_word(sig_offset as u64));
     out.extend_from_slice(&abi_word(pubkey_offset as u64));
@@ -290,9 +300,9 @@ fn encode_validate_transaction_calldata(
 fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&abi_word(bytes.len() as u64));
     out.extend_from_slice(bytes);
-    let padding = padded_len(bytes.len()) - bytes.len();
+    let padding = padded_len(bytes.len()).saturating_sub(bytes.len());
     if padding > 0 {
-        out.resize(out.len() + padding, 0);
+        out.resize(out.len().saturating_add(padding), 0);
     }
 }
 
@@ -309,8 +319,10 @@ fn padded_len(len: usize) -> usize {
 fn is_magic_valid(output: &[u8]) -> bool {
     output == [0x01]
         || (output.len() == 32
-            && ((output[31] == 1 && output[..31].iter().all(|b| *b == 0))
-                || (output[0] == 1 && output[1..].iter().all(|b| *b == 0))))
+            && ((output.last().copied().unwrap_or(0) == 1
+                && output.get(..31).map(|s| s.iter().all(|b| *b == 0)).unwrap_or(false))
+                || (output.first().copied().unwrap_or(0) == 1
+                    && output.get(1..).map(|s| s.iter().all(|b| *b == 0)).unwrap_or(false))))
 }
 
 struct ValidationStateDb<S: KvStore + 'static> {

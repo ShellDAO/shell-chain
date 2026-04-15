@@ -62,9 +62,17 @@ impl TxConflictGraph {
         let mut conflicts = Vec::new();
 
         for left in 0..rwsets.len() {
-            for right in (left + 1)..rwsets.len() {
-                if let Some(conflict) = detect_conflict(left, right, &rwsets[left], &rwsets[right])
-                {
+            for right in (left.saturating_add(1))..rwsets.len() {
+                if let Some(conflict) = detect_conflict(
+                    left,
+                    right,
+                    rwsets
+                        .get(left)
+                        .unwrap_or_else(|| unreachable!("left < rwsets.len()")),
+                    rwsets
+                        .get(right)
+                        .unwrap_or_else(|| unreachable!("right < rwsets.len()")),
+                ) {
                     conflicts.push(conflict);
                 }
             }
@@ -211,7 +219,7 @@ impl ParallelScheduler {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count)
             .build()
-            .expect("thread pool creation should succeed");
+            .unwrap_or_else(|_| unreachable!("thread pool creation should succeed"));
 
         let mut outputs = Vec::new();
         for wave in &plan.waves {
@@ -219,7 +227,12 @@ impl ParallelScheduler {
                 let wave_results = pool.install(|| {
                     wave.tx_indices
                         .par_iter()
-                        .map(|index| execute_tx(&txs[*index]))
+                        .map(|index| {
+                            execute_tx(
+                                txs.get(*index)
+                                    .unwrap_or_else(|| unreachable!("index < txs.len()")),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 });
                 for result in wave_results {
@@ -227,7 +240,10 @@ impl ParallelScheduler {
                 }
             } else {
                 for index in &wave.tx_indices {
-                    outputs.push(execute_tx(&txs[*index])?);
+                    outputs.push(execute_tx(
+                        txs.get(*index)
+                            .unwrap_or_else(|| unreachable!("index < txs.len()")),
+                    )?);
                 }
             }
         }
@@ -258,8 +274,8 @@ impl ConflictMetric {
 
     /// Record one conflict event involving `reexecuted` additional transactions.
     pub fn record_conflict(&mut self, reexecuted: usize) {
-        self.total_conflicts += 1;
-        self.reexecuted_txs += reexecuted;
+        self.total_conflicts = self.total_conflicts.saturating_add(1);
+        self.reexecuted_txs = self.reexecuted_txs.saturating_add(reexecuted);
     }
 
     /// Compute `conflict_ratio` given `total_txs` processed in the batch.

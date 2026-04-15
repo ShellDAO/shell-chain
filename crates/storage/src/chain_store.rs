@@ -30,7 +30,7 @@ pub const MAX_ADDRESS_TX_HISTORY_OFFSET: usize = 10_000;
 
 /// Encode a value to RLP with a version prefix byte.
 fn encode_rlp<T: Encodable>(value: &T) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + value.length());
+    let mut buf = Vec::with_capacity(1usize.saturating_add(value.length()));
     buf.push(format_version::RLP);
     value.encode(&mut buf);
     buf
@@ -43,7 +43,11 @@ fn encode_rlp_list<T: Encodable>(items: &[T]) -> Vec<u8> {
         list: true,
         payload_length: payload,
     };
-    let mut buf = Vec::with_capacity(1 + header.length() + payload);
+    let mut buf = Vec::with_capacity(
+        1usize
+            .saturating_add(header.length())
+            .saturating_add(payload),
+    );
     buf.push(format_version::RLP);
     header.encode(&mut buf);
     for item in items {
@@ -64,12 +68,18 @@ fn decode_versioned<T: Decodable + serde::de::DeserializeOwned>(
     if data.is_empty() {
         return Err(StorageError::Codec("empty data".into()));
     }
-    match data[0] {
+    match data.first().copied().unwrap_or(0) {
         format_version::RLP => {
-            T::decode(&mut &data[1..]).map_err(|e| StorageError::Codec(format!("RLP decode: {e}")))
+            let rest = data
+                .get(1..)
+                .unwrap_or_else(|| unreachable!("data checked non-empty above"));
+            T::decode(&mut &*rest).map_err(|e| StorageError::Codec(format!("RLP decode: {e}")))
         }
         format_version::JSON => {
-            serde_json::from_slice(&data[1..]).map_err(|e| StorageError::Codec(e.to_string()))
+            let rest = data
+                .get(1..)
+                .unwrap_or_else(|| unreachable!("data checked non-empty above"));
+            serde_json::from_slice(rest).map_err(|e| StorageError::Codec(e.to_string()))
         }
         // Legacy data without version prefix — fall back to JSON.
         _ => serde_json::from_slice(data).map_err(|e| StorageError::Codec(e.to_string())),
@@ -352,10 +362,14 @@ impl<S: KvStore> ChainStore<S> {
                 if data.len() != 36 {
                     return Err(StorageError::Codec("invalid tx index entry".into()));
                 }
-                let block_hash = ShellHash::try_from_slice(&data[..32])
-                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                let block_hash = ShellHash::try_from_slice(
+                    data.get(..32)
+                        .unwrap_or_else(|| unreachable!("data.len() == 36 checked above")),
+                )
+                .map_err(|e| StorageError::Codec(e.to_string()))?;
                 let tx_idx = u32::from_be_bytes(
-                    data[32..36]
+                    data.get(32..36)
+                        .unwrap_or_else(|| unreachable!("data.len() == 36 checked above"))
                         .try_into()
                         .map_err(|_| StorageError::Codec("invalid tx index byte length".into()))?,
                 );
@@ -395,10 +409,12 @@ impl<S: KvStore> ChainStore<S> {
         let mut matched = 0usize;
         for (key, value) in &entries {
             // key layout: "a/" (2) + addr (20) + block_number (8) + tx_index (4) = 34
-            if key.len() < prefix.len() + 12 {
+            if key.len() < prefix.len().saturating_add(12) {
                 continue;
             }
-            let block_bytes: [u8; 8] = key[prefix.len()..prefix.len() + 8]
+            let block_bytes: [u8; 8] = key
+                .get(prefix.len()..prefix.len().saturating_add(8))
+                .unwrap_or_else(|| unreachable!("key length validated above"))
                 .try_into()
                 .map_err(|_| StorageError::Codec("invalid addr index key".into()))?;
             let block_number = u64::from_be_bytes(block_bytes);
@@ -407,14 +423,14 @@ impl<S: KvStore> ChainStore<S> {
             }
             if value.len() == 32 {
                 if matched < offset {
-                    matched += 1;
+                    matched = matched.saturating_add(1);
                     continue;
                 }
 
                 let hash = ShellHash::try_from_slice(value)
                     .map_err(|e| StorageError::Codec(e.to_string()))?;
                 tx_hashes.push(hash);
-                matched += 1;
+                matched = matched.saturating_add(1);
                 if tx_hashes.len() == limit {
                     break;
                 }
@@ -518,7 +534,7 @@ impl<S: KvStore> ChainStore<S> {
         let mut count = 0u64;
         while let Some(entry) = snap_reader.next_entry()? {
             batch.put(entry.key, entry.value);
-            count += 1;
+            count = count.saturating_add(1);
 
             // Flush in batches of 10000 to avoid excessive memory use
             if count.is_multiple_of(10_000) {
@@ -586,7 +602,7 @@ impl<S: KvStore> ChainStore<S> {
     /// Increment the total transaction count by `delta` and persist.
     pub fn increment_tx_count(&self, delta: u64) -> Result<u64, StorageError> {
         let current = self.get_total_tx_count()?;
-        let new_count = current + delta;
+        let new_count = current.saturating_add(delta);
         self.set_total_tx_count(new_count)?;
         Ok(new_count)
     }

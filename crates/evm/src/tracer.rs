@@ -84,19 +84,22 @@ pub fn decode_revert_reason(output: &[u8]) -> Option<String> {
         return None;
     }
     // Check for Error(string) selector: 0x08c379a0
-    if output[0..4] != [0x08, 0xc3, 0x79, 0xa0] {
+    if output.get(0..4) != Some(&[0x08, 0xc3, 0x79, 0xa0]) {
         return None;
     }
     // Read string length from offset 36..68
-    let len_bytes = &output[36..68];
-    let len =
-        u32::from_be_bytes([len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
+    let len_bytes = output.get(36..68)?;
+    let b28 = len_bytes.get(28).copied().unwrap_or(0);
+    let b29 = len_bytes.get(29).copied().unwrap_or(0);
+    let b30 = len_bytes.get(30).copied().unwrap_or(0);
+    let b31 = len_bytes.get(31).copied().unwrap_or(0);
+    let len = u32::from_be_bytes([b28, b29, b30, b31]) as usize;
 
-    if output.len() < 68 + len {
+    if output.len() < 68usize.saturating_add(len) {
         return None;
     }
 
-    String::from_utf8(output[68..68 + len].to_vec()).ok()
+    String::from_utf8(output.get(68..68usize.saturating_add(len))?.to_vec()).ok()
 }
 
 #[cfg(test)]

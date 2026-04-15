@@ -223,23 +223,33 @@ fn parse_pq_verify_input(data: &[u8]) -> Option<PqVerifyInput<'_>> {
     }
 
     // Read pubkey
-    let pk_len = u32::from_be_bytes(data[0..4].try_into().ok()?) as usize;
-    let pk_end = 4 + pk_len;
-    if data.len() < pk_end + 4 {
+    let pk_len = u32::from_be_bytes(
+        data.get(0..4)
+            .unwrap_or_else(|| unreachable!("data.len() >= 8 checked above"))
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let pk_end = 4usize.saturating_add(pk_len);
+    if data.len() < pk_end.saturating_add(4) {
         return None;
     }
-    let pubkey = &data[4..pk_end];
+    let pubkey = data.get(4..pk_end)?;
 
     // Read message
-    let msg_len = u32::from_be_bytes(data[pk_end..pk_end + 4].try_into().ok()?) as usize;
-    let msg_end = pk_end + 4 + msg_len;
+    let msg_len = u32::from_be_bytes(
+        data.get(pk_end..pk_end.saturating_add(4))
+            .unwrap_or_else(|| unreachable!("data.len() >= pk_end + 4 checked above"))
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let msg_end = pk_end.saturating_add(4).saturating_add(msg_len);
     if data.len() < msg_end {
         return None;
     }
-    let message = &data[pk_end + 4..msg_end];
+    let message = data.get(pk_end.saturating_add(4)..msg_end)?;
 
     // Remaining = signature
-    let signature = &data[msg_end..];
+    let signature = data.get(msg_end..)?;
     if signature.is_empty() {
         return None;
     }

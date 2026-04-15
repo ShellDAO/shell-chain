@@ -49,8 +49,17 @@ impl<S: KvStore + 'static> WorldState<S> {
 
     /// Create a new empty world state with the given account cache size in MiB.
     pub fn new_with_cache_mb(store: Arc<S>, cache_mb: usize) -> Self {
-        let cap = NonZeroUsize::new(cache_mb * 1024 * 1024 / ACCOUNT_SIZE_BYTES)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS).unwrap());
+        let cap = NonZeroUsize::new(
+            cache_mb
+                .saturating_mul(1024)
+                .saturating_mul(1024)
+                .checked_div(ACCOUNT_SIZE_BYTES)
+                .unwrap_or(1),
+        )
+        .unwrap_or_else(|| {
+            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS)
+                .unwrap_or_else(|| unreachable!("DEFAULT_CACHE_CAPACITY_ACCOUNTS > 0"))
+        });
         Self {
             account_trie: MerkleTrie::new(Arc::clone(&store)),
             store,
@@ -70,8 +79,17 @@ impl<S: KvStore + 'static> WorldState<S> {
         cache_mb: usize,
     ) -> Result<Self, StorageError> {
         let trie = MerkleTrie::at_root(Arc::clone(&store), state_root.as_bytes())?;
-        let cap = NonZeroUsize::new(cache_mb * 1024 * 1024 / ACCOUNT_SIZE_BYTES)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS).unwrap());
+        let cap = NonZeroUsize::new(
+            cache_mb
+                .saturating_mul(1024)
+                .saturating_mul(1024)
+                .checked_div(ACCOUNT_SIZE_BYTES)
+                .unwrap_or(1),
+        )
+        .unwrap_or_else(|| {
+            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS)
+                .unwrap_or_else(|| unreachable!("DEFAULT_CACHE_CAPACITY_ACCOUNTS > 0"))
+        });
         Ok(Self {
             account_trie: trie,
             store,
@@ -86,7 +104,10 @@ impl<S: KvStore + 'static> WorldState<S> {
     pub fn snapshot(&mut self) -> Result<Self, StorageError> {
         let root = self.state_root()?;
         let cap = self.account_cache.lock().cap();
-        let cap_mb = (cap.get() * ACCOUNT_SIZE_BYTES).div_ceil(1024 * 1024);
+        let cap_mb = cap
+            .get()
+            .saturating_mul(ACCOUNT_SIZE_BYTES)
+            .div_ceil(1_048_576);
         Self::at_root_with_cache_mb(Arc::clone(&self.store), &root, cap_mb.max(1))
     }
 
@@ -164,7 +185,7 @@ impl<S: KvStore + 'static> WorldState<S> {
         if account.balance < amount {
             return Err(StorageError::State("insufficient balance".into()));
         }
-        account.balance -= amount;
+        account.balance = account.balance.saturating_sub(amount);
         self.set_account(address, &account)
     }
 

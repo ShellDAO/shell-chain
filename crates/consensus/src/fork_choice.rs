@@ -202,10 +202,10 @@ impl ForkChoice {
     pub fn chain_between(&self, from_hash: &ShellHash, to_hash: &ShellHash) -> Vec<ShellHash> {
         let mut chain = Vec::new();
         let mut current = *from_hash;
-        let max_depth = self.parent_map.len() + 1;
-        let mut iterations = 0;
+        let max_depth = self.parent_map.len().saturating_add(1);
+        let mut iterations: usize = 0;
         while current != *to_hash {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > max_depth {
                 // Cycle detected or excessively deep chain — bail out.
                 return Vec::new();

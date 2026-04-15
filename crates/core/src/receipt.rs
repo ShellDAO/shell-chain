@@ -44,16 +44,17 @@ impl TransactionReceipt {
             payload_length: logs_payload,
         }
         .length()
-            + logs_payload;
-        self.tx_hash.length()
-            + self.block_number.length()
-            + self.tx_index.length()
-            + self.status.length()
-            + self.gas_used.length()
-            + self.cumulative_gas_used.length()
-            + addr_len
-            + self.logs_bloom.length()
-            + logs_list_len
+        .saturating_add(logs_payload);
+        self.tx_hash
+            .length()
+            .saturating_add(self.block_number.length())
+            .saturating_add(self.tx_index.length())
+            .saturating_add(self.status.length())
+            .saturating_add(self.gas_used.length())
+            .saturating_add(self.cumulative_gas_used.length())
+            .saturating_add(addr_len)
+            .saturating_add(self.logs_bloom.length())
+            .saturating_add(logs_list_len)
     }
 }
 
@@ -96,7 +97,7 @@ impl Encodable for TransactionReceipt {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -133,12 +134,12 @@ impl Decodable for TransactionReceipt {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut logs = Vec::new();
-        let logs_end = buf.len() - logs_header.payload_length;
+        let logs_end = buf.len().saturating_sub(logs_header.payload_length);
         while buf.len() > logs_end {
             logs.push(Log::decode(buf)?);
         }
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,

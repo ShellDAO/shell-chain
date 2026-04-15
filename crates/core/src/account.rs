@@ -85,18 +85,19 @@ impl Encodable for Account {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
 impl Account {
     fn fields_len(&self) -> usize {
-        self.pq_pubkey_hash.length()
-            + self.nonce.length()
-            + self.balance.length()
-            + optional_hash_len(&self.validation_code_hash)
-            + optional_hash_len(&self.code_hash)
-            + self.storage_root.length()
+        self.pq_pubkey_hash
+            .length()
+            .saturating_add(self.nonce.length())
+            .saturating_add(self.balance.length())
+            .saturating_add(optional_hash_len(&self.validation_code_hash))
+            .saturating_add(optional_hash_len(&self.code_hash))
+            .saturating_add(self.storage_root.length())
     }
 }
 
@@ -105,8 +106,10 @@ fn decode_optional_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Option<ShellHash>>
         return Err(alloy_rlp::Error::InputTooShort);
     }
     // 0x80 = RLP encoding of empty bytes → None
-    if buf[0] == 0x80 {
-        *buf = &buf[1..];
+    if buf.first().copied().unwrap_or(0) == 0x80 {
+        *buf = buf
+            .get(1..)
+            .unwrap_or_else(|| unreachable!("buf checked non-empty above"));
         Ok(None)
     } else {
         Ok(Some(ShellHash::decode(buf)?))
@@ -128,7 +131,7 @@ impl Decodable for Account {
         let code_hash = decode_optional_hash(buf)?;
         let storage_root = ShellHash::decode(buf)?;
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,

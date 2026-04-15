@@ -43,14 +43,20 @@ pub fn calculate_base_fee(
     if parent_gas_used == gas_target {
         parent_base_fee
     } else if parent_gas_used > gas_target {
-        let delta = parent_base_fee.saturating_mul(parent_gas_used - gas_target)
-            / gas_target
-            / BASE_FEE_CHANGE_DENOMINATOR;
+        let delta = parent_base_fee
+            .saturating_mul(parent_gas_used.saturating_sub(gas_target))
+            .checked_div(gas_target)
+            .unwrap_or(0)
+            .checked_div(BASE_FEE_CHANGE_DENOMINATOR)
+            .unwrap_or(0);
         parent_base_fee.saturating_add(delta.max(1))
     } else {
-        let delta = parent_base_fee.saturating_mul(gas_target - parent_gas_used)
-            / gas_target
-            / BASE_FEE_CHANGE_DENOMINATOR;
+        let delta = parent_base_fee
+            .saturating_mul(gas_target.saturating_sub(parent_gas_used))
+            .checked_div(gas_target)
+            .unwrap_or(0)
+            .checked_div(BASE_FEE_CHANGE_DENOMINATOR)
+            .unwrap_or(0);
         (parent_base_fee.saturating_sub(delta)).max(1)
     }
 }
@@ -88,20 +94,21 @@ pub fn calc_excess_blob_gas(parent_excess: u64, parent_used: u64) -> u64 {
 ///
 /// Uses Taylor series: sum of factor * numerator^i / (denominator^i * i!)
 fn fake_exponential(factor: u64, numerator: u64, denominator: u64) -> u64 {
-    let mut i: u64 = 1;
+    let mut i: u128 = 1;
     let mut output: u128 = 0;
-    let mut numerator_accum: u128 = factor as u128 * denominator as u128;
-    let factor_128 = factor as u128;
+    let mut numerator_accum: u128 = (factor as u128).saturating_mul(denominator as u128);
     let numerator_128 = numerator as u128;
     let denominator_128 = denominator as u128;
-    let _ = factor_128; // used in numerator_accum init
 
     while numerator_accum > 0 {
-        output += numerator_accum;
-        numerator_accum = numerator_accum * numerator_128 / (denominator_128 * i as u128);
-        i += 1;
+        output = output.saturating_add(numerator_accum);
+        numerator_accum = numerator_accum
+            .saturating_mul(numerator_128)
+            .checked_div(denominator_128.saturating_mul(i))
+            .unwrap_or(0);
+        i = i.saturating_add(1);
     }
-    (output / denominator_128) as u64
+    output.checked_div(denominator_128).unwrap_or(0) as u64
 }
 
 #[cfg(test)]

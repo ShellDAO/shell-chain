@@ -38,8 +38,10 @@ impl Address {
         data[0] = version;
         data[1..].copy_from_slice(self.as_bytes());
 
-        let hrp = Hrp::parse(Self::BECH32_HRP).expect("static bech32 hrp must be valid");
-        bech32::encode::<Bech32m>(hrp, &data).expect("fixed-size address payload must encode")
+        let hrp = Hrp::parse(Self::BECH32_HRP)
+            .unwrap_or_else(|_| unreachable!("static bech32 hrp must be valid"));
+        bech32::encode::<Bech32m>(hrp, &data)
+            .unwrap_or_else(|_| unreachable!("fixed-size address payload must encode"))
     }
 
     pub fn from_bech32m(s: &str) -> Result<(Self, u8), PrimitivesError> {
@@ -64,7 +66,7 @@ impl Address {
 
         let (version, raw_addr) = data
             .split_first()
-            .expect("validated fixed-size bech32 payload");
+            .unwrap_or_else(|| unreachable!("validated fixed-size bech32 payload"));
         Ok((Self::try_from_slice(raw_addr)?, *version))
     }
 

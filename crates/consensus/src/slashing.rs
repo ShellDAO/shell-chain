@@ -142,7 +142,7 @@ pub fn detect_offline(
     if current_block <= last_proposed_block {
         return None;
     }
-    let gap = current_block - last_proposed_block;
+    let gap = current_block.saturating_sub(last_proposed_block);
     if gap <= config.offline_window_blocks {
         return None;
     }

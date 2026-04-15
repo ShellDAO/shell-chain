@@ -191,19 +191,19 @@ fn execute_validator_registry<S: KvStore + 'static>(
     }
 
     let selector = decode_selector(input)?;
-    let params = &input[4..];
+    let params = input.get(4..).unwrap_or_default();
 
     match selector {
         s if s == ADD_VALIDATOR_SELECTOR => {
             let addr = decode_address(params)?;
             add_validator(caller, &addr, world_state)?;
-            let gas = SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(true), gas))
         }
         s if s == REMOVE_VALIDATOR_SELECTOR => {
             let addr = decode_address(params)?;
             remove_validator(caller, &addr, world_state)?;
-            let gas = SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(true), gas))
         }
         s if s == GET_VALIDATORS_SELECTOR => {
@@ -231,7 +231,7 @@ fn execute_account_manager<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
 ) -> Result<SystemContractOutcome, SystemContractError> {
     let selector = decode_selector(input)?;
-    let params = &input[4..];
+    let params = input.get(4..).unwrap_or_default();
     let mut effects = SystemContractEffects::default();
 
     match selector {
@@ -241,7 +241,7 @@ fn execute_account_manager<S: KvStore + 'static>(
             effects.updated_accounts.push(*caller);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
-                gas_used: SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS,
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
                 effects,
             })
         }
@@ -251,7 +251,7 @@ fn execute_account_manager<S: KvStore + 'static>(
             effects.updated_accounts.push(*caller);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
-                gas_used: SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS,
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
                 effects,
             })
         }
@@ -260,7 +260,7 @@ fn execute_account_manager<S: KvStore + 'static>(
             effects.updated_accounts.push(*caller);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
-                gas_used: SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS,
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
                 effects,
             })
         }
@@ -424,7 +424,9 @@ fn decode_selector(input: &[u8]) -> Result<[u8; 4], SystemContractError> {
     if input.len() < 4 {
         return Err(SystemContractError::InputTooShort);
     }
-    input[..4]
+    input
+        .get(..4)
+        .ok_or(SystemContractError::InputTooShort)?
         .try_into()
         .map_err(|_| SystemContractError::InputTooShort)
 }
@@ -436,12 +438,19 @@ fn decode_word_usize(word: &[u8]) -> Result<usize, SystemContractError> {
             word.len()
         )));
     }
-    if word[..24].iter().any(|b| *b != 0) {
+    if word
+        .get(..24)
+        .unwrap_or_else(|| unreachable!("word.len() >= 32 checked above"))
+        .iter()
+        .any(|b| *b != 0)
+    {
         return Err(SystemContractError::AbiDecode(
             "ABI word exceeds usize range".into(),
         ));
     }
-    let tail: [u8; 8] = word[24..32]
+    let tail: [u8; 8] = word
+        .get(24..32)
+        .unwrap_or_else(|| unreachable!("word.len() >= 32 checked above"))
         .try_into()
         .map_err(|e: std::array::TryFromSliceError| {
             SystemContractError::AbiDecode(e.to_string())
@@ -456,8 +465,12 @@ fn decode_hash(input: &[u8]) -> Result<ShellHash, SystemContractError> {
             input.len()
         )));
     }
-    ShellHash::try_from_slice(&input[..32])
-        .map_err(|e| SystemContractError::AbiDecode(e.to_string()))
+    ShellHash::try_from_slice(
+        input
+            .get(..32)
+            .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above")),
+    )
+    .map_err(|e| SystemContractError::AbiDecode(e.to_string()))
 }
 
 fn decode_u8(input: &[u8]) -> Result<u8, SystemContractError> {
@@ -467,12 +480,20 @@ fn decode_u8(input: &[u8]) -> Result<u8, SystemContractError> {
             input.len()
         )));
     }
-    if input[..31].iter().any(|b| *b != 0) {
+    if input
+        .get(..31)
+        .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above"))
+        .iter()
+        .any(|b| *b != 0)
+    {
         return Err(SystemContractError::AbiDecode(
             "uint8 must be right-aligned in ABI word".into(),
         ));
     }
-    Ok(input[31])
+    input
+        .get(31)
+        .copied()
+        .ok_or_else(|| SystemContractError::AbiDecode("uint8 word too short".into()))
 }
 
 fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContractError> {
@@ -483,16 +504,28 @@ fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContrac
         )));
     }
 
-    let offset = decode_word_usize(&input[..32])?;
-    let algo_id = decode_u8(&input[32..64])?;
-    if offset + 32 > input.len() {
+    let offset = decode_word_usize(
+        input
+            .get(..32)
+            .unwrap_or_else(|| unreachable!("input.len() >= 64 checked above")),
+    )?;
+    let algo_id = decode_u8(
+        input
+            .get(32..64)
+            .unwrap_or_else(|| unreachable!("input.len() >= 64 checked above")),
+    )?;
+    if offset.saturating_add(32) > input.len() {
         return Err(SystemContractError::AbiDecode(
             "bytes offset points beyond calldata".into(),
         ));
     }
 
-    let bytes_len = decode_word_usize(&input[offset..offset + 32])?;
-    let data_start = offset + 32;
+    let bytes_len = decode_word_usize(
+        input
+            .get(offset..offset.saturating_add(32))
+            .ok_or_else(|| SystemContractError::AbiDecode("bytes offset out of range".into()))?,
+    )?;
+    let data_start = offset.saturating_add(32);
     let data_end = data_start
         .checked_add(bytes_len)
         .ok_or_else(|| SystemContractError::AbiDecode("bytes length overflow".into()))?;
@@ -502,7 +535,13 @@ fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContrac
         ));
     }
 
-    Ok((input[data_start..data_end].to_vec(), algo_id))
+    Ok((
+        input
+            .get(data_start..data_end)
+            .ok_or_else(|| SystemContractError::AbiDecode("bytes range out of bounds".into()))?
+            .to_vec(),
+        algo_id,
+    ))
 }
 
 /// Decode a single ABI-encoded `address` parameter (32 bytes, left-padded with zeros).
@@ -514,15 +553,21 @@ pub fn decode_address(input: &[u8]) -> Result<Address, SystemContractError> {
         )));
     }
     // ABI: address is right-aligned in 32-byte word (bytes 12..32)
-    Address::try_from_slice(&input[12..32])
-        .map_err(|e| SystemContractError::AbiDecode(e.to_string()))
+    Address::try_from_slice(
+        input
+            .get(12..32)
+            .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above")),
+    )
+    .map_err(|e| SystemContractError::AbiDecode(e.to_string()))
 }
 
 /// ABI-encode a `bool` as a 32-byte word.
 pub fn encode_bool(val: bool) -> Vec<u8> {
     let mut out = vec![0u8; 32];
     if val {
-        out[31] = 1;
+        if let Some(b) = out.get_mut(31) {
+            *b = 1;
+        }
     }
     out
 }
@@ -534,7 +579,7 @@ pub fn encode_bool(val: bool) -> Vec<u8> {
 /// - word 1: array length
 /// - word 2..N+2: each address left-padded to 32 bytes
 pub fn encode_address_array(addrs: &[Address]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + addrs.len() * 32);
+    let mut out = Vec::with_capacity(64usize.saturating_add(addrs.len().saturating_mul(32)));
 
     // Offset to dynamic data
     let mut offset = [0u8; 32];
@@ -573,20 +618,21 @@ pub fn encode_rotate_key_calldata(pubkey: &[u8], algo_id: u8) -> Vec<u8> {
     let padded_len = if pubkey.is_empty() {
         0
     } else {
-        pubkey.len().div_ceil(32) * 32
+        pubkey.len().div_ceil(32).saturating_mul(32)
     };
-    let mut data = Vec::with_capacity(4 + 96 + padded_len);
+    let capacity = 4usize.saturating_add(96).saturating_add(padded_len);
+    let mut data = Vec::with_capacity(capacity);
     data.extend_from_slice(&ROTATE_KEY_SELECTOR);
     data.extend_from_slice(&encode_usize_word(64));
     data.extend_from_slice(&encode_u8_word(algo_id));
     data.extend_from_slice(&encode_usize_word(pubkey.len()));
     data.extend_from_slice(pubkey);
-    data.resize(4 + 96 + padded_len, 0);
+    data.resize(capacity, 0);
     data
 }
 
 pub fn encode_set_validation_code_calldata(code_hash: &ShellHash) -> Vec<u8> {
-    let mut data = Vec::with_capacity(4 + 32);
+    let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&SET_VALIDATION_CODE_SELECTOR);
     data.extend_from_slice(code_hash.as_bytes());
     data
@@ -598,7 +644,7 @@ pub fn encode_clear_validation_code_calldata() -> Vec<u8> {
 
 /// Encode calldata for `addValidator(address)`.
 pub fn encode_add_validator_calldata(address: &Address) -> Vec<u8> {
-    let mut data = Vec::with_capacity(4 + 32);
+    let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&ADD_VALIDATOR_SELECTOR);
     let mut word = [0u8; 32];
     word[12..32].copy_from_slice(address.as_bytes());
@@ -608,7 +654,7 @@ pub fn encode_add_validator_calldata(address: &Address) -> Vec<u8> {
 
 /// Encode calldata for `removeValidator(address)`.
 pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
-    let mut data = Vec::with_capacity(4 + 32);
+    let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&REMOVE_VALIDATOR_SELECTOR);
     let mut word = [0u8; 32];
     word[12..32].copy_from_slice(address.as_bytes());
@@ -620,6 +666,7 @@ pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
 
 /// Minimal const-compatible Keccak-256 used solely for selector computation.
 /// Produces the same output as `sha3::Keccak256`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 const fn const_keccak256(data: &[u8]) -> [u8; 32] {
     // Keccak-256 parameters: rate=136, capacity=64, delimited suffix=0x01
     const RATE: usize = 136;
@@ -657,6 +704,7 @@ const fn const_keccak256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 const fn xor_block(mut state: [u64; 25], block: &[u8; 136]) -> [u64; 25] {
     let mut i = 0;
     while i < 136 / 8 {
@@ -675,6 +723,7 @@ const fn xor_block(mut state: [u64; 25], block: &[u8; 136]) -> [u64; 25] {
     state
 }
 
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 const fn keccak_f1600(mut state: [u64; 25]) -> [u64; 25] {
     const RC: [u64; 24] = [
         0x0000000000000001,

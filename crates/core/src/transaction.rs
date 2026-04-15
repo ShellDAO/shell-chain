@@ -94,7 +94,7 @@ impl Encodable for Transaction {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -127,14 +127,14 @@ impl Transaction {
                             payload_length: keys_payload,
                         }
                         .length()
-                            + keys_payload;
-                        let entry_payload = item.address.length() + keys_list_len;
+                        .saturating_add(keys_payload);
+                        let entry_payload = item.address.length().saturating_add(keys_list_len);
                         alloy_rlp::Header {
                             list: true,
                             payload_length: entry_payload,
                         }
                         .length()
-                            + entry_payload
+                        .saturating_add(entry_payload)
                     })
                     .sum();
                 let header = alloy_rlp::Header {
@@ -149,8 +149,8 @@ impl Transaction {
                         payload_length: keys_payload,
                     }
                     .length()
-                        + keys_payload;
-                    let entry_payload = item.address.length() + keys_list_len;
+                    .saturating_add(keys_payload);
+                    let entry_payload = item.address.length().saturating_add(keys_list_len);
                     let entry_header = alloy_rlp::Header {
                         list: true,
                         payload_length: entry_payload,
@@ -188,14 +188,14 @@ impl Transaction {
                             payload_length: keys_payload,
                         }
                         .length()
-                            + keys_payload;
-                        let entry_payload = item.address.length() + keys_list_len;
+                        .saturating_add(keys_payload);
+                        let entry_payload = item.address.length().saturating_add(keys_list_len);
                         alloy_rlp::Header {
                             list: true,
                             payload_length: entry_payload,
                         }
                         .length()
-                            + entry_payload
+                        .saturating_add(entry_payload)
                     })
                     .sum();
                 alloy_rlp::Header {
@@ -203,7 +203,7 @@ impl Transaction {
                     payload_length: payload,
                 }
                 .length()
-                    + payload
+                .saturating_add(payload)
             }
         }
     }
@@ -214,21 +214,22 @@ impl Transaction {
             None => 1, // RLP encoding of empty bytes
         };
         let blob_fee_len = match &self.max_fee_per_blob_gas {
-            Some(fee) => 1u8.length() + fee.length(),
-            None => 0u8.length() + 0u64.length(),
+            Some(fee) => 1u8.length().saturating_add(fee.length()),
+            None => 0u8.length().saturating_add(0u64.length()),
         };
-        self.chain_id.length()
-            + self.nonce.length()
-            + to_len
-            + self.value.length()
-            + self.data.length()
-            + self.gas_limit.length()
-            + self.max_fee_per_gas.length()
-            + self.max_priority_fee_per_gas.length()
-            + self.access_list_rlp_len()
-            + self.tx_type.length()
-            + blob_fee_len
-            + self.blob_hashes_rlp_len()
+        self.chain_id
+            .length()
+            .saturating_add(self.nonce.length())
+            .saturating_add(to_len)
+            .saturating_add(self.value.length())
+            .saturating_add(self.data.length())
+            .saturating_add(self.gas_limit.length())
+            .saturating_add(self.max_fee_per_gas.length())
+            .saturating_add(self.max_priority_fee_per_gas.length())
+            .saturating_add(self.access_list_rlp_len())
+            .saturating_add(self.tx_type.length())
+            .saturating_add(blob_fee_len)
+            .saturating_add(self.blob_hashes_rlp_len())
     }
 
     /// Validate access list size limits.
@@ -308,7 +309,7 @@ impl Transaction {
                     payload_length: payload,
                 }
                 .length()
-                    + payload
+                .saturating_add(payload)
             }
         }
     }
@@ -448,7 +449,7 @@ impl Encodable for SignedTransaction {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -458,7 +459,11 @@ impl SignedTransaction {
             Some(pk) => pk.as_slice().length(),
             None => 1, // RLP encoding of empty bytes
         };
-        self.from.length() + self.tx.length() + self.signature.length() + pk_len
+        self.from
+            .length()
+            .saturating_add(self.tx.length())
+            .saturating_add(self.signature.length())
+            .saturating_add(pk_len)
     }
 }
 
@@ -503,7 +508,7 @@ impl Decodable for Transaction {
         };
         let blob_versioned_hashes = Self::decode_blob_hashes(buf)?;
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,
@@ -537,7 +542,7 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = buf.len() - header.payload_length;
+        let end = buf.len().saturating_sub(header.payload_length);
         let mut items = Vec::new();
         while buf.len() > end {
             let entry_header = alloy_rlp::Header::decode(buf)?;
@@ -549,7 +554,7 @@ impl Transaction {
             if !keys_header.list {
                 return Err(alloy_rlp::Error::UnexpectedString);
             }
-            let keys_end = buf.len() - keys_header.payload_length;
+            let keys_end = buf.len().saturating_sub(keys_header.payload_length);
             let mut storage_keys = Vec::new();
             while buf.len() > keys_end {
                 storage_keys.push(ShellHash::decode(buf)?);
@@ -570,7 +575,7 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = buf.len() - header.payload_length;
+        let end = buf.len().saturating_sub(header.payload_length);
         let mut hashes = Vec::new();
         while buf.len() > end {
             hashes.push(ShellHash::decode(buf)?);
@@ -599,7 +604,7 @@ impl Decodable for SignedTransaction {
             Some(pk_bytes.to_vec())
         };
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,

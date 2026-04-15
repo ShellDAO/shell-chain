@@ -34,11 +34,23 @@ pub fn logs_bloom(logs: &[Log]) -> Bloom {
 /// `(b0 << 8 | b1) & 0x7FF` (mod 2048), which is set in the filter.
 fn bloom_insert(bloom: &mut Bloom, data: &[u8]) {
     let hash = Keccak256::digest(data);
-    for i in 0..3 {
-        let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
-        let byte_index = bit_index / 8;
-        let bit_position = 7 - (bit_index % 8);
-        bloom[byte_index] |= 1 << bit_position;
+    let hash_bytes: &[u8] = hash.as_ref();
+    for i in 0..3usize {
+        let i2 = i.saturating_mul(2);
+        let b0 = hash_bytes
+            .get(i2)
+            .copied()
+            .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2 < 6"));
+        let b1 = hash_bytes
+            .get(i2.saturating_add(1))
+            .copied()
+            .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2+1 < 6"));
+        let bit_index = ((b0 as usize) << 8 | b1 as usize) & 0x7FF;
+        let byte_index = bit_index.checked_div(8).unwrap_or(0);
+        let bit_position = 7usize.saturating_sub(bit_index.checked_rem(8).unwrap_or(0));
+        if let Some(byte) = bloom.get_mut(byte_index) {
+            *byte |= 1u8 << bit_position;
+        }
     }
 }
 
@@ -49,11 +61,25 @@ fn bloom_insert(bloom: &mut Bloom, data: &[u8]) {
 /// A `false` result is definitive — the item was never inserted.
 pub fn bloom_contains(bloom: &Bloom, data: &[u8]) -> bool {
     let hash = Keccak256::digest(data);
-    for i in 0..3 {
-        let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
-        let byte_index = bit_index / 8;
-        let bit_position = 7 - (bit_index % 8);
-        if bloom[byte_index] & (1 << bit_position) == 0 {
+    let hash_bytes: &[u8] = hash.as_ref();
+    for i in 0..3usize {
+        let i2 = i.saturating_mul(2);
+        let b0 = hash_bytes
+            .get(i2)
+            .copied()
+            .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2 < 6"));
+        let b1 = hash_bytes
+            .get(i2.saturating_add(1))
+            .copied()
+            .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2+1 < 6"));
+        let bit_index = ((b0 as usize) << 8 | b1 as usize) & 0x7FF;
+        let byte_index = bit_index.checked_div(8).unwrap_or(0);
+        let bit_position = 7usize.saturating_sub(bit_index.checked_rem(8).unwrap_or(0));
+        if bloom
+            .get(byte_index)
+            .map(|b| b & (1u8 << bit_position) == 0)
+            .unwrap_or(true)
+        {
             return false;
         }
     }
@@ -67,7 +93,9 @@ pub fn bloom_union(blooms: &[Bloom]) -> Bloom {
     let mut result = [0u8; BLOOM_SIZE];
     for b in blooms {
         for (i, byte) in b.iter().enumerate() {
-            result[i] |= byte;
+            if let Some(r) = result.get_mut(i) {
+                *r |= byte;
+            }
         }
     }
     result

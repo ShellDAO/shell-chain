@@ -65,7 +65,7 @@ impl SphincsSigner {
 
     fn secret_key(&self) -> sphincssha2256fsimple::SecretKey {
         sphincssha2256fsimple::SecretKey::from_bytes(&self.secret_key_bytes)
-            .expect("secret key bytes validated at construction")
+            .unwrap_or_else(|_| unreachable!("secret key bytes validated at construction"))
     }
 }
 

@@ -194,26 +194,38 @@ impl ValidatorSet {
     /// occur in a live network).
     pub fn weighted_proposer(&self, block_number: u64) -> Option<Address> {
         let active = self.active_validators();
-        if active.is_empty() {
+        let n = active.len();
+        if n == 0 {
             return None;
         }
 
         let total: u64 = active.iter().map(|v| v.weight).sum();
         if total == 0 {
             // Fallback: plain round-robin when all weights are 0.
-            return Some(active[block_number as usize % active.len()].address);
+            let idx = (block_number as usize).checked_rem(n).unwrap_or(0);
+            return Some(
+                active
+                    .get(idx)
+                    .unwrap_or_else(|| unreachable!("idx < n"))
+                    .address,
+            );
         }
 
-        let slot = block_number % total;
+        let slot = block_number.checked_rem(total).unwrap_or(0);
         let mut cumulative: u64 = 0;
         for v in &active {
-            cumulative += v.weight;
+            cumulative = cumulative.saturating_add(v.weight);
             if slot < cumulative {
                 return Some(v.address);
             }
         }
         // Unreachable: slot < total means we always find a validator.
-        Some(active.last().unwrap().address)
+        Some(
+            active
+                .last()
+                .unwrap_or_else(|| unreachable!("active.is_empty() checked above"))
+                .address,
+        )
     }
 
     // ── Lifecycle mutations ───────────────────────────────────────────────
@@ -302,7 +314,7 @@ impl ValidatorSet {
                 "{address} is not active"
             )));
         }
-        let exit_epoch = current_epoch + self.config.exit_cooldown_epochs;
+        let exit_epoch = current_epoch.saturating_add(self.config.exit_cooldown_epochs);
         info.status = ValidatorStatus::Exiting { exit_epoch };
         Ok(())
     }

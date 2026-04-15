@@ -46,7 +46,7 @@ impl PoaConfig {
         if self.epoch_length == 0 {
             return 0;
         }
-        block_number / self.epoch_length
+        block_number.checked_div(self.epoch_length).unwrap_or(0)
     }
 
     /// Returns true if `block_number` is the first block of a new epoch.
@@ -59,12 +59,23 @@ impl PoaConfig {
 
     /// Return the expected proposer for a given block number.
     pub fn proposer_for_block(&self, block_number: u64) -> Address {
+        let n = self.authorities.len();
+        if n == 0 {
+            // SAFETY: set_authorities ensures the authority set is non-empty.
+            // This branch is unreachable in normal operation.
+            return Address::default();
+        }
         let idx = if self.epoch_length > 0 {
-            (block_number % self.epoch_length) as usize % self.authorities.len()
+            (block_number.checked_rem(self.epoch_length).unwrap_or(0) as usize)
+                .checked_rem(n)
+                .unwrap_or(0)
         } else {
-            block_number as usize % self.authorities.len()
+            (block_number as usize).checked_rem(n).unwrap_or(0)
         };
-        self.authorities[idx]
+        self.authorities
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| unreachable!("idx < authorities.len()"))
     }
 
     pub fn is_authority(&self, address: &Address) -> bool {
@@ -125,7 +136,7 @@ impl PoaEngine {
         current_time: u64,
     ) -> Result<(), ConsensusError> {
         // F-011: Reject blocks with timestamps too far in the future
-        let max_allowed = current_time + self.config.max_future_secs;
+        let max_allowed = current_time.saturating_add(self.config.max_future_secs);
         if header.timestamp > max_allowed {
             return Err(ConsensusError::InvalidTimestamp(format!(
                 "block {} timestamp {} exceeds current_time {} + max_future {}",
@@ -134,13 +145,13 @@ impl PoaEngine {
         }
 
         if let Some(parent) = parent {
-            if header.timestamp < parent.timestamp + self.config.block_time_secs {
+            if header.timestamp < parent.timestamp.saturating_add(self.config.block_time_secs) {
                 return Err(ConsensusError::InvalidTimestamp(format!(
                     "block {} timestamp {} < parent {} + block_time {}",
                     header.number, header.timestamp, parent.timestamp, self.config.block_time_secs,
                 )));
             }
-            if header.number != parent.number + 1 {
+            if header.number != parent.number.saturating_add(1) {
                 return Err(ConsensusError::InvalidTimestamp(format!(
                     "block number {} != parent {} + 1",
                     header.number, parent.number,

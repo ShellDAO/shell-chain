@@ -150,7 +150,9 @@ impl StatePruner {
         let highest_block = self.block_roots.keys().next_back().copied().unwrap_or(0);
 
         // Retention floor: keep exactly `retention_count` most recent blocks.
-        let retention_cutoff = (highest_block + 1).saturating_sub(self.retention_count);
+        let retention_cutoff = highest_block
+            .saturating_add(1)
+            .saturating_sub(self.retention_count);
 
         // Effective cutoff: the stricter of prunable_below and retention_cutoff.
         let cutoff = self.prunable_below.min(retention_cutoff);
@@ -166,7 +168,7 @@ impl StatePruner {
             let root = self.block_roots.get(block_number).cloned();
             if let Some(ref r) = root {
                 if self.active_roots.contains(r) {
-                    protected_count += 1;
+                    protected_count = protected_count.saturating_add(1);
                     continue;
                 }
             }
@@ -174,7 +176,7 @@ impl StatePruner {
             // Build the canonical mapping key: b"n/" ++ block_number (big-endian).
             let key = [CANONICAL_PREFIX, &block_number.to_be_bytes()].concat();
             batch.delete(key);
-            pruned_count += 1;
+            pruned_count = pruned_count.saturating_add(1);
         }
 
         if !batch.is_empty() {

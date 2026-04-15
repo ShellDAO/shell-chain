@@ -1,0 +1,3213 @@
+warning: used `expect()` on a `Result` value
+  --> crates/primitives/src/address.rs:41:19
+   |
+41 |         let hrp = Hrp::parse(Self::BECH32_HRP).expect("static bech32 hrp must be valid");
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+   = note: requested on the command line with `-W clippy::expect-used`
+
+warning: used `expect()` on a `Result` value
+  --> crates/primitives/src/address.rs:42:9
+   |
+42 |         bech32::encode::<Bech32m>(hrp, &data).expect("fixed-size address payload must encode")
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on an `Option` value
+  --> crates/primitives/src/address.rs:65:35
+   |
+65 |           let (version, raw_addr) = data
+   |  ___________________________________^
+66 | |             .split_first()
+67 | |             .expect("validated fixed-size bech32 payload");
+   | |__________________________________________________________^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: `shell-primitives` (lib) generated 3 warnings
+warning: used `expect()` on a `Result` value
+  --> crates/crypto/src/dilithium.rs:68:9
+   |
+68 | /         dilithium3::SecretKey::from_bytes(&self.secret_key_bytes)
+69 | |             .expect("secret key bytes validated at construction")
+   | |_________________________________________________________________^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+   = note: requested on the command line with `-W clippy::expect-used`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/crypto/src/signature.rs:108:9
+    |
+108 | /         alloy_rlp::Header {
+109 | |             list: true,
+110 | |             payload_length: payload,
+...   |
+113 | |             + payload
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: slicing may panic
+   --> crates/crypto/src/signature.rs:125:28
+    |
+125 |         let mut payload = &buf[..header.payload_length];
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: slicing may panic
+   --> crates/crypto/src/signature.rs:130:17
+    |
+130 |         *buf = &buf[header.payload_length..];
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/crypto/src/signature.rs:141:9
+    |
+141 |         self.sig_type.as_u8().length() + self.data.as_slice().length()
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `expect()` on a `Result` value
+  --> crates/crypto/src/sphincs.rs:67:9
+   |
+67 | /         sphincssha2256fsimple::SecretKey::from_bytes(&self.secret_key_bytes)
+68 | |             .expect("secret key bytes validated at construction")
+   | |_________________________________________________________________^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: `shell-crypto` (lib) generated 6 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/account.rs:83:9
+   |
+83 | /         alloy_rlp::Header {
+84 | |             list: true,
+85 | |             payload_length: payload,
+...  |
+88 | |             + payload
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+   = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/account.rs:94:9
+   |
+94 | /         self.pq_pubkey_hash.length()
+95 | |             + self.nonce.length()
+96 | |             + self.balance.length()
+97 | |             + optional_hash_len(&self.validation_code_hash)
+98 | |             + optional_hash_len(&self.code_hash)
+99 | |             + self.storage_root.length()
+   | |________________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/core/src/account.rs:108:8
+    |
+108 |     if buf[0] == 0x80 {
+    |        ^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: slicing may panic
+   --> crates/core/src/account.rs:109:17
+    |
+109 |         *buf = &buf[1..];
+    |                 ^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/account.rs:131:24
+    |
+131 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/block.rs:74:9
+   |
+74 | /         alloy_rlp::Header {
+75 | |             list: true,
+76 | |             payload_length: payload,
+...  |
+79 | |             + payload
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:89:9
+    |
+ 89 | /         self.parent_hash.length()
+ 90 | |             + self.state_root.length()
+ 91 | |             + self.transactions_root.length()
+ 92 | |             + self.receipts_root.length()
+...   |
+104 | |             + self.blob_gas_used.length()
+105 | |             + self.excess_blob_gas.length()
+    | |___________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:145:28
+    |
+145 |           let txs_list_len = alloy_rlp::Header {
+    |  ____________________________^
+146 | |             list: true,
+147 | |             payload_length: txs_payload,
+...   |
+150 | |             + txs_payload;
+    | |_________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:155:9
+    |
+155 |         self.header.length() + txs_list_len + seal_len
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:193:24
+    |
+193 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:252:9
+    |
+252 | /         alloy_rlp::Header {
+253 | |             list: true,
+254 | |             payload_length: payload,
+...   |
+257 | |             + payload
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:268:19
+    |
+268 |         let end = remaining - header.payload_length;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:278:23
+    |
+278 |         let txs_end = buf.len() - txs_header.payload_length;
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/core/src/block.rs:284:51
+    |
+284 |         let proposer_seal = if buf.len() > end && buf[0] == 0x80 {
+    |                                                   ^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/block.rs:293:24
+    |
+293 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/fee.rs:46:21
+   |
+46 |           let delta = parent_base_fee.saturating_mul(parent_gas_used - gas_target)
+   |  _____________________^
+47 | |             / gas_target
+   | |________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/fee.rs:51:21
+   |
+51 |           let delta = parent_base_fee.saturating_mul(gas_target - parent_gas_used)
+   |  _____________________^
+52 | |             / gas_target
+   | |________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/fee.rs:93:37
+   |
+93 |     let mut numerator_accum: u128 = factor as u128 * denominator as u128;
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/fee.rs:100:9
+    |
+100 |         output += numerator_accum;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/fee.rs:101:27
+    |
+101 |         numerator_accum = numerator_accum * numerator_128 / (denominator_128 * i as u128);
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/fee.rs:102:9
+    |
+102 |         i += 1;
+    |         ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/fee.rs:104:5
+    |
+104 |     (output / denominator_128) as u64
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/log.rs:58:9
+   |
+58 | /         alloy_rlp::Header {
+59 | |             list: true,
+60 | |             payload_length: payload,
+...  |
+63 | |             + payload
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/log.rs:82:26
+   |
+82 |         let topics_end = buf.len() - topics_header.payload_length;
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/log.rs:89:24
+   |
+89 |         let consumed = remaining - buf.len();
+   |                        ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/log.rs:108:31
+    |
+108 |           let topics_list_len = alloy_rlp::Header {
+    |  _______________________________^
+109 | |             list: true,
+110 | |             payload_length: topics_payload,
+...   |
+113 | |             + topics_payload;
+    | |____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/log.rs:114:9
+    |
+114 |         self.address.length() + topics_list_len + self.data.length()
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/receipt.rs:42:29
+   |
+42 |           let logs_list_len = alloy_rlp::Header {
+   |  _____________________________^
+43 | |             list: true,
+44 | |             payload_length: logs_payload,
+...  |
+47 | |             + logs_payload;
+   | |__________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/receipt.rs:48:9
+   |
+48 | /         self.tx_hash.length()
+49 | |             + self.block_number.length()
+50 | |             + self.tx_index.length()
+51 | |             + self.status.length()
+...  |
+55 | |             + self.logs_bloom.length()
+56 | |             + logs_list_len
+   | |___________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/receipt.rs:94:9
+   |
+94 | /         alloy_rlp::Header {
+95 | |             list: true,
+96 | |             payload_length: payload,
+...  |
+99 | |             + payload
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/receipt.rs:136:24
+    |
+136 |         let logs_end = buf.len() - logs_header.payload_length;
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/receipt.rs:141:24
+    |
+141 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/core/src/transaction.rs:92:9
+   |
+92 | /         alloy_rlp::Header {
+93 | |             list: true,
+94 | |             payload_length: payload,
+...  |
+97 | |             + payload
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:125:45
+    |
+125 |                           let keys_list_len = alloy_rlp::Header {
+    |  _____________________________________________^
+126 | |                             list: true,
+127 | |                             payload_length: keys_payload,
+...   |
+130 | |                             + keys_payload;
+    | |__________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:131:45
+    |
+131 |                         let entry_payload = item.address.length() + keys_list_len;
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:132:25
+    |
+132 | /                         alloy_rlp::Header {
+133 | |                             list: true,
+134 | |                             payload_length: entry_payload,
+...   |
+137 | |                             + entry_payload
+    | |___________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:147:41
+    |
+147 |                       let keys_list_len = alloy_rlp::Header {
+    |  _________________________________________^
+148 | |                         list: true,
+149 | |                         payload_length: keys_payload,
+...   |
+152 | |                         + keys_payload;
+    | |______________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:153:41
+    |
+153 |                     let entry_payload = item.address.length() + keys_list_len;
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:186:45
+    |
+186 |                           let keys_list_len = alloy_rlp::Header {
+    |  _____________________________________________^
+187 | |                             list: true,
+188 | |                             payload_length: keys_payload,
+...   |
+191 | |                             + keys_payload;
+    | |__________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:192:45
+    |
+192 |                         let entry_payload = item.address.length() + keys_list_len;
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:193:25
+    |
+193 | /                         alloy_rlp::Header {
+194 | |                             list: true,
+195 | |                             payload_length: entry_payload,
+...   |
+198 | |                             + entry_payload
+    | |___________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:201:17
+    |
+201 | /                 alloy_rlp::Header {
+202 | |                     list: true,
+203 | |                     payload_length: payload,
+...   |
+206 | |                     + payload
+    | |_____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:217:26
+    |
+217 |             Some(fee) => 1u8.length() + fee.length(),
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:218:21
+    |
+218 |             None => 0u8.length() + 0u64.length(),
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:220:9
+    |
+220 | /         self.chain_id.length()
+221 | |             + self.nonce.length()
+222 | |             + to_len
+223 | |             + self.value.length()
+...   |
+230 | |             + blob_fee_len
+231 | |             + self.blob_hashes_rlp_len()
+    | |________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:306:17
+    |
+306 | /                 alloy_rlp::Header {
+307 | |                     list: true,
+308 | |                     payload_length: payload,
+...   |
+311 | |                     + payload
+    | |_____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:446:9
+    |
+446 | /         alloy_rlp::Header {
+447 | |             list: true,
+448 | |             payload_length: payload,
+...   |
+451 | |             + payload
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:461:9
+    |
+461 |         self.from.length() + self.tx.length() + self.signature.length() + pk_len
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:506:24
+    |
+506 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:540:19
+    |
+540 |         let end = buf.len() - header.payload_length;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:552:28
+    |
+552 |             let keys_end = buf.len() - keys_header.payload_length;
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:573:19
+    |
+573 |         let end = buf.len() - header.payload_length;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/core/src/transaction.rs:602:24
+    |
+602 |         let consumed = remaining - buf.len();
+    |                        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-core` (lib) generated 53 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/storage/src/chain_store.rs:33:38
+   |
+33 |     let mut buf = Vec::with_capacity(1 + value.length());
+   |                                      ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+   = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/storage/src/chain_store.rs:46:38
+   |
+46 |     let mut buf = Vec::with_capacity(1 + header.length() + payload);
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/storage/src/chain_store.rs:67:11
+   |
+67 |     match data[0] {
+   |           ^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+   = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: slicing may panic
+  --> crates/storage/src/chain_store.rs:69:29
+   |
+69 |             T::decode(&mut &data[1..]).map_err(|e| StorageError::Codec(format!("RLP decode: {e}")))
+   |                             ^^^^^^^^^
+   |
+   = help: consider using `.get(n..)` or .get_mut(n..)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+  --> crates/storage/src/chain_store.rs:72:37
+   |
+72 |             serde_json::from_slice(&data[1..]).map_err(|e| StorageError::Codec(e.to_string()))
+   |                                     ^^^^^^^^^
+   |
+   = help: consider using `.get(n..)` or .get_mut(n..)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/storage/src/chain_store.rs:355:61
+    |
+355 |                 let block_hash = ShellHash::try_from_slice(&data[..32])
+    |                                                             ^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/storage/src/chain_store.rs:358:21
+    |
+358 |                     data[32..36]
+    |                     ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:398:28
+    |
+398 |             if key.len() < prefix.len() + 12 {
+    |                            ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/storage/src/chain_store.rs:401:40
+    |
+401 |             let block_bytes: [u8; 8] = key[prefix.len()..prefix.len() + 8]
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:401:58
+    |
+401 |             let block_bytes: [u8; 8] = key[prefix.len()..prefix.len() + 8]
+    |                                                          ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:410:21
+    |
+410 |                     matched += 1;
+    |                     ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:417:17
+    |
+417 |                 matched += 1;
+    |                 ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:521:13
+    |
+521 |             count += 1;
+    |             ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/chain_store.rs:589:25
+    |
+589 |         let new_count = current + delta;
+    |                         ^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/snapshot.rs:170:9
+    |
+170 |         self.entry_count += 1;
+    |         ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/snapshot.rs:171:9
+    |
+171 |         self.data_size += (key.len() + value.len()) as u64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/storage/src/snapshot.rs:287:25
+    |
+287 |             let line = &self.lines[self.current_line];
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/snapshot.rs:288:13
+    |
+288 |             self.current_line += 1;
+    |             ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/state_pruner.rs:153:32
+    |
+153 |         let retention_cutoff = (highest_block + 1).saturating_sub(self.retention_count);
+    |                                ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/state_pruner.rs:169:21
+    |
+169 |                     protected_count += 1;
+    |                     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/state_pruner.rs:177:13
+    |
+177 |             pruned_count += 1;
+    |             ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/storage/src/world_state.rs:52:37
+   |
+52 |         let cap = NonZeroUsize::new(cache_mb * 1024 * 1024 / ACCOUNT_SIZE_BYTES)
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `unwrap()` on an `Option` value
+  --> crates/storage/src/world_state.rs:53:24
+   |
+53 |             .unwrap_or(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS).unwrap());
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+   = note: requested on the command line with `-W clippy::unwrap-used`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/storage/src/world_state.rs:73:37
+   |
+73 |         let cap = NonZeroUsize::new(cache_mb * 1024 * 1024 / ACCOUNT_SIZE_BYTES)
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `unwrap()` on an `Option` value
+  --> crates/storage/src/world_state.rs:74:24
+   |
+74 |             .unwrap_or(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS).unwrap());
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/storage/src/world_state.rs:89:22
+   |
+89 |         let cap_mb = (cap.get() * ACCOUNT_SIZE_BYTES).div_ceil(1024 * 1024);
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/storage/src/world_state.rs:167:9
+    |
+167 |         account.balance -= amount;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-storage` (lib) generated 27 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/finality.rs:129:9
+    |
+129 |         (total_validators * 2).div_ceil(3)
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: indexing may panic
+   --> crates/consensus/src/finality.rs:224:27
+    |
+224 |                 message: &messages[i],
+    |                           ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: indexing may panic
+   --> crates/consensus/src/finality.rs:225:29
+    |
+225 |                 signature: &sigs[i],
+    |                             ^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/fork_choice.rs:205:25
+    |
+205 |         let max_depth = self.parent_map.len() + 1;
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/fork_choice.rs:208:13
+    |
+208 |             iterations += 1;
+    |             ^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/consensus/src/poa.rs:49:9
+   |
+49 |         block_number / self.epoch_length
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/consensus/src/poa.rs:63:13
+   |
+63 |             (block_number % self.epoch_length) as usize % self.authorities.len()
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/consensus/src/poa.rs:65:13
+   |
+65 |             block_number as usize % self.authorities.len()
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/consensus/src/poa.rs:67:9
+   |
+67 |         self.authorities[idx]
+   |         ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/poa.rs:128:27
+    |
+128 |         let max_allowed = current_time + self.config.max_future_secs;
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/poa.rs:137:35
+    |
+137 |             if header.timestamp < parent.timestamp + self.config.block_time_secs {
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/poa.rs:143:33
+    |
+143 |             if header.number != parent.number + 1 {
+    |                                 ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/slashing.rs:145:15
+    |
+145 |     let gap = current_block - last_proposed_block;
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/consensus/src/validator.rs:204:25
+    |
+204 |             return Some(active[block_number as usize % active.len()].address);
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/validator.rs:204:32
+    |
+204 |             return Some(active[block_number as usize % active.len()].address);
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/validator.rs:207:20
+    |
+207 |         let slot = block_number % total;
+    |                    ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/validator.rs:210:13
+    |
+210 |             cumulative += v.weight;
+    |             ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `unwrap()` on an `Option` value
+   --> crates/consensus/src/validator.rs:216:14
+    |
+216 |         Some(active.last().unwrap().address)
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is `None`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+    = note: requested on the command line with `-W clippy::unwrap-used`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/validator.rs:265:21
+    |
+265 |                     activated += 1;
+    |                     ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/consensus/src/validator.rs:305:26
+    |
+305 |         let exit_epoch = current_epoch + self.config.exit_cooldown_epochs;
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-consensus` (lib) generated 20 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/aa_validation.rs:277:19
+    |
+277 |     let sig_len = 32 + padded_len(signature.len());
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/aa_validation.rs:278:25
+    |
+278 |     let pubkey_offset = sig_offset + sig_len;
+    |                         ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/aa_validation.rs:280:38
+    |
+280 |     let mut out = Vec::with_capacity(4 + 32 * 3 + sig_len + 32 + padded_len(pubkey.len()));
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/aa_validation.rs:293:19
+    |
+293 |     let padding = padded_len(bytes.len()) - bytes.len();
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/aa_validation.rs:295:20
+    |
+295 |         out.resize(out.len() + padding, 0);
+    |                    ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/aa_validation.rs:312:18
+    |
+312 |             && ((output[31] == 1 && output[..31].iter().all(|b| *b == 0))
+    |                  ^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: slicing may panic
+   --> crates/evm/src/aa_validation.rs:312:37
+    |
+312 |             && ((output[31] == 1 && output[..31].iter().all(|b| *b == 0))
+    |                                     ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/aa_validation.rs:313:21
+    |
+313 |                 || (output[0] == 1 && output[1..].iter().all(|b| *b == 0))))
+    |                     ^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/aa_validation.rs:313:39
+    |
+313 |                 || (output[0] == 1 && output[1..].iter().all(|b| *b == 0))))
+    |                                       ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:38:27
+   |
+38 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                           ^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:38:32
+   |
+38 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                ^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:38:56
+   |
+38 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                                        ^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:38:61
+   |
+38 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                                             ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:40:28
+   |
+40 |         let bit_position = 7 - (bit_index % 8);
+   |                            ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:41:9
+   |
+41 |         bloom[byte_index] |= 1 << bit_position;
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:53:27
+   |
+53 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                           ^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:53:32
+   |
+53 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                ^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:53:56
+   |
+53 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                                        ^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:53:61
+   |
+53 |         let bit_index = ((hash[i * 2] as usize) << 8 | hash[i * 2 + 1] as usize) & 0x7FF;
+   |                                                             ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/bloom.rs:55:28
+   |
+55 |         let bit_position = 7 - (bit_index % 8);
+   |                            ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:56:12
+   |
+56 |         if bloom[byte_index] & (1 << bit_position) == 0 {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/bloom.rs:70:13
+   |
+70 |             result[i] |= byte;
+   |             ^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/executor.rs:174:30
+    |
+174 |         let new_cumulative = cumulative_gas_used + gas_used;
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/executor.rs:298:21
+    |
+298 |                     U256::from(gas_used) * U256::from(tx.max_fee_per_gas),
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/executor.rs:300:38
+    |
+300 |                 let new_cumulative = cumulative_gas_used + gas_used;
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/executor.rs:307:77
+    |
+307 |                         if let Ok(addr) = system_contracts::decode_address(&input[4..]) {
+    |                                                                             ^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/executor.rs:320:77
+    |
+320 |                         if let Ok(addr) = system_contracts::decode_address(&input[4..]) {
+    |                                                                             ^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/executor.rs:367:21
+    |
+367 |                     U256::from(gas_used) * U256::from(tx.max_fee_per_gas),
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/executor.rs:369:38
+    |
+369 |                 let new_cumulative = cumulative_gas_used + gas_used;
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/parallel.rs:65:26
+   |
+65 |             for right in (left + 1)..rwsets.len() {
+   |                          ^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+  --> crates/evm/src/parallel.rs:66:71
+   |
+66 |                 if let Some(conflict) = detect_conflict(left, right, &rwsets[left], &rwsets[right])
+   |                                                                       ^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/parallel.rs:66:86
+   |
+66 |                 if let Some(conflict) = detect_conflict(left, right, &rwsets[left], &rwsets[right])
+   |                                                                                      ^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: used `expect()` on a `Result` value
+   --> crates/evm/src/parallel.rs:211:20
+    |
+211 |           let pool = rayon::ThreadPoolBuilder::new()
+    |  ____________________^
+212 | |             .num_threads(worker_count)
+213 | |             .build()
+214 | |             .expect("thread pool creation should succeed");
+    | |__________________________________________________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+    = note: requested on the command line with `-W clippy::expect-used`
+
+warning: indexing may panic
+   --> crates/evm/src/parallel.rs:222:50
+    |
+222 |                         .map(|index| execute_tx(&txs[*index]))
+    |                                                  ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/parallel.rs:230:46
+    |
+230 |                     outputs.push(execute_tx(&txs[*index])?);
+    |                                              ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/parallel.rs:261:9
+    |
+261 |         self.total_conflicts += 1;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/parallel.rs:262:9
+    |
+262 |         self.reexecuted_txs += reexecuted;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/precompiles.rs:226:37
+    |
+226 |     let pk_len = u32::from_be_bytes(data[0..4].try_into().ok()?) as usize;
+    |                                     ^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/precompiles.rs:227:18
+    |
+227 |     let pk_end = 4 + pk_len;
+    |                  ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/precompiles.rs:228:21
+    |
+228 |     if data.len() < pk_end + 4 {
+    |                     ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/precompiles.rs:231:19
+    |
+231 |     let pubkey = &data[4..pk_end];
+    |                   ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/precompiles.rs:234:38
+    |
+234 |     let msg_len = u32::from_be_bytes(data[pk_end..pk_end + 4].try_into().ok()?) as usize;
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/precompiles.rs:234:51
+    |
+234 |     let msg_len = u32::from_be_bytes(data[pk_end..pk_end + 4].try_into().ok()?) as usize;
+    |                                                   ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/precompiles.rs:235:19
+    |
+235 |     let msg_end = pk_end + 4 + msg_len;
+    |                   ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/precompiles.rs:239:20
+    |
+239 |     let message = &data[pk_end + 4..msg_end];
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/precompiles.rs:239:25
+    |
+239 |     let message = &data[pk_end + 4..msg_end];
+    |                         ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/precompiles.rs:242:22
+    |
+242 |     let signature = &data[msg_end..];
+    |                      ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/rwset.rs:231:30
+    |
+231 |     Address::try_from_slice(&data[16..36]).ok()
+    |                              ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:194:19
+    |
+194 |     let params = &input[4..];
+    |                   ^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:234:19
+    |
+234 |     let params = &input[4..];
+    |                   ^^^^^^^^^^
+    |
+    = help: consider using `.get(n..)` or .get_mut(n..)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:427:5
+    |
+427 |     input[..4]
+    |     ^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:439:8
+    |
+439 |     if word[..24].iter().any(|b| *b != 0) {
+    |        ^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:444:25
+    |
+444 |     let tail: [u8; 8] = word[24..32]
+    |                         ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:459:32
+    |
+459 |     ShellHash::try_from_slice(&input[..32])
+    |                                ^^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:470:8
+    |
+470 |     if input[..31].iter().any(|b| *b != 0) {
+    |        ^^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:475:8
+    |
+475 |     Ok(input[31])
+    |        ^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:486:37
+    |
+486 |     let offset = decode_word_usize(&input[..32])?;
+    |                                     ^^^^^^^^^^^
+    |
+    = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:487:30
+    |
+487 |     let algo_id = decode_u8(&input[32..64])?;
+    |                              ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:488:8
+    |
+488 |     if offset + 32 > input.len() {
+    |        ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:494:40
+    |
+494 |     let bytes_len = decode_word_usize(&input[offset..offset + 32])?;
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:494:54
+    |
+494 |     let bytes_len = decode_word_usize(&input[offset..offset + 32])?;
+    |                                                      ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:495:22
+    |
+495 |     let data_start = offset + 32;
+    |                      ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:505:9
+    |
+505 |     Ok((input[data_start..data_end].to_vec(), algo_id))
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+   --> crates/evm/src/system_contracts.rs:517:30
+    |
+517 |     Address::try_from_slice(&input[12..32])
+    |                              ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:525:9
+    |
+525 |         out[31] = 1;
+    |         ^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:537:38
+    |
+537 |     let mut out = Vec::with_capacity(64 + addrs.len() * 32);
+    |                                      ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:576:9
+    |
+576 |         pubkey.len().div_ceil(32) * 32
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:578:39
+    |
+578 |     let mut data = Vec::with_capacity(4 + 96 + padded_len);
+    |                                       ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:584:17
+    |
+584 |     data.resize(4 + 96 + padded_len, 0);
+    |                 ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:633:25
+    |
+633 |         block[offset] = data[i];
+    |                         ^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:633:9
+    |
+633 |         block[offset] = data[i];
+    |         ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:634:9
+    |
+634 |         offset += 1;
+    |         ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:641:9
+    |
+641 |         i += 1;
+    |         ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:643:5
+    |
+643 |     block[offset] ^= 0x01; // Keccak domain separator
+    |     ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:654:19
+    |
+654 |         out[j] = (state[lane] >> (8 * byte_in_lane)) as u8;
+    |                   ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:654:34
+    |
+654 |         out[j] = (state[lane] >> (8 * byte_in_lane)) as u8;
+    |                                  ^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:654:9
+    |
+654 |         out[j] = (state[lane] >> (8 * byte_in_lane)) as u8;
+    |         ^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:655:9
+    |
+655 |         j += 1;
+    |         ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:663:17
+    |
+663 |         let b = i * 8;
+    |                 ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:664:21
+    |
+664 |         let lane = (block[b] as u64)
+    |                     ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:665:16
+    |
+665 |             | (block[b + 1] as u64) << 8
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:665:22
+    |
+665 |             | (block[b + 1] as u64) << 8
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:666:16
+    |
+666 |             | (block[b + 2] as u64) << 16
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:666:22
+    |
+666 |             | (block[b + 2] as u64) << 16
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:667:16
+    |
+667 |             | (block[b + 3] as u64) << 24
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:667:22
+    |
+667 |             | (block[b + 3] as u64) << 24
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:668:16
+    |
+668 |             | (block[b + 4] as u64) << 32
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:668:22
+    |
+668 |             | (block[b + 4] as u64) << 32
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:669:16
+    |
+669 |             | (block[b + 5] as u64) << 40
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:669:22
+    |
+669 |             | (block[b + 5] as u64) << 40
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:670:16
+    |
+670 |             | (block[b + 6] as u64) << 48
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:670:22
+    |
+670 |             | (block[b + 6] as u64) << 48
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:671:16
+    |
+671 |             | (block[b + 7] as u64) << 56;
+    |                ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:671:22
+    |
+671 |             | (block[b + 7] as u64) << 56;
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:672:9
+    |
+672 |         state[i] ^= lane;
+    |         ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:673:9
+    |
+673 |         i += 1;
+    |         ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:20
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                    ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:31
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                               ^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:718:37
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                     ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:46
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                              ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:718:52
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                                    ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:62
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                                              ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:718:68
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                                                    ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:78
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                                                              ^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:718:84
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |                                                                                    ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:718:13
+    |
+718 |             c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    |             ^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:719:13
+    |
+719 |             x += 1;
+    |             ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:724:20
+    |
+724 |             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+    |                    ^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:724:22
+    |
+724 |             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+    |                      ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:724:37
+    |
+724 |             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+    |                                     ^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:724:39
+    |
+724 |             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+    |                                       ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:724:13
+    |
+724 |             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+    |             ^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:725:13
+    |
+725 |             x += 1;
+    |             ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:729:25
+    |
+729 |             state[x] ^= d[x % 5];
+    |                         ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:729:13
+    |
+729 |             state[x] ^= d[x % 5];
+    |             ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:730:13
+    |
+730 |             x += 1;
+    |             ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:737:21
+    |
+737 |             let j = PI[t];
+    |                     ^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:738:24
+    |
+738 |             let temp = state[j];
+    |                        ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:739:44
+    |
+739 |             state[j] = current.rotate_left(ROT[t]);
+    |                                            ^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:739:13
+    |
+739 |             state[j] = current.rotate_left(ROT[t]);
+    |             ^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:741:13
+    |
+741 |             t += 1;
+    |             ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:747:24
+    |
+747 |             let base = y * 5;
+    |                        ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:748:22
+    |
+748 |             let t0 = state[base];
+    |                      ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:749:22
+    |
+749 |             let t1 = state[base + 1];
+    |                      ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:749:28
+    |
+749 |             let t1 = state[base + 1];
+    |                            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:750:22
+    |
+750 |             let t2 = state[base + 2];
+    |                      ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:750:28
+    |
+750 |             let t2 = state[base + 2];
+    |                            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:751:22
+    |
+751 |             let t3 = state[base + 3];
+    |                      ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:751:28
+    |
+751 |             let t3 = state[base + 3];
+    |                            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:752:22
+    |
+752 |             let t4 = state[base + 4];
+    |                      ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:752:28
+    |
+752 |             let t4 = state[base + 4];
+    |                            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:753:13
+    |
+753 |             state[base] = t0 ^ (!t1 & t2);
+    |             ^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:754:13
+    |
+754 |             state[base + 1] = t1 ^ (!t2 & t3);
+    |             ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:754:19
+    |
+754 |             state[base + 1] = t1 ^ (!t2 & t3);
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:755:13
+    |
+755 |             state[base + 2] = t2 ^ (!t3 & t4);
+    |             ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:755:19
+    |
+755 |             state[base + 2] = t2 ^ (!t3 & t4);
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:756:13
+    |
+756 |             state[base + 3] = t3 ^ (!t4 & t0);
+    |             ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:756:19
+    |
+756 |             state[base + 3] = t3 ^ (!t4 & t0);
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:757:13
+    |
+757 |             state[base + 4] = t4 ^ (!t0 & t1);
+    |             ^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:757:19
+    |
+757 |             state[base + 4] = t4 ^ (!t0 & t1);
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:758:13
+    |
+758 |             y += 1;
+    |             ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+   --> crates/evm/src/system_contracts.rs:762:21
+    |
+762 |         state[0] ^= RC[round];
+    |                     ^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = note: the suggestion might not be applicable in constant blocks
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/system_contracts.rs:763:9
+    |
+763 |         round += 1;
+    |         ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+  --> crates/evm/src/tracer.rs:87:8
+   |
+87 |     if output[0..4] != [0x08, 0xc3, 0x79, 0xa0] {
+   |        ^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: slicing may panic
+  --> crates/evm/src/tracer.rs:91:22
+   |
+91 |     let len_bytes = &output[36..68];
+   |                      ^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/tracer.rs:93:29
+   |
+93 |         u32::from_be_bytes([len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
+   |                             ^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/tracer.rs:93:44
+   |
+93 |         u32::from_be_bytes([len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
+   |                                            ^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/tracer.rs:93:59
+   |
+93 |         u32::from_be_bytes([len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
+   |                                                           ^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+  --> crates/evm/src/tracer.rs:93:74
+   |
+93 |         u32::from_be_bytes([len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
+   |                                                                          ^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/tracer.rs:95:23
+   |
+95 |     if output.len() < 68 + len {
+   |                       ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+  --> crates/evm/src/tracer.rs:99:23
+   |
+99 |     String::from_utf8(output[68..68 + len].to_vec()).ok()
+   |                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using `.get(n..m)` or `.get_mut(n..m)` instead
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/evm/src/tracer.rs:99:34
+   |
+99 |     String::from_utf8(output[68..68 + len].to_vec()).ok()
+   |                                  ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/tx_validation.rs:237:9
+    |
+237 |         gas += GAS_CONTRACT_CREATION;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/tx_validation.rs:241:13
+    |
+241 |             gas += GAS_PER_ZERO_BYTE;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/tx_validation.rs:243:13
+    |
+243 |             gas += GAS_PER_NONZERO_BYTE;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/tx_validation.rs:248:13
+    |
+248 |             gas += ACCESS_LIST_ADDRESS_COST;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/evm/src/tx_validation.rs:249:13
+    |
+249 |             gas += ACCESS_LIST_STORAGE_KEY_COST * item.storage_keys.len() as u64;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-evm` (lib) generated 157 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/mempool/src/pool.rs:153:30
+    |
+153 |                 .checked_mul(100 + bump)
+    |                              ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/mempool/src/pool.rs:188:36
+    |
+188 |                 let incoming_neg = -(priority_fee as i128);
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/mempool/src/pool.rs:206:9
+    |
+206 |         inner.seq += 1;
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/mempool/src/pool.rs:209:31
+    |
+209 |             neg_priority_fee: -(priority_fee as i128),
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-mempool` (lib) generated 4 warnings
+warning: indexing may panic
+   --> crates/rpc/src/filter.rs:173:17
+    |
+173 |                 topics[i] = entry.map(|e| e.into_vec());
+    |                 ^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/filter_registry.rs:138:22
+    |
+138 |         let cutoff = Instant::now() - std::time::Duration::from_secs(self.ttl_secs);
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/filter_registry.rs:165:35
+    |
+165 |                         removed = before - after,
+    |                                   ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/handler.rs:704:16
+    |
+704 |     let size = header_size + tx_size;
+    |                ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/handler.rs:930:28
+    |
+930 |                 let size = header_size + tx_size;
+    |                            ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/handler.rs:936:64
+    |
+936 | ...                   .map(|tx| tx_to_rpc(tx, None, Some(head.header.number + 1), None, None))
+    |                                                          ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/handler.rs:953:37
+    |
+953 |                     number: hex_u64(head.header.number + 1),
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1400:12
+     |
+1400 |         if to - from + 1 > MAX_BLOCK_RANGE {
+     |            ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1447:21
+     |
+1447 |                     global_log_index += receipt.logs.len() as u64;
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1465:21
+     |
+1465 |                     global_log_index += 1;
+     |                     ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1529:40
+     |
+1529 |             let actual_to = latest.min(from + MAX_BLOCK_RANGE - 1);
+     |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1568:25
+     |
+1568 |                         global_log_index += 1;
+     |                         ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/rpc/src/handler.rs:1789:58
+     |
+1789 |                     self.chain_store.get_block_by_number(block_height - window),
+     |                                                          ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/rpc/src/middleware.rs:53:9
+   |
+53 |         self.count += 1;
+   |         ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:107:44
+    |
+107 |                 .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+    |                                            ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:132:9
+    |
+132 |         *conns.entry(conn_id).or_insert(0) += 1;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:143:26
+    |
+143 |                     Some(current - 1)
+    |                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:449:17
+    |
+449 |                 consecutive_lags += 1;
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:490:25
+    |
+490 |                         global_log_index += 1;
+    |                         ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:495:17
+    |
+495 |                 consecutive_lags += 1;
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:533:17
+    |
+533 |                 consecutive_lags += 1;
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/rpc/src/subscriptions.rs:586:17
+    |
+586 |                 consecutive_lags += 1;
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-rpc` (lib) generated 22 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/network/src/bandwidth.rs:49:22
+   |
+49 |           let refill = elapsed_nanos.saturating_mul(self.refill_per_sec as u128)
+   |  ______________________^
+50 | |             / Duration::from_secs(1).as_nanos();
+   | |_______________________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+   = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/network/src/bandwidth.rs:59:13
+   |
+59 |             refill as u128 * Duration::from_secs(1).as_nanos() / self.refill_per_sec as u128;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/network/src/bandwidth.rs:61:9
+   |
+61 |         self.last_refill += Duration::from_nanos(consumed_nanos);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/network/src/bandwidth.rs:69:9
+   |
+69 |         self.tokens -= bytes;
+   |         ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `expect()` on a `Result` value
+   --> crates/network/src/bandwidth.rs:125:23
+    |
+125 |           let allowed = self
+    |  _______________________^
+126 | |             .inbound_limiter
+127 | |             .as_ref()
+128 | |             .expect("inbound limiter missing")
+129 | |             .lock()
+130 | |             .expect("lock poisoned")
+    | |____________________________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+    = note: requested on the command line with `-W clippy::expect-used`
+
+warning: used `expect()` on an `Option` value
+   --> crates/network/src/bandwidth.rs:125:23
+    |
+125 |           let allowed = self
+    |  _______________________^
+126 | |             .inbound_limiter
+127 | |             .as_ref()
+128 | |             .expect("inbound limiter missing")
+    | |______________________________________________^
+    |
+    = note: if this value is `None`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+   --> crates/network/src/bandwidth.rs:151:23
+    |
+151 |           let allowed = self
+    |  _______________________^
+152 | |             .outbound_limiter
+153 | |             .as_ref()
+154 | |             .expect("outbound limiter missing")
+155 | |             .lock()
+156 | |             .expect("lock poisoned")
+    | |____________________________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on an `Option` value
+   --> crates/network/src/bandwidth.rs:151:23
+    |
+151 |           let allowed = self
+    |  _______________________^
+152 | |             .outbound_limiter
+153 | |             .as_ref()
+154 | |             .expect("outbound limiter missing")
+    | |_______________________________________________^
+    |
+    = note: if this value is `None`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+   --> crates/network/src/bandwidth.rs:166:24
+    |
+166 |         let mut last = self.last_reset.lock().expect("lock poisoned");
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+   --> crates/network/src/bandwidth.rs:170:17
+    |
+170 |                 limiter.lock().expect("lock poisoned").refill(now);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+   --> crates/network/src/bandwidth.rs:173:17
+    |
+173 |                 limiter.lock().expect("lock poisoned").refill(now);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/network/src/security.rs:122:40
+    |
+122 |             record.banned_until = Some(Instant::now() + self.ban_duration);
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/network/src/security.rs:167:21
+    |
+167 |                     (until - now).as_secs()
+    |                     ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-network` (lib) generated 13 warnings
+warning: used `expect()` on an `Option` value
+  --> crates/node/src/builder.rs:53:21
+   |
+53 |         let store = self.store.take().expect("store must be set");
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+   = note: requested on the command line with `-W clippy::expect-used`
+
+warning: used `expect()` on a `Result` value
+   --> crates/node/src/metrics.rs:151:9
+    |
+151 |         Self::new().expect("failed to register Prometheus metrics")
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+  --> crates/node/src/node.rs:89:32
+   |
+89 |         let metrics = Arc::new(Metrics::new().expect("failed to register Prometheus metrics"));
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/node.rs:218:27
+    |
+218 |             start_number: head_number + 1,
+    |                           ^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+    = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/node.rs:289:27
+    |
+289 |             for number in (snapshot.head_number + 1)..=current_head.number() {
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/node.rs:741:59
+    |
+741 | ...                   start_number: last_ok + 1,
+    |                                     ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/node.rs:887:27
+    |
+887 |         let next_number = head.number() + 1;
+    |                           ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/node.rs:975:21
+    |
+975 |                     cumulative_gas += result.gas_used;
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: slicing may panic
+    --> crates/node/src/node.rs:1020:21
+     |
+1020 |                     bloom[..len].copy_from_slice(&bytes[..len]);
+     |                     ^^^^^^^^^^^^
+     |
+     = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+     = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: slicing may panic
+    --> crates/node/src/node.rs:1020:51
+     |
+1020 |                     bloom[..len].copy_from_slice(&bytes[..len]);
+     |                                                   ^^^^^^^^^^^^
+     |
+     = help: consider using `.get(..n)`or `.get_mut(..n)` instead
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/node/src/node.rs:1086:24
+     |
+1086 |         let expected = head.number() + 1;
+     |                        ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/node/src/node.rs:1115:23
+     |
+1115 |                 gap = incoming - expected,
+     |                       ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: indexing may panic
+    --> crates/node/src/node.rs:1247:30
+     |
+1247 |                     pubkey: &resolved_pks[i],
+     |                              ^^^^^^^^^^^^^^^
+     |
+     = help: consider using `.get(n)` or `.get_mut(n)` instead
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+    --> crates/node/src/node.rs:1248:30
+     |
+1248 |                     message: tx_hashes[i].as_bytes(),
+     |                              ^^^^^^^^^^^^
+     |
+     = help: consider using `.get(n)` or `.get_mut(n)` instead
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+    --> crates/node/src/node.rs:1304:25
+     |
+1304 |                         cumulative_gas += result.gas_used;
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/reorg.rs:115:13
+    |
+115 |             applied += 1;
+    |             ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/reorg.rs:121:34
+    |
+121 |             let new_tip_number = ancestor_number + new_chain.len() as u64;
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/reorg.rs:122:34
+    |
+122 |             let old_tip_number = ancestor_number + old_chain.len() as u64;
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/node/src/reorg.rs:123:22
+    |
+123 |             for n in (new_tip_number + 1)..=old_tip_number {
+    |                      ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: `shell-node` (lib) generated 19 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> tests/e2e/common.rs:77:24
+   |
+77 |             timestamp: 1_700_000_000 + number * 2,
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+   = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:103:5
+    |
+103 |     env.chain_store.put_block(block).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+    = note: requested on the command line with `-W clippy::unwrap-used`
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:104:5
+    |
+104 | /     env.chain_store
+105 | |         .set_canonical(block.header.number, &hash)
+106 | |         .unwrap();
+    | |_________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:107:5
+    |
+107 |     env.chain_store.set_head(&hash).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:125:9
+    |
+125 | /         ws.add_balance(&address, U256::from(FUNDED_BALANCE))
+126 | |             .unwrap();
+    | |_____________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:128:5
+    |
+128 |     env.chain_store.put_pubkey(&address, &pubkey).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:157:15
+    |
+157 |     let sig = signer.sign(tx.hash().0.as_slice()).unwrap();
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> tests/e2e/common.rs:177:29
+    |
+177 |     block.header.gas_used = txs.len() as u64 * 21_000;
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:183:5
+    |
+183 |     env.chain_store.put_block(&block).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:184:5
+    |
+184 |     env.chain_store.set_canonical(number, &hash).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:185:5
+    |
+185 |     env.chain_store.set_head(&hash).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> tests/e2e/common.rs:193:13
+    |
+193 |             cumulative_gas += 21_000;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `unwrap()` on a `Result` value
+   --> tests/e2e/common.rs:207:5
+    |
+207 |     env.chain_store.put_receipts(&hash, &receipts).unwrap();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unwrap_used
+
+warning: `shell-e2e-tests` (lib) generated 13 warnings
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/cli/src/commands/account.rs:69:21
+   |
+69 |                     found += 1;
+   |                     ^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+   = note: requested on the command line with `-W clippy::arithmetic-side-effects`
+
+warning: indexing may panic
+   --> crates/cli/src/commands/account.rs:102:19
+    |
+102 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+    = note: requested on the command line with `-W clippy::indexing-slicing`
+
+warning: indexing may panic
+   --> crates/cli/src/commands/account.rs:128:19
+    |
+128 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/cli/src/commands/backup.rs:163:13
+    |
+163 |             total += meta.len();
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/cli/src/commands/backup.rs:165:13
+    |
+165 |             total += dir_size(&entry.path()).unwrap_or(0);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/cli/src/commands/key.rs:37:43
+   |
+37 |         &hex::encode(signer.public_key())[hex::encode(signer.public_key()).len() - 16..]
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/cli/src/commands/key.rs:58:31
+   |
+58 |         &encrypted.public_key[encrypted.public_key.len() - 16..]
+   |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/cli/src/commands/removedb.rs:39:13
+   |
+39 |             total += dir_size(&entry.path().to_path_buf())?;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+  --> crates/cli/src/commands/removedb.rs:41:13
+   |
+41 |             total += meta.len();
+   |             ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/cli/src/commands/run.rs:204:19
+    |
+204 |     for number in (recovered.number() + 1)..=head.number() {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: arithmetic operation that can potentially result in unexpected side-effects
+   --> crates/cli/src/commands/run.rs:485:31
+    |
+485 |         max_idle_interval_ms: args.max_idle_interval * 1000,
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#arithmetic_side_effects
+
+warning: used `expect()` on a `Result` value
+   --> crates/cli/src/commands/run.rs:613:21
+    |
+613 | /                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+614 | |                         .expect("failed to register SIGTERM handler");
+    | |_____________________________________________________________________^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#expect_used
+    = note: requested on the command line with `-W clippy::expect-used`
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:252:22
+    |
+252 |     let result_str = result["result"]
+    |                      ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:344:19
+    |
+344 |     let tx_hash = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:373:19
+    |
+373 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:388:19
+    |
+388 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:403:19
+    |
+403 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:423:9
+    |
+423 |         call_obj["to"] = serde_json::json!(format!("{to_addr}"));
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: indexing may panic
+   --> crates/cli/src/commands/tx.rs:433:19
+    |
+433 |     let hex_str = result["result"]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = help: consider using `.get(n)` or `.get_mut(n)` instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#indexing_slicing
+
+warning: `shell-cli` (bin "shell-node") generated 19 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s

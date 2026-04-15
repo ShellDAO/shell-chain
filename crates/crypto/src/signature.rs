@@ -110,7 +110,7 @@ impl Encodable for PQSignature {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -122,12 +122,16 @@ impl alloy_rlp::Decodable for PQSignature {
         }
         // Restrict decoding to the declared payload length to prevent
         // malicious RLP from reading beyond the list boundary.
-        let mut payload = &buf[..header.payload_length];
+        let mut payload = buf
+            .get(..header.payload_length)
+            .unwrap_or_else(|| unreachable!("RLP header payload_length validated by decode"));
         let sig_type_u8 = u8::decode(&mut payload)?;
         let sig_type = SignatureType::from_u8(sig_type_u8)
             .ok_or(alloy_rlp::Error::Custom("unknown signature type"))?;
         let data = alloy_rlp::Header::decode_bytes(&mut payload, false)?.to_vec();
-        *buf = &buf[header.payload_length..];
+        *buf = buf
+            .get(header.payload_length..)
+            .unwrap_or_else(|| unreachable!("RLP header payload_length validated by decode"));
         let sig = Self { sig_type, data };
         // F-157: Reject oversized signatures during deserialization.
         sig.validate_size()
@@ -138,7 +142,10 @@ impl alloy_rlp::Decodable for PQSignature {
 
 impl PQSignature {
     fn fields_len(&self) -> usize {
-        self.sig_type.as_u8().length() + self.data.as_slice().length()
+        self.sig_type
+            .as_u8()
+            .length()
+            .saturating_add(self.data.as_slice().length())
     }
 
     /// Validate that the signature size is within acceptable bounds.

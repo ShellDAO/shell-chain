@@ -76,7 +76,7 @@ impl Encodable for BlockHeader {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -86,23 +86,24 @@ impl BlockHeader {
             Some(proof) => proof.length(),
             None => 1, // 0x80
         };
-        self.parent_hash.length()
-            + self.state_root.length()
-            + self.transactions_root.length()
-            + self.receipts_root.length()
-            + self.logs_bloom.length()
-            + self.number.length()
-            + self.gas_limit.length()
-            + self.gas_used.length()
-            + self.timestamp.length()
-            + self.extra_data.length()
-            + self.proposer.length()
-            + proof_len
-            + self.base_fee_per_gas.length()
-            + self.withdrawals_root.length()
-            + self.parent_beacon_block_root.length()
-            + self.blob_gas_used.length()
-            + self.excess_blob_gas.length()
+        self.parent_hash
+            .length()
+            .saturating_add(self.state_root.length())
+            .saturating_add(self.transactions_root.length())
+            .saturating_add(self.receipts_root.length())
+            .saturating_add(self.logs_bloom.length())
+            .saturating_add(self.number.length())
+            .saturating_add(self.gas_limit.length())
+            .saturating_add(self.gas_used.length())
+            .saturating_add(self.timestamp.length())
+            .saturating_add(self.extra_data.length())
+            .saturating_add(self.proposer.length())
+            .saturating_add(proof_len)
+            .saturating_add(self.base_fee_per_gas.length())
+            .saturating_add(self.withdrawals_root.length())
+            .saturating_add(self.parent_beacon_block_root.length())
+            .saturating_add(self.blob_gas_used.length())
+            .saturating_add(self.excess_blob_gas.length())
     }
 
     /// Compute the block hash (keccak256 of RLP-encoded header).
@@ -147,12 +148,15 @@ impl Block {
             payload_length: txs_payload,
         }
         .length()
-            + txs_payload;
+        .saturating_add(txs_payload);
         let seal_len = match &self.proposer_seal {
             Some(seal) => seal.length(),
             None => 1, // 0x80 empty bytes
         };
-        self.header.length() + txs_list_len + seal_len
+        self.header
+            .length()
+            .saturating_add(txs_list_len)
+            .saturating_add(seal_len)
     }
 }
 
@@ -190,7 +194,7 @@ impl Decodable for BlockHeader {
         let blob_gas_used = u64::decode(buf)?;
         let excess_blob_gas = u64::decode(buf)?;
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,
@@ -254,7 +258,7 @@ impl Encodable for Block {
             payload_length: payload,
         }
         .length()
-            + payload
+        .saturating_add(payload)
     }
 }
 
@@ -265,7 +269,7 @@ impl Decodable for Block {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
-        let end = remaining - header.payload_length;
+        let end = remaining.saturating_sub(header.payload_length);
 
         let block_header = BlockHeader::decode(buf)?;
 
@@ -275,13 +279,13 @@ impl Decodable for Block {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut transactions = Vec::new();
-        let txs_end = buf.len() - txs_header.payload_length;
+        let txs_end = buf.len().saturating_sub(txs_header.payload_length);
         while buf.len() > txs_end {
             transactions.push(SignedTransaction::decode(buf)?);
         }
 
         // Proposer seal: empty bytes (0x80) → None, RLP list → PQSignature
-        let proposer_seal = if buf.len() > end && buf[0] == 0x80 {
+        let proposer_seal = if buf.len() > end && buf.first().copied().unwrap_or(0) == 0x80 {
             let _ = alloy_rlp::Header::decode_bytes(buf, false)?;
             None
         } else if buf.len() > end {
@@ -290,7 +294,7 @@ impl Decodable for Block {
             None
         };
 
-        let consumed = remaining - buf.len();
+        let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
                 expected: header.payload_length,
