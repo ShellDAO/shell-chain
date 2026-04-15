@@ -172,6 +172,8 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         // Build receipt
         let gas_used = exec_result.gas().spent();
         let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
+
+        let (status, logs, contract_address, output_bytes) = match &exec_result {
             ExecutionResult::Success { logs, output, .. } => {
                 let contract_addr = match output {
                     revm::context::result::Output::Create(_, Some(addr)) => {
@@ -302,9 +304,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 if let Ok(selector) = <[u8; 4]>::try_from(input.get(..4).unwrap_or_default()) {
                     let registry_addr = system_contracts::registry_address();
                     if selector == system_contracts::ADD_VALIDATOR_SELECTOR {
-                        if let Ok(addr) = system_contracts::decode_address(
-                            input.get(4..).unwrap_or_default(),
-                        ) {
+                        if let Ok(addr) =
+                            system_contracts::decode_address(input.get(4..).unwrap_or_default())
+                        {
                             let topic = ShellHash::from(system_contracts::validator_added_topic());
                             let mut addr_word = [0u8; 32];
                             addr_word[12..32].copy_from_slice(addr.as_bytes());
@@ -317,9 +319,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                             }
                         }
                     } else if selector == system_contracts::REMOVE_VALIDATOR_SELECTOR {
-                        if let Ok(addr) = system_contracts::decode_address(
-                            input.get(4..).unwrap_or_default(),
-                        ) {
+                        if let Ok(addr) =
+                            system_contracts::decode_address(input.get(4..).unwrap_or_default())
+                        {
                             let topic =
                                 ShellHash::from(system_contracts::validator_removed_topic());
                             let mut addr_word = [0u8; 32];

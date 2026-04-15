@@ -320,9 +320,15 @@ fn is_magic_valid(output: &[u8]) -> bool {
     output == [0x01]
         || (output.len() == 32
             && ((output.last().copied().unwrap_or(0) == 1
-                && output.get(..31).map(|s| s.iter().all(|b| *b == 0)).unwrap_or(false))
+                && output
+                    .get(..31)
+                    .map(|s| s.iter().all(|b| *b == 0))
+                    .unwrap_or(false))
                 || (output.first().copied().unwrap_or(0) == 1
-                    && output.get(1..).map(|s| s.iter().all(|b| *b == 0)).unwrap_or(false))))
+                    && output
+                        .get(1..)
+                        .map(|s| s.iter().all(|b| *b == 0))
+                        .unwrap_or(false))))
 }
 
 struct ValidationStateDb<S: KvStore + 'static> {
