@@ -3,6 +3,7 @@ name = "shell-load-test"
 version.workspace = true
 edition.workspace = true
 description = "High-TPS load test harness for Shell-chain node"
+publish = false
 
 [[bin]]
 name = "shell-load-test"
