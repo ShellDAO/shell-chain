@@ -1,0 +1,26 @@
+[package]
+name = "shell-multi-prover"
+version.workspace = true
+edition.workspace = true
+description = "Multi-prover L1–L2 STARK soak test for Shell-chain"
+publish = false
+
+[[bin]]
+name = "shell-multi-prover"
+path = "src/main.rs"
+
+[dependencies]
+shell-stark-prover = { path = "../../crates/stark-prover" }
+
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio              = { version = "1", features = ["full"] }
+anyhow             = "1"
+csv                = "1"
+hdrhistogram       = "7"
+chrono             = { version = "0.4", features = ["serde"] }
+rand               = "0.8"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+reqwest            = { version = "0.11", features = ["json"] }

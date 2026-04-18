@@ -19,6 +19,7 @@ members = [
     "crates/bench",
     "tools/load-test",
     "tools/stark-bench",
+    "tools/multi-prover-test",
 ]
 
 [workspace.package]
