@@ -1,8 +1,9 @@
 [package]
 name = "shell-stark-bench"
-version = "0.15.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Long-running STARK block-compression performance benchmark for Shell-chain"
+publish = false
 
 [[bin]]
 name = "shell-stark-bench"
