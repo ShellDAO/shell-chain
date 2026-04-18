@@ -1,6 +1,6 @@
 [package]
 name = "shell-stark-bench"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Long-running STARK block-compression performance benchmark for Shell-chain"
 
