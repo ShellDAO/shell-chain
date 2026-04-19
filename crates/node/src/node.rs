@@ -82,6 +82,9 @@ pub struct Node<S: KvStore + 'static> {
     /// Dev-only runtime controls for Hardhat/Foundry compatibility.
     dev_state: RwLock<DevState>,
     shutdown_tx: watch::Sender<bool>,
+    /// L2 grace-window: maps block_hash → delete_at_block_number.
+    /// Witnesses in this map are deleted once the head advances past delete_at.
+    pending_grace_deletes: parking_lot::Mutex<HashMap<ShellHash, u64>>,
 }
 
 const SYNC_RETRY_BASE_INTERVAL_SECS: u64 = 5;
@@ -177,6 +180,7 @@ impl<S: KvStore + 'static> Node<S> {
                 snapshots: BTreeMap::new(),
             }),
             shutdown_tx,
+            pending_grace_deletes: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -980,7 +984,10 @@ impl<S: KvStore + 'static> Node<S> {
                                                     Err(e) => warn!(block = block_number, "L2: failed to delete witness bundle: {e}"),
                                                 }
                                             } else {
-                                                debug!(block = block_number, grace, head, "L2: proof stored, within grace window — witness kept");
+                                                // Schedule deletion: delete once head reaches block_number + grace.
+                                                let delete_at = block_number.saturating_add(grace);
+                                                self.pending_grace_deletes.lock().insert(block_hash, delete_at);
+                                                debug!(block = block_number, grace, head, delete_at, "L2: proof stored, within grace window — deletion scheduled");
                                             }
                                         }
                                     }
@@ -1097,18 +1104,56 @@ impl<S: KvStore + 'static> Node<S> {
                 _ = peer_count_timer.tick() => {
                     let peers = network.peer_count().await;
                     self.metrics.peer_count.set(peers as i64);
-                    // ops-metrics: update per-CF storage size gauges lazily on each 10s tick.
-                    // Uses prefix scan byte counts as a backend-agnostic approximation.
-                    // RocksDB nodes can replace this with property_int_value_cf calls.
-                    let chain_bytes = self.chain_store.approximate_prefix_bytes(b"b/")
-                        .unwrap_or(0)
-                        .saturating_add(self.chain_store.approximate_prefix_bytes(b"h/").unwrap_or(0))
-                        .saturating_add(self.chain_store.approximate_prefix_bytes(b"n/").unwrap_or(0));
-                    let witness_bytes = self.chain_store.approximate_prefix_bytes(b"w/").unwrap_or(0);
-                    let proof_bytes = self.chain_store.approximate_prefix_bytes(b"p/").unwrap_or(0);
+                // ops-metrics: update per-CF storage size gauges with a 300s TTL cache.
+                // The fallback approximate_prefix_bytes() scans all matching keys; refreshing
+                // it every 10s scales poorly as the DB grows. Cache with atomics to amortize.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    use std::time::{SystemTime, UNIX_EPOCH};
+
+                    const STORAGE_SIZE_CACHE_TTL_SECS: u64 = 300;
+                    static LAST_STORAGE_SIZE_UPDATE: AtomicU64 = AtomicU64::new(0);
+                    static CACHED_CHAIN_BYTES: AtomicU64 = AtomicU64::new(0);
+                    static CACHED_WITNESS_BYTES: AtomicU64 = AtomicU64::new(0);
+                    static CACHED_PROOF_BYTES: AtomicU64 = AtomicU64::new(0);
+
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let last = LAST_STORAGE_SIZE_UPDATE.load(Ordering::Relaxed);
+
+                    if now_secs.saturating_sub(last) >= STORAGE_SIZE_CACHE_TTL_SECS {
+                        let chain_bytes = self
+                            .chain_store
+                            .approximate_prefix_bytes(b"b/")
+                            .unwrap_or(0)
+                            .saturating_add(
+                                self.chain_store.approximate_prefix_bytes(b"h/").unwrap_or(0),
+                            )
+                            .saturating_add(
+                                self.chain_store.approximate_prefix_bytes(b"n/").unwrap_or(0),
+                            );
+                        let witness_bytes =
+                            self.chain_store.approximate_prefix_bytes(b"w/").unwrap_or(0);
+                        let proof_bytes =
+                            self.chain_store.approximate_prefix_bytes(b"pa/").unwrap_or(0);
+
+                        CACHED_CHAIN_BYTES.store(chain_bytes, Ordering::Relaxed);
+                        CACHED_WITNESS_BYTES.store(witness_bytes, Ordering::Relaxed);
+                        CACHED_PROOF_BYTES.store(proof_bytes, Ordering::Relaxed);
+                        LAST_STORAGE_SIZE_UPDATE.store(now_secs, Ordering::Relaxed);
+                    }
+
                     // State trie bytes are stored in a separate KV namespace; use 0 until
                     // the trie store exposes a size_estimate().
-                    self.metrics.update_cf_sizes(chain_bytes, witness_bytes, 0, proof_bytes);
+                    self.metrics.update_cf_sizes(
+                        CACHED_CHAIN_BYTES.load(Ordering::Relaxed),
+                        CACHED_WITNESS_BYTES.load(Ordering::Relaxed),
+                        0,
+                        CACHED_PROOF_BYTES.load(Ordering::Relaxed),
+                    );
+                }
                 }
 
                 _ = sync_retry_timer.tick() => {
@@ -1771,6 +1816,26 @@ impl<S: KvStore + 'static> Node<S> {
         self.chain_store.set_head(&block_hash)?;
         for (address, pubkey) in new_pubkeys {
             self.chain_store.put_pubkey(&address, &pubkey)?;
+        }
+
+        // L2 grace-window: flush any witnesses whose delete_at block has been reached.
+        {
+            let current_head = block.number();
+            let mut grace_map = self.pending_grace_deletes.lock();
+            grace_map.retain(|hash, delete_at| {
+                if current_head >= *delete_at {
+                    match self.chain_store.delete_witness_bundle(hash) {
+                        Ok(()) => info!(
+                            block = *delete_at,
+                            "L2: grace-window expired, witness bundle deleted"
+                        ),
+                        Err(e) => warn!(block = *delete_at, "L2: grace-window delete failed: {e}"),
+                    }
+                    false // remove from map
+                } else {
+                    true // keep pending
+                }
+            });
         }
 
         // Remove any included transactions from our mempool.

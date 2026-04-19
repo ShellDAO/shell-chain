@@ -11,11 +11,9 @@
 /// Run with: `cargo bench --package shell-bench --bench bench_block_split`
 use alloy_rlp::Encodable;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use shell_core::{
-    Block, BlockHeader, SignedTransaction, StrippedBlock, Transaction, TxWitness, WitnessBundle,
-};
+use shell_core::{Block, BlockHeader, SignedTransaction, StrippedBlock, Transaction};
 use shell_crypto::{DilithiumSigner, PQSignature, SignatureType, Signer};
-use shell_primitives::{Address, Bytes, ShellHash, U256};
+use shell_primitives::{Address, Bytes, U256};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -67,17 +65,12 @@ fn make_block(tx_count: usize) -> Block {
 
     Block {
         header: BlockHeader {
-            parent_hash: ShellHash::default(),
-            state_root: ShellHash::default(),
-            transactions_root: ShellHash::default(),
-            receipts_root: ShellHash::default(),
-            logs_bloom: Bytes::default(),
             number: 1,
             gas_limit: 30_000_000,
             gas_used: tx_count as u64 * 21_000,
             timestamp: 1_700_000_000,
-            extra_data: Bytes::default(),
             sig_aggregate_proof: None,
+            ..BlockHeader::default()
         },
         transactions: txs,
     }

@@ -8,7 +8,7 @@ use crate::witness::{StrippedTransaction, TxWitness, WitnessBundle};
 use crate::SignedTransaction;
 
 /// Block header.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BlockHeader {
     pub parent_hash: ShellHash,
     pub state_root: ShellHash,
@@ -158,6 +158,14 @@ impl Block {
 
     pub fn tx_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    /// Split this block into a [`StrippedBlock`] and a [`WitnessBundle`].
+    ///
+    /// Convenience wrapper around [`StrippedBlock::split`] for ergonomic call sites
+    /// (e.g. `block.split()` instead of `StrippedBlock::split(&block)`).
+    pub fn split(self) -> (StrippedBlock, WitnessBundle) {
+        StrippedBlock::split(&self)
     }
 
     fn rlp_fields_len(&self) -> usize {
@@ -403,18 +411,38 @@ impl StrippedBlock {
     /// read transaction payloads (from / to / value / etc.).
     pub fn into_block(self, bundle: Option<WitnessBundle>) -> Block {
         let transactions = match bundle {
-            Some(b) => self
-                .transactions
-                .into_iter()
-                .zip(b.witnesses)
-                .map(|(st, w)| {
-                    if let Some(pk) = w.pubkey {
-                        SignedTransaction::with_pubkey(st.from, st.tx, w.signature, pk)
-                    } else {
-                        SignedTransaction::new(st.from, st.tx, w.signature)
-                    }
-                })
-                .collect(),
+            Some(b) => {
+                // Guard against a corrupted/truncated bundle: zip silently drops
+                // trailing transactions when lengths differ, so we enforce an
+                // exact match and fall back to stub signatures on mismatch.
+                if b.witnesses.len() != self.transactions.len() {
+                    tracing::warn!(
+                        tx_count = self.transactions.len(),
+                        witness_count = b.witnesses.len(),
+                        "into_block: witness bundle length mismatch — returning stub signatures"
+                    );
+                    let stub_sig = PQSignature {
+                        sig_type: SignatureType::Dilithium3,
+                        data: Vec::new(),
+                    };
+                    self.transactions
+                        .into_iter()
+                        .map(|st| SignedTransaction::new(st.from, st.tx, stub_sig.clone()))
+                        .collect()
+                } else {
+                    self.transactions
+                        .into_iter()
+                        .zip(b.witnesses)
+                        .map(|(st, w)| {
+                            if let Some(pk) = w.pubkey {
+                                SignedTransaction::with_pubkey(st.from, st.tx, w.signature, pk)
+                            } else {
+                                SignedTransaction::new(st.from, st.tx, w.signature)
+                            }
+                        })
+                        .collect()
+                }
+            }
             None => {
                 // Witnesses pruned after STARK proof acceptance: return stub sigs.
                 let stub_sig = PQSignature {

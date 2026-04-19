@@ -56,10 +56,11 @@ pub struct Metrics {
     // -----------------------------------------------------------------------
     // Storage size metrics (ops-metrics)
     // -----------------------------------------------------------------------
-    /// On-disk SST file size per column family.
+    /// Approximate logical data size per column family (prefix scan estimate).
     /// Labels: `cf` ∈ { "chain", "witness", "state", "proof" }.
-    /// Updated lazily when the `/metrics` endpoint is scraped (via
-    /// `update_cf_sizes`). Returns 0 for backends that don't expose CF sizes.
+    /// Updated on a 300-second TTL cache to avoid expensive full-prefix scans
+    /// on every metrics scrape. RocksDB nodes can replace this with
+    /// `property_int_value_cf` calls for exact SST file sizes.
     pub storage_cf_size: GaugeVec,
     registry: Registry,
 }

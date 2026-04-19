@@ -228,8 +228,29 @@ async fn prover_worker(
                 (ev, false)
             }
             Ok((Ok(proof), prove_elapsed)) => {
-                let serialized = serde_json::to_vec(&proof).unwrap_or_default();
-                let proof_bytes = serialized.len();
+                // Treat serialization failure as a proof error — don't report ok=true
+                // with 0 proof_bytes, which would hide failures and skew compression ratios.
+                let proof_bytes = match serde_json::to_vec(&proof) {
+                    Ok(bytes) => bytes.len(),
+                    Err(e) => {
+                        let ev = ProofEvent {
+                            prover_id,
+                            batch_size,
+                            batch_root: 0,
+                            prove_ms: prove_elapsed.as_secs_f64() * 1000.0,
+                            verify_us: 0.0,
+                            proof_bytes: 0,
+                            ok: false,
+                            error_msg: format!("serialize: {e}"),
+                            elapsed_secs,
+                            block_number,
+                        };
+                        if tx.send(CoordMsg::Proof(ev)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
 
                 // Extract batch_root for L2 aggregation.
                 let batch_root = u128::from_le_bytes(proof.batch_root_bytes);
