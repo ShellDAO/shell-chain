@@ -7,7 +7,7 @@ mod transaction;
 mod witness;
 
 pub use account::Account;
-pub use block::{Block, BlockHeader};
+pub use block::{Block, BlockHeader, StrippedBlock};
 pub use fee::{
     calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, miner_tip,
     BLOB_BASE_FEE_UPDATE_FRACTION, INITIAL_BASE_FEE, MIN_BLOB_BASE_FEE, TARGET_BLOB_GAS_PER_BLOCK,

@@ -1,8 +1,10 @@
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
-use shell_crypto::PQSignature;
+use shell_crypto::{PQSignature, SignatureType};
 use shell_primitives::{Address, Bytes, ShellHash};
 
+use crate::transaction::PubkeyMode;
+use crate::witness::{StrippedTransaction, TxWitness, WitnessBundle};
 use crate::SignedTransaction;
 
 /// Block header.
@@ -346,6 +348,175 @@ impl Decodable for Block {
     }
 }
 
+// ── StrippedBlock ─────────────────────────────────────────────────────────────
+
+/// A block body with PQ signatures stripped out (Phase B storage format).
+///
+/// Stored at `b/<hash>` — contains the block header, stripped transaction
+/// payloads (no signatures/pubkeys), and the proposer seal.  PQ witness
+/// material lives in a parallel [`WitnessBundle`] at `w/<hash>`.
+///
+/// ## Wire encoding (RLP)
+/// Same structure as [`Block`] but `transactions` is a list of
+/// [`StrippedTransaction`] instead of [`SignedTransaction`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrippedBlock {
+    pub header: BlockHeader,
+    pub transactions: Vec<StrippedTransaction>,
+    /// PoA proposer seal — kept in the stripped body (not a tx witness).
+    pub proposer_seal: Option<PQSignature>,
+}
+
+impl StrippedBlock {
+    /// Split a full [`Block`] into a [`StrippedBlock`] and its [`WitnessBundle`].
+    ///
+    /// All PQ signature material is moved into the bundle; the stripped block
+    /// retains only transaction payloads (from + tx fields).
+    pub fn split(block: &Block) -> (Self, WitnessBundle) {
+        let mut stripped_txs = Vec::with_capacity(block.transactions.len());
+        let mut witnesses = Vec::with_capacity(block.transactions.len());
+
+        for tx in &block.transactions {
+            stripped_txs.push(StrippedTransaction::new(tx.from, tx.tx.clone()));
+            let pubkey = match &tx.pubkey_mode {
+                PubkeyMode::Embedded(pk) => Some(pk.clone()),
+                PubkeyMode::Reference => None,
+            };
+            witnesses.push(TxWitness {
+                signature: tx.signature.clone(),
+                pubkey,
+            });
+        }
+
+        let stripped = Self {
+            header: block.header.clone(),
+            transactions: stripped_txs,
+            proposer_seal: block.proposer_seal.clone(),
+        };
+        (stripped, WitnessBundle::new(witnesses))
+    }
+
+    /// Reconstruct a full [`Block`] from a [`StrippedBlock`] and an optional [`WitnessBundle`].
+    ///
+    /// If `bundle` is `None` (block is STARK-compressed and witnesses were pruned),
+    /// the returned transactions carry empty stub signatures so callers can still
+    /// read transaction payloads (from / to / value / etc.).
+    pub fn into_block(self, bundle: Option<WitnessBundle>) -> Block {
+        let transactions = match bundle {
+            Some(b) => self
+                .transactions
+                .into_iter()
+                .zip(b.witnesses)
+                .map(|(st, w)| {
+                    if let Some(pk) = w.pubkey {
+                        SignedTransaction::with_pubkey(st.from, st.tx, w.signature, pk)
+                    } else {
+                        SignedTransaction::new(st.from, st.tx, w.signature)
+                    }
+                })
+                .collect(),
+            None => {
+                // Witnesses pruned after STARK proof acceptance: return stub sigs.
+                let stub_sig =
+                    PQSignature { sig_type: SignatureType::Dilithium3, data: Vec::new() };
+                self.transactions
+                    .into_iter()
+                    .map(|st| SignedTransaction::new(st.from, st.tx, stub_sig.clone()))
+                    .collect()
+            }
+        };
+        Block { header: self.header, transactions, proposer_seal: self.proposer_seal }
+    }
+
+    fn rlp_fields_len(&self) -> usize {
+        let txs_payload: usize = self.transactions.iter().map(|t| t.length()).sum();
+        let txs_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: txs_payload,
+        }
+        .length()
+        .saturating_add(txs_payload);
+        let seal_len = match &self.proposer_seal {
+            Some(seal) => seal.length(),
+            None => 1,
+        };
+        self.header
+            .length()
+            .saturating_add(txs_list_len)
+            .saturating_add(seal_len)
+    }
+}
+
+impl Encodable for StrippedBlock {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.rlp_fields_len(),
+        };
+        header.encode(out);
+        self.header.encode(out);
+        let txs_payload: usize = self.transactions.iter().map(|t| t.length()).sum();
+        alloy_rlp::Header { list: true, payload_length: txs_payload }.encode(out);
+        for tx in &self.transactions {
+            tx.encode(out);
+        }
+        match &self.proposer_seal {
+            Some(seal) => seal.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+    }
+
+    fn length(&self) -> usize {
+        let payload = self.rlp_fields_len();
+        alloy_rlp::Header { list: true, payload_length: payload }.length().saturating_add(payload)
+    }
+}
+
+impl Decodable for StrippedBlock {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+        let end = remaining.saturating_sub(header.payload_length);
+
+        let block_header = BlockHeader::decode(buf)?;
+
+        let txs_header = alloy_rlp::Header::decode(buf)?;
+        if !txs_header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let mut transactions = Vec::new();
+        let txs_end = buf.len().saturating_sub(txs_header.payload_length);
+        while buf.len() > txs_end {
+            transactions.push(StrippedTransaction::decode(buf)?);
+        }
+
+        let proposer_seal = if buf.len() > end && buf.first().copied().unwrap_or(0) == 0x80 {
+            let _ = alloy_rlp::Header::decode_bytes(buf, false)?;
+            None
+        } else if buf.len() > end {
+            Some(PQSignature::decode(buf)?)
+        } else {
+            None
+        };
+
+        let consumed = remaining.saturating_sub(buf.len());
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+
+        Ok(Self { header: block_header, transactions, proposer_seal })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +699,109 @@ mod tests {
         );
         let decoded: BlockHeader = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.witness_root, header.witness_root);
+    }
+
+    // ── StrippedBlock tests ───────────────────────────────────────────────────
+
+    fn make_signed_tx() -> SignedTransaction {
+        use shell_crypto::{DilithiumSigner, Signer};
+        use shell_primitives::{Address, U256};
+        use crate::transaction::Transaction;
+
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"test").unwrap();
+        let tx = Transaction {
+            chain_id: 1,
+            nonce: 0,
+            to: Some(Address::from([0xBB; 20])),
+            value: U256::from(42u64),
+            data: shell_primitives::Bytes::default(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000,
+            max_priority_fee_per_gas: 1_000,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        SignedTransaction::with_pubkey(Address::from([0xAA; 20]), tx, sig, pk)
+    }
+
+    #[test]
+    fn stripped_block_rlp_roundtrip_empty() {
+        let stripped = StrippedBlock {
+            header: sample_header(),
+            transactions: vec![],
+            proposer_seal: None,
+        };
+        let mut buf = Vec::new();
+        stripped.encode(&mut buf);
+        let decoded = StrippedBlock::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(decoded.header, stripped.header);
+        assert!(decoded.transactions.is_empty());
+    }
+
+    #[test]
+    fn stripped_block_split_preserves_tx_payload() {
+        let signed = make_signed_tx();
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![signed.clone()],
+            proposer_seal: None,
+        };
+
+        let (stripped, bundle) = StrippedBlock::split(&block);
+
+        assert_eq!(stripped.transactions.len(), 1);
+        assert_eq!(bundle.witnesses.len(), 1);
+        // Sender and tx fields preserved in stripped body
+        assert_eq!(stripped.transactions[0].from, signed.from);
+        assert_eq!(stripped.transactions[0].tx, signed.tx);
+        // Witness carries the signature and pubkey
+        assert!(bundle.witnesses[0].has_pubkey());
+    }
+
+    #[test]
+    fn stripped_block_reconstruct_full_roundtrip() {
+        let signed = make_signed_tx();
+        let original = Block {
+            header: sample_header(),
+            transactions: vec![signed],
+            proposer_seal: None,
+        };
+
+        let (stripped, bundle) = StrippedBlock::split(&original);
+        let reconstructed = stripped.into_block(Some(bundle));
+
+        assert_eq!(reconstructed.header, original.header);
+        assert_eq!(reconstructed.transactions.len(), 1);
+        assert_eq!(reconstructed.transactions[0].from, original.transactions[0].from);
+        assert_eq!(reconstructed.transactions[0].tx, original.transactions[0].tx);
+        assert_eq!(
+            reconstructed.transactions[0].signature,
+            original.transactions[0].signature
+        );
+    }
+
+    #[test]
+    fn stripped_block_no_witness_returns_stub_sig() {
+        let signed = make_signed_tx();
+        let original = Block {
+            header: sample_header(),
+            transactions: vec![signed.clone()],
+            proposer_seal: None,
+        };
+
+        let (stripped, _bundle) = StrippedBlock::split(&original);
+        // Reconstruct without witness (simulates STARK-compressed block)
+        let stub_block = stripped.into_block(None);
+
+        assert_eq!(stub_block.transactions.len(), 1);
+        // Payload preserved
+        assert_eq!(stub_block.transactions[0].from, signed.from);
+        assert_eq!(stub_block.transactions[0].tx, signed.tx);
+        // Signature is an empty stub
+        assert!(stub_block.transactions[0].signature.data.is_empty());
     }
 }

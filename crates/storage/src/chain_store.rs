@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
-use shell_core::{Block, BlockHeader, TransactionReceipt};
+use shell_core::{Block, BlockHeader, StrippedBlock, TransactionReceipt};
 use shell_primitives::{Address, ShellHash};
 
 use crate::{KvStore, StorageError};
@@ -91,6 +91,8 @@ fn decode_versioned<T: Decodable + serde::de::DeserializeOwned>(
 mod prefix {
     pub const HEADER_BY_HASH: &[u8] = b"h/";
     pub const BODY_BY_HASH: &[u8] = b"b/";
+    /// Witness bundle (PQ signatures) key prefix — separate from body.
+    pub const WITNESS_BY_HASH: &[u8] = b"w/";
     pub const HASH_BY_NUMBER: &[u8] = b"n/";
     pub const RECEIPTS_BY_HASH: &[u8] = b"r/";
     pub const TX_INDEX: &[u8] = b"t/";
@@ -128,6 +130,10 @@ impl<S: KvStore> ChainStore<S> {
 
     fn body_key(hash: &ShellHash) -> Vec<u8> {
         [prefix::BODY_BY_HASH, hash.as_bytes()].concat()
+    }
+
+    fn witness_key(hash: &ShellHash) -> Vec<u8> {
+        [prefix::WITNESS_BY_HASH, hash.as_bytes()].concat()
     }
 
     fn number_key(number: u64) -> Vec<u8> {
@@ -170,7 +176,13 @@ impl<S: KvStore> ChainStore<S> {
 
     // ── Block operations ───────────────────────────────────────
 
-    /// Store a block (header + body) and update the transaction index.
+    /// Store a block — split into a stripped body (`b/<hash>`) and a witness
+    /// bundle (`w/<hash>`) — and update the transaction index.
+    ///
+    /// The stripped body contains the header and transaction payloads (from /
+    /// to / value / etc.) but **not** PQ signatures or public keys.  The
+    /// witness bundle contains all PQ cryptographic material for the block's
+    /// transactions in parallel order.
     ///
     /// Does **not** update HEAD or the canonical number→hash index.
     /// Callers must explicitly call [`set_canonical`] and [`set_head`]
@@ -184,9 +196,20 @@ impl<S: KvStore> ChainStore<S> {
         self.store
             .put(&Self::header_key(&block_hash), &header_bytes)?;
 
-        // Store body (full block RLP)
-        let body_bytes = encode_rlp(block);
+        // Split block into stripped body + witness bundle and store separately.
+        let (stripped, bundle) = StrippedBlock::split(block);
+        let body_bytes = encode_rlp(&stripped);
         self.store.put(&Self::body_key(&block_hash), &body_bytes)?;
+
+        // Only persist witness bundle when there are transactions to witness.
+        // Empty blocks have no PQ material, so omitting the entry is correct
+        // and allows WitnessPruner to distinguish "no bundle" from "pruned".
+        if !bundle.is_empty() {
+            let mut witness_buf = Vec::new();
+            bundle.encode(&mut witness_buf);
+            self.store
+                .put(&Self::witness_key(&block_hash), &witness_buf)?;
+        }
 
         // Transaction → (block_hash, tx_index) mapping + address index
         for (i, tx) in block.transactions.iter().enumerate() {
@@ -226,13 +249,27 @@ impl<S: KvStore> ChainStore<S> {
         self.store.delete(&Self::number_key(number))
     }
 
-    /// Delete the block body for the given block hash.
+    /// Delete the stripped block body for the given block hash.
     ///
-    /// The block header and canonical mapping are preserved; only the
-    /// transaction list (the bulk of the data) is removed.  This is the
-    /// EIP-4444-style body expiry operation.
+    /// The block header, witness bundle, and canonical mapping are preserved;
+    /// only the stripped transaction payloads are removed.
     pub fn delete_body(&self, hash: &ShellHash) -> Result<(), StorageError> {
         self.store.delete(&Self::body_key(hash))
+    }
+
+    /// Delete the witness bundle (PQ signatures) for the given block hash.
+    ///
+    /// Called after a [`ProofAmendment`] (STARK proof) is accepted for the
+    /// block, replacing the individual signatures with a single aggregate proof.
+    /// The stripped body at `b/<hash>` is preserved so transaction payloads
+    /// remain readable.
+    pub fn delete_witness_bundle(&self, hash: &ShellHash) -> Result<(), StorageError> {
+        self.store.delete(&Self::witness_key(hash))
+    }
+
+    /// Returns `true` if a witness bundle is stored for the given block hash.
+    pub fn has_witness_bundle(&self, hash: &ShellHash) -> Result<bool, StorageError> {
+        Ok(self.store.get(&Self::witness_key(hash))?.is_some())
     }
 
     /// Set the HEAD pointer to the given block hash.
@@ -241,14 +278,28 @@ impl<S: KvStore> ChainStore<S> {
     }
 
     /// Get a block by its hash.
+    ///
+    /// Reads the stripped body (`b/<hash>`) and the witness bundle
+    /// (`w/<hash>`) and reassembles a full [`Block`].  If the witness bundle
+    /// has already been pruned (STARK-compressed block), the returned
+    /// transactions carry empty stub signatures but transaction payloads
+    /// (from / to / value / etc.) remain accessible.
     pub fn get_block_by_hash(&self, hash: &ShellHash) -> Result<Option<Block>, StorageError> {
-        match self.store.get(&Self::body_key(hash))? {
-            Some(data) => {
-                let block: Block = decode_versioned(&data)?;
-                Ok(Some(block))
+        let stripped: StrippedBlock = match self.store.get(&Self::body_key(hash))? {
+            Some(data) => decode_versioned(&data)?,
+            None => return Ok(None),
+        };
+
+        let bundle = match self.store.get(&Self::witness_key(hash))? {
+            Some(bytes) => {
+                let b = shell_core::WitnessBundle::decode(&mut bytes.as_slice())
+                    .map_err(|e| StorageError::Codec(format!("witness decode: {e}")))?;
+                Some(b)
             }
-            None => Ok(None),
-        }
+            None => None,
+        };
+
+        Ok(Some(stripped.into_block(bundle)))
     }
 
     /// Get a block by its number.
@@ -648,6 +699,10 @@ impl<S: KvStore> WitnessStore<S> {
         Self { store }
     }
 
+    fn key(block_hash: &ShellHash) -> Vec<u8> {
+        [b"w/".as_ref(), block_hash.as_bytes()].concat()
+    }
+
     /// Store a [`WitnessBundle`] for a block identified by its hash.
     pub fn put_bundle(
         &self,
@@ -656,7 +711,7 @@ impl<S: KvStore> WitnessStore<S> {
     ) -> Result<(), StorageError> {
         let mut buf = Vec::new();
         bundle.encode(&mut buf);
-        self.store.put(block_hash.as_bytes(), &buf)
+        self.store.put(&Self::key(block_hash), &buf)
     }
 
     /// Retrieve the [`WitnessBundle`] for a block, if stored.
@@ -664,7 +719,7 @@ impl<S: KvStore> WitnessStore<S> {
         &self,
         block_hash: &ShellHash,
     ) -> Result<Option<shell_core::WitnessBundle>, StorageError> {
-        match self.store.get(block_hash.as_bytes())? {
+        match self.store.get(&Self::key(block_hash))? {
             None => Ok(None),
             Some(bytes) => {
                 let bundle = shell_core::WitnessBundle::decode(&mut bytes.as_slice())
@@ -676,12 +731,12 @@ impl<S: KvStore> WitnessStore<S> {
 
     /// Delete the [`WitnessBundle`] for a block (witness pruning, Phase D1).
     pub fn delete_bundle(&self, block_hash: &ShellHash) -> Result<(), StorageError> {
-        self.store.delete(block_hash.as_bytes())
+        self.store.delete(&Self::key(block_hash))
     }
 
     /// Returns `true` if a witness bundle exists for the given block hash.
     pub fn has_bundle(&self, block_hash: &ShellHash) -> Result<bool, StorageError> {
-        Ok(self.store.get(block_hash.as_bytes())?.is_some())
+        Ok(self.store.get(&Self::key(block_hash))?.is_some())
     }
 }
 
@@ -1603,8 +1658,8 @@ mod tests {
 
     #[test]
     fn witness_store_independent_from_chain_store() {
-        // Witness and chain stores use the same MemoryDb but different key spaces
-        // (witness keys = raw 32-byte block hash; chain keys = prefixed).
+        // Witness and chain stores use the same MemoryDb but different key spaces.
+        // WitnessStore uses "w/<hash>"; ChainStore body uses "b/<hash>".
         let db = Arc::new(MemoryDb::default());
         let cs = ChainStore::new(Arc::clone(&db));
         let ws = WitnessStore::new(Arc::clone(&db));
@@ -1618,5 +1673,128 @@ mod tests {
         // Both can be retrieved independently
         assert!(cs.get_block_by_hash(&hash).unwrap().is_some());
         assert!(ws.get_bundle(&hash).unwrap().is_some());
+    }
+
+    // ── Phase B split / round-trip tests ──────────────────────────────────────
+
+    fn make_block_with_txs(number: u64) -> Block {
+        use shell_core::{SignedTransaction, Transaction, PubkeyMode as _};
+        use shell_crypto::{DilithiumSigner, Signer};
+        use shell_primitives::{Address, U256};
+
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"payload").unwrap();
+        let tx = Transaction {
+            chain_id: 1,
+            nonce: number,
+            to: Some(Address::from([0xBB; 20])),
+            value: U256::from(number * 1000),
+            data: Bytes::default(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000,
+            max_priority_fee_per_gas: 1_000,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signed = SignedTransaction::with_pubkey(Address::from([0xAA; 20]), tx, sig, pk);
+        Block {
+            header: BlockHeader {
+                parent_hash: ShellHash::ZERO,
+                state_root: ShellHash::ZERO,
+                transactions_root: ShellHash::ZERO,
+                receipts_root: ShellHash::ZERO,
+                logs_bloom: Bytes::new(),
+                number,
+                gas_limit: 30_000_000,
+                gas_used: 21_000,
+                timestamp: 1700000000 + number,
+                extra_data: Bytes::new(),
+                proposer: Address::ZERO,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: 0,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![signed],
+            proposer_seal: None,
+        }
+    }
+
+    #[test]
+    fn put_block_stores_separate_body_and_witness_keys() {
+        // After split: b/<hash> exists, w/<hash> exists, and they are distinct.
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(0);
+        let hash = block.hash();
+
+        cs.put_block(&block).unwrap();
+
+        let body_key = [b"b/".as_ref(), hash.as_bytes()].concat();
+        let wit_key = [b"w/".as_ref(), hash.as_bytes()].concat();
+
+        assert!(db.get(&body_key).unwrap().is_some(), "b/<hash> should exist");
+        assert!(db.get(&wit_key).unwrap().is_some(), "w/<hash> should exist");
+    }
+
+    #[test]
+    fn get_block_reconstructs_tx_payload() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db);
+        let block = make_block_with_txs(1);
+        let hash = block.hash();
+        let original_from = block.transactions[0].from;
+        let original_value = block.transactions[0].tx.value;
+
+        cs.put_block(&block).unwrap();
+        let loaded = cs.get_block_by_hash(&hash).unwrap().unwrap();
+
+        assert_eq!(loaded.transactions.len(), 1);
+        assert_eq!(loaded.transactions[0].from, original_from);
+        assert_eq!(loaded.transactions[0].tx.value, original_value);
+    }
+
+    #[test]
+    fn delete_witness_returns_stub_sig_on_get() {
+        // After deleting the witness bundle (STARK proof accepted),
+        // get_block_by_hash still returns the block with payload intact,
+        // but signatures are empty stubs.
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db);
+        let block = make_block_with_txs(2);
+        let hash = block.hash();
+        let original_from = block.transactions[0].from;
+
+        cs.put_block(&block).unwrap();
+        cs.delete_witness_bundle(&hash).unwrap();
+
+        let loaded = cs.get_block_by_hash(&hash).unwrap().unwrap();
+        assert_eq!(loaded.transactions.len(), 1);
+        assert_eq!(loaded.transactions[0].from, original_from, "from preserved");
+        assert!(
+            loaded.transactions[0].signature.data.is_empty(),
+            "stub sig after witness deletion"
+        );
+    }
+
+    #[test]
+    fn empty_block_has_no_witness_key() {
+        // Empty blocks (no txs) should NOT write a w/<hash> key.
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = empty_block(99);
+        let hash = block.hash();
+
+        cs.put_block(&block).unwrap();
+
+        let wit_key = [b"w/".as_ref(), hash.as_bytes()].concat();
+        assert!(db.get(&wit_key).unwrap().is_none(), "no w/<hash> for empty block");
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
     }
 }
