@@ -963,6 +963,11 @@ impl NetworkService for Libp2pNetwork {
             | NetworkMessage::Pong => TopicKind::Blocks,
             NetworkMessage::NewTransaction(_) => TopicKind::Transactions,
             NetworkMessage::NewAttestation(_) => TopicKind::Attestation,
+            NetworkMessage::ProofAmendment { .. }
+            | NetworkMessage::ProofAck { .. }
+            | NetworkMessage::EquivocationEvidence(_)
+            | NetworkMessage::ProofChallenge(_)
+            | NetworkMessage::ProofChallengeResponse(_) => TopicKind::Blocks,
         };
 
         let data =
