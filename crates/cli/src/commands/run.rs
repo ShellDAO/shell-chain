@@ -569,6 +569,11 @@ async fn run_with_store<S: KvStore + 'static>(
             } else {
                 eprintln!("   Pruning:     archive (keep all)");
             }
+            if args.body_retention > 0 {
+                eprintln!("   Bodies:      keep last {} blocks", args.body_retention);
+            } else {
+                eprintln!("   Bodies:      archive (keep all)");
+            }
             if resumed {
                 eprintln!("   Mode:        resumed from persistent storage");
             }
@@ -625,6 +630,11 @@ async fn run_with_store<S: KvStore + 'static>(
             eprintln!("   Pruning:     keep last {} state roots", args.pruning);
         } else {
             eprintln!("   Pruning:     archive (keep all)");
+        }
+        if args.body_retention > 0 {
+            eprintln!("   Bodies:      keep last {} blocks", args.body_retention);
+        } else {
+            eprintln!("   Bodies:      archive (keep all)");
         }
         if resumed {
             eprintln!("   Mode:        resumed from persistent storage");
