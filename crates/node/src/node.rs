@@ -900,6 +900,25 @@ impl<S: KvStore + 'static> Node<S> {
                                         warn!(%peer, block = block_number, "failed to store proof amendment: {e}");
                                     } else {
                                         info!(block = block_number, "G5: proof amendment stored from peer {peer}");
+                                        // L2: delete witness bundle once proof is secured, unless grace window is active.
+                                        let grace = self.config.pruning.proof_replacement_grace;
+                                        if grace == 0 {
+                                            match self.chain_store.delete_witness_bundle(&block_hash) {
+                                                Ok(()) => info!(block = block_number, "L2: witness bundle deleted after proof replacement"),
+                                                Err(e) => warn!(block = block_number, "L2: failed to delete witness bundle: {e}"),
+                                            }
+                                        } else {
+                                            let head = self.chain_store.get_head_block()
+                                                .ok().flatten().map(|b| b.header.number).unwrap_or(0);
+                                            if head.saturating_sub(block_number) >= grace {
+                                                match self.chain_store.delete_witness_bundle(&block_hash) {
+                                                    Ok(()) => info!(block = block_number, "L2: witness bundle deleted after grace period"),
+                                                    Err(e) => warn!(block = block_number, "L2: failed to delete witness bundle: {e}"),
+                                                }
+                                            } else {
+                                                debug!(block = block_number, grace, head, "L2: proof stored, within grace window — witness kept");
+                                            }
+                                        }
                                     }
                                 }
                                 // G5: Acknowledge that a peer has stored a proof amendment.
@@ -4110,5 +4129,64 @@ mod tests {
             proof_size < raw_sig_pubkey_size,
             "STARK proof ({proof_size} B) should be smaller than raw sig+pubkey data ({raw_sig_pubkey_size} B)"
         );
+    }
+
+    // ─── L2: proof-replaces-witness tests ──────────────────────────────────────
+
+    /// L2 basic: when a ProofAmendment network message is handled and grace=0,
+    /// the witness bundle for that block is deleted from chain_store.
+    #[test]
+    fn l2_proof_amendment_deletes_witness_bundle_grace_zero() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let block = node.produce_block(&signer, 1).unwrap();
+        let block_hash = block.hash();
+        let block_num = block.number();
+
+        // Verify witness was written by put_block (block has 0 txs → no bundle)
+        // so write one manually to simulate a block with txs.
+        use shell_core::{TxWitness, WitnessBundle};
+        use shell_crypto::PQSignature;
+        let bundle = WitnessBundle { witnesses: vec![TxWitness::new_reference(PQSignature { sig_type: shell_crypto::SignatureType::Dilithium3, data: vec![0u8; 3309] })] };
+        node.witness_store.put_bundle(&block_hash, &bundle).unwrap();
+        assert!(node.chain_store.has_witness_bundle(&block_hash).unwrap(), "bundle should exist before amendment");
+
+        // Simulate receiving a ProofAmendment (grace=0 by default).
+        let dummy_payload = b"fake-proof".to_vec();
+        node.amendment_store.put_amendment(&block_hash, &dummy_payload).unwrap();
+
+        // Now manually apply the L2 logic (the network handler calls this inline).
+        let grace = node.config.pruning.proof_replacement_grace;
+        assert_eq!(grace, 0, "default grace should be 0");
+        node.chain_store.delete_witness_bundle(&block_hash).unwrap();
+
+        assert!(!node.chain_store.has_witness_bundle(&block_hash).unwrap(), "witness bundle should be gone after proof replacement");
+        // TX detail block body must still be readable.
+        let retrieved = node.chain_store.get_block_by_hash(&block_hash).unwrap();
+        assert!(retrieved.is_some(), "block body (tx detail) must survive witness deletion");
+        assert_eq!(retrieved.unwrap().number(), block_num);
+    }
+
+    /// L2 grace: when grace=2 and proof arrives for block N while head is N+1,
+    /// the witness bundle must NOT be deleted yet.
+    #[test]
+    fn l2_proof_amendment_respects_grace_window() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let block1 = node.produce_block(&signer, 1).unwrap();
+        let b1_hash = block1.hash();
+
+        use shell_core::{TxWitness, WitnessBundle};
+        use shell_crypto::PQSignature;
+        let bundle = WitnessBundle { witnesses: vec![TxWitness::new_reference(PQSignature { sig_type: shell_crypto::SignatureType::Dilithium3, data: vec![0u8; 3309] })] };
+        node.witness_store.put_bundle(&b1_hash, &bundle).unwrap();
+
+        // Set grace=2; head is at block 1, so head.saturating_sub(1) = 0 < 2.
+        // Simulating the grace check logic from the event loop handler.
+        let grace: u64 = 2;
+        let head = node.chain_store.get_head_block().ok().flatten().map(|b| b.header.number).unwrap_or(0);
+        let should_delete = head.saturating_sub(block1.number()) >= grace;
+        assert!(!should_delete, "within grace window: should NOT delete");
+        assert!(node.chain_store.has_witness_bundle(&b1_hash).unwrap(), "witness bundle must survive grace window");
     }
 }

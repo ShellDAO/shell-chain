@@ -24,6 +24,13 @@ pub struct PruningConfig {
     /// `0` means archive mode — no bodies are ever pruned.
     /// Default: 512 (matches `DEFAULT_BODY_RETENTION`).
     pub body_retention: u64,
+    /// Minimum number of blocks to wait after a `ProofAmendment` is stored
+    /// before the corresponding `WitnessBundle` (`w/<hash>`) is deleted.
+    ///
+    /// `0` (default) means delete immediately once the proof lands.
+    /// A non-zero value keeps signatures available for that many extra blocks
+    /// (useful for forensic / audit windows in production).
+    pub proof_replacement_grace: u64,
 }
 
 impl PruningConfig {
@@ -33,6 +40,7 @@ impl PruningConfig {
             keep_recent,
             witness_retention: DEFAULT_WITNESS_RETENTION,
             body_retention: DEFAULT_BODY_RETENTION,
+            proof_replacement_grace: 0,
         }
     }
 
