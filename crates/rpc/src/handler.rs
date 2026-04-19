@@ -777,6 +777,16 @@ fn block_to_rpc(block: &Block, full_txs: bool) -> RpcBlock {
         parent_beacon_block_root: format!("{:?}", block.header.parent_beacon_block_root),
         blob_gas_used: hex_u64(block.header.blob_gas_used),
         excess_blob_gas: hex_u64(block.header.excess_blob_gas),
+        sig_aggregate_proof_size: block
+            .header
+            .sig_aggregate_proof
+            .as_ref()
+            .map(|p| p.len() as u64),
+        sig_aggregate_proof: block
+            .header
+            .sig_aggregate_proof
+            .as_ref()
+            .map(|p| hex_bytes(p.as_ref())),
     }
 }
 
@@ -984,6 +994,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     parent_beacon_block_root: format!("{:?}", ShellHash::ZERO),
                     blob_gas_used: hex_u64(0),
                     excess_blob_gas: hex_u64(0),
+                    sig_aggregate_proof: None,
+                    sig_aggregate_proof_size: None,
                 };
                 Ok(Some(pending_block))
             }
