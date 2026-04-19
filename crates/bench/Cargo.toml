@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "bench_compression"
 harness = false
+
+[[bench]]
+name = "bench_block_split"
+harness = false

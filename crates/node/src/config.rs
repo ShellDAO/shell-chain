@@ -147,6 +147,17 @@ impl NodeConfig {
     /// `network_type`, so callers only need to override what differs.
     pub fn for_network(authority: Address, network_type: NetworkType) -> Self {
         let params = network_type.default_params();
+        // ops-defaults: STARK-enabled nodes default to witness_retention=0
+        // (witnesses are replaced by proofs immediately after proof commit).
+        // Bodies are always retained in archive mode.
+        let pruning = if params.stark_aggregation {
+            PruningConfig {
+                witness_retention: 0,
+                ..PruningConfig::default()
+            }
+        } else {
+            PruningConfig::default()
+        };
         Self {
             chain_id: 1337,
             network_type,
@@ -164,7 +175,7 @@ impl NodeConfig {
             proposer_address: Some(authority),
             block_time_ms: params.block_time_ms,
             data_dir: "shell-data".into(),
-            pruning: PruningConfig::default(),
+            pruning,
             metrics: MetricsConfig::default(),
             max_idle_interval_ms: 0,
             state_cache_size_mb: 64,

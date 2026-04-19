@@ -122,6 +122,21 @@ impl<S: KvStore> ChainStore<S> {
         &self.store
     }
 
+    /// Approximate total byte size of all values stored under a given key prefix.
+    ///
+    /// Scans the prefix and sums `key.len() + value.len()` for each entry.
+    /// This is an O(n) operation and should only be called on low-frequency
+    /// paths (e.g., the 10-second metrics tick).  Returns `Ok(0)` for empty
+    /// prefixes; propagates storage errors.
+    pub fn approximate_prefix_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
+        let entries = self.store.scan_prefix(prefix)?;
+        let total: u64 = entries
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum();
+        Ok(total)
+    }
+
     // ── Key helpers ────────────────────────────────────────────
 
     fn header_key(hash: &ShellHash) -> Vec<u8> {
@@ -270,6 +285,58 @@ impl<S: KvStore> ChainStore<S> {
     /// Returns `true` if a witness bundle is stored for the given block hash.
     pub fn has_witness_bundle(&self, hash: &ShellHash) -> Result<bool, StorageError> {
         Ok(self.store.get(&Self::witness_key(hash))?.is_some())
+    }
+
+    // ── L3: Trie node reference counting ───────────────────────────────────────
+    //
+    // Key format: `refs/<node_hash>` → little-endian u32 (reference count).
+    // The count is incremented each time a trie node is written and decremented
+    // when it is overwritten or explicitly evicted.  A node is eligible for
+    // physical deletion once its count reaches 0.
+    //
+    // This is the foundation of L3 state-trie pruning; actual trie-node
+    // eviction is gated behind `PruningConfig::state_pruning_experimental`.
+
+    fn trie_refcount_key(node_hash: &ShellHash) -> Vec<u8> {
+        [b"refs/".as_ref(), node_hash.as_bytes()].concat()
+    }
+
+    /// Return the current reference count for a trie node (0 if not present).
+    pub fn trie_node_refcount(&self, node_hash: &ShellHash) -> Result<u32, StorageError> {
+        match self.store.get(&Self::trie_refcount_key(node_hash))? {
+            None => Ok(0),
+            Some(bytes) if bytes.len() == 4 => Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            Some(bytes) => Err(StorageError::Codec(format!(
+                "trie refcount: expected 4 bytes, got {}",
+                bytes.len()
+            ))),
+        }
+    }
+
+    /// Increment the reference count for a trie node by 1.
+    ///
+    /// Called when a trie node is first written to storage.
+    pub fn trie_refcount_inc(&self, node_hash: &ShellHash) -> Result<u32, StorageError> {
+        let current = self.trie_node_refcount(node_hash)?;
+        let next = current.saturating_add(1);
+        self.store.put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
+        Ok(next)
+    }
+
+    /// Decrement the reference count for a trie node by 1.
+    ///
+    /// Returns the new count.  When the count reaches 0 the key is removed;
+    /// the caller may then delete the actual trie node (`t/<hash>`).
+    pub fn trie_refcount_dec(&self, node_hash: &ShellHash) -> Result<u32, StorageError> {
+        let current = self.trie_node_refcount(node_hash)?;
+        if current <= 1 {
+            self.store.delete(&Self::trie_refcount_key(node_hash))?;
+            Ok(0)
+        } else {
+            let next = current - 1;
+            self.store.put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
+            Ok(next)
+        }
     }
 
     /// Set the HEAD pointer to the given block hash.

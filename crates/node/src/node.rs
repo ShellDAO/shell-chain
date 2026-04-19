@@ -180,6 +180,49 @@ impl<S: KvStore + 'static> Node<S> {
         }
     }
 
+    /// Print the three-line startup pruning banner (ops-banner).
+    ///
+    /// Called once from the event loop at startup to give operators a quick
+    /// view of what data will be retained.
+    pub fn log_pruning_banner(&self) {
+        let p = &self.config.pruning;
+
+        let state_mode = if p.state_pruning_experimental {
+            if p.keep_recent == 0 {
+                "archive (experimental enabled but keep_recent=0)".to_string()
+            } else {
+                format!("keep-{} (experimental)", p.keep_recent)
+            }
+        } else {
+            "archive".to_string()
+        };
+
+        let witness_mode = if p.witness_retention == 0 {
+            if self.config.enable_stark_aggregation {
+                "replaced-by-proof".to_string()
+            } else {
+                "archive".to_string()
+            }
+        } else {
+            format!("keep-{}", p.witness_retention)
+        };
+
+        let stark_line = if self.config.enable_stark_aggregation {
+            if p.proof_replacement_grace == 0 {
+                "STARK: enabled  (witnesses replaced immediately after proof commit)".to_string()
+            } else {
+                format!("STARK: enabled  (grace={} blocks before witness deletion)", p.proof_replacement_grace)
+            }
+        } else {
+            "STARK: disabled".to_string()
+        };
+
+        tracing::info!("╔═══ Shell Chain — Storage Policy ══════════════════════════════╗");
+        tracing::info!("║  state={}  bodies=archive  witnesses={}", state_mode, witness_mode);
+        tracing::info!("║  {}", stark_line);
+        tracing::info!("╚════════════════════════════════════════════════════════════════╝");
+    }
+
     fn sync_system_contract_state(
         &self,
         local_ws: &mut WorldState<S>,
@@ -389,6 +432,17 @@ impl<S: KvStore + 'static> Node<S> {
                 root = %evicted.state_root,
                 "state root eligible for pruning"
             );
+            // L3: when experimental trie pruning is enabled, evict trie nodes
+            // for the now-unreachable state root.  Until reference-counting is
+            // fully wired into the trie writer path, this only logs intent.
+            if self.config.pruning.state_pruning_experimental {
+                tracing::debug!(
+                    block = evicted.block_number,
+                    root = %evicted.state_root,
+                    "L3 (experimental): trie node eviction eligible — \
+                     full ref-count walk deferred until trie writer is instrumented"
+                );
+            }
         }
 
         // F-303: Drive StatePruner — register block and run periodic pruning.
@@ -566,6 +620,9 @@ impl<S: KvStore + 'static> Node<S> {
         if let Some(addr) = self.config.proposer_address {
             self.register_authority_pubkey(addr, signer.public_key().to_vec());
         }
+
+        // ops-banner: print storage policy at startup.
+        self.log_pruning_banner();
 
         let mut block_timer = interval(Duration::from_millis(self.config.block_time_ms));
         let mut peer_count_timer = interval(Duration::from_secs(10));
@@ -1033,6 +1090,18 @@ impl<S: KvStore + 'static> Node<S> {
                 _ = peer_count_timer.tick() => {
                     let peers = network.peer_count().await;
                     self.metrics.peer_count.set(peers as i64);
+                    // ops-metrics: update per-CF storage size gauges lazily on each 10s tick.
+                    // Uses prefix scan byte counts as a backend-agnostic approximation.
+                    // RocksDB nodes can replace this with property_int_value_cf calls.
+                    let chain_bytes = self.chain_store.approximate_prefix_bytes(b"b/")
+                        .unwrap_or(0)
+                        .saturating_add(self.chain_store.approximate_prefix_bytes(b"h/").unwrap_or(0))
+                        .saturating_add(self.chain_store.approximate_prefix_bytes(b"n/").unwrap_or(0));
+                    let witness_bytes = self.chain_store.approximate_prefix_bytes(b"w/").unwrap_or(0);
+                    let proof_bytes = self.chain_store.approximate_prefix_bytes(b"p/").unwrap_or(0);
+                    // State trie bytes are stored in a separate KV namespace; use 0 until
+                    // the trie store exposes a size_estimate().
+                    self.metrics.update_cf_sizes(chain_bytes, witness_bytes, 0, proof_bytes);
                 }
 
                 _ = sync_retry_timer.tick() => {

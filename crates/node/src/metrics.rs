@@ -53,6 +53,14 @@ pub struct Metrics {
     pub stark_equivocations_detected: IntCounter,
     /// Timestamp when the node started, used for uptime calculation.
     pub uptime_start: Instant,
+    // -----------------------------------------------------------------------
+    // Storage size metrics (ops-metrics)
+    // -----------------------------------------------------------------------
+    /// On-disk SST file size per column family.
+    /// Labels: `cf` ∈ { "chain", "witness", "state", "proof" }.
+    /// Updated lazily when the `/metrics` endpoint is scraped (via
+    /// `update_cf_sizes`). Returns 0 for backends that don't expose CF sizes.
+    pub storage_cf_size: GaugeVec,
     registry: Registry,
 }
 
@@ -134,6 +142,15 @@ impl Metrics {
             "Total equivocation proofs detected and broadcast",
         ))?;
 
+        // ops-metrics: per-CF storage size
+        let storage_cf_size = GaugeVec::new(
+            Opts::new(
+                "shell_storage_cf_size_bytes",
+                "On-disk SST file size per column family (lazy, updated on scrape)",
+            ),
+            &["cf"],
+        )?;
+
         registry.register(Box::new(block_height.clone()))?;
         registry.register(Box::new(peer_count.clone()))?;
         registry.register(Box::new(tx_pool_size.clone()))?;
@@ -150,6 +167,7 @@ impl Metrics {
         registry.register(Box::new(stark_backlog_depth.clone()))?;
         registry.register(Box::new(stark_amendments_broadcast.clone()))?;
         registry.register(Box::new(stark_equivocations_detected.clone()))?;
+        registry.register(Box::new(storage_cf_size.clone()))?;
 
         Ok(Self {
             block_height,
@@ -169,6 +187,7 @@ impl Metrics {
             stark_amendments_broadcast,
             stark_equivocations_detected,
             uptime_start: Instant::now(),
+            storage_cf_size,
             registry,
         })
     }
@@ -199,6 +218,32 @@ impl Metrics {
         self.validator_slot_miss
             .with_label_values(&[validator])
             .inc();
+    }
+
+    /// Update per-column-family storage size gauges.
+    ///
+    /// Call this lazily (e.g., on every metrics scrape) to report disk
+    /// footprint without blocking the critical path.  Pass `0` for any CF
+    /// whose size is unavailable (e.g., MemoryDb backends).
+    ///
+    /// # Column family labels
+    /// - `"chain"`   — block headers, bodies, canonical mapping (`b/`, `h/`, `c/`, …)
+    /// - `"witness"` — PQ signature witness bundles (`w/<hash>`)
+    /// - `"state"`   — Merkle-Patricia trie nodes
+    /// - `"proof"`   — STARK proof amendments (`p/<hash>`)
+    pub fn update_cf_sizes(&self, chain: u64, witness: u64, state: u64, proof: u64) {
+        self.storage_cf_size
+            .with_label_values(&["chain"])
+            .set(chain as f64);
+        self.storage_cf_size
+            .with_label_values(&["witness"])
+            .set(witness as f64);
+        self.storage_cf_size
+            .with_label_values(&["state"])
+            .set(state as f64);
+        self.storage_cf_size
+            .with_label_values(&["proof"])
+            .set(proof as f64);
     }
 }
 

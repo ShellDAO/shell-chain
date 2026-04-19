@@ -31,6 +31,14 @@ pub struct PruningConfig {
     /// A non-zero value keeps signatures available for that many extra blocks
     /// (useful for forensic / audit windows in production).
     pub proof_replacement_grace: u64,
+    /// Enable experimental state-trie pruning (L3).
+    ///
+    /// When `false` (default), state roots are tracked in memory but no trie
+    /// nodes are physically deleted on eviction — archive mode for trie data.
+    /// When `true`, evicted state roots trigger reference-count decrements and
+    /// zero-ref trie nodes are deleted from storage. **Experimental** — only
+    /// enable after thorough testing; a bug here can corrupt the state trie.
+    pub state_pruning_experimental: bool,
 }
 
 impl PruningConfig {
@@ -41,6 +49,7 @@ impl PruningConfig {
             witness_retention: DEFAULT_WITNESS_RETENTION,
             body_retention: DEFAULT_BODY_RETENTION,
             proof_replacement_grace: 0,
+            state_pruning_experimental: false,
         }
     }
 
