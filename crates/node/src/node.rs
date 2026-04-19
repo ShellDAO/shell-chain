@@ -211,14 +211,21 @@ impl<S: KvStore + 'static> Node<S> {
             if p.proof_replacement_grace == 0 {
                 "STARK: enabled  (witnesses replaced immediately after proof commit)".to_string()
             } else {
-                format!("STARK: enabled  (grace={} blocks before witness deletion)", p.proof_replacement_grace)
+                format!(
+                    "STARK: enabled  (grace={} blocks before witness deletion)",
+                    p.proof_replacement_grace
+                )
             }
         } else {
             "STARK: disabled".to_string()
         };
 
         tracing::info!("╔═══ Shell Chain — Storage Policy ══════════════════════════════╗");
-        tracing::info!("║  state={}  bodies=archive  witnesses={}", state_mode, witness_mode);
+        tracing::info!(
+            "║  state={}  bodies=archive  witnesses={}",
+            state_mode,
+            witness_mode
+        );
         tracing::info!("║  {}", stark_line);
         tracing::info!("╚════════════════════════════════════════════════════════════════╝");
     }
@@ -4216,23 +4223,39 @@ mod tests {
         // so write one manually to simulate a block with txs.
         use shell_core::{TxWitness, WitnessBundle};
         use shell_crypto::PQSignature;
-        let bundle = WitnessBundle { witnesses: vec![TxWitness::new_reference(PQSignature { sig_type: shell_crypto::SignatureType::Dilithium3, data: vec![0u8; 3309] })] };
+        let bundle = WitnessBundle {
+            witnesses: vec![TxWitness::new_reference(PQSignature {
+                sig_type: shell_crypto::SignatureType::Dilithium3,
+                data: vec![0u8; 3309],
+            })],
+        };
         node.witness_store.put_bundle(&block_hash, &bundle).unwrap();
-        assert!(node.chain_store.has_witness_bundle(&block_hash).unwrap(), "bundle should exist before amendment");
+        assert!(
+            node.chain_store.has_witness_bundle(&block_hash).unwrap(),
+            "bundle should exist before amendment"
+        );
 
         // Simulate receiving a ProofAmendment (grace=0 by default).
         let dummy_payload = b"fake-proof".to_vec();
-        node.amendment_store.put_amendment(&block_hash, &dummy_payload).unwrap();
+        node.amendment_store
+            .put_amendment(&block_hash, &dummy_payload)
+            .unwrap();
 
         // Now manually apply the L2 logic (the network handler calls this inline).
         let grace = node.config.pruning.proof_replacement_grace;
         assert_eq!(grace, 0, "default grace should be 0");
         node.chain_store.delete_witness_bundle(&block_hash).unwrap();
 
-        assert!(!node.chain_store.has_witness_bundle(&block_hash).unwrap(), "witness bundle should be gone after proof replacement");
+        assert!(
+            !node.chain_store.has_witness_bundle(&block_hash).unwrap(),
+            "witness bundle should be gone after proof replacement"
+        );
         // TX detail block body must still be readable.
         let retrieved = node.chain_store.get_block_by_hash(&block_hash).unwrap();
-        assert!(retrieved.is_some(), "block body (tx detail) must survive witness deletion");
+        assert!(
+            retrieved.is_some(),
+            "block body (tx detail) must survive witness deletion"
+        );
         assert_eq!(retrieved.unwrap().number(), block_num);
     }
 
@@ -4247,15 +4270,29 @@ mod tests {
 
         use shell_core::{TxWitness, WitnessBundle};
         use shell_crypto::PQSignature;
-        let bundle = WitnessBundle { witnesses: vec![TxWitness::new_reference(PQSignature { sig_type: shell_crypto::SignatureType::Dilithium3, data: vec![0u8; 3309] })] };
+        let bundle = WitnessBundle {
+            witnesses: vec![TxWitness::new_reference(PQSignature {
+                sig_type: shell_crypto::SignatureType::Dilithium3,
+                data: vec![0u8; 3309],
+            })],
+        };
         node.witness_store.put_bundle(&b1_hash, &bundle).unwrap();
 
         // Set grace=2; head is at block 1, so head.saturating_sub(1) = 0 < 2.
         // Simulating the grace check logic from the event loop handler.
         let grace: u64 = 2;
-        let head = node.chain_store.get_head_block().ok().flatten().map(|b| b.header.number).unwrap_or(0);
+        let head = node
+            .chain_store
+            .get_head_block()
+            .ok()
+            .flatten()
+            .map(|b| b.header.number)
+            .unwrap_or(0);
         let should_delete = head.saturating_sub(block1.number()) >= grace;
         assert!(!should_delete, "within grace window: should NOT delete");
-        assert!(node.chain_store.has_witness_bundle(&b1_hash).unwrap(), "witness bundle must survive grace window");
+        assert!(
+            node.chain_store.has_witness_bundle(&b1_hash).unwrap(),
+            "witness bundle must survive grace window"
+        );
     }
 }

@@ -41,7 +41,12 @@ fn make_transfer_tx(nonce: u64) -> Transaction {
     }
 }
 
-fn make_signed_tx(signer: &DilithiumSigner, from: Address, nonce: u64, first: bool) -> SignedTransaction {
+fn make_signed_tx(
+    signer: &DilithiumSigner,
+    from: Address,
+    nonce: u64,
+    first: bool,
+) -> SignedTransaction {
     let tx = make_transfer_tx(nonce);
     let sig = signer.sign(tx.hash().0.as_slice()).unwrap();
     let pubkey = signer.public_key().to_vec();
@@ -109,7 +114,10 @@ fn post_proof_size(block: &Block) -> usize {
 
 fn print_size_table() {
     println!("\n╔══ Block Split Storage Sizes ═════════════════════════════════════╗");
-    println!("║  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}", "txs", "legacy", "split", "post-proof", "split%", "proof%", "saving%");
+    println!(
+        "║  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "txs", "legacy", "split", "post-proof", "split%", "proof%", "saving%"
+    );
     for tx_count in [1, 10, 50, 100] {
         let block = make_block(tx_count);
         let legacy = legacy_size(&block);
@@ -117,7 +125,10 @@ fn print_size_table() {
         let post = post_proof_size(&block);
         println!(
             "║  {:>6}  {:>8}  {:>8}  {:>8}  {:>7.1}%  {:>7.1}%  {:>7.1}%",
-            tx_count, legacy, split, post,
+            tx_count,
+            legacy,
+            split,
+            post,
             split as f64 / legacy as f64 * 100.0,
             post as f64 / legacy as f64 * 100.0,
             (1.0 - post as f64 / legacy as f64) * 100.0,
@@ -125,8 +136,10 @@ fn print_size_table() {
     }
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
     println!("  note: split ≈ legacy (same data, different keys)");
-    println!("  note: post-proof removes PQ signatures (~{} B/tx), retaining TX payloads\n",
-        DILITHIUM3_SIG_LEN + DILITHIUM3_PUBKEY_LEN);
+    println!(
+        "  note: post-proof removes PQ signatures (~{} B/tx), retaining TX payloads\n",
+        DILITHIUM3_SIG_LEN + DILITHIUM3_PUBKEY_LEN
+    );
 }
 
 // ─── Benchmarks ──────────────────────────────────────────────────────────────

@@ -232,8 +232,7 @@ async fn prover_worker(
                 let proof_bytes = serialized.len();
 
                 // Extract batch_root for L2 aggregation.
-                let batch_root =
-                    u128::from_le_bytes(proof.batch_root_bytes);
+                let batch_root = u128::from_le_bytes(proof.batch_root_bytes);
 
                 let verify_result = tokio::task::spawn_blocking(move || {
                     let t = Instant::now();
@@ -244,9 +243,7 @@ async fn prover_worker(
 
                 let (ok, verify_us, error_msg) = match verify_result {
                     Ok((Ok(()), dur)) => (true, dur.as_secs_f64() * 1e6, String::new()),
-                    Ok((Err(e), dur)) => {
-                        (false, dur.as_secs_f64() * 1e6, format!("verify: {e}"))
-                    }
+                    Ok((Err(e), dur)) => (false, dur.as_secs_f64() * 1e6, format!("verify: {e}")),
                     Err(_) => (false, 0.0, "verify: spawn panic".into()),
                 };
 

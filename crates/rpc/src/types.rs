@@ -45,7 +45,10 @@ pub struct RpcBlock {
     #[serde(rename = "sigAggregateProof", skip_serializing_if = "Option::is_none")]
     pub sig_aggregate_proof: Option<String>,
     /// Byte length of the STARK aggregate proof. `null` when no proof exists.
-    #[serde(rename = "sigAggregateProofSize", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "sigAggregateProofSize",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sig_aggregate_proof_size: Option<u64>,
 }
 

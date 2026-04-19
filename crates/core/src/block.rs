@@ -417,15 +417,21 @@ impl StrippedBlock {
                 .collect(),
             None => {
                 // Witnesses pruned after STARK proof acceptance: return stub sigs.
-                let stub_sig =
-                    PQSignature { sig_type: SignatureType::Dilithium3, data: Vec::new() };
+                let stub_sig = PQSignature {
+                    sig_type: SignatureType::Dilithium3,
+                    data: Vec::new(),
+                };
                 self.transactions
                     .into_iter()
                     .map(|st| SignedTransaction::new(st.from, st.tx, stub_sig.clone()))
                     .collect()
             }
         };
-        Block { header: self.header, transactions, proposer_seal: self.proposer_seal }
+        Block {
+            header: self.header,
+            transactions,
+            proposer_seal: self.proposer_seal,
+        }
     }
 
     fn rlp_fields_len(&self) -> usize {
@@ -456,7 +462,11 @@ impl Encodable for StrippedBlock {
         header.encode(out);
         self.header.encode(out);
         let txs_payload: usize = self.transactions.iter().map(|t| t.length()).sum();
-        alloy_rlp::Header { list: true, payload_length: txs_payload }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: txs_payload,
+        }
+        .encode(out);
         for tx in &self.transactions {
             tx.encode(out);
         }
@@ -471,7 +481,12 @@ impl Encodable for StrippedBlock {
 
     fn length(&self) -> usize {
         let payload = self.rlp_fields_len();
-        alloy_rlp::Header { list: true, payload_length: payload }.length().saturating_add(payload)
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
     }
 }
 
@@ -513,7 +528,11 @@ impl Decodable for StrippedBlock {
             });
         }
 
-        Ok(Self { header: block_header, transactions, proposer_seal })
+        Ok(Self {
+            header: block_header,
+            transactions,
+            proposer_seal,
+        })
     }
 }
 
@@ -704,9 +723,9 @@ mod tests {
     // ── StrippedBlock tests ───────────────────────────────────────────────────
 
     fn make_signed_tx() -> SignedTransaction {
+        use crate::transaction::Transaction;
         use shell_crypto::{DilithiumSigner, Signer};
         use shell_primitives::{Address, U256};
-        use crate::transaction::Transaction;
 
         let signer = DilithiumSigner::generate();
         let pk = signer.public_key().to_vec();
@@ -776,8 +795,14 @@ mod tests {
 
         assert_eq!(reconstructed.header, original.header);
         assert_eq!(reconstructed.transactions.len(), 1);
-        assert_eq!(reconstructed.transactions[0].from, original.transactions[0].from);
-        assert_eq!(reconstructed.transactions[0].tx, original.transactions[0].tx);
+        assert_eq!(
+            reconstructed.transactions[0].from,
+            original.transactions[0].from
+        );
+        assert_eq!(
+            reconstructed.transactions[0].tx,
+            original.transactions[0].tx
+        );
         assert_eq!(
             reconstructed.transactions[0].signature,
             original.transactions[0].signature

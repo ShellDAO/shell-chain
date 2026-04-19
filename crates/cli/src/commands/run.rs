@@ -500,6 +500,8 @@ async fn run_with_store<S: KvStore + 'static>(
             keep_recent: args.pruning,
             witness_retention: args.witness_retention,
             body_retention: args.body_retention,
+            proof_replacement_grace: 100,
+            state_pruning_experimental: false,
         },
         metrics: shell_node::config::MetricsConfig {
             enabled: true,

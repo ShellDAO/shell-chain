@@ -305,7 +305,9 @@ impl<S: KvStore> ChainStore<S> {
     pub fn trie_node_refcount(&self, node_hash: &ShellHash) -> Result<u32, StorageError> {
         match self.store.get(&Self::trie_refcount_key(node_hash))? {
             None => Ok(0),
-            Some(bytes) if bytes.len() == 4 => Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            Some(bytes) if bytes.len() == 4 => {
+                Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
             Some(bytes) => Err(StorageError::Codec(format!(
                 "trie refcount: expected 4 bytes, got {}",
                 bytes.len()
@@ -319,7 +321,8 @@ impl<S: KvStore> ChainStore<S> {
     pub fn trie_refcount_inc(&self, node_hash: &ShellHash) -> Result<u32, StorageError> {
         let current = self.trie_node_refcount(node_hash)?;
         let next = current.saturating_add(1);
-        self.store.put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
+        self.store
+            .put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
         Ok(next)
     }
 
@@ -334,7 +337,8 @@ impl<S: KvStore> ChainStore<S> {
             Ok(0)
         } else {
             let next = current - 1;
-            self.store.put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
+            self.store
+                .put(&Self::trie_refcount_key(node_hash), &next.to_le_bytes())?;
             Ok(next)
         }
     }
@@ -1745,7 +1749,7 @@ mod tests {
     // ── Phase B split / round-trip tests ──────────────────────────────────────
 
     fn make_block_with_txs(number: u64) -> Block {
-        use shell_core::{SignedTransaction, Transaction, PubkeyMode as _};
+        use shell_core::{PubkeyMode as _, SignedTransaction, Transaction};
         use shell_crypto::{DilithiumSigner, Signer};
         use shell_primitives::{Address, U256};
 
@@ -1806,7 +1810,10 @@ mod tests {
         let body_key = [b"b/".as_ref(), hash.as_bytes()].concat();
         let wit_key = [b"w/".as_ref(), hash.as_bytes()].concat();
 
-        assert!(db.get(&body_key).unwrap().is_some(), "b/<hash> should exist");
+        assert!(
+            db.get(&body_key).unwrap().is_some(),
+            "b/<hash> should exist"
+        );
         assert!(db.get(&wit_key).unwrap().is_some(), "w/<hash> should exist");
     }
 
@@ -1861,7 +1868,10 @@ mod tests {
         cs.put_block(&block).unwrap();
 
         let wit_key = [b"w/".as_ref(), hash.as_bytes()].concat();
-        assert!(db.get(&wit_key).unwrap().is_none(), "no w/<hash> for empty block");
+        assert!(
+            db.get(&wit_key).unwrap().is_none(),
+            "no w/<hash> for empty block"
+        );
         assert!(!cs.has_witness_bundle(&hash).unwrap());
     }
 }
