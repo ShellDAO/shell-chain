@@ -325,7 +325,7 @@ This design enables seamless addition of new algorithms without protocol-breakin
 | **Internal hashing** | BLAKE3 | Performance |
 | **Keystore KDF** | Argon2id | Memory-hard, side-channel resistant |
 | **Keystore cipher** | XChaCha20-Poly1305 | AEAD, safe random nonces |
-| **Address format** | 20 bytes, keccak256(pk)[12:32] | Ethereum-compatible |
+| **Address format** | 20 bytes, `blake3(version \|\| algo_id \|\| pubkey)[0..20]` | PQ-bound, algo-agnostic |
 | **Key zeroization** | `zeroize` crate | Secure memory erasure |
 
 Shell-chain is quantum-ready today. No migration will be needed when quantum computers arrive.

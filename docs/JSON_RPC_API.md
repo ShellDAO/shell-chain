@@ -2,7 +2,7 @@
 
 Complete reference for the shell-chain JSON-RPC API. All methods follow the [JSON-RPC 2.0](https://www.jsonrpc.org/specification) specification.
 
-> **See also:** [Quickstart Guide](QUICKSTART.md) · [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md) · [Post-Quantum Cryptography Guide](PQ_CRYPTO_GUIDE.md) · [Native Account Abstraction Guide](ACCOUNT_ABSTRACTION_GUIDE.md)
+> **See also:** [Quickstart Guide](QUICKSTART.md) · [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md) · [Post-Quantum Cryptography Guide](PQ_CRYPTO_GUIDE.md) · [Native Account Abstraction Guide](ACCOUNT_ABSTRACTION_GUIDE.md) · [System Contracts](SYSTEM_CONTRACTS.md) · [Prover Guide](PROVER_GUIDE.md)
 
 ---
 
@@ -1156,6 +1156,85 @@ Returns pending governance proposals that have not yet been finalized.
 ### shell_addValidator / shell_removeValidator *(disabled)*
 
 These methods return error `-32601`. Direct validator set mutation is disabled to prevent split-brain issues. Use `shell_proposeAddValidator` and `shell_proposeRemoveValidator` instead, which go through the governance transaction flow.
+
+### shell_transactionCount
+
+Returns the total number of transactions stored across all blocks (chain-wide counter, not per-address nonce).
+
+**Parameters:** none
+
+**Response:** `"0x<hex>"` — total transaction count as a hex string.
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_transactionCount","params":[],"id":1}'
+# → {"result":"0x1a4f"}
+```
+
+### shell_getTransactionsByAddress
+
+Returns transactions sent from or received by an address. Supports pagination.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | string | `pq1...` address |
+| `fromBlock` | number \| null | Start block (inclusive, default 0) |
+| `toBlock` | number \| null | End block (inclusive, default latest) |
+| `page` | number \| null | Page index, 0-based (default 0) |
+| `limit` | number \| null | Results per page (default 20) |
+
+**Response:** Array of transaction objects (same format as `eth_getTransactionByHash`).
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getTransactionsByAddress","params":["pq1abc...",0,null,0,20],"id":1}'
+```
+
+### shell_getBlockWitnesses
+
+Returns the PQ witness bundle for a block — the individual Dilithium3 signatures stored separately from TX bodies. Returns `null` when witnesses have been pruned (STARK proof received) or the block predates B3 storage.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `block` | string | Block hash (`0x...`) or block number (`"0x<hex>"` / `"latest"`) |
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blockHash` | string | Block hash |
+| `witnessRoot` | string | `witness_root` from block header |
+| `witnessCount` | number | Number of witnesses in bundle |
+| `witnesses` | array | `[{ txIndex, sigType, signature, pubkey? }, ...]` |
+
+Returns `null` when no witness bundle is stored (pruned or not applicable).
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getBlockWitnesses","params":["latest"],"id":1}'
+```
+
+### shell_setBalance *(dev/testnet only)*
+
+Directly sets the balance of an address. **Only available when `api_modules` includes `dev`.** Returns `-32601` on production nodes.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | string | Target `pq1...` address |
+| `balance` | string | New balance in wei as decimal string |
+
+**Response:** `true` on success.
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_setBalance","params":["pq1abc...","1000000000000000000"],"id":1}'
+```
 
 ---
 

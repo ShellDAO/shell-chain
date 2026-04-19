@@ -308,7 +308,48 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 
 ### Signature behavior
 
-- `ecrecover` always returns `address(0)` — Shell-Chain uses post-quantum Dilithium3 signatures, not ECDSA. Contracts that rely on `ecrecover` for signature verification will not work as expected. Use the PQ signature scheme instead.
+- **`ecrecover` (0x01) is disabled.** The precompile exists at address `0x01` but is a no-op — it returns empty bytes to force PQ migration. Contracts that call `ecrecover` will receive an empty result, not `address(0)`. Do not rely on it.
+- **Use the PQ precompile instead.** See [PQ_DILITHIUM_VERIFY precompile](#pq_dilithium_verify-precompile-0x0100) below.
+
+### PQ_DILITHIUM_VERIFY precompile (`0x0100`)
+
+Shell-Chain exposes a native Dilithium3 signature verification precompile at address `0x0000000000000000000000000000000000000100`.
+
+**Gas cost:** 10,000 (flat, regardless of message length)
+
+**Input format** (length-prefixed binary, no ABI encoding):
+```
+[4 bytes: pubkey_len  (big-endian u32)] [pubkey bytes]
+[4 bytes: msg_len     (big-endian u32)] [message bytes]
+[remaining bytes]                       [signature bytes]
+```
+
+**Output:** 32 bytes — `0x...01` if valid, `0x...00` if invalid or any error.
+
+**Example (Solidity):**
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+library PQVerify {
+    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000100;
+
+    /// Verify a Dilithium3 signature. Returns true on valid.
+    function verify(
+        bytes memory pubkey,
+        bytes memory message,
+        bytes memory signature
+    ) internal view returns (bool) {
+        bytes memory input = abi.encodePacked(
+            uint32(pubkey.length), pubkey,
+            uint32(message.length), message,
+            signature
+        );
+        (bool ok, bytes memory result) = PQ_PRECOMPILE.staticcall(input);
+        return ok && result.length >= 32 && result[31] == 0x01;
+    }
+}
+```
 
 ### Transaction types supported
 

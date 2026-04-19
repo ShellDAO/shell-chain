@@ -2,7 +2,7 @@
 
 This guide covers everything you need to run a shell-chain testnet node — from system requirements to monitoring and maintenance.
 
-> **See also:** [Quickstart Guide](QUICKSTART.md) · [JSON-RPC API Reference](JSON_RPC_API.md) · [Post-Quantum Cryptography Guide](PQ_CRYPTO_GUIDE.md) · [Native Account Abstraction Guide](ACCOUNT_ABSTRACTION_GUIDE.md)
+> **See also:** [Quickstart Guide](QUICKSTART.md) · [JSON-RPC API Reference](JSON_RPC_API.md) · [Post-Quantum Cryptography Guide](PQ_CRYPTO_GUIDE.md) · [Prover Guide](PROVER_GUIDE.md) · [Consensus Details](CONSENSUS_DETAILS.md) · [Block Pruning & Compression](BLOCK_PRUNING_AND_COMPRESSION.md)
 
 ---
 
@@ -352,6 +352,7 @@ block_time = 2000               # Block production interval (milliseconds)
 keystore = "/data/keystore.json" # Path to encrypted keystore file (validators only)
 db = "rocksdb"                  # Storage backend: "memory" or "rocksdb"
 pruning = 0                     # State roots to retain (0 = archive mode)
+node_role = "validator"         # Node role: "validator", "validator-prover", or "prover"
 
 [rpc]
 listen_addr = "0.0.0.0:8545"   # JSON-RPC HTTP listen address
@@ -369,6 +370,11 @@ enable_mdns = true              # mDNS local peer discovery (disable in cloud)
 
 [consensus]
 engine = "poa"                  # Consensus engine (Proof of Authority)
+enable_stark_aggregation = false  # Enable async STARK proof generation (see PROVER_GUIDE.md)
+
+[prover]
+max_concurrent_proofs = 1       # Parallel proof jobs (validator-prover / prover roles only)
+proving_priority = "sequential" # "sequential" or "latest-first"
 
 [metrics]
 enabled = true                  # Enable Prometheus metrics
@@ -378,6 +384,18 @@ listen_addr = "0.0.0.0:9090"   # Metrics HTTP endpoint
 level = "info"                  # Log level (trace, debug, info, warn, error)
 format = "json"                 # Log format: "text" or "json"
 ```
+
+### Node roles
+
+Shell-Chain supports three operational roles, set via `node.node_role` or `--node-role`:
+
+| Role | Block production | Proves blocks | Use case |
+|------|-----------------|---------------|----------|
+| `validator` *(default)* | ✅ | ❌ | Standard block-producing authority node |
+| `validator-prover` | ✅ | ✅ (idle slots) | Validator that also contributes proof work |
+| `prover` | ❌ | ✅ (full time) | Standalone prover — no keys needed |
+
+A `prover` node syncs the chain, generates `ProofAmendment` proofs, and propagates them via P2P without producing blocks. See [PROVER_GUIDE.md](PROVER_GUIDE.md) for details.
 
 ### Validator vs RPC configuration differences
 
@@ -407,6 +425,9 @@ format = "json"                 # Log format: "text" or "json"
 | `--bootnodes <ADDRS>` | — | Comma-separated bootstrap peers |
 | `--enable-mdns` | disabled | Enable mDNS discovery |
 | `--pruning <N>` | `0` | State roots retained (0 = archive) |
+| `--node-role <ROLE>` | `validator` | `validator`, `validator-prover`, or `prover` |
+| `--stark` | disabled | Enable STARK proof aggregation |
+| `--max-concurrent-proofs <N>` | `1` | Parallel proof jobs (prover roles only) |
 | `--checkpoint-url <URL>` | — | Checkpoint sync URL |
 | `--rpc-cors <ORIGINS>` | — | CORS allowed origins |
 | `--rpc-rate-limit <N>` | — | Rate limit (req/s) |

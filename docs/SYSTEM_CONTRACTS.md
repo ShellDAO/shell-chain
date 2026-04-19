@@ -1,0 +1,195 @@
+# System Contracts
+
+Shell-Chain ships two native system contracts. They live at well-known addresses
+and are executed as native Rust code — no Solidity bytecode, no compiler needed.
+The EVM executor intercepts calls to these addresses before running the EVM.
+
+---
+
+## Addresses
+
+| Contract | Address | Description |
+|----------|---------|-------------|
+| `ValidatorRegistry` | `0x0000000000000000000000000000000000000001` | Manages the active validator set |
+| `AccountManager` | `0x0000000000000000000000000000000000000002` | Per-account PQ key rotation and custom validation code |
+
+---
+
+## ValidatorRegistry
+
+### Purpose
+
+Maintains the canonical set of block-producing validators. All writes go through
+governance transactions (see `shell_proposeAddValidator` / `shell_proposeRemoveValidator`)
+to prevent split-brain scenarios.
+
+### Interface
+
+```solidity
+interface IValidatorRegistry {
+    // ── Write (validator-only) ──────────────────────────────────────────────
+    function addValidator(address validator) external;
+    function removeValidator(address validator) external;
+
+    // ── Read (anyone) ───────────────────────────────────────────────────────
+    function getValidators() external view returns (address[] memory);
+    function isValidator(address account) external view returns (bool);
+}
+```
+
+### Function selectors
+
+| Function | Selector (keccak256) | Access |
+|----------|---------------------|--------|
+| `addValidator(address)` | computed at compile time | validators only |
+| `removeValidator(address)` | computed at compile time | validators only |
+| `getValidators()` | computed at compile time | anyone |
+| `isValidator(address)` | computed at compile time | anyone |
+
+### Calling from Solidity
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IValidatorRegistry {
+    function getValidators() external view returns (address[] memory);
+    function isValidator(address account) external view returns (bool);
+}
+
+contract ValidatorCheck {
+    IValidatorRegistry constant REGISTRY =
+        IValidatorRegistry(0x0000000000000000000000000000000000000001);
+
+    function currentValidators() external view returns (address[] memory) {
+        return REGISTRY.getValidators();
+    }
+
+    function amIAValidator() external view returns (bool) {
+        return REGISTRY.isValidator(msg.sender);
+    }
+}
+```
+
+### Events
+
+| Event | Signature | Emitted when |
+|-------|-----------|-------------|
+| `ValidatorAdded` | `ValidatorAdded(address indexed validator)` | `addValidator` succeeds |
+| `ValidatorRemoved` | `ValidatorRemoved(address indexed validator)` | `removeValidator` succeeds |
+
+### Access control
+
+Only existing validators can call `addValidator` / `removeValidator`. Calls from
+non-validators revert with `SystemContractError::Unauthorised`.
+
+---
+
+## AccountManager
+
+### Purpose
+
+Allows accounts to:
+1. **Rotate their PQ signing key** without changing address — critical for
+   post-quantum key lifecycle management.
+2. **Set a custom validation contract** — enables account abstraction patterns
+   where transaction validation is handled by on-chain code.
+
+### Interface
+
+```solidity
+interface IAccountManager {
+    /// Rotate the caller's PQ public key.
+    /// pubkey: raw Dilithium3 or SPHINCS+ public key bytes
+    /// algo:   0 = Dilithium3, 1 = SPHINCS+-SHA2-256f
+    function rotateKey(bytes calldata pubkey, uint8 algo) external;
+
+    /// Set a custom validator contract for this account.
+    /// validationCodeHash: keccak256 hash of the deployed validator bytecode.
+    ///   The contract at that address must implement IAccountValidator.
+    function setValidationCode(bytes32 validationCodeHash) external;
+
+    /// Remove the custom validator — revert to default PQ signature check.
+    function clearValidationCode() external;
+}
+```
+
+### Function selectors
+
+| Function | Access |
+|----------|--------|
+| `rotateKey(bytes,uint8)` | self only (`msg.sender == tx.origin account`) |
+| `setValidationCode(bytes32)` | self only |
+| `clearValidationCode()` | self only |
+
+### Key rotation example
+
+```bash
+# Encode a rotateKey calldata with shell-cli
+shell-cli encode-rotate-key --pubkey /path/to/new_pubkey.bin --algo dilithium3
+
+# Submit via RPC
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc":"2.0",
+    "method":"shell_sendTransaction",
+    "params":[{
+      "from": "pq1MYADDRESS",
+      "to":   "0x0000000000000000000000000000000000000002",
+      "data": "0x<rotateKey calldata>",
+      "gas":  "0x186a0"
+    }],
+    "id":1
+  }'
+```
+
+After the transaction is included, future transactions from `pq1MYADDRESS` are
+validated using the new key. The old key is invalidated immediately.
+
+### Custom validation code
+
+Setting `validationCode` delegates transaction validation for this account to
+the contract at the specified code hash. This is the foundation of Shell-Chain's
+native account abstraction. See [ACCOUNT_ABSTRACTION_GUIDE.md](ACCOUNT_ABSTRACTION_GUIDE.md)
+for the full `IAccountValidator` interface and examples.
+
+```bash
+# Set validation code
+shell-cli encode-set-validation-code --code-hash 0xabc123...
+
+# Clear (revert to PQ default)
+shell-cli encode-clear-validation-code
+```
+
+---
+
+## Gas costs
+
+System contract calls use a flat base gas charge:
+
+| Operation | Gas |
+|-----------|-----|
+| `addValidator` | `SYSTEM_CALL_BASE_GAS` + state write |
+| `removeValidator` | `SYSTEM_CALL_BASE_GAS` + state write |
+| `getValidators` | `SYSTEM_CALL_BASE_GAS` + read × n |
+| `isValidator` | `SYSTEM_CALL_BASE_GAS` + read |
+| `rotateKey` | `SYSTEM_CALL_BASE_GAS` + pubkey write |
+| `setValidationCode` | `SYSTEM_CALL_BASE_GAS` + hash write |
+| `clearValidationCode` | `SYSTEM_CALL_BASE_GAS` + delete |
+
+`SYSTEM_CALL_BASE_GAS` is a constant defined in `shell-evm` — use
+`shell_estimateGovernanceGas` to get accurate estimates before submitting.
+
+---
+
+## Implementation notes
+
+- System contracts are **intercepted by the EVM executor** before EVM bytecode
+  execution. There is no bytecode at these addresses — `eth_getCode` returns an
+  empty result.
+- Both contracts produce standard EVM-style `logs` (topics + data) that appear
+  in `eth_getLogs` responses.
+- State is stored in the `WorldState` trie alongside regular account state —
+  system contract storage is persistent and survives node restarts.
+- System contracts do **not** use ABI-encoded reverts. Errors are translated to
+  EVM-style failures (empty returndata, gas consumed).
