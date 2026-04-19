@@ -1,4 +1,10 @@
-.PHONY: bench bench-quick test e2e e2e-extended load-test chaos-test security-audit
+.PHONY: bench bench-quick test ci e2e e2e-extended load-test chaos-test security-audit
+
+# Mirror CI checks exactly (run before every push)
+ci:
+	cargo fmt --all -- --check
+	cargo clippy --workspace -- -D warnings
+	cargo test --workspace
 
 # Run full criterion benchmarks for all workspace crates
 bench:
