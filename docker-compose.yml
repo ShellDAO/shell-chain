@@ -13,12 +13,15 @@ services:
     command: >
       --datadir /data
       --rpc-addr 0.0.0.0:8545
-      --rpc-api eth,net,web3,shell
+      --rpc-api eth,net,web3,shell,evm
       --p2p
       --p2p-addr 0.0.0.0:30303
       --enable-mdns
       --db rocksdb
       --block-time 2000
+      --unsafe-dev-exposed
+      --rpc-rate-limit 5000
+      --pruning 0
     ports:
       - "127.0.0.1:8545:8545"
       - "30303:30303"
