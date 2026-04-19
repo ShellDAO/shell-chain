@@ -302,6 +302,8 @@ mod tests {
             parent_beacon_block_root: format!("{:?}", ShellHash::ZERO),
             blob_gas_used: "0x0".into(),
             excess_blob_gas: "0x0".into(),
+            sig_aggregate_proof: None,
+            sig_aggregate_proof_size: None,
         };
 
         let json = serde_json::to_value(&block).unwrap();
@@ -365,6 +367,8 @@ mod tests {
             parent_beacon_block_root: format!("{:?}", ShellHash::ZERO),
             blob_gas_used: hex_u64(0),
             excess_blob_gas: hex_u64(0),
+            sig_aggregate_proof: None,
+            sig_aggregate_proof_size: None,
         };
 
         let json = serde_json::to_value(&block).unwrap();
@@ -691,6 +695,8 @@ mod tests {
             parent_beacon_block_root: format!("{:?}", ShellHash::ZERO),
             blob_gas_used: "0x0".into(),
             excess_blob_gas: "0x0".into(),
+            sig_aggregate_proof: None,
+            sig_aggregate_proof_size: None,
         };
 
         let json = serde_json::to_string(&block).unwrap();

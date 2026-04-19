@@ -97,7 +97,7 @@ fn worker_batch_sizes(prover_id: usize, total_provers: usize) -> Vec<usize> {
         return all;
     }
     // Divide the range: prover 0 gets small, last gets large
-    let chunk = (all.len() + total_provers - 1) / total_provers;
+    let chunk = all.len().div_ceil(total_provers);
     let start = (prover_id * chunk).min(all.len());
     let end = (start + chunk).min(all.len());
     if start >= end {
@@ -351,6 +351,7 @@ async fn node_monitor(
 
 // ─── Coordinator ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn coordinator(
     num_provers: usize,
     duration: Duration,
