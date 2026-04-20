@@ -192,12 +192,12 @@ enum Commands {
         #[arg(long, default_value = "full")]
         storage_profile: String,
 
-        /// Override body (TX detail) retention from the storage profile.
+        /// Override witness bundle retention from the storage profile.
         /// 0 = keep forever. If omitted, the storage profile default is used.
         #[arg(long)]
         witness_retention: Option<u64>,
 
-        /// Override witness bundle retention from the storage profile.
+        /// Override body (TX detail) retention from the storage profile.
         /// 0 = keep forever. If omitted, the storage profile default is used.
         #[arg(long)]
         body_retention: Option<u64>,

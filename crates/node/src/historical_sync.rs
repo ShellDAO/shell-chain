@@ -178,12 +178,7 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
     ///
     /// Stores each returned block's body and, if the range is not yet complete,
     /// issues the next `BodyRequest` batch.
-    pub fn handle_response(
-        &self,
-        peer: PeerId,
-        blocks: Vec<shell_core::Block>,
-        head_number: u64,
-    ) {
+    pub fn handle_response(&self, peer: PeerId, blocks: Vec<shell_core::Block>, head_number: u64) {
         let mut last_stored: Option<u64> = None;
         for block in &blocks {
             let n = block.header.number;
@@ -198,7 +193,10 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
             let next_start = last + 1;
             if next_start <= head_number {
                 // Check if there are still missing bodies ahead.
-                if self.first_missing_body_in_range(next_start, head_number).is_some() {
+                if self
+                    .first_missing_body_in_range(next_start, head_number)
+                    .is_some()
+                {
                     info!(next_start, "historical sync: requesting next batch");
                     (self.send_fn)(
                         peer,

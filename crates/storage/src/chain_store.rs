@@ -294,10 +294,11 @@ impl<S: KvStore> ChainStore<S> {
         Ok(self.store.get(&Self::body_key(hash))?.is_some())
     }
 
-    /// Store only the stripped body portion of a block (without header or witness).
+    /// Store only the stripped body portion of a block (without witness bundle).
     ///
-    /// Used during historical back-fill to restore pruned TX bodies without
-    /// overwriting any witness or proof data that may already be present.
+    /// The stored entry includes the block header and transaction list but omits
+    /// PQ signature bundles, making it suitable for back-fill without overwriting
+    /// any witness or proof data that may already be present.
     pub fn put_body_only(&self, block: &shell_core::Block) -> Result<(), StorageError> {
         let hash = block.hash();
         let (stripped, _bundle) = shell_core::StrippedBlock::split(block);

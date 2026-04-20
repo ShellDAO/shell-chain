@@ -93,13 +93,17 @@ impl StorageProfile {
     ///
     /// Used when the node needs to advertise its capability without explicitly
     /// knowing which profile was originally configured.
+    ///
+    /// Note: classification is based on body/witness retention and proof-replacement
+    /// grace only. `keep_recent` (state-root pruning) is intentionally excluded from
+    /// the profile check because state-root pruning is independent of block-body storage.
     pub fn from_pruning_config(cfg: &PruningConfig) -> Self {
         if cfg.proof_replacement_grace == u64::MAX
             && cfg.body_retention == 0
             && cfg.witness_retention == 0
         {
             Self::Archive
-        } else if cfg.body_retention == 0 && cfg.keep_recent == 0 {
+        } else if cfg.body_retention == 0 && cfg.witness_retention != 0 {
             Self::Full
         } else {
             Self::Light

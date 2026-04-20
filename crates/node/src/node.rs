@@ -764,8 +764,7 @@ impl<S: KvStore + 'static> Node<S> {
             let _ = network.broadcast(cap_msg).await;
             info!(
                 profile = profile.as_str(),
-                oldest_body_block,
-                "L4: broadcasted storage capability"
+                oldest_body_block, "L4: broadcasted storage capability"
             );
         }
 
@@ -1153,7 +1152,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 // L4: Peer requests block bodies for historical back-fill.
                                 NetworkMessage::BodyRequest { start_number, count } => {
                                     debug!(%peer, start_number, count, "L4: received BodyRequest");
-                                    let end = start_number + count.min(128);
+                                    let end = start_number.saturating_add(count.min(128));
                                     let mut blocks = Vec::new();
                                     for n in start_number..end {
                                         if let Ok(Some(block)) = self.chain_store.get_block_by_number(n) {
@@ -1178,6 +1177,23 @@ impl<S: KvStore + 'static> Node<S> {
                                     let mut last_stored: Option<u64> = None;
                                     for block in &blocks {
                                         let n = block.header.number;
+                                        // Validate block hash matches canonical chain before storing.
+                                        let expected_hash = self.chain_store
+                                            .get_block_hash_by_number(n)
+                                            .ok()
+                                            .flatten();
+                                        let actual_hash = block.hash();
+                                        if expected_hash.as_ref() != Some(&actual_hash) {
+                                            warn!(
+                                                block = n,
+                                                "L4: BodyResponse hash mismatch — skipping (peer may be malicious)"
+                                            );
+                                            continue;
+                                        }
+                                        if self.chain_store.has_body(&actual_hash).unwrap_or(false) {
+                                            last_stored = Some(n);
+                                            continue;
+                                        }
                                         if let Err(e) = self.chain_store.put_body_only(block) {
                                             warn!(block = n, error = %e, "L4: failed to store backfill body");
                                         } else {

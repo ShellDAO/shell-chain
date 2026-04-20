@@ -503,7 +503,11 @@ async fn run_with_store<S: KvStore + 'static>(
                 warn!("Invalid --storage-profile value: {e}. Falling back to 'full'.");
                 StorageProfile::Full
             });
-            profile.to_pruning_config(args.body_retention, args.witness_retention, None)
+            profile.to_pruning_config(
+                args.body_retention,
+                args.witness_retention,
+                Some(args.pruning),
+            )
         },
         metrics: shell_node::config::MetricsConfig {
             enabled: true,
@@ -723,8 +727,9 @@ mod tests {
             state_cache_size_mb: None,
             parallel_evm: true,
             parallel_evm_workers: Some(4),
-            witness_retention: DEFAULT_WITNESS_RETENTION,
-            body_retention: DEFAULT_BODY_RETENTION,
+            witness_retention: Some(DEFAULT_WITNESS_RETENTION),
+            body_retention: Some(DEFAULT_BODY_RETENTION),
+            storage_profile: "full".into(),
             enable_stark_aggregation: false,
             network: "dev".into(),
         };

@@ -261,8 +261,12 @@ Base: 50 tx/block, 2 s/block → 43,200 blocks/day.
 shell-node --storage-profile full --witness-retention 2048
 ```
 
-Explicit flags take priority over the profile. `--storage-profile` is ignored
-if both body and witness retention are provided explicitly.
+Explicit flags take priority over the profile for body and witness retention.
+When both `--body-retention` and `--witness-retention` are provided, those values
+override the profile defaults; however, `--storage-profile` still determines
+`proof_replacement_grace` (how long to wait before replacing witness data with a
+STARK proof). To fully ignore the profile, use `--body-retention`, `--witness-retention`,
+and set `--pruning` explicitly.
 
 ### Auto-sync on profile upgrade
 
