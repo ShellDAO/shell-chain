@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use shell_primitives::ShellHash;
 use shell_storage::{DEFAULT_BODY_RETENTION, DEFAULT_WITNESS_RETENTION};
 use std::collections::VecDeque;
+use std::str::FromStr;
 
 /// High-level node storage classification.
 ///
@@ -36,18 +37,6 @@ pub enum StorageProfile {
 }
 
 impl StorageProfile {
-    /// Parse a case-insensitive string slice.
-    pub fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().as_str() {
-            "archive" => Ok(Self::Archive),
-            "full" => Ok(Self::Full),
-            "light" => Ok(Self::Light),
-            other => Err(format!(
-                "unknown storage profile '{other}'; valid values: archive, full, light"
-            )),
-        }
-    }
-
     /// Returns the canonical lowercase name used in logs and CLI.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -107,6 +96,21 @@ impl StorageProfile {
             Self::Full
         } else {
             Self::Light
+        }
+    }
+}
+
+impl FromStr for StorageProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "archive" => Ok(Self::Archive),
+            "full" => Ok(Self::Full),
+            "light" => Ok(Self::Light),
+            other => Err(format!(
+                "unknown storage profile '{other}'; valid values: archive, full, light"
+            )),
         }
     }
 }

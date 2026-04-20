@@ -499,10 +499,13 @@ async fn run_with_store<S: KvStore + 'static>(
         block_time_ms: args.block_time,
         data_dir: args.datadir.to_string_lossy().into(),
         pruning: {
-            let profile = StorageProfile::from_str(&args.storage_profile).unwrap_or_else(|e| {
-                warn!("Invalid --storage-profile value: {e}. Falling back to 'full'.");
-                StorageProfile::Full
-            });
+            let profile = args
+                .storage_profile
+                .parse::<StorageProfile>()
+                .unwrap_or_else(|e| {
+                    warn!("Invalid --storage-profile value: {e}. Falling back to 'full'.");
+                    StorageProfile::Full
+                });
             profile.to_pruning_config(
                 args.body_retention,
                 args.witness_retention,
@@ -577,8 +580,9 @@ async fn run_with_store<S: KvStore + 'static>(
             } else {
                 eprintln!("   Pruning:     archive (keep all)");
             }
-            if args.body_retention > 0 {
-                eprintln!("   Bodies:      keep last {} blocks", args.body_retention);
+            let body_ret = args.body_retention.unwrap_or(0);
+            if body_ret > 0 {
+                eprintln!("   Bodies:      keep last {} blocks", body_ret);
             } else {
                 eprintln!("   Bodies:      archive (keep all)");
             }
@@ -639,7 +643,7 @@ async fn run_with_store<S: KvStore + 'static>(
         } else {
             eprintln!("   Pruning:     archive (keep all)");
         }
-        if args.body_retention.map_or(false, |v| v > 0) {
+        if args.body_retention.is_some_and(|v| v > 0) {
             eprintln!(
                 "   Bodies:      keep last {} blocks",
                 args.body_retention.unwrap()

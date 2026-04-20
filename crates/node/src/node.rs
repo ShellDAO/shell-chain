@@ -1174,6 +1174,9 @@ impl<S: KvStore + 'static> Node<S> {
                                         .flatten()
                                         .map(|b| b.header.number)
                                         .unwrap_or(0);
+                                    // Track the first block number in this response so we can
+                                    // advance past a bad batch even if no block is stored.
+                                    let batch_start = blocks.first().map(|b| b.header.number);
                                     let mut last_stored: Option<u64> = None;
                                     for block in &blocks {
                                         let n = block.header.number;
@@ -1200,12 +1203,16 @@ impl<S: KvStore + 'static> Node<S> {
                                             last_stored = Some(n);
                                         }
                                     }
-                                    if let Some(last) = last_stored {
-                                        let next_start = last + 1;
-                                        if next_start <= head_number {
+                                    // Advance using last_stored if any blocks were accepted, or
+                                    // skip the entire bad batch using batch_start to avoid stalling.
+                                    let next_start = last_stored
+                                        .map(|n| n + 1)
+                                        .or_else(|| batch_start.map(|s| s.saturating_add(128)));
+                                    if let Some(next) = next_start {
+                                        if next <= head_number {
                                             // More blocks needed — request next batch.
                                             let _ = network.broadcast(NetworkMessage::BodyRequest {
-                                                start_number: next_start,
+                                                start_number: next,
                                                 count: 128,
                                             }).await;
                                         } else {

@@ -351,8 +351,9 @@ chain_id = 31337                # Chain ID
 block_time = 2000               # Block production interval (milliseconds)
 keystore = "/data/keystore.json" # Path to encrypted keystore file (validators only)
 db = "rocksdb"                  # Storage backend: "memory" or "rocksdb"
-pruning = 0                     # State roots to retain (0 = archive mode; prefer --storage-profile)
-storage_profile = "full"        # Storage profile: "archive", "full" (default), or "light"
+pruning = 0                     # State roots to retain (0 = archive mode)
+# Storage profile is set via CLI flag: --storage-profile archive|full|light (default: full)
+# Individual overrides: --body-retention N, --witness-retention N
 node_role = "validator"         # Node role: "validator", "validator-prover", or "prover"
 
 [rpc]
