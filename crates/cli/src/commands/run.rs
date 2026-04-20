@@ -652,11 +652,12 @@ async fn run_with_store<S: KvStore + 'static>(
         } else {
             eprintln!("   Pruning:     archive (keep all)");
         }
-        if args.body_retention.is_some_and(|v| v > 0) {
-            eprintln!(
-                "   Bodies:      keep last {} blocks",
-                args.body_retention.unwrap()
-            );
+        if let Some(retention) = args.body_retention {
+            if retention > 0 {
+                eprintln!("   Bodies:      keep last {} blocks", retention);
+            } else {
+                eprintln!("   Bodies:      archive (keep all)");
+            }
         } else {
             eprintln!("   Bodies:      archive (keep all)");
         }

@@ -136,11 +136,9 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
         };
 
         // Find the first missing body working forward from block 0.
-        let first_missing = self.first_missing_body(head_number);
-        if first_missing.is_none() {
+        let Some(start) = self.first_missing_body(head_number) else {
             return SyncStatus::Complete;
-        }
-        let start = first_missing.unwrap();
+        };
 
         // Count total gaps (approximate — just for logging).
         let gaps_found = self.count_missing_bodies(start, head_number);

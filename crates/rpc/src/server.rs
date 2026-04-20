@@ -151,7 +151,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     world_state: Arc<parking_lot::RwLock<WorldState<S>>>,
     tx_pool: Arc<TxPool>,
     chain_id: u64,
-    tx_broadcast: Option<tokio::sync::mpsc::UnboundedSender<SignedTransaction>>,
+    tx_broadcast: Option<tokio::sync::mpsc::Sender<SignedTransaction>>,
     block_events: tokio::sync::broadcast::Sender<BlockEvent>,
     proposer_signer: Option<Arc<dyn Signer>>,
     proposer_address: Option<Address>,

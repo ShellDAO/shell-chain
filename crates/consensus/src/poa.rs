@@ -20,6 +20,9 @@ pub struct PoaConfig {
     pub max_future_secs: u64,
     /// Number of blocks per epoch. 0 means no epochs (legacy behavior).
     pub epoch_length: u64,
+    /// Authorities that have been slashed for equivocation and are excluded from
+    /// block production. Slashed addresses are checked in `is_authority()`.
+    pub slashed: std::collections::HashSet<Address>,
 }
 
 /// Default maximum future timestamp tolerance (60 seconds).
@@ -33,6 +36,7 @@ impl PoaConfig {
             block_time_secs,
             max_future_secs: DEFAULT_MAX_FUTURE_SECS,
             epoch_length: 0,
+            slashed: std::collections::HashSet::new(),
         }
     }
 
@@ -154,7 +158,16 @@ impl PoaConfig {
     }
 
     pub fn is_authority(&self, address: &Address) -> bool {
-        self.authorities.contains(address)
+        self.authorities.contains(address) && !self.slashed.contains(address)
+    }
+
+    /// Mark an authority as slashed due to equivocation.
+    ///
+    /// Slashed authorities are excluded from `is_authority()` checks and
+    /// cannot propose new blocks. The slash is in-memory only; operators
+    /// must update the genesis/config to permanently remove the authority.
+    pub fn slash_authority(&mut self, offender: &Address) {
+        self.slashed.insert(*offender);
     }
 
     /// Replace the authority set. Panics if the new set is empty.
@@ -187,6 +200,14 @@ impl PoaEngine {
     /// Mutable access to the consensus configuration (e.g. for validator set updates).
     pub fn config_mut(&mut self) -> &mut PoaConfig {
         &mut self.config
+    }
+
+    /// Slash an authority for equivocation.
+    ///
+    /// The slashed address is immediately excluded from `is_authority()` checks,
+    /// preventing it from proposing future blocks. Delegates to `PoaConfig::slash_authority`.
+    pub fn slash_authority(&mut self, offender: &Address) {
+        self.config.slash_authority(offender);
     }
 
     fn verify_proposer(&self, header: &BlockHeader) -> Result<(), ConsensusError> {

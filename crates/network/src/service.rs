@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::error::NetworkError;
-use crate::message::{NetworkEvent, NetworkMessage};
+use crate::message::{NetworkEvent, NetworkMessage, PeerId};
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -17,6 +17,18 @@ use std::sync::Arc;
 pub trait NetworkService: Send + Sync {
     /// Broadcast a message to all connected peers.
     async fn broadcast(&self, msg: NetworkMessage) -> Result<(), NetworkError>;
+
+    /// Send a message to a specific peer only (unicast).
+    ///
+    /// Default implementation falls back to broadcast. Implementations that
+    /// support direct peer messaging should override this to avoid amplification.
+    async fn send_to_peer(
+        &self,
+        _peer_id: &PeerId,
+        msg: NetworkMessage,
+    ) -> Result<(), NetworkError> {
+        self.broadcast(msg).await
+    }
 
     /// Wait for the next network event.
     /// Returns `None` if the network has shut down.

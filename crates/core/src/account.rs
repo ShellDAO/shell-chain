@@ -107,9 +107,8 @@ fn decode_optional_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Option<ShellHash>>
     }
     // 0x80 = RLP encoding of empty bytes → None
     if buf.first().copied().unwrap_or(0) == 0x80 {
-        *buf = buf
-            .get(1..)
-            .unwrap_or_else(|| unreachable!("buf checked non-empty above"));
+        // buf.is_empty() was checked above, so &buf[1..] is always valid here.
+        *buf = &buf[1..];
         Ok(None)
     } else {
         Ok(Some(ShellHash::decode(buf)?))

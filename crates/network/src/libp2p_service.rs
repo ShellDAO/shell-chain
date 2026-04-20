@@ -959,6 +959,8 @@ impl NetworkService for Libp2pNetwork {
             NetworkMessage::NewBlock(_)
             | NetworkMessage::BlockRequest { .. }
             | NetworkMessage::BlockResponse { .. }
+            | NetworkMessage::BodyRequest { .. }
+            | NetworkMessage::BodyResponse { .. }
             | NetworkMessage::Ping
             | NetworkMessage::Pong => TopicKind::Blocks,
             NetworkMessage::NewTransaction(_) => TopicKind::Transactions,
