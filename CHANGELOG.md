@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] — 2026-04-20 — M14: Storage Profile Node Classification
+
+### Added
+
+- **`--storage-profile <archive|full|light>`** — single flag selects full data-retention policy, replacing
+  the confusing `--body-retention` / `--witness-retention` pair as the primary UX.
+
+  | Profile | TX bodies | PQ witnesses | proof_replacement_grace | State roots | ~Daily write |
+  |---|---|---|---|---|---|
+  | `archive` | forever | forever (never replaced by STARK) | u64::MAX | forever | ~12.8 GB/day |
+  | `full` *(default)* | forever | 128 blocks | 0 (replaced immediately) | forever | ~1.5 GB/day |
+  | `light` | 4096 blocks (~2.3 h) | 64 blocks | 0 | 4096 blocks | ~1 GB fixed |
+
+- `StorageProfile` enum in `crates/node/src/pruning.rs` with `to_pruning_config()` / `from_pruning_config()`.
+- `StorageCapability { profile, oldest_body_block }` P2P message — nodes advertise their data-retention level on
+  connect and on startup.
+- `BodyRequest { start_number, count }` / `BodyResponse { blocks }` P2P messages for historical body back-fill.
+- `PeerCapabilityTracker` (`crates/node/src/historical_sync.rs`) — tracks which peers carry which profiles;
+  selects best candidate for back-fill requests.
+- `HistoricalBodySync` — on profile upgrade (e.g. `light → full`), automatically back-fills missing block
+  bodies from archive/full peers in 128-block batches without interrupting consensus.
+- `ChainStore::has_body()` and `ChainStore::put_body_only()` — efficient body presence check and selective
+  body restore without overwriting witness bundles.
+- `Node::oldest_available_body_block()` — binary-search helper exposed in startup capability broadcast.
+- `docker-compose.yml` updated: node1=`archive`, node2/node3=`full`.
+- `docs/BLOCK_PRUNING_AND_COMPRESSION.md` — new "Storage Profiles" section with profile comparison table,
+  data-volume estimates, auto-sync description, and Docker defaults.
+
+### Changed
+
+- `--body-retention` and `--witness-retention` are now `Option<u64>` overrides; when absent, values come from
+  the selected profile. Existing scripts providing these flags continue to work unchanged.
+- `proof_replacement_grace` is no longer hardcoded to 100; it is now profile-driven (0 for full/light,
+  u64::MAX for archive).
+- Node startup banner now shows the active profile name and actual retention values instead of the hardcoded
+  `bodies=archive` label.
+
+### Previous release: [0.15.0]
+
 ## [0.15.0] — 2026-04-18 — M13: wPoA+STARK Signature Aggregation
 
 ### Added

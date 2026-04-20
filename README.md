@@ -18,6 +18,7 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 - 🧩 **PQ Precompiles** — on-chain Dilithium/SPHINCS+ verification, Kyber decapsulation, STARK proof verification
 - ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with stake-weighted proposer selection, slashing, and finality tracking
 - ⚡ **STARK Sig-Aggregation** — Winterfell STARK proofs compress Dilithium3 signatures **7× per block**; 157 proofs/sec sustained throughput
+- 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
 - 🛠️ **Developer Ecosystem** — TypeScript SDK (`shell-sdk`) with viem-based PQ signers and AA transaction builders
 - 🌐 **P2P Networking** — libp2p with GossipSub, Kademlia DHT, peer scoring, and message signature verification
 - 📡 **Full JSON-RPC** — Ethereum-compatible `eth_*`, `web3_*`, `net_*`, `debug_*`, plus Shell-specific APIs, secured by TLS, rate limiting, and API keys
@@ -86,7 +87,7 @@ For the full design and current implementation status, see
 | `shell-primitives` | Foundational types: Keccak-256, BLAKE3, H256, Address, U256, Bytes |
 | `shell-crypto` | CRYSTALS-Dilithium & SPHINCS+ signing, multi-algorithm Signer/Verifier traits |
 | `shell-core` | Block, Transaction (AA-native), Account, Receipt, EIP-1559 gas model |
-| `shell-storage` | RocksDB backend, Merkle Patricia Trie, RLP serialization, state pruning |
+| `shell-storage` | RocksDB backend, Merkle Patricia Trie, RLP serialization, state pruning, storage profiles |
 | `shell-consensus` | Weighted PoA (wPoA) engine, finality tracker, fork choice rule, dynamic validator set, slashing |
 | `shell-evm` | revm integration (Cancun spec), PQ precompiles, EIP-2930/4844, system contracts |
 | `shell-mempool` | Transaction pool with PQ validation, fee-priority ordering, Replace-by-Fee |
@@ -145,6 +146,7 @@ For details, see [docs/PQ_CRYPTO_GUIDE.md](docs/PQ_CRYPTO_GUIDE.md).
 - [API Reference](docs/JSON_RPC_API.md) — complete JSON-RPC API documentation
 - [PQ Crypto Guide](docs/PQ_CRYPTO_GUIDE.md) — post-quantum cryptography details
 - [Native Account Abstraction Guide](docs/ACCOUNT_ABSTRACTION_GUIDE.md) — `pq1...` addresses, validation layers, and AA rollout
+- [Block Pruning & Compression](docs/BLOCK_PRUNING_AND_COMPRESSION.md) — storage profiles (archive/full/light), block body lifecycle, STARK compression
 - [Changelog](CHANGELOG.md) — full release history
 
 ## Contributing

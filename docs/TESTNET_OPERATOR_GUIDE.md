@@ -351,7 +351,8 @@ chain_id = 31337                # Chain ID
 block_time = 2000               # Block production interval (milliseconds)
 keystore = "/data/keystore.json" # Path to encrypted keystore file (validators only)
 db = "rocksdb"                  # Storage backend: "memory" or "rocksdb"
-pruning = 0                     # State roots to retain (0 = archive mode)
+pruning = 0                     # State roots to retain (0 = archive mode; prefer --storage-profile)
+storage_profile = "full"        # Storage profile: "archive", "full" (default), or "light"
 node_role = "validator"         # Node role: "validator", "validator-prover", or "prover"
 
 [rpc]
@@ -425,6 +426,9 @@ A `prover` node syncs the chain, generates `ProofAmendment` proofs, and propagat
 | `--bootnodes <ADDRS>` | — | Comma-separated bootstrap peers |
 | `--enable-mdns` | disabled | Enable mDNS discovery |
 | `--pruning <N>` | `0` | State roots retained (0 = archive) |
+| `--storage-profile <PROFILE>` | `full` | Data retention profile: `archive`, `full`, or `light` (see [Block Pruning](BLOCK_PRUNING_AND_COMPRESSION.md)) |
+| `--body-retention <N>` | profile default | Override block body retention window (blocks; 0 = forever) |
+| `--witness-retention <N>` | profile default | Override PQ witness retention window (blocks; 0 = forever) |
 | `--node-role <ROLE>` | `validator` | `validator`, `validator-prover`, or `prover` |
 | `--stark` | disabled | Enable STARK proof aggregation |
 | `--max-concurrent-proofs <N>` | `1` | Parallel proof jobs (prover roles only) |
@@ -725,7 +729,8 @@ curl -s http://localhost:8545 \
 ### High memory usage
 
 - Switch from `--db memory` to `--db rocksdb` for production.
-- Enable pruning: `--pruning 1000` retains only the last 1,000 state roots.
+- Choose a storage profile: `--storage-profile light` uses a fixed ~1 GB rolling window; `--storage-profile full` (default) keeps TX history forever but replaces PQ witnesses with compact STARK proofs.
+- Enable state-root pruning: `--pruning 1000` retains only the last 1,000 state roots (also set by `light` profile automatically).
 - Check mempool size via `shell_pendingCount` RPC.
 
 ### Metrics not appearing in Grafana
@@ -736,4 +741,4 @@ curl -s http://localhost:8545 \
 
 ---
 
-*Last updated: 2025*
+*Last updated: 2026-04-20*

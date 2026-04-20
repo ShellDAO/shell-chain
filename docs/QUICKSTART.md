@@ -99,7 +99,8 @@ shell-node run \
   --block-time 2000 \
   --chain-id 1337 \
   --db memory \
-  --rpc-api eth,net,web3,shell
+  --rpc-api eth,net,web3,shell \
+  --storage-profile full
 ```
 
 Enter your keystore password when prompted. You should see log output showing blocks being produced every 2 seconds.
@@ -232,6 +233,7 @@ For more details on alpha testnet operations, see the [Testnet Operator Guide](T
 ## Next Steps
 
 - **Run a multi-node testnet:** See the [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md) for Docker deployment with 3 validators + monitoring.
+- **Choose a storage profile:** `--storage-profile archive` (full history), `full` (default — TX history forever, STARK replaces PQ witnesses), or `light` (~2 h rolling window). See [Block Pruning & Compression](BLOCK_PRUNING_AND_COMPRESSION.md).
 - **Deploy smart contracts:** See [Smart Contract Guide](SMART_CONTRACT_GUIDE.md) for deploying Solidity/Vyper contracts with Hardhat or Foundry.
 - **Full API reference:** See [JSON-RPC API Reference](JSON_RPC_API.md) for all 61 RPC methods.
 - **Understand the cryptography:** See [PQ Crypto Guide](PQ_CRYPTO_GUIDE.md) for details on Dilithium3, key formats, and quantum resistance.
@@ -241,4 +243,4 @@ For more details on alpha testnet operations, see the [Testnet Operator Guide](T
 
 ---
 
-*Last updated: 2025*
+*Last updated: 2026-04-20*
