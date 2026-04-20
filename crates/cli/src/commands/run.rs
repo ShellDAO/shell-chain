@@ -65,9 +65,11 @@ pub struct RunArgs {
     pub parallel_evm: bool,
     /// Number of worker threads for the parallel-EVM scheduler (default: logical CPUs).
     pub parallel_evm_workers: Option<usize>,
-    /// Number of recent blocks whose witness bundles are retained (0 = archive, default: 128).
+    /// Override witness bundle retention from the storage profile.
+    /// `0` = keep forever. Omit to use the storage profile default.
     pub witness_retention: Option<u64>,
-    /// Number of recent blocks whose full bodies are retained (0 = archive, default: 512).
+    /// Override body (TX detail) retention from the storage profile.
+    /// `0` = keep forever. Omit to use the storage profile default.
     pub body_retention: Option<u64>,
     /// High-level storage profile: "archive", "full", or "light".
     pub storage_profile: String,
@@ -509,7 +511,14 @@ async fn run_with_store<S: KvStore + 'static>(
             profile.to_pruning_config(
                 args.body_retention,
                 args.witness_retention,
-                Some(args.pruning),
+                // Pass None when --pruning is at default (0) so storage profiles
+                // can apply their own keep_recent defaults (e.g. light = 4096).
+                // An explicit non-zero --pruning flag overrides the profile.
+                if args.pruning == 0 {
+                    None
+                } else {
+                    Some(args.pruning)
+                },
             )
         },
         metrics: shell_node::config::MetricsConfig {

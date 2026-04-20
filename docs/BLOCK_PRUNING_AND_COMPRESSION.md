@@ -231,7 +231,7 @@ all retention parameters at once. Profiles replace the confusing
 ### Choosing a profile
 
 ```
-shell-node --storage-profile <archive|full|light>
+shell-node run --storage-profile <archive|full|light>
 ```
 
 Default: **`full`**
@@ -258,15 +258,15 @@ Base: 50 tx/block, 2 s/block → 43,200 blocks/day.
 
 ```
 # full profile but keep the last 2048 blocks of witnesses too
-shell-node --storage-profile full --witness-retention 2048
+shell-node run --storage-profile full --witness-retention 2048
 ```
 
 Explicit flags take priority over the profile for body and witness retention.
-When both `--body-retention` and `--witness-retention` are provided, those values
-override the profile defaults; however, `--storage-profile` still determines
-`proof_replacement_grace` (how long to wait before replacing witness data with a
-STARK proof). To fully ignore the profile, use `--body-retention`, `--witness-retention`,
-and set `--pruning` explicitly.
+`--storage-profile` also sets `proof_replacement_grace` (how long to wait before
+replacing PQ witness data with a STARK proof) and — when `--pruning` is omitted —
+the `keep_recent` (state-root) default for the profile. To fully override all
+profile values, use `--body-retention`, `--witness-retention`, and `--pruning`
+explicitly.
 
 ### Auto-sync on profile upgrade
 

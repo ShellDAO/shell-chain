@@ -106,6 +106,33 @@ pub enum NetworkMessage {
     BodyResponse { blocks: Vec<Block> },
 }
 
+/// High-level topic classification for network message propagation.
+///
+/// Keeping this mapping alongside `NetworkMessage` makes it much harder for
+/// new variants to be silently unrouted by transport-specific code (e.g. libp2p).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkTopic {
+    /// Block and block-body propagation traffic.
+    Blocks,
+    /// Consensus and proof-related traffic.
+    Consensus,
+}
+
+impl NetworkMessage {
+    /// Returns the propagation topic for this message type.
+    ///
+    /// Returns `None` for messages that don't map to a specific topic
+    /// (handled by transport-specific routing logic).
+    pub const fn topic(&self) -> Option<NetworkTopic> {
+        match self {
+            Self::StorageCapability { .. }
+            | Self::BodyRequest { .. }
+            | Self::BodyResponse { .. } => Some(NetworkTopic::Blocks),
+            _ => None,
+        }
+    }
+}
+
 /// Events produced by the network layer for the node to process.
 #[derive(Debug)]
 pub enum NetworkEvent {

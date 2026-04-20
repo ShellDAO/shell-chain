@@ -195,18 +195,8 @@ impl<S: KvStore + 'static> Node<S> {
     pub fn log_pruning_banner(&self) {
         let p = &self.config.pruning;
 
-        // Determine which named profile matches the active config (best-effort).
-        let profile_name = if p.proof_replacement_grace == u64::MAX
-            && p.body_retention == 0
-            && p.witness_retention == 0
-            && p.keep_recent == 0
-        {
-            StorageProfile::Archive.as_str()
-        } else if p.body_retention == 0 && p.keep_recent == 0 {
-            StorageProfile::Full.as_str()
-        } else {
-            StorageProfile::Light.as_str()
-        };
+        // Use the canonical classifier so banner + P2P capability stay consistent.
+        let profile_name = StorageProfile::from_pruning_config(p).as_str();
 
         let state_mode = if p.state_pruning_experimental {
             if p.keep_recent == 0 {
@@ -768,6 +758,30 @@ impl<S: KvStore + 'static> Node<S> {
             );
         }
 
+        // L4: After advertising capability, give peers a brief window to respond,
+        // then scan for missing bodies and issue the initial BodyRequest to kick
+        // off historical body back-fill on nodes that upgraded their storage profile.
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if network.peer_count().await > 0 {
+                let oldest = self.oldest_available_body_block();
+                let head = self.head_number();
+                if oldest > 0 {
+                    // There are gaps — request bodies starting from the beginning.
+                    let _ = network
+                        .broadcast(NetworkMessage::BodyRequest {
+                            start_number: 0,
+                            count: 128,
+                        })
+                        .await;
+                    info!(
+                        oldest_available = oldest,
+                        head, "L4: kicked historical body back-fill startup scan"
+                    );
+                }
+            }
+        }
+
         loop {
             tokio::select! {
                 _ = block_timer.tick() => {
@@ -1162,6 +1176,17 @@ impl<S: KvStore + 'static> Node<S> {
                                         }
                                     }
                                     if !blocks.is_empty() {
+                                        // TODO(L4): BodyResponse should be unicast (peer-targeted).
+                                        // Broadcasting historical body data to all peers is wasteful
+                                        // and creates an amplification vector. Until the network layer
+                                        // exposes a send-to-peer API, we broadcast and rely on peers
+                                        // deduplicating via has_body() checks.
+                                        warn!(
+                                            %peer,
+                                            start_number,
+                                            count = blocks.len(),
+                                            "L4: serving BodyResponse via broadcast — unicast API needed to avoid amplification"
+                                        );
                                         let _ = network.broadcast(NetworkMessage::BodyResponse { blocks }).await;
                                     }
                                 }
@@ -1174,10 +1199,13 @@ impl<S: KvStore + 'static> Node<S> {
                                         .flatten()
                                         .map(|b| b.header.number)
                                         .unwrap_or(0);
-                                    // Track the first block number in this response so we can
+                                    // Track the first block in this response so we can
                                     // advance past a bad batch even if no block is stored.
                                     let batch_start = blocks.first().map(|b| b.header.number);
                                     let mut last_stored: Option<u64> = None;
+                                    // Track first gap (mismatch or storage failure) so we
+                                    // re-request from that point and don't silently skip blocks.
+                                    let mut first_gap: Option<u64> = None;
                                     for block in &blocks {
                                         let n = block.header.number;
                                         // Validate block hash matches canonical chain before storing.
@@ -1191,6 +1219,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 block = n,
                                                 "L4: BodyResponse hash mismatch — skipping (peer may be malicious)"
                                             );
+                                            first_gap.get_or_insert(n);
                                             continue;
                                         }
                                         if self.chain_store.has_body(&actual_hash).unwrap_or(false) {
@@ -1199,14 +1228,17 @@ impl<S: KvStore + 'static> Node<S> {
                                         }
                                         if let Err(e) = self.chain_store.put_body_only(block) {
                                             warn!(block = n, error = %e, "L4: failed to store backfill body");
+                                            first_gap.get_or_insert(n);
                                         } else {
                                             last_stored = Some(n);
                                         }
                                     }
-                                    // Advance using last_stored if any blocks were accepted, or
-                                    // skip the entire bad batch using batch_start to avoid stalling.
-                                    let next_start = last_stored
-                                        .map(|n| n + 1)
+                                    // If any block failed (mismatch or store error), re-request from
+                                    // the first gap so missing blocks are never permanently skipped.
+                                    // If all succeeded, continue from last_stored + 1.
+                                    // If the entire batch was bad, skip it to avoid stalling.
+                                    let next_start = first_gap
+                                        .or_else(|| last_stored.map(|n| n + 1))
                                         .or_else(|| batch_start.map(|s| s.saturating_add(128)));
                                     if let Some(next) = next_start {
                                         if next <= head_number {

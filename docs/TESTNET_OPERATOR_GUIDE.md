@@ -731,7 +731,7 @@ curl -s http://localhost:8545 \
 
 - Switch from `--db memory` to `--db rocksdb` for production.
 - Choose a storage profile: `--storage-profile light` uses a fixed ~1 GB rolling window; `--storage-profile full` (default) keeps TX history forever but replaces PQ witnesses with compact STARK proofs.
-- Enable state-root pruning: `--pruning 1000` retains only the last 1,000 state roots (also set by `light` profile automatically).
+- Enable state-root pruning: `--pruning 1000` retains only the last 1,000 state roots. Note: the `light` profile sets its own `keep_recent` default (4096) only when `--pruning` is omitted; pass `--pruning N` explicitly to override.
 - Check mempool size via `shell_pendingCount` RPC.
 
 ### Metrics not appearing in Grafana
