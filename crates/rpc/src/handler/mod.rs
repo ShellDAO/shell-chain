@@ -335,12 +335,15 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let mut evm = ShellEvm::new(state_db, self.chain_id);
 
         let from = req.from.unwrap_or(Address::ZERO);
+        // Cap gas to prevent DoS via unbounded simulated execution.
+        const RPC_GAS_CAP: u64 = 50_000_000;
         let gas_limit = req
             .gas
             .as_deref()
             .map(|s| parse_hex_u64(s))
             .transpose()?
-            .unwrap_or(30_000_000);
+            .unwrap_or(30_000_000)
+            .min(RPC_GAS_CAP);
         let value = req
             .value
             .as_deref()
@@ -569,8 +572,11 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
 
 /// Convert a storage error into a JSON-RPC internal error.
+/// The raw error details are logged server-side but NOT returned to callers
+/// to prevent leaking internal implementation details.
 pub(crate) fn internal_err(msg: impl std::fmt::Display) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(-32603, msg.to_string(), None::<()>)
+    tracing::error!(rpc_internal_error = %msg, "RPC internal error");
+    ErrorObjectOwned::owned(-32603, "Internal server error", None::<()>)
 }
 
 /// Convert a user input problem into a JSON-RPC invalid params error.

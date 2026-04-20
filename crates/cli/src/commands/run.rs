@@ -293,6 +293,22 @@ async fn run_with_store<S: KvStore + 'static>(
                     path.display()
                 )
             })?;
+            // Reject world-readable or group-readable keystores on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)?.permissions().mode();
+                if (mode & 0o077) != 0 {
+                    return Err(format!(
+                        "keystore file '{}' has insecure permissions (0o{:03o}); \
+                         run: chmod 600 {}",
+                        path.display(),
+                        mode & 0o777,
+                        path.display()
+                    )
+                    .into());
+                }
+            }
             info!("Loading keystore from {}", path.display());
             let json = std::fs::read_to_string(&path)?;
             let encrypted: EncryptedKey = serde_json::from_str(&json)?;
@@ -508,6 +524,15 @@ async fn run_with_store<S: KvStore + 'static>(
                     warn!("Invalid --storage-profile value: {e}. Falling back to 'full'.");
                     StorageProfile::Full
                 });
+            // Reject contradictory: archive (keep-forever) + explicit pruning limit.
+            if profile == StorageProfile::Archive && args.pruning > 0 {
+                return Err(format!(
+                    "conflicting options: --storage-profile archive keeps all history, \
+                     but --pruning {} would discard it; remove one of the two flags",
+                    args.pruning
+                )
+                .into());
+            }
             profile.to_pruning_config(
                 args.body_retention,
                 args.witness_retention,

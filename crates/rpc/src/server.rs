@@ -70,7 +70,7 @@ impl Default for RpcConfig {
             ws_addr: Some(SocketAddr::from(([127, 0, 0, 1], 8546))),
             tls_cert_path: None,
             tls_key_path: None,
-            cors_allowed_origins: Some(vec!["*".to_string()]),
+            cors_allowed_origins: None,
             rate_limit_per_sec: Some(50),
             api_namespaces: vec!["eth".into(), "net".into(), "web3".into(), "shell".into()],
             allow_unsafe_dev_exposed: false,

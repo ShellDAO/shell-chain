@@ -99,6 +99,8 @@ impl std::fmt::Display for RegistryError {
     }
 }
 
+impl std::error::Error for RegistryError {}
+
 /// I5: Registry of known standalone prover nodes with reputation tracking.
 #[derive(Debug)]
 pub struct ProverRegistry {
