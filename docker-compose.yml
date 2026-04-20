@@ -22,6 +22,7 @@ services:
       --unsafe-dev-exposed
       --rpc-rate-limit 5000
       --pruning 0
+      --storage-profile archive
     ports:
       - "127.0.0.1:8545:8545"
       - "30303:30303"
@@ -53,6 +54,7 @@ services:
       --enable-mdns
       --db rocksdb
       --block-time 2000
+      --storage-profile full
     ports:
       - "127.0.0.1:8546:8545"
     volumes:
@@ -77,6 +79,7 @@ services:
       --enable-mdns
       --db rocksdb
       --block-time 2000
+      --storage-profile full
     ports:
       - "127.0.0.1:8547:8545"
     volumes:

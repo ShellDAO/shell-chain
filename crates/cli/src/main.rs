@@ -175,13 +175,33 @@ enum Commands {
         #[arg(long)]
         parallel_evm_workers: Option<usize>,
 
-        /// Number of recent blocks whose witness bundles are retained (0 = archive, default: 128).
-        #[arg(long, default_value = "128")]
-        witness_retention: u64,
+        /// High-level storage classification for this node.
+        ///
+        /// Controls which block data is retained and for how long:
+        ///
+        ///   archive — TX bodies + PQ signatures + STARK proofs kept forever.
+        ///             Witness bundles are never deleted, even after a STARK proof arrives.
+        ///             ~12.8 GB/day at 50 tx/block.
+        ///
+        ///   full    — TX bodies kept forever; PQ signatures replaced by STARK proofs
+        ///             once the proof lands. Recommended default. ~1.5 GB/day.
+        ///
+        ///   light   — Rolling 4 096-block window (~2.3 h at 2 s/block). ~1 GB total (stable).
+        ///
+        /// Individual --body-retention / --witness-retention flags override the profile default.
+        #[arg(long, default_value = "full")]
+        storage_profile: String,
 
-        /// Number of recent blocks whose full bodies are retained (0 = archive, default: 512).
-        #[arg(long, default_value = "512")]
-        body_retention: u64,
+        /// Override body (TX detail) retention from the storage profile.
+        /// 0 = keep forever. If omitted, the storage profile default is used.
+        #[arg(long)]
+        witness_retention: Option<u64>,
+
+        /// Override witness bundle retention from the storage profile.
+        /// 0 = keep forever. If omitted, the storage profile default is used.
+        #[arg(long)]
+        body_retention: Option<u64>,
+
         /// Enable STARK aggregate proof generation during block production.
         /// WARNING: expensive (~150ms per block). Off by default.
         #[arg(long, default_value = "false")]
@@ -365,6 +385,7 @@ async fn main() {
             state_cache_size_mb,
             parallel_evm,
             parallel_evm_workers,
+            storage_profile,
             witness_retention,
             body_retention,
             enable_stark_aggregation,
@@ -516,6 +537,7 @@ async fn main() {
                 state_cache_size_mb,
                 parallel_evm: effective_parallel_evm,
                 parallel_evm_workers: effective_parallel_evm_workers,
+                storage_profile,
                 witness_retention,
                 body_retention,
                 enable_stark_aggregation,

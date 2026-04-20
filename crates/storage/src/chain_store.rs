@@ -287,6 +287,25 @@ impl<S: KvStore> ChainStore<S> {
         Ok(self.store.get(&Self::witness_key(hash))?.is_some())
     }
 
+    /// Returns `true` if a stripped body (`b/<hash>`) is stored for the given block hash.
+    ///
+    /// Used by the historical body sync to detect pruned blocks.
+    pub fn has_body(&self, hash: &ShellHash) -> Result<bool, StorageError> {
+        Ok(self.store.get(&Self::body_key(hash))?.is_some())
+    }
+
+    /// Store only the stripped body portion of a block (without header or witness).
+    ///
+    /// Used during historical back-fill to restore pruned TX bodies without
+    /// overwriting any witness or proof data that may already be present.
+    pub fn put_body_only(&self, block: &shell_core::Block) -> Result<(), StorageError> {
+        let hash = block.hash();
+        let (stripped, _bundle) = shell_core::StrippedBlock::split(block);
+        let body_bytes = encode_rlp(&stripped);
+        self.store.put(&Self::body_key(&hash), &body_bytes)?;
+        Ok(())
+    }
+
     // ── L3: Trie node reference counting ───────────────────────────────────────
     //
     // Key format: `refs/<node_hash>` → little-endian u32 (reference count).

@@ -27,7 +27,7 @@ its own deletion trigger.
 
 | Segment | RocksDB key | Content | Size (50-tx block) | Retention |
 |---|---|---|---|---|
-| **TX Detail** | `b/<block_hash>` | `StrippedBlock` — header + `Vec<StrippedTransaction>` (from/to/value/nonce/gas/input) | ~7 KB | **Forever** |
+| **TX Detail** | `b/<block_hash>` | `StrippedBlock` — header + `Vec<StrippedTransaction>` (from/to/value/nonce/gas/input) | ~7 KB | Profile-dependent (see below) |
 | **Witness Bundle** | `w/<block_hash>` | `WitnessBundle` — one `TxWitness` per tx (Dilithium3 sig + optional pubkey) | ~180 KB | Deleted after STARK proof arrives |
 | **STARK Proof** | `pa/<block_hash>` | `ProofAmendment` — Winterfell aggregate proof covering all sigs in block | ~15 KB | **Forever** |
 
@@ -219,3 +219,72 @@ to compress. The `b/<hash>` entry is still written and retained.
 Yes. `ProofAmendment` is self-contained — it includes `batch_root_bytes`,
 `n_sigs`, and the Winterfell proof. Any node can verify the aggregate without
 the original signatures.
+
+---
+
+## Storage Profiles
+
+Shell Chain nodes choose a *storage profile* with a single CLI flag that sets
+all retention parameters at once. Profiles replace the confusing
+`--body-retention` / `--witness-retention` pair as the primary user interface.
+
+### Choosing a profile
+
+```
+shell-node --storage-profile <archive|full|light>
+```
+
+Default: **`full`**
+
+| Profile | `body_retention` | `witness_retention` | `proof_replacement_grace` | `keep_recent` | Typical use |
+|---|---|---|---|---|---|
+| `archive` | 0 (forever) | 0 (forever) | u64::MAX (never delete) | 0 (forever) | Complete cryptographic audit trail; PQ signatures kept even after STARK proof |
+| `full` (**default**) | 0 (forever) | 128 | 0 (replace immediately) | 0 (forever) | Full node: TX history queryable forever; STARK proof replaces PQ signatures |
+| `light` | 4096 (~2.3 h) | 64 | 0 | 4096 | Light / embedded node; rolling ~2-hour window only |
+
+### Data volume estimates
+
+Base: 50 tx/block, 2 s/block → 43,200 blocks/day.
+
+| Profile | Daily write | Annual steady-state |
+|---|---|---|
+| `archive` | ~12.8 GB/day | ~4.7 TB/year |
+| `full` | ~1.5 GB/day | ~550 GB/year |
+| `light` | no growth | ~1 GB fixed |
+
+### Override individual parameters
+
+`--body-retention` and `--witness-retention` override profile defaults:
+
+```
+# full profile but keep the last 2048 blocks of witnesses too
+shell-node --storage-profile full --witness-retention 2048
+```
+
+Explicit flags take priority over the profile. `--storage-profile` is ignored
+if both body and witness retention are provided explicitly.
+
+### Auto-sync on profile upgrade
+
+When a node is restarted with a higher storage profile (e.g. `light → full`),
+it automatically back-fills missing block bodies from peers that advertise a
+richer profile via the `StorageCapability` P2P message. Back-fill runs in the
+background; normal consensus is not interrupted. When finished, the node logs:
+
+```
+✓ historical body back-fill complete
+```
+
+If no peer with sufficient history is reachable, the node logs a warning and
+retries on each new peer connection.
+
+> **Note**: if *all* nodes in a network ran `light` profile and data has been
+> pruned, that history is permanently lost and cannot be recovered.
+
+### Docker Compose defaults
+
+The bundled `docker-compose.yml` assigns:
+
+- **node1** — `archive` (serves as authoritative history source)
+- **node2 / node3** — `full` (typical validator nodes)
+

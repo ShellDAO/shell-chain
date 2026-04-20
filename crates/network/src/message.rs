@@ -87,6 +87,23 @@ pub enum NetworkMessage {
     ProofChallenge(Box<ProofChallenge>),
     /// I2: Response to a `ProofChallenge` — provides raw proof bytes for re-verification.
     ProofChallengeResponse(Box<ChallengeResponse>),
+    /// Advertise this node's storage capability to a newly connected peer.
+    ///
+    /// Sent once after a peer connection is established.  Receivers use this
+    /// information to prefer archive/full peers when requesting historical data.
+    StorageCapability {
+        /// Human-readable profile name: "archive", "full", or "light".
+        profile: String,
+        /// Lowest block number whose body (`b/<hash>`) is still available locally.
+        /// `0` means all blocks from genesis are available.
+        oldest_body_block: u64,
+    },
+    /// Request missing block bodies (TX detail) for a range of block numbers.
+    ///
+    /// Used for historical body back-fill after a node upgrades its storage profile.
+    BodyRequest { start_number: u64, count: u64 },
+    /// Response carrying block bodies for a `BodyRequest`.
+    BodyResponse { blocks: Vec<Block> },
 }
 
 /// Events produced by the network layer for the node to process.
