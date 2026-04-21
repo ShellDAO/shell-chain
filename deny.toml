@@ -15,19 +15,21 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
     "CC0-1.0",
     "OpenSSL",
     "MPL-2.0",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
-# Warn on duplicate crate versions; deny wildcard version requirements.
+# Warn on duplicate crate versions; warn on wildcard version requirements
+# (workspace = true deps appear as wildcards in member Cargo.toml files).
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "warn"
 # Crates that must never appear in the dependency tree.
 deny = []
-# No skip entries needed — all duplicates are in transitive deps we don't control.
 skip = []
 skip-tree = []
 

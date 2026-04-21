@@ -1,6 +1,7 @@
 [package]
 name = "shell-stark-bench"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 description = "Long-running STARK block-compression performance benchmark for Shell-chain"
 publish = false
