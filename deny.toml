@@ -20,21 +20,15 @@ allow = [
     "OpenSSL",
     "MPL-2.0",
 ]
-# Allow dual-licensed crates where at least one license is permitted.
-exceptions = []
 
 [bans]
-# Deny exact duplicate versions of the same crate (except where explicitly
-# skipped) to reduce supply-chain attack surface.
+# Warn on duplicate crate versions; deny wildcard version requirements.
 multiple-versions = "warn"
 wildcards = "deny"
 # Crates that must never appear in the dependency tree.
 deny = []
-# Allow multiple versions of these commonly duplicated crates.
-skip = [
-    { name = "syn", version = "1" },
-    { name = "syn", version = "2" },
-]
+# No skip entries needed — all duplicates are in transitive deps we don't control.
+skip = []
 skip-tree = []
 
 [sources]
