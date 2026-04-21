@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] — 2026-04-21 — Security & Efficiency Hardening
+
+### Security
+
+- **RPC CORS default**: changed from wildcard `*` to `None` (same-origin only); operators must
+  explicitly set `cors_allowed_origins` to enable cross-origin access.
+- **RPC gas cap**: `eth_call` / `eth_estimateGas` now capped at 50 M gas (previously unbounded,
+  allowing CPU-exhaustion DoS).
+- **RPC error leakage**: `internal_err()` now logs details server-side and returns a generic
+  `"Internal server error"` to callers; user-facing "not found" and "invalid params" errors
+  surface correctly via dedicated `not_found_err()` and `invalid_params_err()` helpers.
+- **Keystore file permissions**: node startup rejects keystore files with world- or group-readable
+  Unix permissions (`chmod 600` enforced on load, not just on create).
+- **Slashing wired**: `PoaEngine::slash_authority()` now mutates `PoaConfig.slashed` and
+  `is_authority()` excludes slashed validators; previously slashing was logged but had no effect.
+- **BodyResponse unicast**: block-body responses now sent directly to the requesting peer instead
+  of broadcasting to all peers (eliminates O(n) amplification).
+- **Bounded tx-broadcast channel**: replaced `unbounded_channel` with `channel(4096)` + `try_send`
+  backpressure; prevents unbounded memory growth under transaction floods.
+
+### Reliability
+
+- **Archive + pruning conflict**: `--storage-profile archive` combined with `--pruning N` now
+  returns an early error instead of silently ignoring archive semantics.
+- **Error traits**: `RegistryError` and `WindowError` now implement `std::error::Error`,
+  enabling proper trait-object error composition.
+
+### Code Quality
+
+- **Large-file split**: `crates/node/src/node.rs` (4 575 lines) split into 6 focused modules;
+  `crates/rpc/src/handler.rs` (4 762 lines) split into 7 focused modules.
+- **Production unwraps**: remaining 2 production `unwrap()` calls eliminated.
+
+### CI / Supply Chain
+
+- New `supply-chain` CI job: runs `cargo deny check` (license + advisory + ban policy) and
+  `cargo audit` (vulnerability scan) on every push and PR.
+- Fixes `BodyRequest` / `BodyResponse` missing match arms in `Libp2pNetwork::broadcast()`
+  (compile error when `libp2p` feature is enabled).
+
+### Previous release: [0.16.0]
+
 ## [0.16.0] — 2026-04-20 — M14: Storage Profile Node Classification
 
 ### Added
