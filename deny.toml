@@ -6,6 +6,7 @@ unmaintained = "none"
 
 [licenses]
 # Allow only standard permissive/copyleft licenses suitable for open-source use.
+# Anything not in this list is implicitly denied.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -18,15 +19,6 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
     "MPL-2.0",
-]
-# Copyleft licenses that require review before adding new crates.
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
 ]
 # Allow dual-licensed crates where at least one license is permitted.
 exceptions = []

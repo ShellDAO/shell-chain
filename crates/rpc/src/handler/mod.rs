@@ -1908,7 +1908,7 @@ mod tests {
     async fn web3_client_version() {
         let handler = setup();
         let result = Web3ApiServer::client_version(&handler).await.unwrap();
-        assert_eq!(result, "shell-chain/0.6.0");
+        assert_eq!(result, format!("shell-chain/{}", env!("CARGO_PKG_VERSION")));
     }
 
     #[tokio::test]
@@ -2206,7 +2206,10 @@ mod tests {
         let handler = setup();
         let result = ShellApiServer::get_node_info(&handler).await.unwrap();
 
-        assert_eq!(result["version"], "ShellChain/v0.6.0/rust");
+        assert_eq!(
+            result["version"],
+            format!("ShellChain/v{}/rust", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(result["chainId"], 42);
         assert_eq!(result["blockHeight"], 0);
         assert_eq!(result["peerCount"], 0);
