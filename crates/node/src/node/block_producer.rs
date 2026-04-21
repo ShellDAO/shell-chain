@@ -232,5 +232,4 @@ impl<S: KvStore + 'static> Node<S> {
 
         Ok(block)
     }
-
 }

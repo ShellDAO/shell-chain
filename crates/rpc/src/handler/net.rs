@@ -3,7 +3,7 @@ use super::*;
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> Web3ApiServer for RpcHandler<S> {
     async fn client_version(&self) -> Result<String, ErrorObjectOwned> {
-        Ok("shell-chain/0.6.0".to_string())
+        Ok(format!("shell-chain/{}", env!("CARGO_PKG_VERSION")))
     }
 
     async fn sha3(&self, data: String) -> Result<String, ErrorObjectOwned> {
@@ -11,9 +11,10 @@ impl<S: KvStore + 'static> Web3ApiServer for RpcHandler<S> {
         // Limit input to 32 KB to prevent DoS via large allocations.
         const MAX_HEX_LEN: usize = 32 * 1024 * 2; // 32 KB decoded = 64 KB hex
         if raw.len() > MAX_HEX_LEN {
-            return Err(internal_err("input too large (max 32 KB)"));
+            return Err(invalid_params_err("input too large (max 32 KB)"));
         }
-        let bytes = hex::decode(raw).map_err(|e| internal_err(format!("invalid hex: {e}")))?;
+        let bytes =
+            hex::decode(raw).map_err(|e| invalid_params_err(format!("invalid hex: {e}")))?;
         let hash = shell_primitives::keccak256(&bytes);
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
@@ -141,4 +142,3 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         serde_json::to_value(&traces).map_err(|e| internal_err(format!("serialization error: {e}")))
     }
 }
-

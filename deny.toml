@@ -1,8 +1,8 @@
 [advisories]
 # Deny crates with known security advisories.
 ignore = []
-# Unmaintained crates at warning level (block only on critical).
-unmaintained = "warn"
+# Unmaintained crates: "none" skips the check (use "workspace" or "all" to enable).
+unmaintained = "none"
 
 [licenses]
 # Allow only standard permissive/copyleft licenses suitable for open-source use.

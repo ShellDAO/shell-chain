@@ -458,7 +458,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn send_raw_transaction(&self, data: String) -> Result<ShellHash, ErrorObjectOwned> {
         // Decode hex payload: "0x" + hex-encoded transaction bytes.
         let raw = data.strip_prefix("0x").unwrap_or(&data);
-        let bytes = hex::decode(raw).map_err(|e| internal_err(format!("invalid hex: {e}")))?;
+        let bytes =
+            hex::decode(raw).map_err(|e| invalid_params_err(format!("invalid hex: {e}")))?;
 
         // Try RLP decoding first (standard Ethereum format), then JSON (legacy).
         let signed_tx: SignedTransaction = {

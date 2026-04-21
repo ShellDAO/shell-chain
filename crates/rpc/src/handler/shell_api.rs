@@ -121,7 +121,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         };
 
         Ok(serde_json::json!({
-            "version": "ShellChain/v0.6.0/rust",
+            "version": format!("ShellChain/v{}/rust", env!("CARGO_PKG_VERSION")),
             "chainId": self.chain_id,
             "blockHeight": block_height,
             "peerCount": 0,
@@ -347,11 +347,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             .chain_store
             .get_header_by_hash(&block_hash)
             .map_err(internal_err)?;
-        let witness_root = header
+        let witness_root: serde_json::Value = header
             .as_ref()
             .and_then(|h| h.witness_root)
-            .map(|r| format!("0x{}", hex::encode(r.as_bytes())))
-            .unwrap_or_else(|| "null".into());
+            .map(|r| serde_json::Value::String(format!("0x{}", hex::encode(r.as_bytes()))))
+            .unwrap_or(serde_json::Value::Null);
 
         // Look up the witness bundle if a store is wired.
         let Some(ws) = &self.witness_store else {
@@ -400,4 +400,3 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         }))
     }
 }
-

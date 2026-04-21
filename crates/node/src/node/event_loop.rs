@@ -582,7 +582,14 @@ impl<S: KvStore + 'static> Node<S> {
                                             count = blocks.len(),
                                             "L4: serving BodyResponse via unicast to requesting peer"
                                         );
-                                        let _ = network.send_to_peer(&peer, NetworkMessage::BodyResponse { blocks }).await;
+                                        let _ = network
+                                            .send_to_peer(
+                                                &peer,
+                                                NetworkMessage::BodyResponse { blocks },
+                                            )
+                                            // Note: send_to_peer falls back to broadcast if the
+                                            // transport does not support unicast addressing.
+                                            .await;
                                     }
                                 }
                                 // L4: Receive block bodies from a peer as historical back-fill.
@@ -805,5 +812,4 @@ impl<S: KvStore + 'static> Node<S> {
         let _ = network.shutdown().await;
         Ok(())
     }
-
 }

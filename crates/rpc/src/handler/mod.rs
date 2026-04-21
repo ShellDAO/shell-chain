@@ -14,7 +14,9 @@ pub(crate) use shell_evm::bloom::BLOOM_SIZE;
 pub(crate) use shell_evm::{ShellEvm, ShellStateDb};
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
-pub(crate) use shell_storage::{ChainStore, KvStore, WitnessStore, WorldState, MAX_ADDRESS_TX_HISTORY_OFFSET};
+pub(crate) use shell_storage::{
+    ChainStore, KvStore, WitnessStore, WorldState, MAX_ADDRESS_TX_HISTORY_OFFSET,
+};
 
 pub(crate) use crate::admin::{AdminApiServer, NodeInfo, PeerInfo};
 pub(crate) use crate::api::{
@@ -27,13 +29,12 @@ pub(crate) use crate::filter_registry::{FilterKind, FilterRegistry};
 pub(crate) use crate::subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
 pub(crate) use crate::types::*;
 
-
-mod evm;
-mod eth;
-mod shell_api;
-mod net;
-mod debug;
 mod admin;
+mod debug;
+mod eth;
+mod evm;
+mod net;
+mod shell_api;
 
 /// JSON-RPC handler wired to storage and mempool backends.
 ///
@@ -568,8 +569,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         }
     }
 }
-
-
 
 /// Convert a storage error into a JSON-RPC internal error.
 /// The raw error details are logged server-side but NOT returned to callers

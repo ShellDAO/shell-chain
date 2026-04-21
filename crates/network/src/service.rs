@@ -20,13 +20,16 @@ pub trait NetworkService: Send + Sync {
 
     /// Send a message to a specific peer only (unicast).
     ///
-    /// Default implementation falls back to broadcast. Implementations that
-    /// support direct peer messaging should override this to avoid amplification.
+    /// Default implementation falls back to broadcast when the transport does
+    /// not support addressing individual peers. Implementations that support
+    /// true unicast (e.g. libp2p request-response) should override this method
+    /// to avoid message amplification.
     async fn send_to_peer(
         &self,
         _peer_id: &PeerId,
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
+        // Fallback: broadcast to all peers when unicast is not implemented.
         self.broadcast(msg).await
     }
 

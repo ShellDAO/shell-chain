@@ -48,4 +48,3 @@ impl<S: KvStore + 'static> EvmApiServer for RpcHandler<S> {
         dev.revert(&snapshot_id).map_err(internal_err)
     }
 }
-

@@ -54,4 +54,3 @@ impl<S: KvStore + 'static> DevRpcControl for Node<S> {
         self.revert_inner(snapshot_id).map_err(|e| e.to_string())
     }
 }
-

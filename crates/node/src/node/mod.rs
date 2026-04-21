@@ -6,7 +6,6 @@ mod dev_rpc;
 mod event_loop;
 mod p2p_handlers;
 
-
 pub(crate) use std::collections::{BTreeMap, HashMap};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +19,9 @@ pub(crate) use shell_consensus::{
     PoaEngine,
 };
 pub(crate) use shell_core::{calculate_base_fee, Account, Block, BlockHeader, SignedTransaction};
-pub(crate) use shell_crypto::{BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem};
+pub(crate) use shell_crypto::{
+    BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem,
+};
 pub(crate) use shell_evm::{commit_evm_state, validate_tx_for_import, ShellEvm, ShellStateDb};
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};
@@ -614,7 +615,6 @@ impl<S: KvStore + 'static> Node<S> {
     pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
     }
-
 }
 
 #[cfg(test)]
