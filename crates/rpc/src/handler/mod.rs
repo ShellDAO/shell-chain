@@ -456,38 +456,38 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         ErrorObjectOwned,
     > {
         let hex_str = tx_hash.strip_prefix("0x").unwrap_or(tx_hash);
-        let hash_bytes =
-            hex::decode(hex_str).map_err(|e| internal_err(format!("invalid tx hash hex: {e}")))?;
+        let hash_bytes = hex::decode(hex_str)
+            .map_err(|e| invalid_params_err(format!("invalid tx hash hex: {e}")))?;
         let hash = ShellHash::try_from_slice(&hash_bytes)
-            .map_err(|e| internal_err(format!("invalid tx hash length: {e}")))?;
+            .map_err(|e| invalid_params_err(format!("invalid tx hash length: {e}")))?;
 
         let (block_hash, tx_index) = self
             .chain_store
             .get_tx_location(&hash)
             .map_err(internal_err)?
-            .ok_or_else(|| internal_err("transaction not found"))?;
+            .ok_or_else(|| not_found_err("transaction not found"))?;
 
         let block = self
             .chain_store
             .get_block_by_hash(&block_hash)
             .map_err(internal_err)?
-            .ok_or_else(|| internal_err("block not found"))?;
+            .ok_or_else(|| not_found_err("block not found"))?;
 
         let tx = block
             .transactions
             .get(tx_index as usize)
-            .ok_or_else(|| internal_err("transaction not in block"))?
+            .ok_or_else(|| not_found_err("transaction not in block"))?
             .clone();
 
         let receipts = self
             .chain_store
             .get_receipts(&block_hash)
             .map_err(internal_err)?
-            .ok_or_else(|| internal_err("receipts not found"))?;
+            .ok_or_else(|| not_found_err("receipts not found"))?;
 
         let receipt = receipts
             .get(tx_index as usize)
-            .ok_or_else(|| internal_err("receipt not found"))?
+            .ok_or_else(|| not_found_err("receipt not found"))?
             .clone();
 
         Ok((block, tx, receipt, tx_index))
@@ -501,11 +501,11 @@ impl<S: KvStore + 'static> RpcHandler<S> {
                 .chain_store
                 .get_block_by_number(n)
                 .map_err(internal_err)?
-                .ok_or_else(|| internal_err(format!("block {n} not found"))),
+                .ok_or_else(|| not_found_err(format!("block {n} not found"))),
             None => {
                 // "latest" — resolve head
                 let head = self.chain_store.get_head_block().map_err(internal_err)?;
-                head.ok_or_else(|| internal_err("chain has no blocks"))
+                head.ok_or_else(|| not_found_err("chain has no blocks"))
             }
         }
     }
@@ -577,6 +577,11 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 pub(crate) fn internal_err(msg: impl std::fmt::Display) -> ErrorObjectOwned {
     tracing::error!(rpc_internal_error = %msg, "RPC internal error");
     ErrorObjectOwned::owned(-32603, "Internal server error", None::<()>)
+}
+
+/// Resource not found — a valid user-facing response, exposed to the caller.
+pub(crate) fn not_found_err(msg: impl std::fmt::Display) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32001, msg.to_string(), None::<()>)
 }
 
 /// Convert a user input problem into a JSON-RPC invalid params error.

@@ -467,12 +467,12 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 Ok(tx) if slice.is_empty() => tx,
                 Ok(_) => {
                     // RLP decoded but trailing bytes remain — reject per Geth behavior.
-                    return Err(internal_err(
-                        "invalid transaction: RLP has trailing bytes".to_string(),
+                    return Err(invalid_params_err(
+                        "invalid transaction: RLP has trailing bytes",
                     ));
                 }
                 Err(_) => serde_json::from_slice::<SignedTransaction>(&bytes).map_err(|e| {
-                    internal_err(format!("invalid transaction: not valid RLP or JSON ({e})"))
+                    invalid_params_err(format!("invalid transaction: not valid RLP or JSON ({e})"))
                 })?,
             }
         };
