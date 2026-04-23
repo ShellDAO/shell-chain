@@ -112,19 +112,27 @@ construction-time error.
 To prevent any cross-domain replay:
 
 ```text
-batch_signing_hash = keccak256( 0x7E || rlp(Transaction) || rlp(AaBundle) )
-```
-
-The leading `0x7E` byte is a domain tag identical to `tx_type`; combined with
-the encoded `tx_type` field inside the RLP it gives belt-and-suspenders
-isolation from legacy/EIP-1559 hashes.
-
-```text
+batch_signing_hash    = keccak256( 0x7E || rlp(Transaction) || rlp_signing(AaBundle) )
 paymaster_signing_hash = keccak256( 0x7F || from || batch_signing_hash )
 ```
 
-`0x7F` is a distinct domain byte for the paymaster's authorization, binding
-it to both the sender address and the canonical batch hash.
+`rlp_signing(AaBundle)` is the canonical bundle RLP encoding **with the
+`paymaster_signature` field omitted** (only `inner_calls` + `paymaster` are
+hashed). This breaks the otherwise-circular dependency where the sender's
+`batch_signing_hash` would depend on the paymaster's signature, which itself
+depends on `batch_signing_hash`. The signing-form encoder lives at
+`AaBundle::encode_for_signing`; the wire encoder still includes
+`paymaster_signature` so the RLP roundtrip is lossless.
+
+The leading domain bytes (`0x7E`, `0x7F`) plus the encoded `tx_type` field
+inside the inner RLP give belt-and-suspenders isolation from
+legacy/EIP-1559/blob transaction hashes.
+
+> **Sender hash routing.** `SignedTransaction::sender_signing_hash()` returns
+> `batch_signing_hash` for AA-bundle txs and the legacy `hash()` otherwise.
+> All sender PQ-signature verification paths (mempool ingress, witness
+> import, custom-validation calldata) MUST use this single entry point; this
+> avoids per-call-site branching on `tx_type`.
 
 ---
 
@@ -132,18 +140,38 @@ it to both the sender address and the canonical batch hash.
 
 For `tx_type == 0x7E` a transaction passes mempool admission when:
 
-1. **Structural**: `inner_calls` Some & non-empty & ≤ 16; per-call data ≤ 128 KiB;
-   Σ gas ≤ outer gas_limit; outer `to/value/data` zero.
-2. **Sender PQ signature**: existing Layer 1/2/3 dispatch, signing
-   `batch_signing_hash` (§ 2.5) instead of legacy tx hash.
-3. **Paymaster (if `paymaster.is_some()`)**:
-   - `paymaster_signature.len() > 0`
-   - paymaster's pubkey resolvable from the on-chain registry
-   - PQ-verify `paymaster_signature` over `paymaster_signing_hash`
-   - paymaster account balance ≥ `gas_limit * max_fee_per_gas`
-4. **Sender nonce**: standard `account.nonce == tx.nonce`.
+1. **Structural** (`tx_validation::validate_aa_bundle_structure`):
+   - `aa_bundle.is_some()` ⇔ `tx_type == 0x7E` (both directions)
+   - `inner_calls` non-empty & `len ≤ MAX_INNER_CALLS` (16)
+   - per-inner `data.len() ≤ MAX_INNER_CALLDATA` (128 KiB)
+   - `tx.gas_limit ≥ compute_intrinsic_gas(...) + Σ inner.gas_limit + AA_INNER_CALL_INTRINSIC_GAS × len(inner_calls)`
+   - outer `to/value/data` zero (enforced by `with_aa_bundle`)
+2. **Sender PQ signature**: existing Layer 1/2/3 dispatch via
+   `aa_validation`, signing `sender_signing_hash()` (= `batch_signing_hash`).
+3. **Paymaster (if `paymaster.is_some()`)** — see `verify_paymaster_signature`:
+   - `paymaster_signature` is `Some(non-empty)`
+   - paymaster's pubkey **must already be registered on-chain** (looked up via
+     `ChainStore::get_pubkey(paymaster)`); on miss → `PaymasterPubkeyNotFound`.
+     **v0.18.0 limitation**: sponsoring requires the paymaster to have
+     transacted at least once (or be provisioned via genesis). Embedded
+     paymaster pubkeys / multi-algo paymasters are deferred to v0.19.0+.
+   - PQ-verify `paymaster_signature` over `paymaster_signing_hash`. The
+     paymaster signature wrapper reuses the **sender's `sig_type`** for v0.18.0
+     (single-algorithm chain assumption); a future minor may relax this.
+   - paymaster account balance ≥ `gas_limit × max_fee_per_gas`.
+4. **Sender balance**: `account.balance ≥ Σ inner.value` (paymaster covers
+   gas; sender still pays inner-call value transfers). For self-sponsored
+   bundles (no paymaster), sender pays both gas + Σ inner.value. The outer
+   envelope `value` is ignored for AA txs (and forced to zero by
+   `with_aa_bundle`).
+5. **Sender nonce**: standard `account.nonce == tx.nonce`.
 
 Any failure → reject before block inclusion.
+
+> **Executor hard guard.** `ShellEvm::execute_tx()` rejects any AA bundle
+> with `ExecutorError::AaBundleNotYetExecutable` until the M2b dispatcher
+> lands. This is fail-loud insurance against accidentally executing a bundle
+> as a legacy tx.
 
 ---
 

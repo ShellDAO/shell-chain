@@ -34,6 +34,9 @@ pub enum ExecutorError {
 
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
+
+    #[error("aa bundle execution dispatcher not yet available (M2b — will land in v0.18.0): {0}")]
+    AaBundleNotYetExecutable(String),
 }
 
 /// Result of executing a single transaction.
@@ -87,6 +90,21 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
         let tx = &signed_tx.tx;
+
+        // ── AA bundle hard guard (M2a) ────────────────────────
+        // The mempool already validates structure + signatures; this guard
+        // exists so that if a bundle ever reaches the single-tx executor
+        // path (e.g. via legacy block-building code paths) it fails loud
+        // instead of being silently mis-executed as a normal tx. The full
+        // batch dispatcher with atomicity + paymaster gas accounting lands
+        // in M2b under a separate review.
+        if signed_tx.is_aa_bundle() {
+            return Err(ExecutorError::AaBundleNotYetExecutable(format!(
+                "tx {} is an AA bundle (tx_type=0x{:X}); call the bundle dispatcher instead",
+                signed_tx.hash(),
+                tx.tx_type
+            )));
+        }
 
         // ── System contract intercept ──────────────────────────
         if let Some(to) = &tx.to {
@@ -2893,5 +2911,53 @@ mod tests {
             crate::tx_validation::compute_intrinsic_gas(&[], false, &al3) - base,
             18_600
         );
+    }
+
+    #[test]
+    fn execute_aa_bundle_is_hard_guarded() {
+        use shell_core::{AaBundle, InnerCall, AA_BUNDLE_TX_TYPE};
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let from = ShellAddress::from([0x42; 20]);
+        fund_account(&mut evm, &from, U256::from(10_000_000_000u64));
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![InnerCall {
+                to: Some(ShellAddress::from([0xAA; 20])),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            }],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            shell_core::PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+
+        let header = sample_header();
+        let res = evm.execute_tx(&signed, &header, 0, 0);
+        assert!(matches!(res, Err(ExecutorError::AaBundleNotYetExecutable(_))));
     }
 }

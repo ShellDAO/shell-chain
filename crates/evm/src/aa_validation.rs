@@ -135,7 +135,7 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
         }
     }
 
-    let tx_hash = signed_tx.hash();
+    let tx_hash = signed_tx.sender_signing_hash();
     let valid = verifier.verify(&pubkey, tx_hash.as_bytes(), &signed_tx.signature)?;
     if !valid {
         return Err(AaValidationError::SignatureInvalid);
@@ -202,7 +202,7 @@ fn validate_custom_contract<S: KvStore + 'static>(
         .kind(TxKind::Call(signed_tx.from.into()))
         .value(alloy_primitives::U256::ZERO)
         .data(AlBytes::from(encode_validate_transaction_calldata(
-            &signed_tx.hash(),
+            &signed_tx.sender_signing_hash(),
             &signed_tx.signature.data,
             pubkey,
         )))

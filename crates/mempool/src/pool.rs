@@ -6,7 +6,10 @@ use parking_lot::RwLock;
 
 use shell_core::SignedTransaction;
 use shell_crypto::Verifier;
-use shell_evm::{compute_intrinsic_gas, validate_aa_tx, AaValidationError, AaValidationOutcome};
+use shell_evm::{
+    compute_intrinsic_gas, validate_aa_bundle_structure, validate_aa_tx, AaValidationError,
+    AaValidationOutcome, TxValidationError,
+};
 use shell_primitives::{Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, WorldState};
 
@@ -340,11 +343,19 @@ impl TxPool {
             }
         }
 
+        // AA bundle structural pre-check (M2 native AA): consistency between
+        // tx_type and aa_bundle, MAX_INNER_CALLS / MAX_INNER_CALLDATA, and
+        // inner-gas budget vs outer gas_limit. Returns the additional
+        // intrinsic-gas surcharge for AA txs (zero otherwise).
+        let aa_extra_gas = validate_aa_bundle_structure(tx)
+            .map_err(|e: TxValidationError| MempoolError::InvalidTransaction(e.to_string()))?;
+
         let intrinsic = compute_intrinsic_gas(
             tx.tx.data.as_ref(),
             tx.tx.is_contract_creation(),
             &tx.tx.access_list,
-        );
+        )
+        .saturating_add(aa_extra_gas);
         if tx.tx.gas_limit < intrinsic {
             return Err(MempoolError::GasTooLow {
                 got: tx.tx.gas_limit,

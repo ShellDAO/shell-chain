@@ -556,6 +556,65 @@ impl AaBundle {
     }
 }
 
+impl AaBundle {
+    /// Length of the signing-form payload (excludes `paymaster_signature`).
+    /// This MUST be used by callers that need the canonical bundle bytes for
+    /// hashing — both sender batch hash and paymaster authorization hash hash
+    /// the bundle in this signature-stripped form to avoid the circular
+    /// dependency between sender sig and paymaster sig.
+    fn signing_fields_len(&self) -> usize {
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        }
+        .length()
+        .saturating_add(inner_payload);
+        let paymaster_len = match &self.paymaster {
+            Some(addr) => addr.length(),
+            None => 1,
+        };
+        inner_list_len.saturating_add(paymaster_len)
+    }
+
+    /// Encodes the bundle for signing-hash purposes (omits
+    /// `paymaster_signature`). See `signing_fields_len` for rationale.
+    pub fn encode_for_signing(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.signing_fields_len(),
+        };
+        header.encode(out);
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_header = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        };
+        inner_header.encode(out);
+        for call in &self.inner_calls {
+            call.encode(out);
+        }
+        match &self.paymaster {
+            Some(addr) => addr.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+    }
+
+    /// Total signing-form encoded length (header + payload).
+    pub fn signing_length(&self) -> usize {
+        let payload = self.signing_fields_len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
+    }
+}
+
 impl Encodable for AaBundle {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let header = alloy_rlp::Header {
@@ -892,6 +951,17 @@ impl SignedTransaction {
         })
     }
 
+    /// Hash signed by the sender's PQ signature.
+    ///
+    /// For AA-bundle transactions returns [`Self::batch_signing_hash`] (so the
+    /// signature commits to both the outer envelope *and* the inner calls);
+    /// for any other tx_type returns the regular [`Self::hash`]. This single
+    /// entry point lets validators uniformly compute "the hash the sender
+    /// signed over" without branching on tx_type at every call site.
+    pub fn sender_signing_hash(&self) -> ShellHash {
+        self.batch_signing_hash().unwrap_or_else(|| self.hash())
+    }
+
     /// Returns `true` if this signed transaction carries a native AA bundle.
     pub fn is_aa_bundle(&self) -> bool {
         self.tx.tx_type == AA_BUNDLE_TX_TYPE && self.aa_bundle.is_some()
@@ -911,10 +981,10 @@ impl SignedTransaction {
         if self.tx.tx_type != AA_BUNDLE_TX_TYPE {
             return None;
         }
-        let mut buf = Vec::with_capacity(1 + self.tx.length() + bundle.length());
+        let mut buf = Vec::with_capacity(1 + self.tx.length() + bundle.signing_length());
         buf.push(BATCH_SIGNING_HASH_DOMAIN);
         self.tx.encode(&mut buf);
-        bundle.encode(&mut buf);
+        bundle.encode_for_signing(&mut buf);
         Some(shell_primitives::keccak256(&buf))
     }
 
