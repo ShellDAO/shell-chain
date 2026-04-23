@@ -4,7 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Reliability
+_Tracking work toward the next release (after 0.18.0)._
+
+## [0.18.0] — Native Account Abstraction Phase 1 + Operations Hardening
+
+> In development on branch `feat/v0.18.0-dev`. Workspace version bumped to `0.18.0-dev`.
+
+### Highlights (planned)
+
+- **Native AA Phase 1**: batch transactions (atomic, single PQ signature covering N inner calls)
+  and sponsored gas via a minimal native paymaster account abstraction. Session keys and
+  guardian recovery are explicitly deferred to v0.19.0.
+- **Operations Hardening**: storage profile rollout (archive / full / light), witness endpoint
+  completion (full Merkle proofs + light-client verifier), Prometheus / tracing observability
+  with `/healthz` + `/readyz`, unified RPC error code table and auto-generated RPC reference.
+
+### Carry-over from v0.17.0 (already merged into Unreleased prior to this section)
 
 - **SignedTransaction JSON compatibility guard**: compatibility deserialization for sdk-style
   `sender_pubkey` now rejects ambiguous payloads that also specify `pubkey_mode`, while still
