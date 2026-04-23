@@ -98,11 +98,11 @@ async fn submit_sdk_dilithium3_fixture_and_verify_receipt() {
     let pubkey = Vec::from_hex(
         include_str!("../../crates/rpc/tests/fixtures/sdk_dilithium3_tx_pubkey.hex").trim(),
     )
-    .unwrap();
+    .expect("failed to decode sdk_dilithium3_tx_pubkey.hex fixture");
     let signature_bytes = Vec::from_hex(
         include_str!("../../crates/rpc/tests/fixtures/sdk_dilithium3_tx_signature.hex").trim(),
     )
-    .unwrap();
+    .expect("failed to decode sdk_dilithium3_tx_signature.hex fixture");
     let from = Address::from_public_key(&pubkey, 0);
 
     {

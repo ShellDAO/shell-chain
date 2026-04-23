@@ -678,6 +678,11 @@ impl From<AaValidationError> for TxValidationError {
             AaValidationError::SignatureInvalid => Self::SignatureInvalid,
             AaValidationError::PubkeyConflict => Self::PubkeyConflict,
             AaValidationError::DisallowedAlgorithm(sig_type) => Self::DisallowedAlgorithm(sig_type),
+            AaValidationError::Crypto(
+                shell_crypto::CryptoError::VerificationFailed
+                | shell_crypto::CryptoError::InvalidPublicKeyLength { .. }
+                | shell_crypto::CryptoError::InvalidSignatureLength { .. },
+            ) => Self::SignatureInvalid,
             AaValidationError::Crypto(err) => Self::Crypto(err),
             AaValidationError::Storage(err) => Self::Storage(err),
             AaValidationError::StateDb(err) => Self::AaValidation(err.to_string()),
