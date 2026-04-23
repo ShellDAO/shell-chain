@@ -162,6 +162,41 @@ pub struct CallRequest {
     pub access_list: Option<Vec<RpcAccessListItem>>,
 }
 
+/// Request object for `shell_estimateBatch`.
+///
+/// Estimates gas for a Native-AA bundle (tx_type = `0x7E`) without requiring
+/// the caller to sign or assemble the full `AaBundle`. Structural only: the
+/// return value reflects admission-layer arithmetic
+/// (`outer_intrinsic + Σ inner.gas_limit + (n-1) × AA_INNER_CALL_INTRINSIC_GAS`)
+/// plus, when an inner call's `gasLimit` is omitted, a per-inner simulation
+/// using `eth_call`-style execution (with a 20% buffer, minimum 21,000).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEstimateRequest {
+    /// Nominal sender (caller) for per-inner simulation. Defaults to zero.
+    pub from: Option<Address>,
+    /// Optional paymaster address. Purely informational for the estimate; the
+    /// returned gas bound does not change based on paymaster presence.
+    pub paymaster: Option<Address>,
+    /// List of inner calls to estimate.
+    pub inner_calls: Vec<BatchInnerCallRequest>,
+}
+
+/// Single inner call in a `shell_estimateBatch` request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchInnerCallRequest {
+    /// Destination address. `None` means contract creation.
+    pub to: Option<Address>,
+    /// Hex-encoded wei value (e.g., `"0x1"`). Defaults to `0`.
+    pub value: Option<String>,
+    /// Hex-encoded call data.
+    pub data: Option<String>,
+    /// Hex-encoded advisory gas cap for this inner call. When omitted, the
+    /// server simulates the call and uses `max(gas_used × 1.2, 21_000)`.
+    pub gas_limit: Option<String>,
+}
+
 /// Format a u64 as "0x..." hex string.
 pub fn hex_u64(v: u64) -> String {
     format!("{:#x}", v)

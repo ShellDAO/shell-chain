@@ -416,6 +416,170 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "witnesses": witnesses,
         }))
     }
+
+    async fn estimate_batch(
+        &self,
+        req: crate::types::BatchEstimateRequest,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        use shell_core::{AA_INNER_CALL_INTRINSIC_GAS, MAX_INNER_CALLS};
+
+        if req.inner_calls.is_empty() {
+            return Err(ErrorObjectOwned::owned(
+                -32000,
+                "estimateBatch: inner_calls must not be empty",
+                None::<()>,
+            ));
+        }
+        if req.inner_calls.len() > MAX_INNER_CALLS {
+            return Err(ErrorObjectOwned::owned(
+                -32000,
+                format!(
+                    "estimateBatch: inner_calls exceeds MAX_INNER_CALLS ({MAX_INNER_CALLS})"
+                ),
+                None::<()>,
+            ));
+        }
+
+        const PER_INNER_DEFAULT_FLOOR: u64 = 21_000;
+        let from = req.from.unwrap_or(Address::ZERO);
+
+        let mut per_inner = Vec::with_capacity(req.inner_calls.len());
+        let mut inner_sum: u64 = 0;
+        for (idx, call) in req.inner_calls.iter().enumerate() {
+            let (gas_limit, simulated) = match call.gas_limit.as_deref() {
+                Some(hex) => (parse_hex_u64(hex)?, false),
+                None => {
+                    let call_req = crate::types::CallRequest {
+                        from: Some(from),
+                        to: call.to,
+                        data: call.data.clone(),
+                        value: call.value.clone(),
+                        gas: None,
+                        access_list: None,
+                    };
+                    let (_out, used) = self.execute_call(&call_req).map_err(|e| {
+                        ErrorObjectOwned::owned(
+                            -32000,
+                            format!("estimateBatch: simulation for inner[{idx}] failed: {e}"),
+                            None::<()>,
+                        )
+                    })?;
+                    let buffered = ((used as f64) * 1.2) as u64;
+                    (std::cmp::max(buffered, PER_INNER_DEFAULT_FLOOR), true)
+                }
+            };
+            if gas_limit == 0 {
+                return Err(ErrorObjectOwned::owned(
+                    -32000,
+                    format!("estimateBatch: inner[{idx}] gas_limit must be > 0"),
+                    None::<()>,
+                ));
+            }
+            inner_sum = inner_sum
+                .checked_add(gas_limit)
+                .ok_or_else(|| internal_err("estimateBatch: inner_sum overflow"))?;
+            per_inner.push(serde_json::json!({
+                "gasLimit": hex_u64(gas_limit),
+                "simulated": simulated,
+            }));
+        }
+
+        let outer_intrinsic: u64 = 21_000;
+        let extra_inners = (req.inner_calls.len() as u64).saturating_sub(1);
+        let intrinsic_surcharge = extra_inners.saturating_mul(AA_INNER_CALL_INTRINSIC_GAS);
+        let total = outer_intrinsic
+            .checked_add(inner_sum)
+            .and_then(|v| v.checked_add(intrinsic_surcharge))
+            .ok_or_else(|| internal_err("estimateBatch: totalGas overflow"))?;
+
+        Ok(serde_json::json!({
+            "totalGas": hex_u64(total),
+            "outerIntrinsic": hex_u64(outer_intrinsic),
+            "innerSum": hex_u64(inner_sum),
+            "intrinsicSurcharge": hex_u64(intrinsic_surcharge),
+            "perInner": per_inner,
+            "paymaster": req.paymaster,
+        }))
+    }
+
+    async fn get_paymaster_policy(
+        &self,
+        address: Address,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let pubkey = self
+            .chain_store
+            .get_pubkey(&address)
+            .map_err(internal_err)?;
+        let balance = {
+            let ws = self.world_state.read();
+            ws.get_balance(&address).map_err(internal_err)?
+        };
+
+        Ok(serde_json::json!({
+            "address": address,
+            "hasPqPubkey": pubkey.is_some(),
+            "pubkeyBytes": pubkey.as_ref().map(|b| b.len() as u64),
+            "balance": hex_u256(balance),
+            "policy": "eoa-open",
+            "maxGasSponsorship": serde_json::Value::Null,
+        }))
+    }
+
+    async fn is_sponsored(
+        &self,
+        tx_hash: ShellHash,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let describe = |tx: &SignedTransaction, location: &str| {
+            let is_bundle = tx.is_aa_bundle();
+            let (paymaster, inner_count) = tx
+                .aa_bundle()
+                .map(|b| (b.paymaster, b.inner_calls.len() as u64))
+                .unwrap_or((None, 0));
+            let sponsored = is_bundle
+                && paymaster
+                    .map(|p| p != tx.from)
+                    .unwrap_or(false);
+            serde_json::json!({
+                "found": true,
+                "location": location,
+                "isAaBundle": is_bundle,
+                "sponsored": sponsored,
+                "paymaster": paymaster,
+                "sender": tx.from,
+                "innerCallCount": if is_bundle { Some(inner_count) } else { None },
+            })
+        };
+
+        if let Some(pending) = self.tx_pool.get(&tx_hash) {
+            return Ok(describe(&pending, "mempool"));
+        }
+
+        let location = self
+            .chain_store
+            .get_tx_location(&tx_hash)
+            .map_err(internal_err)?;
+        if let Some((block_hash, tx_index)) = location {
+            if let Some(block) = self
+                .chain_store
+                .get_block_by_hash(&block_hash)
+                .map_err(internal_err)?
+            {
+                if let Some(tx) = block.transactions.get(tx_index as usize) {
+                    return Ok(describe(tx, "chain"));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "found": false,
+            "location": serde_json::Value::Null,
+            "isAaBundle": false,
+            "sponsored": false,
+            "paymaster": serde_json::Value::Null,
+            "sender": serde_json::Value::Null,
+            "innerCallCount": serde_json::Value::Null,
+        }))
+    }
 }
 
 fn resolve_witness_block<S: KvStore + 'static>(

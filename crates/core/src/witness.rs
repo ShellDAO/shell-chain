@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use shell_crypto::PQSignature;
 use shell_primitives::{Address, ShellHash};
 
-use crate::transaction::Transaction;
+use crate::transaction::{AaBundle, Transaction, AA_BUNDLE_PRESENCE_FLAG, AA_BUNDLE_TX_TYPE};
 
 // ── StrippedTransaction ──────────────────────────────────────────────────────
 
@@ -14,19 +14,51 @@ use crate::transaction::Transaction;
 /// [`WitnessBundle`]. Full nodes store both; light clients can skip the bundle.
 ///
 /// ## Wire encoding (RLP)
-/// Fields: `from`, `tx` (same fields as [`Transaction`] encoded as a nested list).
+/// Fields: `from`, `tx` (same fields as [`Transaction`] encoded as a nested list),
+/// followed by an OPTIONAL trailing AA bundle (presence-flag + RLP) when
+/// `tx.tx_type == AA_BUNDLE_TX_TYPE`. Mirrors the encoding of
+/// [`SignedTransaction`] so that stripped/full forms agree on which bytes
+/// represent the bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrippedTransaction {
     /// Sender address (required: PQ signatures are not key-recoverable).
     pub from: Address,
     /// The unsigned transaction payload.
     pub tx: Transaction,
+    /// Optional Native-AA bundle. Present iff `tx.tx_type == AA_BUNDLE_TX_TYPE`.
+    /// `paymaster_signature` (when set) is body data here too: the paymaster
+    /// signature is not the per-tx PQ witness (the sender's signature is) and
+    /// rides with the bundle for execution-time verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_bundle: Option<AaBundle>,
 }
 
 impl StrippedTransaction {
     /// Create a [`StrippedTransaction`] from a sender address and transaction.
     pub fn new(from: Address, tx: Transaction) -> Self {
-        Self { from, tx }
+        Self {
+            from,
+            tx,
+            aa_bundle: None,
+        }
+    }
+
+    /// Create a [`StrippedTransaction`] carrying a Native-AA bundle.
+    ///
+    /// Returns `Err` when `tx.tx_type != AA_BUNDLE_TX_TYPE`.
+    pub fn with_aa_bundle(
+        from: Address,
+        tx: Transaction,
+        aa_bundle: AaBundle,
+    ) -> Result<Self, &'static str> {
+        if tx.tx_type != AA_BUNDLE_TX_TYPE {
+            return Err("StrippedTransaction::with_aa_bundle: tx.tx_type must equal AA_BUNDLE_TX_TYPE");
+        }
+        Ok(Self {
+            from,
+            tx,
+            aa_bundle: Some(aa_bundle),
+        })
     }
 
     /// Encode to RLP bytes.
@@ -40,11 +72,22 @@ impl StrippedTransaction {
     pub fn rlp_decode(bytes: &[u8]) -> Result<Self, alloy_rlp::Error> {
         Self::decode(&mut &bytes[..])
     }
+
+    fn fields_len(&self) -> usize {
+        let aa_len = match &self.aa_bundle {
+            Some(b) => 1usize.saturating_add(b.length()),
+            None => 0,
+        };
+        self.from
+            .length()
+            .saturating_add(self.tx.length())
+            .saturating_add(aa_len)
+    }
 }
 
 impl Encodable for StrippedTransaction {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let payload_len = self.from.length() + self.tx.length();
+        let payload_len = self.fields_len();
         let header = alloy_rlp::Header {
             list: true,
             payload_length: payload_len,
@@ -52,10 +95,16 @@ impl Encodable for StrippedTransaction {
         header.encode(out);
         self.from.encode(out);
         self.tx.encode(out);
+        // Trailing optional AA bundle. Absent → emit nothing (preserves the
+        // pre-v0.18.0 wire format byte-for-byte for legacy stripped txs).
+        if let Some(bundle) = &self.aa_bundle {
+            out.put_u8(AA_BUNDLE_PRESENCE_FLAG);
+            bundle.encode(out);
+        }
     }
 
     fn length(&self) -> usize {
-        let payload_len = self.from.length() + self.tx.length();
+        let payload_len = self.fields_len();
         alloy_rlp::length_of_length(payload_len) + payload_len
     }
 }
@@ -66,9 +115,33 @@ impl Decodable for StrippedTransaction {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
+        let start_remaining = buf.len();
         let from = Address::decode(buf)?;
         let tx = Transaction::decode(buf)?;
-        Ok(Self { from, tx })
+        let consumed_so_far = start_remaining.saturating_sub(buf.len());
+
+        let aa_bundle = if consumed_so_far < header.payload_length {
+            // At least one trailing byte present — must be the bundle presence flag.
+            if buf.is_empty() {
+                return Err(alloy_rlp::Error::InputTooShort);
+            }
+            let flag = buf[0];
+            if flag != AA_BUNDLE_PRESENCE_FLAG {
+                return Err(alloy_rlp::Error::Custom(
+                    "invalid AA bundle presence flag in StrippedTransaction",
+                ));
+            }
+            *buf = &buf[1..];
+            Some(AaBundle::decode(buf)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            from,
+            tx,
+            aa_bundle,
+        })
     }
 }
 

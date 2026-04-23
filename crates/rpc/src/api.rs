@@ -480,4 +480,66 @@ pub trait ShellApi {
         &self,
         block: String,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Estimates gas for a Native-AA bundle (tx_type = `0x7E`).
+    ///
+    /// Returns a JSON object:
+    /// - `totalGas` — hex: `outerIntrinsic + innerSum + intrinsicSurcharge`
+    /// - `outerIntrinsic` — hex: 21,000 (standard tx base cost; access list
+    ///   is not supported in the admission AA path yet)
+    /// - `innerSum` — hex: Σ per-inner gas (explicit or simulated)
+    /// - `intrinsicSurcharge` — hex: `(n - 1) × AA_INNER_CALL_INTRINSIC_GAS`
+    /// - `perInner` — array of `{ gasLimit, simulated }` where `simulated`
+    ///   is `true` iff the request omitted `gasLimit` and the server filled it
+    ///   in via `eth_call`-style simulation (+ 20% buffer, min 21,000).
+    ///
+    /// Does NOT require signatures; is a pure estimator. Errors
+    /// (`-32000`) if the bundle would be rejected by admission regardless of
+    /// signatures (empty inner_calls, > 16 inner calls, zero-gas inners).
+    #[method(name = "estimateBatch")]
+    async fn estimate_batch(
+        &self,
+        req: crate::types::BatchEstimateRequest,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns Native-AA paymaster policy for an address.
+    ///
+    /// In v0.18.0 Phase 1, paymasters are plain EOAs; the "policy" is
+    /// "sponsor any bundle that carries a valid paymaster signature over the
+    /// bundle's signing hash, as long as balance covers `gas_used × max_fee`".
+    ///
+    /// Response:
+    /// - `address` — queried address
+    /// - `hasPqPubkey` — whether a PQ public key is registered (prerequisite
+    ///   to act as a paymaster on Native AA)
+    /// - `balance` — hex wei balance (available to sponsor gas)
+    /// - `policy` — constant string `"eoa-open"` (Phase 1)
+    /// - `maxGasSponsorship` — `null` (no per-tx cap in Phase 1; bounded only
+    ///   by balance)
+    /// - `pubkeyBytes` — hex length of the registered pubkey (sanity only),
+    ///   or `null`
+    #[method(name = "getPaymasterPolicy")]
+    async fn get_paymaster_policy(
+        &self,
+        address: Address,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns whether a transaction is (or would be) sponsored by a
+    /// paymaster.
+    ///
+    /// Looks the transaction up first in the mempool, then in on-chain
+    /// storage. Response:
+    /// - `found` — whether the tx was located
+    /// - `location` — `"mempool"` | `"chain"` | `null`
+    /// - `isAaBundle` — whether tx_type is `0x7E` with a valid bundle
+    /// - `sponsored` — `true` iff `isAaBundle` and `paymaster` is set to a
+    ///   non-sender address
+    /// - `paymaster` — paymaster address (or `null`)
+    /// - `sender` — tx sender (or `null` when not found)
+    /// - `innerCallCount` — number of inner calls in the bundle (or `null`)
+    #[method(name = "isSponsored")]
+    async fn is_sponsored(
+        &self,
+        tx_hash: ShellHash,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 }

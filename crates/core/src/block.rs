@@ -385,7 +385,9 @@ impl StrippedBlock {
         let mut witnesses = Vec::with_capacity(block.transactions.len());
 
         for tx in &block.transactions {
-            stripped_txs.push(StrippedTransaction::new(tx.from, tx.tx.clone()));
+            let mut stripped = StrippedTransaction::new(tx.from, tx.tx.clone());
+            stripped.aa_bundle = tx.aa_bundle.clone();
+            stripped_txs.push(stripped);
             let pubkey = match &tx.pubkey_mode {
                 PubkeyMode::Embedded(pk) => Some(pk.clone()),
                 PubkeyMode::Reference => None,
@@ -427,18 +429,25 @@ impl StrippedBlock {
                     };
                     self.transactions
                         .into_iter()
-                        .map(|st| SignedTransaction::new(st.from, st.tx, stub_sig.clone()))
+                        .map(|st| {
+                            let mut signed =
+                                SignedTransaction::new(st.from, st.tx, stub_sig.clone());
+                            signed.aa_bundle = st.aa_bundle;
+                            signed
+                        })
                         .collect()
                 } else {
                     self.transactions
                         .into_iter()
                         .zip(b.witnesses)
                         .map(|(st, w)| {
-                            if let Some(pk) = w.pubkey {
+                            let mut signed = if let Some(pk) = w.pubkey {
                                 SignedTransaction::with_pubkey(st.from, st.tx, w.signature, pk)
                             } else {
                                 SignedTransaction::new(st.from, st.tx, w.signature)
-                            }
+                            };
+                            signed.aa_bundle = st.aa_bundle;
+                            signed
                         })
                         .collect()
                 }
@@ -451,7 +460,12 @@ impl StrippedBlock {
                 };
                 self.transactions
                     .into_iter()
-                    .map(|st| SignedTransaction::new(st.from, st.tx, stub_sig.clone()))
+                    .map(|st| {
+                        let mut signed =
+                            SignedTransaction::new(st.from, st.tx, stub_sig.clone());
+                        signed.aa_bundle = st.aa_bundle;
+                        signed
+                    })
                     .collect()
             }
         };
@@ -857,4 +871,75 @@ mod tests {
         // Signature is an empty stub
         assert!(stub_block.transactions[0].signature.data.is_empty());
     }
+
+    #[test]
+    fn stripped_block_split_roundtrip_preserves_aa_bundle() {
+        use crate::transaction::{AaBundle, InnerCall, AA_BUNDLE_TX_TYPE};
+        use shell_crypto::{DilithiumSigner, Signer};
+        use shell_primitives::{Address, Bytes, U256};
+
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"aa-batch-test").unwrap();
+
+        let mut tx = make_signed_tx().tx;
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        tx.gas_limit = 200_000;
+
+        let bundle = AaBundle {
+            inner_calls: vec![
+                InnerCall {
+                    to: Some(Address::from([0xAA; 20])),
+                    value: U256::from(1u64),
+                    data: Bytes::from(vec![0x11, 0x22]),
+                    gas_limit: 50_000,
+                },
+                InnerCall {
+                    to: Some(Address::from([0xBB; 20])),
+                    value: U256::from(2u64),
+                    data: Bytes::from(vec![0x33]),
+                    gas_limit: 60_000,
+                },
+            ],
+            paymaster: Some(Address::from([0xCC; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        };
+
+        let signed = SignedTransaction::with_aa_bundle(
+            Address::from([0xAA; 20]),
+            tx,
+            sig,
+            crate::transaction::PubkeyMode::Embedded(pk),
+            bundle.clone(),
+        )
+        .expect("with_aa_bundle");
+
+        let original = Block {
+            header: sample_header(),
+            transactions: vec![signed],
+            proposer_seal: None,
+        };
+
+        // split + into_block (with witness) preserves the bundle.
+        let (stripped, wb) = StrippedBlock::split(&original);
+        assert_eq!(stripped.transactions[0].aa_bundle.as_ref(), Some(&bundle));
+        let restored = stripped.into_block(Some(wb));
+        assert_eq!(restored.transactions[0].aa_bundle.as_ref(), Some(&bundle));
+
+        // RLP roundtrip of the StrippedBlock also preserves the bundle (this is
+        // the disk persistence path).
+        let (stripped, wb) = StrippedBlock::split(&original);
+        let mut buf = Vec::new();
+        stripped.encode(&mut buf);
+        let decoded_stripped = StrippedBlock::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(
+            decoded_stripped.transactions[0].aa_bundle.as_ref(),
+            Some(&bundle)
+        );
+        let rebuilt = decoded_stripped.into_block(Some(wb));
+        assert_eq!(rebuilt.transactions[0].aa_bundle.as_ref(), Some(&bundle));
+    }
+
+    #[test]
+    fn _stripped_block_no_witness_stub_sig_marker() {}
 }

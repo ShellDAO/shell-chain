@@ -3602,4 +3602,250 @@ mod tests {
             "unexpected error: {err_msg}"
         );
     }
+
+    // ── v0.18.0 M3 · Native-AA RPC surface ────────────────────────────
+
+    fn make_inner_call_req(
+        to: Address,
+        value: u64,
+        gas_limit: Option<u64>,
+    ) -> crate::types::BatchInnerCallRequest {
+        crate::types::BatchInnerCallRequest {
+            to: Some(to),
+            value: Some(format!("{:#x}", value)),
+            data: None,
+            gas_limit: gas_limit.map(|g| format!("{:#x}", g)),
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_rejects_empty_inner_calls() {
+        let handler = setup();
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message().contains("inner_calls must not be empty"),
+            "unexpected err: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_rejects_too_many_inner_calls() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let calls: Vec<_> = (0..shell_core::MAX_INNER_CALLS + 1)
+            .map(|_| make_inner_call_req(dst, 0, Some(21_000)))
+            .collect();
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: calls,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message().contains("exceeds MAX_INNER_CALLS"),
+            "unexpected err: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_explicit_gas_limits_computes_structural_total() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let res = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: vec![
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        // outerIntrinsic = 21_000
+        // innerSum = 3 × 21_000 = 63_000
+        // intrinsicSurcharge = 2 × AA_INNER_CALL_INTRINSIC_GAS = 8_000
+        // totalGas = 21_000 + 63_000 + 8_000 = 92_000
+        assert_eq!(res["outerIntrinsic"], format!("{:#x}", 21_000));
+        assert_eq!(res["innerSum"], format!("{:#x}", 63_000));
+        assert_eq!(
+            res["intrinsicSurcharge"],
+            format!("{:#x}", 2 * shell_core::AA_INNER_CALL_INTRINSIC_GAS)
+        );
+        assert_eq!(res["totalGas"], format!("{:#x}", 92_000));
+        let per = res["perInner"].as_array().unwrap();
+        assert_eq!(per.len(), 3);
+        assert_eq!(per[0]["simulated"], false);
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_simulates_when_gas_limit_missing() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        // Omit gas_limit for the first inner call — the server must simulate it
+        // via execute_call and return simulated = true with a gas ≥ 21_000.
+        let res = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: Some(Address::ZERO),
+                paymaster: None,
+                inner_calls: vec![make_inner_call_req(dst, 0, None)],
+            },
+        )
+        .await
+        .unwrap();
+        let per = res["perInner"].as_array().unwrap();
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0]["simulated"], true);
+        let gas = u64::from_str_radix(
+            per[0]["gasLimit"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        assert!(gas >= 21_000, "expected simulated gas ≥ 21_000, got {gas}");
+    }
+
+    #[tokio::test]
+    async fn get_paymaster_policy_returns_unregistered_for_bare_address() {
+        let handler = setup();
+        let addr = Address::from([0xCC; 20]);
+        let res = ShellApiServer::get_paymaster_policy(&handler, addr)
+            .await
+            .unwrap();
+        assert_eq!(res["hasPqPubkey"], false);
+        assert_eq!(res["pubkeyBytes"], serde_json::Value::Null);
+        assert_eq!(res["policy"], "eoa-open");
+        assert_eq!(res["maxGasSponsorship"], serde_json::Value::Null);
+        assert_eq!(res["balance"], "0x0");
+    }
+
+    #[tokio::test]
+    async fn get_paymaster_policy_surfaces_balance_and_pubkey() {
+        let handler = setup();
+        let addr = Address::from([0xCD; 20]);
+        handler
+            .chain_store
+            .put_pubkey(&addr, &[0xAB; 1_952])
+            .unwrap();
+        {
+            let mut ws = handler.world_state.write();
+            ws.set_balance(&addr, U256::from(123_456_u64)).unwrap();
+        }
+
+        let res = ShellApiServer::get_paymaster_policy(&handler, addr)
+            .await
+            .unwrap();
+        assert_eq!(res["hasPqPubkey"], true);
+        assert_eq!(res["pubkeyBytes"], 1_952u64);
+        assert_eq!(res["balance"], format!("{:#x}", 123_456_u64));
+        assert_eq!(res["policy"], "eoa-open");
+    }
+
+    #[tokio::test]
+    async fn is_sponsored_returns_not_found_for_unknown_hash() {
+        let handler = setup();
+        let res = ShellApiServer::is_sponsored(&handler, ShellHash::from_slice(&[0u8; 32]))
+            .await
+            .unwrap();
+        assert_eq!(res["found"], false);
+        assert_eq!(res["location"], serde_json::Value::Null);
+        assert_eq!(res["sponsored"], false);
+    }
+
+    #[tokio::test]
+    async fn is_sponsored_detects_chain_stored_sponsored_bundle() {
+        use shell_core::{AaBundle, InnerCall, PubkeyMode, AA_BUNDLE_TX_TYPE};
+        use shell_crypto::{PQSignature, SignatureType};
+
+        let handler = setup();
+        let sender = Address::from([0x11; 20]);
+        let payer = Address::from([0x22; 20]);
+
+        let inner = InnerCall {
+            to: Some(Address::from([0xFF; 20])),
+            value: U256::from(1u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![inner.clone(), inner],
+            paymaster: Some(payer),
+            paymaster_signature: Some(Bytes::from(vec![0xAB; 64])),
+        };
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let placeholder_sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let signed = SignedTransaction::with_aa_bundle(
+            sender,
+            tx,
+            placeholder_sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+        let tx_hash = signed.hash();
+
+        // Build a minimal block carrying this tx and index it.
+        let genesis = make_genesis_block();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &genesis.hash())
+            .unwrap();
+
+        let mut header = genesis.header.clone();
+        header.parent_hash = genesis.hash();
+        header.number = 1;
+        let block = Block {
+            header,
+            transactions: vec![signed],
+            proposer_seal: None,
+        };
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        let res = ShellApiServer::is_sponsored(&handler, tx_hash)
+            .await
+            .unwrap();
+        assert_eq!(res["found"], true);
+        assert_eq!(res["location"], "chain");
+        assert_eq!(res["isAaBundle"], true);
+        assert_eq!(res["sponsored"], true);
+        assert_eq!(res["paymaster"], serde_json::to_value(payer).unwrap());
+        assert_eq!(res["sender"], serde_json::to_value(sender).unwrap());
+        assert_eq!(res["innerCallCount"], 2u64);
+    }
 }
