@@ -99,13 +99,28 @@ impl<S: KvStore + 'static> Node<S> {
                 continue;
             }
 
-            match evm.execute_tx(tx, &header, idx as u32, cumulative_gas) {
+            let is_aa = tx.is_aa_bundle();
+            let exec_result = if is_aa {
+                evm.execute_aa_bundle(tx, &header, idx as u32, cumulative_gas)
+            } else {
+                evm.execute_tx(tx, &header, idx as u32, cumulative_gas)
+            };
+            match exec_result {
                 Ok(result) => {
                     cumulative_gas += result.gas_used;
                     receipts.push(result.receipt);
                     included_txs.push(tx.clone());
 
-                    if result.is_system_tx {
+                    if is_aa {
+                        // AA dispatcher already mutated evm.state_db.world_state
+                        // in place (including atomic rollback on failure). Mirror
+                        // to the node's persistent world_state by reopening it at
+                        // the post-bundle root. Both world_states share the same
+                        // KV-backed trie store, so this is a constant-time op.
+                        let new_root = evm.state_db_mut().world_state_mut().state_root()?;
+                        let mut ws = self.world_state.write();
+                        ws.rollback_to_root(&new_root)?;
+                    } else if result.is_system_tx {
                         self.sync_system_contract_state(
                             evm.state_db_mut().world_state_mut(),
                             &result.system_contract_effects,

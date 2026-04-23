@@ -177,21 +177,68 @@ Any failure → reject before block inclusion.
 
 ## 4. Execution semantics
 
-`crates/evm/src/executor.rs` gains a `BatchExecutor` path:
+`crates/evm/src/executor.rs::ShellEvm::execute_aa_bundle` implements the
+atomic bundle dispatcher. `execute_tx` hard-rejects AA bundles with
+`ExecutorError::AaBundleNotYetExecutable`; `block_producer` / `block_importer`
+dispatch on `tx.is_aa_bundle()`.
 
-1. Charge gas upfront from **paymaster** if set, else from **sender**:
-   `gas_reserve = gas_limit * max_fee_per_gas` debited from chosen payer's balance.
-2. For each `InnerCall i`:
-   - Bump effective EVM call depth by 1 (inner calls execute as if from
-     `tx.from`, with `msg.sender == tx.from`).
-   - Run with the call's own gas limit (capped to remaining budget).
-   - Collect logs/receipt entry.
-3. **Atomicity**: if any inner call reverts (`Halt` other than gas refund) or
-   any per-call gas runs out, the whole batch reverts; remaining gas refunds
-   computed once at the outer level.
-4. Bump sender's nonce by **1** (single bump per batch, not per inner call).
-5. Emit one outer receipt + one `inner_logs` array (or N synthetic receipts
-   under `inner_results[]` — see § 5 RPC shape).
+### 4.1 Settlement model
+
+Instead of relying on revm's default "charge caller up-front, refund later"
+flow (which cannot route gas to a *paymaster* distinct from the revm caller),
+the dispatcher runs each inner with revm's balance check disabled
+(`CfgEnv::disable_balance_check = true`), lets each inner mutate state, and
+performs a single post-bundle reconciliation that forces the canonical
+balances and nonce.
+
+1. **Snapshot** `pre_root = world_state.state_root()`, `sender_pre_balance`,
+   `payer_pre_balance` (for sponsored bundles).
+2. **Re-check payer balance** at execution time against
+   `gas_reserve = gas_limit × max_fee_per_gas`. If short, bump sender nonce,
+   emit a `status = 0` receipt with `gas_used = 0`, no further state changes.
+   This protects against mempool→execution balance drift without consuming
+   gas the payer cannot afford.
+3. **For each `InnerCall i`**, run a fresh `revm::Evm` with:
+   - `caller = tx.from` (sender) — msg.sender in the inner call is *always*
+     `tx.from`, never the paymaster;
+   - `kind = Call(to)` or `Create` when `to = None`;
+   - `CfgEnv { disable_nonce_check: true, disable_base_fee: true,
+              disable_balance_check: true, .. }`.
+
+   After each successful inner call the revm state diff is committed to
+   `world_state` so subsequent inners observe prior effects. Logs are
+   appended to a single list in **inner-call iteration order**.
+
+4. **Atomicity**: any `ExecutionResult::Revert` / `ExecutionResult::Halt` in
+   an inner call — or an outright `transact()` error — triggers
+   `world_state.rollback_to_root(&pre_root)`, wiping **all** bundle
+   mutations (including prior successful inners' state changes).
+
+5. **Settlement**:
+   - **Success**: override sender & payer balances and bump sender nonce
+     exactly once. Self-sponsored:
+     `sender.balance = sender_pre - Σ inner.value - total_gas_used × max_fee`;
+     sender nonce `= tx.nonce + 1`. Sponsored:
+     `sender.balance = sender_pre - Σ inner.value`, `sender.nonce = tx.nonce + 1`,
+     `payer.balance = payer_pre - total_gas_used × max_fee`.
+   - **Failure (atomic revert)**: post-rollback, charge payer
+     `total_gas_used × max_fee` (clamped at `payer_pre_balance`), bump
+     sender nonce by 1.
+
+6. **Receipt**: one outer `TransactionReceipt` with `status ∈ {0,1}`,
+   `gas_used = Σ inner gas_used`, `logs = all inner-call logs in order`
+   on success / empty on failure, `output = revert_data` on failure.
+
+### 4.2 Invariants
+
+- `sender.nonce` bumps by **exactly 1** per bundle, regardless of inner count.
+- `msg.sender` in every inner is `tx.from`; paymaster identity is never
+  borrowed inside inner execution.
+- Logs ordering is deterministic (inner-call iteration order).
+- Outer receipt gas refund is computed once; no double-refund via inner paths.
+- Payer balance shortfall at execution time never fails the block — it
+  produces a receipt with `status = 0`, `gas_used = 0` and bumps nonce for
+  DoS protection.
 
 ### Gas accounting
 - Intrinsic gas: `21_000` outer + `4_000` per additional inner call (encourages

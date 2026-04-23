@@ -64,7 +64,7 @@ async-trait = "0.1"
 eth_trie = "0.4"
 
 # --- evm ---
-revm = { version = "36", default-features = false, features = ["std", "optional_no_base_fee"] }
+revm = { version = "36", default-features = false, features = ["std", "optional_no_base_fee", "optional_balance_check"] }
 
 # --- rpc ---
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
