@@ -328,7 +328,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let Some((block_hash, header)) = resolve_witness_block(self, &block)? else {
             return Ok(serde_json::Value::Null);
         };
-        let witness_root = witness_root_value(header.as_ref());
+        let witness_root = witness_root_value(Some(&header));
 
         // Look up the witness bundle if a store is wired.
         let Some(ws) = &self.witness_store else {
@@ -388,10 +388,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             return Ok(serde_json::Value::Null);
         };
 
-        let block_number = header
-            .as_ref()
-            .map(|h| h.number)
-            .ok_or_else(|| internal_err("witness block header missing"))?;
+        let block_number = header.number;
 
         let witnesses: Vec<serde_json::Value> = bundle
             .witnesses
@@ -414,7 +411,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(serde_json::json!({
             "block_hash": format!("0x{}", hex::encode(block_hash.as_bytes())),
             "block_number": block_number,
-            "witness_root": witness_root_value(header.as_ref()),
+            "witness_root": witness_root_value(Some(&header)),
             "witness_count": witnesses.len(),
             "witnesses": witnesses,
         }))
@@ -424,7 +421,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 fn resolve_witness_block<S: KvStore + 'static>(
     handler: &RpcHandler<S>,
     block: &str,
-) -> Result<Option<(ShellHash, Option<BlockHeader>)>, ErrorObjectOwned> {
+) -> Result<Option<(ShellHash, BlockHeader)>, ErrorObjectOwned> {
     let block_hash = if block.starts_with("0x") && block.len() == 66 {
         let bytes = hex::decode(&block[2..])
             .map_err(|e| internal_err(format!("invalid block hash hex: {e}")))?;
@@ -449,13 +446,13 @@ fn resolve_witness_block<S: KvStore + 'static>(
         }
     };
 
-    let header = handler
+    let Some(header) = handler
         .chain_store
         .get_header_by_hash(&block_hash)
-        .map_err(internal_err)?;
-    if header.is_none() {
+        .map_err(internal_err)?
+    else {
         return Ok(None);
-    }
+    };
 
     Ok(Some((block_hash, header)))
 }

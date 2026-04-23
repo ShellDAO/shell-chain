@@ -117,6 +117,19 @@ impl<S: KvStore> ChainStore<S> {
         Self { store }
     }
 
+    fn block_number_from_addr_index_key(
+        prefix_len: usize,
+        key: &[u8],
+    ) -> Result<u64, StorageError> {
+        if key.len() < prefix_len.saturating_add(12) {
+            return Err(StorageError::Codec("invalid addr index key".into()));
+        }
+        let block_bytes: [u8; 8] = key[prefix_len..prefix_len.saturating_add(8)]
+            .try_into()
+            .map_err(|_| StorageError::Codec("invalid addr index key".into()))?;
+        Ok(u64::from_be_bytes(block_bytes))
+    }
+
     /// Returns a reference to the underlying key-value store.
     pub fn store(&self) -> &Arc<S> {
         &self.store
@@ -572,16 +585,9 @@ impl<S: KvStore> ChainStore<S> {
         let mut tx_hashes = Vec::with_capacity(limit);
         let mut matched = 0usize;
         for (key, value) in &entries {
-            // key layout: "a/" (2) + addr (20) + block_number (8) + tx_index (4) = 34
-            if key.len() < prefix.len().saturating_add(12) {
+            let Ok(block_number) = Self::block_number_from_addr_index_key(prefix.len(), key) else {
                 continue;
-            }
-            let block_bytes: [u8; 8] = key
-                .get(prefix.len()..prefix.len().saturating_add(8))
-                .unwrap_or_else(|| unreachable!("key length validated above"))
-                .try_into()
-                .map_err(|_| StorageError::Codec("invalid addr index key".into()))?;
-            let block_number = u64::from_be_bytes(block_bytes);
+            };
             if block_number < from_block || block_number > to_block {
                 continue;
             }
@@ -617,14 +623,11 @@ impl<S: KvStore> ChainStore<S> {
         let total = entries
             .iter()
             .filter_map(|(key, value)| {
-                if key.len() < prefix.len().saturating_add(12) || value.len() != 32 {
+                if value.len() != 32 {
                     return None;
                 }
-                let block_bytes: [u8; 8] = key
-                    .get(prefix.len()..prefix.len().saturating_add(8))?
-                    .try_into()
-                    .ok()?;
-                let block_number = u64::from_be_bytes(block_bytes);
+                let block_number =
+                    Self::block_number_from_addr_index_key(prefix.len(), key).ok()?;
                 (block_number >= from_block && block_number <= to_block).then_some(1u64)
             })
             .sum();
