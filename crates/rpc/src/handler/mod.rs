@@ -1422,8 +1422,7 @@ mod tests {
         let result = ShellApiServer::get_block_witnesses(&handler, fake_hash)
             .await
             .unwrap();
-        // Block header not found, but no bundle stored → empty witnesses.
-        assert_eq!(result["witnessCount"], 0);
+        assert_eq!(result, serde_json::Value::Null);
     }
 
     #[tokio::test]
