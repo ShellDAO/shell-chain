@@ -13,6 +13,7 @@ use shell_primitives::{blake3_hash, keccak256, Address, ShellHash};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 
 use crate::precompiles::ShellPrecompiles;
+use crate::tx_validation::verify_paymaster_signature;
 use crate::state_db::{shell_hash_to_b256, ShellStateDb, StateDbError};
 
 pub const VALIDATION_GAS_CAP: u64 = 500_000;
@@ -60,6 +61,12 @@ pub enum AaValidationError {
 
     #[error("state db: {0}")]
     StateDb(#[from] StateDbError),
+
+    #[error("paymaster signature invalid: {0}")]
+    PaymasterSignatureInvalid(String),
+
+    #[error("paymaster pubkey not found: {0}")]
+    PaymasterPubkeyNotFound(Address),
 }
 
 pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
@@ -139,6 +146,21 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
     let valid = verifier.verify(&pubkey, tx_hash.as_bytes(), &signed_tx.signature)?;
     if !valid {
         return Err(AaValidationError::SignatureInvalid);
+    }
+
+    // Verify paymaster signature at admission time (defence-in-depth: also
+    // verified at import time, but checking early rejects forged bundles
+    // before they occupy mempool capacity).
+    if let Some(paymaster) = signed_tx.aa_bundle().and_then(|b| b.paymaster) {
+        if paymaster != signed_tx.from {
+            verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier)
+                .map_err(|e| match e {
+                    crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(addr) => {
+                        AaValidationError::PaymasterPubkeyNotFound(addr)
+                    }
+                    other => AaValidationError::PaymasterSignatureInvalid(other.to_string()),
+                })?;
+        }
     }
 
     Ok(AaValidationOutcome {

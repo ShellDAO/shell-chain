@@ -262,37 +262,37 @@ balances and nonce.
 ### 5.2 New RPCs
 
 > **Note:** The schemas below reflect the original design intent. The v0.18.0
-> implementation uses camelCase JSON keys to match the existing RPC convention.
+> implementation uses snake_case JSON keys.
 
 ```text
 shell_estimateBatch(tx) → {
-  totalGas: "0x...",
-  outerIntrinsic: "0x...",
-  innerSum: "0x...",
-  intrinsicSurcharge: "0x...",
-  perInner: [ { gasLimit: "0x...", simulated: bool }, ... ]
+  total_gas: "0x...",
+  outer_intrinsic: "0x...",
+  inner_sum: "0x...",
+  intrinsic_surcharge: "0x...",
+  per_inner: [ { gas_limit: "0x...", simulated: bool }, ... ]
 }
 
 shell_getPaymasterPolicy(address) → {
   address: "0x...",
-  hasPqPubkey: bool,
-  pubkeyBytes: number | null,
+  has_pq_pubkey: bool,
+  pubkey_bytes: number | null,
   balance: "0x...",
   policy: "eoa-open",
-  maxGasSponsorship: null
+  max_gas_sponsorship: null
 }
 // Always returns an object; never null. Unregistered → default "eoa-open" policy.
 
 shell_isSponsored(txHash) → {
   found: bool,
-  location: "mempool" | "chain",   // present when found=true
-  isAaBundle: bool,
+  location: "mempool" | "chain" | null,
+  is_aa_bundle: bool,
   sponsored: bool,
   paymaster: "0x..." | null,
-  sender: "0x...",
-  innerCallCount: number | null
+  sender: "0x..." | null,
+  inner_call_count: number | null
 }
-// Returns { found: false, sponsored: false } for unknown tx (no -32001 error).
+// Returns { found: false, location: null, ... } for unknown tx (no -32001 error).
 ```
 
 ### 5.3 Error codes

@@ -18,7 +18,7 @@ _Tracking work toward the next release (after 0.18.0)._
 - **Atomic execution**: any inner call failure reverts the entire bundle; gas and nonce
   deducted once for the batch; individual receipts produced per inner call.
 - **`shell_estimateBatch`**: estimates per-inner and total gas for a batch request,
-  returns `totalGas / outerIntrinsic / innerSum / intrinsicSurcharge / perInner`.
+  returns `total_gas / outer_intrinsic / inner_sum / intrinsic_surcharge / per_inner`.
 - **`shell_sendTransaction`**: accepts AA-bundle `SignedTransaction` directly;
   mempool validates bundle structure and verifies `batch_signing_hash` signature.
 - `AA_BUNDLE_TX_TYPE = 0x7E`, `MAX_INNER_CALLS = 16`,

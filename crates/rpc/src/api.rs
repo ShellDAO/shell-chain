@@ -514,13 +514,13 @@ pub trait ShellApi {
     /// Estimates gas for a Native-AA bundle (tx_type = `0x7E`).
     ///
     /// Returns a JSON object:
-    /// - `totalGas` — hex: `outerIntrinsic + innerSum + intrinsicSurcharge`
-    /// - `outerIntrinsic` — hex: 21,000 (standard tx base cost; access list
+    /// - `total_gas` — hex: `outer_intrinsic + inner_sum + intrinsic_surcharge`
+    /// - `outer_intrinsic` — hex: 21,000 (standard tx base cost; access list
     ///   is not supported in the admission AA path yet)
-    /// - `innerSum` — hex: Σ per-inner gas (explicit or simulated)
-    /// - `intrinsicSurcharge` — hex: `(n - 1) × AA_INNER_CALL_INTRINSIC_GAS`
-    /// - `perInner` — array of `{ gasLimit, simulated }` where `simulated`
-    ///   is `true` iff the request omitted `gasLimit` and the server filled it
+    /// - `inner_sum` — hex: Σ per-inner gas (explicit or simulated)
+    /// - `intrinsic_surcharge` — hex: `(n - 1) × AA_INNER_CALL_INTRINSIC_GAS`
+    /// - `per_inner` — array of `{ gas_limit, simulated }` where `simulated`
+    ///   is `true` iff the request omitted `gas_limit` and the server filled it
     ///   in via `eth_call`-style simulation (+ 20% buffer, min 21,000).
     ///
     /// Does NOT require signatures; is a pure estimator. Errors
@@ -561,12 +561,12 @@ pub trait ShellApi {
     /// storage. Response:
     /// - `found` — whether the tx was located
     /// - `location` — `"mempool"` | `"chain"` | `null`
-    /// - `isAaBundle` — whether tx_type is `0x7E` with a valid bundle
-    /// - `sponsored` — `true` iff `isAaBundle` and `paymaster` is set to a
+    /// - `is_aa_bundle` — whether tx_type is `0x7E` with a valid bundle
+    /// - `sponsored` — `true` iff `is_aa_bundle` and `paymaster` is set to a
     ///   non-sender address
     /// - `paymaster` — paymaster address (or `null`)
     /// - `sender` — tx sender (or `null` when not found)
-    /// - `innerCallCount` — number of inner calls in the bundle (or `null`)
+    /// - `inner_call_count` — number of inner calls in the bundle (or `null`)
     #[method(name = "isSponsored")]
     async fn is_sponsored(
         &self,
@@ -579,7 +579,7 @@ pub trait ShellApi {
     /// reflect the resolved `PruningConfig` (after applying any per-field
     /// overrides such as `--body-retention` / `--witness-retention`).
     /// A value of `0` means "keep forever" for retention/keep_recent;
-    /// `proofReplacementGrace = u64::MAX` means "never delete witness even
+    /// `proof_replacement_grace = u64::MAX` means "never delete witness even
     /// after STARK proof arrives" (archive mode behavior).
     ///
     /// Returns an error when the node has not been configured with a profile

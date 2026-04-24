@@ -325,7 +325,7 @@ fn sum_inner_values(bundle: &shell_core::AaBundle) -> U256 {
 /// no "embedded paymaster pubkey" path, because the bundle does not carry one.
 /// Sponsoring an account therefore requires that account to have transacted
 /// at least once (or to have been provisioned via genesis / system contract).
-fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
+pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
     signed_tx: &SignedTransaction,
     paymaster: &Address,
     chain_store: &ChainStore<S>,
@@ -1230,6 +1230,12 @@ impl From<AaValidationError> for TxValidationError {
             }
             AaValidationError::ValidationContractRejected(msg)
             | AaValidationError::ValidationContractExecution(msg) => Self::AaValidation(msg),
+            AaValidationError::PaymasterSignatureInvalid(_) => {
+                Self::PaymasterSignatureInvalid
+            }
+            AaValidationError::PaymasterPubkeyNotFound(addr) => {
+                Self::PaymasterPubkeyNotFound(addr)
+            }
         }
     }
 }

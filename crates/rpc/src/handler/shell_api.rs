@@ -523,7 +523,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 .checked_add(gas_limit)
                 .ok_or_else(|| internal_err("estimateBatch: inner_sum overflow"))?;
             per_inner.push(serde_json::json!({
-                "gasLimit": hex_u64(gas_limit),
+                "gas_limit": hex_u64(gas_limit),
                 "simulated": simulated,
             }));
         }
@@ -534,14 +534,14 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let total = outer_intrinsic
             .checked_add(inner_sum)
             .and_then(|v| v.checked_add(intrinsic_surcharge))
-            .ok_or_else(|| internal_err("estimateBatch: totalGas overflow"))?;
+            .ok_or_else(|| internal_err("estimateBatch: total_gas overflow"))?;
 
         Ok(serde_json::json!({
-            "totalGas": hex_u64(total),
-            "outerIntrinsic": hex_u64(outer_intrinsic),
-            "innerSum": hex_u64(inner_sum),
-            "intrinsicSurcharge": hex_u64(intrinsic_surcharge),
-            "perInner": per_inner,
+            "total_gas": hex_u64(total),
+            "outer_intrinsic": hex_u64(outer_intrinsic),
+            "inner_sum": hex_u64(inner_sum),
+            "intrinsic_surcharge": hex_u64(intrinsic_surcharge),
+            "per_inner": per_inner,
             "paymaster": req.paymaster,
         }))
     }
@@ -561,11 +561,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
         Ok(serde_json::json!({
             "address": address,
-            "hasPqPubkey": pubkey.is_some(),
-            "pubkeyBytes": pubkey.as_ref().map(|b| b.len() as u64),
+            "has_pq_pubkey": pubkey.is_some(),
+            "pubkey_bytes": pubkey.as_ref().map(|b| b.len() as u64),
             "balance": hex_u256(balance),
             "policy": "eoa-open",
-            "maxGasSponsorship": serde_json::Value::Null,
+            "max_gas_sponsorship": serde_json::Value::Null,
         }))
     }
 
@@ -583,11 +583,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             serde_json::json!({
                 "found": true,
                 "location": location,
-                "isAaBundle": is_bundle,
+                "is_aa_bundle": is_bundle,
                 "sponsored": sponsored,
                 "paymaster": paymaster,
                 "sender": tx.from,
-                "innerCallCount": if is_bundle { Some(inner_count) } else { None },
+                "inner_call_count": if is_bundle { Some(inner_count) } else { None },
             })
         };
 
@@ -614,11 +614,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(serde_json::json!({
             "found": false,
             "location": serde_json::Value::Null,
-            "isAaBundle": false,
+            "is_aa_bundle": false,
             "sponsored": false,
             "paymaster": serde_json::Value::Null,
             "sender": serde_json::Value::Null,
-            "innerCallCount": serde_json::Value::Null,
+            "inner_call_count": serde_json::Value::Null,
         }))
     }
 

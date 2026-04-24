@@ -3844,18 +3844,18 @@ mod tests {
         .await
         .unwrap();
 
-        // outerIntrinsic = 21_000
-        // innerSum = 3 × 21_000 = 63_000
-        // intrinsicSurcharge = 2 × AA_INNER_CALL_INTRINSIC_GAS = 8_000
-        // totalGas = 21_000 + 63_000 + 8_000 = 92_000
-        assert_eq!(res["outerIntrinsic"], format!("{:#x}", 21_000));
-        assert_eq!(res["innerSum"], format!("{:#x}", 63_000));
+        // outer_intrinsic = 21_000
+        // inner_sum = 3 × 21_000 = 63_000
+        // intrinsic_surcharge = 2 × AA_INNER_CALL_INTRINSIC_GAS = 8_000
+        // total_gas = 21_000 + 63_000 + 8_000 = 92_000
+        assert_eq!(res["outer_intrinsic"], format!("{:#x}", 21_000));
+        assert_eq!(res["inner_sum"], format!("{:#x}", 63_000));
         assert_eq!(
-            res["intrinsicSurcharge"],
+            res["intrinsic_surcharge"],
             format!("{:#x}", 2 * shell_core::AA_INNER_CALL_INTRINSIC_GAS)
         );
-        assert_eq!(res["totalGas"], format!("{:#x}", 92_000));
-        let per = res["perInner"].as_array().unwrap();
+        assert_eq!(res["total_gas"], format!("{:#x}", 92_000));
+        let per = res["per_inner"].as_array().unwrap();
         assert_eq!(per.len(), 3);
         assert_eq!(per[0]["simulated"], false);
     }
@@ -3876,11 +3876,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let per = res["perInner"].as_array().unwrap();
+        let per = res["per_inner"].as_array().unwrap();
         assert_eq!(per.len(), 1);
         assert_eq!(per[0]["simulated"], true);
         let gas = u64::from_str_radix(
-            per[0]["gasLimit"]
+            per[0]["gas_limit"]
                 .as_str()
                 .unwrap()
                 .trim_start_matches("0x"),
@@ -3897,10 +3897,10 @@ mod tests {
         let res = ShellApiServer::get_paymaster_policy(&handler, addr)
             .await
             .unwrap();
-        assert_eq!(res["hasPqPubkey"], false);
-        assert_eq!(res["pubkeyBytes"], serde_json::Value::Null);
+        assert_eq!(res["has_pq_pubkey"], false);
+        assert_eq!(res["pubkey_bytes"], serde_json::Value::Null);
         assert_eq!(res["policy"], "eoa-open");
-        assert_eq!(res["maxGasSponsorship"], serde_json::Value::Null);
+        assert_eq!(res["max_gas_sponsorship"], serde_json::Value::Null);
         assert_eq!(res["balance"], "0x0");
     }
 
@@ -3920,8 +3920,8 @@ mod tests {
         let res = ShellApiServer::get_paymaster_policy(&handler, addr)
             .await
             .unwrap();
-        assert_eq!(res["hasPqPubkey"], true);
-        assert_eq!(res["pubkeyBytes"], 1_952u64);
+        assert_eq!(res["has_pq_pubkey"], true);
+        assert_eq!(res["pubkey_bytes"], 1_952u64);
         assert_eq!(res["balance"], format!("{:#x}", 123_456_u64));
         assert_eq!(res["policy"], "eoa-open");
     }
@@ -4008,11 +4008,11 @@ mod tests {
             .unwrap();
         assert_eq!(res["found"], true);
         assert_eq!(res["location"], "chain");
-        assert_eq!(res["isAaBundle"], true);
+        assert_eq!(res["is_aa_bundle"], true);
         assert_eq!(res["sponsored"], true);
         assert_eq!(res["paymaster"], serde_json::to_value(payer).unwrap());
         assert_eq!(res["sender"], serde_json::to_value(sender).unwrap());
-        assert_eq!(res["innerCallCount"], 2u64);
+        assert_eq!(res["inner_call_count"], 2u64);
     }
 
     // ── shell_getStorageProfile ────────────────────────────────────
@@ -4029,11 +4029,11 @@ mod tests {
         });
         let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
         assert_eq!(res["profile"], "full");
-        assert_eq!(res["bodyRetention"], 0u64);
-        assert_eq!(res["witnessRetention"], 128u64);
-        assert_eq!(res["keepRecent"], 0u64);
-        assert_eq!(res["proofReplacementGrace"], 0u64);
-        assert_eq!(res["statePruningExperimental"], false);
+        assert_eq!(res["body_retention"], 0u64);
+        assert_eq!(res["witness_retention"], 128u64);
+        assert_eq!(res["keep_recent"], 0u64);
+        assert_eq!(res["proof_replacement_grace"], 0u64);
+        assert_eq!(res["state_pruning_experimental"], false);
     }
 
     #[tokio::test]
@@ -4048,7 +4048,7 @@ mod tests {
         });
         let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
         assert_eq!(res["profile"], "archive");
-        assert_eq!(res["proofReplacementGrace"], u64::MAX);
+        assert_eq!(res["proof_replacement_grace"], u64::MAX);
     }
 
     #[tokio::test]

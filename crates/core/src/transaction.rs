@@ -361,6 +361,12 @@ pub const MAX_INNER_CALLS: usize = 16;
 pub const MAX_INNER_CALLDATA: usize = 128 * 1024;
 
 /// Domain byte mixed into the canonical batch signing hash (sender PQ sig).
+///
+/// Intentionally equal to `AA_BUNDLE_TX_TYPE` (0x7E): the byte is used as a
+/// domain separator *inside* the keccak256 preimage (not as an RLP tx-type
+/// envelope byte), so reusing the tx-type value is safe — the two constants
+/// operate in entirely different contexts.  Future maintainers: do not "fix"
+/// this without reading `batch_signing_hash()` first.
 pub const BATCH_SIGNING_HASH_DOMAIN: u8 = 0x7E;
 
 /// Domain byte mixed into the paymaster authorization signing hash.

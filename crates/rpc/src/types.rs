@@ -168,10 +168,9 @@ pub struct CallRequest {
 /// the caller to sign or assemble the full `AaBundle`. Structural only: the
 /// return value reflects admission-layer arithmetic
 /// (`outer_intrinsic + Σ inner.gas_limit + (n-1) × AA_INNER_CALL_INTRINSIC_GAS`)
-/// plus, when an inner call's `gasLimit` is omitted, a per-inner simulation
+/// plus, when an inner call's `gas_limit` is omitted, a per-inner simulation
 /// using `eth_call`-style execution (with a 20% buffer, minimum 21,000).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BatchEstimateRequest {
     /// Nominal sender (caller) for per-inner simulation. Defaults to zero.
     pub from: Option<Address>,
@@ -184,7 +183,6 @@ pub struct BatchEstimateRequest {
 
 /// Single inner call in a `shell_estimateBatch` request.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BatchInnerCallRequest {
     /// Destination address. `None` means contract creation.
     pub to: Option<Address>,
@@ -199,13 +197,14 @@ pub struct BatchInnerCallRequest {
 
 /// Active storage profile descriptor returned by `shell_getStorageProfile`.
 ///
-/// `profile` is one of `"archive" | "full" | "light"`. `bodyRetention`,
-/// `witnessRetention`, `keepRecent`, `proofReplacementGrace` reflect the
+/// Active storage profile descriptor returned by `shell_getStorageProfile`.
+///
+/// `profile` is one of `"archive" | "full" | "light"`. `body_retention`,
+/// `witness_retention`, `keep_recent`, `proof_replacement_grace` reflect the
 /// effective `PruningConfig` after applying any per-field overrides
-/// (a value of `0` means "keep forever" except for `proofReplacementGrace`
+/// (a value of `0` means "keep forever" except for `proof_replacement_grace`
 /// where `u64::MAX` means "never delete witness even after STARK proof").
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StorageProfileInfo {
     pub profile: String,
     pub body_retention: u64,

@@ -107,13 +107,43 @@ impl TxPool {
         let gas_cost = U256::from(tx.tx.gas_limit)
             .checked_mul(U256::from(tx.tx.max_fee_per_gas))
             .unwrap_or(U256::MAX);
-        let needed = gas_cost.checked_add(tx.tx.value).unwrap_or(U256::MAX);
-        let balance = world_state.get_balance(&sender).unwrap_or(U256::ZERO);
-        if balance < needed {
+
+        // For AA bundles with a paymaster, gas is covered by the paymaster.
+        // For all other transactions (including batch-only AA), the sender pays.
+        let payer = tx
+            .aa_bundle()
+            .and_then(|b| b.paymaster)
+            .filter(|pm| *pm != sender)
+            .unwrap_or(sender);
+
+        let payer_gas_balance = world_state.get_balance(&payer).unwrap_or(U256::ZERO);
+        if payer_gas_balance < gas_cost {
             return Err(MempoolError::InsufficientBalance {
-                needed,
-                have: balance,
+                needed: gas_cost,
+                have: payer_gas_balance,
             });
+        }
+
+        // Sender must still cover the transferred value even when paymaster pays gas.
+        let needed_for_value = tx.tx.value;
+        let sender_balance = world_state.get_balance(&sender).unwrap_or(U256::ZERO);
+        if payer != sender {
+            // Paymaster covers gas; only check sender has enough for the value transfer.
+            if sender_balance < needed_for_value {
+                return Err(MempoolError::InsufficientBalance {
+                    needed: needed_for_value,
+                    have: sender_balance,
+                });
+            }
+        } else {
+            // Non-paymaster path: sender covers both gas and value.
+            let needed = gas_cost.checked_add(tx.tx.value).unwrap_or(U256::MAX);
+            if sender_balance < needed {
+                return Err(MempoolError::InsufficientBalance {
+                    needed,
+                    have: sender_balance,
+                });
+            }
         }
 
         let hash = tx.hash();

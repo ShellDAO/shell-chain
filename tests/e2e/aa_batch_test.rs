@@ -165,10 +165,10 @@ async fn estimate_batch_single_transfer_returns_gas() {
         .await
         .unwrap();
 
-    let inner_gas = result["perInner"].as_array().unwrap();
+    let inner_gas = result["per_inner"].as_array().unwrap();
     assert_eq!(inner_gas.len(), 1, "should return one inner_gas entry");
 
-    let total_gas_hex = result["totalGas"].as_str().unwrap();
+    let total_gas_hex = result["total_gas"].as_str().unwrap();
     let total_gas = u64::from_str_radix(total_gas_hex.trim_start_matches("0x"), 16).unwrap();
     assert!(total_gas >= 21_000, "total_gas should be at least base gas");
 }
@@ -203,10 +203,10 @@ async fn estimate_batch_multiple_calls_sums_gas() {
         .await
         .unwrap();
 
-    let inner_gas = result["perInner"].as_array().unwrap();
+    let inner_gas = result["per_inner"].as_array().unwrap();
     assert_eq!(inner_gas.len(), 2);
 
-    let total_gas_hex = result["totalGas"].as_str().unwrap();
+    let total_gas_hex = result["total_gas"].as_str().unwrap();
     let total_gas = u64::from_str_radix(total_gas_hex.trim_start_matches("0x"), 16).unwrap();
     // total = sum(inner) + AA_BUNDLE_TX_TYPE * count intrinsic overhead
     assert!(

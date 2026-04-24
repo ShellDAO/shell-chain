@@ -88,7 +88,7 @@ async fn get_paymaster_policy_returns_default_eoa_open_when_not_registered() {
         result["policy"], "eoa-open",
         "default policy should be eoa-open"
     );
-    assert_eq!(result["hasPqPubkey"], false, "no pubkey registered");
+    assert_eq!(result["has_pq_pubkey"], false, "no pubkey registered");
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ async fn is_sponsored_returns_false_for_regular_tx() {
         result["sponsored"], false,
         "regular tx should not be sponsored"
     );
-    assert_eq!(result["isAaBundle"], false, "regular tx is not AA");
+    assert_eq!(result["is_aa_bundle"], false, "regular tx is not AA");
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ async fn is_sponsored_detects_sponsored_aa_tx() {
         result["sponsored"], true,
         "AA tx with paymaster should be sponsored"
     );
-    assert_eq!(result["isAaBundle"], true);
+    assert_eq!(result["is_aa_bundle"], true);
     // paymaster field is present and non-null
     assert!(
         !result["paymaster"].is_null(),

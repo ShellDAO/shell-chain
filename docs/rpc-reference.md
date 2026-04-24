@@ -305,19 +305,21 @@ Estimates gas for a batch (AA) transaction.
   "from": "0x...",           // optional
   "inner_calls": [
     { "to": "0x...", "value": "0x0", "data": "0x", "gas_limit": "0x5208" }
-  ]
+  ],
+  "paymaster": "0x..."       // optional, informational only
 }
 ```
 ```json
 {
-  "totalGas": "0x...",
-  "outerIntrinsic": "0x...",
-  "innerSum": "0x...",
-  "intrinsicSurcharge": "0x...",
-  "perInner": [
-    { "gasLimit": "0x5208", "simulated": true },
-    { "gasLimit": "0x7530", "simulated": false }
-  ]
+  "total_gas": "0x...",
+  "outer_intrinsic": "0x...",
+  "inner_sum": "0x...",
+  "intrinsic_surcharge": "0x...",
+  "per_inner": [
+    { "gas_limit": "0x5208", "simulated": true },
+    { "gas_limit": "0x7530", "simulated": false }
+  ],
+  "paymaster": "0x..."       // echoed from request; null if absent
 }
 ```
 Errors:
@@ -331,11 +333,11 @@ Returns the paymaster policy for an address. Always returns a policy object
 ```json
 {
   "address": "0x...",
-  "hasPqPubkey": false,
-  "pubkeyBytes": null,
+  "has_pq_pubkey": false,
+  "pubkey_bytes": null,
   "balance": "0x...",
   "policy": "eoa-open",
-  "maxGasSponsorship": null
+  "max_gas_sponsorship": null
 }
 ```
 
@@ -346,16 +348,24 @@ For unknown transactions, returns a normal object with `found: false` (no error)
 {
   "found": true,
   "location": "chain",
-  "isAaBundle": true,
+  "is_aa_bundle": true,
   "sponsored": true,
   "paymaster": "0x...",
   "sender": "0x...",
-  "innerCallCount": 2
+  "inner_call_count": 2
 }
 ```
 When not found:
 ```json
-{ "found": false, "sponsored": false }
+{
+  "found": false,
+  "location": null,
+  "is_aa_bundle": false,
+  "sponsored": false,
+  "paymaster": null,
+  "sender": null,
+  "inner_call_count": null
+}
 ```
 
 ---
@@ -364,6 +374,8 @@ When not found:
 
 ### shell_getStorageProfile()
 Returns the node's current storage profile configuration.
+
+Full node example:
 ```json
 {
   "profile": "full",
@@ -373,8 +385,20 @@ Returns the node's current storage profile configuration.
   "proof_replacement_grace": 0,
   "state_pruning_experimental": false
 }
-errors: -32003 if storage profile is not configured
 ```
+
+Archive node example (`proof_replacement_grace = u64::MAX` = never prune witness after proof):
+```json
+{
+  "profile": "archive",
+  "body_retention": 0,
+  "witness_retention": 0,
+  "keep_recent": 0,
+  "proof_replacement_grace": 18446744073709551615,
+  "state_pruning_experimental": false
+}
+```
+Errors: `-32003` if storage profile is not configured.
 
 ---
 
