@@ -34,6 +34,9 @@ pub enum ExecutorError {
 
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
+
+    #[error("aa bundle execution dispatcher not yet available (M2b — will land in v0.18.0): {0}")]
+    AaBundleNotYetExecutable(String),
 }
 
 /// Result of executing a single transaction.
@@ -87,6 +90,21 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
         let tx = &signed_tx.tx;
+
+        // ── AA bundle hard guard (M2a) ────────────────────────
+        // The mempool already validates structure + signatures; this guard
+        // exists so that if a bundle ever reaches the single-tx executor
+        // path (e.g. via legacy block-building code paths) it fails loud
+        // instead of being silently mis-executed as a normal tx. The full
+        // batch dispatcher with atomicity + paymaster gas accounting lands
+        // in M2b under a separate review.
+        if signed_tx.is_aa_bundle() {
+            return Err(ExecutorError::AaBundleNotYetExecutable(format!(
+                "tx {} is an AA bundle (tx_type=0x{:X}); call the bundle dispatcher instead",
+                signed_tx.hash(),
+                tx.tx_type
+            )));
+        }
 
         // ── System contract intercept ──────────────────────────
         if let Some(to) = &tx.to {
@@ -236,6 +254,321 @@ impl<S: KvStore + 'static> ShellEvm<S> {
     /// Access the underlying state database mutably.
     pub fn state_db_mut(&mut self) -> &mut ShellStateDb<S> {
         &mut self.state_db
+    }
+
+    /// Execute an AA bundle (`tx_type == 0x7E`) atomically.
+    ///
+    /// Pre-conditions: the caller MUST have already run
+    /// `validate_tx`/`validate_tx_for_import` from `tx_validation` so that
+    /// structure, sender PQ signature, paymaster signature, and balance
+    /// snapshots have all been verified.
+    ///
+    /// Semantics:
+    /// - State changes from inner calls are applied directly to the live
+    ///   `WorldState` after each successful inner call so that subsequent
+    ///   inner calls observe prior effects.
+    /// - If any inner call reverts/halts, all bundle state mutations are
+    ///   rolled back to the pre-bundle root via `WorldState::rollback_to_root`.
+    ///   Only the gas spent so far is charged to the payer and the sender
+    ///   nonce is bumped exactly once.
+    /// - Sender nonce is bumped by **+1** for the entire batch (not per
+    ///   inner), even on failure.
+    /// - Gas: the payer (paymaster if set, else sender) is debited
+    ///   `actual_gas_used × max_fee_per_gas`; remaining `gas_limit` is not
+    ///   reserved beyond the validation check.
+    /// - The returned `TxExecutionResult` carries `is_system_tx = true` and
+    ///   an empty `state_changes` so block-producer / importer code skips
+    ///   double-applying changes (the dispatcher writes them in place).
+    pub fn execute_aa_bundle(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        tx_index: u32,
+        cumulative_gas_used: u64,
+    ) -> Result<TxExecutionResult, ExecutorError> {
+        let bundle = signed_tx.aa_bundle().ok_or_else(|| {
+            ExecutorError::Evm("execute_aa_bundle called on non-AA tx".into())
+        })?;
+        let tx = &signed_tx.tx;
+        let sender = signed_tx.from;
+        let payer = bundle.paymaster.unwrap_or(sender);
+        let max_fee = U256::from(tx.max_fee_per_gas);
+        let is_sponsored = payer != sender;
+
+        // Capture pre-bundle state root for atomic rollback on inner failure.
+        let pre_root = self.state_db.world_state_mut().state_root()?;
+
+        // Snapshot sender / payer balances for post-execution reconciliation.
+        let sender_pre_bal = self
+            .state_db
+            .world_state()
+            .get_account(&sender)?
+            .map(|a| a.balance)
+            .unwrap_or(U256::ZERO);
+        let payer_pre_bal = if is_sponsored {
+            self.state_db
+                .world_state()
+                .get_account(&payer)?
+                .map(|a| a.balance)
+                .unwrap_or(U256::ZERO)
+        } else {
+            sender_pre_bal
+        };
+
+        // Re-check payer balance at execution time (state may have moved
+        // since mempool admission).
+        let gas_reserve = U256::from(tx.gas_limit).saturating_mul(max_fee);
+        if payer_pre_bal < gas_reserve {
+            // Bump nonce, charge nothing, emit failure receipt.
+            self.state_db.world_state_mut().increment_nonce(&sender)?;
+            let receipt = TransactionReceipt {
+                tx_hash: signed_tx.hash(),
+                block_number: header.number,
+                tx_index,
+                status: 0,
+                gas_used: 0,
+                cumulative_gas_used,
+                contract_address: None,
+                logs_bloom: shell_primitives::Bytes::from(
+                    crate::bloom::logs_bloom(&[]).to_vec(),
+                ),
+                logs: vec![],
+            };
+            return Ok(TxExecutionResult {
+                receipt,
+                state_changes: EvmState::default(),
+                gas_used: 0,
+                output: b"aa: payer balance shortfall at execution".to_vec(),
+                is_system_tx: true,
+                system_contract_effects: SystemContractEffects::default(),
+            });
+        }
+
+        // Build the shared block env once (re-used across inner calls).
+        let mut block_env = BlockEnv {
+            number: U256::from(header.number),
+            beneficiary: header.proposer.into(),
+            timestamp: U256::from(header.timestamp),
+            gas_limit: header.gas_limit,
+            basefee: 0,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            blob_excess_gas_and_price: None,
+            slot_num: 0,
+        };
+        block_env.set_blob_excess_gas_and_price(header.excess_blob_gas, 3_338_477);
+
+        let mut total_gas_used: u64 = 0;
+        let mut successful_values_sum: U256 = U256::ZERO;
+        let mut all_logs: Vec<shell_core::Log> = Vec::new();
+        let mut atomic_failure = false;
+        let mut last_revert_data: Vec<u8> = Vec::new();
+
+        for inner in &bundle.inner_calls {
+            let kind = match &inner.to {
+                Some(addr) => TxKind::Call((*addr).into()),
+                None => TxKind::Create,
+            };
+            let tx_env = TxEnv::builder()
+                .caller(sender.into())
+                .gas_limit(inner.gas_limit)
+                .max_fee_per_gas(tx.max_fee_per_gas as u128)
+                .gas_priority_fee(Some(tx.max_priority_fee_per_gas as u128))
+                .kind(kind)
+                .value(inner.value)
+                .data(AlBytes::from(inner.data.as_ref().to_vec()))
+                .nonce(0) // disable_nonce_check is on; placeholder.
+                .chain_id(Some(self.chain_id))
+                .build_fill();
+
+            let ctx: MainnetContext<&mut ShellStateDb<S>> =
+                Context::new(&mut self.state_db, SpecId::CANCUN)
+                    .modify_block_chained(|b| *b = block_env.clone())
+                    .modify_cfg_chained(|cfg: &mut CfgEnv| {
+                        cfg.chain_id = self.chain_id;
+                        cfg.disable_nonce_check = true;
+                        cfg.disable_base_fee = true;
+                        // Sender may legitimately lack gas funds when sponsored;
+                        // we reconcile balances post-bundle. Skip revm's upfront
+                        // balance check to permit execution either way.
+                        cfg.disable_balance_check = true;
+                    });
+            let spec = SpecId::CANCUN;
+            let mut evm = Evm::new(
+                ctx,
+                EthInstructions::new_mainnet_with_spec(spec),
+                ShellPrecompiles::new(spec),
+            );
+            let exec_outcome = evm.transact(tx_env);
+            drop(evm);
+
+            let result_and_state = match exec_outcome {
+                Ok(r) => r,
+                Err(_) => {
+                    // Pre-execution validation failure → treat as inner revert.
+                    atomic_failure = true;
+                    break;
+                }
+            };
+
+            let exec_result = result_and_state.result;
+            let state = result_and_state.state;
+            let inner_gas = exec_result.gas().spent();
+            total_gas_used = total_gas_used.saturating_add(inner_gas);
+
+            match &exec_result {
+                ExecutionResult::Success { logs, .. } => {
+                    for log in logs {
+                        if let Ok(l) = shell_core::Log::new(
+                            ShellAddress::from(log.address),
+                            log.topics().iter().map(|t| ShellHash::from(*t)).collect(),
+                            shell_primitives::Bytes::from(log.data.data.to_vec()),
+                        ) {
+                            all_logs.push(l);
+                        }
+                    }
+                    successful_values_sum =
+                        successful_values_sum.saturating_add(inner.value);
+                    let cs_arc =
+                        std::sync::Arc::clone(self.state_db.chain_store().store());
+                    let cs_view = ChainStore::new(cs_arc);
+                    commit_evm_state(&state, self.state_db.world_state_mut(), &cs_view)?;
+                }
+                ExecutionResult::Revert { output, .. } => {
+                    atomic_failure = true;
+                    last_revert_data = output.to_vec();
+                    break;
+                }
+                ExecutionResult::Halt { .. } => {
+                    atomic_failure = true;
+                    break;
+                }
+            }
+        }
+
+        // ── Settlement ─────────────────────────────────────────
+        // Override whatever revm did to sender/payer balances and force them to
+        // the canonical post-bundle values. This neutralizes revm's per-inner
+        // gas debits (which land on the caller = sender), and applies our AA
+        // gas policy (payer covers gas, sender covers inner values).
+        if atomic_failure {
+            // Wipe all inner-call state mutations.
+            self.state_db
+                .world_state_mut()
+                .rollback_to_root(&pre_root)?;
+            let gas_cost =
+                U256::from(total_gas_used).saturating_mul(max_fee);
+            // Charge payer for actual gas used only; clamp at balance.
+            let charge = gas_cost.min(payer_pre_bal);
+            let mut p_acct = self
+                .state_db
+                .world_state()
+                .get_account(&payer)?
+                .unwrap_or_else(|| Account {
+                    pq_pubkey_hash: ShellHash::default(),
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    validation_code_hash: None,
+                    code_hash: None,
+                    storage_root: ShellHash::ZERO,
+                });
+            p_acct.balance = payer_pre_bal.saturating_sub(charge);
+            if !is_sponsored {
+                p_acct.nonce = tx.nonce.saturating_add(1);
+            }
+            self.state_db
+                .world_state_mut()
+                .set_account(&payer, &p_acct)?;
+            if is_sponsored {
+                // Bump sender nonce separately.
+                self.state_db.world_state_mut().increment_nonce(&sender)?;
+            }
+        } else {
+            // Success: force canonical balances & nonce.
+            let gas_cost =
+                U256::from(total_gas_used).saturating_mul(max_fee);
+
+            // Load (post-inner) account states so we preserve any storage_root
+            // / code_hash changes (e.g., if sender or payer is a contract that
+            // emitted state during an inner call — unlikely for EOAs but we
+            // preserve it regardless).
+            let mut s_acct = self
+                .state_db
+                .world_state()
+                .get_account(&sender)?
+                .unwrap_or_else(|| Account {
+                    pq_pubkey_hash: ShellHash::default(),
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    validation_code_hash: None,
+                    code_hash: None,
+                    storage_root: ShellHash::ZERO,
+                });
+
+            if is_sponsored {
+                let mut p_acct = self
+                    .state_db
+                    .world_state()
+                    .get_account(&payer)?
+                    .unwrap_or_else(|| Account {
+                        pq_pubkey_hash: ShellHash::default(),
+                        nonce: 0,
+                        balance: U256::ZERO,
+                        validation_code_hash: None,
+                        code_hash: None,
+                        storage_root: ShellHash::ZERO,
+                    });
+                s_acct.balance =
+                    sender_pre_bal.saturating_sub(successful_values_sum);
+                s_acct.nonce = tx.nonce.saturating_add(1);
+                p_acct.balance = payer_pre_bal.saturating_sub(gas_cost);
+                self.state_db
+                    .world_state_mut()
+                    .set_account(&sender, &s_acct)?;
+                self.state_db
+                    .world_state_mut()
+                    .set_account(&payer, &p_acct)?;
+            } else {
+                s_acct.balance = sender_pre_bal
+                    .saturating_sub(successful_values_sum)
+                    .saturating_sub(gas_cost);
+                s_acct.nonce = tx.nonce.saturating_add(1);
+                self.state_db
+                    .world_state_mut()
+                    .set_account(&sender, &s_acct)?;
+            }
+        }
+
+        let status: u8 = if atomic_failure { 0 } else { 1 };
+        let logs = if atomic_failure { Vec::new() } else { all_logs };
+        let output = if atomic_failure {
+            last_revert_data
+        } else {
+            Vec::new()
+        };
+
+        let receipt = TransactionReceipt {
+            tx_hash: signed_tx.hash(),
+            block_number: header.number,
+            tx_index,
+            status,
+            gas_used: total_gas_used,
+            cumulative_gas_used: cumulative_gas_used.saturating_add(total_gas_used),
+            contract_address: None,
+            logs_bloom: shell_primitives::Bytes::from(
+                crate::bloom::logs_bloom(&logs).to_vec(),
+            ),
+            logs,
+        };
+
+        Ok(TxExecutionResult {
+            receipt,
+            state_changes: EvmState::default(),
+            gas_used: total_gas_used,
+            output,
+            is_system_tx: true,
+            system_contract_effects: SystemContractEffects::default(),
+        })
     }
 
     /// Convert shell-chain access list to revm's AccessList format.
@@ -2893,5 +3226,304 @@ mod tests {
             crate::tx_validation::compute_intrinsic_gas(&[], false, &al3) - base,
             18_600
         );
+    }
+
+    #[test]
+    fn execute_aa_bundle_is_hard_guarded() {
+        use shell_core::{AaBundle, InnerCall, AA_BUNDLE_TX_TYPE};
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let from = ShellAddress::from([0x42; 20]);
+        fund_account(&mut evm, &from, U256::from(10_000_000_000u64));
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![InnerCall {
+                to: Some(ShellAddress::from([0xAA; 20])),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            }],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            shell_core::PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+
+        let header = sample_header();
+        let res = evm.execute_tx(&signed, &header, 0, 0);
+        assert!(matches!(res, Err(ExecutorError::AaBundleNotYetExecutable(_))));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M2b: AA bundle dispatcher tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn make_aa_signed(
+        from: ShellAddress,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee: u64,
+        inner_calls: Vec<shell_core::InnerCall>,
+        paymaster: Option<ShellAddress>,
+    ) -> SignedTransaction {
+        use shell_core::{AaBundle, AA_BUNDLE_TX_TYPE};
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce,
+            to: None,
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls,
+            paymaster,
+            paymaster_signature: paymaster
+                .map(|_| shell_primitives::Bytes::from(vec![0u8; 1])),
+        };
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            shell_core::PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap()
+    }
+
+    fn get_balance(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress) -> U256 {
+        evm.state_db_mut()
+            .world_state_mut()
+            .get_account(addr)
+            .unwrap()
+            .map(|a| a.balance)
+            .unwrap_or(U256::ZERO)
+    }
+
+    fn get_nonce(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress) -> u64 {
+        evm.state_db_mut()
+            .world_state_mut()
+            .get_account(addr)
+            .unwrap()
+            .map(|a| a.nonce)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn execute_aa_bundle_self_sponsored_two_transfers_success() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let dst1 = ShellAddress::from([0xAA; 20]);
+        let dst2 = ShellAddress::from([0xBB; 20]);
+
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+
+        let inner_calls = vec![
+            InnerCall {
+                to: Some(dst1),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            },
+            InnerCall {
+                to: Some(dst2),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            },
+        ];
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+
+        assert_eq!(get_balance(&mut evm, &dst1), U256::from(1u64));
+        assert_eq!(get_balance(&mut evm, &dst2), U256::from(1u64));
+        assert_eq!(get_nonce(&mut evm, &sender), 1);
+        assert_eq!(res.receipt.status, 1);
+        assert!(res.gas_used > 0, "gas_used should be non-zero");
+    }
+
+    #[test]
+    fn execute_aa_bundle_atomic_revert_on_inner_failure() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let dst1 = ShellAddress::from([0xAA; 20]);
+        let dst2 = ShellAddress::from([0xBB; 20]);
+
+        fund_account(&mut evm, &sender, U256::from(5_000_000u64));
+
+        let inner_calls = vec![
+            InnerCall {
+                to: Some(dst1),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            },
+            InnerCall {
+                to: Some(dst2),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                // 100 gas is well below the 21_000 intrinsic for a transfer
+                // → revm halts with OutOfGas.
+                gas_limit: 100,
+            },
+        ];
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+
+        let pre_bal = get_balance(&mut evm, &sender);
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+
+        assert_eq!(get_balance(&mut evm, &dst1), U256::ZERO);
+        assert_eq!(get_balance(&mut evm, &dst2), U256::ZERO);
+        assert_eq!(get_nonce(&mut evm, &sender), 1);
+        assert_eq!(res.receipt.status, 0);
+        let post_bal = get_balance(&mut evm, &sender);
+        let charged = pre_bal - post_bal;
+        assert!(
+            charged <= U256::from(200_000u64 * 10u64),
+            "charge {charged} should not exceed gas_limit*max_fee"
+        );
+    }
+
+    #[test]
+    fn execute_aa_bundle_sponsored_success() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let paymaster = ShellAddress::from([0x77; 20]);
+        let dst = ShellAddress::from([0xAA; 20]);
+
+        fund_account(&mut evm, &sender, U256::from(10u64));
+        fund_account(&mut evm, &paymaster, U256::from(10_000_000u64));
+
+        let inner_calls = vec![InnerCall {
+            to: Some(dst),
+            value: U256::from(5u64),
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let signed =
+            make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+
+        let sender_pre = get_balance(&mut evm, &sender);
+        let paymaster_pre = get_balance(&mut evm, &paymaster);
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+
+        assert_eq!(res.receipt.status, 1);
+        assert_eq!(get_balance(&mut evm, &dst), U256::from(5u64));
+        let sender_post = get_balance(&mut evm, &sender);
+        assert_eq!(
+            sender_pre - sender_post,
+            U256::from(5u64),
+            "sender should pay only the inner value"
+        );
+        let paymaster_post = get_balance(&mut evm, &paymaster);
+        assert!(
+            paymaster_pre > paymaster_post,
+            "paymaster balance should decrease"
+        );
+        assert!(
+            paymaster_pre - paymaster_post <= U256::from(200_000u64 * 10u64),
+            "paymaster charge should not exceed gas_limit * max_fee"
+        );
+        assert_eq!(get_nonce(&mut evm, &sender), 1);
+    }
+
+    #[test]
+    fn execute_aa_bundle_sponsored_payer_shortfall_at_execution() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let paymaster = ShellAddress::from([0x77; 20]);
+        let dst = ShellAddress::from([0xAA; 20]);
+
+        fund_account(&mut evm, &sender, U256::from(1_000u64));
+        fund_account(&mut evm, &paymaster, U256::ZERO);
+
+        let inner_calls = vec![InnerCall {
+            to: Some(dst),
+            value: U256::from(1u64),
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let signed =
+            make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+
+        assert_eq!(res.receipt.status, 0);
+        assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);
+        assert_eq!(get_balance(&mut evm, &sender), U256::from(1_000u64));
+        assert_eq!(get_balance(&mut evm, &paymaster), U256::ZERO);
+        assert_eq!(get_nonce(&mut evm, &sender), 1);
+        assert_eq!(res.gas_used, 0);
+    }
+
+    #[test]
+    fn execute_aa_bundle_single_nonce_bump_regardless_of_inner_count() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        fund_account(&mut evm, &sender, U256::from(100_000_000u64));
+
+        let inner_calls = (0..5u8)
+            .map(|i| InnerCall {
+                to: Some(ShellAddress::from([0xA0 + i; 20])),
+                value: U256::from(1u64),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            })
+            .collect();
+        let signed = make_aa_signed(sender, 7, 500_000, 10, inner_calls, None);
+
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+        assert_eq!(res.receipt.status, 1);
+        assert_eq!(get_nonce(&mut evm, &sender), 8);
     }
 }

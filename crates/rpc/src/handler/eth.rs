@@ -33,18 +33,14 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     }
 
     async fn sign(&self, _address: Address, _data: String) -> Result<String, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "eth_sign is not supported: node does not hold private keys",
-            None::<()>,
         ))
     }
 
     async fn sign_transaction(&self, _tx: serde_json::Value) -> Result<String, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "eth_signTransaction is not supported: node does not hold private keys",
-            None::<()>,
         ))
     }
 
@@ -583,14 +579,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
 
         // Cap range to prevent DoS.
         if to - from + 1 > MAX_BLOCK_RANGE {
-            return Err(ErrorObjectOwned::owned(
-                -32005,
-                format!(
-                    "query returned more than {} blocks; cap the range",
-                    MAX_BLOCK_RANGE
-                ),
-                None::<()>,
-            ));
+            return Err(limit_exceeded(format!(
+                "query returned more than {} blocks; cap the range",
+                MAX_BLOCK_RANGE
+            )));
         }
 
         let mut results = Vec::new();
@@ -690,7 +682,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let (is_log, last_poll_block) = self
             .filter_registry
             .get_filter_info(&id)
-            .ok_or_else(|| ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))?;
+            .ok_or_else(|| not_found("filter not found"))?;
 
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
         let latest = head.map(|b| b.number()).unwrap_or(0);
@@ -707,7 +699,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             let raw = self
                 .filter_registry
                 .get_log_filter(&id)
-                .ok_or_else(|| ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))?;
+                .ok_or_else(|| not_found("filter not found"))?;
             let filter = raw.into_filter(latest);
 
             let mut results = Vec::new();
@@ -786,7 +778,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let raw = self
             .filter_registry
             .get_log_filter(&id)
-            .ok_or_else(|| ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))?;
+            .ok_or_else(|| not_found("filter not found"))?;
         self.get_logs(raw).await
     }
 

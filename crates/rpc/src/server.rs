@@ -161,6 +161,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     dev_control: Option<DynDevRpcControl>,
     admin_p2p_context: Option<(String, String)>,
     witness_store: Option<Arc<WitnessStore<S>>>,
+    storage_profile_info: Option<crate::types::StorageProfileInfo>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Load and validate TLS configuration.
     // When cert+key are provided, we start jsonrpsee on an internal loopback
@@ -213,6 +214,9 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     }
     if let Some(ws) = witness_store {
         handler = handler.with_witness_store(ws);
+    }
+    if let Some(info) = storage_profile_info {
+        handler = handler.with_storage_profile(info);
     }
     // Populate the RPC listen address from the configured public address.
     // (The actual bound port may differ when using ephemeral port 0, but for

@@ -28,20 +28,16 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         // split-brain — validator changes must go through a system contract
         // transaction so all nodes compute the same state_root deterministically.
         // Use shell_proposeAddValidator instead.
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "shell_addValidator is disabled: use shell_proposeAddValidator instead",
-            None::<()>,
         ))
     }
 
     async fn remove_validator(&self, _address: String) -> Result<bool, ErrorObjectOwned> {
         // DISABLED (F-039/F-040): See add_validator rationale.
         // Use shell_proposeRemoveValidator instead.
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "shell_removeValidator is disabled: use shell_proposeRemoveValidator instead",
-            None::<()>,
         ))
     }
 
@@ -102,11 +98,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             }
             "getValidators" | "isValidator" => shell_evm::SYSTEM_CALL_BASE_GAS,
             _ => {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("unknown governance operation: {operation}"),
-                    None::<()>,
-                ));
+                return Err(invalid_params(format!(
+                    "unknown governance operation: {operation}"
+                )));
             }
         };
         Ok(hex_u64(gas))
@@ -219,7 +213,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     ) -> Result<bool, ErrorObjectOwned> {
         // Require dev mode — shell_setBalance is a state-mutation endpoint.
         self.dev_control.as_ref().ok_or_else(|| {
-            ErrorObjectOwned::owned(-32601, "shell_setBalance requires dev mode", None::<()>)
+            dev_mode_required("shell_setBalance requires dev mode")
         })?;
         let value = if let Some(hex_str) = balance.strip_prefix("0x") {
             U256::from_str_radix(hex_str, 16)
@@ -369,9 +363,14 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             })
             .collect();
 
+        // OPS-2: verify computed root vs header's witness_root.
+        let computed_root = bundle.compute_root();
+        let root_verified = header.witness_root.map(|hr| hr == computed_root);
+
         Ok(serde_json::json!({
             "blockHash": block_hash,
             "witnessRoot": witness_root,
+            "witnessRootVerified": root_verified,
             "witnessCount": witnesses.len(),
             "witnesses": witnesses,
         }))
@@ -389,6 +388,8 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         };
 
         let block_number = header.number;
+        let state_root = format!("0x{}", hex::encode(header.state_root.as_bytes()));
+        let timestamp = header.timestamp;
 
         let witnesses: Vec<serde_json::Value> = bundle
             .witnesses
@@ -408,13 +409,227 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             })
             .collect();
 
+        // OPS-2: verify computed root vs header's witness_root.
+        let computed_root = bundle.compute_root();
+        let witness_root_verified = header.witness_root.map(|hr| hr == computed_root);
+
         Ok(serde_json::json!({
             "block_hash": format!("0x{}", hex::encode(block_hash.as_bytes())),
             "block_number": block_number,
+            "state_root": state_root,
+            "timestamp": timestamp,
             "witness_root": witness_root_value(Some(&header)),
+            "witness_root_verified": witness_root_verified,
             "witness_count": witnesses.len(),
             "witnesses": witnesses,
         }))
+    }
+
+    async fn verify_witness_root(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let Some((block_hash, header)) = resolve_witness_block(self, &block)? else {
+            return Ok(serde_json::json!({
+                "blockHash": serde_json::Value::Null,
+                "verified": serde_json::Value::Null,
+                "reason": "block not found",
+            }));
+        };
+
+        let Some(expected_root) = header.witness_root else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "block header has no witness_root (pre-B2 block or genesis)",
+            }));
+        };
+
+        let Some(ws) = &self.witness_store else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "witness store not available on this node",
+            }));
+        };
+
+        let Some(bundle) = ws.get_bundle(&block_hash).map_err(internal_err)? else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "witness bundle not stored (pruned or never written)",
+            }));
+        };
+
+        let computed_root = bundle.compute_root();
+        let verified = computed_root == expected_root;
+        Ok(serde_json::json!({
+            "blockHash": block_hash,
+            "expectedRoot": expected_root,
+            "computedRoot": computed_root,
+            "verified": verified,
+        }))
+    }
+
+    async fn estimate_batch(
+        &self,
+        req: crate::types::BatchEstimateRequest,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        use shell_core::{AA_INNER_CALL_INTRINSIC_GAS, MAX_INNER_CALLS};
+
+        if req.inner_calls.is_empty() {
+            return Err(invalid_params("estimateBatch: inner_calls must not be empty"));
+        }
+        if req.inner_calls.len() > MAX_INNER_CALLS {
+            return Err(invalid_params(format!(
+                "estimateBatch: inner_calls exceeds MAX_INNER_CALLS ({MAX_INNER_CALLS})"
+            )));
+        }
+
+        const PER_INNER_DEFAULT_FLOOR: u64 = 21_000;
+        let from = req.from.unwrap_or(Address::ZERO);
+
+        let mut per_inner = Vec::with_capacity(req.inner_calls.len());
+        let mut inner_sum: u64 = 0;
+        for (idx, call) in req.inner_calls.iter().enumerate() {
+            let (gas_limit, simulated) = match call.gas_limit.as_deref() {
+                Some(hex) => (parse_hex_u64(hex)?, false),
+                None => {
+                    let call_req = crate::types::CallRequest {
+                        from: Some(from),
+                        to: call.to,
+                        data: call.data.clone(),
+                        value: call.value.clone(),
+                        gas: None,
+                        access_list: None,
+                    };
+                    let (_out, used) = self.execute_call(&call_req).map_err(|e| {
+                        server_error(format!(
+                            "estimateBatch: simulation for inner[{idx}] failed: {e}"
+                        ))
+                    })?;
+                    let buffered = ((used as f64) * 1.2) as u64;
+                    (std::cmp::max(buffered, PER_INNER_DEFAULT_FLOOR), true)
+                }
+            };
+            if gas_limit == 0 {
+                return Err(invalid_params(format!(
+                    "estimateBatch: inner[{idx}] gas_limit must be > 0"
+                )));
+            }
+            inner_sum = inner_sum
+                .checked_add(gas_limit)
+                .ok_or_else(|| internal_err("estimateBatch: inner_sum overflow"))?;
+            per_inner.push(serde_json::json!({
+                "gasLimit": hex_u64(gas_limit),
+                "simulated": simulated,
+            }));
+        }
+
+        let outer_intrinsic: u64 = 21_000;
+        let extra_inners = (req.inner_calls.len() as u64).saturating_sub(1);
+        let intrinsic_surcharge = extra_inners.saturating_mul(AA_INNER_CALL_INTRINSIC_GAS);
+        let total = outer_intrinsic
+            .checked_add(inner_sum)
+            .and_then(|v| v.checked_add(intrinsic_surcharge))
+            .ok_or_else(|| internal_err("estimateBatch: totalGas overflow"))?;
+
+        Ok(serde_json::json!({
+            "totalGas": hex_u64(total),
+            "outerIntrinsic": hex_u64(outer_intrinsic),
+            "innerSum": hex_u64(inner_sum),
+            "intrinsicSurcharge": hex_u64(intrinsic_surcharge),
+            "perInner": per_inner,
+            "paymaster": req.paymaster,
+        }))
+    }
+
+    async fn get_paymaster_policy(
+        &self,
+        address: Address,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let pubkey = self
+            .chain_store
+            .get_pubkey(&address)
+            .map_err(internal_err)?;
+        let balance = {
+            let ws = self.world_state.read();
+            ws.get_balance(&address).map_err(internal_err)?
+        };
+
+        Ok(serde_json::json!({
+            "address": address,
+            "hasPqPubkey": pubkey.is_some(),
+            "pubkeyBytes": pubkey.as_ref().map(|b| b.len() as u64),
+            "balance": hex_u256(balance),
+            "policy": "eoa-open",
+            "maxGasSponsorship": serde_json::Value::Null,
+        }))
+    }
+
+    async fn is_sponsored(
+        &self,
+        tx_hash: ShellHash,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let describe = |tx: &SignedTransaction, location: &str| {
+            let is_bundle = tx.is_aa_bundle();
+            let (paymaster, inner_count) = tx
+                .aa_bundle()
+                .map(|b| (b.paymaster, b.inner_calls.len() as u64))
+                .unwrap_or((None, 0));
+            let sponsored = is_bundle
+                && paymaster
+                    .map(|p| p != tx.from)
+                    .unwrap_or(false);
+            serde_json::json!({
+                "found": true,
+                "location": location,
+                "isAaBundle": is_bundle,
+                "sponsored": sponsored,
+                "paymaster": paymaster,
+                "sender": tx.from,
+                "innerCallCount": if is_bundle { Some(inner_count) } else { None },
+            })
+        };
+
+        if let Some(pending) = self.tx_pool.get(&tx_hash) {
+            return Ok(describe(&pending, "mempool"));
+        }
+
+        let location = self
+            .chain_store
+            .get_tx_location(&tx_hash)
+            .map_err(internal_err)?;
+        if let Some((block_hash, tx_index)) = location {
+            if let Some(block) = self
+                .chain_store
+                .get_block_by_hash(&block_hash)
+                .map_err(internal_err)?
+            {
+                if let Some(tx) = block.transactions.get(tx_index as usize) {
+                    return Ok(describe(tx, "chain"));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "found": false,
+            "location": serde_json::Value::Null,
+            "isAaBundle": false,
+            "sponsored": false,
+            "paymaster": serde_json::Value::Null,
+            "sender": serde_json::Value::Null,
+            "innerCallCount": serde_json::Value::Null,
+        }))
+    }
+
+    async fn get_storage_profile(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        match &self.storage_profile {
+            Some(info) => serde_json::to_value(info).map_err(|e| internal_err(e.to_string())),
+            None => Err(feature_not_enabled(
+                "storage profile not configured on this node",
+            )),
+        }
     }
 }
 

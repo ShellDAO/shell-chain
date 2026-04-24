@@ -24,6 +24,10 @@ pub(crate) use crate::api::{
     Web3ApiServer,
 };
 pub(crate) use crate::dev_control::DynDevRpcControl;
+pub(crate) use crate::error::{
+    dev_mode_required, feature_not_enabled, invalid_params, limit_exceeded, method_not_found,
+    not_found, server_error,
+};
 pub(crate) use crate::filter::{RawLogFilter, MAX_BLOCK_RANGE};
 pub(crate) use crate::filter_registry::{FilterKind, FilterRegistry};
 pub(crate) use crate::subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
@@ -84,6 +88,10 @@ pub struct RpcHandler<S: KvStore + 'static> {
     admin_p2p_listen: String,
     /// Optional witness store for Phase B witness bundle queries (B4).
     witness_store: Option<Arc<WitnessStore<S>>>,
+    /// Optional active storage profile descriptor surfaced via
+    /// `shell_getStorageProfile`. Set by the node at startup; absent in pure
+    /// in-memory test setups.
+    storage_profile: Option<crate::types::StorageProfileInfo>,
 }
 
 impl<S: KvStore + 'static> Clone for RpcHandler<S> {
@@ -111,6 +119,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             admin_peer_id: self.admin_peer_id.clone(),
             admin_p2p_listen: self.admin_p2p_listen.clone(),
             witness_store: self.witness_store.clone(),
+            storage_profile: self.storage_profile.clone(),
         }
     }
 }
@@ -154,9 +163,17 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             admin_peer_id: String::new(),
             admin_p2p_listen: String::new(),
             witness_store: None,
+            storage_profile: None,
         };
         FilterRegistry::start_cleanup(Arc::clone(&handler.filter_registry));
         handler
+    }
+
+    /// Attach the active storage profile descriptor for `shell_getStorageProfile`.
+    /// Set by the node at startup; absent in pure in-memory test setups.
+    pub fn with_storage_profile(mut self, info: crate::types::StorageProfileInfo) -> Self {
+        self.storage_profile = Some(info);
+        self
     }
 
     /// Attach a witness store for `shell_getBlockWitnesses` (Phase B4).
@@ -239,14 +256,10 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         if let Ok(Some(head)) = self.chain_store.get_head_block() {
             let current_base_fee = head.header.base_fee_per_gas;
             if current_base_fee > 0 && signed_tx.tx.max_fee_per_gas < current_base_fee {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    format!(
-                        "max fee per gas ({}) below current base fee ({})",
-                        signed_tx.tx.max_fee_per_gas, current_base_fee
-                    ),
-                    None::<()>,
-                ));
+                return Err(server_error(format!(
+                    "max fee per gas ({}) below current base fee ({})",
+                    signed_tx.tx.max_fee_per_gas, current_base_fee
+                )));
             }
         }
 
@@ -260,7 +273,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let hash = self
             .tx_pool
             .insert(signed_tx, &mut ws, chain_store, &verifier)
-            .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+            .map_err(|e| server_error(e.to_string()))?;
 
         // Broadcast to peers via the network channel.
         if let (Some(sender), Some(tx)) = (&self.tx_broadcast, tx_for_broadcast) {
@@ -1402,6 +1415,11 @@ mod tests {
         );
         assert_eq!(result["block_number"], 0);
         assert_eq!(result["witness_count"], 1);
+        // OPS-2: enriched fields
+        assert!(result["state_root"].as_str().unwrap().starts_with("0x"));
+        assert!(result["timestamp"].is_u64());
+        // genesis block has no witness_root → verified is null
+        assert!(result["witness_root_verified"].is_null());
         let witnesses = result["witnesses"].as_array().unwrap();
         assert_eq!(witnesses[0]["tx_index"], 0);
         assert_eq!(witnesses[0]["sig_type"], "Dilithium3");
@@ -1413,6 +1431,146 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn get_block_witnesses_includes_root_verified_flag() {
+        use shell_core::{TxWitness, WitnessBundle};
+
+        let handler = setup_with_witness();
+        let block = make_genesis_block();
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"tx0").unwrap();
+        let bundle = WitnessBundle::new(vec![TxWitness::new_embedded(sig, pk)]);
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&block_hash, &bundle)
+            .unwrap();
+
+        let result =
+            ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
+                .await
+                .unwrap();
+
+        // genesis block carries no witness_root → verified is null
+        assert!(result["witnessRootVerified"].is_null());
+        assert_eq!(result["witnessCount"], 1);
+    }
+
+    // ── shell_verifyWitnessRoot ────────────────────────────────────
+
+    #[tokio::test]
+    async fn verify_witness_root_block_not_found() {
+        let handler = setup_with_witness();
+        let fake = format!("0x{}", "aa".repeat(32));
+        let res = ShellApiServer::verify_witness_root(&handler, fake)
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_no_witness_root_in_header() {
+        let handler = setup_with_witness();
+        let block = make_genesis_block(); // genesis has no witness_root
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("no witness_root"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_no_bundle_stored() {
+        use shell_primitives::ShellHash;
+        // Manufacture a block header with a witness_root set but no bundle stored.
+        let handler = setup_with_witness();
+        let mut block = make_genesis_block();
+        block.header.witness_root = Some(ShellHash::from([0xab; 32]));
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("not stored"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_match_and_mismatch() {
+        use shell_core::{TxWitness, WitnessBundle};
+        use shell_primitives::ShellHash;
+
+        let handler = setup_with_witness();
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"tx0").unwrap();
+        let bundle = WitnessBundle::new(vec![TxWitness::new_embedded(sig, pk)]);
+        let correct_root = bundle.compute_root();
+
+        // --- match case: header.witness_root == bundle.compute_root() ---
+        let mut block_match = make_genesis_block();
+        block_match.header.witness_root = Some(correct_root);
+        let hash_match = block_match.hash();
+        handler.chain_store.put_block(&block_match).unwrap();
+        handler.chain_store.set_canonical(0, &hash_match).unwrap();
+        handler.chain_store.set_head(&hash_match).unwrap();
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&hash_match, &bundle)
+            .unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(res["verified"], true);
+        assert_eq!(res["expectedRoot"], serde_json::to_value(correct_root).unwrap());
+
+        // --- mismatch case: wrong root in header ---
+        let wrong_root = ShellHash::from([0xff; 32]);
+        let mut block_bad = make_genesis_block();
+        block_bad.header.witness_root = Some(wrong_root);
+        block_bad.header.number = 1; // different block so different hash
+        let hash_bad = block_bad.hash();
+        handler.chain_store.put_block(&block_bad).unwrap();
+        handler.chain_store.set_canonical(1, &hash_bad).unwrap();
+        handler.chain_store.set_head(&hash_bad).unwrap();
+
+        let signer2 = DilithiumSigner::generate();
+        let pk2 = signer2.public_key().to_vec();
+        let sig2 = signer2.sign(b"tx0").unwrap();
+        let bundle2 = WitnessBundle::new(vec![TxWitness::new_embedded(sig2, pk2)]);
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&hash_bad, &bundle2)
+            .unwrap();
+
+        let res2 = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(res2["verified"], false);
+        assert_eq!(res2["expectedRoot"], serde_json::to_value(wrong_root).unwrap());
     }
 
     #[tokio::test]
@@ -3601,5 +3759,297 @@ mod tests {
             err_msg.contains("not valid RLP or JSON"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    // ── v0.18.0 M3 · Native-AA RPC surface ────────────────────────────
+
+    fn make_inner_call_req(
+        to: Address,
+        value: u64,
+        gas_limit: Option<u64>,
+    ) -> crate::types::BatchInnerCallRequest {
+        crate::types::BatchInnerCallRequest {
+            to: Some(to),
+            value: Some(format!("{:#x}", value)),
+            data: None,
+            gas_limit: gas_limit.map(|g| format!("{:#x}", g)),
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_rejects_empty_inner_calls() {
+        let handler = setup();
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message().contains("inner_calls must not be empty"),
+            "unexpected err: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_rejects_too_many_inner_calls() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let calls: Vec<_> = (0..shell_core::MAX_INNER_CALLS + 1)
+            .map(|_| make_inner_call_req(dst, 0, Some(21_000)))
+            .collect();
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: calls,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message().contains("exceeds MAX_INNER_CALLS"),
+            "unexpected err: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_explicit_gas_limits_computes_structural_total() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let res = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: vec![
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                    make_inner_call_req(dst, 0, Some(21_000)),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        // outerIntrinsic = 21_000
+        // innerSum = 3 × 21_000 = 63_000
+        // intrinsicSurcharge = 2 × AA_INNER_CALL_INTRINSIC_GAS = 8_000
+        // totalGas = 21_000 + 63_000 + 8_000 = 92_000
+        assert_eq!(res["outerIntrinsic"], format!("{:#x}", 21_000));
+        assert_eq!(res["innerSum"], format!("{:#x}", 63_000));
+        assert_eq!(
+            res["intrinsicSurcharge"],
+            format!("{:#x}", 2 * shell_core::AA_INNER_CALL_INTRINSIC_GAS)
+        );
+        assert_eq!(res["totalGas"], format!("{:#x}", 92_000));
+        let per = res["perInner"].as_array().unwrap();
+        assert_eq!(per.len(), 3);
+        assert_eq!(per[0]["simulated"], false);
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_simulates_when_gas_limit_missing() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        // Omit gas_limit for the first inner call — the server must simulate it
+        // via execute_call and return simulated = true with a gas ≥ 21_000.
+        let res = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: Some(Address::ZERO),
+                paymaster: None,
+                inner_calls: vec![make_inner_call_req(dst, 0, None)],
+            },
+        )
+        .await
+        .unwrap();
+        let per = res["perInner"].as_array().unwrap();
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0]["simulated"], true);
+        let gas = u64::from_str_radix(
+            per[0]["gasLimit"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        assert!(gas >= 21_000, "expected simulated gas ≥ 21_000, got {gas}");
+    }
+
+    #[tokio::test]
+    async fn get_paymaster_policy_returns_unregistered_for_bare_address() {
+        let handler = setup();
+        let addr = Address::from([0xCC; 20]);
+        let res = ShellApiServer::get_paymaster_policy(&handler, addr)
+            .await
+            .unwrap();
+        assert_eq!(res["hasPqPubkey"], false);
+        assert_eq!(res["pubkeyBytes"], serde_json::Value::Null);
+        assert_eq!(res["policy"], "eoa-open");
+        assert_eq!(res["maxGasSponsorship"], serde_json::Value::Null);
+        assert_eq!(res["balance"], "0x0");
+    }
+
+    #[tokio::test]
+    async fn get_paymaster_policy_surfaces_balance_and_pubkey() {
+        let handler = setup();
+        let addr = Address::from([0xCD; 20]);
+        handler
+            .chain_store
+            .put_pubkey(&addr, &[0xAB; 1_952])
+            .unwrap();
+        {
+            let mut ws = handler.world_state.write();
+            ws.set_balance(&addr, U256::from(123_456_u64)).unwrap();
+        }
+
+        let res = ShellApiServer::get_paymaster_policy(&handler, addr)
+            .await
+            .unwrap();
+        assert_eq!(res["hasPqPubkey"], true);
+        assert_eq!(res["pubkeyBytes"], 1_952u64);
+        assert_eq!(res["balance"], format!("{:#x}", 123_456_u64));
+        assert_eq!(res["policy"], "eoa-open");
+    }
+
+    #[tokio::test]
+    async fn is_sponsored_returns_not_found_for_unknown_hash() {
+        let handler = setup();
+        let res = ShellApiServer::is_sponsored(&handler, ShellHash::from_slice(&[0u8; 32]))
+            .await
+            .unwrap();
+        assert_eq!(res["found"], false);
+        assert_eq!(res["location"], serde_json::Value::Null);
+        assert_eq!(res["sponsored"], false);
+    }
+
+    #[tokio::test]
+    async fn is_sponsored_detects_chain_stored_sponsored_bundle() {
+        use shell_core::{AaBundle, InnerCall, PubkeyMode, AA_BUNDLE_TX_TYPE};
+        use shell_crypto::{PQSignature, SignatureType};
+
+        let handler = setup();
+        let sender = Address::from([0x11; 20]);
+        let payer = Address::from([0x22; 20]);
+
+        let inner = InnerCall {
+            to: Some(Address::from([0xFF; 20])),
+            value: U256::from(1u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![inner.clone(), inner],
+            paymaster: Some(payer),
+            paymaster_signature: Some(Bytes::from(vec![0xAB; 64])),
+        };
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let placeholder_sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let signed = SignedTransaction::with_aa_bundle(
+            sender,
+            tx,
+            placeholder_sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+        let tx_hash = signed.hash();
+
+        // Build a minimal block carrying this tx and index it.
+        let genesis = make_genesis_block();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &genesis.hash())
+            .unwrap();
+
+        let mut header = genesis.header.clone();
+        header.parent_hash = genesis.hash();
+        header.number = 1;
+        let block = Block {
+            header,
+            transactions: vec![signed],
+            proposer_seal: None,
+        };
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        let res = ShellApiServer::is_sponsored(&handler, tx_hash)
+            .await
+            .unwrap();
+        assert_eq!(res["found"], true);
+        assert_eq!(res["location"], "chain");
+        assert_eq!(res["isAaBundle"], true);
+        assert_eq!(res["sponsored"], true);
+        assert_eq!(res["paymaster"], serde_json::to_value(payer).unwrap());
+        assert_eq!(res["sender"], serde_json::to_value(sender).unwrap());
+        assert_eq!(res["innerCallCount"], 2u64);
+    }
+
+    // ── shell_getStorageProfile ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_storage_profile_returns_attached_descriptor() {
+        let handler = setup().with_storage_profile(crate::types::StorageProfileInfo {
+            profile: "full".into(),
+            body_retention: 0,
+            witness_retention: 128,
+            keep_recent: 0,
+            proof_replacement_grace: 0,
+            state_pruning_experimental: false,
+        });
+        let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
+        assert_eq!(res["profile"], "full");
+        assert_eq!(res["bodyRetention"], 0u64);
+        assert_eq!(res["witnessRetention"], 128u64);
+        assert_eq!(res["keepRecent"], 0u64);
+        assert_eq!(res["proofReplacementGrace"], 0u64);
+        assert_eq!(res["statePruningExperimental"], false);
+    }
+
+    #[tokio::test]
+    async fn get_storage_profile_archive_descriptor_round_trip() {
+        let handler = setup().with_storage_profile(crate::types::StorageProfileInfo {
+            profile: "archive".into(),
+            body_retention: 0,
+            witness_retention: 0,
+            keep_recent: 0,
+            proof_replacement_grace: u64::MAX,
+            state_pruning_experimental: false,
+        });
+        let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
+        assert_eq!(res["profile"], "archive");
+        assert_eq!(res["proofReplacementGrace"], u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn get_storage_profile_returns_error_when_unconfigured() {
+        let handler = setup();
+        let err = ShellApiServer::get_storage_profile(&handler)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
+        assert!(err.message().contains("storage profile"));
     }
 }

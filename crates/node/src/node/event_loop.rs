@@ -85,6 +85,17 @@ impl<S: KvStore + 'static> Node<S> {
             },
             None, // admin_p2p_context: wire peer_id + p2p_listen when P2P layer is integrated
             Some(Arc::clone(&self.witness_store)), // B5: witness store wired
+            Some({
+                let p = &self.config.pruning;
+                shell_rpc::types::StorageProfileInfo {
+                    profile: StorageProfile::from_pruning_config(p).as_str().to_string(),
+                    body_retention: p.body_retention,
+                    witness_retention: p.witness_retention,
+                    keep_recent: p.keep_recent,
+                    proof_replacement_grace: p.proof_replacement_grace,
+                    state_pruning_experimental: p.state_pruning_experimental,
+                }
+            }),
         )
         .await
         .map_err(|e| NodeError::Startup(format!("RPC: {e}")))?;

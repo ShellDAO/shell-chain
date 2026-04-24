@@ -295,12 +295,20 @@ impl<S: KvStore + 'static> Node<S> {
             let mut cumulative_gas: u64 = 0;
 
             for (idx, tx) in block.transactions.iter().enumerate() {
-                match evm.execute_tx(tx, &block.header, idx as u32, cumulative_gas) {
+                let exec_result = if tx.is_aa_bundle() {
+                    evm.execute_aa_bundle(tx, &block.header, idx as u32, cumulative_gas)
+                } else {
+                    evm.execute_tx(tx, &block.header, idx as u32, cumulative_gas)
+                };
+                match exec_result {
                     Ok(result) => {
                         cumulative_gas += result.gas_used;
                         receipts.push(result.receipt);
 
-                        if result.is_system_tx {
+                        if tx.is_aa_bundle() {
+                            // AA dispatcher already mutated state_db.world_state
+                            // in-place (with atomic rollback on inner failure).
+                        } else if result.is_system_tx {
                             self.sync_system_contract_state(
                                 evm.state_db_mut().world_state_mut(),
                                 &result.system_contract_effects,

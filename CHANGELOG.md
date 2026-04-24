@@ -4,18 +4,86 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Reliability
+_Tracking work toward the next release (after 0.18.0)._
 
-- **SignedTransaction JSON compatibility guard**: compatibility deserialization for sdk-style
-  `sender_pubkey` now rejects ambiguous payloads that also specify `pubkey_mode`, while still
-  accepting legacy `sender_pubkey`-only requests.
-- **Dilithium3 sdk compatibility**: chain verification now accepts shell-sdk's current
-  ML-DSA-65-produced `"Dilithium3"` signatures as a compatibility fallback, with regression tests
-  covering both direct verification and `eth_sendRawTransaction` first-use JSON submission.
-- **SDK/wallet RPC contract alignment**: `shell_getNodeInfo` now exposes sdk-facing snake_case
-  fields alongside legacy camelCase ones, `shell_getWitness` is available as an alias with the
-  typed witness shape the sdk expects, and `shell_getTransactionsByAddress.total` now reports the
-  full match count instead of the current page size.
+## [0.18.0] — Native Account Abstraction Phase 1 + Operations Hardening
+
+> Released on branch `feat/v0.18.0-dev`. Workspace version: `0.18.0-dev`.
+
+### AA Phase 1: Batch Transactions
+
+- **`AaBundle` wire format** (`tx_type = 0x7E`): new `AaBundle` struct carrying
+  `Vec<InnerCall>` with per-call `to / value / data / gas_limit`; single PQ signature
+  covers the entire batch (`batch_signing_hash` domain-separated from legacy hashes).
+- **Atomic execution**: any inner call failure reverts the entire bundle; gas and nonce
+  deducted once for the batch; individual receipts produced per inner call.
+- **`shell_estimateBatch`**: estimates per-inner and total gas for a batch request,
+  returns `totalGas / outerIntrinsic / innerSum / intrinsicSurcharge / perInner`.
+- **`shell_sendTransaction`**: accepts AA-bundle `SignedTransaction` directly;
+  mempool validates bundle structure and verifies `batch_signing_hash` signature.
+- `AA_BUNDLE_TX_TYPE = 0x7E`, `MAX_INNER_CALLS = 16`,
+  `AA_INNER_CALL_INTRINSIC_GAS` per extra inner call.
+
+### AA Phase 1: Sponsored Gas (Paymaster)
+
+- **Native paymaster** fields in `AaBundle`: `paymaster: Option<Address>` +
+  `paymaster_signature: Option<Bytes>` (PQ sig over `paymaster_signing_hash`).
+- **`shell_getPaymasterPolicy(address)`**: returns paymaster's registered balance,
+  pubkey presence, and policy (`eoa-open` default).
+- **`shell_isSponsored(txHash)`**: returns
+  `{found, sponsored, isAaBundle, paymaster, sender, innerCallCount, location}` for
+  any queried tx hash (mempool or chain).
+- Paymaster fields fully optional; legacy transactions unaffected.
+
+### OPS-1: Storage Profile
+
+- `archive / full / light` profiles wired to CLI flag, node config, and
+  `shell_getStorageProfile` RPC.
+- Node startup validates profile-disk consistency; safe runtime-switch path
+  (archive↔full only).
+- `docs/storage-profiles.md` with profile comparison table and migration guide.
+
+### OPS-2: Witness Endpoint Hardening
+
+- `shell_getWitness` returns full Merkle proof + state root + block context on
+  archive/full nodes (no longer 501).
+- `shell_verifyWitnessRoot`: new RPC verifying stored bundle root against block header.
+- 11 new unit tests in `crates/rpc` covering all witness error paths and success cases.
+
+### OPS-3: Observability
+
+- **Prometheus metrics** (`/metrics`): `rpc_request_duration_seconds` HistogramVec
+  with `method` label; `record_rpc_call()` helper for manual instrumentation.
+- **`/healthz` + `/readyz`**: Kubernetes-compatible aliases for existing
+  `/health` and `/ready` endpoints.
+- `docs/observability.md`: full metrics reference, tracing guide (env-var control),
+  Grafana starter dashboard JSON, Kubernetes probe config.
+
+### OPS-4: RPC Stability & Docs
+
+- **Unified error code table** (`crates/rpc/src/error.rs`): named constants
+  `METHOD_NOT_FOUND (-32601)`, `INVALID_PARAMS (-32602)`, `INTERNAL_ERROR (-32603)`,
+  `SERVER_ERROR (-32000)`, `NOT_FOUND (-32001)`, `DEV_MODE_REQUIRED (-32002)`,
+  `FEATURE_NOT_ENABLED (-32003)`, `LIMIT_EXCEEDED (-32005)` + convenience constructors.
+- All magic `-32xxx` literals across `shell_api.rs`, `eth.rs`, `evm.rs`, `admin.rs`
+  migrated to named constructors.
+- Semantic fix: `shell_getStorageProfile` "not configured" now returns
+  `FEATURE_NOT_ENABLED (-32003)` instead of generic `SERVER_ERROR (-32000)`.
+- `shell_setBalance` now returns `DEV_MODE_REQUIRED (-32002)` instead of
+  `METHOD_NOT_FOUND (-32601)`.
+- `docs/rpc-reference.md`: complete method listing for all namespaces
+  (`eth_`, `shell_`, `net_`, `web3_`, `admin_`, `debug_`, `evm_`).
+
+### Tests
+
+- 9 AA batch e2e tests (`tests/e2e/aa_batch_test.rs`): `estimateBatch` validation
+  and success path, tx submission → mempool, retrieval after mining, receipt fields,
+  `AaBundle` persistence through block storage roundtrip.
+- 6 AA sponsored gas e2e tests (`tests/e2e/aa_sponsored_test.rs`): paymaster policy
+  default shape, `isSponsored` for unknown/regular/sponsored txs, paymaster survives
+  block roundtrip, multiple sponsored txs in one block.
+- 3 new `error.rs` unit tests; 4 new metrics/health endpoint tests.
+
 
 ## [0.17.0] — 2026-04-21 — Security & Efficiency Hardening
 

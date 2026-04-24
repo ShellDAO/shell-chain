@@ -56,10 +56,8 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
     async fn add_peer(&self, _multiaddr: String) -> Result<bool, ErrorObjectOwned> {
         // Dynamic peer dialling requires a command channel to the network layer.
         // Stubbed for Batch 4; full implementation in Batch 5 (P2P observability).
-        Err(ErrorObjectOwned::owned(
-            jsonrpsee::types::error::METHOD_NOT_FOUND_CODE,
+        Err(crate::error::method_not_found(
             "admin_addPeer not yet implemented; use --bootnodes at startup",
-            None::<()>,
         ))
     }
 }

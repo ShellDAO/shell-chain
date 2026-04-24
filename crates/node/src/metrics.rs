@@ -10,8 +10,8 @@ use std::time::Instant;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    CounterVec, Encoder, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry,
-    TextEncoder,
+    CounterVec, Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge,
+    Opts, Registry, TextEncoder,
 };
 
 /// Prometheus metrics for a shell-chain node.
@@ -62,6 +62,13 @@ pub struct Metrics {
     /// on every metrics scrape. RocksDB nodes can replace this with
     /// `property_int_value_cf` calls for exact SST file sizes.
     pub storage_cf_size: GaugeVec,
+    // -----------------------------------------------------------------------
+    // OPS-3: RPC latency
+    // -----------------------------------------------------------------------
+    /// Per-method RPC request duration in seconds.
+    /// Label: `method` — JSON-RPC method name (e.g. `"shell_getBlock"`).
+    /// Record via [`Metrics::record_rpc_call`].
+    pub rpc_request_duration_seconds: HistogramVec,
     registry: Registry,
 }
 
@@ -152,6 +159,16 @@ impl Metrics {
             &["cf"],
         )?;
 
+        // OPS-3: RPC latency per method
+        let rpc_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "shell_rpc_request_duration_seconds",
+                "RPC request duration by method",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+            &["method"],
+        )?;
+
         registry.register(Box::new(block_height.clone()))?;
         registry.register(Box::new(peer_count.clone()))?;
         registry.register(Box::new(tx_pool_size.clone()))?;
@@ -169,6 +186,7 @@ impl Metrics {
         registry.register(Box::new(stark_amendments_broadcast.clone()))?;
         registry.register(Box::new(stark_equivocations_detected.clone()))?;
         registry.register(Box::new(storage_cf_size.clone()))?;
+        registry.register(Box::new(rpc_request_duration_seconds.clone()))?;
 
         Ok(Self {
             block_height,
@@ -189,6 +207,7 @@ impl Metrics {
             stark_equivocations_detected,
             uptime_start: Instant::now(),
             storage_cf_size,
+            rpc_request_duration_seconds,
             registry,
         })
     }
@@ -221,8 +240,17 @@ impl Metrics {
             .inc();
     }
 
-    /// Update per-column-family storage size gauges.
+    /// Record the duration of a completed RPC call.
     ///
+    /// `method` is the JSON-RPC method name (e.g. `"shell_getBlock"`).
+    /// `duration_secs` is the wall-clock time from request start to response.
+    pub fn record_rpc_call(&self, method: &str, duration_secs: f64) {
+        self.rpc_request_duration_seconds
+            .with_label_values(&[method])
+            .observe(duration_secs);
+    }
+
+    /// Update per-column-family storage size gauges.    ///
     /// Call this lazily (e.g., on every metrics scrape) to report disk
     /// footprint without blocking the critical path.  Pass `0` for any CF
     /// whose size is unavailable (e.g., MemoryDb backends).
@@ -280,7 +308,7 @@ fn json_response(
     }
 }
 
-/// Handle a single HTTP request, routing to `/metrics`, `/health`, or `/ready`.
+/// Handle a single HTTP request, routing to `/metrics`, `/health[z]`, or `/read[y|yz]`.
 fn handle_request<B>(
     req: Request<B>,
     metrics: &Arc<Metrics>,
@@ -297,7 +325,8 @@ fn handle_request<B>(
                 Err(_) => plain_response(StatusCode::INTERNAL_SERVER_ERROR, "response build error"),
             }
         }
-        (&Method::GET, "/health") => {
+        // `/health` and `/healthz` are equivalent.
+        (&Method::GET, "/health") | (&Method::GET, "/healthz") => {
             let body = serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -307,7 +336,8 @@ fn handle_request<B>(
             });
             json_response(StatusCode::OK, body)
         }
-        (&Method::GET, "/ready") => {
+        // `/ready` and `/readyz` are equivalent (Kubernetes-style).
+        (&Method::GET, "/ready") | (&Method::GET, "/readyz") => {
             let block_height = metrics.block_height.get();
             if block_height > 0 {
                 json_response(StatusCode::OK, serde_json::json!({ "ready": true }))
@@ -548,5 +578,65 @@ mod tests {
         let output = m.gather();
         assert!(output.contains("shell_epoch_number 7"));
         assert!(output.contains("shell_validator_active_count 4"));
+    }
+
+    #[test]
+    fn rpc_latency_histogram_records_by_method() {
+        let m = Metrics::new().expect("metrics init");
+        m.record_rpc_call("shell_getBlock", 0.005);
+        m.record_rpc_call("shell_getBlock", 0.010);
+        m.record_rpc_call("eth_getBalance", 0.002);
+
+        let output = m.gather();
+        assert!(
+            output.contains("shell_rpc_request_duration_seconds"),
+            "should contain rpc duration metric"
+        );
+        assert!(
+            output.contains(r#"method="shell_getBlock""#),
+            "should label by method"
+        );
+        assert!(
+            output.contains(r#"method="eth_getBalance""#),
+            "should label different methods separately"
+        );
+        // getBlock has 2 observations
+        assert!(
+            output.contains("shell_rpc_request_duration_seconds_count{method=\"shell_getBlock\"} 2"),
+            "should count 2 shell_getBlock calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_alias_returns_same_as_health() {
+        let m = Arc::new(Metrics::new().expect("metrics init"));
+        m.block_height.set(5);
+
+        let resp = handle_request(get("/healthz"), &m);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["block_height"], 5);
+    }
+
+    #[tokio::test]
+    async fn readyz_alias_returns_same_as_ready() {
+        let m = Arc::new(Metrics::new().expect("metrics init"));
+        m.block_height.set(3);
+
+        let resp = handle_request(get("/readyz"), &m);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["ready"], true);
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_no_blocks() {
+        let m = Arc::new(Metrics::new().expect("metrics init"));
+
+        let resp = handle_request(get("/readyz"), &m);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["ready"], false);
     }
 }

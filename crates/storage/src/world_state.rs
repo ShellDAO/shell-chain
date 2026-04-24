@@ -111,6 +111,20 @@ impl<S: KvStore + 'static> WorldState<S> {
         Self::at_root_with_cache_mb(Arc::clone(&self.store), &root, cap_mb.max(1))
     }
 
+    /// Re-open this world state at the given historical root **in place**,
+    /// dropping any uncommitted trie mutations and clearing the account cache.
+    ///
+    /// Used by atomic execution paths (e.g. AA bundle dispatcher) that need
+    /// to discard a partially-applied set of state changes when an inner
+    /// step reverts. The previous root must already be reachable in the
+    /// underlying KV store.
+    pub fn rollback_to_root(&mut self, root: &ShellHash) -> Result<(), StorageError> {
+        let trie = MerkleTrie::at_root(Arc::clone(&self.store), root.as_bytes())?;
+        self.account_trie = trie;
+        self.account_cache.lock().clear();
+        Ok(())
+    }
+
     fn account_key(address: &Address) -> Vec<u8> {
         keccak256(address.as_bytes()).as_bytes().to_vec()
     }

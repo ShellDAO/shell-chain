@@ -475,9 +475,118 @@ pub trait ShellApi {
     ///
     /// Returns `null` when the node does not expose a witness store or when the
     /// requested block's raw witness bundle has been pruned.
+    ///
+    /// Response fields (OPS-2 enriched):
+    /// - `block_hash`     — `"0x..."` canonical block hash
+    /// - `block_number`   — u64 block height
+    /// - `state_root`     — `"0x..."` state root from the block header
+    /// - `timestamp`      — u64 block timestamp (Unix seconds)
+    /// - `witness_root`   — `"0x..."` expected witness Merkle root from header
+    /// - `witness_root_verified` — `bool`: `true` when the computed bundle root
+    ///   matches the header's `witness_root`; `false` on mismatch (tampered or
+    ///   corrupt bundle); `null` when the header carries no witness_root.
+    /// - `witness_count`  — number of witnesses
+    /// - `witnesses`      — array of `{ tx_index, sig_type, signature, public_key? }`
     #[method(name = "getWitness")]
     async fn get_witness(
         &self,
         block: String,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Verify that a stored witness bundle's Merkle root matches the block
+    /// header's `witness_root` field.
+    ///
+    /// This is the primary light-client verifier: after downloading a
+    /// `shell_getWitness` response, the client can call this to confirm the
+    /// bundle has not been tampered with.
+    ///
+    /// Returns:
+    /// - `{ blockHash, expectedRoot, computedRoot, verified: true }`  on match.
+    /// - `{ blockHash, expectedRoot, computedRoot, verified: false }` on mismatch.
+    /// - `{ blockHash, verified: null, reason: "..." }` when the block is
+    ///   unknown, the header has no `witness_root`, or no bundle is stored.
+    #[method(name = "verifyWitnessRoot")]
+    async fn verify_witness_root(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Estimates gas for a Native-AA bundle (tx_type = `0x7E`).
+    ///
+    /// Returns a JSON object:
+    /// - `totalGas` — hex: `outerIntrinsic + innerSum + intrinsicSurcharge`
+    /// - `outerIntrinsic` — hex: 21,000 (standard tx base cost; access list
+    ///   is not supported in the admission AA path yet)
+    /// - `innerSum` — hex: Σ per-inner gas (explicit or simulated)
+    /// - `intrinsicSurcharge` — hex: `(n - 1) × AA_INNER_CALL_INTRINSIC_GAS`
+    /// - `perInner` — array of `{ gasLimit, simulated }` where `simulated`
+    ///   is `true` iff the request omitted `gasLimit` and the server filled it
+    ///   in via `eth_call`-style simulation (+ 20% buffer, min 21,000).
+    ///
+    /// Does NOT require signatures; is a pure estimator. Errors
+    /// (`-32000`) if the bundle would be rejected by admission regardless of
+    /// signatures (empty inner_calls, > 16 inner calls, zero-gas inners).
+    #[method(name = "estimateBatch")]
+    async fn estimate_batch(
+        &self,
+        req: crate::types::BatchEstimateRequest,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns Native-AA paymaster policy for an address.
+    ///
+    /// In v0.18.0 Phase 1, paymasters are plain EOAs; the "policy" is
+    /// "sponsor any bundle that carries a valid paymaster signature over the
+    /// bundle's signing hash, as long as balance covers `gas_used × max_fee`".
+    ///
+    /// Response:
+    /// - `address` — queried address
+    /// - `hasPqPubkey` — whether a PQ public key is registered (prerequisite
+    ///   to act as a paymaster on Native AA)
+    /// - `balance` — hex wei balance (available to sponsor gas)
+    /// - `policy` — constant string `"eoa-open"` (Phase 1)
+    /// - `maxGasSponsorship` — `null` (no per-tx cap in Phase 1; bounded only
+    ///   by balance)
+    /// - `pubkeyBytes` — hex length of the registered pubkey (sanity only),
+    ///   or `null`
+    #[method(name = "getPaymasterPolicy")]
+    async fn get_paymaster_policy(
+        &self,
+        address: Address,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns whether a transaction is (or would be) sponsored by a
+    /// paymaster.
+    ///
+    /// Looks the transaction up first in the mempool, then in on-chain
+    /// storage. Response:
+    /// - `found` — whether the tx was located
+    /// - `location` — `"mempool"` | `"chain"` | `null`
+    /// - `isAaBundle` — whether tx_type is `0x7E` with a valid bundle
+    /// - `sponsored` — `true` iff `isAaBundle` and `paymaster` is set to a
+    ///   non-sender address
+    /// - `paymaster` — paymaster address (or `null`)
+    /// - `sender` — tx sender (or `null` when not found)
+    /// - `innerCallCount` — number of inner calls in the bundle (or `null`)
+    #[method(name = "isSponsored")]
+    async fn is_sponsored(
+        &self,
+        tx_hash: ShellHash,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns the active storage profile and the effective pruning parameters.
+    ///
+    /// Profile is one of `"archive" | "full" | "light"`. The numeric fields
+    /// reflect the resolved `PruningConfig` (after applying any per-field
+    /// overrides such as `--body-retention` / `--witness-retention`).
+    /// A value of `0` means "keep forever" for retention/keep_recent;
+    /// `proofReplacementGrace = u64::MAX` means "never delete witness even
+    /// after STARK proof arrives" (archive mode behavior).
+    ///
+    /// Returns an error when the node has not been configured with a profile
+    /// (e.g. legacy startup paths). Stable consumers should treat such an
+    /// error as `"profile: unknown"`.
+    #[method(name = "getStorageProfile")]
+    async fn get_storage_profile(
+        &self,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 }

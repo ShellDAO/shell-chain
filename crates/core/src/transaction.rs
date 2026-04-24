@@ -329,6 +329,395 @@ impl Transaction {
 /// Expected Dilithium3 public key length in bytes.
 pub const DILITHIUM3_PUBKEY_LEN: usize = 1952;
 
+// =====================================================================
+// Native AA Phase 1 — batch tx + sponsored gas (v0.18.0)
+//
+// See `docs/AA_BATCH_AND_SPONSORED_SPEC.md` for the full design spec.
+//
+// Wire-format design:
+//   - `Transaction` is intentionally **unchanged** so all existing literals,
+//     RLP goldens, and call sites are unaffected.
+//   - AA payload lives inside a new `AaBundle` carried as an OPTIONAL trailing
+//     field on `SignedTransaction`. When `aa_bundle == None`, encoding adds
+//     ZERO bytes (the outer list header records exactly the fixed-field
+//     payload), so the wire format for legacy (non-AA) transactions is
+//     byte-for-byte identical to v0.17.0.
+//   - When `aa_bundle == Some(bundle)`, the encoder appends a single-byte
+//     presence flag (`0x01`) followed by the RLP-encoded bundle, and the
+//     outer list header grows accordingly. The decoder inspects the remaining
+//     bytes within the outer header's payload region to detect the trailing
+//     bundle.
+// =====================================================================
+
+/// Transaction-type byte reserved for native AA bundles (batch + optional
+/// sponsored gas). Chosen to stay clear of EIP-2718 envelope bytes (`0x01`,
+/// `0x02`, `0x03`, `0x04`, `0x7F`).
+pub const AA_BUNDLE_TX_TYPE: u8 = 0x7E;
+
+/// Maximum number of inner calls allowed in a single AA bundle.
+pub const MAX_INNER_CALLS: usize = 16;
+
+/// Maximum size of a single inner call's `data` field, in bytes.
+pub const MAX_INNER_CALLDATA: usize = 128 * 1024;
+
+/// Domain byte mixed into the canonical batch signing hash (sender PQ sig).
+pub const BATCH_SIGNING_HASH_DOMAIN: u8 = 0x7E;
+
+/// Domain byte mixed into the paymaster authorization signing hash.
+pub const PAYMASTER_SIGNING_HASH_DOMAIN: u8 = 0x7F;
+
+/// Intrinsic gas surcharge for each *additional* inner call beyond the first.
+/// One-call bundles cost the same as a normal tx; bundles of N cost
+/// `21_000 + (N-1) * 4_000` intrinsic gas.
+pub const AA_INNER_CALL_INTRINSIC_GAS: u64 = 4_000;
+
+/// One inner call inside an AA bundle.
+///
+/// Each inner call executes as if `msg.sender == bundle.from` (the bundle's
+/// signing account), with its own per-call gas budget. Inner-call results
+/// are aggregated into the outer transaction receipt (`inner_results`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InnerCall {
+    /// Recipient. `None` means contract creation.
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Bytes,
+    /// Advisory gas cap for this inner call. The sum across all inner calls
+    /// MUST be ≤ the outer `Transaction.gas_limit`.
+    pub gas_limit: u64,
+}
+
+impl Encodable for InnerCall {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.fields_len(),
+        };
+        header.encode(out);
+        // to: None → empty bytes (Ethereum convention)
+        match &self.to {
+            Some(addr) => addr.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+        self.value.encode(out);
+        self.data.encode(out);
+        self.gas_limit.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload = self.fields_len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
+    }
+}
+
+impl InnerCall {
+    fn fields_len(&self) -> usize {
+        let to_len = match &self.to {
+            Some(addr) => addr.length(),
+            None => 1,
+        };
+        to_len
+            .saturating_add(self.value.length())
+            .saturating_add(self.data.length())
+            .saturating_add(self.gas_limit.length())
+    }
+}
+
+impl Decodable for InnerCall {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+
+        let to_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        let to = if to_raw.is_empty() {
+            None
+        } else if to_raw.len() == 20 {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(to_raw);
+            Some(Address::from(arr))
+        } else {
+            return Err(alloy_rlp::Error::Custom("invalid 'to' address length"));
+        };
+        let value = U256::decode(buf)?;
+        let data = Bytes::decode(buf)?;
+        let gas_limit = u64::decode(buf)?;
+
+        let consumed = remaining.saturating_sub(buf.len());
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+        Ok(Self {
+            to,
+            value,
+            data,
+            gas_limit,
+        })
+    }
+}
+
+/// AA bundle carried as the trailing optional field of [`SignedTransaction`]
+/// when the underlying transaction's `tx_type` equals [`AA_BUNDLE_TX_TYPE`].
+///
+/// A bundle expresses two orthogonal AA capabilities:
+/// 1. **Batch execution** via `inner_calls` — N atomic calls under a single
+///    sender PQ signature and a single nonce.
+/// 2. **Sponsored gas** via `paymaster` + `paymaster_signature` — a third
+///    party authorizes paying the transaction's gas budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AaBundle {
+    /// Atomic inner calls (1..=[`MAX_INNER_CALLS`]).
+    pub inner_calls: Vec<InnerCall>,
+    /// Optional paymaster account paying the transaction's gas budget.
+    /// `None` → sender pays gas (still a valid AA bundle for batch-only use).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paymaster: Option<Address>,
+    /// PQ signature by `paymaster` over [`SignedTransaction::paymaster_signing_hash`].
+    /// Must be present iff `paymaster.is_some()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paymaster_signature: Option<Bytes>,
+}
+
+impl AaBundle {
+    /// Validate structural constraints (counts, sizes, paymaster pairing).
+    /// Does NOT verify any signatures or balances; that happens at mempool
+    /// admission and execution time.
+    pub fn validate_structure(&self) -> Result<(), &'static str> {
+        if self.inner_calls.is_empty() {
+            return Err("aa bundle: inner_calls must be non-empty");
+        }
+        if self.inner_calls.len() > MAX_INNER_CALLS {
+            return Err("aa bundle: inner_calls exceeds MAX_INNER_CALLS");
+        }
+        for call in &self.inner_calls {
+            if call.data.len() > MAX_INNER_CALLDATA {
+                return Err("aa bundle: inner call data exceeds MAX_INNER_CALLDATA");
+            }
+        }
+        match (&self.paymaster, &self.paymaster_signature) {
+            (Some(_), Some(sig)) if !sig.is_empty() => Ok(()),
+            (Some(_), _) => Err("aa bundle: paymaster set but signature missing/empty"),
+            (None, Some(sig)) if !sig.is_empty() => {
+                Err("aa bundle: paymaster_signature set but paymaster missing")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Sum of inner-call advisory gas caps. Caller MUST verify this is
+    /// ≤ outer `Transaction.gas_limit`.
+    pub fn inner_gas_sum(&self) -> u128 {
+        self.inner_calls
+            .iter()
+            .map(|c| c.gas_limit as u128)
+            .sum::<u128>()
+    }
+
+    /// Intrinsic gas surcharge added by the bundle on top of the standard
+    /// 21_000 base: 4_000 per *additional* inner call beyond the first.
+    pub fn intrinsic_gas_surcharge(&self) -> u64 {
+        let extras = self.inner_calls.len().saturating_sub(1) as u64;
+        extras.saturating_mul(AA_INNER_CALL_INTRINSIC_GAS)
+    }
+
+    fn fields_len(&self) -> usize {
+        // [inner_calls_list, paymaster (20B or empty), paymaster_sig_bytes]
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        }
+        .length()
+        .saturating_add(inner_payload);
+        let paymaster_len = match &self.paymaster {
+            Some(addr) => addr.length(),
+            None => 1,
+        };
+        let sig_len = match &self.paymaster_signature {
+            Some(sig) if !sig.is_empty() => sig.as_ref().length(),
+            _ => 1,
+        };
+        inner_list_len
+            .saturating_add(paymaster_len)
+            .saturating_add(sig_len)
+    }
+}
+
+impl AaBundle {
+    /// Length of the signing-form payload (excludes `paymaster_signature`).
+    /// This MUST be used by callers that need the canonical bundle bytes for
+    /// hashing — both sender batch hash and paymaster authorization hash hash
+    /// the bundle in this signature-stripped form to avoid the circular
+    /// dependency between sender sig and paymaster sig.
+    fn signing_fields_len(&self) -> usize {
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        }
+        .length()
+        .saturating_add(inner_payload);
+        let paymaster_len = match &self.paymaster {
+            Some(addr) => addr.length(),
+            None => 1,
+        };
+        inner_list_len.saturating_add(paymaster_len)
+    }
+
+    /// Encodes the bundle for signing-hash purposes (omits
+    /// `paymaster_signature`). See `signing_fields_len` for rationale.
+    pub fn encode_for_signing(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.signing_fields_len(),
+        };
+        header.encode(out);
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_header = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        };
+        inner_header.encode(out);
+        for call in &self.inner_calls {
+            call.encode(out);
+        }
+        match &self.paymaster {
+            Some(addr) => addr.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+    }
+
+    /// Total signing-form encoded length (header + payload).
+    pub fn signing_length(&self) -> usize {
+        let payload = self.signing_fields_len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
+    }
+}
+
+impl Encodable for AaBundle {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.fields_len(),
+        };
+        header.encode(out);
+        // inner_calls: encoded as a flat RLP list of InnerCall lists.
+        let inner_payload: usize = self.inner_calls.iter().map(|c| c.length()).sum();
+        let inner_header = alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        };
+        inner_header.encode(out);
+        for call in &self.inner_calls {
+            call.encode(out);
+        }
+        // paymaster: 20-byte address or empty bytes
+        match &self.paymaster {
+            Some(addr) => addr.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+        // paymaster_signature: opaque bytes or empty
+        match &self.paymaster_signature {
+            Some(sig) if !sig.is_empty() => sig.as_ref().encode(out),
+            _ => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+    }
+
+    fn length(&self) -> usize {
+        let payload = self.fields_len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
+    }
+}
+
+impl Decodable for AaBundle {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+
+        // inner_calls list
+        let inner_header = alloy_rlp::Header::decode(buf)?;
+        if !inner_header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let inner_end = buf.len().saturating_sub(inner_header.payload_length);
+        let mut inner_calls = Vec::new();
+        while buf.len() > inner_end {
+            inner_calls.push(InnerCall::decode(buf)?);
+        }
+
+        // paymaster
+        let paymaster_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        let paymaster = if paymaster_raw.is_empty() {
+            None
+        } else if paymaster_raw.len() == 20 {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(paymaster_raw);
+            Some(Address::from(arr))
+        } else {
+            return Err(alloy_rlp::Error::Custom(
+                "invalid paymaster address length",
+            ));
+        };
+
+        // paymaster_signature
+        let sig_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        let paymaster_signature = if sig_raw.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(sig_raw.to_vec()))
+        };
+
+        let consumed = remaining.saturating_sub(buf.len());
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+
+        Ok(Self {
+            inner_calls,
+            paymaster,
+            paymaster_signature,
+        })
+    }
+}
+
 /// How the sender's public key is conveyed in a [`SignedTransaction`].
 ///
 /// Post-quantum signatures (Dilithium3) are not key-recoverable, so the sender
@@ -399,6 +788,11 @@ pub struct SignedTransaction {
     /// How the sender's public key is provided (inline or registry reference).
     #[serde(default)]
     pub pubkey_mode: PubkeyMode,
+    /// Native AA payload (batch + optional sponsored gas). MUST be `Some`
+    /// iff `tx.tx_type == AA_BUNDLE_TX_TYPE`. See `AaBundle` and
+    /// `docs/AA_BATCH_AND_SPONSORED_SPEC.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_bundle: Option<AaBundle>,
     /// Lazily cached hash — computed from the unsigned tx on first access.
     #[serde(skip)]
     tx_hash: OnceLock<ShellHash>,
@@ -414,6 +808,8 @@ struct SignedTransactionHelper {
     pubkey_mode: Option<PubkeyMode>,
     #[serde(default)]
     sender_pubkey: Option<Vec<u8>>,
+    #[serde(default)]
+    aa_bundle: Option<AaBundle>,
 }
 
 impl<'de> Deserialize<'de> for SignedTransaction {
@@ -446,6 +842,7 @@ impl<'de> Deserialize<'de> for SignedTransaction {
             tx: helper.tx,
             signature: helper.signature,
             pubkey_mode,
+            aa_bundle: helper.aa_bundle,
             tx_hash: OnceLock::new(),
         })
     }
@@ -462,6 +859,7 @@ impl Clone for SignedTransaction {
             tx: self.tx.clone(),
             signature: self.signature.clone(),
             pubkey_mode: self.pubkey_mode.clone(),
+            aa_bundle: self.aa_bundle.clone(),
             tx_hash: lock,
         }
     }
@@ -473,6 +871,7 @@ impl PartialEq for SignedTransaction {
             && self.tx == other.tx
             && self.signature == other.signature
             && self.pubkey_mode == other.pubkey_mode
+            && self.aa_bundle == other.aa_bundle
     }
 }
 
@@ -489,6 +888,7 @@ impl SignedTransaction {
             tx,
             signature,
             pubkey_mode: PubkeyMode::Reference,
+            aa_bundle: None,
             tx_hash: OnceLock::new(),
         }
     }
@@ -515,8 +915,93 @@ impl SignedTransaction {
             tx,
             signature,
             pubkey_mode: PubkeyMode::Embedded(pubkey),
+            aa_bundle: None,
             tx_hash: OnceLock::new(),
         }
+    }
+
+    /// Attach a native AA bundle to a signed transaction.
+    ///
+    /// `tx.tx_type` MUST equal [`AA_BUNDLE_TX_TYPE`]; the bundle's structural
+    /// constraints (inner-call count, sizes, paymaster pairing) are validated
+    /// before returning. The provided `signature` is the sender's PQ signature
+    /// over [`SignedTransaction::batch_signing_hash`] (the caller is
+    /// responsible for producing it correctly).
+    pub fn with_aa_bundle(
+        from: Address,
+        tx: Transaction,
+        signature: PQSignature,
+        pubkey_mode: PubkeyMode,
+        aa_bundle: AaBundle,
+    ) -> Result<Self, &'static str> {
+        if tx.tx_type != AA_BUNDLE_TX_TYPE {
+            return Err("with_aa_bundle: tx.tx_type must equal AA_BUNDLE_TX_TYPE (0x7E)");
+        }
+        aa_bundle.validate_structure()?;
+        if aa_bundle.inner_gas_sum() > tx.gas_limit as u128 {
+            return Err("with_aa_bundle: sum(inner.gas_limit) exceeds outer gas_limit");
+        }
+        Ok(Self {
+            from,
+            tx,
+            signature,
+            pubkey_mode,
+            aa_bundle: Some(aa_bundle),
+            tx_hash: OnceLock::new(),
+        })
+    }
+
+    /// Hash signed by the sender's PQ signature.
+    ///
+    /// For AA-bundle transactions returns [`Self::batch_signing_hash`] (so the
+    /// signature commits to both the outer envelope *and* the inner calls);
+    /// for any other tx_type returns the regular [`Self::hash`]. This single
+    /// entry point lets validators uniformly compute "the hash the sender
+    /// signed over" without branching on tx_type at every call site.
+    pub fn sender_signing_hash(&self) -> ShellHash {
+        self.batch_signing_hash().unwrap_or_else(|| self.hash())
+    }
+
+    /// Returns `true` if this signed transaction carries a native AA bundle.
+    pub fn is_aa_bundle(&self) -> bool {
+        self.tx.tx_type == AA_BUNDLE_TX_TYPE && self.aa_bundle.is_some()
+    }
+
+    /// Borrow the AA bundle if present.
+    pub fn aa_bundle(&self) -> Option<&AaBundle> {
+        self.aa_bundle.as_ref()
+    }
+
+    /// Canonical signing hash for AA-bundle senders:
+    /// `keccak256( BATCH_SIGNING_HASH_DOMAIN || rlp(tx) || rlp(aa_bundle) )`.
+    ///
+    /// Returns `None` for non-AA transactions (callers should use [`Self::hash`]).
+    pub fn batch_signing_hash(&self) -> Option<ShellHash> {
+        let bundle = self.aa_bundle.as_ref()?;
+        if self.tx.tx_type != AA_BUNDLE_TX_TYPE {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(1 + self.tx.length() + bundle.signing_length());
+        buf.push(BATCH_SIGNING_HASH_DOMAIN);
+        self.tx.encode(&mut buf);
+        bundle.encode_for_signing(&mut buf);
+        Some(shell_primitives::keccak256(&buf))
+    }
+
+    /// Canonical signing hash for the paymaster's authorization:
+    /// `keccak256( PAYMASTER_SIGNING_HASH_DOMAIN || from || batch_signing_hash )`.
+    ///
+    /// Returns `None` if no paymaster is set on the bundle (or the tx is not
+    /// an AA bundle at all).
+    pub fn paymaster_signing_hash(&self) -> Option<ShellHash> {
+        let bundle = self.aa_bundle.as_ref()?;
+        bundle.paymaster?;
+        let batch_hash = self.batch_signing_hash()?;
+        let mut buf = Vec::with_capacity(1 + 20 + 32);
+        buf.push(PAYMASTER_SIGNING_HASH_DOMAIN);
+        buf.extend_from_slice(self.from.0.as_slice());
+        buf.extend_from_slice(batch_hash.0.as_slice());
+        Some(shell_primitives::keccak256(&buf))
     }
 
     /// Transaction hash (excludes signature data and sender).
@@ -553,6 +1038,13 @@ impl Encodable for SignedTransaction {
                 empty.encode(out);
             }
         }
+        // Trailing optional AA bundle. Absent → emit nothing (zero overhead
+        // for legacy txs). Present → emit a 1-byte presence flag (0x01)
+        // followed by the RLP-encoded bundle.
+        if let Some(bundle) = &self.aa_bundle {
+            out.put_u8(AA_BUNDLE_PRESENCE_FLAG);
+            bundle.encode(out);
+        }
     }
 
     fn length(&self) -> usize {
@@ -566,17 +1058,27 @@ impl Encodable for SignedTransaction {
     }
 }
 
+/// 1-byte presence marker prepended to an [`AaBundle`] when one is attached
+/// to a [`SignedTransaction`]. Absent bundles emit nothing at all (preserving
+/// the legacy v0.17.0 wire format byte-for-byte).
+pub const AA_BUNDLE_PRESENCE_FLAG: u8 = 0x01;
+
 impl SignedTransaction {
     fn fields_len(&self) -> usize {
         let pk_len = match &self.pubkey_mode {
             PubkeyMode::Embedded(pk) => pk.as_slice().length(),
             PubkeyMode::Reference => 1, // RLP empty bytes = 1 byte
         };
+        let aa_len = match &self.aa_bundle {
+            Some(bundle) => 1usize.saturating_add(bundle.length()),
+            None => 0,
+        };
         self.from
             .length()
             .saturating_add(self.tx.length())
             .saturating_add(self.signature.length())
             .saturating_add(pk_len)
+            .saturating_add(aa_len)
     }
 }
 
@@ -718,6 +1220,28 @@ impl Decodable for SignedTransaction {
             PubkeyMode::Embedded(pk_bytes.to_vec())
         };
 
+        // Optional trailing AA bundle. Detected by checking whether the outer
+        // list payload still has bytes after consuming the four fixed fields.
+        let consumed_so_far = remaining.saturating_sub(buf.len());
+        let aa_bundle = if consumed_so_far < header.payload_length {
+            // Read the 1-byte presence flag.
+            if buf.is_empty() {
+                return Err(alloy_rlp::Error::Custom(
+                    "missing aa bundle presence flag",
+                ));
+            }
+            let flag = buf[0];
+            *buf = &buf[1..];
+            if flag != AA_BUNDLE_PRESENCE_FLAG {
+                return Err(alloy_rlp::Error::Custom(
+                    "invalid aa bundle presence flag",
+                ));
+            }
+            Some(AaBundle::decode(buf)?)
+        } else {
+            None
+        };
+
         let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
@@ -731,6 +1255,7 @@ impl Decodable for SignedTransaction {
             tx,
             signature,
             pubkey_mode,
+            aa_bundle,
             tx_hash: OnceLock::new(),
         })
     }
@@ -1594,5 +2119,372 @@ mod tests {
             embedded_size > reference_size + 1900,
             "embedded={embedded_size}, reference={reference_size}"
         );
+    }
+
+    // ============================================================
+    // Native AA Phase 1 — InnerCall / AaBundle / SignedTransaction
+    // ============================================================
+
+    fn sample_inner_call(value: u64) -> InnerCall {
+        InnerCall {
+            to: Some(Address::from([0xAA; 20])),
+            value: U256::from(value),
+            data: Bytes::from(vec![0x01, 0x02, 0x03]),
+            gas_limit: 50_000,
+        }
+    }
+
+    fn sample_aa_tx() -> Transaction {
+        let mut tx = sample_tx();
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        tx.gas_limit = 200_000;
+        tx
+    }
+
+    #[test]
+    fn inner_call_rlp_roundtrip() {
+        let call = sample_inner_call(1234);
+        let mut buf = Vec::new();
+        call.encode(&mut buf);
+        let decoded = InnerCall::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(call, decoded);
+    }
+
+    #[test]
+    fn inner_call_contract_creation_rlp_roundtrip() {
+        let call = InnerCall {
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::from(vec![0x60; 64]),
+            gas_limit: 1_000_000,
+        };
+        let mut buf = Vec::new();
+        call.encode(&mut buf);
+        let decoded = InnerCall::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(call, decoded);
+    }
+
+    #[test]
+    fn aa_bundle_validate_structure_rejects_empty() {
+        let bundle = AaBundle::default();
+        let err = bundle.validate_structure().unwrap_err();
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn aa_bundle_validate_structure_rejects_too_many_inner_calls() {
+        let bundle = AaBundle {
+            inner_calls: (0..(MAX_INNER_CALLS + 1))
+                .map(|_| sample_inner_call(1))
+                .collect(),
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let err = bundle.validate_structure().unwrap_err();
+        assert!(err.contains("MAX_INNER_CALLS"));
+    }
+
+    #[test]
+    fn aa_bundle_validate_structure_rejects_oversized_calldata() {
+        let mut call = sample_inner_call(0);
+        call.data = Bytes::from(vec![0u8; MAX_INNER_CALLDATA + 1]);
+        let bundle = AaBundle {
+            inner_calls: vec![call],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let err = bundle.validate_structure().unwrap_err();
+        assert!(err.contains("MAX_INNER_CALLDATA"));
+    }
+
+    #[test]
+    fn aa_bundle_validate_structure_rejects_paymaster_without_signature() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(0)],
+            paymaster: Some(Address::from([0x55; 20])),
+            paymaster_signature: None,
+        };
+        let err = bundle.validate_structure().unwrap_err();
+        assert!(err.contains("signature missing"));
+    }
+
+    #[test]
+    fn aa_bundle_validate_structure_rejects_signature_without_paymaster() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(0)],
+            paymaster: None,
+            paymaster_signature: Some(Bytes::from(vec![0xAB; 64])),
+        };
+        let err = bundle.validate_structure().unwrap_err();
+        assert!(err.contains("paymaster missing"));
+    }
+
+    #[test]
+    fn aa_bundle_intrinsic_surcharge_zero_for_one_call() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        assert_eq!(bundle.intrinsic_gas_surcharge(), 0);
+    }
+
+    #[test]
+    fn aa_bundle_intrinsic_surcharge_per_extra_call() {
+        let bundle = AaBundle {
+            inner_calls: vec![
+                sample_inner_call(1),
+                sample_inner_call(2),
+                sample_inner_call(3),
+            ],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        assert_eq!(bundle.intrinsic_gas_surcharge(), 2 * AA_INNER_CALL_INTRINSIC_GAS);
+    }
+
+    #[test]
+    fn aa_bundle_rlp_roundtrip_batch_only() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1), sample_inner_call(2)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let mut buf = Vec::new();
+        bundle.encode(&mut buf);
+        let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn aa_bundle_rlp_roundtrip_with_paymaster() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(7)],
+            paymaster: Some(Address::from([0x77; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
+        };
+        let mut buf = Vec::new();
+        bundle.encode(&mut buf);
+        let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn signed_tx_legacy_rlp_byte_for_byte_unchanged_when_no_aa_bundle() {
+        // CRITICAL backward-compat invariant: a SignedTransaction without an
+        // aa_bundle MUST encode byte-identically to v0.17.0 (zero overhead).
+        // This test pins the encoded length to detect any accidental drift.
+        let tx = sample_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let signed = SignedTransaction::new(from, tx, sig);
+
+        let bytes = alloy_rlp::encode(&signed);
+        let decoded = SignedTransaction::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(signed, decoded);
+        assert!(decoded.aa_bundle.is_none());
+        assert!(!decoded.is_aa_bundle());
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rlp_roundtrip() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1), sample_inner_call(2)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .expect("valid bundle");
+
+        let bytes = alloy_rlp::encode(&signed);
+        let decoded = SignedTransaction::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(signed, decoded);
+        assert!(decoded.is_aa_bundle());
+        assert_eq!(decoded.aa_bundle().unwrap().inner_calls.len(), 2);
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_sponsored_rlp_roundtrip() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: Some(Address::from([0x77; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .expect("valid bundle");
+
+        let bytes = alloy_rlp::encode(&signed);
+        let decoded = SignedTransaction::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(signed, decoded);
+        assert_eq!(
+            decoded.aa_bundle().and_then(|b| b.paymaster),
+            Some(Address::from([0x77; 20]))
+        );
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rejects_wrong_tx_type() {
+        let tx = sample_tx(); // tx_type = 2
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let err = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap_err();
+        assert!(err.contains("AA_BUNDLE_TX_TYPE"));
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rejects_inner_gas_overflow() {
+        let mut tx = sample_aa_tx();
+        tx.gas_limit = 80_000;
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1), sample_inner_call(2)], // 100k > 80k
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let err = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds outer gas_limit"));
+    }
+
+    #[test]
+    fn batch_signing_hash_distinct_from_legacy_hash() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx.clone(),
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+
+        let batch_hash = signed.batch_signing_hash().expect("aa tx");
+        let legacy_hash = signed.hash();
+        // Domain byte + bundle bytes guarantee distinct hashes.
+        assert_ne!(batch_hash, legacy_hash);
+    }
+
+    #[test]
+    fn batch_signing_hash_none_for_legacy_tx() {
+        let tx = sample_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let signed = SignedTransaction::new(from, tx, sig);
+        assert!(signed.batch_signing_hash().is_none());
+        assert!(signed.paymaster_signing_hash().is_none());
+    }
+
+    #[test]
+    fn paymaster_signing_hash_distinct_from_batch_hash() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: Some(Address::from([0x77; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0xCD; 32])),
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+
+        let batch_hash = signed.batch_signing_hash().unwrap();
+        let pm_hash = signed.paymaster_signing_hash().unwrap();
+        assert_ne!(batch_hash, pm_hash);
+    }
+
+    #[test]
+    fn paymaster_signing_hash_none_when_no_paymaster_set() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: None,
+            paymaster_signature: None,
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+        assert!(signed.batch_signing_hash().is_some());
+        assert!(signed.paymaster_signing_hash().is_none());
+    }
+
+    #[test]
+    fn signed_tx_json_roundtrip_with_aa_bundle() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1), sample_inner_call(2)],
+            paymaster: Some(Address::from([0x77; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sig,
+            PubkeyMode::Reference,
+            bundle,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&signed).unwrap();
+        let back: SignedTransaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(signed, back);
     }
 }
