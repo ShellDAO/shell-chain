@@ -389,7 +389,7 @@ pub fn validate_aa_bundle_structure(
     let surcharge = bundle.intrinsic_gas_surcharge();
     // Saturating cast: outer gas_limit is u64; bundle limits guarantee
     // inner_sum fits in u64 (16 calls × u64 each is well within range).
-    let combined = (inner_sum as u128).saturating_add(surcharge as u128);
+    let combined = inner_sum.saturating_add(surcharge as u128);
     if combined > tx.gas_limit as u128 {
         return Err(TxValidationError::InvalidAaBundle(format!(
             "inner_sum ({inner_sum}) + intrinsic_surcharge ({surcharge}) exceeds outer gas_limit ({})",
