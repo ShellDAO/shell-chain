@@ -369,9 +369,14 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             })
             .collect();
 
+        // OPS-2: verify computed root vs header's witness_root.
+        let computed_root = bundle.compute_root();
+        let root_verified = header.witness_root.map(|hr| hr == computed_root);
+
         Ok(serde_json::json!({
             "blockHash": block_hash,
             "witnessRoot": witness_root,
+            "witnessRootVerified": root_verified,
             "witnessCount": witnesses.len(),
             "witnesses": witnesses,
         }))
@@ -389,6 +394,8 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         };
 
         let block_number = header.number;
+        let state_root = format!("0x{}", hex::encode(header.state_root.as_bytes()));
+        let timestamp = header.timestamp;
 
         let witnesses: Vec<serde_json::Value> = bundle
             .witnesses
@@ -408,12 +415,65 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             })
             .collect();
 
+        // OPS-2: verify computed root vs header's witness_root.
+        let computed_root = bundle.compute_root();
+        let witness_root_verified = header.witness_root.map(|hr| hr == computed_root);
+
         Ok(serde_json::json!({
             "block_hash": format!("0x{}", hex::encode(block_hash.as_bytes())),
             "block_number": block_number,
+            "state_root": state_root,
+            "timestamp": timestamp,
             "witness_root": witness_root_value(Some(&header)),
+            "witness_root_verified": witness_root_verified,
             "witness_count": witnesses.len(),
             "witnesses": witnesses,
+        }))
+    }
+
+    async fn verify_witness_root(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let Some((block_hash, header)) = resolve_witness_block(self, &block)? else {
+            return Ok(serde_json::json!({
+                "blockHash": serde_json::Value::Null,
+                "verified": serde_json::Value::Null,
+                "reason": "block not found",
+            }));
+        };
+
+        let Some(expected_root) = header.witness_root else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "block header has no witness_root (pre-B2 block or genesis)",
+            }));
+        };
+
+        let Some(ws) = &self.witness_store else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "witness store not available on this node",
+            }));
+        };
+
+        let Some(bundle) = ws.get_bundle(&block_hash).map_err(internal_err)? else {
+            return Ok(serde_json::json!({
+                "blockHash": block_hash,
+                "verified": serde_json::Value::Null,
+                "reason": "witness bundle not stored (pruned or never written)",
+            }));
+        };
+
+        let computed_root = bundle.compute_root();
+        let verified = computed_root == expected_root;
+        Ok(serde_json::json!({
+            "blockHash": block_hash,
+            "expectedRoot": expected_root,
+            "computedRoot": computed_root,
+            "verified": verified,
         }))
     }
 

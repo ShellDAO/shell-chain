@@ -475,8 +475,38 @@ pub trait ShellApi {
     ///
     /// Returns `null` when the node does not expose a witness store or when the
     /// requested block's raw witness bundle has been pruned.
+    ///
+    /// Response fields (OPS-2 enriched):
+    /// - `block_hash`     — `"0x..."` canonical block hash
+    /// - `block_number`   — u64 block height
+    /// - `state_root`     — `"0x..."` state root from the block header
+    /// - `timestamp`      — u64 block timestamp (Unix seconds)
+    /// - `witness_root`   — `"0x..."` expected witness Merkle root from header
+    /// - `witness_root_verified` — `bool`: `true` when the computed bundle root
+    ///   matches the header's `witness_root`; `false` on mismatch (tampered or
+    ///   corrupt bundle); `null` when the header carries no witness_root.
+    /// - `witness_count`  — number of witnesses
+    /// - `witnesses`      — array of `{ tx_index, sig_type, signature, public_key? }`
     #[method(name = "getWitness")]
     async fn get_witness(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Verify that a stored witness bundle's Merkle root matches the block
+    /// header's `witness_root` field.
+    ///
+    /// This is the primary light-client verifier: after downloading a
+    /// `shell_getWitness` response, the client can call this to confirm the
+    /// bundle has not been tampered with.
+    ///
+    /// Returns:
+    /// - `{ blockHash, expectedRoot, computedRoot, verified: true }`  on match.
+    /// - `{ blockHash, expectedRoot, computedRoot, verified: false }` on mismatch.
+    /// - `{ blockHash, verified: null, reason: "..." }` when the block is
+    ///   unknown, the header has no `witness_root`, or no bundle is stored.
+    #[method(name = "verifyWitnessRoot")]
+    async fn verify_witness_root(
         &self,
         block: String,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;

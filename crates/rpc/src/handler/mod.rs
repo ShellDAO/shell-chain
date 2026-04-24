@@ -1415,6 +1415,11 @@ mod tests {
         );
         assert_eq!(result["block_number"], 0);
         assert_eq!(result["witness_count"], 1);
+        // OPS-2: enriched fields
+        assert!(result["state_root"].as_str().unwrap().starts_with("0x"));
+        assert!(result["timestamp"].is_u64());
+        // genesis block has no witness_root → verified is null
+        assert!(result["witness_root_verified"].is_null());
         let witnesses = result["witnesses"].as_array().unwrap();
         assert_eq!(witnesses[0]["tx_index"], 0);
         assert_eq!(witnesses[0]["sig_type"], "Dilithium3");
@@ -1426,6 +1431,146 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn get_block_witnesses_includes_root_verified_flag() {
+        use shell_core::{TxWitness, WitnessBundle};
+
+        let handler = setup_with_witness();
+        let block = make_genesis_block();
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"tx0").unwrap();
+        let bundle = WitnessBundle::new(vec![TxWitness::new_embedded(sig, pk)]);
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&block_hash, &bundle)
+            .unwrap();
+
+        let result =
+            ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
+                .await
+                .unwrap();
+
+        // genesis block carries no witness_root → verified is null
+        assert!(result["witnessRootVerified"].is_null());
+        assert_eq!(result["witnessCount"], 1);
+    }
+
+    // ── shell_verifyWitnessRoot ────────────────────────────────────
+
+    #[tokio::test]
+    async fn verify_witness_root_block_not_found() {
+        let handler = setup_with_witness();
+        let fake = format!("0x{}", "aa".repeat(32));
+        let res = ShellApiServer::verify_witness_root(&handler, fake)
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_no_witness_root_in_header() {
+        let handler = setup_with_witness();
+        let block = make_genesis_block(); // genesis has no witness_root
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("no witness_root"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_no_bundle_stored() {
+        use shell_primitives::ShellHash;
+        // Manufacture a block header with a witness_root set but no bundle stored.
+        let handler = setup_with_witness();
+        let mut block = make_genesis_block();
+        block.header.witness_root = Some(ShellHash::from([0xab; 32]));
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert!(res["verified"].is_null());
+        assert!(res["reason"].as_str().unwrap().contains("not stored"));
+    }
+
+    #[tokio::test]
+    async fn verify_witness_root_match_and_mismatch() {
+        use shell_core::{TxWitness, WitnessBundle};
+        use shell_primitives::ShellHash;
+
+        let handler = setup_with_witness();
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"tx0").unwrap();
+        let bundle = WitnessBundle::new(vec![TxWitness::new_embedded(sig, pk)]);
+        let correct_root = bundle.compute_root();
+
+        // --- match case: header.witness_root == bundle.compute_root() ---
+        let mut block_match = make_genesis_block();
+        block_match.header.witness_root = Some(correct_root);
+        let hash_match = block_match.hash();
+        handler.chain_store.put_block(&block_match).unwrap();
+        handler.chain_store.set_canonical(0, &hash_match).unwrap();
+        handler.chain_store.set_head(&hash_match).unwrap();
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&hash_match, &bundle)
+            .unwrap();
+
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(res["verified"], true);
+        assert_eq!(res["expectedRoot"], serde_json::to_value(correct_root).unwrap());
+
+        // --- mismatch case: wrong root in header ---
+        let wrong_root = ShellHash::from([0xff; 32]);
+        let mut block_bad = make_genesis_block();
+        block_bad.header.witness_root = Some(wrong_root);
+        block_bad.header.number = 1; // different block so different hash
+        let hash_bad = block_bad.hash();
+        handler.chain_store.put_block(&block_bad).unwrap();
+        handler.chain_store.set_canonical(1, &hash_bad).unwrap();
+        handler.chain_store.set_head(&hash_bad).unwrap();
+
+        let signer2 = DilithiumSigner::generate();
+        let pk2 = signer2.public_key().to_vec();
+        let sig2 = signer2.sign(b"tx0").unwrap();
+        let bundle2 = WitnessBundle::new(vec![TxWitness::new_embedded(sig2, pk2)]);
+        handler
+            .witness_store
+            .as_ref()
+            .unwrap()
+            .put_bundle(&hash_bad, &bundle2)
+            .unwrap();
+
+        let res2 = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(res2["verified"], false);
+        assert_eq!(res2["expectedRoot"], serde_json::to_value(wrong_root).unwrap());
     }
 
     #[tokio::test]
