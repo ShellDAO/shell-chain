@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 _Tracking work toward the next release (after 0.18.0)._
 
+### Changed (operator-visible)
+
+- **Default block-production behavior**: `--max-idle-interval` (CLI) /
+  `NodeConfig.max_idle_interval_ms` now default to **`60` seconds (`60_000` ms)**
+  instead of `0`. By default, a node will skip empty blocks while the mempool is
+  empty and produce a heartbeat block at most every 60 s. To restore the legacy
+  every-tick behavior, pass `--max-idle-interval 0`. Synchronization, light-client
+  checkpointing, and timestamp monotonicity are unaffected because the heartbeat
+  upper bound is bounded (Constitution Invariant H-1). See
+  `crates/node/src/node/event_loop.rs:190-210` and Constitution §2.4.
+
 ## [0.18.0-patch1] — Drift Audit: snake_case RPC + Paymaster Hardening
 
 ### Fixed

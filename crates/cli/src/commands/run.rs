@@ -760,7 +760,7 @@ mod tests {
             rpc_tls_key: None,
             unsafe_dev_exposed: false,
             metrics_addr: "127.0.0.1:9090".into(),
-            max_idle_interval: 0,
+            max_idle_interval: 60,
             mempool_max_size: None,
             mempool_price_bump: None,
             state_cache_size_mb: None,

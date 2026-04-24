@@ -151,8 +151,12 @@ enum Commands {
         #[arg(long)]
         metrics_addr: Option<String>,
 
-        /// Max idle seconds before producing a heartbeat block (0 = always produce).
-        #[arg(long, default_value = "0")]
+        /// Max idle seconds before producing a heartbeat block when mempool is
+        /// empty. `0` disables idle-skip and produces a block on every tick
+        /// (legacy behavior). Default `60`: skip empty blocks but heartbeat
+        /// at least once per minute to keep sync, light clients, and timestamp
+        /// monotonicity healthy.
+        #[arg(long, default_value = "60")]
         max_idle_interval: u64,
 
         /// Maximum number of pending transactions in the mempool.

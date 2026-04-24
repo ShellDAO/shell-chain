@@ -116,7 +116,11 @@ pub struct NodeConfig {
     /// Prometheus metrics endpoint configuration.
     pub metrics: MetricsConfig,
     /// Maximum idle interval in ms before producing a heartbeat block.
-    /// When 0, every block_time tick produces a block (legacy behavior).
+    /// When the mempool is empty and the time since the last block exceeds
+    /// this threshold, an empty heartbeat block is produced to keep the chain
+    /// alive (sync, light clients, timestamp monotonicity).
+    /// `0` disables idle-skip and produces a block on every tick (legacy).
+    /// Default: `60_000` (60 s) — skip empty blocks but heartbeat once a minute.
     pub max_idle_interval_ms: u64,
     /// Account cache size in MiB for the world state LRU trie cache.
     /// Default: 64 MiB.  Higher values reduce state trie decode overhead.
@@ -177,7 +181,7 @@ impl NodeConfig {
             data_dir: "shell-data".into(),
             pruning,
             metrics: MetricsConfig::default(),
-            max_idle_interval_ms: 0,
+            max_idle_interval_ms: 60_000,
             state_cache_size_mb: 64,
             parallel_evm: ParallelEvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
