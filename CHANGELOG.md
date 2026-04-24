@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 _Tracking work toward the next release (after 0.18.0)._
 
+## [0.18.0-patch1] — Drift Audit: snake_case RPC + Paymaster Hardening
+
+### Fixed
+
+- **RPC wire format (client-breaking)**: All five new v0.18.0 `shell_*` RPC methods
+  returned or accepted camelCase JSON keys; SDK `types.ts` uses snake_case throughout,
+  causing silent parse failures on every AA call from SDK ≥ 0.4.0 clients.
+  - `shell_estimateBatch` request: `innerCalls` → `inner_calls`, `gasLimit` → `gas_limit`
+  - `shell_getPaymasterPolicy` response: `hasPqPubkey` → `has_pq_pubkey`,
+    `pubkeyBytes` → `pubkey_bytes`, `maxGasSponsorship` → `max_gas_sponsorship`
+  - `shell_isSponsored` response: `isAaBundle` → `is_aa_bundle`,
+    `innerCallCount` → `inner_call_count`; not-found path now returns all 7 fields
+  - `shell_getStorageProfile` response: removed `rename_all = "camelCase"` from
+    `StorageProfileInfo`; docs corrected (`proof_replacement_grace` for archive =
+    `u64::MAX = 18446744073709551615`, not `0`)
+- **Mempool paymaster balance check**: mempool now correctly checks the **paymaster's**
+  balance for sponsored AA bundles instead of the sender's, preventing sponsored bundles
+  with an insolvent paymaster from entering the pool (F-020 extension)
+- **Mempool paymaster signature verification**: `validate_aa_tx` now verifies the
+  paymaster signature at mempool admission, not only at block import time; forged
+  paymaster authorizations are rejected early
+- **`BATCH_SIGNING_HASH_DOMAIN` comment**: clarifies intentional equality with
+  `AA_BUNDLE_TX_TYPE = 0x7E` (different semantic contexts, same byte value is safe)
+
 ## [0.18.0] — Native Account Abstraction Phase 1 + Operations Hardening
 
 > Released on branch `feat/v0.18.0-dev`. Workspace version: `0.18.0-dev`.
@@ -31,7 +55,7 @@ _Tracking work toward the next release (after 0.18.0)._
 - **`shell_getPaymasterPolicy(address)`**: returns paymaster's registered balance,
   pubkey presence, and policy (`eoa-open` default).
 - **`shell_isSponsored(txHash)`**: returns
-  `{found, sponsored, isAaBundle, paymaster, sender, innerCallCount, location}` for
+  `{found, sponsored, is_aa_bundle, paymaster, sender, inner_call_count, location}` for
   any queried tx hash (mempool or chain).
 - Paymaster fields fully optional; legacy transactions unaffected.
 
