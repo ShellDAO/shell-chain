@@ -36,13 +36,15 @@ pub const INTERNAL_ERROR: i32 = -32603;
 // Server-defined application codes  (`-32000` … `-32099`)
 // ---------------------------------------------------------------------------
 
-/// `-32000` — Generic server error / resource not found.
+/// `-32000` — Generic server / precondition error.
 ///
-/// Used for "block not found", "filter not found", "storage profile not
-/// configured", and similar not-found / precondition failures.
+/// Used for simulation failures, EVM-level rejections, and precondition
+/// failures that are not resource-not-found (e.g. "storage profile not
+/// configured", "EVM simulation failed").  Use `NOT_FOUND` (`-32001`) for
+/// missing resources.
 pub const SERVER_ERROR: i32 = -32000;
 
-/// `-32001` — The requested resource (block, tx, receipt) was not found.
+/// `-32001` — The requested resource (block, tx, receipt, filter) was not found.
 pub const NOT_FOUND: i32 = -32001;
 
 /// `-32002` — The operation requires the node to be in dev mode.

@@ -6,9 +6,7 @@
 
 use shell_e2e::*;
 
-use shell_core::{
-    AaBundle, InnerCall, SignedTransaction, Transaction, AA_BUNDLE_TX_TYPE,
-};
+use shell_core::{AaBundle, InnerCall, SignedTransaction, Transaction, AA_BUNDLE_TX_TYPE};
 use shell_crypto::Signer;
 use shell_primitives::{Address, Bytes, ShellHash, U256};
 use shell_rpc::api::ShellApiServer;
@@ -47,7 +45,9 @@ fn make_sponsored_tx(
     let placeholder_sig = sender.signer.sign(b"placeholder").unwrap();
     let mut temp = SignedTransaction::new(sender.address, tx.clone(), placeholder_sig);
     temp.aa_bundle = Some(bundle.clone());
-    let signing_hash = temp.batch_signing_hash().expect("AA bundle tx must have batch_signing_hash");
+    let signing_hash = temp
+        .batch_signing_hash()
+        .expect("AA bundle tx must have batch_signing_hash");
     let sig = sender.signer.sign(signing_hash.0.as_slice()).unwrap();
     let mut signed = SignedTransaction::new(sender.address, tx, sig);
     signed.aa_bundle = Some(bundle);
@@ -69,7 +69,7 @@ fn inner_call(to: Address) -> InnerCall {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn get_paymaster_policy_returns_null_when_not_registered() {
+async fn get_paymaster_policy_returns_default_eoa_open_when_not_registered() {
     let env = setup();
     let genesis = make_genesis_block();
     store_block(&env, &genesis);
@@ -84,7 +84,10 @@ async fn get_paymaster_policy_returns_null_when_not_registered() {
         !result.is_null(),
         "unregistered paymaster should return default policy object"
     );
-    assert_eq!(result["policy"], "eoa-open", "default policy should be eoa-open");
+    assert_eq!(
+        result["policy"], "eoa-open",
+        "default policy should be eoa-open"
+    );
     assert_eq!(result["hasPqPubkey"], false, "no pubkey registered");
 }
 
@@ -103,7 +106,10 @@ async fn is_sponsored_returns_not_found_for_unknown_tx() {
         .await
         .unwrap();
 
-    assert_eq!(result["found"], false, "unknown tx should report found=false");
+    assert_eq!(
+        result["found"], false,
+        "unknown tx should report found=false"
+    );
     assert_eq!(result["sponsored"], false);
 }
 
@@ -133,7 +139,10 @@ async fn is_sponsored_returns_false_for_regular_tx() {
         .unwrap();
 
     assert_eq!(result["found"], true, "mined tx should be found");
-    assert_eq!(result["sponsored"], false, "regular tx should not be sponsored");
+    assert_eq!(
+        result["sponsored"], false,
+        "regular tx should not be sponsored"
+    );
     assert_eq!(result["isAaBundle"], false, "regular tx is not AA");
 }
 
@@ -162,7 +171,10 @@ async fn is_sponsored_detects_sponsored_aa_tx() {
         .unwrap();
 
     assert_eq!(result["found"], true);
-    assert_eq!(result["sponsored"], true, "AA tx with paymaster should be sponsored");
+    assert_eq!(
+        result["sponsored"], true,
+        "AA tx with paymaster should be sponsored"
+    );
     assert_eq!(result["isAaBundle"], true);
     // paymaster field is present and non-null
     assert!(

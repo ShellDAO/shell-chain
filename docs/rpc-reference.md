@@ -1,6 +1,6 @@
 # RPC Reference
 
-shell-chain exposes three JSON-RPC namespaces:
+shell-chain exposes five JSON-RPC namespaces:
 
 - **`eth_`** — Ethereum-compatible methods
 - **`shell_`** — shell-chain extension methods (PQ, AA, governance, ops)
@@ -286,12 +286,13 @@ block: hex block number | "latest" | "earliest" | block hash
 ```
 When information is unavailable:
 ```json
-{ "verified": null, "reason": "no bundle stored for block" }
+{ "verified": null, "reason": "block header has no witness_root (pre-B2 block or genesis)" }
 ```
 Possible `reason` values:
 - `"block not found"`
-- `"no witness_root in block header"`
-- `"no bundle stored for block"`
+- `"block header has no witness_root (pre-B2 block or genesis)"`
+- `"witness store not available on this node"`
+- `"witness bundle not stored (pruned or never written)"`
 
 ---
 
@@ -309,9 +310,14 @@ Estimates gas for a batch (AA) transaction.
 ```
 ```json
 {
-  "inner_gas": ["0x5208", "0x7530"],
-  "total_gas": "0xcf08",
-  "simulated": [true, false]
+  "totalGas": "0x...",
+  "outerIntrinsic": "0x...",
+  "innerSum": "0x...",
+  "intrinsicSurcharge": "0x...",
+  "perInner": [
+    { "gasLimit": "0x5208", "simulated": true },
+    { "gasLimit": "0x7530", "simulated": false }
+  ]
 }
 ```
 Errors:
@@ -320,26 +326,36 @@ Errors:
 - `-32000` if EVM simulation fails
 
 ### shell_getPaymasterPolicy(address)
-Returns the paymaster policy for an address.
+Returns the paymaster policy for an address. Always returns a policy object
+(never `null`); unregistered addresses receive the default `"eoa-open"` policy.
 ```json
 {
-  "paymaster": "0x...",
-  "allowance": "0xde0b6b3a7640000",
-  "validUntil": 1800000000,
-  "sponsoredMethods": ["transfer", "approve"]
+  "address": "0x...",
+  "hasPqPubkey": false,
+  "pubkeyBytes": null,
+  "balance": "0x...",
+  "policy": "eoa-open",
+  "maxGasSponsorship": null
 }
-→ null if no policy registered
 ```
 
 ### shell_isSponsored(txHash)
 Returns whether a transaction was sponsored by a paymaster.
+For unknown transactions, returns a normal object with `found: false` (no error).
 ```json
 {
-  "txHash": "0x...",
+  "found": true,
+  "location": "chain",
+  "isAaBundle": true,
   "sponsored": true,
-  "paymaster": "0x..."
+  "paymaster": "0x...",
+  "sender": "0x...",
+  "innerCallCount": 2
 }
-errors: -32001 if transaction not found
+```
+When not found:
+```json
+{ "found": false, "sponsored": false }
 ```
 
 ---
@@ -351,9 +367,11 @@ Returns the node's current storage profile configuration.
 ```json
 {
   "profile": "full",
-  "pruningDepth": 1000,
-  "keepWitnesses": true,
-  "keepReceipts": true
+  "body_retention": 0,
+  "witness_retention": 128,
+  "keep_recent": 0,
+  "proof_replacement_grace": 0,
+  "state_pruning_experimental": false
 }
 errors: -32003 if storage profile is not configured
 ```

@@ -524,8 +524,8 @@ pub trait ShellApi {
     ///   in via `eth_call`-style simulation (+ 20% buffer, min 21,000).
     ///
     /// Does NOT require signatures; is a pure estimator. Errors
-    /// (`-32000`) if the bundle would be rejected by admission regardless of
-    /// signatures (empty inner_calls, > 16 inner calls, zero-gas inners).
+    /// (`-32602`) if the bundle is structurally invalid (empty inner_calls,
+    /// > 16 inner calls, zero-gas inners); (`-32000`) if EVM simulation fails.
     #[method(name = "estimateBatch")]
     async fn estimate_batch(
         &self,

@@ -165,7 +165,9 @@ impl Metrics {
                 "shell_rpc_request_duration_seconds",
                 "RPC request duration by method",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+            ]),
             &["method"],
         )?;
 
@@ -602,7 +604,8 @@ mod tests {
         );
         // getBlock has 2 observations
         assert!(
-            output.contains("shell_rpc_request_duration_seconds_count{method=\"shell_getBlock\"} 2"),
+            output
+                .contains("shell_rpc_request_duration_seconds_count{method=\"shell_getBlock\"} 2"),
             "should count 2 shell_getBlock calls"
         );
     }

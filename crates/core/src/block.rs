@@ -461,8 +461,7 @@ impl StrippedBlock {
                 self.transactions
                     .into_iter()
                     .map(|st| {
-                        let mut signed =
-                            SignedTransaction::new(st.from, st.tx, stub_sig.clone());
+                        let mut signed = SignedTransaction::new(st.from, st.tx, stub_sig.clone());
                         signed.aa_bundle = st.aa_bundle;
                         signed
                     })

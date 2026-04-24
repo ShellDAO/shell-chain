@@ -137,8 +137,9 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     let aa_extra_gas = validate_aa_bundle_structure(signed_tx)?;
 
     // 2. Intrinsic gas check
-    let intrinsic = compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
-        .saturating_add(aa_extra_gas);
+    let intrinsic =
+        compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
+            .saturating_add(aa_extra_gas);
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -290,8 +291,9 @@ pub fn validate_tx_for_import<S: KvStore + 'static, V: Verifier>(
     let aa_extra_gas = validate_aa_bundle_structure(signed_tx)?;
 
     // 3. Intrinsic gas
-    let intrinsic = compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
-        .saturating_add(aa_extra_gas);
+    let intrinsic =
+        compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
+            .saturating_add(aa_extra_gas);
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -345,10 +347,8 @@ fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
         .ok_or_else(|| TxValidationError::InvalidAaBundle("no paymaster_signing_hash".into()))?;
     // Reuse sender's algorithm tag as paymaster's algorithm tag for v0.18.0
     // (single-algorithm chain; multi-algo paymaster will land in v0.19.0+).
-    let pq_sig = shell_crypto::PQSignature::new(
-        signed_tx.signature.sig_type,
-        sig_bytes.as_ref().to_vec(),
-    );
+    let pq_sig =
+        shell_crypto::PQSignature::new(signed_tx.signature.sig_type, sig_bytes.as_ref().to_vec());
     let valid = verifier
         .verify(&pubkey, hash.as_bytes(), &pq_sig)
         .map_err(TxValidationError::Crypto)?;
@@ -963,7 +963,9 @@ mod tests {
     fn validate_aa_bundle_too_many_inner_calls() {
         let signer = make_signer();
         let tx = aa_outer_tx(test_chain_id(), 0, 10_000_000);
-        let calls: Vec<_> = (0..(MAX_INNER_CALLS + 1)).map(|_| inner(0, 21_000)).collect();
+        let calls: Vec<_> = (0..(MAX_INNER_CALLS + 1))
+            .map(|_| inner(0, 21_000))
+            .collect();
         let bundle = AaBundle {
             inner_calls: calls,
             paymaster: None,
@@ -1015,7 +1017,10 @@ mod tests {
         let signed = sign_aa(&signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
-        assert!(matches!(res, Err(TxValidationError::InsufficientBalance { .. })));
+        assert!(matches!(
+            res,
+            Err(TxValidationError::InsufficientBalance { .. })
+        ));
     }
 
     #[test]
@@ -1059,7 +1064,11 @@ mod tests {
         let signed = sign_aa(&sender_signer, tx, final_bundle, true);
         let verifier = DilithiumVerifier;
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
-        assert!(res.is_ok(), "sponsored happy path should pass: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "sponsored happy path should pass: {:?}",
+            res.err()
+        );
     }
 
     #[test]
@@ -1082,7 +1091,10 @@ mod tests {
         let signed = sign_aa(&sender_signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
-        assert!(matches!(res, Err(TxValidationError::PaymasterPubkeyNotFound(_))));
+        assert!(matches!(
+            res,
+            Err(TxValidationError::PaymasterPubkeyNotFound(_))
+        ));
     }
 
     #[test]
@@ -1107,7 +1119,10 @@ mod tests {
         let signed = sign_aa(&sender_signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
-        assert!(matches!(res, Err(TxValidationError::PaymasterSignatureInvalid)));
+        assert!(matches!(
+            res,
+            Err(TxValidationError::PaymasterSignatureInvalid)
+        ));
     }
 
     #[test]

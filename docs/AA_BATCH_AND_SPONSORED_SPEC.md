@@ -261,32 +261,50 @@ balances and nonce.
 
 ### 5.2 New RPCs
 
+> **Note:** The schemas below reflect the original design intent. The v0.18.0
+> implementation uses camelCase JSON keys to match the existing RPC convention.
+
 ```text
 shell_estimateBatch(tx) → {
-  total_gas: 0x...,
-  inner_estimates: [ 0x..., ... ]
+  totalGas: "0x...",
+  outerIntrinsic: "0x...",
+  innerSum: "0x...",
+  intrinsicSurcharge: "0x...",
+  perInner: [ { gasLimit: "0x...", simulated: bool }, ... ]
 }
 
 shell_getPaymasterPolicy(address) → {
-  is_paymaster: bool,
-  balance: 0x...,
-  // policy fields reserved for v0.19.0:
-  daily_cap: null,
-  allowed_targets: null
+  address: "0x...",
+  hasPqPubkey: bool,
+  pubkeyBytes: number | null,
+  balance: "0x...",
+  policy: "eoa-open",
+  maxGasSponsorship: null
 }
+// Always returns an object; never null. Unregistered → default "eoa-open" policy.
 
 shell_isSponsored(txHash) → {
+  found: bool,
+  location: "mempool" | "chain",   // present when found=true
+  isAaBundle: bool,
   sponsored: bool,
-  paymaster: 0x... | null
+  paymaster: "0x..." | null,
+  sender: "0x...",
+  innerCallCount: number | null
 }
+// Returns { found: false, sponsored: false } for unknown tx (no -32001 error).
 ```
 
 ### 5.3 Error codes
-- `-32030 batch_too_large` (>16 inner calls)
-- `-32031 batch_inner_revert` (returned by simulate/estimate, with
-  `data.failed_index`)
-- `-32032 paymaster_unauthorized` (sig verify failed)
-- `-32033 paymaster_insufficient_balance`
+
+> **Note:** The custom `-32030`–`-32033` codes below were the original design.
+> The v0.18.0 implementation uses standard codes for simplicity:
+
+Actual shipped error codes:
+- `-32602 invalid_params` — structural rejections (empty/too-many inner calls, zero-gas inner)
+- `-32000 server_error` — EVM simulation failure (with detail message)
+- `-32602 invalid_params` — paymaster signature verification failure (in mempool admission)
+- `-32003 feature_not_enabled` — paymaster not configured on this node
 
 ---
 

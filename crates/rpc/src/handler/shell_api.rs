@@ -212,9 +212,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         balance: String,
     ) -> Result<bool, ErrorObjectOwned> {
         // Require dev mode — shell_setBalance is a state-mutation endpoint.
-        self.dev_control.as_ref().ok_or_else(|| {
-            dev_mode_required("shell_setBalance requires dev mode")
-        })?;
+        self.dev_control
+            .as_ref()
+            .ok_or_else(|| dev_mode_required("shell_setBalance requires dev mode"))?;
         let value = if let Some(hex_str) = balance.strip_prefix("0x") {
             U256::from_str_radix(hex_str, 16)
                 .map_err(|e| internal_err(format!("invalid hex balance: {e}")))?
@@ -478,7 +478,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         use shell_core::{AA_INNER_CALL_INTRINSIC_GAS, MAX_INNER_CALLS};
 
         if req.inner_calls.is_empty() {
-            return Err(invalid_params("estimateBatch: inner_calls must not be empty"));
+            return Err(invalid_params(
+                "estimateBatch: inner_calls must not be empty",
+            ));
         }
         if req.inner_calls.len() > MAX_INNER_CALLS {
             return Err(invalid_params(format!(
@@ -577,10 +579,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 .aa_bundle()
                 .map(|b| (b.paymaster, b.inner_calls.len() as u64))
                 .unwrap_or((None, 0));
-            let sponsored = is_bundle
-                && paymaster
-                    .map(|p| p != tx.from)
-                    .unwrap_or(false);
+            let sponsored = is_bundle && paymaster.map(|p| p != tx.from).unwrap_or(false);
             serde_json::json!({
                 "found": true,
                 "location": location,

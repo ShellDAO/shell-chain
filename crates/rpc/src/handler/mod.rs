@@ -1455,10 +1455,9 @@ mod tests {
             .put_bundle(&block_hash, &bundle)
             .unwrap();
 
-        let result =
-            ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
-                .await
-                .unwrap();
+        let result = ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
+            .await
+            .unwrap();
 
         // genesis block carries no witness_root → verified is null
         assert!(result["witnessRootVerified"].is_null());
@@ -1543,7 +1542,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res["verified"], true);
-        assert_eq!(res["expectedRoot"], serde_json::to_value(correct_root).unwrap());
+        assert_eq!(
+            res["expectedRoot"],
+            serde_json::to_value(correct_root).unwrap()
+        );
 
         // --- mismatch case: wrong root in header ---
         let wrong_root = ShellHash::from([0xff; 32]);
@@ -1570,7 +1572,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res2["verified"], false);
-        assert_eq!(res2["expectedRoot"], serde_json::to_value(wrong_root).unwrap());
+        assert_eq!(
+            res2["expectedRoot"],
+            serde_json::to_value(wrong_root).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3875,7 +3880,10 @@ mod tests {
         assert_eq!(per.len(), 1);
         assert_eq!(per[0]["simulated"], true);
         let gas = u64::from_str_radix(
-            per[0]["gasLimit"].as_str().unwrap().trim_start_matches("0x"),
+            per[0]["gasLimit"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
             16,
         )
         .unwrap();

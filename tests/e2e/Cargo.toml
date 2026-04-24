@@ -29,6 +29,14 @@ path = "wpoa_regression.rs"
 name = "throughput_test"
 path = "throughput_test.rs"
 
+[[test]]
+name = "aa_batch_test"
+path = "aa_batch_test.rs"
+
+[[test]]
+name = "aa_sponsored_test"
+path = "aa_sponsored_test.rs"
+
 [dependencies]
 shell-primitives = { path = "../../crates/primitives" }
 shell-crypto = { path = "../../crates/crypto" }

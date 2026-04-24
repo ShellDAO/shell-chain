@@ -35,7 +35,7 @@ pub enum ExecutorError {
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
 
-    #[error("aa bundle execution dispatcher not yet available (M2b — will land in v0.18.0): {0}")]
+    #[error("aa bundle must be executed via execute_aa_bundle; submit as tx_type=0x7E: {0}")]
     AaBundleNotYetExecutable(String),
 }
 
@@ -286,9 +286,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         tx_index: u32,
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
-        let bundle = signed_tx.aa_bundle().ok_or_else(|| {
-            ExecutorError::Evm("execute_aa_bundle called on non-AA tx".into())
-        })?;
+        let bundle = signed_tx
+            .aa_bundle()
+            .ok_or_else(|| ExecutorError::Evm("execute_aa_bundle called on non-AA tx".into()))?;
         let tx = &signed_tx.tx;
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
@@ -329,9 +329,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 gas_used: 0,
                 cumulative_gas_used,
                 contract_address: None,
-                logs_bloom: shell_primitives::Bytes::from(
-                    crate::bloom::logs_bloom(&[]).to_vec(),
-                ),
+                logs_bloom: shell_primitives::Bytes::from(crate::bloom::logs_bloom(&[]).to_vec()),
                 logs: vec![],
             };
             return Ok(TxExecutionResult {
@@ -427,10 +425,8 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                             all_logs.push(l);
                         }
                     }
-                    successful_values_sum =
-                        successful_values_sum.saturating_add(inner.value);
-                    let cs_arc =
-                        std::sync::Arc::clone(self.state_db.chain_store().store());
+                    successful_values_sum = successful_values_sum.saturating_add(inner.value);
+                    let cs_arc = std::sync::Arc::clone(self.state_db.chain_store().store());
                     let cs_view = ChainStore::new(cs_arc);
                     commit_evm_state(&state, self.state_db.world_state_mut(), &cs_view)?;
                 }
@@ -456,8 +452,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             self.state_db
                 .world_state_mut()
                 .rollback_to_root(&pre_root)?;
-            let gas_cost =
-                U256::from(total_gas_used).saturating_mul(max_fee);
+            let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
             // Charge payer for actual gas used only; clamp at balance.
             let charge = gas_cost.min(payer_pre_bal);
             let mut p_acct = self
@@ -485,8 +480,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             }
         } else {
             // Success: force canonical balances & nonce.
-            let gas_cost =
-                U256::from(total_gas_used).saturating_mul(max_fee);
+            let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
 
             // Load (post-inner) account states so we preserve any storage_root
             // / code_hash changes (e.g., if sender or payer is a contract that
@@ -518,8 +512,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                         code_hash: None,
                         storage_root: ShellHash::ZERO,
                     });
-                s_acct.balance =
-                    sender_pre_bal.saturating_sub(successful_values_sum);
+                s_acct.balance = sender_pre_bal.saturating_sub(successful_values_sum);
                 s_acct.nonce = tx.nonce.saturating_add(1);
                 p_acct.balance = payer_pre_bal.saturating_sub(gas_cost);
                 self.state_db
@@ -555,9 +548,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             gas_used: total_gas_used,
             cumulative_gas_used: cumulative_gas_used.saturating_add(total_gas_used),
             contract_address: None,
-            logs_bloom: shell_primitives::Bytes::from(
-                crate::bloom::logs_bloom(&logs).to_vec(),
-            ),
+            logs_bloom: shell_primitives::Bytes::from(crate::bloom::logs_bloom(&logs).to_vec()),
             logs,
         };
 
@@ -3273,7 +3264,10 @@ mod tests {
 
         let header = sample_header();
         let res = evm.execute_tx(&signed, &header, 0, 0);
-        assert!(matches!(res, Err(ExecutorError::AaBundleNotYetExecutable(_))));
+        assert!(matches!(
+            res,
+            Err(ExecutorError::AaBundleNotYetExecutable(_))
+        ));
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -3306,18 +3300,11 @@ mod tests {
         let bundle = AaBundle {
             inner_calls,
             paymaster,
-            paymaster_signature: paymaster
-                .map(|_| shell_primitives::Bytes::from(vec![0u8; 1])),
+            paymaster_signature: paymaster.map(|_| shell_primitives::Bytes::from(vec![0u8; 1])),
         };
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
-        SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            shell_core::PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap()
+        SignedTransaction::with_aa_bundle(from, tx, sig, shell_core::PubkeyMode::Reference, bundle)
+            .unwrap()
     }
 
     fn get_balance(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress) -> U256 {
@@ -3441,8 +3428,7 @@ mod tests {
             data: PBytes::new(),
             gas_limit: 50_000,
         }];
-        let signed =
-            make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
 
         let sender_pre = get_balance(&mut evm, &sender);
         let paymaster_pre = get_balance(&mut evm, &paymaster);
@@ -3488,8 +3474,7 @@ mod tests {
             data: PBytes::new(),
             gas_limit: 50_000,
         }];
-        let signed =
-            make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
 
         let header = sample_header();
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();

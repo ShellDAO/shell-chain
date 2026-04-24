@@ -52,7 +52,9 @@ impl StrippedTransaction {
         aa_bundle: AaBundle,
     ) -> Result<Self, &'static str> {
         if tx.tx_type != AA_BUNDLE_TX_TYPE {
-            return Err("StrippedTransaction::with_aa_bundle: tx.tx_type must equal AA_BUNDLE_TX_TYPE");
+            return Err(
+                "StrippedTransaction::with_aa_bundle: tx.tx_type must equal AA_BUNDLE_TX_TYPE",
+            );
         }
         Ok(Self {
             from,

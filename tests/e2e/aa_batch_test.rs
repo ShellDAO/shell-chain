@@ -47,7 +47,9 @@ fn make_batch_tx(
     let placeholder_sig = sender.signer.sign(b"placeholder").unwrap();
     let mut temp = SignedTransaction::new(sender.address, tx.clone(), placeholder_sig);
     temp.aa_bundle = Some(bundle.clone());
-    let signing_hash = temp.batch_signing_hash().expect("AA bundle tx must have batch_signing_hash");
+    let signing_hash = temp
+        .batch_signing_hash()
+        .expect("AA bundle tx must have batch_signing_hash");
     let sig = sender.signer.sign(signing_hash.0.as_slice()).unwrap();
     let mut signed = SignedTransaction::new(sender.address, tx, sig);
     signed.aa_bundle = Some(bundle);
@@ -207,7 +209,10 @@ async fn estimate_batch_multiple_calls_sums_gas() {
     let total_gas_hex = result["totalGas"].as_str().unwrap();
     let total_gas = u64::from_str_radix(total_gas_hex.trim_start_matches("0x"), 16).unwrap();
     // total = sum(inner) + AA_BUNDLE_TX_TYPE * count intrinsic overhead
-    assert!(total_gas > 21_000 + 30_000, "total should exceed sum of inners");
+    assert!(
+        total_gas > 21_000 + 30_000,
+        "total should exceed sum of inners"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -236,9 +241,7 @@ async fn send_batch_tx_and_retrieve_from_mempool() {
     assert_eq!(hash, batch_hash, "returned hash should match tx hash");
 
     // Tx should be in mempool
-    let pool_count = ShellApiServer::pending_count(&env.handler)
-        .await
-        .unwrap();
+    let pool_count = ShellApiServer::pending_count(&env.handler).await.unwrap();
     let count = u64::from_str_radix(pool_count.trim_start_matches("0x"), 16).unwrap();
     assert_eq!(count, 1, "mempool should have 1 pending batch tx");
 }
@@ -339,7 +342,10 @@ async fn aa_bundle_survives_block_storage_roundtrip() {
         .expect("block must be stored");
 
     let stored_tx = block.transactions.first().expect("block should have a tx");
-    let bundle = stored_tx.aa_bundle.as_ref().expect("aa_bundle must be present");
+    let bundle = stored_tx
+        .aa_bundle
+        .as_ref()
+        .expect("aa_bundle must be present");
     assert_eq!(
         bundle.inner_calls.len(),
         expected_count,

@@ -689,9 +689,7 @@ impl Decodable for AaBundle {
             arr.copy_from_slice(paymaster_raw);
             Some(Address::from(arr))
         } else {
-            return Err(alloy_rlp::Error::Custom(
-                "invalid paymaster address length",
-            ));
+            return Err(alloy_rlp::Error::Custom("invalid paymaster address length"));
         };
 
         // paymaster_signature
@@ -1226,16 +1224,12 @@ impl Decodable for SignedTransaction {
         let aa_bundle = if consumed_so_far < header.payload_length {
             // Read the 1-byte presence flag.
             if buf.is_empty() {
-                return Err(alloy_rlp::Error::Custom(
-                    "missing aa bundle presence flag",
-                ));
+                return Err(alloy_rlp::Error::Custom("missing aa bundle presence flag"));
             }
             let flag = buf[0];
             *buf = &buf[1..];
             if flag != AA_BUNDLE_PRESENCE_FLAG {
-                return Err(alloy_rlp::Error::Custom(
-                    "invalid aa bundle presence flag",
-                ));
+                return Err(alloy_rlp::Error::Custom("invalid aa bundle presence flag"));
             }
             Some(AaBundle::decode(buf)?)
         } else {
@@ -2240,7 +2234,10 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        assert_eq!(bundle.intrinsic_gas_surcharge(), 2 * AA_INNER_CALL_INTRINSIC_GAS);
+        assert_eq!(
+            bundle.intrinsic_gas_surcharge(),
+            2 * AA_INNER_CALL_INTRINSIC_GAS
+        );
     }
 
     #[test]
@@ -2296,14 +2293,9 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .expect("valid bundle");
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+                .expect("valid bundle");
 
         let bytes = alloy_rlp::encode(&signed);
         let decoded = SignedTransaction::decode(&mut bytes.as_slice()).unwrap();
@@ -2322,14 +2314,9 @@ mod tests {
             paymaster: Some(Address::from([0x77; 20])),
             paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .expect("valid bundle");
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+                .expect("valid bundle");
 
         let bytes = alloy_rlp::encode(&signed);
         let decoded = SignedTransaction::decode(&mut bytes.as_slice()).unwrap();
@@ -2350,14 +2337,8 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        let err = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap_err();
+        let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+            .unwrap_err();
         assert!(err.contains("AA_BUNDLE_TX_TYPE"));
     }
 
@@ -2372,14 +2353,8 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        let err = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap_err();
+        let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+            .unwrap_err();
         assert!(err.contains("exceeds outer gas_limit"));
     }
 
@@ -2393,14 +2368,9 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx.clone(),
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap();
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx.clone(), sig, PubkeyMode::Reference, bundle)
+                .unwrap();
 
         let batch_hash = signed.batch_signing_hash().expect("aa tx");
         let legacy_hash = signed.hash();
@@ -2428,14 +2398,9 @@ mod tests {
             paymaster: Some(Address::from([0x77; 20])),
             paymaster_signature: Some(Bytes::from(vec![0xCD; 32])),
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap();
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+                .unwrap();
 
         let batch_hash = signed.batch_signing_hash().unwrap();
         let pm_hash = signed.paymaster_signing_hash().unwrap();
@@ -2452,14 +2417,9 @@ mod tests {
             paymaster: None,
             paymaster_signature: None,
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap();
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+                .unwrap();
         assert!(signed.batch_signing_hash().is_some());
         assert!(signed.paymaster_signing_hash().is_none());
     }
@@ -2474,14 +2434,9 @@ mod tests {
             paymaster: Some(Address::from([0x77; 20])),
             paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
         };
-        let signed = SignedTransaction::with_aa_bundle(
-            from,
-            tx,
-            sig,
-            PubkeyMode::Reference,
-            bundle,
-        )
-        .unwrap();
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+                .unwrap();
 
         let json = serde_json::to_string(&signed).unwrap();
         let back: SignedTransaction = serde_json::from_str(&json).unwrap();
