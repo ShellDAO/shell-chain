@@ -148,9 +148,11 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
         return Err(AaValidationError::SignatureInvalid);
     }
 
-    // Verify paymaster signature at admission time (defence-in-depth: also
-    // verified at import time, but checking early rejects forged bundles
-    // before they occupy mempool capacity).
+    // Verify paymaster signature. This is the SINGLE verification point —
+    // both mempool-admission (validate_tx) and import (validate_tx_for_import)
+    // delegate to this function, so no second pass is needed at either call
+    // site. Early rejection here prevents forged bundles from occupying
+    // mempool capacity.
     if let Some(paymaster) = signed_tx.aa_bundle().and_then(|b| b.paymaster) {
         if paymaster != signed_tx.from {
             verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier).map_err(
