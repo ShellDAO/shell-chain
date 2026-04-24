@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 _Tracking work toward v0.19.0._
 
+### Added
+
+- **I4: ProofWindowManager wired into node** (`crates/node`): `Node` now holds a
+  `ProofWindowManager` instance (default `WindowConfig`). `advance()` is called on
+  every block import; `gc()` runs every 100 blocks. This moves I4 from `lib-only`
+  to production and enables prover claim/squatting tracking in the wPoA era.
+  See `crates/consensus/src/window.rs` and CONSTITUTION §13.2.
+
+### Fixed
+
+- **Double PQ signature verification** (`crates/evm`): `validate_tx()` and
+  `validate_tx_for_import()` both previously called `verify_paymaster_signature()`
+  after already invoking `validate_aa_tx()` which performs the same check internally.
+  The redundant second call is now removed; PQ (Dilithium) sig verification is
+  performed exactly once per path (~3KB sig overhead). Addresses Copilot review
+  comment on PR #26.
+
 ### Changed (operator-visible)
 
 - **Default block-production behavior**: `--max-idle-interval` (CLI) /

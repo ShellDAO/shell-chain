@@ -16,7 +16,7 @@ pub(crate) use tracing::{debug, info, warn};
 
 pub(crate) use shell_consensus::{
     detect_double_sign, Attestation, ConsensusEngine, EquivocationProof, FinalityState, ForkChoice,
-    PoaEngine,
+    PoaEngine, ProofWindowManager, WindowConfig,
 };
 pub(crate) use shell_core::{calculate_base_fee, Account, Block, BlockHeader, SignedTransaction};
 pub(crate) use shell_crypto::{
@@ -96,6 +96,9 @@ pub struct Node<S: KvStore + 'static> {
     /// L2 grace-window: maps block_hash → delete_at_block_number.
     /// Witnesses in this map are deleted once the head advances past delete_at.
     pending_grace_deletes: parking_lot::Mutex<HashMap<ShellHash, u64>>,
+    /// I4: Proof window manager — tracks claim/squatting per block.
+    /// Advances on each block import; drives prover reliability scoring in wPoA era.
+    pub proof_window_manager: parking_lot::Mutex<ProofWindowManager>,
 }
 
 const SYNC_RETRY_BASE_INTERVAL_SECS: u64 = 5;
@@ -193,6 +196,9 @@ impl<S: KvStore + 'static> Node<S> {
             shutdown_tx,
             peer_caps: crate::historical_sync::PeerCapabilityTracker::new(),
             pending_grace_deletes: parking_lot::Mutex::new(HashMap::new()),
+            proof_window_manager: parking_lot::Mutex::new(ProofWindowManager::new(
+                WindowConfig::default(),
+            )),
         }
     }
 

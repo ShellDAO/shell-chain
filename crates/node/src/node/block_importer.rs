@@ -429,6 +429,18 @@ impl<S: KvStore + 'static> Node<S> {
         // Track the imported state root for pruning decisions.
         self.record_finalized_state_root(block.number(), block.header.state_root);
 
+        // I4: Advance the proof window manager to the new block height.
+        // This expires any stale claim timeouts and updates prover reliability counters.
+        // GC is run every 100 blocks to remove entries older than window_size_blocks.
+        {
+            let block_number = block.number();
+            let mut wm = self.proof_window_manager.lock();
+            wm.advance(block_number);
+            if block_number % 100 == 0 {
+                wm.gc(block_number);
+            }
+        }
+
         // H4: Standalone Prover node — extract sig batch entries from imported block
         // and push them to the proof backlog for async proving.
         // Validators handle this in produce_block (G4); Prover nodes do it here.
