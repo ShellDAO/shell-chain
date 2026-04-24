@@ -28,20 +28,16 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         // split-brain — validator changes must go through a system contract
         // transaction so all nodes compute the same state_root deterministically.
         // Use shell_proposeAddValidator instead.
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "shell_addValidator is disabled: use shell_proposeAddValidator instead",
-            None::<()>,
         ))
     }
 
     async fn remove_validator(&self, _address: String) -> Result<bool, ErrorObjectOwned> {
         // DISABLED (F-039/F-040): See add_validator rationale.
         // Use shell_proposeRemoveValidator instead.
-        Err(ErrorObjectOwned::owned(
-            -32601,
+        Err(method_not_found(
             "shell_removeValidator is disabled: use shell_proposeRemoveValidator instead",
-            None::<()>,
         ))
     }
 
@@ -102,11 +98,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             }
             "getValidators" | "isValidator" => shell_evm::SYSTEM_CALL_BASE_GAS,
             _ => {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("unknown governance operation: {operation}"),
-                    None::<()>,
-                ));
+                return Err(invalid_params(format!(
+                    "unknown governance operation: {operation}"
+                )));
             }
         };
         Ok(hex_u64(gas))
@@ -219,7 +213,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     ) -> Result<bool, ErrorObjectOwned> {
         // Require dev mode — shell_setBalance is a state-mutation endpoint.
         self.dev_control.as_ref().ok_or_else(|| {
-            ErrorObjectOwned::owned(-32601, "shell_setBalance requires dev mode", None::<()>)
+            dev_mode_required("shell_setBalance requires dev mode")
         })?;
         let value = if let Some(hex_str) = balance.strip_prefix("0x") {
             U256::from_str_radix(hex_str, 16)
@@ -484,20 +478,12 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         use shell_core::{AA_INNER_CALL_INTRINSIC_GAS, MAX_INNER_CALLS};
 
         if req.inner_calls.is_empty() {
-            return Err(ErrorObjectOwned::owned(
-                -32000,
-                "estimateBatch: inner_calls must not be empty",
-                None::<()>,
-            ));
+            return Err(invalid_params("estimateBatch: inner_calls must not be empty"));
         }
         if req.inner_calls.len() > MAX_INNER_CALLS {
-            return Err(ErrorObjectOwned::owned(
-                -32000,
-                format!(
-                    "estimateBatch: inner_calls exceeds MAX_INNER_CALLS ({MAX_INNER_CALLS})"
-                ),
-                None::<()>,
-            ));
+            return Err(invalid_params(format!(
+                "estimateBatch: inner_calls exceeds MAX_INNER_CALLS ({MAX_INNER_CALLS})"
+            )));
         }
 
         const PER_INNER_DEFAULT_FLOOR: u64 = 21_000;
@@ -518,22 +504,18 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                         access_list: None,
                     };
                     let (_out, used) = self.execute_call(&call_req).map_err(|e| {
-                        ErrorObjectOwned::owned(
-                            -32000,
-                            format!("estimateBatch: simulation for inner[{idx}] failed: {e}"),
-                            None::<()>,
-                        )
+                        server_error(format!(
+                            "estimateBatch: simulation for inner[{idx}] failed: {e}"
+                        ))
                     })?;
                     let buffered = ((used as f64) * 1.2) as u64;
                     (std::cmp::max(buffered, PER_INNER_DEFAULT_FLOOR), true)
                 }
             };
             if gas_limit == 0 {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    format!("estimateBatch: inner[{idx}] gas_limit must be > 0"),
-                    None::<()>,
-                ));
+                return Err(invalid_params(format!(
+                    "estimateBatch: inner[{idx}] gas_limit must be > 0"
+                )));
             }
             inner_sum = inner_sum
                 .checked_add(gas_limit)
@@ -644,10 +626,8 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     async fn get_storage_profile(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
         match &self.storage_profile {
             Some(info) => serde_json::to_value(info).map_err(|e| internal_err(e.to_string())),
-            None => Err(ErrorObjectOwned::owned(
-                -32000,
+            None => Err(feature_not_enabled(
                 "storage profile not configured on this node",
-                None::<()>,
             )),
         }
     }

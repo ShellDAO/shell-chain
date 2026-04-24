@@ -24,6 +24,10 @@ pub(crate) use crate::api::{
     Web3ApiServer,
 };
 pub(crate) use crate::dev_control::DynDevRpcControl;
+pub(crate) use crate::error::{
+    dev_mode_required, feature_not_enabled, invalid_params, limit_exceeded, method_not_found,
+    not_found, server_error,
+};
 pub(crate) use crate::filter::{RawLogFilter, MAX_BLOCK_RANGE};
 pub(crate) use crate::filter_registry::{FilterKind, FilterRegistry};
 pub(crate) use crate::subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
@@ -252,14 +256,10 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         if let Ok(Some(head)) = self.chain_store.get_head_block() {
             let current_base_fee = head.header.base_fee_per_gas;
             if current_base_fee > 0 && signed_tx.tx.max_fee_per_gas < current_base_fee {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    format!(
-                        "max fee per gas ({}) below current base fee ({})",
-                        signed_tx.tx.max_fee_per_gas, current_base_fee
-                    ),
-                    None::<()>,
-                ));
+                return Err(server_error(format!(
+                    "max fee per gas ({}) below current base fee ({})",
+                    signed_tx.tx.max_fee_per_gas, current_base_fee
+                )));
             }
         }
 
@@ -273,7 +273,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let hash = self
             .tx_pool
             .insert(signed_tx, &mut ws, chain_store, &verifier)
-            .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+            .map_err(|e| server_error(e.to_string()))?;
 
         // Broadcast to peers via the network channel.
         if let (Some(sender), Some(tx)) = (&self.tx_broadcast, tx_for_broadcast) {
@@ -4049,7 +4049,7 @@ mod tests {
         let err = ShellApiServer::get_storage_profile(&handler)
             .await
             .unwrap_err();
-        assert_eq!(err.code(), -32000);
+        assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
     }
 }

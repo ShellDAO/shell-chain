@@ -7,6 +7,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod dev_control;
+pub mod error;
 pub mod filter;
 pub mod filter_registry;
 pub mod handler;
