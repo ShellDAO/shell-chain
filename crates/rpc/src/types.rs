@@ -197,6 +197,24 @@ pub struct BatchInnerCallRequest {
     pub gas_limit: Option<String>,
 }
 
+/// Active storage profile descriptor returned by `shell_getStorageProfile`.
+///
+/// `profile` is one of `"archive" | "full" | "light"`. `bodyRetention`,
+/// `witnessRetention`, `keepRecent`, `proofReplacementGrace` reflect the
+/// effective `PruningConfig` after applying any per-field overrides
+/// (a value of `0` means "keep forever" except for `proofReplacementGrace`
+/// where `u64::MAX` means "never delete witness even after STARK proof").
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageProfileInfo {
+    pub profile: String,
+    pub body_retention: u64,
+    pub witness_retention: u64,
+    pub keep_recent: u64,
+    pub proof_replacement_grace: u64,
+    pub state_pruning_experimental: bool,
+}
+
 /// Format a u64 as "0x..." hex string.
 pub fn hex_u64(v: u64) -> String {
     format!("{:#x}", v)

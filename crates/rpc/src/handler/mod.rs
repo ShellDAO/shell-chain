@@ -84,6 +84,10 @@ pub struct RpcHandler<S: KvStore + 'static> {
     admin_p2p_listen: String,
     /// Optional witness store for Phase B witness bundle queries (B4).
     witness_store: Option<Arc<WitnessStore<S>>>,
+    /// Optional active storage profile descriptor surfaced via
+    /// `shell_getStorageProfile`. Set by the node at startup; absent in pure
+    /// in-memory test setups.
+    storage_profile: Option<crate::types::StorageProfileInfo>,
 }
 
 impl<S: KvStore + 'static> Clone for RpcHandler<S> {
@@ -111,6 +115,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             admin_peer_id: self.admin_peer_id.clone(),
             admin_p2p_listen: self.admin_p2p_listen.clone(),
             witness_store: self.witness_store.clone(),
+            storage_profile: self.storage_profile.clone(),
         }
     }
 }
@@ -154,9 +159,17 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             admin_peer_id: String::new(),
             admin_p2p_listen: String::new(),
             witness_store: None,
+            storage_profile: None,
         };
         FilterRegistry::start_cleanup(Arc::clone(&handler.filter_registry));
         handler
+    }
+
+    /// Attach the active storage profile descriptor for `shell_getStorageProfile`.
+    /// Set by the node at startup; absent in pure in-memory test setups.
+    pub fn with_storage_profile(mut self, info: crate::types::StorageProfileInfo) -> Self {
+        self.storage_profile = Some(info);
+        self
     }
 
     /// Attach a witness store for `shell_getBlockWitnesses` (Phase B4).
@@ -3847,5 +3860,51 @@ mod tests {
         assert_eq!(res["paymaster"], serde_json::to_value(payer).unwrap());
         assert_eq!(res["sender"], serde_json::to_value(sender).unwrap());
         assert_eq!(res["innerCallCount"], 2u64);
+    }
+
+    // ── shell_getStorageProfile ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_storage_profile_returns_attached_descriptor() {
+        let handler = setup().with_storage_profile(crate::types::StorageProfileInfo {
+            profile: "full".into(),
+            body_retention: 0,
+            witness_retention: 128,
+            keep_recent: 0,
+            proof_replacement_grace: 0,
+            state_pruning_experimental: false,
+        });
+        let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
+        assert_eq!(res["profile"], "full");
+        assert_eq!(res["bodyRetention"], 0u64);
+        assert_eq!(res["witnessRetention"], 128u64);
+        assert_eq!(res["keepRecent"], 0u64);
+        assert_eq!(res["proofReplacementGrace"], 0u64);
+        assert_eq!(res["statePruningExperimental"], false);
+    }
+
+    #[tokio::test]
+    async fn get_storage_profile_archive_descriptor_round_trip() {
+        let handler = setup().with_storage_profile(crate::types::StorageProfileInfo {
+            profile: "archive".into(),
+            body_retention: 0,
+            witness_retention: 0,
+            keep_recent: 0,
+            proof_replacement_grace: u64::MAX,
+            state_pruning_experimental: false,
+        });
+        let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
+        assert_eq!(res["profile"], "archive");
+        assert_eq!(res["proofReplacementGrace"], u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn get_storage_profile_returns_error_when_unconfigured() {
+        let handler = setup();
+        let err = ShellApiServer::get_storage_profile(&handler)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32000);
+        assert!(err.message().contains("storage profile"));
     }
 }

@@ -542,4 +542,21 @@ pub trait ShellApi {
         &self,
         tx_hash: ShellHash,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns the active storage profile and the effective pruning parameters.
+    ///
+    /// Profile is one of `"archive" | "full" | "light"`. The numeric fields
+    /// reflect the resolved `PruningConfig` (after applying any per-field
+    /// overrides such as `--body-retention` / `--witness-retention`).
+    /// A value of `0` means "keep forever" for retention/keep_recent;
+    /// `proofReplacementGrace = u64::MAX` means "never delete witness even
+    /// after STARK proof arrives" (archive mode behavior).
+    ///
+    /// Returns an error when the node has not been configured with a profile
+    /// (e.g. legacy startup paths). Stable consumers should treat such an
+    /// error as `"profile: unknown"`.
+    #[method(name = "getStorageProfile")]
+    async fn get_storage_profile(
+        &self,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 }

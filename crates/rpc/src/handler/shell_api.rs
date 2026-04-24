@@ -580,6 +580,17 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "innerCallCount": serde_json::Value::Null,
         }))
     }
+
+    async fn get_storage_profile(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        match &self.storage_profile {
+            Some(info) => serde_json::to_value(info).map_err(|e| internal_err(e.to_string())),
+            None => Err(ErrorObjectOwned::owned(
+                -32000,
+                "storage profile not configured on this node",
+                None::<()>,
+            )),
+        }
+    }
 }
 
 fn resolve_witness_block<S: KvStore + 'static>(
