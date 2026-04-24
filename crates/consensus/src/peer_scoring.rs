@@ -3,6 +3,17 @@
 //! Extends the basic network peer scoring to account for prover-specific
 //! behaviour: proof delivery timeliness, challenge responses, and equivocation.
 //!
+//! # Implementation Status (Constitution §13.5)
+//!
+//! **lib-only** — This module is intentionally NOT wired into the production node
+//! or `shell-network`. It is a higher-level, proof-quality scoring layer designed
+//! for the wPoA era, complementing the P2P-level [`network::security::PeerTracker`]
+//! which handles basic ban/allow logic at the libp2p layer.
+//!
+//! When wPoA is activated (F-WPOA-ACTIVATE), this module should be wired into
+//! `node::NodeState` and driven from the proof challenge/response event loop.
+//! Until then it lives as a complete, tested library awaiting integration.
+//!
 //! # Scoring model
 //!
 //! Each peer starts at `initial_score`. Scores change on observable events:

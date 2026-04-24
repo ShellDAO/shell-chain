@@ -176,7 +176,9 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
 
     if let Some(bundle) = signed_tx.aa_bundle.as_ref() {
         if let Some(paymaster) = bundle.paymaster {
-            verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier)?;
+            // Paymaster PQ signature already verified by `validate_aa_tx` above;
+            // skip redundant re-verification here (S-3, defence-in-depth is at
+            // the aa_validation layer). Only the balance check is needed here.
             let needed_gas = match max_gas_cost {
                 Some(n) => n,
                 None => U256::MAX,
@@ -300,14 +302,9 @@ pub fn validate_tx_for_import<S: KvStore + 'static, V: Verifier>(
 
     let _ = validate_aa_tx(signed_tx, world_state, chain_store, verifier)?;
 
-    // Verify paymaster signature on the canonical paymaster_signing_hash so
-    // import-time witness validation rejects forged sponsorships even if the
-    // sender signature is valid.
-    if let Some(bundle) = signed_tx.aa_bundle.as_ref() {
-        if let Some(paymaster) = bundle.paymaster {
-            verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier)?;
-        }
-    }
+    // Paymaster PQ signature already verified inside validate_aa_tx above
+    // (aa_validation.rs:154-164). No additional verify_paymaster_signature
+    // call needed here; avoid the expensive PQ double-verify at import time.
 
     Ok(())
 }

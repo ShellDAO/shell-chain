@@ -2,9 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [Unreleased — 0.19.0-dev]
 
-_Tracking work toward the next release (after 0.18.0)._
+_Tracking work toward v0.19.0._
 
 ### Changed (operator-visible)
 
