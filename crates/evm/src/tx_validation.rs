@@ -1230,12 +1230,8 @@ impl From<AaValidationError> for TxValidationError {
             }
             AaValidationError::ValidationContractRejected(msg)
             | AaValidationError::ValidationContractExecution(msg) => Self::AaValidation(msg),
-            AaValidationError::PaymasterSignatureInvalid(_) => {
-                Self::PaymasterSignatureInvalid
-            }
-            AaValidationError::PaymasterPubkeyNotFound(addr) => {
-                Self::PaymasterPubkeyNotFound(addr)
-            }
+            AaValidationError::PaymasterSignatureInvalid(_) => Self::PaymasterSignatureInvalid,
+            AaValidationError::PaymasterPubkeyNotFound(addr) => Self::PaymasterPubkeyNotFound(addr),
         }
     }
 }

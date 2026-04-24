@@ -1661,6 +1661,9 @@ mod tests {
         // Override block_time to 1s so the test completes quickly
         // regardless of the Dev network profile default (30s).
         node.config.block_time_ms = 1_000;
+        // Disable idle-skip so the loop produces blocks even with an empty
+        // mempool (this test only verifies block production, not idle behavior).
+        node.config.max_idle_interval_ms = 0;
         store_genesis(&node);
 
         let bus = NetworkBus::new(64);
