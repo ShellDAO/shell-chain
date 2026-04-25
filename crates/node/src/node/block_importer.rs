@@ -436,7 +436,7 @@ impl<S: KvStore + 'static> Node<S> {
             let block_number = block.number();
             let mut wm = self.proof_window_manager.lock();
             wm.advance(block_number);
-            if block_number % 100 == 0 {
+            if block_number.is_multiple_of(100) {
                 wm.gc(block_number);
             }
         }
