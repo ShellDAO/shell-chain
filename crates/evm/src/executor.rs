@@ -3251,6 +3251,7 @@ mod tests {
             }],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
         let signed = SignedTransaction::with_aa_bundle(
@@ -3301,6 +3302,7 @@ mod tests {
             inner_calls,
             paymaster,
             paymaster_signature: paymaster.map(|_| shell_primitives::Bytes::from(vec![0u8; 1])),
+            ..Default::default()
         };
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
         SignedTransaction::with_aa_bundle(from, tx, sig, shell_core::PubkeyMode::Reference, bundle)

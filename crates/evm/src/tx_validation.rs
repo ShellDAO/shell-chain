@@ -925,6 +925,7 @@ mod tests {
             inner_calls: vec![inner(1, 50_000)],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         // tx_type = legacy but bundle attached → expect rejection.
         // Bypass with_aa_bundle()'s tx_type check by hand-constructing.
@@ -946,6 +947,7 @@ mod tests {
             inner_calls: vec![inner(0, 100_000), inner(0, 100_000)],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         // with_aa_bundle() rejects this at construction; bypass via direct field.
         let from = signer_address(&signer);
@@ -967,6 +969,7 @@ mod tests {
             inner_calls: calls,
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         let from = signer_address(&signer);
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
@@ -990,6 +993,7 @@ mod tests {
             inner_calls: vec![inner(2, 50_000), inner(3, 50_000)],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         let signed = sign_aa(&signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
@@ -1010,6 +1014,7 @@ mod tests {
             inner_calls: vec![inner(1_000_000_000, 50_000)],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         let signed = sign_aa(&signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
@@ -1040,6 +1045,7 @@ mod tests {
             inner_calls: vec![inner(7, 50_000)],
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(vec![0u8; 1])),
+            ..Default::default()
         };
         // Build placeholder signed_tx to derive paymaster_signing_hash.
         let placeholder = SignedTransaction::with_aa_bundle(
@@ -1057,6 +1063,7 @@ mod tests {
             inner_calls: initial_bundle.inner_calls.clone(),
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(pm_sig.data.clone())),
+            ..Default::default()
         };
         let signed = sign_aa(&sender_signer, tx, final_bundle, true);
         let verifier = DilithiumVerifier;
@@ -1084,6 +1091,7 @@ mod tests {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(vec![0xAB; 64])),
+            ..Default::default()
         };
         let signed = sign_aa(&sender_signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
@@ -1112,6 +1120,7 @@ mod tests {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(bogus_sig.data.clone())),
+            ..Default::default()
         };
         let signed = sign_aa(&sender_signer, tx, bundle, true);
         let verifier = DilithiumVerifier;
@@ -1139,6 +1148,7 @@ mod tests {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(vec![0u8; 1])),
+            ..Default::default()
         };
         let placeholder = SignedTransaction::with_aa_bundle(
             sender,
@@ -1155,6 +1165,7 @@ mod tests {
             inner_calls: initial_bundle.inner_calls.clone(),
             paymaster: Some(paymaster),
             paymaster_signature: Some(ShellBytes::from(pm_sig.data.clone())),
+            ..Default::default()
         };
         let signed = sign_aa(&sender_signer, tx, final_bundle, true);
         let verifier = DilithiumVerifier;
@@ -1179,6 +1190,7 @@ mod tests {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: None,
             paymaster_signature: None,
+            ..Default::default()
         };
         let placeholder = SignedTransaction::with_aa_bundle(
             from,

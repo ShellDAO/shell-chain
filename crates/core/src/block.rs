@@ -902,6 +902,7 @@ mod tests {
             ],
             paymaster: Some(Address::from([0xCC; 20])),
             paymaster_signature: Some(Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            ..Default::default()
         };
 
         let signed = SignedTransaction::with_aa_bundle(
