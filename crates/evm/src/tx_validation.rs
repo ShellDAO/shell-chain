@@ -71,6 +71,12 @@ pub enum TxValidationError {
         have: U256,
     },
 
+    #[error("contract paymaster rejected transaction (returned false)")]
+    PaymasterRejected,
+
+    #[error("contract paymaster validation failed: {0}")]
+    PaymasterValidationFailed(String),
+
     #[error("aa validation failed: {0}")]
     AaValidation(String),
 }
@@ -1241,6 +1247,10 @@ impl From<AaValidationError> for TxValidationError {
             | AaValidationError::ValidationContractExecution(msg) => Self::AaValidation(msg),
             AaValidationError::PaymasterSignatureInvalid(_) => Self::PaymasterSignatureInvalid,
             AaValidationError::PaymasterPubkeyNotFound(addr) => Self::PaymasterPubkeyNotFound(addr),
+            AaValidationError::PaymasterRejected => Self::PaymasterRejected,
+            AaValidationError::PaymasterValidationFailed(msg) => {
+                Self::PaymasterValidationFailed(msg)
+            }
         }
     }
 }

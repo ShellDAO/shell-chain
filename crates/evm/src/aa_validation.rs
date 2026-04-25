@@ -17,6 +17,11 @@ use crate::state_db::{shell_hash_to_b256, ShellStateDb, StateDbError};
 use crate::tx_validation::verify_paymaster_signature;
 
 pub const VALIDATION_GAS_CAP: u64 = 500_000;
+/// Gas budget for `IPaymaster.validatePaymasterOp` staticcall (T-7).
+pub const PAYMASTER_VALIDATE_GAS_CAP: u64 = 50_000;
+
+const VALIDATE_PAYMASTER_OP_SIGNATURE: &[u8] =
+    b"validatePaymasterOp(address,bytes,uint256,bytes)";
 
 const VALIDATE_TRANSACTION_SIGNATURE: &[u8] = b"validateTransaction(bytes32,bytes,bytes)";
 
@@ -67,6 +72,12 @@ pub enum AaValidationError {
 
     #[error("paymaster pubkey not found: {0}")]
     PaymasterPubkeyNotFound(Address),
+
+    #[error("contract paymaster rejected transaction (returned false)")]
+    PaymasterRejected,
+
+    #[error("contract paymaster validation failed: {0}")]
+    PaymasterValidationFailed(String),
 }
 
 pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
@@ -148,21 +159,35 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
         return Err(AaValidationError::SignatureInvalid);
     }
 
-    // Verify paymaster signature. This is the SINGLE verification point —
-    // both mempool-admission (validate_tx) and import (validate_tx_for_import)
-    // delegate to this function, so no second pass is needed at either call
-    // site. Early rejection here prevents forged bundles from occupying
-    // mempool capacity.
-    if let Some(paymaster) = signed_tx.aa_bundle().and_then(|b| b.paymaster) {
-        if paymaster != signed_tx.from {
-            verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier).map_err(
-                |e| match e {
-                    crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(addr) => {
-                        AaValidationError::PaymasterPubkeyNotFound(addr)
-                    }
-                    other => AaValidationError::PaymasterSignatureInvalid(other.to_string()),
-                },
-            )?;
+    // Paymaster validation — dispatches on type:
+    //   Phase 1 (EOA paymaster): paymaster_signature present → verify PQ sig.
+    //   Phase 2 (contract paymaster): paymaster_context present → staticcall.
+    // Self-sponsored (no paymaster) → no paymaster check needed.
+    if let Some(bundle) = signed_tx.aa_bundle() {
+        if let Some(paymaster) = bundle.paymaster {
+            if paymaster != signed_tx.from {
+                if let Some(context) = bundle.paymaster_context.as_ref().map(|b| b.as_ref()) {
+                    // Phase 2: contract paymaster via staticcall sandbox.
+                    call_paymaster_validate(
+                        signed_tx,
+                        &paymaster,
+                        context,
+                        world_state,
+                        chain_store,
+                    )?;
+                } else {
+                    // Phase 1: EOA paymaster PQ signature.
+                    verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier)
+                        .map_err(|e| match e {
+                            crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(
+                                addr,
+                            ) => AaValidationError::PaymasterPubkeyNotFound(addr),
+                            other => {
+                                AaValidationError::PaymasterSignatureInvalid(other.to_string())
+                            }
+                        })?;
+                }
+            }
         }
     }
 
@@ -359,6 +384,194 @@ fn is_magic_valid(output: &[u8]) -> bool {
                         .map(|s| s.iter().all(|b| *b == 0))
                         .unwrap_or(false))))
 }
+
+/// Call `IPaymaster.validatePaymasterOp` in a read-only EVM sandbox.
+///
+/// The call runs against a world-state snapshot; the snapshot is discarded
+/// afterward so no state mutations persist even if the paymaster contract
+/// internally writes storage.
+///
+/// `calldata` here is the outer transaction's `tx.data` (the AaBundle RLP).
+fn call_paymaster_validate<S: KvStore + 'static>(
+    signed_tx: &SignedTransaction,
+    paymaster: &Address,
+    context: &[u8],
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+) -> Result<(), AaValidationError> {
+    let max_gas_cost = signed_tx
+        .tx
+        .gas_limit
+        .saturating_mul(signed_tx.tx.max_fee_per_gas);
+
+    let calldata = encode_validate_paymaster_op_calldata(
+        &signed_tx.from,
+        signed_tx.tx.data.as_ref(),
+        max_gas_cost,
+        context,
+    );
+
+    let snapshot = world_state.snapshot()?;
+    let paymaster_chain_store = ChainStore::new(chain_store.store().clone());
+    let state_db = ShellStateDb::new(snapshot, paymaster_chain_store);
+
+    let head = chain_store.get_head_block()?;
+    let (number, timestamp, gas_limit, excess_blob_gas) = match head {
+        Some(block) => (
+            block.header.number,
+            block.header.timestamp,
+            block.header.gas_limit,
+            block.header.excess_blob_gas,
+        ),
+        None => (0, 0, PAYMASTER_VALIDATE_GAS_CAP, 0),
+    };
+
+    let tx_env = TxEnv::builder()
+        .caller(Address::ZERO.into())
+        .gas_limit(PAYMASTER_VALIDATE_GAS_CAP)
+        .max_fee_per_gas(0)
+        .gas_priority_fee(Some(0))
+        .kind(TxKind::Call((*paymaster).into()))
+        .value(alloy_primitives::U256::ZERO)
+        .data(AlBytes::from(calldata))
+        .nonce(0)
+        .chain_id(Some(signed_tx.tx.chain_id))
+        .build_fill();
+
+    let mut block_env = BlockEnv {
+        number: alloy_primitives::U256::from(number),
+        beneficiary: Address::ZERO.into(),
+        timestamp: alloy_primitives::U256::from(timestamp),
+        gas_limit,
+        basefee: 0,
+        difficulty: alloy_primitives::U256::ZERO,
+        prevrandao: Some(alloy_primitives::B256::ZERO),
+        blob_excess_gas_and_price: None,
+        slot_num: 0,
+    };
+    block_env.set_blob_excess_gas_and_price(excess_blob_gas, 3_338_477);
+
+    let mut db = state_db;
+    let ctx: MainnetContext<&mut ShellStateDb<S>> = Context::new(&mut db, SpecId::CANCUN)
+        .modify_block_chained(|b| *b = block_env)
+        .modify_cfg_chained(|cfg: &mut CfgEnv| {
+            cfg.chain_id = signed_tx.tx.chain_id;
+            cfg.disable_nonce_check = true;
+            cfg.disable_base_fee = true;
+        });
+
+    let spec = SpecId::CANCUN;
+    let mut evm = Evm::new(
+        ctx,
+        EthInstructions::new_mainnet_with_spec(spec),
+        ShellPrecompiles::new(spec),
+    );
+
+    let exec_result = evm
+        .transact(tx_env)
+        .map_err(|e| AaValidationError::PaymasterValidationFailed(format!("{e:?}")))?
+        .result;
+
+    match exec_result {
+        ExecutionResult::Success { output, .. } => {
+            let bytes = match output {
+                revm::context::result::Output::Call(b) => b.to_vec(),
+                revm::context::result::Output::Create(b, _) => b.to_vec(),
+            };
+            // Return value is `bool accepted` ABI-encoded as a 32-byte word.
+            // The boolean true is represented as ...0001 (low byte = 1).
+            let accepted = bytes
+                .last()
+                .copied()
+                .map(|b| b == 1)
+                .unwrap_or(false)
+                && bytes
+                    .get(..bytes.len().saturating_sub(1))
+                    .map(|s| s.iter().all(|b| *b == 0))
+                    .unwrap_or(true);
+            if accepted {
+                Ok(())
+            } else {
+                Err(AaValidationError::PaymasterRejected)
+            }
+        }
+        ExecutionResult::Revert { output, .. } => {
+            Err(AaValidationError::PaymasterValidationFailed(format!(
+                "reverted: 0x{}",
+                hex::encode(output)
+            )))
+        }
+        ExecutionResult::Halt { reason, .. } => {
+            Err(AaValidationError::PaymasterValidationFailed(format!(
+                "halted: {reason:?}"
+            )))
+        }
+    }
+}
+
+/// ABI-encode `validatePaymasterOp(address,bytes,uint256,bytes)` calldata.
+///
+/// Layout:
+/// ```text
+/// [0..4]   selector
+/// [4..36]  sender (address, left-padded to 32 bytes)
+/// [36..68] offset of callData (= 0x80 = 128)
+/// [68..100] maxGasCost (uint256)
+/// [100..132] offset of context (= 0x80 + 32 + padded(callData.len))
+/// [132..]  callData length + callData padded
+///          context length + context padded
+/// ```
+fn encode_validate_paymaster_op_calldata(
+    sender: &Address,
+    call_data: &[u8],
+    max_gas_cost: u64,
+    context: &[u8],
+) -> Vec<u8> {
+    let call_data_offset: usize = 128; // 4 static args × 32 bytes
+    let call_data_len_padded = padded_len(call_data.len());
+    let context_offset = call_data_offset
+        .saturating_add(32) // length word
+        .saturating_add(call_data_len_padded);
+
+    let capacity = 4
+        + 32 // sender
+        + 32 // callData offset
+        + 32 // maxGasCost
+        + 32 // context offset
+        + 32 + call_data_len_padded
+        + 32 + padded_len(context.len());
+    let mut out = Vec::with_capacity(capacity);
+
+    // selector
+    out.extend_from_slice(
+        keccak256(VALIDATE_PAYMASTER_OP_SIGNATURE)
+            .as_bytes()
+            .get(..4)
+            .unwrap_or_else(|| unreachable!("keccak256 is 32 bytes")),
+    );
+
+    // sender: address left-padded to 32 bytes
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(sender.0.as_slice());
+
+    // callData offset
+    out.extend_from_slice(&abi_word(call_data_offset as u64));
+
+    // maxGasCost
+    out.extend_from_slice(&abi_word(max_gas_cost));
+
+    // context offset
+    out.extend_from_slice(&abi_word(context_offset as u64));
+
+    // callData bytes
+    encode_bytes(call_data, &mut out);
+
+    // context bytes
+    encode_bytes(context, &mut out);
+
+    out
+}
+
 
 struct ValidationStateDb<S: KvStore + 'static> {
     inner: ShellStateDb<S>,
