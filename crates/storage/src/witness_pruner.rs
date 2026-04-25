@@ -229,16 +229,16 @@ mod tests {
         assert_eq!(result.not_found_count, 0);
 
         // Blocks 0..6 should have no bundle.
-        for n in 0usize..6 {
+        for (n, hash) in hashes.iter().enumerate().take(6) {
             assert!(
-                !ws.has_bundle(&hashes[n]).unwrap(),
+                !ws.has_bundle(hash).unwrap(),
                 "block {n} bundle should be pruned"
             );
         }
         // Blocks 6..10 still have bundles.
-        for n in 6usize..10 {
+        for (n, hash) in hashes.iter().enumerate().skip(6).take(4) {
             assert!(
-                ws.has_bundle(&hashes[n]).unwrap(),
+                ws.has_bundle(hash).unwrap(),
                 "block {n} bundle should be retained"
             );
         }
@@ -265,11 +265,11 @@ mod tests {
         assert_eq!(pruner.pruned_below(), 12);
 
         // Blocks 0..12 pruned, 12..20 retained.
-        for n in 0usize..12 {
-            assert!(!ws.has_bundle(&hashes[n]).unwrap());
+        for hash in hashes.iter().take(12) {
+            assert!(!ws.has_bundle(hash).unwrap());
         }
-        for n in 12usize..20 {
-            assert!(ws.has_bundle(&hashes[n]).unwrap());
+        for hash in hashes.iter().skip(12) {
+            assert!(ws.has_bundle(hash).unwrap());
         }
     }
 

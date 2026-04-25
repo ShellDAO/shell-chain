@@ -15,7 +15,7 @@ pub use fee::{
 pub use log::{Log, LogError, MAX_LOG_TOPICS};
 pub use receipt::TransactionReceipt;
 pub use transaction::{
-    AaBundle, AccessListItem, InnerCall, PubkeyMode, SignedTransaction, Transaction,
+    AaBundle, AccessListItem, InnerCall, PubkeyMode, SessionAuth, SignedTransaction, Transaction,
     AA_BUNDLE_PRESENCE_FLAG, AA_BUNDLE_TX_TYPE, AA_INNER_CALL_INTRINSIC_GAS,
     BATCH_SIGNING_HASH_DOMAIN, DILITHIUM3_PUBKEY_LEN, MAX_BLOB_HASHES_PER_TX, MAX_INNER_CALLDATA,
     MAX_INNER_CALLS, PAYMASTER_SIGNING_HASH_DOMAIN,

@@ -28,6 +28,7 @@ fn sample_header() -> BlockHeader {
         parent_beacon_block_root: ShellHash::ZERO,
         blob_gas_used: 0,
         excess_blob_gas: 0,
+        ..BlockHeader::default()
     }
 }
 

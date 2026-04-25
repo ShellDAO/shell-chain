@@ -28,6 +28,7 @@ fn make_block(number: u64, proposer: Address) -> Block {
             parent_beacon_block_root: ShellHash::ZERO,
             blob_gas_used: 0,
             excess_blob_gas: 0,
+            ..BlockHeader::default()
         },
         transactions: vec![],
         proposer_seal: None,

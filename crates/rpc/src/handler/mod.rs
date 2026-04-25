@@ -993,7 +993,7 @@ mod tests {
         }
         handler
             .chain_store
-            .put_pubkey(&from, &sender.public_key().to_vec())
+            .put_pubkey(&from, sender.public_key())
             .unwrap();
 
         let genesis = make_genesis_block();
@@ -3956,6 +3956,7 @@ mod tests {
             inner_calls: vec![inner.clone(), inner],
             paymaster: Some(payer),
             paymaster_signature: Some(Bytes::from(vec![0xAB; 64])),
+            ..Default::default()
         };
         let tx = Transaction {
             chain_id: 42,

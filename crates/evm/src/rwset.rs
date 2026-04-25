@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn validator_registry_tracks_validator_set() {
         let validator = Address::from([0x33; 20]);
-        let mut data = Vec::from(encode_add_validator_calldata(&validator));
+        let mut data = encode_add_validator_calldata(&validator);
         let tx = signed_tx(Some(registry_address()), 0, std::mem::take(&mut data));
         let rwset = HeuristicRwSetExtractor.extract(&tx);
 

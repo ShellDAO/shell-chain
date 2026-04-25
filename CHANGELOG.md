@@ -14,6 +14,26 @@ _Tracking work toward v0.19.0._
   to production and enables prover claim/squatting tracking in the wPoA era.
   See `crates/consensus/src/window.rs` and CONSTITUTION §13.2.
 
+- **AA Phase 2 wire format** (`crates/core`): `AaBundle` extended with
+  `paymaster_context: Option<Bytes>` (contract paymaster) and
+  `session_auth: Option<SessionAuth>` (session key delegation). `SessionAuth`
+  carries `session_pubkey`, `session_algo`, optional `target`, `value_cap`,
+  `expiry_block`, `root_signature`, and `session_signature`. RLP encodes as a
+  5-field list. Breaking change vs v0.18.x wire format. See `docs/AA_PHASE2_SPEC.md`.
+
+- **AA Phase 2 contract paymaster** (`crates/evm`): `validatePaymasterOp` ABI call
+  dispatched when `paymaster_context` is present. Call runs in a world-state
+  snapshot (mutations discarded). Gas cap 50k. Bool return decoded from 32-byte
+  ABI word.
+
+- **AA Phase 2 session keys** (`crates/evm`): Session-key-signed AA bundles now
+  validated via two-step PQ verification: (1) root key authorizes the session key
+  via `session_auth_hash`; (2) session key signs the tx via `sender_signing_hash`.
+  Constraint checks: expiry block, value cap (Σ inner call values), optional target
+  restriction. New error variants: `SessionKeyExpired`, `SessionValueCapExceeded`,
+  `SessionTargetMismatch`, `SessionRootSignatureInvalid`, `SessionKeySignatureInvalid`,
+  `SessionKeyDisallowedAlgorithm`.
+
 ### Fixed
 
 - **Double PQ signature verification** (`crates/evm`): `validate_tx()` and

@@ -77,6 +77,27 @@ pub enum TxValidationError {
     #[error("contract paymaster validation failed: {0}")]
     PaymasterValidationFailed(String),
 
+    #[error("session key expired at block {expiry_block} (current {current_block})")]
+    SessionKeyExpired {
+        expiry_block: u64,
+        current_block: u64,
+    },
+
+    #[error("session key value cap exceeded")]
+    SessionValueCapExceeded,
+
+    #[error("session key target mismatch")]
+    SessionTargetMismatch,
+
+    #[error("session key root authorization signature invalid")]
+    SessionRootSignatureInvalid,
+
+    #[error("session key tx signature invalid")]
+    SessionKeySignatureInvalid,
+
+    #[error("session key algorithm not allowed: {0}")]
+    SessionKeyDisallowedAlgorithm(u8),
+
     #[error("aa validation failed: {0}")]
     AaValidation(String),
 }
@@ -432,6 +453,53 @@ pub fn compute_intrinsic_gas(
         }
     }
     gas
+}
+
+impl From<AaValidationError> for TxValidationError {
+    fn from(value: AaValidationError) -> Self {
+        match value {
+            AaValidationError::PubkeyNotFound => Self::PubkeyNotFound,
+            AaValidationError::AddressMismatch { from, derived } => {
+                Self::AddressMismatch { from, derived }
+            }
+            AaValidationError::SignatureInvalid => Self::SignatureInvalid,
+            AaValidationError::PubkeyConflict => Self::PubkeyConflict,
+            AaValidationError::DisallowedAlgorithm(sig_type) => Self::DisallowedAlgorithm(sig_type),
+            AaValidationError::Crypto(
+                shell_crypto::CryptoError::VerificationFailed
+                | shell_crypto::CryptoError::InvalidPublicKeyLength { .. }
+                | shell_crypto::CryptoError::InvalidSignatureLength { .. },
+            ) => Self::SignatureInvalid,
+            AaValidationError::Crypto(err) => Self::Crypto(err),
+            AaValidationError::Storage(err) => Self::Storage(err),
+            AaValidationError::StateDb(err) => Self::AaValidation(err.to_string()),
+            AaValidationError::ValidationCodeMissing(hash) => {
+                Self::AaValidation(format!("validation code missing for hash {hash}"))
+            }
+            AaValidationError::ValidationContractRejected(msg)
+            | AaValidationError::ValidationContractExecution(msg) => Self::AaValidation(msg),
+            AaValidationError::PaymasterSignatureInvalid(_) => Self::PaymasterSignatureInvalid,
+            AaValidationError::PaymasterPubkeyNotFound(addr) => Self::PaymasterPubkeyNotFound(addr),
+            AaValidationError::PaymasterRejected => Self::PaymasterRejected,
+            AaValidationError::PaymasterValidationFailed(msg) => {
+                Self::PaymasterValidationFailed(msg)
+            }
+            AaValidationError::SessionKeyExpired {
+                expiry_block,
+                current_block,
+            } => Self::SessionKeyExpired {
+                expiry_block,
+                current_block,
+            },
+            AaValidationError::SessionValueCapExceeded { .. } => Self::SessionValueCapExceeded,
+            AaValidationError::SessionTargetMismatch { .. } => Self::SessionTargetMismatch,
+            AaValidationError::SessionRootSignatureInvalid => Self::SessionRootSignatureInvalid,
+            AaValidationError::SessionKeySignatureInvalid => Self::SessionKeySignatureInvalid,
+            AaValidationError::SessionKeyDisallowedAlgorithm(algo) => {
+                Self::SessionKeyDisallowedAlgorithm(algo)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1219,38 +1287,5 @@ mod tests {
         let verifier = DilithiumVerifier;
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
         assert!(matches!(res, Err(TxValidationError::SignatureInvalid)));
-    }
-}
-
-impl From<AaValidationError> for TxValidationError {
-    fn from(value: AaValidationError) -> Self {
-        match value {
-            AaValidationError::PubkeyNotFound => Self::PubkeyNotFound,
-            AaValidationError::AddressMismatch { from, derived } => {
-                Self::AddressMismatch { from, derived }
-            }
-            AaValidationError::SignatureInvalid => Self::SignatureInvalid,
-            AaValidationError::PubkeyConflict => Self::PubkeyConflict,
-            AaValidationError::DisallowedAlgorithm(sig_type) => Self::DisallowedAlgorithm(sig_type),
-            AaValidationError::Crypto(
-                shell_crypto::CryptoError::VerificationFailed
-                | shell_crypto::CryptoError::InvalidPublicKeyLength { .. }
-                | shell_crypto::CryptoError::InvalidSignatureLength { .. },
-            ) => Self::SignatureInvalid,
-            AaValidationError::Crypto(err) => Self::Crypto(err),
-            AaValidationError::Storage(err) => Self::Storage(err),
-            AaValidationError::StateDb(err) => Self::AaValidation(err.to_string()),
-            AaValidationError::ValidationCodeMissing(hash) => {
-                Self::AaValidation(format!("validation code missing for hash {hash}"))
-            }
-            AaValidationError::ValidationContractRejected(msg)
-            | AaValidationError::ValidationContractExecution(msg) => Self::AaValidation(msg),
-            AaValidationError::PaymasterSignatureInvalid(_) => Self::PaymasterSignatureInvalid,
-            AaValidationError::PaymasterPubkeyNotFound(addr) => Self::PaymasterPubkeyNotFound(addr),
-            AaValidationError::PaymasterRejected => Self::PaymasterRejected,
-            AaValidationError::PaymasterValidationFailed(msg) => {
-                Self::PaymasterValidationFailed(msg)
-            }
-        }
     }
 }

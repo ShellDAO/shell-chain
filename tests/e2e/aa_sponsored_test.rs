@@ -40,6 +40,7 @@ fn make_sponsored_tx(
         inner_calls,
         paymaster: Some(paymaster),
         paymaster_signature: Some(Bytes::from(vec![0xab; 32])),
+        ..Default::default()
     };
     // Compute batch_signing_hash by building a placeholder, then sign the correct hash.
     let placeholder_sig = sender.signer.sign(b"placeholder").unwrap();

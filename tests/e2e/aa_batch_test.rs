@@ -42,6 +42,7 @@ fn make_batch_tx(
         inner_calls,
         paymaster: None,
         paymaster_signature: None,
+        ..Default::default()
     };
     // Compute batch_signing_hash by building a placeholder, then sign the correct hash.
     let placeholder_sig = sender.signer.sign(b"placeholder").unwrap();

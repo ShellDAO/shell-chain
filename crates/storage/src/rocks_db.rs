@@ -42,6 +42,7 @@ pub const CF_INDEX: &str = "index";
 pub const CF_WITNESS: &str = "witness";
 
 /// All column family names, in canonical order.
+#[allow(dead_code)]
 pub const ALL_CFS: &[&str] = &[CF_STATE, CF_CHAIN, CF_RECEIPTS, CF_INDEX, CF_WITNESS];
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;

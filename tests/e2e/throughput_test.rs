@@ -73,11 +73,7 @@ async fn throughput_500_transactions_baseline() {
         "acceptance rate {acceptance_rate}% below 95% ({accepted}/{count} accepted)"
     );
 
-    let tps = if elapsed_ms > 0 {
-        (accepted as u128 * 1000) / elapsed_ms
-    } else {
-        u128::MAX
-    };
+    let tps = (accepted as u128 * 1000).checked_div(elapsed_ms).unwrap_or(u128::MAX);
 
     println!("[throughput] {accepted}/{count} tx accepted in {elapsed_ms}ms — {tps} TPS");
 

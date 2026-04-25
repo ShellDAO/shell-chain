@@ -11,8 +11,8 @@
 /// Run with: `cargo bench --package shell-bench --bench bench_block_split`
 use alloy_rlp::Encodable;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use shell_core::{Block, BlockHeader, SignedTransaction, StrippedBlock, Transaction};
-use shell_crypto::{DilithiumSigner, PQSignature, SignatureType, Signer};
+use shell_core::{Block, BlockHeader, SignedTransaction, Transaction};
+use shell_crypto::{DilithiumSigner, Signer};
 use shell_primitives::{Address, Bytes, U256};
 
 // ─── Constants ────────────────────────────────────────────────────────────────

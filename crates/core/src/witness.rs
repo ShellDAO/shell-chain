@@ -540,7 +540,7 @@ mod tests {
         let (sig1, pk1) = dummy_sig_and_pk();
         let (sig2, _pk2) = dummy_sig_and_pk();
 
-        let stripped_txs = vec![
+        let stripped_txs = [
             StrippedTransaction::new(from, dummy_tx()),
             StrippedTransaction::new(from, dummy_tx()),
         ];

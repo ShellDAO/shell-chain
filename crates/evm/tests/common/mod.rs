@@ -116,6 +116,7 @@ pub fn apply_tx<V: Verifier>(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn deploy_runtime_contract<S: Signer, V: Verifier>(
     evm: &mut ShellEvm<MemoryDb>,
     chain_store: &ChainStore<MemoryDb>,

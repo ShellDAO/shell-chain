@@ -7,9 +7,9 @@ use revm::handler::{ExecuteEvm, MainnetContext};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
-use shell_core::SignedTransaction;
-use shell_crypto::{SignatureType, Verifier, ALLOWED_ALGORITHMS};
-use shell_primitives::{blake3_hash, keccak256, Address, ShellHash};
+use shell_core::{InnerCall, SessionAuth, SignedTransaction};
+use shell_crypto::{PQSignature, SignatureType, Verifier, ALLOWED_ALGORITHMS};
+use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 
 use crate::precompiles::ShellPrecompiles;
@@ -78,6 +78,30 @@ pub enum AaValidationError {
 
     #[error("contract paymaster validation failed: {0}")]
     PaymasterValidationFailed(String),
+
+    #[error("session key expired at block {expiry_block} (current {current_block})")]
+    SessionKeyExpired {
+        expiry_block: u64,
+        current_block: u64,
+    },
+
+    #[error("session key value cap exceeded: sum {sum} > cap {cap}")]
+    SessionValueCapExceeded { sum: String, cap: String },
+
+    #[error("session key target mismatch: inner call to {got:?}, expected {expected:?}")]
+    SessionTargetMismatch {
+        expected: Address,
+        got: Option<Address>,
+    },
+
+    #[error("session key root authorization signature invalid")]
+    SessionRootSignatureInvalid,
+
+    #[error("session key tx signature invalid")]
+    SessionKeySignatureInvalid,
+
+    #[error("session key algorithm not allowed: {0}")]
+    SessionKeyDisallowedAlgorithm(u8),
 }
 
 pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
@@ -154,9 +178,34 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
     }
 
     let tx_hash = signed_tx.sender_signing_hash();
-    let valid = verifier.verify(&pubkey, tx_hash.as_bytes(), &signed_tx.signature)?;
-    if !valid {
-        return Err(AaValidationError::SignatureInvalid);
+
+    // Session key path: root_signature authorizes the session key; session key
+    // signs the tx. Root pubkey sig check is replaced by the two-step session
+    // verification. See AA Phase 2 spec §4.
+    if let Some(bundle) = signed_tx.aa_bundle() {
+        if let Some(session_auth) = &bundle.session_auth {
+            validate_session_auth(
+                signed_tx,
+                session_auth,
+                &pubkey,
+                bundle.inner_calls.as_slice(),
+                &tx_hash,
+                chain_store,
+                verifier,
+            )?;
+            // Paymaster validation runs after session auth.
+        } else {
+            // Normal path: root key signs the tx directly.
+            let valid = verifier.verify(&pubkey, tx_hash.as_bytes(), &signed_tx.signature)?;
+            if !valid {
+                return Err(AaValidationError::SignatureInvalid);
+            }
+        }
+    } else {
+        let valid = verifier.verify(&pubkey, tx_hash.as_bytes(), &signed_tx.signature)?;
+        if !valid {
+            return Err(AaValidationError::SignatureInvalid);
+        }
     }
 
     // Paymaster validation — dispatches on type:
@@ -385,7 +434,90 @@ fn is_magic_valid(output: &[u8]) -> bool {
                         .unwrap_or(false))))
 }
 
-/// Call `IPaymaster.validatePaymasterOp` in a read-only EVM sandbox.
+/// Validate `SessionAuth` in a session-key-signed AA bundle.
+///
+/// Steps (AA Phase 2 spec §4.2):
+/// 1. Expiry: `session_auth.expiry_block > current_block`
+/// 2. Value cap: Σ `inner_call.value ≤ session_auth.value_cap`
+/// 3. Target: if `session_auth.target` is Some, all inner calls must target it
+/// 4. Root authorization: verify `root_signature` (from root key `root_pubkey`)
+///    over `session_auth.auth_hash(chain_id)`.
+/// 5. Session sig: verify `session_auth.session_signature` (from session_pubkey)
+///    over the tx `sender_signing_hash()`.
+///    `signed_tx.signature` is the session key's outer sig — the same bytes —
+///    so step 5 also covers the outer-tx sig check.
+fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
+    signed_tx: &SignedTransaction,
+    session_auth: &SessionAuth,
+    root_pubkey: &[u8],
+    inner_calls: &[InnerCall],
+    tx_hash: &ShellHash,
+    chain_store: &ChainStore<S>,
+    verifier: &V,
+) -> Result<(), AaValidationError> {
+    // 1. Expiry check.
+    let current_block = chain_store
+        .get_head_block()?
+        .map(|b| b.header.number)
+        .unwrap_or(0);
+    if session_auth.expiry_block <= current_block {
+        return Err(AaValidationError::SessionKeyExpired {
+            expiry_block: session_auth.expiry_block,
+            current_block,
+        });
+    }
+
+    // 2. Value cap check: sum of all inner call values must not exceed cap.
+    let value_sum: U256 = inner_calls
+        .iter()
+        .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value));
+    if value_sum > session_auth.value_cap {
+        return Err(AaValidationError::SessionValueCapExceeded {
+            sum: format!("{value_sum:?}"),
+            cap: format!("{:?}", session_auth.value_cap),
+        });
+    }
+
+    // 3. Target restriction: if set, every inner call must target it.
+    if let Some(required_target) = session_auth.target {
+        for call in inner_calls {
+            if call.to != Some(required_target) {
+                return Err(AaValidationError::SessionTargetMismatch {
+                    expected: required_target,
+                    got: call.to,
+                });
+            }
+        }
+    }
+
+    // 4. Root authorization: root_signature over session_auth.auth_hash(chain_id).
+    let auth_hash = session_auth.auth_hash(signed_tx.tx.chain_id);
+    let root_sig = PQSignature::new(signed_tx.signature.sig_type, session_auth.root_signature.as_ref().to_vec());
+    let root_valid = verifier.verify(root_pubkey, auth_hash.as_bytes(), &root_sig)?;
+    if !root_valid {
+        return Err(AaValidationError::SessionRootSignatureInvalid);
+    }
+
+    // 5. Session signature: session_pubkey signs sender_signing_hash().
+    let session_algo = SignatureType::from_u8(session_auth.session_algo).ok_or(
+        AaValidationError::SessionKeyDisallowedAlgorithm(session_auth.session_algo),
+    )?;
+    if !ALLOWED_ALGORITHMS.contains(&session_algo) {
+        return Err(AaValidationError::SessionKeyDisallowedAlgorithm(
+            session_auth.session_algo,
+        ));
+    }
+    let session_sig = PQSignature::new(session_algo, session_auth.session_signature.as_ref().to_vec());
+    let session_valid =
+        verifier.verify(session_auth.session_pubkey.as_ref(), tx_hash.as_bytes(), &session_sig)?;
+    if !session_valid {
+        return Err(AaValidationError::SessionKeySignatureInvalid);
+    }
+
+    Ok(())
+}
+
+
 ///
 /// The call runs against a world-state snapshot; the snapshot is discarded
 /// afterward so no state mutations persist even if the paymaster contract

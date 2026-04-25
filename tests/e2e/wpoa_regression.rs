@@ -51,6 +51,7 @@ fn make_header(number: u64, proposer: Address, extra: &[u8]) -> BlockHeader {
     }
 }
 
+#[allow(dead_code)]
 fn default_slashing_config() -> SlashingConfig {
     SlashingConfig::default()
 }
