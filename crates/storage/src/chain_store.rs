@@ -14,6 +14,36 @@ pub struct ChainConfig {
     pub genesis_hash: ShellHash,
 }
 
+/// Maximum number of guardians per account.
+pub const MAX_GUARDIANS: usize = 5;
+/// Minimum timelock in blocks between recovery initiation and execution.
+pub const MIN_RECOVERY_TIMELOCK: u64 = 100;
+
+/// Guardian set configuration stored per account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardianConfig {
+    /// List of guardian addresses (1..=MAX_GUARDIANS).
+    pub guardians: Vec<[u8; 20]>,
+    /// Required number of guardian votes (1..=guardians.len()).
+    pub threshold: u8,
+    /// Minimum blocks between threshold-reach and execution.
+    pub timelock: u64,
+}
+
+/// Active recovery proposal for an account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryProposal {
+    /// Proposed new PQ public key bytes.
+    pub new_pubkey: Vec<u8>,
+    /// Algorithm ID of the new public key.
+    pub new_algo: u8,
+    /// Guardian addresses that have voted for this exact proposal.
+    pub votes: Vec<[u8; 20]>,
+    /// Block number after which `executeRecovery` may be called.
+    /// Zero means the threshold has not yet been reached.
+    pub maturity_block: u64,
+}
+
 /// Storage format version bytes for migration compatibility.
 mod format_version {
     /// Legacy JSON format.
@@ -102,6 +132,10 @@ mod prefix {
     pub const PUBKEY_BY_ADDR: &[u8] = b"pk/";
     /// Address → tx_hash index: key = "a/" + address(20) + block_number(8) + tx_index(4)
     pub const ADDR_TX_INDEX: &[u8] = b"a/";
+    /// Guardian config: key = "gc/" + address(20) → CBOR-encoded GuardianConfig
+    pub const GUARDIAN_CONFIG: &[u8] = b"gc/";
+    /// Active recovery proposal: key = "rp/" + address(20) → CBOR-encoded RecoveryProposal
+    pub const RECOVERY_PROPOSAL: &[u8] = b"rp/";
 }
 
 /// Block/receipt/transaction-index storage.
@@ -687,6 +721,74 @@ impl<S: KvStore> ChainStore<S> {
     /// Retrieve the registered PQ public key for an address.
     pub fn get_pubkey(&self, address: &Address) -> Result<Option<Vec<u8>>, StorageError> {
         self.store.get(&Self::pubkey_key(address))
+    }
+
+    // ── Guardian recovery storage ──────────────────────────────
+
+    /// Persist the guardian configuration for an account.
+    pub fn put_guardian_config(
+        &self,
+        account: &Address,
+        config: &GuardianConfig,
+    ) -> Result<(), StorageError> {
+        let encoded =
+            serde_json::to_vec(config).map_err(|e| StorageError::Codec(e.to_string()))?;
+        self.store.put(&Self::guardian_config_key(account), &encoded)
+    }
+
+    /// Retrieve the guardian configuration for an account.
+    pub fn get_guardian_config(
+        &self,
+        account: &Address,
+    ) -> Result<Option<GuardianConfig>, StorageError> {
+        match self.store.get(&Self::guardian_config_key(account))? {
+            None => Ok(None),
+            Some(bytes) => {
+                let config = serde_json::from_slice(&bytes)
+                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                Ok(Some(config))
+            }
+        }
+    }
+
+    /// Persist the active recovery proposal for an account.
+    pub fn put_recovery_proposal(
+        &self,
+        account: &Address,
+        proposal: &RecoveryProposal,
+    ) -> Result<(), StorageError> {
+        let encoded =
+            serde_json::to_vec(proposal).map_err(|e| StorageError::Codec(e.to_string()))?;
+        self.store
+            .put(&Self::recovery_proposal_key(account), &encoded)
+    }
+
+    /// Retrieve the active recovery proposal for an account.
+    pub fn get_recovery_proposal(
+        &self,
+        account: &Address,
+    ) -> Result<Option<RecoveryProposal>, StorageError> {
+        match self.store.get(&Self::recovery_proposal_key(account))? {
+            None => Ok(None),
+            Some(bytes) => {
+                let proposal = serde_json::from_slice(&bytes)
+                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                Ok(Some(proposal))
+            }
+        }
+    }
+
+    /// Remove the active recovery proposal for an account.
+    pub fn delete_recovery_proposal(&self, account: &Address) -> Result<(), StorageError> {
+        self.store.delete(&Self::recovery_proposal_key(account))
+    }
+
+    fn guardian_config_key(account: &Address) -> Vec<u8> {
+        [prefix::GUARDIAN_CONFIG, account.as_ref()].concat()
+    }
+
+    fn recovery_proposal_key(account: &Address) -> Vec<u8> {
+        [prefix::RECOVERY_PROPOSAL, account.as_ref()].concat()
     }
 
     // ── Snapshot import/export ─────────────────────────────────

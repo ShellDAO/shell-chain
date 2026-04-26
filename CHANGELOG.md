@@ -34,6 +34,15 @@ _Tracking work toward v0.19.0._
   `SessionTargetMismatch`, `SessionRootSignatureInvalid`, `SessionKeySignatureInvalid`,
   `SessionKeyDisallowedAlgorithm`.
 
+- **AA Phase 2 guardian recovery** (`crates/evm`, `crates/storage`): `AccountManager`
+  system contract gains 4 new entry points: `setGuardians(address[],uint8,uint64)`,
+  `submitRecovery(address,bytes,uint8)`, `executeRecovery(address)`,
+  `cancelRecovery(address)`. `GuardianConfig` and `RecoveryProposal` persisted in
+  `ChainStore` under `gc/` and `rp/` key prefixes. Invariants: max 5 guardians,
+  min 100-block timelock, k-of-n threshold, no self-guardian, no duplicate votes.
+  After threshold reached, maturity block = current + timelock; anyone may execute
+  after maturity. Owner may cancel before execution. See `docs/AA_PHASE2_SPEC.md §5`.
+
 ### Fixed
 
 - **Double PQ signature verification** (`crates/evm`): `validate_tx()` and

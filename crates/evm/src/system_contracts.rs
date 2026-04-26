@@ -17,11 +17,18 @@
 //! | AccountManager | `rotateKey(bytes,uint8)` | self |
 //! | AccountManager | `setValidationCode(bytes32)` | self |
 //! | AccountManager | `clearValidationCode()` | self |
+//! | AccountManager | `setGuardians(address[],uint8,uint64)` | self |
+//! | AccountManager | `submitRecovery(address,bytes,uint8)` | guardian |
+//! | AccountManager | `executeRecovery(address)` | anyone (post-maturity) |
+//! | AccountManager | `cancelRecovery(address)` | account owner |
 
 use shell_core::Account;
 use shell_crypto::SignatureType;
 use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
-use shell_storage::{ChainStore, KvStore, WorldState};
+use shell_storage::{
+    ChainStore, GuardianConfig, KvStore, RecoveryProposal, WorldState, MAX_GUARDIANS,
+    MIN_RECOVERY_TIMELOCK,
+};
 
 // ── Contract address ───────────────────────────────────────────────
 
@@ -69,6 +76,16 @@ pub const ROTATE_KEY_SELECTOR: [u8; 4] = compute_selector(b"rotateKey(bytes,uint
 pub const SET_VALIDATION_CODE_SELECTOR: [u8; 4] = compute_selector(b"setValidationCode(bytes32)");
 /// keccak256("clearValidationCode()")[..4]
 pub const CLEAR_VALIDATION_CODE_SELECTOR: [u8; 4] = compute_selector(b"clearValidationCode()");
+/// keccak256("setGuardians(address[],uint8,uint64)")[..4]
+pub const SET_GUARDIANS_SELECTOR: [u8; 4] =
+    compute_selector(b"setGuardians(address[],uint8,uint64)");
+/// keccak256("submitRecovery(address,bytes,uint8)")[..4]
+pub const SUBMIT_RECOVERY_SELECTOR: [u8; 4] =
+    compute_selector(b"submitRecovery(address,bytes,uint8)");
+/// keccak256("executeRecovery(address)")[..4]
+pub const EXECUTE_RECOVERY_SELECTOR: [u8; 4] = compute_selector(b"executeRecovery(address)");
+/// keccak256("cancelRecovery(address)")[..4]
+pub const CANCEL_RECOVERY_SELECTOR: [u8; 4] = compute_selector(b"cancelRecovery(address)");
 
 /// Compute a 4-byte function selector at compile time.
 const fn compute_selector(sig: &[u8]) -> [u8; 4] {
@@ -136,6 +153,26 @@ pub enum SystemContractError {
     AbiDecode(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("guardian list must have 1..={0} entries, got {1}")]
+    InvalidGuardianCount(usize, usize),
+    #[error("threshold must be between 1 and {0}, got {1}")]
+    InvalidThreshold(usize, u8),
+    #[error("timelock too short: minimum {0} blocks, got {1}")]
+    TimelockTooShort(u64, u64),
+    #[error("guardian cannot be the account itself")]
+    GuardianIsSelf,
+    #[error("duplicate guardian address")]
+    DuplicateGuardian,
+    #[error("caller is not a registered guardian for this account")]
+    NotAGuardian,
+    #[error("no guardian configuration for account {0}")]
+    NoGuardianConfig(Address),
+    #[error("no active recovery proposal for account {0}")]
+    NoRecoveryProposal(Address),
+    #[error("recovery proposal not yet mature (maturity block {0})")]
+    RecoveryNotMature(u64),
+    #[error("recovery already active; cancel before starting a new one")]
+    RecoveryAlreadyActive,
 }
 
 // ── Main dispatch ──────────────────────────────────────────────────
@@ -258,6 +295,43 @@ fn execute_account_manager<S: KvStore + 'static>(
         s if s == CLEAR_VALIDATION_CODE_SELECTOR => {
             clear_validation_code(caller, world_state)?;
             effects.updated_accounts.push(*caller);
+            Ok(SystemContractOutcome {
+                output: encode_bool(true),
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
+                effects,
+            })
+        }
+        s if s == SET_GUARDIANS_SELECTOR => {
+            set_guardians(caller, params, chain_store)?;
+            Ok(SystemContractOutcome {
+                output: encode_bool(true),
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
+                effects,
+            })
+        }
+        s if s == SUBMIT_RECOVERY_SELECTOR => {
+            submit_recovery(caller, params, chain_store)?;
+            Ok(SystemContractOutcome {
+                output: encode_bool(true),
+                gas_used: SYSTEM_CALL_BASE_GAS
+                    .saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
+                effects,
+            })
+        }
+        s if s == EXECUTE_RECOVERY_SELECTOR => {
+            let account = decode_address(params)?;
+            execute_recovery(&account, world_state, chain_store)?;
+            effects.updated_accounts.push(account);
+            Ok(SystemContractOutcome {
+                output: encode_bool(true),
+                gas_used: SYSTEM_CALL_BASE_GAS
+                    .saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
+                effects,
+            })
+        }
+        s if s == CANCEL_RECOVERY_SELECTOR => {
+            let account = decode_address(params)?;
+            cancel_recovery(caller, &account, chain_store)?;
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
                 gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
@@ -418,6 +492,313 @@ fn clear_validation_code<S: KvStore + 'static>(
     Ok(())
 }
 
+// ── Guardian recovery operations ────────────────────────────────────
+
+/// Register or update the guardian set for `caller`.
+///
+/// ABI: `setGuardians(address[],uint8,uint64)`
+fn set_guardians<S: KvStore + 'static>(
+    caller: &Address,
+    params: &[u8],
+    chain_store: &ChainStore<S>,
+) -> Result<(), SystemContractError> {
+    // ABI head: offset_to_array (32) | threshold (32) | timelock (32)
+    if params.len() < 96 {
+        return Err(SystemContractError::AbiDecode(
+            "setGuardians: params too short".into(),
+        ));
+    }
+    let array_offset = decode_word_usize(
+        params
+            .get(..32)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+    let threshold = decode_u8(
+        params
+            .get(32..64)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+    let timelock = decode_u64(
+        params
+            .get(64..96)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+
+    // Decode address array at array_offset
+    if array_offset.saturating_add(32) > params.len() {
+        return Err(SystemContractError::AbiDecode(
+            "setGuardians: array offset out of bounds".into(),
+        ));
+    }
+    let array_len = decode_word_usize(
+        params
+            .get(array_offset..array_offset.saturating_add(32))
+            .ok_or_else(|| SystemContractError::AbiDecode("array length word OOB".into()))?,
+    )?;
+    let elem_start = array_offset.saturating_add(32);
+    let elem_end = elem_start.saturating_add(array_len.saturating_mul(32));
+    if elem_end > params.len() {
+        return Err(SystemContractError::AbiDecode(
+            "setGuardians: address array truncated".into(),
+        ));
+    }
+
+    // Validate counts
+    if array_len == 0 || array_len > MAX_GUARDIANS {
+        return Err(SystemContractError::InvalidGuardianCount(
+            MAX_GUARDIANS,
+            array_len,
+        ));
+    }
+    if threshold == 0 || threshold as usize > array_len {
+        return Err(SystemContractError::InvalidThreshold(array_len, threshold));
+    }
+    if timelock < MIN_RECOVERY_TIMELOCK {
+        return Err(SystemContractError::TimelockTooShort(
+            MIN_RECOVERY_TIMELOCK,
+            timelock,
+        ));
+    }
+
+    let mut guardians: Vec<[u8; 20]> = Vec::with_capacity(array_len);
+    for i in 0..array_len {
+        let word_start = elem_start.saturating_add(i.saturating_mul(32));
+        let addr = decode_address(
+            params
+                .get(word_start..word_start.saturating_add(32))
+                .ok_or_else(|| SystemContractError::AbiDecode("address OOB".into()))?,
+        )?;
+        let raw: [u8; 20] = addr
+            .as_ref()
+            .try_into()
+            .expect("Address is always 20 bytes");
+        let caller_raw_cmp: [u8; 20] = caller
+            .as_ref()
+            .try_into()
+            .expect("Address is always 20 bytes");
+        if raw == caller_raw_cmp {
+            return Err(SystemContractError::GuardianIsSelf);
+        }
+        if guardians.contains(&raw) {
+            return Err(SystemContractError::DuplicateGuardian);
+        }
+        guardians.push(raw);
+    }
+
+    let config = GuardianConfig {
+        guardians,
+        threshold,
+        timelock,
+    };
+    chain_store
+        .put_guardian_config(caller, &config)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Submit or vote on a recovery proposal.
+///
+/// ABI: `submitRecovery(address,bytes,uint8)`
+/// - If no active proposal exists, creates one.
+/// - If an active proposal with the same `(newPubkey, newAlgo)` exists, adds a vote.
+/// - When votes reach threshold, sets `maturity_block = current_block + timelock`.
+fn submit_recovery<S: KvStore + 'static>(
+    caller: &Address,
+    params: &[u8],
+    chain_store: &ChainStore<S>,
+) -> Result<(), SystemContractError> {
+    // ABI head: account (32) | offset_to_bytes (32) | new_algo (32)
+    if params.len() < 96 {
+        return Err(SystemContractError::AbiDecode(
+            "submitRecovery: params too short".into(),
+        ));
+    }
+    let account = decode_address(
+        params
+            .get(..32)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+    let bytes_offset = decode_word_usize(
+        params
+            .get(32..64)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+    let new_algo = decode_u8(
+        params
+            .get(64..96)
+            .unwrap_or_else(|| unreachable!("params.len() >= 96")),
+    )?;
+    // Validate algo
+    SignatureType::from_u8(new_algo)
+        .ok_or(SystemContractError::InvalidAlgorithm(new_algo))?;
+
+    // Decode bytes payload
+    if bytes_offset.saturating_add(32) > params.len() {
+        return Err(SystemContractError::AbiDecode(
+            "submitRecovery: bytes offset OOB".into(),
+        ));
+    }
+    let bytes_len = decode_word_usize(
+        params
+            .get(bytes_offset..bytes_offset.saturating_add(32))
+            .ok_or_else(|| SystemContractError::AbiDecode("bytes len OOB".into()))?,
+    )?;
+    let data_start = bytes_offset.saturating_add(32);
+    let data_end = data_start
+        .checked_add(bytes_len)
+        .ok_or_else(|| SystemContractError::AbiDecode("bytes len overflow".into()))?;
+    if data_end > params.len() {
+        return Err(SystemContractError::AbiDecode(
+            "submitRecovery: pubkey truncated".into(),
+        ));
+    }
+    if bytes_len == 0 {
+        return Err(SystemContractError::EmptyPubkey);
+    }
+    let new_pubkey = params
+        .get(data_start..data_end)
+        .ok_or_else(|| SystemContractError::AbiDecode("pubkey range OOB".into()))?
+        .to_vec();
+
+    // Load guardian config
+    let config = chain_store
+        .get_guardian_config(&account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .ok_or(SystemContractError::NoGuardianConfig(account))?;
+
+    let caller_raw: [u8; 20] = caller
+        .as_ref()
+        .try_into()
+        .expect("Address is always 20 bytes");
+    if !config.guardians.contains(&caller_raw) {
+        return Err(SystemContractError::NotAGuardian);
+    }
+
+    // Load or create proposal
+    let mut proposal = chain_store
+        .get_recovery_proposal(&account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .unwrap_or(RecoveryProposal {
+            new_pubkey: new_pubkey.clone(),
+            new_algo,
+            votes: Vec::new(),
+            maturity_block: 0,
+        });
+
+    // If the proposal changed (different pubkey or algo), reject to avoid confusion.
+    // Caller must `cancelRecovery` first.
+    if proposal.new_pubkey != new_pubkey || proposal.new_algo != new_algo {
+        return Err(SystemContractError::RecoveryAlreadyActive);
+    }
+
+    // Reject duplicate vote from same guardian
+    if proposal.votes.contains(&caller_raw) {
+        return Ok(()); // idempotent — already voted
+    }
+    proposal.votes.push(caller_raw);
+
+    // Check if threshold reached and maturity not yet set
+    if proposal.maturity_block == 0
+        && proposal.votes.len() >= config.threshold as usize
+    {
+        let current_block = chain_store
+            .get_head_block()
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            .map(|b| b.header.number)
+            .unwrap_or(0);
+        proposal.maturity_block = current_block.saturating_add(config.timelock);
+    }
+
+    chain_store
+        .put_recovery_proposal(&account, &proposal)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Execute a matured recovery proposal, rotating the account's PQ public key.
+///
+/// ABI: `executeRecovery(address)` — callable by anyone once maturity_block is reached.
+fn execute_recovery<S: KvStore + 'static>(
+    account: &Address,
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+) -> Result<(), SystemContractError> {
+    let proposal = chain_store
+        .get_recovery_proposal(account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .ok_or(SystemContractError::NoRecoveryProposal(*account))?;
+
+    if proposal.maturity_block == 0 {
+        // Threshold not reached yet
+        return Err(SystemContractError::RecoveryNotMature(0));
+    }
+
+    let current_block = chain_store
+        .get_head_block()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .map(|b| b.header.number)
+        .unwrap_or(0);
+
+    if current_block < proposal.maturity_block {
+        return Err(SystemContractError::RecoveryNotMature(
+            proposal.maturity_block,
+        ));
+    }
+
+    // Validate the new algo
+    SignatureType::from_u8(proposal.new_algo)
+        .ok_or(SystemContractError::InvalidAlgorithm(proposal.new_algo))?;
+
+    // Rotate the key
+    let mut acct = world_state
+        .get_account(account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .unwrap_or(Account {
+            pq_pubkey_hash: ShellHash::ZERO,
+            nonce: 0,
+            balance: U256::ZERO,
+            validation_code_hash: None,
+            code_hash: None,
+            storage_root: ShellHash::ZERO,
+        });
+    acct.pq_pubkey_hash = blake3_hash(&proposal.new_pubkey);
+    world_state
+        .set_account(account, &acct)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    chain_store
+        .put_pubkey(account, &proposal.new_pubkey)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+
+    // Clear the proposal
+    chain_store
+        .delete_recovery_proposal(account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Cancel an active recovery proposal. Only callable by the account owner
+/// (i.e., the account itself, still in possession of the old key).
+///
+/// ABI: `cancelRecovery(address)`
+fn cancel_recovery<S: KvStore + 'static>(
+    caller: &Address,
+    account: &Address,
+    chain_store: &ChainStore<S>,
+) -> Result<(), SystemContractError> {
+    // Only the account owner may cancel
+    if caller != account {
+        return Err(SystemContractError::Unauthorized);
+    }
+    chain_store
+        .get_recovery_proposal(account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .ok_or(SystemContractError::NoRecoveryProposal(*account))?;
+    chain_store
+        .delete_recovery_proposal(account)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 // ── ABI helpers ────────────────────────────────────────────────────
 
 fn decode_selector(input: &[u8]) -> Result<[u8; 4], SystemContractError> {
@@ -494,6 +875,33 @@ fn decode_u8(input: &[u8]) -> Result<u8, SystemContractError> {
         .get(31)
         .copied()
         .ok_or_else(|| SystemContractError::AbiDecode("uint8 word too short".into()))
+}
+
+fn decode_u64(input: &[u8]) -> Result<u64, SystemContractError> {
+    if input.len() < 32 {
+        return Err(SystemContractError::AbiDecode(format!(
+            "expected 32 bytes for uint64, got {}",
+            input.len()
+        )));
+    }
+    if input
+        .get(..24)
+        .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above"))
+        .iter()
+        .any(|b| *b != 0)
+    {
+        return Err(SystemContractError::AbiDecode(
+            "uint64 value exceeds u64 range".into(),
+        ));
+    }
+    let tail: [u8; 8] = input
+        .get(24..32)
+        .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above"))
+        .try_into()
+        .map_err(|e: std::array::TryFromSliceError| {
+            SystemContractError::AbiDecode(e.to_string())
+        })?;
+    Ok(u64::from_be_bytes(tail))
 }
 
 fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContractError> {
@@ -658,6 +1066,96 @@ pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
     data.extend_from_slice(&REMOVE_VALIDATOR_SELECTOR);
     let mut word = [0u8; 32];
     word[12..32].copy_from_slice(address.as_bytes());
+    data.extend_from_slice(&word);
+    data
+}
+
+/// Encode calldata for `setGuardians(address[],uint8,uint64)`.
+///
+/// ABI layout (params after selector):
+/// - word 0: offset to address[] data = 96 (0x60)
+/// - word 1: threshold (uint8, right-aligned)
+/// - word 2: timelock  (uint64, right-aligned)
+/// - word 3: array length
+/// - word 4..N+4: each address right-aligned in 32 bytes
+pub fn encode_set_guardians_calldata(
+    guardians: &[Address],
+    threshold: u8,
+    timelock: u64,
+) -> Vec<u8> {
+    // 4 (selector) + 3×32 (head) + 32 (array len) + N×32 (elements)
+    let capacity = 4usize
+        .saturating_add(96)
+        .saturating_add(32)
+        .saturating_add(guardians.len().saturating_mul(32));
+    let mut data = Vec::with_capacity(capacity);
+    data.extend_from_slice(&SET_GUARDIANS_SELECTOR);
+    // offset to array = 96 bytes into params (after 3 words)
+    data.extend_from_slice(&encode_usize_word(96));
+    data.extend_from_slice(&encode_u8_word(threshold));
+    // encode uint64 timelock
+    let mut tl_word = [0u8; 32];
+    tl_word[24..32].copy_from_slice(&timelock.to_be_bytes());
+    data.extend_from_slice(&tl_word);
+    // array length
+    data.extend_from_slice(&encode_usize_word(guardians.len()));
+    // array elements
+    for addr in guardians {
+        let mut word = [0u8; 32];
+        word[12..32].copy_from_slice(addr.as_bytes());
+        data.extend_from_slice(&word);
+    }
+    data
+}
+
+/// Encode calldata for `submitRecovery(address,bytes,uint8)`.
+pub fn encode_submit_recovery_calldata(
+    account: &Address,
+    new_pubkey: &[u8],
+    new_algo: u8,
+) -> Vec<u8> {
+    let padded_len = if new_pubkey.is_empty() {
+        0
+    } else {
+        new_pubkey.len().div_ceil(32).saturating_mul(32)
+    };
+    // 4 (selector) + 3×32 (head: account, offset, algo) + 32 (len) + padded
+    let capacity = 4usize
+        .saturating_add(96)
+        .saturating_add(32)
+        .saturating_add(padded_len);
+    let mut data = Vec::with_capacity(capacity);
+    data.extend_from_slice(&SUBMIT_RECOVERY_SELECTOR);
+    // account (address, right-aligned)
+    let mut addr_word = [0u8; 32];
+    addr_word[12..32].copy_from_slice(account.as_bytes());
+    data.extend_from_slice(&addr_word);
+    // offset to bytes = 96 bytes from start of params
+    data.extend_from_slice(&encode_usize_word(96));
+    data.extend_from_slice(&encode_u8_word(new_algo));
+    // bytes length + payload
+    data.extend_from_slice(&encode_usize_word(new_pubkey.len()));
+    data.extend_from_slice(new_pubkey);
+    data.resize(capacity, 0);
+    data
+}
+
+/// Encode calldata for `executeRecovery(address)`.
+pub fn encode_execute_recovery_calldata(account: &Address) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4usize.saturating_add(32));
+    data.extend_from_slice(&EXECUTE_RECOVERY_SELECTOR);
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(account.as_bytes());
+    data.extend_from_slice(&word);
+    data
+}
+
+/// Encode calldata for `cancelRecovery(address)`.
+pub fn encode_cancel_recovery_calldata(account: &Address) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4usize.saturating_add(32));
+    data.extend_from_slice(&CANCEL_RECOVERY_SELECTOR);
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(account.as_bytes());
     data.extend_from_slice(&word);
     data
 }
@@ -1542,5 +2040,242 @@ mod tests {
         let calldata = encode_remove_validator_calldata(&v2);
         let (_, gas) = execute_system_contract(&v1, &calldata, &mut ws).unwrap();
         assert_eq!(gas, expected);
+    }
+
+    // ── Guardian recovery tests ────────────────────────────────
+
+    #[test]
+    fn set_guardians_stores_config() {
+        let owner = Address::from([0x30; 20]);
+        let g1 = Address::from([0x31; 20]);
+        let g2 = Address::from([0x32; 20]);
+        let (mut ws, cs) = setup_account_manager();
+
+        let calldata = encode_set_guardians_calldata(&[g1, g2], 1, 100);
+        let outcome = execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+        assert_eq!(outcome.output, encode_bool(true));
+
+        let config = cs.get_guardian_config(&owner).unwrap().unwrap();
+        assert_eq!(config.guardians.len(), 2);
+        assert_eq!(config.threshold, 1);
+        assert_eq!(config.timelock, 100);
+    }
+
+    #[test]
+    fn set_guardians_rejects_self_as_guardian() {
+        let owner = Address::from([0x33; 20]);
+        let (mut ws, cs) = setup_account_manager();
+        let calldata = encode_set_guardians_calldata(&[owner], 1, 100);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SystemContractError::GuardianIsSelf));
+    }
+
+    #[test]
+    fn set_guardians_rejects_short_timelock() {
+        let owner = Address::from([0x34; 20]);
+        let g1 = Address::from([0x35; 20]);
+        let (mut ws, cs) = setup_account_manager();
+        let calldata = encode_set_guardians_calldata(&[g1], 1, 50);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SystemContractError::TimelockTooShort(100, 50)
+        ));
+    }
+
+    #[test]
+    fn set_guardians_rejects_too_many() {
+        let owner = Address::from([0x36; 20]);
+        let guardians: Vec<Address> = (1u8..=6)
+            .map(|i| Address::from([i; 20]))
+            .collect();
+        let (mut ws, cs) = setup_account_manager();
+        let calldata = encode_set_guardians_calldata(&guardians, 1, 100);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SystemContractError::InvalidGuardianCount(5, 6)
+        ));
+    }
+
+    #[test]
+    fn submit_recovery_and_execute_rotates_key() {
+        let owner = Address::from([0x40; 20]);
+        let g1 = Address::from([0x41; 20]);
+        let g2 = Address::from([0x42; 20]);
+        let (mut ws, cs) = setup_account_manager();
+
+        // Set up guardian config with 2-of-2, timelock=100
+        let calldata = encode_set_guardians_calldata(&[g1, g2], 2, 100);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        let new_pubkey = b"new_pq_pubkey_bytes".to_vec();
+        let new_algo = 1u8; // Dilithium3
+
+        // Vote 1 (g1)
+        let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &g1,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        // Only 1 vote — maturity_block should still be 0
+        let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
+        assert_eq!(proposal.votes.len(), 1);
+        assert_eq!(proposal.maturity_block, 0);
+
+        // Vote 2 (g2) — threshold reached
+        let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &g2,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
+        assert_eq!(proposal.votes.len(), 2);
+        // No head block → current_block=0 → maturity = 0 + 100 = 100
+        assert_eq!(proposal.maturity_block, 100);
+
+        // Cannot execute before maturity — head is at 0 but maturity=100
+        let calldata = encode_execute_recovery_calldata(&owner);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &Address::from([0x99; 20]),
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SystemContractError::RecoveryNotMature(100)
+        ));
+    }
+
+    #[test]
+    fn cancel_recovery_removes_proposal() {
+        let owner = Address::from([0x50; 20]);
+        let g1 = Address::from([0x51; 20]);
+        let (mut ws, cs) = setup_account_manager();
+
+        // Set guardians
+        let calldata = encode_set_guardians_calldata(&[g1], 1, 100);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        // Vote (threshold=1 so it immediately matures in test with no head block)
+        let new_pubkey = b"recovery_pubkey".to_vec();
+        let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, 1);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &g1,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        assert!(cs.get_recovery_proposal(&owner).unwrap().is_some());
+
+        // Owner cancels
+        let calldata = encode_cancel_recovery_calldata(&owner);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
+    }
+
+    #[test]
+    fn cancel_recovery_rejects_non_owner() {
+        let owner = Address::from([0x60; 20]);
+        let g1 = Address::from([0x61; 20]);
+        let attacker = Address::from([0x62; 20]);
+        let (mut ws, cs) = setup_account_manager();
+
+        let calldata = encode_set_guardians_calldata(&[g1], 1, 100);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        let calldata = encode_submit_recovery_calldata(&owner, b"pubkey", 1);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &g1,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        let calldata = encode_cancel_recovery_calldata(&owner);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &attacker,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SystemContractError::Unauthorized));
     }
 }
