@@ -313,8 +313,7 @@ fn execute_account_manager<S: KvStore + 'static>(
             submit_recovery(caller, params, chain_store)?;
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
-                gas_used: SYSTEM_CALL_BASE_GAS
-                    .saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
                 effects,
             })
         }
@@ -324,8 +323,7 @@ fn execute_account_manager<S: KvStore + 'static>(
             effects.updated_accounts.push(account);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
-                gas_used: SYSTEM_CALL_BASE_GAS
-                    .saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
+                gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS.saturating_mul(2)),
                 effects,
             })
         }
@@ -561,6 +559,10 @@ fn set_guardians<S: KvStore + 'static>(
     }
 
     let mut guardians: Vec<[u8; 20]> = Vec::with_capacity(array_len);
+    let caller_raw: [u8; 20] = caller
+        .as_ref()
+        .try_into()
+        .expect("Address is always 20 bytes");
     for i in 0..array_len {
         let word_start = elem_start.saturating_add(i.saturating_mul(32));
         let addr = decode_address(
@@ -572,11 +574,7 @@ fn set_guardians<S: KvStore + 'static>(
             .as_ref()
             .try_into()
             .expect("Address is always 20 bytes");
-        let caller_raw_cmp: [u8; 20] = caller
-            .as_ref()
-            .try_into()
-            .expect("Address is always 20 bytes");
-        if raw == caller_raw_cmp {
+        if raw == caller_raw {
             return Err(SystemContractError::GuardianIsSelf);
         }
         if guardians.contains(&raw) {
@@ -629,8 +627,7 @@ fn submit_recovery<S: KvStore + 'static>(
             .unwrap_or_else(|| unreachable!("params.len() >= 96")),
     )?;
     // Validate algo
-    SignatureType::from_u8(new_algo)
-        .ok_or(SystemContractError::InvalidAlgorithm(new_algo))?;
+    SignatureType::from_u8(new_algo).ok_or(SystemContractError::InvalidAlgorithm(new_algo))?;
 
     // Decode bytes payload
     if bytes_offset.saturating_add(32) > params.len() {
@@ -698,9 +695,7 @@ fn submit_recovery<S: KvStore + 'static>(
     proposal.votes.push(caller_raw);
 
     // Check if threshold reached and maturity not yet set
-    if proposal.maturity_block == 0
-        && proposal.votes.len() >= config.threshold as usize
-    {
+    if proposal.maturity_block == 0 && proposal.votes.len() >= config.threshold as usize {
         let current_block = chain_store
             .get_head_block()
             .map_err(|e| SystemContractError::Storage(e.to_string()))?
@@ -2107,9 +2102,7 @@ mod tests {
     #[test]
     fn set_guardians_rejects_too_many() {
         let owner = Address::from([0x36; 20]);
-        let guardians: Vec<Address> = (1u8..=6)
-            .map(|i| Address::from([i; 20]))
-            .collect();
+        let guardians: Vec<Address> = (1u8..=6).map(|i| Address::from([i; 20])).collect();
         let (mut ws, cs) = setup_account_manager();
         let calldata = encode_set_guardians_calldata(&guardians, 1, 100);
         let err = execute_system_contract_call(
@@ -2135,28 +2128,16 @@ mod tests {
 
         // Set up guardian config with 2-of-2, timelock=100
         let calldata = encode_set_guardians_calldata(&[g1, g2], 2, 100);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &owner,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
 
         let new_pubkey = b"new_pq_pubkey_bytes".to_vec();
         let new_algo = 1u8; // Dilithium3
 
         // Vote 1 (g1)
         let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &g1,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &g1, &calldata, &mut ws, &cs)
+            .unwrap();
 
         // Only 1 vote — maturity_block should still be 0
         let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
@@ -2165,14 +2146,8 @@ mod tests {
 
         // Vote 2 (g2) — threshold reached
         let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &g2,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &g2, &calldata, &mut ws, &cs)
+            .unwrap();
 
         let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
         assert_eq!(proposal.votes.len(), 2);
@@ -2189,10 +2164,7 @@ mod tests {
             &cs,
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            SystemContractError::RecoveryNotMature(100)
-        ));
+        assert!(matches!(err, SystemContractError::RecoveryNotMature(100)));
     }
 
     #[test]
@@ -2203,39 +2175,21 @@ mod tests {
 
         // Set guardians
         let calldata = encode_set_guardians_calldata(&[g1], 1, 100);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &owner,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
 
         // Vote (threshold=1 so it immediately matures in test with no head block)
         let new_pubkey = b"recovery_pubkey".to_vec();
         let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, 1);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &g1,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &g1, &calldata, &mut ws, &cs)
+            .unwrap();
 
         assert!(cs.get_recovery_proposal(&owner).unwrap().is_some());
 
         // Owner cancels
         let calldata = encode_cancel_recovery_calldata(&owner);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &owner,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
 
         assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
     }
@@ -2248,24 +2202,12 @@ mod tests {
         let (mut ws, cs) = setup_account_manager();
 
         let calldata = encode_set_guardians_calldata(&[g1], 1, 100);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &owner,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
 
         let calldata = encode_submit_recovery_calldata(&owner, b"pubkey", 1);
-        execute_system_contract_call(
-            &account_manager_address(),
-            &g1,
-            &calldata,
-            &mut ws,
-            &cs,
-        )
-        .unwrap();
+        execute_system_contract_call(&account_manager_address(), &g1, &calldata, &mut ws, &cs)
+            .unwrap();
 
         let calldata = encode_cancel_recovery_calldata(&owner);
         let err = execute_system_contract_call(

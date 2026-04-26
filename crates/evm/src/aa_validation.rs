@@ -20,8 +20,7 @@ pub const VALIDATION_GAS_CAP: u64 = 500_000;
 /// Gas budget for `IPaymaster.validatePaymasterOp` staticcall (T-7).
 pub const PAYMASTER_VALIDATE_GAS_CAP: u64 = 50_000;
 
-const VALIDATE_PAYMASTER_OP_SIGNATURE: &[u8] =
-    b"validatePaymasterOp(address,bytes,uint256,bytes)";
+const VALIDATE_PAYMASTER_OP_SIGNATURE: &[u8] = b"validatePaymasterOp(address,bytes,uint256,bytes)";
 
 const VALIDATE_TRANSACTION_SIGNATURE: &[u8] = b"validateTransaction(bytes32,bytes,bytes)";
 
@@ -440,12 +439,12 @@ fn is_magic_valid(output: &[u8]) -> bool {
 /// 1. Expiry: `session_auth.expiry_block > current_block`
 /// 2. Value cap: Σ `inner_call.value ≤ session_auth.value_cap`
 /// 3. Target: if `session_auth.target` is Some, all inner calls must target it
-/// 4. Root authorization: verify `root_signature` (from root key `root_pubkey`)
-///    over `session_auth.auth_hash(chain_id)`.
-/// 5. Session sig: verify `session_auth.session_signature` (from session_pubkey)
-///    over the tx `sender_signing_hash()`.
-///    `signed_tx.signature` is the session key's outer sig — the same bytes —
-///    so step 5 also covers the outer-tx sig check.
+/// 4. Root authorization: verify `root_signature` over `session_auth.auth_hash(chain_id)`
+///    using the root pubkey. All `ALLOWED_ALGORITHMS` are tried (root key algo is not
+///    stored separately from the pubkey bytes).
+/// 5. Session sig: verify `session_auth.session_signature` (signed by `session_pubkey`)
+///    over the tx `sender_signing_hash()`. The outer `signed_tx.signature` MUST equal
+///    `session_auth.session_signature` (same bytes and algo) to prevent injection.
 fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
     signed_tx: &SignedTransaction,
     session_auth: &SessionAuth,
@@ -491,14 +490,25 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
     }
 
     // 4. Root authorization: root_signature over session_auth.auth_hash(chain_id).
+    //
+    // The root key's algorithm is not stored separately from the pubkey bytes,
+    // so we try all ALLOWED_ALGORITHMS and accept if any succeeds. This handles
+    // the case where the root key and session key use different algorithms.
     let auth_hash = session_auth.auth_hash(signed_tx.tx.chain_id);
-    let root_sig = PQSignature::new(signed_tx.signature.sig_type, session_auth.root_signature.as_ref().to_vec());
-    let root_valid = verifier.verify(root_pubkey, auth_hash.as_bytes(), &root_sig)?;
+    let root_valid = ALLOWED_ALGORITHMS.iter().copied().any(|algo| {
+        let root_sig = PQSignature::new(algo, session_auth.root_signature.as_ref().to_vec());
+        verifier
+            .verify(root_pubkey, auth_hash.as_bytes(), &root_sig)
+            .unwrap_or(false)
+    });
     if !root_valid {
         return Err(AaValidationError::SessionRootSignatureInvalid);
     }
 
-    // 5. Session signature: session_pubkey signs sender_signing_hash().
+    // 5. Session signature: the outer tx signature IS the session signature —
+    //    both must agree on algo and bytes. This binds the session key to the
+    //    outer transaction envelope and prevents an attacker from injecting an
+    //    arbitrary outer sig while supplying a valid session_signature separately.
     let session_algo = SignatureType::from_u8(session_auth.session_algo).ok_or(
         AaValidationError::SessionKeyDisallowedAlgorithm(session_auth.session_algo),
     )?;
@@ -507,16 +517,26 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
             session_auth.session_algo,
         ));
     }
-    let session_sig = PQSignature::new(session_algo, session_auth.session_signature.as_ref().to_vec());
-    let session_valid =
-        verifier.verify(session_auth.session_pubkey.as_ref(), tx_hash.as_bytes(), &session_sig)?;
+    if signed_tx.signature.sig_type != session_algo
+        || signed_tx.signature.data.as_slice() != session_auth.session_signature.as_ref()
+    {
+        return Err(AaValidationError::SessionKeySignatureInvalid);
+    }
+    let session_sig = PQSignature::new(
+        session_algo,
+        session_auth.session_signature.as_ref().to_vec(),
+    );
+    let session_valid = verifier.verify(
+        session_auth.session_pubkey.as_ref(),
+        tx_hash.as_bytes(),
+        &session_sig,
+    )?;
     if !session_valid {
         return Err(AaValidationError::SessionKeySignatureInvalid);
     }
 
     Ok(())
 }
-
 
 ///
 /// The call runs against a world-state snapshot; the snapshot is discarded
@@ -612,11 +632,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
             };
             // Return value is `bool accepted` ABI-encoded as a 32-byte word.
             // The boolean true is represented as ...0001 (low byte = 1).
-            let accepted = bytes
-                .last()
-                .copied()
-                .map(|b| b == 1)
-                .unwrap_or(false)
+            let accepted = bytes.last().copied().map(|b| b == 1).unwrap_or(false)
                 && bytes
                     .get(..bytes.len().saturating_sub(1))
                     .map(|s| s.iter().all(|b| *b == 0))
@@ -633,11 +649,9 @@ fn call_paymaster_validate<S: KvStore + 'static>(
                 hex::encode(output)
             )))
         }
-        ExecutionResult::Halt { reason, .. } => {
-            Err(AaValidationError::PaymasterValidationFailed(format!(
-                "halted: {reason:?}"
-            )))
-        }
+        ExecutionResult::Halt { reason, .. } => Err(AaValidationError::PaymasterValidationFailed(
+            format!("halted: {reason:?}"),
+        )),
     }
 }
 
@@ -703,7 +717,6 @@ fn encode_validate_paymaster_op_calldata(
 
     out
 }
-
 
 struct ValidationStateDb<S: KvStore + 'static> {
     inner: ShellStateDb<S>,

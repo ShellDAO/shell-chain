@@ -427,9 +427,7 @@ impl SessionAuth {
     /// `blake3(SESSION_AUTH_HASH_DOMAIN || session_pubkey || target (20B|zero) || value_cap (32B BE) || expiry_block (8B BE) || chain_id (8B BE))`
     pub fn auth_hash(&self, chain_id: u64) -> ShellHash {
         use shell_primitives::blake3_hash;
-        let mut preimage = Vec::with_capacity(
-            1 + self.session_pubkey.len() + 20 + 32 + 8 + 8,
-        );
+        let mut preimage = Vec::with_capacity(1 + self.session_pubkey.len() + 20 + 32 + 8 + 8);
         preimage.push(SESSION_AUTH_HASH_DOMAIN);
         preimage.extend_from_slice(self.session_pubkey.as_ref());
         match &self.target {
@@ -452,7 +450,11 @@ impl SessionAuth {
         };
         let value_buf = self.value_cap.to_be_bytes::<32>();
         // Trim leading zeros for compact encoding.
-        let trimmed = value_buf.iter().position(|&b| b != 0).map(|i| &value_buf[i..]).unwrap_or(&value_buf[31..]);
+        let trimmed = value_buf
+            .iter()
+            .position(|&b| b != 0)
+            .map(|i| &value_buf[i..])
+            .unwrap_or(&value_buf[31..]);
         let value_len = trimmed.length();
         let expiry_len = self.expiry_block.length();
         let root_sig_len = self.root_signature.as_ref().length();
@@ -463,17 +465,27 @@ impl SessionAuth {
 
 impl Encodable for SessionAuth {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let header = alloy_rlp::Header { list: true, payload_length: self.fields_len() };
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.fields_len(),
+        };
         header.encode(out);
         self.session_pubkey.as_ref().encode(out);
         (self.session_algo as u64).encode(out);
         match &self.target {
             Some(addr) => addr.encode(out),
-            None => { let empty: &[u8] = &[]; empty.encode(out); }
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
         }
         // value_cap: encode as trimmed big-endian bytes
         let value_buf = self.value_cap.to_be_bytes::<32>();
-        let trimmed = value_buf.iter().position(|&b| b != 0).map(|i| &value_buf[i..]).unwrap_or(&value_buf[31..]);
+        let trimmed = value_buf
+            .iter()
+            .position(|&b| b != 0)
+            .map(|i| &value_buf[i..])
+            .unwrap_or(&value_buf[31..]);
         trimmed.encode(out);
         self.expiry_block.encode(out);
         self.root_signature.as_ref().encode(out);
@@ -482,31 +494,51 @@ impl Encodable for SessionAuth {
 
     fn length(&self) -> usize {
         let payload = self.fields_len();
-        alloy_rlp::Header { list: true, payload_length: payload }.length().saturating_add(payload)
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
     }
 }
 
 impl Decodable for SessionAuth {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let header = alloy_rlp::Header::decode(buf)?;
-        if !header.list { return Err(alloy_rlp::Error::UnexpectedString); }
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
         let remaining = buf.len();
 
         let session_pubkey = Bytes::from(alloy_rlp::Header::decode_bytes(buf, false)?.to_vec());
         let session_algo = {
             let v: u64 = Decodable::decode(buf)?;
+            if v > u8::MAX as u64 {
+                return Err(alloy_rlp::Error::Custom(
+                    "session_auth: session_algo out of range (must fit u8)",
+                ));
+            }
             v as u8
         };
         let target_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
         let target = if target_raw.is_empty() {
             None
         } else if target_raw.len() == 20 {
-            let mut arr = [0u8; 20]; arr.copy_from_slice(target_raw);
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(target_raw);
             Some(Address::from(arr))
         } else {
-            return Err(alloy_rlp::Error::Custom("session_auth: invalid target address length"));
+            return Err(alloy_rlp::Error::Custom(
+                "session_auth: invalid target address length",
+            ));
         };
         let value_bytes = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if value_bytes.len() > 32 {
+            return Err(alloy_rlp::Error::Custom(
+                "session_auth: value_cap exceeds 32 bytes",
+            ));
+        }
         let value_cap = U256::from_be_slice(value_bytes);
         let expiry_block: u64 = Decodable::decode(buf)?;
         let root_signature = Bytes::from(alloy_rlp::Header::decode_bytes(buf, false)?.to_vec());
@@ -514,9 +546,20 @@ impl Decodable for SessionAuth {
 
         let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
-            return Err(alloy_rlp::Error::ListLengthMismatch { expected: header.payload_length, got: consumed });
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
         }
-        Ok(Self { session_pubkey, session_algo, target, value_cap, expiry_block, root_signature, session_signature })
+        Ok(Self {
+            session_pubkey,
+            session_algo,
+            target,
+            value_cap,
+            expiry_block,
+            root_signature,
+            session_signature,
+        })
     }
 }
 
@@ -680,7 +723,17 @@ impl AaBundle {
         }
 
         // Paymaster type dispatch: sig XOR context.
-        match (&self.paymaster, &self.paymaster_signature, &self.paymaster_context) {
+        //
+        // Note: empty `paymaster_context` (`Some([])`) is treated as absent (same
+        // as `None`) because RLP encodes empty bytes → empty string → decoded back
+        // as `None` in `Decodable::decode`. Contract paymasters that need no
+        // context must use a single-byte sentinel (e.g. `0x00`) or any non-empty
+        // byte slice to distinguish from the no-paymaster case.
+        match (
+            &self.paymaster,
+            &self.paymaster_signature,
+            &self.paymaster_context,
+        ) {
             // Self-pay: no paymaster.
             (None, None, None) => {}
             // EOA paymaster (Phase 1): sig present, no context.
@@ -697,7 +750,9 @@ impl AaBundle {
             }
             // Both sig and context: invalid.
             (Some(_), Some(_), Some(_)) => {
-                return Err("aa bundle: paymaster_signature and paymaster_context are mutually exclusive");
+                return Err(
+                    "aa bundle: paymaster_signature and paymaster_context are mutually exclusive",
+                );
             }
             // Orphan sig or context without paymaster address.
             (None, Some(_), _) => {

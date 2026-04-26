@@ -132,9 +132,9 @@ mod prefix {
     pub const PUBKEY_BY_ADDR: &[u8] = b"pk/";
     /// Address → tx_hash index: key = "a/" + address(20) + block_number(8) + tx_index(4)
     pub const ADDR_TX_INDEX: &[u8] = b"a/";
-    /// Guardian config: key = "gc/" + address(20) → CBOR-encoded GuardianConfig
+    /// Guardian config: key = "gc/" + address(20) → JSON-encoded GuardianConfig
     pub const GUARDIAN_CONFIG: &[u8] = b"gc/";
-    /// Active recovery proposal: key = "rp/" + address(20) → CBOR-encoded RecoveryProposal
+    /// Active recovery proposal: key = "rp/" + address(20) → JSON-encoded RecoveryProposal
     pub const RECOVERY_PROPOSAL: &[u8] = b"rp/";
 }
 
@@ -732,8 +732,9 @@ impl<S: KvStore> ChainStore<S> {
         config: &GuardianConfig,
     ) -> Result<(), StorageError> {
         let encoded =
-            serde_json::to_vec(config).map_err(|e| StorageError::Codec(e.to_string()))?;
-        self.store.put(&Self::guardian_config_key(account), &encoded)
+            serde_json::to_vec(config).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.store
+            .put(&Self::guardian_config_key(account), &encoded)
     }
 
     /// Retrieve the guardian configuration for an account.
@@ -758,7 +759,7 @@ impl<S: KvStore> ChainStore<S> {
         proposal: &RecoveryProposal,
     ) -> Result<(), StorageError> {
         let encoded =
-            serde_json::to_vec(proposal).map_err(|e| StorageError::Codec(e.to_string()))?;
+            serde_json::to_vec(proposal).map_err(|e| StorageError::Serialization(e.to_string()))?;
         self.store
             .put(&Self::recovery_proposal_key(account), &encoded)
     }
