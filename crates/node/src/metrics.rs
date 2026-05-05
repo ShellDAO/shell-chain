@@ -55,6 +55,12 @@ pub struct Metrics {
     pub stark_amendments_broadcast: IntCounter,
     /// Total equivocation proofs detected and broadcast.
     pub stark_equivocations_detected: IntCounter,
+    /// Number of STARK settlements accepted and included in a produced block.
+    pub stark_settlements_accepted: IntCounter,
+    /// Number of STARK amendments rejected during validation.
+    pub stark_settlements_rejected: IntCounter,
+    /// Current frontier lag: how many L0 blocks are not yet settled at L1.
+    pub stark_frontier_lag: IntGauge,
     /// Timestamp when the node started, used for uptime calculation.
     pub uptime_start: Instant,
     // -----------------------------------------------------------------------
@@ -161,6 +167,18 @@ impl Metrics {
             "shell_stark_equivocations_detected_total",
             "Total equivocation proofs detected and broadcast",
         ))?;
+        let stark_settlements_accepted = IntCounter::with_opts(Opts::new(
+            "shell_stark_settlements_accepted_total",
+            "Number of STARK settlements accepted and included in a produced block",
+        ))?;
+        let stark_settlements_rejected = IntCounter::with_opts(Opts::new(
+            "shell_stark_settlements_rejected_total",
+            "Number of STARK amendments rejected during validation",
+        ))?;
+        let stark_frontier_lag = IntGauge::with_opts(Opts::new(
+            "shell_stark_frontier_lag",
+            "Current frontier lag: how many L0 blocks are not yet settled at L1",
+        ))?;
 
         // ops-metrics: per-CF storage size
         let storage_cf_size = GaugeVec::new(
@@ -201,6 +219,9 @@ impl Metrics {
         registry.register(Box::new(stark_backlog_depth.clone()))?;
         registry.register(Box::new(stark_amendments_broadcast.clone()))?;
         registry.register(Box::new(stark_equivocations_detected.clone()))?;
+        registry.register(Box::new(stark_settlements_accepted.clone()))?;
+        registry.register(Box::new(stark_settlements_rejected.clone()))?;
+        registry.register(Box::new(stark_frontier_lag.clone()))?;
         registry.register(Box::new(storage_cf_size.clone()))?;
         registry.register(Box::new(rpc_request_duration_seconds.clone()))?;
 
@@ -223,6 +244,9 @@ impl Metrics {
             stark_backlog_depth,
             stark_amendments_broadcast,
             stark_equivocations_detected,
+            stark_settlements_accepted,
+            stark_settlements_rejected,
+            stark_frontier_lag,
             uptime_start: Instant::now(),
             storage_cf_size,
             rpc_request_duration_seconds,

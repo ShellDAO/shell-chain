@@ -155,6 +155,7 @@ impl<S: KvStore + 'static> Node<S> {
         amendment: &ProofAmendment,
     ) -> Result<(), NodeError> {
         self.validate_stark_amendment_ordering_with_overlay(amendment, &HashMap::new())
+            .inspect_err(|_| self.metrics.stark_settlements_rejected.inc())
     }
 
     pub(crate) fn validate_stark_settlement_sequence(
@@ -163,7 +164,8 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<(), NodeError> {
         let mut overlay = HashMap::new();
         for amendment in amendments {
-            self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay)?;
+            self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay)
+                .inspect_err(|_| self.metrics.stark_settlements_rejected.inc())?;
             for source in amendment.covered_hashes() {
                 overlay.insert(source, amendment.layer);
             }
@@ -333,13 +335,15 @@ impl<S: KvStore + 'static> Node<S> {
         if let Some(layer) = overlay_layers.get(source_hash) {
             return Ok(*layer);
         }
-        let settled_layer = self
-            .settled_stark_sources
-            .lock()
-            .iter()
-            .filter_map(|(layer, source)| (source == source_hash).then_some(*layer))
-            .max()
-            .unwrap_or(0);
+        // Check layers 1, 2, 3 from highest to lowest for the given source_hash.
+        // The in-memory set is always authoritative; the index is the durable backup.
+        let settled_layer = {
+            let lock = self.settled_stark_sources.lock();
+            (1u32..=3)
+                .rev()
+                .find(|&l| lock.contains(&(l, *source_hash)))
+                .unwrap_or(0)
+        };
         if settled_layer > 0 {
             return Ok(settled_layer);
         }

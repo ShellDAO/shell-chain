@@ -105,6 +105,10 @@ pub struct RpcTransaction {
     pub original_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compressed_size: Option<String>,
+    /// Decoded proof amendment input for `StarkReward` transactions.
+    /// `None` for all other transaction types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoded_input: Option<serde_json::Value>,
 }
 
 /// Lightweight transaction response for explorer block rows.
@@ -533,6 +537,7 @@ mod tests {
             reward_source_hash: None,
             original_size: None,
             compressed_size: None,
+            decoded_input: None,
         };
 
         let json = serde_json::to_value(&tx).unwrap();
@@ -596,6 +601,7 @@ mod tests {
             reward_source_hash: None,
             original_size: None,
             compressed_size: None,
+            decoded_input: None,
         };
 
         let json = serde_json::to_value(&tx).unwrap();
@@ -647,6 +653,7 @@ mod tests {
             reward_source_hash: None,
             original_size: None,
             compressed_size: None,
+            decoded_input: None,
         };
 
         let json = serde_json::to_string(&tx).unwrap();
@@ -688,6 +695,7 @@ mod tests {
             reward_source_hash: None,
             original_size: None,
             compressed_size: None,
+            decoded_input: None,
         };
 
         let json = serde_json::to_value(&tx).unwrap();

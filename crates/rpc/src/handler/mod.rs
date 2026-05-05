@@ -1087,13 +1087,27 @@ pub(crate) fn tx_to_rpc(
         reward_source_hash: None,
         original_size: None,
         compressed_size: None,
+        decoded_input: None,
     }
+}
+
+/// Attempt to decode a proof payload as a JSON-structured `ProofAmendment`.
+///
+/// Returns `Some(serde_json::Value)` when the payload is valid JSON; `None` otherwise.
+/// Used to populate the `decoded_input` field on `StarkReward` RPC transactions.
+pub(crate) fn decode_proof_amendment_input(payload: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(payload).ok()
 }
 
 pub(crate) fn system_tx_to_rpc(
     tx: &SystemTransaction,
     block_hash: Option<ShellHash>,
 ) -> RpcTransaction {
+    let decoded_input = tx
+        .proof_payload
+        .as_ref()
+        .filter(|_| tx.kind == shell_core::SystemTxKind::StarkReward)
+        .and_then(|payload| decode_proof_amendment_input(payload.as_ref()));
     RpcTransaction {
         hash: tx.hash(),
         block_hash,
@@ -1126,6 +1140,7 @@ pub(crate) fn system_tx_to_rpc(
         reward_source_hash: Some(tx.source_hash),
         original_size: tx.original_size.map(hex_u64),
         compressed_size: tx.compressed_size.map(hex_u64),
+        decoded_input,
     }
 }
 

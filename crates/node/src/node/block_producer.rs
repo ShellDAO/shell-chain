@@ -296,6 +296,7 @@ impl<S: KvStore + 'static> Node<S> {
             let reward_hash = reward_tx.hash();
             system_txs.push(reward_tx);
             settled_stark_artifacts.push((amendment.clone(), reward_hash));
+            self.metrics.stark_settlements_accepted.inc();
             settled_stark_proofs.push(amendment);
         }
         header.extra_data = Bytes::default();
@@ -416,6 +417,11 @@ impl<S: KvStore + 'static> Node<S> {
                     .into_iter()
                     .map(move |source| (amendment.layer, source))
             }));
+        for amendment in settled_stark_proofs.iter() {
+            for source in amendment.covered_hashes() {
+                let _ = self.settled_source_index.put(amendment.layer, &source);
+            }
+        }
         self.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.

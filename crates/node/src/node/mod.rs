@@ -36,8 +36,8 @@ pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
-    validator_registry_addr, BodyPruner, ChainStore, KvStore, ProofAmendmentStore, StatePruner,
-    WitnessPruner, WitnessStore, WorldState,
+    validator_registry_addr, BodyPruner, ChainStore, KvStore, ProofAmendmentStore,
+    SettledSourceIndex, StatePruner, WitnessPruner, WitnessStore, WorldState,
 };
 
 pub(crate) use crate::config::NodeConfig;
@@ -84,6 +84,9 @@ pub struct Node<S: KvStore + 'static> {
     pub proof_backlog: Arc<parking_lot::Mutex<ProofBacklog>>,
     /// G5: Stores async STARK proof amendments received from the network.
     pub amendment_store: ProofAmendmentStore<S>,
+    /// Persistent index of settled (layer, source_hash) pairs. Written on every
+    /// settlement; loaded at startup to skip the O(n-blocks) chain rebuild.
+    settled_source_index: SettledSourceIndex<S>,
     /// Compression-valid STARK proof amendments waiting to be settled in the
     /// next locally produced block.
     pending_stark_settlements: Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
@@ -171,6 +174,7 @@ impl<S: KvStore + 'static> Node<S> {
         let stark_aggregation = config.enable_stark_aggregation;
         let metrics = Arc::new(Metrics::new().expect("failed to register Prometheus metrics"));
         let amendment_store = ProofAmendmentStore::new(store.clone());
+        let settled_source_index = SettledSourceIndex::new(store.clone());
 
         // F-094: Recover finalized state from persistent storage on restart.
         let (fin_number, fin_hash) = {
@@ -221,6 +225,7 @@ impl<S: KvStore + 'static> Node<S> {
             stark_aggregation,
             proof_backlog: Arc::new(parking_lot::Mutex::new(ProofBacklog::new())),
             amendment_store,
+            settled_source_index,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
             prover_service_handle: parking_lot::Mutex::new(None),
@@ -1506,6 +1511,94 @@ mod tests {
         assert_eq!(settlements.len(), 2);
         assert_eq!(settlements[0].layer, 1);
         assert_eq!(settlements[1].layer, 2);
+    }
+
+    #[test]
+    fn stark_settled_index_survives_simulated_restart() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+
+        // Apply a STARK settlement via block production.
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+        node.pending_stark_settlements.lock().push(amendment.clone());
+        node.produce_block(&signer, 100).unwrap();
+
+        // Verify settled_stark_sources was populated.
+        assert!(
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, genesis_hash)),
+            "genesis hash should be settled at L1"
+        );
+        assert!(
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, hashes[0])),
+            "block 1 should be settled at L1"
+        );
+        assert!(
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, hashes[1])),
+            "block 2 should be settled at L1"
+        );
+
+        // Simulate restart: clear in-memory set and reload via index (fast path).
+        node.settled_stark_sources.lock().clear();
+        assert!(
+            node.settled_stark_sources.lock().is_empty(),
+            "cleared before rebuild"
+        );
+        let count = node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(count, 3, "fast path should restore 3 settled entries");
+
+        // After rebuild, settled_stark_sources should contain all three sources.
+        assert!(
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, genesis_hash)),
+            "genesis hash should be restored after restart"
+        );
+        assert!(
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, hashes[0])),
+            "block 1 should be restored after restart"
+        );
+
+        // Verify that a duplicate settlement would be rejected.
+        node.pending_stark_settlements.lock().push(amendment);
+        let dup_err = node.validate_stark_amendment_ordering(&ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: hashes[1],
+            block_number: 2,
+            start_block: Some(0),
+            proof: shell_stark_prover::proof::SigBatchProof {
+                version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
+                batch_root_bytes: [0x22; 16],
+                n_sigs: MIN_L1_STARK_TXS,
+                proof_bytes: vec![0x33; 128],
+            },
+            prover: Address::from([0x44; 20]),
+            prover_signature: Bytes::from(vec![0x55; 8]),
+            layer: 1,
+            source_hashes: vec![genesis_hash, hashes[0], hashes[1]],
+            original_size: Some(10_000),
+            compressed_size: Some(128),
+            settlement_tx_hash: None,
+        });
+        // The duplicate settlement should fail because the sources are already
+        // settled at L1 (current_layer >= amendment.layer).
+        assert!(
+            dup_err.is_err(),
+            "duplicate settlement should be rejected, got: {dup_err:?}"
+        );
     }
 
     #[test]

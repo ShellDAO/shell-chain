@@ -609,6 +609,11 @@ impl<S: KvStore + 'static> Node<S> {
                     .into_iter()
                     .map(move |source| (amendment.layer, source))
             }));
+        for amendment in stark_settlements.iter() {
+            for source in amendment.covered_hashes() {
+                let _ = self.settled_source_index.put(amendment.layer, &source);
+            }
+        }
         self.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
         for (address, pubkey) in new_pubkeys {
             self.chain_store.put_pubkey(&address, &pubkey)?;

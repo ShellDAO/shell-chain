@@ -1338,6 +1338,76 @@ impl<S: KvStore> ProofAmendmentStore<S> {
     }
 }
 
+// ── SettledSourceIndex ─────────────────────────────────────────────────────
+
+/// Persistent index of settled (layer, source_hash) pairs.
+///
+/// Keyed as `ss/{layer_be4}{source_hash_32bytes}` → `[1u8]`.
+/// Provides O(1) containment check and O(prefix-scan) enumeration — much
+/// faster than rebuilding by scanning all block settlement transactions.
+pub struct SettledSourceIndex<S: KvStore> {
+    store: Arc<S>,
+}
+
+impl<S: KvStore> Clone for SettledSourceIndex<S> {
+    fn clone(&self) -> Self {
+        Self { store: Arc::clone(&self.store) }
+    }
+}
+
+/// Key prefix for the settled-source index (`ss/`).
+const SS_PREFIX: &[u8] = b"ss/";
+
+impl<S: KvStore> SettledSourceIndex<S> {
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
+    }
+
+    fn key(layer: u32, hash: &ShellHash) -> Vec<u8> {
+        let mut k = SS_PREFIX.to_vec();
+        k.extend_from_slice(&layer.to_be_bytes());
+        k.extend_from_slice(hash.as_bytes());
+        k
+    }
+
+    /// Record that `(layer, hash)` has been settled.
+    pub fn put(&self, layer: u32, hash: &ShellHash) -> Result<(), StorageError> {
+        self.store.put(&Self::key(layer, hash), &[1u8])
+    }
+
+    /// Returns true if `(layer, hash)` is recorded as settled.
+    pub fn has(&self, layer: u32, hash: &ShellHash) -> Result<bool, StorageError> {
+        Ok(self.store.get(&Self::key(layer, hash))?.is_some())
+    }
+
+    /// Return all (layer, hash) entries. Used at startup to fast-load the
+    /// in-memory `settled_stark_sources` set without a full chain scan.
+    pub fn all_entries(&self) -> Result<Vec<(u32, ShellHash)>, StorageError> {
+        let raw = self.store.scan_prefix(SS_PREFIX)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (key, _) in raw {
+            // key = b"ss/" (3) + layer_be4 (4) + hash (32)
+            if key.len() != SS_PREFIX.len() + 4 + 32 {
+                continue;
+            }
+            let layer = u32::from_be_bytes(
+                key[SS_PREFIX.len()..SS_PREFIX.len() + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let hash_bytes: [u8; 32] = key[SS_PREFIX.len() + 4..].try_into().unwrap();
+            out.push((layer, ShellHash::from(hash_bytes)));
+        }
+        Ok(out)
+    }
+
+    /// Return true if any entry exists (used to detect whether the index is
+    /// populated or whether a full chain-rebuild is needed).
+    pub fn is_populated(&self) -> Result<bool, StorageError> {
+        Ok(!self.store.scan_prefix(SS_PREFIX)?.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1496,6 +1496,26 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     pub(crate) fn rebuild_settled_stark_sources_from_chain(&self) -> Result<usize, NodeError> {
+        // Fast path: load from the persistent index if it has been populated.
+        let index_entries = self.settled_source_index.all_entries()?;
+        if !index_entries.is_empty() {
+            let mut settled = self.settled_stark_sources.lock();
+            settled.clear();
+            let count = index_entries.len();
+            let l1_count = index_entries.iter().filter(|(l, _)| *l == 1).count() as i64;
+            settled.extend(index_entries);
+            let head = self
+                .chain_store
+                .get_head_block()?
+                .map(|block| block.number())
+                .unwrap_or(0);
+            let lag = (head as i64 + 1).saturating_sub(l1_count).max(0);
+            self.metrics.stark_frontier_lag.set(lag);
+            return Ok(count);
+        }
+
+        // Slow path: rebuild by scanning every block (first run / index missing).
+        // Backfill the index as we go so subsequent restarts use the fast path.
         let head = self
             .chain_store
             .get_head_block()?
@@ -1526,11 +1546,15 @@ impl<S: KvStore + 'static> Node<S> {
                 self.store_stark_artifacts(&amendment, settlement_tx_hash)?;
                 for source in amendment.covered_hashes() {
                     if settled.insert((amendment.layer, source)) {
+                        let _ = self.settled_source_index.put(amendment.layer, &source);
                         rebuilt += 1;
                     }
                 }
             }
         }
+        let l1_count = settled.iter().filter(|(l, _)| *l == 1).count() as i64;
+        let lag = (head as i64 + 1).saturating_sub(l1_count).max(0);
+        self.metrics.stark_frontier_lag.set(lag);
         Ok(rebuilt)
     }
 
