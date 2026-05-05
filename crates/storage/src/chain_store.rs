@@ -1351,7 +1351,9 @@ pub struct SettledSourceIndex<S: KvStore> {
 
 impl<S: KvStore> Clone for SettledSourceIndex<S> {
     fn clone(&self) -> Self {
-        Self { store: Arc::clone(&self.store) }
+        Self {
+            store: Arc::clone(&self.store),
+        }
     }
 }
 

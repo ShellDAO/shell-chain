@@ -1526,7 +1526,9 @@ mod tests {
 
         // Apply a STARK settlement via block production.
         let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
-        node.pending_stark_settlements.lock().push(amendment.clone());
+        node.pending_stark_settlements
+            .lock()
+            .push(amendment.clone());
         node.produce_block(&signer, 100).unwrap();
 
         // Verify settled_stark_sources was populated.
@@ -1537,15 +1539,11 @@ mod tests {
             "genesis hash should be settled at L1"
         );
         assert!(
-            node.settled_stark_sources
-                .lock()
-                .contains(&(1, hashes[0])),
+            node.settled_stark_sources.lock().contains(&(1, hashes[0])),
             "block 1 should be settled at L1"
         );
         assert!(
-            node.settled_stark_sources
-                .lock()
-                .contains(&(1, hashes[1])),
+            node.settled_stark_sources.lock().contains(&(1, hashes[1])),
             "block 2 should be settled at L1"
         );
 
@@ -1566,9 +1564,7 @@ mod tests {
             "genesis hash should be restored after restart"
         );
         assert!(
-            node.settled_stark_sources
-                .lock()
-                .contains(&(1, hashes[0])),
+            node.settled_stark_sources.lock().contains(&(1, hashes[0])),
             "block 1 should be restored after restart"
         );
 
