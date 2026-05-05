@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] — 2026-05-06 — Stability, STARK hardening, and ops maturity
+
+### Added
+
+- **Durable STARK settled-source index** (`ss/` key prefix): settled `(layer,
+  source_hash)` pairs are now written to persistent storage on every settlement.
+  Node restart loads from the index in O(prefix-scan) instead of scanning all
+  blocks; first-run backfills the index automatically from chain history.
+- **O(3) `compression_layer_for_source` lookup**: replaced O(n-settled) linear
+  scan with a constant-cost check across layers 1–3, eliminating the
+  performance cliff as the settled set grows.
+- **Proof input decode in RPC**: `system_tx_to_rpc` now decodes `StarkReward`
+  transaction payloads into a structured `decodedInput` JSON field (block
+  range, layer, entry count, compression sizes, settlement tx hash).
+- **Settlement liveness metrics**: added Prometheus counters/gauges
+  `shell_stark_settlements_accepted_total`, `shell_stark_settlements_rejected_total`,
+  and `shell_stark_frontier_lag`.
+- **`SettledSourceIndex`** re-exported from `shell-storage` for use by
+  downstream tooling and tests.
+- **Restart-recovery tests**: `stark_settled_index_survives_simulated_restart`
+  and `import_invalid_stark_settlement_does_not_poison_settled_index`.
+
+### Changed
+
+- Settlement validation now increments `stark_settlements_rejected` on any
+  ordering/layer/frontier rejection, enabling ops monitoring of invalid proof
+  traffic.
+- `rebuild_settled_stark_sources_from_chain()` uses the persistent index as a
+  fast path; falls back to chain scan only when index is absent (upgrade path).
+
 ## [0.21.1] — 2026-05-06 — STARK settlement hardening patch
 
 ### Fixed
