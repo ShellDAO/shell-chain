@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.1] — 2026-05-06 — STARK settlement hardening patch
+
+### Fixed
+
+- Harden STARK settlement/reward handling so proof payloads are carried by
+  canonical `StarkReward` system transactions and imported blocks materialize
+  proof pointers consistently.
+- Preserve legacy block RLP compatibility for pre-`system_transactions` blocks
+  with non-empty proposer seals.
+- Prevent STARK prover backlog stalls on long low-entry L1 ranges at the
+  configured max-source window.
+- Align node tests with current system reward receipts, continuous STARK
+  frontier ranges, and 2s testnet block cadence.
+
 ## [0.21.0] — 2026-05-02 — F-PQ1-ONLY + F-FORK-FINALITY
 
 ### Breaking Changes
