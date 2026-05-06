@@ -1300,6 +1300,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fips204"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2",
+ "sha3",
+ "zeroize",
+]
+
+[[package]]
 name = "fixed-hash"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2203,15 +2215,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openssl"
-version = "0.10.78"
+version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
+checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
 dependencies = [
  "bitflags",
  "cfg-if",
  "foreign-types",
  "libc",
- "once_cell",
  "openssl-macros",
  "openssl-sys",
 ]
@@ -2235,9 +2246,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.114"
+version = "0.9.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ce1245cd07fcc4cfdb438f7507b0c7e4f3849a69fd84d52374c66d83741bb6"
+checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
 dependencies = [
  "cc",
  "libc",
@@ -3346,10 +3357,11 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.17.0"
+version = "0.22.0"
 dependencies = [
  "alloy-rlp",
  "serde",
+ "serde_json",
  "shell-crypto",
  "shell-primitives",
  "thiserror",
@@ -3358,15 +3370,17 @@ dependencies = [
 
 [[package]]
 name = "shell-crypto"
-version = "0.17.0"
+version = "0.22.0"
 dependencies = [
  "alloy-rlp",
+ "fips204",
  "hex",
  "pqcrypto-dilithium",
  "pqcrypto-sphincsplus",
  "pqcrypto-traits",
  "rayon",
  "serde",
+ "serde_json",
  "shell-primitives",
  "thiserror",
  "zeroize",
@@ -3374,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "shell-evm"
-version = "0.17.0"
+version = "0.22.0"
 dependencies = [
  "alloy-primitives",
  "hex",
@@ -3392,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "shell-primitives"
-version = "0.17.0"
+version = "0.22.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3406,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "shell-storage"
-version = "0.17.0"
+version = "0.22.0"
 dependencies = [
  "alloy-rlp",
  "base64",
