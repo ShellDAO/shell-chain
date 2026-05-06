@@ -272,6 +272,19 @@ impl ProofBacklog {
         self.total_completed
     }
 
+    /// Return the minimum block number among all pending tasks for the given layer,
+    /// or `None` if no tasks for that layer are queued.
+    ///
+    /// Used by the frontier seeding logic to avoid displacing already-queued
+    /// lower-numbered tasks with `push_front`.
+    pub fn min_block_number_for_layer(&self, layer: u32) -> Option<u64> {
+        self.pending
+            .iter()
+            .filter(|t| t.layer == layer)
+            .map(|t| t.block_number)
+            .min()
+    }
+
     /// Drain all pending tasks, returning them in FIFO order.
     ///
     /// Useful for graceful shutdown — the caller can persist or re-queue tasks.

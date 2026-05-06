@@ -50,7 +50,7 @@ pub(crate) use readiness::{ProductionReadiness, ProductionReadinessState};
 
 pub(crate) use shell_stark_prover::{
     prover::{verify_sig_batch, SigBatchEntry},
-    ProofAmendment, ProofBacklog, ProofTask, MIN_L1_STARK_TXS,
+    ProofAmendment, ProofBacklog, ProofTask, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
 };
 
 /// A running shell-chain node.
