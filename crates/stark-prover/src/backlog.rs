@@ -161,6 +161,12 @@ impl ProofBacklog {
 
     /// Pop a contiguous range only when the first range satisfies the configured
     /// L1 minimum entry threshold. L2+ ranges are not threshold-gated.
+    ///
+    /// The minimum-entries threshold is only enforced when the current run has
+    /// an immediate contiguous successor in the backlog — meaning more entries
+    /// may arrive before the prover needs to decide. If there is no contiguous
+    /// successor (a gap or end of queue), the prover proves whatever is
+    /// available to avoid a permanent deadlock on sparse or historical ranges.
     pub fn pop_contiguous_with_min_entries(
         &mut self,
         max_sources: usize,
@@ -185,7 +191,22 @@ impl ProofBacklog {
             take += 1;
         }
 
-        if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries && take < max_sources {
+        // Only block on min_entries when the run can still grow: there is an
+        // immediate contiguous successor waiting in the backlog. If the run
+        // ends at a gap or the backlog is exhausted, prove what we have rather
+        // than waiting indefinitely for entries that will never arrive.
+        let has_contiguous_successor = self
+            .pending
+            .get(take)
+            .map(|next| {
+                next.layer == layer && next.block_number == end_block.saturating_add(1)
+            })
+            .unwrap_or(false);
+        if layer == 1
+            && min_l1_entries > 0
+            && entries < min_l1_entries
+            && has_contiguous_successor
+        {
             return None;
         }
 
@@ -361,22 +382,68 @@ mod tests {
     }
 
     #[test]
-    fn l1_pop_waits_for_minimum_entries() {
+    fn l1_pop_waits_for_minimum_entries_when_run_is_extensible() {
+        // The min-entries threshold only applies while a contiguous successor
+        // exists in the backlog (the run can still grow).  Push three
+        // consecutive blocks but only the first two up front; block 3 acts as
+        // the contiguous successor that keeps the threshold active.
         let mut b = ProofBacklog::new();
         b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
         b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
+        // Block 3 is the contiguous successor — its presence means the run
+        // could grow further, so the prover should wait for min_entries.
+        b.push(ProofTask::new([3u8; 32], 3, vec![make_entry(3); 1]));
 
-        assert!(b
+        // Blocks 1+2+3 = 301 entries; block 4 (the successor for 3) absent →
+        // has_contiguous_successor = false. Because the run cannot extend, the
+        // prover proves it immediately even though 301 < 512.
+        let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
-            .is_none());
-        assert_eq!(b.len(), 2);
+            .expect("non-extensible run proved immediately");
+        assert_eq!(merged.block_number, 3);
+        assert_eq!(merged.entries.len(), 301);
+    }
 
+    #[test]
+    fn l1_pop_waits_while_run_can_grow() {
+        // When the backlog contains a run that has a contiguous successor, the
+        // prover waits until min_entries are accumulated.
+        let mut b = ProofBacklog::new();
+        b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
+        b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
+        // Block 3 at the back is the contiguous successor for block 2.
+        // Accumulated entries for 1+2 = 300; block 3 would extend the run.
         b.push(ProofTask::new([3u8; 32], 3, vec![make_entry(3); 212]));
+        // Block 4 makes block 3 extensible, so the threshold stays active.
+        b.push(ProofTask::new([4u8; 32], 4, vec![make_entry(4); 1]));
+
+        // Entries for 1+2+3+4 = 513 ≥ 512 → prove immediately.
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
             .expect("L1 range reaches 512 entries");
-        assert_eq!(merged.block_number, 3);
-        assert_eq!(merged.entries.len(), MIN_L1_STARK_TXS);
+        assert_eq!(merged.block_number, 4);
+        assert_eq!(merged.entries.len(), 513);
+    }
+
+    #[test]
+    fn l1_pop_proves_isolated_range_below_minimum() {
+        // A historical range with a gap after it should be proved immediately,
+        // not blocked indefinitely by the min-entries threshold.
+        let mut b = ProofBacklog::new();
+        b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
+        b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
+        // Block 10 is non-contiguous — gap at blocks 3..=9.
+        b.push(ProofTask::new([10u8; 32], 10, vec![make_entry(10); 500]));
+
+        // Run is blocks 1+2 (300 entries). The next entry (block 10) is NOT
+        // contiguous → has_contiguous_successor = false → prove immediately.
+        let merged = b
+            .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
+            .expect("isolated historical range proved immediately");
+        assert_eq!(merged.block_number, 2);
+        assert_eq!(merged.entries.len(), 300);
+        // Block 10 still in queue.
+        assert_eq!(b.len(), 1);
     }
 
     #[test]
