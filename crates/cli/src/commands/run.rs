@@ -346,7 +346,7 @@ async fn run_with_store<S: KvStore + 'static>(
 
     // Check if chain is already initialized (persistent storage resume).
     let chain_store = ChainStore::new(store.clone());
-    let resumed = if let Ok(Some(head)) = chain_store.get_head_block() {
+    let mut resumed = if let Ok(Some(head)) = chain_store.get_head_block() {
         info!(
             "Resuming from block #{} (state_root: {:?})",
             head.number(),
@@ -356,6 +356,77 @@ async fn run_with_store<S: KvStore + 'static>(
     } else {
         false
     };
+
+    // Recovery: HEAD key lost (unflushed memtable on ungraceful shutdown) but FINALIZED present.
+    if !resumed {
+        if let Ok(Some(fin)) = chain_store.get_finalized_number() {
+            if fin > 0 {
+                warn!("HEAD key missing but FINALIZED={fin}; attempting HEAD recovery");
+                let mut recovered = false;
+                let mut num = fin;
+                loop {
+                    if let Ok(Some(block)) = chain_store.get_block_by_number(num) {
+                        warn!(
+                            "Recovering lost HEAD from canonical block #{n} (FINALIZED was {fin})",
+                            n = num
+                        );
+                        chain_store.set_head(&block.hash())?;
+                        recovered = true;
+                        resumed = true;
+                        break;
+                    }
+                    if num == 0 {
+                        break;
+                    }
+                    num -= 1;
+                }
+                if !recovered {
+                    warn!("HEAD recovery failed: no canonical blocks found up to FINALIZED={fin}");
+                    // Clear stale FINALIZED so invariant won't fail with head=0
+                    let _ = chain_store.set_finalized_number(0);
+                }
+            }
+        }
+    }
+
+    // Recovery path 2: HEAD exists but is genesis (#0) while FINALIZED > 0.
+    // This happens when a previous failed startup wrote genesis after HEAD was lost.
+    if resumed {
+        if let (Ok(Some(head)), Ok(Some(fin))) = (
+            chain_store.get_head_block(),
+            chain_store.get_finalized_number(),
+        ) {
+            if head.number() == 0 && fin > 0 {
+                warn!("HEAD is genesis but FINALIZED={fin}; scanning for actual chain tip");
+                let mut recovered = false;
+                let mut num = fin;
+                loop {
+                    if let Ok(Some(block)) = chain_store.get_block_by_number(num) {
+                        if block.number() > 0 {
+                            warn!(
+                                "Recovering HEAD from canonical block #{n} (FINALIZED was {fin})",
+                                n = num
+                            );
+                            chain_store.set_head(&block.hash())?;
+                            recovered = true;
+                            break;
+                        }
+                    }
+                    if num == 0 {
+                        break;
+                    }
+                    num -= 1;
+                }
+                if !recovered {
+                    warn!(
+                        "HEAD recovery path 2 failed: resetting FINALIZED to avoid invariant failure"
+                    );
+                    // Clear stale FINALIZED so invariant won't fail with head=0
+                    let _ = chain_store.set_finalized_number(0);
+                }
+            }
+        }
+    }
 
     if resumed && repair_head_state_if_needed(&chain_store)? {
         if let Some(repaired_head) = chain_store.get_head_block()? {
