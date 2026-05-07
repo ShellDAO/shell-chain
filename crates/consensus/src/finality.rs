@@ -141,10 +141,10 @@ impl FinalityState {
         if total_validators <= 1 {
             return 1;
         }
-        // Use u128 intermediate to prevent overflow when total_validators is very large.
+        // Use u128 intermediate to prevent overflow when total_validators is very large;
+        // saturating_mul caps at u128::MAX rather than wrapping.
         let n = total_validators as u128;
-        usize::try_from(n.checked_mul(2).unwrap_or(u128::MAX).div_ceil(3))
-            .unwrap_or(total_validators)
+        usize::try_from(n.saturating_mul(2).div_ceil(3)).unwrap_or(total_validators)
     }
 
     /// Last finalized block number.
