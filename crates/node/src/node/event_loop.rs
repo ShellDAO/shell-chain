@@ -1009,12 +1009,17 @@ impl<S: KvStore + 'static> Node<S> {
                                     // Also check the pending queue to prevent duplicate settlements
                                     // from concurrent proof-amendment messages for the same sources.
                                     let pending_dup = if !already_settled {
+                                        // Build a set once for O(1) membership checks against
+                                        // each queued entry's covered_hashes (avoids O(n²) scans).
+                                        let covered_set: std::collections::HashSet<_> =
+                                            covered_hashes.iter().copied().collect();
                                         let pending = self.pending_stark_settlements.lock();
                                         pending.iter().any(|queued| {
                                             queued.layer == amendment.layer
-                                                && queued.covered_hashes().iter().any(|s| {
-                                                    covered_hashes.contains(s)
-                                                })
+                                                && queued
+                                                    .covered_hashes()
+                                                    .iter()
+                                                    .any(|s| covered_set.contains(s))
                                         })
                                     } else {
                                         false

@@ -138,7 +138,8 @@ impl PoaConfig {
             .map(|&w| if w == 0 { 1 } else { w })
             .collect();
 
-        // Sum with overflow check; saturate to u64::MAX if weights are extreme (prevents panic).
+        // Sum with overflow check; saturate to u64::MAX if weights are extreme (prevents
+        // wraparound that would cause biased selection or division-by-zero risks).
         let total_weight: u64 = weights
             .iter()
             .try_fold(0u64, |acc, &w| acc.checked_add(w))

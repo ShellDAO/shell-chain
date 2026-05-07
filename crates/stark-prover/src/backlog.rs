@@ -207,7 +207,13 @@ impl ProofBacklog {
             .get(take)
             .map(|next| next.layer == layer && next.block_number == end_block.saturating_add(1))
             .unwrap_or(false);
-        if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries && has_contiguous_successor
+        // Also require take < max_sources: a run that has hit the capacity cap cannot
+        // grow further even if a contiguous successor exists, so it must not stall.
+        if layer == 1
+            && min_l1_entries > 0
+            && entries < min_l1_entries
+            && take < max_sources
+            && has_contiguous_successor
         {
             return None;
         }
