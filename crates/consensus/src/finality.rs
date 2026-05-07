@@ -87,7 +87,9 @@ impl FinalityState {
     /// (to prevent memory exhaustion from attestation flood attacks).
     pub fn record_attestation(&mut self, attestation: Attestation) -> bool {
         // Reject attestations for unknown blocks when at capacity.
-        if !self.pending_attestations.contains_key(&attestation.block_hash)
+        if !self
+            .pending_attestations
+            .contains_key(&attestation.block_hash)
             && self.pending_attestations.len() >= MAX_PENDING_ATTESTATION_BLOCKS
         {
             return false;
@@ -141,12 +143,8 @@ impl FinalityState {
         }
         // Use u128 intermediate to prevent overflow when total_validators is very large.
         let n = total_validators as u128;
-        usize::try_from(
-            n.checked_mul(2)
-                .unwrap_or(u128::MAX)
-                .div_ceil(3),
-        )
-        .unwrap_or(total_validators)
+        usize::try_from(n.checked_mul(2).unwrap_or(u128::MAX).div_ceil(3))
+            .unwrap_or(total_validators)
     }
 
     /// Last finalized block number.
