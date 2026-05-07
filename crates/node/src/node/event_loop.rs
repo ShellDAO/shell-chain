@@ -1686,7 +1686,7 @@ impl<S: KvStore + 'static> Node<S> {
             // next prover iteration, and we'll re-seed on the following call.
             let first_new_block = tasks[0].block_number;
             let min_existing = backlog.min_block_number_for_layer(tasks[0].layer);
-            if min_existing.map_or(true, |min| first_new_block <= min) {
+            if min_existing.is_none_or(|min| first_new_block <= min) {
                 for task in tasks.into_iter().rev() {
                     if !task
                         .source_hashes
