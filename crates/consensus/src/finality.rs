@@ -3,6 +3,11 @@ use shell_crypto::{BatchVerifier, CryptoError, PQSignature, SignatureType, Verif
 use shell_primitives::{Address, ShellHash};
 use std::collections::{HashMap, HashSet};
 
+/// Maximum number of distinct block hashes tracked in pending attestations.
+/// Limits memory exposure from attestation flood attacks: each entry is a
+/// `ShellHash → HashSet<Address>` mapping, bounded at this many unique block hashes.
+const MAX_PENDING_ATTESTATION_BLOCKS: usize = 512;
+
 /// An attestation is a validator's signed confirmation that they accept a block.
 /// Validators broadcast attestations after importing a valid block.
 /// When a BFT quorum (ceil(2N/3)) of validators attest to a block, it becomes finalized.
@@ -78,7 +83,15 @@ impl FinalityState {
     }
 
     /// Record an attestation. Returns true if this is a new (non-duplicate) attestation.
+    /// Returns false for duplicates and when the pending attestation block-set is at capacity
+    /// (to prevent memory exhaustion from attestation flood attacks).
     pub fn record_attestation(&mut self, attestation: Attestation) -> bool {
+        // Reject attestations for unknown blocks when at capacity.
+        if !self.pending_attestations.contains_key(&attestation.block_hash)
+            && self.pending_attestations.len() >= MAX_PENDING_ATTESTATION_BLOCKS
+        {
+            return false;
+        }
         let validators = self
             .pending_attestations
             .entry(attestation.block_hash)
@@ -126,7 +139,14 @@ impl FinalityState {
         if total_validators <= 1 {
             return 1;
         }
-        (total_validators.saturating_mul(2)).div_ceil(3)
+        // Use u128 intermediate to prevent overflow when total_validators is very large.
+        let n = total_validators as u128;
+        usize::try_from(
+            n.checked_mul(2)
+                .unwrap_or(u128::MAX)
+                .div_ceil(3),
+        )
+        .unwrap_or(total_validators)
     }
 
     /// Last finalized block number.

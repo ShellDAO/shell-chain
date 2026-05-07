@@ -138,7 +138,11 @@ impl PoaConfig {
             .map(|&w| if w == 0 { 1 } else { w })
             .collect();
 
-        let total_weight: u64 = weights.iter().sum();
+        // Sum with overflow check; saturate to u64::MAX if weights are extreme (prevents panic).
+        let total_weight: u64 = weights
+            .iter()
+            .try_fold(0u64, |acc, &w| acc.checked_add(w))
+            .unwrap_or(u64::MAX);
 
         // Deterministic seed from block number.
         let seed_bytes = keccak256(&block_number.to_le_bytes());
@@ -148,7 +152,7 @@ impl PoaConfig {
 
         let mut cumulative: u64 = 0;
         for (i, &w) in weights.iter().enumerate() {
-            cumulative += w;
+            cumulative = cumulative.saturating_add(w);
             if ticket < cumulative {
                 return self.authorities[i];
             }
