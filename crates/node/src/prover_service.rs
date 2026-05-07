@@ -217,9 +217,12 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             task.source_hashes.len()
         );
 
+        // Destructure task so entries can be moved into spawn_blocking while the
+        // remaining fields remain available after the await point.
+        let ProofTask { entries, source_hashes, layer, original_size, .. } = task;
+
         // Run the CPU-intensive proof generation on a blocking thread so the
         // tokio executor is not starved.
-        let entries = task.entries.clone();
         let proof_result = tokio::task::spawn_blocking(move || prove_sig_batch(&entries)).await;
 
         match proof_result {
@@ -238,18 +241,18 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     block_hash: block_hash_shell,
                     block_number,
                     start_block: block_number.checked_add(1).and_then(|end_plus_one| {
-                        end_plus_one.checked_sub(task.source_hashes.len().max(1) as u64)
+                        end_plus_one.checked_sub(source_hashes.len().max(1) as u64)
                     }),
                     proof,
                     prover_signature: Bytes::new(),
                     prover: self.prover_address,
-                    layer: task.layer,
-                    source_hashes: if task.source_hashes.is_empty() {
+                    layer,
+                    source_hashes: if source_hashes.is_empty() {
                         vec![block_hash_shell]
                     } else {
-                        task.source_hashes.clone()
+                        source_hashes
                     },
-                    original_size: task.original_size,
+                    original_size,
                     compressed_size: None,
                     settlement_tx_hash: None,
                 };

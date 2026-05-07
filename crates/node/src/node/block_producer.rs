@@ -84,8 +84,8 @@ impl<S: KvStore + 'static> Node<S> {
             witness_root: None,
         };
 
-        let mut included_txs: Vec<SignedTransaction> = Vec::new();
-        let mut receipts = Vec::new();
+        let mut included_txs: Vec<SignedTransaction> = Vec::with_capacity(256);
+        let mut receipts = Vec::with_capacity(256);
         let mut cumulative_gas: u64 = 0;
         let mut total_effective_fees = U256::ZERO;
 

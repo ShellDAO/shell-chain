@@ -5,7 +5,7 @@
 //! the prover can drain it, enabling the system to shed non-critical work or
 //! activate additional prover capacity.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use shell_primitives::ShellHash;
 
@@ -84,6 +84,10 @@ pub const DEFAULT_MAX_L1_RANGE_SOURCES: usize = 1024;
 /// depth at which it considers itself "above threshold" and signals that the
 /// prover is falling behind block production.
 ///
+/// Two O(1)/O(log n) indexes are maintained alongside the queue:
+/// - `source_index`: `(layer, source_hash)` → O(1) `contains_source` lookup.
+/// - `layer_blocks`: per-layer `BTreeSet<block_number>` → O(log n) `min_block_number_for_layer`.
+///
 /// # Thread safety
 ///
 /// `ProofBacklog` is not `Sync` — callers should wrap it in a `Mutex` or
@@ -91,6 +95,10 @@ pub const DEFAULT_MAX_L1_RANGE_SOURCES: usize = 1024;
 #[derive(Debug)]
 pub struct ProofBacklog {
     pending: VecDeque<ProofTask>,
+    /// (layer, source_hash) presence index — enables O(1) `contains_source`.
+    source_index: HashSet<(u32, ShellHash)>,
+    /// Per-layer sorted block numbers — enables O(log n) `min_block_number_for_layer`.
+    layer_blocks: BTreeMap<u32, BTreeSet<u64>>,
     /// Depth at which [`is_above_threshold`] returns `true`.
     ///
     /// [`is_above_threshold`]: ProofBacklog::is_above_threshold
@@ -113,6 +121,8 @@ impl ProofBacklog {
     pub fn with_threshold(watermark_threshold: usize) -> Self {
         Self {
             pending: VecDeque::new(),
+            source_index: HashSet::new(),
+            layer_blocks: BTreeMap::new(),
             watermark_threshold,
             total_enqueued: 0,
             total_completed: 0,
@@ -121,27 +131,23 @@ impl ProofBacklog {
 
     /// Push a new proving task onto the back of the queue.
     pub fn push(&mut self, task: ProofTask) {
+        self.index_add(&task);
         self.pending.push_back(task);
         self.total_enqueued += 1;
     }
 
     /// Push a proving task onto the front of the queue.
     pub fn push_front(&mut self, task: ProofTask) {
+        self.index_add(&task);
         self.pending.push_front(task);
         self.total_enqueued += 1;
     }
 
     /// Returns true when a pending task already covers `source_hash` at `layer`.
+    ///
+    /// O(1) — backed by an internal HashSet index.
     pub fn contains_source(&self, layer: u32, source_hash: &ShellHash) -> bool {
-        self.pending.iter().any(|task| {
-            task.layer == layer
-                && (task
-                    .source_hashes
-                    .iter()
-                    .any(|source| source == source_hash)
-                    || (task.source_hashes.is_empty()
-                        && ShellHash::from(task.block_hash) == *source_hash))
-        })
+        self.source_index.contains(&(layer, *source_hash))
     }
 
     /// Pop the next task from the front of the queue (FIFO).
@@ -149,6 +155,7 @@ impl ProofBacklog {
     /// Returns `None` when the backlog is empty.
     pub fn pop(&mut self) -> Option<ProofTask> {
         let task = self.pending.pop_front()?;
+        self.index_remove(&task);
         self.total_completed += 1;
         Some(task)
     }
@@ -212,7 +219,9 @@ impl ProofBacklog {
 
         let mut merged = self.pop()?;
         for _ in 1..take {
+            // Use direct pop_front and call index_remove so the index stays consistent.
             let next = self.pending.pop_front().expect("take checked above");
+            self.index_remove(&next);
             self.total_completed += 1;
             merged.block_hash = next.block_hash;
             merged.block_number = next.block_number;
@@ -275,14 +284,9 @@ impl ProofBacklog {
     /// Return the minimum block number among all pending tasks for the given layer,
     /// or `None` if no tasks for that layer are queued.
     ///
-    /// Used by the frontier seeding logic to avoid displacing already-queued
-    /// lower-numbered tasks with `push_front`.
+    /// O(log n) — backed by a per-layer `BTreeSet<u64>` index.
     pub fn min_block_number_for_layer(&self, layer: u32) -> Option<u64> {
-        self.pending
-            .iter()
-            .filter(|t| t.layer == layer)
-            .map(|t| t.block_number)
-            .min()
+        self.layer_blocks.get(&layer)?.first().copied()
     }
 
     /// Drain all pending tasks, returning them in FIFO order.
@@ -291,7 +295,41 @@ impl ProofBacklog {
     pub fn drain(&mut self) -> Vec<ProofTask> {
         let tasks: Vec<_> = self.pending.drain(..).collect();
         self.total_completed += tasks.len() as u64;
+        self.source_index.clear();
+        self.layer_blocks.clear();
         tasks
+    }
+
+    // ── Private index helpers ────────────────────────────────────────────────
+
+    fn index_add(&mut self, task: &ProofTask) {
+        if task.source_hashes.is_empty() {
+            self.source_index.insert((task.layer, ShellHash::from(task.block_hash)));
+        } else {
+            for sh in &task.source_hashes {
+                self.source_index.insert((task.layer, *sh));
+            }
+        }
+        self.layer_blocks
+            .entry(task.layer)
+            .or_default()
+            .insert(task.block_number);
+    }
+
+    fn index_remove(&mut self, task: &ProofTask) {
+        if task.source_hashes.is_empty() {
+            self.source_index.remove(&(task.layer, ShellHash::from(task.block_hash)));
+        } else {
+            for sh in &task.source_hashes {
+                self.source_index.remove(&(task.layer, *sh));
+            }
+        }
+        if let Some(set) = self.layer_blocks.get_mut(&task.layer) {
+            set.remove(&task.block_number);
+            if set.is_empty() {
+                self.layer_blocks.remove(&task.layer);
+            }
+        }
     }
 }
 
@@ -602,5 +640,85 @@ mod tests {
     fn custom_threshold_respected() {
         let b = ProofBacklog::with_threshold(128);
         assert_eq!(b.watermark_threshold(), 128);
+    }
+
+    // ── Index-consistency tests ──────────────────────────────────────────────
+
+    #[test]
+    fn source_index_cleared_after_pop() {
+        let mut b = ProofBacklog::new();
+        let hash = ShellHash::from([3u8; 32]);
+        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![hash], None));
+        assert!(b.contains_source(1, &hash));
+        b.pop();
+        assert!(!b.contains_source(1, &hash), "index must be cleaned up after pop");
+    }
+
+    #[test]
+    fn source_index_cleared_after_drain() {
+        let mut b = ProofBacklog::new();
+        let hash = ShellHash::from([5u8; 32]);
+        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![hash], None));
+        b.drain();
+        assert!(!b.contains_source(1, &hash), "index must be cleared after drain");
+        assert!(b.layer_blocks.is_empty());
+        assert!(b.source_index.is_empty());
+    }
+
+    #[test]
+    fn source_index_cleared_after_pop_contiguous() {
+        let mut b = ProofBacklog::new();
+        let h1 = ShellHash::from([1u8; 32]);
+        let h2 = ShellHash::from([2u8; 32]);
+        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![h1], None));
+        b.push(ProofTask::with_sources([2u8; 32], 2, vec![], 1, vec![h2], None));
+        b.pop_contiguous(10);
+        assert!(!b.contains_source(1, &h1));
+        assert!(!b.contains_source(1, &h2));
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn min_block_number_for_layer_uses_index() {
+        let mut b = ProofBacklog::new();
+        b.push(make_task(5));
+        b.push(make_task(3));
+        b.push(make_task(8));
+        assert_eq!(b.min_block_number_for_layer(1), Some(3));
+
+        b.pop(); // removes 5 (FIFO)
+        // min should still be 3 (it was pushed second but is still pending)
+        assert_eq!(b.min_block_number_for_layer(1), Some(3));
+    }
+
+    #[test]
+    fn min_block_number_for_layer_none_when_empty() {
+        let b = ProofBacklog::new();
+        assert_eq!(b.min_block_number_for_layer(1), None);
+    }
+
+    #[test]
+    fn min_block_number_cleared_after_drain() {
+        let mut b = ProofBacklog::new();
+        b.push(make_task(10));
+        b.drain();
+        assert_eq!(b.min_block_number_for_layer(1), None);
+    }
+
+    #[test]
+    fn fallback_source_index_uses_block_hash_when_source_hashes_empty() {
+        // ProofTask::new() leaves source_hashes = vec![ShellHash::from(block_hash)]
+        // but a task constructed directly may have empty source_hashes.
+        // index_add/remove fall back to block_hash in that case.
+        let bh: [u8; 32] = [42u8; 32];
+        let bh_hash = ShellHash::from(bh);
+        let mut task = make_task(1);
+        task.block_hash = bh;
+        task.source_hashes.clear(); // empty — triggers fallback path
+        let mut b = ProofBacklog::new();
+        b.push(task);
+        assert!(b.contains_source(1, &bh_hash));
+        b.pop();
+        assert!(!b.contains_source(1, &bh_hash));
     }
 }

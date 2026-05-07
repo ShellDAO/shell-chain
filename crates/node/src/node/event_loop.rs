@@ -1002,11 +1002,24 @@ impl<S: KvStore + 'static> Node<S> {
                                     }
                                     let already_settled = {
                                         let settled = self.settled_stark_sources.lock();
-                                        amendment.covered_hashes().into_iter().any(|source| {
-                                            settled.contains(&(amendment.layer, source))
+                                        covered_hashes.iter().any(|source| {
+                                            settled.contains(&(amendment.layer, *source))
                                         })
                                     };
-                                    if already_settled {
+                                    // Also check the pending queue to prevent duplicate settlements
+                                    // from concurrent proof-amendment messages for the same sources.
+                                    let pending_dup = if !already_settled {
+                                        let pending = self.pending_stark_settlements.lock();
+                                        pending.iter().any(|queued| {
+                                            queued.layer == amendment.layer
+                                                && queued.covered_hashes().iter().any(|s| {
+                                                    covered_hashes.contains(s)
+                                                })
+                                        })
+                                    } else {
+                                        false
+                                    };
+                                    if already_settled || pending_dup {
                                         debug!(
                                             block = block_number,
                                             source = %amendment.block_hash,
@@ -1082,7 +1095,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             block_number = equivocation.header_a.number,
                                             "I1: equivocation evidence verified (slashing deferred — epoch-boundary not implemented)"
                                         );
-                                        // TODO: apply slash_authority only at epoch boundary
+                                        // TODO(shell-chain#31): apply slash_authority only at epoch boundary
                                         // once ValidatorSet epoch transitions are in place.
                                     } else {
                                         warn!(%peer, "I1: received invalid equivocation evidence, ignoring");
