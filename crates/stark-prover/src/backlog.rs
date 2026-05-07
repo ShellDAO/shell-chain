@@ -205,14 +205,9 @@ impl ProofBacklog {
         let has_contiguous_successor = self
             .pending
             .get(take)
-            .map(|next| {
-                next.layer == layer && next.block_number == end_block.saturating_add(1)
-            })
+            .map(|next| next.layer == layer && next.block_number == end_block.saturating_add(1))
             .unwrap_or(false);
-        if layer == 1
-            && min_l1_entries > 0
-            && entries < min_l1_entries
-            && has_contiguous_successor
+        if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries && has_contiguous_successor
         {
             return None;
         }
@@ -304,7 +299,8 @@ impl ProofBacklog {
 
     fn index_add(&mut self, task: &ProofTask) {
         if task.source_hashes.is_empty() {
-            self.source_index.insert((task.layer, ShellHash::from(task.block_hash)));
+            self.source_index
+                .insert((task.layer, ShellHash::from(task.block_hash)));
         } else {
             for sh in &task.source_hashes {
                 self.source_index.insert((task.layer, *sh));
@@ -318,7 +314,8 @@ impl ProofBacklog {
 
     fn index_remove(&mut self, task: &ProofTask) {
         if task.source_hashes.is_empty() {
-            self.source_index.remove(&(task.layer, ShellHash::from(task.block_hash)));
+            self.source_index
+                .remove(&(task.layer, ShellHash::from(task.block_hash)));
         } else {
             for sh in &task.source_hashes {
                 self.source_index.remove(&(task.layer, *sh));
@@ -648,19 +645,39 @@ mod tests {
     fn source_index_cleared_after_pop() {
         let mut b = ProofBacklog::new();
         let hash = ShellHash::from([3u8; 32]);
-        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![hash], None));
+        b.push(ProofTask::with_sources(
+            [1u8; 32],
+            1,
+            vec![],
+            1,
+            vec![hash],
+            None,
+        ));
         assert!(b.contains_source(1, &hash));
         b.pop();
-        assert!(!b.contains_source(1, &hash), "index must be cleaned up after pop");
+        assert!(
+            !b.contains_source(1, &hash),
+            "index must be cleaned up after pop"
+        );
     }
 
     #[test]
     fn source_index_cleared_after_drain() {
         let mut b = ProofBacklog::new();
         let hash = ShellHash::from([5u8; 32]);
-        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![hash], None));
+        b.push(ProofTask::with_sources(
+            [1u8; 32],
+            1,
+            vec![],
+            1,
+            vec![hash],
+            None,
+        ));
         b.drain();
-        assert!(!b.contains_source(1, &hash), "index must be cleared after drain");
+        assert!(
+            !b.contains_source(1, &hash),
+            "index must be cleared after drain"
+        );
         assert!(b.layer_blocks.is_empty());
         assert!(b.source_index.is_empty());
     }
@@ -670,8 +687,22 @@ mod tests {
         let mut b = ProofBacklog::new();
         let h1 = ShellHash::from([1u8; 32]);
         let h2 = ShellHash::from([2u8; 32]);
-        b.push(ProofTask::with_sources([1u8; 32], 1, vec![], 1, vec![h1], None));
-        b.push(ProofTask::with_sources([2u8; 32], 2, vec![], 1, vec![h2], None));
+        b.push(ProofTask::with_sources(
+            [1u8; 32],
+            1,
+            vec![],
+            1,
+            vec![h1],
+            None,
+        ));
+        b.push(ProofTask::with_sources(
+            [2u8; 32],
+            2,
+            vec![],
+            1,
+            vec![h2],
+            None,
+        ));
         b.pop_contiguous(10);
         assert!(!b.contains_source(1, &h1));
         assert!(!b.contains_source(1, &h2));
@@ -687,7 +718,7 @@ mod tests {
         assert_eq!(b.min_block_number_for_layer(1), Some(3));
 
         b.pop(); // removes 5 (FIFO)
-        // min should still be 3 (it was pushed second but is still pending)
+                 // min should still be 3 (it was pushed second but is still pending)
         assert_eq!(b.min_block_number_for_layer(1), Some(3));
     }
 

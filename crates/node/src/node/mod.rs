@@ -3935,10 +3935,15 @@ mod tests {
         assert_eq!(task.source_hashes.len(), 1);
     }
 
-    /// STARK compression: verify ProverService does not prove L1 ranges before
-    /// the minimum tx-entry threshold is reached.
+    /// STARK compression: verify ProverService proves isolated L1 runs immediately
+    /// even when the tx-entry count is below the minimum threshold.
+    ///
+    /// The min-entry threshold is only enforced while the backlog holds a
+    /// contiguous successor task (the run can still grow). Isolated ranges
+    /// are proved right away to avoid permanent starvation of historical or
+    /// sparse ranges.
     #[tokio::test]
-    async fn stark_prover_service_waits_for_l1_minimum() {
+    async fn stark_prover_service_proves_isolated_l1_run() {
         use crate::prover_service::{ProverConfig, ProverService};
         use shell_storage::ProofAmendmentStore;
 
@@ -3989,20 +3994,25 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         handle.shutdown().await;
 
+        // Isolated runs (no contiguous successor) are proved immediately regardless
+        // of the min-entry threshold — both tasks must be gone from the backlog.
         assert_eq!(
             node.proof_backlog.lock().len(),
-            2,
-            "ProverService must wait until L1 reaches the minimum tx-entry threshold"
+            0,
+            "ProverService must prove isolated L1 runs immediately to avoid starvation"
         );
-        assert!(settlement_queue.lock().is_empty());
+        // At least one proof amendment should have been generated and broadcast.
         assert!(
-            amendment_rx.try_recv().is_err(),
-            "no under-threshold L1 proof should be broadcast"
+            amendment_rx.try_recv().is_ok(),
+            "at least one proof amendment must be broadcast for isolated L1 run"
         );
-        assert!(amendment_store
-            .get_amendment(&block_hash)
-            .unwrap()
-            .is_none());
+        assert!(
+            amendment_store
+                .get_amendment(&block_hash)
+                .unwrap()
+                .is_some(),
+            "amendment for block_hash must be stored"
+        );
     }
 
     // ─── L2: proof-replaces-witness tests ──────────────────────────────────────

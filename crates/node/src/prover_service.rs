@@ -219,7 +219,13 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
 
         // Destructure task so entries can be moved into spawn_blocking while the
         // remaining fields remain available after the await point.
-        let ProofTask { entries, source_hashes, layer, original_size, .. } = task;
+        let ProofTask {
+            entries,
+            source_hashes,
+            layer,
+            original_size,
+            ..
+        } = task;
 
         // Run the CPU-intensive proof generation on a blocking thread so the
         // tokio executor is not starved.
@@ -361,7 +367,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_waits_for_l1_minimum_entries() {
+    async fn service_proves_isolated_l1_run_below_minimum() {
+        // A task with fewer than MIN_L1_STARK_TXS entries but no contiguous
+        // successor is proved immediately to avoid permanent starvation of
+        // isolated/historical ranges. The min-entry gate only fires when the
+        // backlog has a contiguous successor (the run can still grow).
         let (service, backlog) = make_service();
         {
             let mut b = backlog.lock();
@@ -371,8 +381,8 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         handle.shutdown().await;
         let b = backlog.lock();
-        assert_eq!(b.len(), 1);
-        assert_eq!(b.total_completed(), 0);
+        assert_eq!(b.len(), 0, "isolated run must be proved immediately");
+        assert_eq!(b.total_completed(), 1);
     }
 
     #[tokio::test]
