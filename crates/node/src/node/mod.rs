@@ -93,8 +93,6 @@ pub struct Node<S: KvStore + 'static> {
     /// In-memory guard against duplicate STARK reward settlement in the current
     /// process lifetime. The block-committed settlement remains authoritative.
     settled_stark_sources: parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
-    /// H3: Handle to the background prover service (non-None when `node_role.runs_prover()`).
-    prover_service_handle: parking_lot::Mutex<Option<ProverServiceHandle>>,
     /// I1: Queue of equivocation proofs discovered during import_block, to be broadcast
     /// in the next event loop iteration (import_block is sync; network sends are async).
     equivocation_queue: parking_lot::Mutex<Vec<EquivocationProof>>,
@@ -153,6 +151,364 @@ struct DevState {
     next_block_timestamp: Option<u64>,
     next_snapshot_id: u64,
     snapshots: BTreeMap<String, DevSnapshot>,
+}
+
+type NodeStateDb<S> = ShellStateDb<S>;
+
+struct BlockStoreBoundary<'a, S: KvStore + 'static> {
+    store: &'a Arc<S>,
+    chain_store: &'a Arc<ChainStore<S>>,
+    world_state: &'a Arc<RwLock<WorldState<S>>>,
+    witness_store: &'a Arc<WitnessStore<S>>,
+    pending_grace_deletes: &'a parking_lot::Mutex<HashMap<ShellHash, u64>>,
+}
+
+impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
+    fn head_block(&self) -> Result<Option<Block>, NodeError> {
+        Ok(self.chain_store.get_head_block()?)
+    }
+
+    fn block_exists(&self, block_number: u64) -> Result<bool, NodeError> {
+        Ok(self
+            .chain_store
+            .get_block_by_number(block_number)?
+            .is_some())
+    }
+
+    fn block_by_number(&self, block_number: u64) -> Result<Option<Block>, NodeError> {
+        Ok(self.chain_store.get_block_by_number(block_number)?)
+    }
+
+    fn block_hash_by_number(&self, block_number: u64) -> Result<Option<ShellHash>, NodeError> {
+        Ok(self.chain_store.get_block_hash_by_number(block_number)?)
+    }
+
+    fn current_state_root(&self) -> Result<ShellHash, NodeError> {
+        let mut ws = self.world_state.write();
+        Ok(ws.state_root()?)
+    }
+
+    fn isolated_state_db(&self) -> Result<(NodeStateDb<S>, ShellHash), NodeError> {
+        let current_root = self.current_state_root()?;
+        let ws = WorldState::at_root(self.store.clone(), &current_root)?;
+        let cs = ChainStore::new(self.store.clone());
+        Ok((ShellStateDb::new(ws, cs), current_root))
+    }
+
+    fn rollback_world_state(&self, root: &ShellHash) -> Result<(), NodeError> {
+        let mut ws = self.world_state.write();
+        ws.rollback_to_root(root)?;
+        Ok(())
+    }
+
+    fn replace_world_state(&self, committed_world_state: WorldState<S>) {
+        let mut live_ws = self.world_state.write();
+        *live_ws = committed_world_state;
+    }
+
+    fn add_balance(&self, address: &Address, balance: U256) -> Result<(), NodeError> {
+        let mut ws = self.world_state.write();
+        ws.add_balance(address, balance)?;
+        Ok(())
+    }
+
+    fn commit_canonical_block(
+        &self,
+        block: &Block,
+        receipts: Option<&[TransactionReceipt]>,
+    ) -> Result<(), NodeError> {
+        self.chain_store.commit_canonical_block(block, receipts)?;
+        Ok(())
+    }
+
+    fn put_side_fork_block(&self, block: &Block) -> Result<(), NodeError> {
+        self.chain_store.put_side_fork_block(block)?;
+        Ok(())
+    }
+
+    fn side_fork_count(&self, block_number: u64) -> usize {
+        self.chain_store
+            .get_side_fork_hashes(block_number)
+            .map(|hashes| hashes.len())
+            .unwrap_or(0)
+    }
+
+    fn stored_pubkey(&self, address: &Address) -> Result<Option<Vec<u8>>, NodeError> {
+        Ok(self.chain_store.get_pubkey(address)?)
+    }
+
+    fn store_pubkey(&self, address: &Address, pubkey: &[u8]) -> Result<(), NodeError> {
+        self.chain_store.put_pubkey(address, pubkey)?;
+        Ok(())
+    }
+
+    fn witness_bundle(
+        &self,
+        block_hash: &ShellHash,
+    ) -> Result<Option<shell_core::WitnessBundle>, NodeError> {
+        Ok(self.witness_store.get_bundle(block_hash)?)
+    }
+
+    fn update_chain_totals(
+        &self,
+        block_number: u64,
+        tx_count: u64,
+        gas_used: u64,
+    ) -> Result<(), NodeError> {
+        self.chain_store
+            .add_canonical_block_to_totals(block_number, tx_count, gas_used)?;
+        Ok(())
+    }
+
+    fn prune_grace_witnesses(&self, current_head: u64) {
+        let mut grace_map = self.pending_grace_deletes.lock();
+        grace_map.retain(|hash, delete_at| {
+            if current_head >= *delete_at {
+                match self.chain_store.delete_witness_bundle(hash) {
+                    Ok(()) => info!(
+                        block = *delete_at,
+                        "L2: grace-window expired, witness bundle deleted"
+                    ),
+                    Err(e) => warn!(block = *delete_at, "L2: grace-window delete failed: {e}"),
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+struct ConsensusManagerBoundary<'a, S: KvStore + 'static> {
+    consensus: &'a Arc<RwLock<dyn ConsensusEngine>>,
+    known_authorities: &'a Arc<RwLock<HashMap<Address, Vec<u8>>>>,
+    finality: &'a Arc<RwLock<FinalityState>>,
+    fork_choice: &'a Arc<RwLock<ForkChoice>>,
+    world_state: &'a Arc<RwLock<WorldState<S>>>,
+}
+
+impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
+    fn ensure_local_proposer(&self, block_number: u64, proposer: Address) -> Result<(), NodeError> {
+        if self.consensus.read().is_proposer(block_number, &proposer) {
+            Ok(())
+        } else {
+            Err(NodeError::NotProposer)
+        }
+    }
+
+    fn finalized_cursor(&self) -> (u64, ShellHash) {
+        let finality = self.finality.read();
+        (
+            finality.last_finalized_number(),
+            *finality.last_finalized_hash(),
+        )
+    }
+
+    fn finalized_number(&self) -> u64 {
+        self.finality.read().last_finalized_number()
+    }
+
+    fn verify_header(&self, header: &BlockHeader) -> Result<(), NodeError> {
+        self.consensus.read().verify_header(header)?;
+        Ok(())
+    }
+
+    fn sign_block(&self, block: &mut Block, signer: &dyn Signer) -> Result<(), NodeError> {
+        self.consensus.read().sign_block(block, signer)?;
+        Ok(())
+    }
+
+    fn register_authority_pubkey(&self, address: Address, pubkey: Vec<u8>) {
+        self.known_authorities.write().insert(address, pubkey);
+    }
+
+    fn known_authority_pubkey(&self, address: &Address) -> Option<Vec<u8>> {
+        self.known_authorities.read().get(address).cloned()
+    }
+
+    fn register_fork_choice_block(
+        &self,
+        block_hash: ShellHash,
+        parent_hash: ShellHash,
+        block_number: u64,
+    ) -> bool {
+        let (attestation_count, is_finalized) = {
+            let finality = self.finality.read();
+            (
+                finality.attestation_count(&block_hash),
+                finality.last_finalized_number() >= block_number,
+            )
+        };
+        self.fork_choice.write().add_block(
+            block_hash,
+            parent_hash,
+            block_number,
+            attestation_count,
+            is_finalized,
+        )
+    }
+
+    fn reload_authorities_if_boundary(&self, block_number: u64) -> Result<(), NodeError> {
+        let should_reload = {
+            let consensus = self.consensus.read();
+            let config = consensus.poa_config();
+            config.epoch_length == 0 || config.is_epoch_boundary(block_number)
+        };
+        if !should_reload {
+            return Ok(());
+        }
+
+        let (validators, weights) = {
+            let ws = self.world_state.read();
+            let validators = ws.get_validators()?;
+            let weights: Result<Vec<u64>, _> = validators
+                .iter()
+                .map(|validator| ws.get_validator_weight(validator))
+                .collect();
+            (validators, weights?)
+        };
+        if validators.is_empty() {
+            warn!(
+                block = block_number,
+                "validator registry is empty at reload boundary; keeping current authority set"
+            );
+            return Ok(());
+        }
+
+        self.consensus
+            .write()
+            .set_authorities_with_weights(validators, weights);
+        Ok(())
+    }
+}
+
+struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
+    proof_backlog: &'a Arc<parking_lot::Mutex<ProofBacklog>>,
+    pending_stark_settlements: &'a Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
+    settled_stark_sources: &'a parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
+    settled_source_index: &'a SettledSourceIndex<S>,
+    metrics: &'a Arc<Metrics>,
+}
+
+impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
+    fn take_pending_stark_settlements(&self) -> Vec<ProofAmendment> {
+        let mut pending = self.pending_stark_settlements.lock();
+        std::mem::take(&mut *pending)
+    }
+
+    fn has_settled_source(&self, key: (u32, ShellHash)) -> bool {
+        self.settled_stark_sources.lock().contains(&key)
+    }
+
+    fn queue_task(&self, task: ProofTask) {
+        self.proof_backlog.lock().push(task);
+    }
+
+    fn record_accepted_settlement(&self) {
+        self.metrics.stark_settlements_accepted.inc();
+    }
+
+    fn record_settled_sources(&self, amendments: &[ProofAmendment]) {
+        self.settled_stark_sources
+            .lock()
+            .extend(amendments.iter().flat_map(|amendment| {
+                amendment
+                    .covered_hashes()
+                    .into_iter()
+                    .map(move |source| (amendment.layer, source))
+            }));
+        for amendment in amendments {
+            for source in amendment.covered_hashes() {
+                let _ = self.settled_source_index.put(amendment.layer, &source);
+            }
+        }
+    }
+}
+
+struct MemPoolBoundary<'a, S: KvStore + 'static> {
+    tx_pool: &'a Arc<TxPool>,
+    world_state: &'a Arc<RwLock<WorldState<S>>>,
+    tx_rebroadcast_seen: &'a parking_lot::Mutex<HashMap<ShellHash, std::time::Instant>>,
+}
+
+impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
+    fn pending_for_block(&self, max_txs: usize) -> Vec<SignedTransaction> {
+        self.tx_pool.pending_for_block(max_txs)
+    }
+
+    fn pending_for_rebroadcast(
+        &self,
+        target_peer: Option<&shell_network::PeerId>,
+        limit: usize,
+    ) -> Vec<SignedTransaction> {
+        let txs = self.tx_pool.pending(limit);
+        if txs.is_empty() || target_peer.is_some() {
+            return txs;
+        }
+
+        let now = std::time::Instant::now();
+        let cooldown = std::time::Duration::from_secs(TX_REBROADCAST_COOLDOWN_SECS);
+        let mut seen = self.tx_rebroadcast_seen.lock();
+        seen.retain(|_, last_seen| now.duration_since(*last_seen) < cooldown);
+        txs.into_iter()
+            .filter(|tx| {
+                let hash = tx.hash();
+                if seen
+                    .get(&hash)
+                    .is_some_and(|last_seen| now.duration_since(*last_seen) < cooldown)
+                {
+                    false
+                } else {
+                    seen.insert(hash, now);
+                    true
+                }
+            })
+            .collect()
+    }
+
+    fn remove_committed_hashes(&self, tx_hashes: &[ShellHash]) -> usize {
+        self.tx_pool.remove_batch(tx_hashes);
+        let ws = self.world_state.read();
+        self.tx_pool.prune_nonce_too_low(&ws)
+    }
+}
+
+struct NetworkInterface<'a, N: NetworkService + ?Sized> {
+    inner: &'a mut N,
+}
+
+impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
+    fn new(inner: &'a mut N) -> Self {
+        Self { inner }
+    }
+
+    async fn broadcast(&self, msg: NetworkMessage) -> Result<(), shell_network::NetworkError> {
+        self.inner.broadcast(msg).await
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer_id: &shell_network::PeerId,
+        msg: NetworkMessage,
+    ) -> Result<(), shell_network::NetworkError> {
+        self.inner.send_to_peer(peer_id, msg).await
+    }
+
+    async fn next_event(&mut self) -> Option<shell_network::NetworkEvent> {
+        self.inner.next_event().await
+    }
+
+    async fn peer_count(&self) -> usize {
+        self.inner.peer_count().await
+    }
+
+    fn peer_count_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.inner.peer_count_handle()
+    }
+
+    async fn shutdown(&self) -> Result<(), shell_network::NetworkError> {
+        self.inner.shutdown().await
+    }
 }
 
 impl<S: KvStore + 'static> Node<S> {
@@ -228,7 +584,6 @@ impl<S: KvStore + 'static> Node<S> {
             settled_source_index,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
-            prover_service_handle: parking_lot::Mutex::new(None),
             equivocation_queue: parking_lot::Mutex::new(Vec::new()),
             finality: Arc::new(RwLock::new(finality_state)),
             fork_choice: Arc::new(RwLock::new(ForkChoice::new(ShellHash::ZERO))),
@@ -252,6 +607,44 @@ impl<S: KvStore + 'static> Node<S> {
                 std::time::Duration::from_secs(300),
             )),
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn block_store(&self) -> BlockStoreBoundary<'_, S> {
+        BlockStoreBoundary {
+            store: &self.store,
+            chain_store: &self.chain_store,
+            world_state: &self.world_state,
+            witness_store: &self.witness_store,
+            pending_grace_deletes: &self.pending_grace_deletes,
+        }
+    }
+
+    fn consensus_manager(&self) -> ConsensusManagerBoundary<'_, S> {
+        ConsensusManagerBoundary {
+            consensus: &self.consensus,
+            known_authorities: &self.known_authorities,
+            finality: &self.finality,
+            fork_choice: &self.fork_choice,
+            world_state: &self.world_state,
+        }
+    }
+
+    fn prover_orchestrator(&self) -> ProverOrchestratorBoundary<'_, S> {
+        ProverOrchestratorBoundary {
+            proof_backlog: &self.proof_backlog,
+            pending_stark_settlements: &self.pending_stark_settlements,
+            settled_stark_sources: &self.settled_stark_sources,
+            settled_source_index: &self.settled_source_index,
+            metrics: &self.metrics,
+        }
+    }
+
+    fn mem_pool(&self) -> MemPoolBoundary<'_, S> {
+        MemPoolBoundary {
+            tx_pool: &self.tx_pool,
+            world_state: &self.world_state,
+            tx_rebroadcast_seen: &self.tx_rebroadcast_seen,
         }
     }
 
@@ -421,68 +814,19 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn reload_authorities_if_boundary(&self, block_number: u64) -> Result<(), NodeError> {
-        let should_reload = {
-            let consensus = self.consensus.read();
-            let config = consensus.poa_config();
-            config.epoch_length == 0 || config.is_epoch_boundary(block_number)
-        };
-        if !should_reload {
-            return Ok(());
-        }
-
-        let (validators, weights) = {
-            let ws = self.world_state.read();
-            let validators = ws.get_validators()?;
-            let weights: Result<Vec<u64>, _> = validators
-                .iter()
-                .map(|validator| ws.get_validator_weight(validator))
-                .collect();
-            (validators, weights?)
-        };
-        if validators.is_empty() {
-            warn!(
-                block = block_number,
-                "validator registry is empty at reload boundary; keeping current authority set"
-            );
-            return Ok(());
-        }
-
-        self.consensus
-            .write()
-            .set_authorities_with_weights(validators, weights);
-        Ok(())
-    }
-
-    fn register_fork_choice_block(
-        &self,
-        block_hash: ShellHash,
-        parent_hash: ShellHash,
-        block_number: u64,
-    ) -> bool {
-        let (attestation_count, is_finalized) = {
-            let finality = self.finality.read();
-            (
-                finality.attestation_count(&block_hash),
-                finality.last_finalized_number() >= block_number,
-            )
-        };
-        self.fork_choice.write().add_block(
-            block_hash,
-            parent_hash,
-            block_number,
-            attestation_count,
-            is_finalized,
-        )
+        self.consensus_manager()
+            .reload_authorities_if_boundary(block_number)
     }
 
     /// Register an authority's public key for seal verification.
     pub fn register_authority_pubkey(&self, address: Address, pubkey: Vec<u8>) {
-        self.known_authorities.write().insert(address, pubkey);
+        self.consensus_manager()
+            .register_authority_pubkey(address, pubkey);
     }
 
     fn head_number(&self) -> u64 {
-        self.chain_store
-            .get_head_block()
+        self.block_store()
+            .head_block()
             .ok()
             .flatten()
             .map(|b| b.number())
@@ -523,7 +867,7 @@ impl<S: KvStore + 'static> Node<S> {
 
     async fn request_missing_blocks<N: NetworkService + ?Sized>(
         &self,
-        network: &mut N,
+        network: &NetworkInterface<'_, N>,
         target_peer: Option<&shell_network::PeerId>,
         sync_requested: &mut bool,
         sync_request_nonce: &mut Option<u64>,
@@ -559,38 +903,13 @@ impl<S: KvStore + 'static> Node<S> {
 
     async fn rebroadcast_pending_transactions<N: NetworkService + ?Sized>(
         &self,
-        network: &mut N,
+        network: &NetworkInterface<'_, N>,
         target_peer: Option<&shell_network::PeerId>,
         limit: usize,
         reason: &'static str,
     ) {
-        let txs = self.tx_pool.pending(limit);
-        if txs.is_empty() {
-            return;
-        }
-
-        let txs: Vec<SignedTransaction> = if target_peer.is_none() {
-            let now = std::time::Instant::now();
-            let cooldown = std::time::Duration::from_secs(TX_REBROADCAST_COOLDOWN_SECS);
-            let mut seen = self.tx_rebroadcast_seen.lock();
-            seen.retain(|_, last_seen| now.duration_since(*last_seen) < cooldown);
-            txs.into_iter()
-                .filter(|tx| {
-                    let hash = tx.hash();
-                    if seen
-                        .get(&hash)
-                        .is_some_and(|last_seen| now.duration_since(*last_seen) < cooldown)
-                    {
-                        false
-                    } else {
-                        seen.insert(hash, now);
-                        true
-                    }
-                })
-                .collect()
-        } else {
-            txs
-        };
+        let mem_pool = self.mem_pool();
+        let txs = mem_pool.pending_for_rebroadcast(target_peer, limit);
         if txs.is_empty() {
             return;
         }
@@ -852,7 +1171,56 @@ mod tests {
     use shell_mempool::MempoolConfig;
     use shell_primitives::U256;
     use shell_rpc::DevRpcControl;
-    use shell_storage::MemoryDb;
+    use shell_storage::{MemoryDb, StorageError, WriteBatch};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FailingBatchDb {
+        inner: MemoryDb,
+        fail_next_batch: AtomicBool,
+    }
+
+    impl FailingBatchDb {
+        fn new() -> Self {
+            Self {
+                inner: MemoryDb::new(),
+                fail_next_batch: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_batch(&self) {
+            self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl KvStore for FailingBatchDb {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            if self.fail_next_batch.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected batch failure".into()));
+            }
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn setup_node() -> (Node<MemoryDb>, DilithiumSigner) {
         let signer = DilithiumSigner::generate();
@@ -875,7 +1243,35 @@ mod tests {
         (node, signer)
     }
 
-    fn store_genesis(node: &Node<MemoryDb>) {
+    fn setup_failing_batch_node() -> (Node<FailingBatchDb>, DilithiumSigner, Arc<FailingBatchDb>) {
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let authority = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
+
+        let db = Arc::new(FailingBatchDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![authority], 1),
+        )));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+            chain_id: 1337,
+            ..MempoolConfig::default()
+        }));
+
+        let config = NodeConfig::dev(authority);
+        let node = Node::new(
+            config,
+            db.clone(),
+            chain_store,
+            world_state,
+            tx_pool,
+            consensus,
+        );
+        (node, signer, db)
+    }
+
+    fn store_genesis<S: KvStore + 'static>(node: &Node<S>) {
         let genesis = Block {
             header: BlockHeader {
                 parent_hash: ShellHash::default(),
@@ -907,7 +1303,7 @@ mod tests {
         node.chain_store.set_head(&hash).unwrap();
     }
 
-    fn store_consistent_genesis(node: &Node<MemoryDb>) {
+    fn store_consistent_genesis<S: KvStore + 'static>(node: &Node<S>) {
         let state_root = current_state_root(node);
         let genesis = Block {
             header: BlockHeader {
@@ -940,7 +1336,7 @@ mod tests {
         node.chain_store.set_head(&hash).unwrap();
     }
 
-    fn fund_account(node: &Node<MemoryDb>, addr: &Address, balance: U256) {
+    fn fund_account<S: KvStore + 'static>(node: &Node<S>, addr: &Address, balance: U256) {
         let account = shell_core::Account {
             pq_pubkey_hash: ShellHash::default(),
             nonce: 0,
@@ -953,7 +1349,7 @@ mod tests {
         ws.set_account(addr, &account).unwrap();
     }
 
-    fn current_state_root(node: &Node<MemoryDb>) -> ShellHash {
+    fn current_state_root<S: KvStore + 'static>(node: &Node<S>) -> ShellHash {
         let mut ws = node.world_state.write();
         ws.state_root().unwrap()
     }
@@ -1117,7 +1513,7 @@ mod tests {
         }
     }
 
-    fn put_dummy_witness(node: &Node<MemoryDb>, hash: &ShellHash) {
+    fn put_dummy_witness<S: KvStore + 'static>(node: &Node<S>, hash: &ShellHash) {
         use shell_core::{TxWitness, WitnessBundle};
         use shell_crypto::{PQSignature, SignatureType};
 
@@ -1130,8 +1526,8 @@ mod tests {
         node.witness_store.put_bundle(hash, &bundle).unwrap();
     }
 
-    fn produce_witnessed_blocks(
-        node: &Node<MemoryDb>,
+    fn produce_witnessed_blocks<S: KvStore + 'static>(
+        node: &Node<S>,
         signer: &DilithiumSigner,
         count: u64,
     ) -> Vec<ShellHash> {
@@ -1341,6 +1737,7 @@ mod tests {
             .get_block_by_hash(&hashes[1])
             .unwrap()
             .unwrap();
+        let block2_number = block2.number();
         let genesis_hash = leader
             .chain_store
             .get_block_hash_by_number(0)
@@ -1355,6 +1752,14 @@ mod tests {
             .find(|tx| tx.kind == SystemTxKind::StarkReward)
             .expect("settlement tx")
             .hash();
+        assert_eq!(settlement_block.number(), block2_number + 1);
+        assert!(
+            block2
+                .system_transactions
+                .iter()
+                .all(|tx| tx.kind != SystemTxKind::StarkReward),
+            "final source block must remain the proof anchor"
+        );
 
         let follower_db = Arc::new(MemoryDb::new());
         let follower_chain_store = Arc::new(ChainStore::new(follower_db.clone()));
@@ -1401,10 +1806,14 @@ mod tests {
             .get_amendment(&hashes[1])
             .unwrap()
             .expect("import should store full proof for final source");
-        assert!(matches!(
-            shell_stark_prover::StoredProofArtifact::from_json(&proof_bytes).unwrap(),
-            shell_stark_prover::StoredProofArtifact::Amendment(_)
-        ));
+        match shell_stark_prover::StoredProofArtifact::from_json(&proof_bytes).unwrap() {
+            shell_stark_prover::StoredProofArtifact::Amendment(amendment) => {
+                assert_eq!(amendment.block_hash, hashes[1]);
+                assert_eq!(amendment.block_number, block2_number);
+                assert_eq!(amendment.settlement_tx_hash, Some(settlement_tx_hash));
+            }
+            other => panic!("expected amendment, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1595,6 +2004,145 @@ mod tests {
             dup_err.is_err(),
             "duplicate settlement should be rejected, got: {dup_err:?}"
         );
+    }
+
+    #[test]
+    fn produce_block_backfills_pointer_metadata_and_anchors_full_proof_on_final_source() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+        let final_source = node
+            .chain_store
+            .get_block_by_hash(&hashes[1])
+            .unwrap()
+            .expect("final source block");
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+
+        node.pending_stark_settlements.lock().push(amendment);
+        let settlement_block = node.produce_block(&signer, 100).unwrap();
+        let settlement_tx = settlement_block
+            .system_transactions
+            .iter()
+            .find(|tx| tx.kind == SystemTxKind::StarkReward)
+            .expect("settlement tx");
+
+        assert_eq!(settlement_block.number(), final_source.number() + 1);
+        assert!(
+            final_source
+                .system_transactions
+                .iter()
+                .all(|tx| tx.kind != SystemTxKind::StarkReward),
+            "settlement must land after the sealed source block"
+        );
+
+        for (source_hash, source_block) in [(genesis_hash, 0u64), (hashes[0], 1u64)] {
+            let pointer_bytes = node
+                .amendment_store
+                .get_amendment(&source_hash)
+                .unwrap()
+                .expect("pointer should be stored");
+            match shell_stark_prover::StoredProofArtifact::from_json(&pointer_bytes).unwrap() {
+                shell_stark_prover::StoredProofArtifact::Pointer(pointer) => {
+                    assert_eq!(pointer.source_hash, source_hash);
+                    assert_eq!(pointer.source_block, source_block);
+                    assert_eq!(pointer.target_hash, hashes[1]);
+                    assert_eq!(pointer.target_block, 2);
+                    assert_eq!(pointer.start_block, 0);
+                    assert_eq!(pointer.end_block, 2);
+                    assert_eq!(pointer.settlement_tx_hash, Some(settlement_tx.hash()));
+                }
+                other => panic!("expected pointer, got {other:?}"),
+            }
+        }
+
+        let proof_bytes = node
+            .amendment_store
+            .get_amendment(&hashes[1])
+            .unwrap()
+            .expect("final source should store full proof");
+        match shell_stark_prover::StoredProofArtifact::from_json(&proof_bytes).unwrap() {
+            shell_stark_prover::StoredProofArtifact::Amendment(full) => {
+                assert_eq!(full.block_hash, hashes[1]);
+                assert_eq!(full.block_number, 2);
+                assert_eq!(full.settlement_tx_hash, Some(settlement_tx.hash()));
+            }
+            other => panic!("expected full proof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_settled_index_reconstructs_artifacts_when_persistent_index_is_missing() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+
+        node.pending_stark_settlements
+            .lock()
+            .push(amendment.clone());
+        let settlement_block = node.produce_block(&signer, 100).unwrap();
+        let settlement_tx_hash = settlement_block
+            .system_transactions
+            .iter()
+            .find(|tx| tx.kind == SystemTxKind::StarkReward)
+            .expect("settlement tx")
+            .hash();
+
+        for (key, _) in node.store.scan_prefix(b"pa/").unwrap() {
+            node.store.delete(&key).unwrap();
+        }
+        for (key, _) in node.store.scan_prefix(b"ss/").unwrap() {
+            node.store.delete(&key).unwrap();
+        }
+        node.settled_stark_sources.lock().clear();
+
+        assert!(node.store.scan_prefix(b"pa/").unwrap().is_empty());
+        assert!(node.store.scan_prefix(b"ss/").unwrap().is_empty());
+
+        let rebuilt = node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(rebuilt, 3);
+        assert_eq!(node.store.scan_prefix(b"ss/").unwrap().len(), 3);
+        assert!(node
+            .settled_stark_sources
+            .lock()
+            .contains(&(1, genesis_hash)));
+        assert!(node.settled_stark_sources.lock().contains(&(1, hashes[0])));
+        assert!(node.settled_stark_sources.lock().contains(&(1, hashes[1])));
+
+        let pointer_bytes = node
+            .amendment_store
+            .get_amendment(&hashes[0])
+            .unwrap()
+            .expect("rebuild should restore pointer");
+        match shell_stark_prover::StoredProofArtifact::from_json(&pointer_bytes).unwrap() {
+            shell_stark_prover::StoredProofArtifact::Pointer(pointer) => {
+                assert_eq!(pointer.target_hash, hashes[1]);
+                assert_eq!(pointer.settlement_tx_hash, Some(settlement_tx_hash));
+            }
+            other => panic!("expected pointer, got {other:?}"),
+        }
+
+        let proof_bytes = node
+            .amendment_store
+            .get_amendment(&hashes[1])
+            .unwrap()
+            .expect("rebuild should restore final proof");
+        match shell_stark_prover::StoredProofArtifact::from_json(&proof_bytes).unwrap() {
+            shell_stark_prover::StoredProofArtifact::Amendment(full) => {
+                assert_eq!(full.settlement_tx_hash, Some(settlement_tx_hash));
+            }
+            other => panic!("expected full proof, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1819,6 +2367,158 @@ mod tests {
             ShellHash::default(),
             "state root should reflect committed state"
         );
+    }
+
+    #[test]
+    fn produce_block_commit_failure_rolls_back_world_state() {
+        let (node, signer, failing_db) = setup_failing_batch_node();
+
+        let genesis = Block {
+            header: BlockHeader {
+                parent_hash: ShellHash::default(),
+                state_root: ShellHash::default(),
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: 0,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_000,
+                extra_data: Bytes::default(),
+                proposer: node.config.proposer_address.unwrap(),
+                sig_aggregate_proof: None,
+                base_fee_per_gas: 0,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let genesis_hash = genesis.hash();
+        node.chain_store.put_block(&genesis).unwrap();
+        node.chain_store.set_canonical(0, &genesis_hash).unwrap();
+        node.chain_store.set_head(&genesis_hash).unwrap();
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0xCC; 20]);
+        let initial_balance = U256::from(100_000_000_000_000u64);
+        let transfer_value = U256::from(1_000_000u64);
+        fund_account(&node, &sender, initial_balance);
+        let root_before = current_state_root(&node);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: transfer_value,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let tx_hash = {
+            let encoded = alloy_rlp::encode(&tx);
+            shell_primitives::keccak256(&encoded)
+        };
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed =
+            SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
+        let verifier = MultiVerifier;
+        let mut ws = node.world_state.write();
+        node.tx_pool
+            .insert(signed, &mut ws, node.chain_store.as_ref(), &verifier)
+            .unwrap();
+        drop(ws);
+
+        failing_db.fail_next_batch();
+        let err = node.produce_block(&signer, 100).unwrap_err();
+        assert!(
+            matches!(err, NodeError::Storage(_)),
+            "expected storage error, got {err}"
+        );
+
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            0
+        );
+        assert!(node.chain_store.get_block_by_number(1).unwrap().is_none());
+        assert_eq!(current_state_root(&node), root_before);
+        let ws = node.world_state.read();
+        assert_eq!(ws.get_balance(&sender).unwrap(), initial_balance);
+        assert_eq!(ws.get_balance(&receiver).unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn produce_block_commit_failure_does_not_persist_stark_settlement_side_effects() {
+        let (node, signer, failing_db) = setup_failing_batch_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+        let root_before = current_state_root(&node);
+        let head_before = node.chain_store.get_head_block().unwrap().unwrap().number();
+
+        node.pending_stark_settlements
+            .lock()
+            .push(amendment.clone());
+        failing_db.fail_next_batch();
+        let err = node.produce_block(&signer, 100).unwrap_err();
+        assert!(
+            matches!(err, NodeError::Storage(_)),
+            "expected storage error, got {err}"
+        );
+
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            head_before
+        );
+        assert!(node
+            .chain_store
+            .get_block_by_number(head_before + 1)
+            .unwrap()
+            .is_none());
+        assert_eq!(current_state_root(&node), root_before);
+        assert!(node
+            .amendment_store
+            .get_amendment(&genesis_hash)
+            .unwrap()
+            .is_none());
+        assert!(node
+            .amendment_store
+            .get_amendment(&hashes[0])
+            .unwrap()
+            .is_none());
+        assert!(node
+            .amendment_store
+            .get_amendment(&hashes[1])
+            .unwrap()
+            .is_none());
+        assert!(node.store.scan_prefix(b"ss/").unwrap().is_empty());
+        assert!(!node
+            .settled_stark_sources
+            .lock()
+            .contains(&(amendment.layer, genesis_hash)));
+        assert!(!node
+            .settled_stark_sources
+            .lock()
+            .contains(&(amendment.layer, hashes[0])));
+        assert!(!node
+            .settled_stark_sources
+            .lock()
+            .contains(&(amendment.layer, hashes[1])));
     }
 
     #[test]
@@ -2782,6 +3482,60 @@ mod tests {
             head.number() >= 3,
             "expected at least 3 blocks, got {}",
             head.number()
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_event_loop_stops_background_prover_tasks() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::net::SocketAddr;
+
+        let (mut node, signer) = setup_node();
+        node.config.node_role = crate::config::NodeRole::ValidatorProver;
+        node.config.metrics.enabled = false;
+        node.config.rpc.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        node.config.rpc.ws_addr = None;
+        store_consistent_genesis(&node);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+
+        let node = Arc::new(node);
+        let signer = Arc::new(signer) as Arc<dyn Signer>;
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(signer, &mut network).await }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        handle.abort();
+        let err = handle
+            .await
+            .expect_err("aborted event loop should not complete normally");
+        assert!(
+            err.is_cancelled(),
+            "expected cancelled join error, got {err}"
+        );
+
+        let completed_before = {
+            let mut backlog = node.proof_backlog.lock();
+            let _ = backlog.drain();
+            let completed_before = backlog.total_completed();
+            backlog.push(ProofTask::new([7u8; 32], 7, vec![]));
+            completed_before
+        };
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        let backlog = node.proof_backlog.lock();
+        assert_eq!(
+            backlog.len(),
+            1,
+            "aborted run must not leave prover tasks running"
+        );
+        assert_eq!(
+            backlog.total_completed(),
+            completed_before,
+            "aborted run must not drain backlog after lifecycle owner is dropped"
         );
     }
 
@@ -3933,6 +4687,71 @@ mod tests {
         assert!(task.entries.is_empty());
         assert_eq!(task.original_size, Some(0));
         assert_eq!(task.source_hashes.len(), 1);
+    }
+
+    #[test]
+    fn stark_source_original_size_uses_fallback_for_pruned_stub_block() {
+        let (node, proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+
+        let (signer, addr, pubkey) = make_stark_account(&node);
+        let tx = make_embedded_tx(&signer, addr, pubkey, 0, 1);
+        let verifier = MultiVerifier;
+        let mut ws = node.world_state.write();
+        node.tx_pool
+            .insert(tx, &mut ws, node.chain_store.as_ref(), &verifier)
+            .unwrap();
+        drop(ws);
+
+        let block = node.produce_block(&proposer_signer, 8).unwrap();
+        let source_hash = block.hash();
+        node.chain_store.put_block(&block).unwrap();
+        assert!(node.chain_store.has_witness_bundle(&source_hash).unwrap());
+
+        node.chain_store
+            .delete_witness_bundle(&source_hash)
+            .unwrap();
+        let pruned_block = node
+            .chain_store
+            .get_block_by_hash(&source_hash)
+            .unwrap()
+            .expect("block should still be readable after witness pruning");
+
+        assert!(
+            !pruned_block.transactions.is_empty(),
+            "test requires a block with at least one tx"
+        );
+        assert!(pruned_block
+            .transactions
+            .iter()
+            .all(|tx| tx.signature.data.is_empty()));
+
+        let (_, stub_bundle) = shell_core::StrippedBlock::split(&pruned_block);
+        let stub_bundle_size = alloy_rlp::encode(&stub_bundle).len() as u64;
+        assert!(stub_bundle_size > 0, "stub split should be non-empty");
+
+        let original_size = node
+            .stark_source_original_size(
+                &source_hash,
+                &pruned_block,
+                pruned_block.transactions.len(),
+            )
+            .unwrap()
+            .expect("original_size should be computable");
+
+        const ESTIMATED_DILITHIUM3_SIG_BYTES: u64 = 3_309;
+        const ESTIMATED_REFERENCE_WITNESS_RLP_OVERHEAD_BYTES: u64 = 8;
+        let expected = pruned_block.transactions.len() as u64
+            * (ESTIMATED_DILITHIUM3_SIG_BYTES + ESTIMATED_REFERENCE_WITNESS_RLP_OVERHEAD_BYTES);
+
+        assert_eq!(
+            original_size, expected,
+            "pruned stub blocks must use conservative fallback sizing"
+        );
+        assert!(
+            original_size > stub_bundle_size,
+            "fallback size must not undercount to stub witness bytes"
+        );
     }
 
     /// STARK compression: verify ProverService proves isolated L1 runs immediately

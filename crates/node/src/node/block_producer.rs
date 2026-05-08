@@ -7,50 +7,33 @@ impl<S: KvStore + 'static> Node<S> {
     /// commits state changes after every transaction (so subsequent txs see
     /// prior updates), assembles a block, and commits it to storage.
     pub fn produce_block(&self, signer: &dyn Signer, max_txs: usize) -> Result<Block, NodeError> {
-        let head = self
-            .chain_store
-            .get_head_block()?
-            .ok_or(NodeError::NoGenesis)?;
+        let block_store = self.block_store();
+        let consensus = self.consensus_manager();
+        let prover = self.prover_orchestrator();
+        let mem_pool = self.mem_pool();
+
+        let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
         let head_hash = head.hash();
         let next_number = head.number() + 1;
 
         let proposer_addr = self.config.proposer_address.ok_or(NodeError::NotProposer)?;
+        consensus.ensure_local_proposer(next_number, proposer_addr)?;
 
-        if !self
-            .consensus
-            .read()
-            .is_proposer(next_number, &proposer_addr)
-        {
-            return Err(NodeError::NotProposer);
-        }
-
-        let (finalized_number, finalized_hash) = {
-            let finality = self.finality.read();
-            (
-                finality.last_finalized_number(),
-                *finality.last_finalized_hash(),
-            )
-        };
+        let (finalized_number, finalized_hash) = consensus.finalized_cursor();
         ChainStateMachine::ensure_production_parent(
             head.number(),
             head_hash,
             next_number,
-            self.chain_store.get_block_by_number(next_number)?.is_some(),
+            block_store.block_exists(next_number)?,
             finalized_number,
             finalized_hash,
         )?;
 
         // Collect pending transactions from mempool.
-        let candidates = self.tx_pool.pending_for_block(max_txs);
+        let candidates = mem_pool.pending_for_block(max_txs);
 
         // Create an isolated EVM instance at the current state root.
-        let current_root = {
-            let mut ws = self.world_state.write();
-            ws.state_root()?
-        };
-        let ws = WorldState::at_root(self.store.clone(), &current_root)?;
-        let cs = ChainStore::new(self.store.clone());
-        let state_db = ShellStateDb::new(ws, cs);
+        let (state_db, current_root) = block_store.isolated_state_db()?;
         let mut evm = ShellEvm::new(state_db, self.config.chain_id);
 
         let now = self.current_block_timestamp(head.header.timestamp);
@@ -143,8 +126,7 @@ impl<S: KvStore + 'static> Node<S> {
                         // the post-bundle root. Both world_states share the same
                         // KV-backed trie store, so this is a constant-time op.
                         let new_root = evm.state_db_mut().world_state_mut().state_root()?;
-                        let mut ws = self.world_state.write();
-                        ws.rollback_to_root(&new_root)?;
+                        block_store.rollback_world_state(&new_root)?;
                     } else if result.is_system_tx {
                         self.sync_system_contract_state(
                             evm.state_db_mut().world_state_mut(),
@@ -184,10 +166,7 @@ impl<S: KvStore + 'static> Node<S> {
             evm.state_db_mut()
                 .world_state_mut()
                 .add_balance(&proposer_addr, producer_reward)?;
-            {
-                let mut ws = self.world_state.write();
-                ws.add_balance(&proposer_addr, producer_reward)?;
-            }
+            block_store.add_balance(&proposer_addr, producer_reward)?;
             let tx_index = included_txs.len() as u32;
             let reward_tx = SystemTransaction::block_gas_reward(
                 self.config.chain_id,
@@ -211,10 +190,7 @@ impl<S: KvStore + 'static> Node<S> {
             system_txs.push(reward_tx);
         }
 
-        let mut pending_stark_settlements = {
-            let mut pending = self.pending_stark_settlements.lock();
-            std::mem::take(&mut *pending)
-        };
+        let mut pending_stark_settlements = prover.take_pending_stark_settlements();
         pending_stark_settlements.sort_by(|a, b| {
             (
                 a.layer,
@@ -246,7 +222,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
             if settlement_keys
                 .iter()
-                .any(|key| self.settled_stark_sources.lock().contains(key))
+                .any(|key| prover.has_settled_source(*key))
             {
                 continue;
             }
@@ -278,10 +254,7 @@ impl<S: KvStore + 'static> Node<S> {
             evm.state_db_mut()
                 .world_state_mut()
                 .add_balance(&reward_tx.to, reward_tx.value)?;
-            {
-                let mut ws = self.world_state.write();
-                ws.add_balance(&reward_tx.to, reward_tx.value)?;
-            }
+            block_store.add_balance(&reward_tx.to, reward_tx.value)?;
             receipts.push(TransactionReceipt {
                 tx_hash: reward_tx.hash(),
                 block_number: next_number,
@@ -296,7 +269,7 @@ impl<S: KvStore + 'static> Node<S> {
             let reward_hash = reward_tx.hash();
             system_txs.push(reward_tx);
             settled_stark_artifacts.push((amendment.clone(), reward_hash));
-            self.metrics.stark_settlements_accepted.inc();
+            prover.record_accepted_settlement();
             settled_stark_proofs.push(amendment);
         }
         header.extra_data = Bytes::default();
@@ -361,23 +334,20 @@ impl<S: KvStore + 'static> Node<S> {
         };
 
         // Sign the block with the proposer's key.
-        self.consensus.read().sign_block(&mut block, signer)?;
+        consensus.sign_block(&mut block, signer)?;
 
         // Register the signer's pubkey so we can verify our own blocks on re-import.
-        self.register_authority_pubkey(proposer_addr, signer.public_key().to_vec());
+        consensus.register_authority_pubkey(proposer_addr, signer.public_key().to_vec());
 
         // Commit to storage.
         let block_hash = block.hash();
-
-        self.chain_store.put_block(&block)?;
         // G4: Push proof task with real block hash and stored witness size.
         if let Some(entries) = stark_entries {
             let block_num = block.header.number;
             let hash_bytes: [u8; 32] = *block_hash.as_bytes();
             let original_size =
                 self.stark_source_original_size(&block_hash, &block, entries.len())?;
-            let mut backlog = self.proof_backlog.lock();
-            backlog.push(ProofTask::with_sources(
+            prover.queue_task(ProofTask::with_sources(
                 hash_bytes,
                 block_num,
                 entries,
@@ -397,40 +367,25 @@ impl<S: KvStore + 'static> Node<S> {
                 "queued additional historical STARK frontier proof tasks after block production"
             );
         }
-        self.chain_store.put_receipts(&block_hash, &receipts)?;
-        self.chain_store.put_system_transactions(
-            &block_hash,
-            block.number(),
-            &block.system_transactions,
-        )?;
-        self.chain_store
-            .set_canonical(block.number(), &block_hash)?;
-        self.chain_store.set_head(&block_hash)?;
+        if let Err(err) = block_store.commit_canonical_block(&block, Some(receipts.as_slice())) {
+            if let Err(rollback_err) = block_store.rollback_world_state(&current_root) {
+                warn!(
+                    error = %rollback_err,
+                    target_root = %current_root,
+                    "produce_block: failed to roll back world state after storage commit error"
+                );
+            }
+            return Err(err);
+        }
         for (amendment, settlement_tx_hash) in &settled_stark_artifacts {
             self.store_stark_artifacts(amendment, Some(*settlement_tx_hash))?;
         }
-        self.settled_stark_sources
-            .lock()
-            .extend(settled_stark_proofs.iter().flat_map(|amendment| {
-                amendment
-                    .covered_hashes()
-                    .into_iter()
-                    .map(move |source| (amendment.layer, source))
-            }));
-        for amendment in settled_stark_proofs.iter() {
-            for source in amendment.covered_hashes() {
-                let _ = self.settled_source_index.put(amendment.layer, &source);
-            }
-        }
-        self.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
+        prover.record_settled_sources(&settled_stark_proofs);
+        consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.
         let tx_hashes: Vec<ShellHash> = included_txs.iter().map(|tx| tx.hash()).collect();
-        self.tx_pool.remove_batch(&tx_hashes);
-        let pruned = {
-            let ws = self.world_state.read();
-            self.tx_pool.prune_nonce_too_low(&ws)
-        };
+        let pruned = mem_pool.remove_committed_hashes(&tx_hashes);
         if pruned > 0 {
             debug!(
                 count = pruned,
@@ -439,7 +394,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Update canonical aggregate counters for shell_* stats RPCs.
-        self.chain_store.add_canonical_block_to_totals(
+        block_store.update_chain_totals(
             block.number(),
             included_txs.len() as u64,
             block.header.gas_used,

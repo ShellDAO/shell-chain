@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use shell_core::{Block, BlockHeader, StrippedBlock, SystemTransaction, TransactionReceipt};
 use shell_primitives::{Address, ShellHash, U256};
 
-use crate::{KvStore, StorageError};
+use crate::{KvStore, StorageError, WriteBatch};
 
 /// Persistent chain configuration (written once at genesis).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,19 +325,18 @@ impl<S: KvStore> ChainStore<S> {
             .collect()
     }
 
-    fn put_block_parts(&self, block: &Block, index_transactions: bool) -> Result<(), StorageError> {
+    fn append_block_parts(batch: &mut WriteBatch, block: &Block, index_transactions: bool) {
         let block_hash = block.hash();
         let block_number = block.number();
 
         // Store header (RLP with version prefix)
         let header_bytes = encode_rlp(&block.header);
-        self.store
-            .put(&Self::header_key(&block_hash), &header_bytes)?;
+        batch.put(Self::header_key(&block_hash), header_bytes);
 
         // Split block into stripped body + witness bundle and store separately.
         let (stripped, bundle) = StrippedBlock::split(block);
         let body_bytes = encode_rlp(&stripped);
-        self.store.put(&Self::body_key(&block_hash), &body_bytes)?;
+        batch.put(Self::body_key(&block_hash), body_bytes);
 
         // Only persist witness bundle when there are transactions to witness.
         // Empty blocks have no PQ material, so omitting the entry is correct
@@ -345,8 +344,7 @@ impl<S: KvStore> ChainStore<S> {
         if !bundle.is_empty() {
             let mut witness_buf = Vec::new();
             bundle.encode(&mut witness_buf);
-            self.store
-                .put(&Self::witness_key(&block_hash), &witness_buf)?;
+            batch.put(Self::witness_key(&block_hash), witness_buf);
         }
 
         if index_transactions {
@@ -355,28 +353,31 @@ impl<S: KvStore> ChainStore<S> {
                 let tx_hash = tx.hash();
                 let mut index_value = block_hash.as_bytes().to_vec();
                 index_value.extend_from_slice(&(i as u32).to_be_bytes());
-                self.store
-                    .put(&Self::tx_index_key(&tx_hash), &index_value)?;
+                batch.put(Self::tx_index_key(&tx_hash), index_value);
 
                 // Address index: sender
                 let idx = i as u32;
-                self.store.put(
-                    &Self::addr_tx_key(&tx.sender(), block_number, idx),
-                    tx_hash.as_bytes(),
-                )?;
+                batch.put(
+                    Self::addr_tx_key(&tx.sender(), block_number, idx),
+                    tx_hash.as_bytes().to_vec(),
+                );
                 // Address index: recipient (if not contract creation)
                 if let Some(to) = tx.tx.to {
                     if to != tx.sender() {
-                        self.store.put(
-                            &Self::addr_tx_key(&to, block_number, idx),
-                            tx_hash.as_bytes(),
-                        )?;
+                        batch.put(
+                            Self::addr_tx_key(&to, block_number, idx),
+                            tx_hash.as_bytes().to_vec(),
+                        );
                     }
                 }
             }
         }
+    }
 
-        Ok(())
+    fn put_block_parts(&self, block: &Block, index_transactions: bool) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        Self::append_block_parts(&mut batch, block, index_transactions);
+        self.store.write_batch(batch)
     }
 
     /// Mark a block number → hash mapping in the canonical chain index.
@@ -620,23 +621,94 @@ impl<S: KvStore> ChainStore<S> {
         block_number: u64,
         system_txs: &[SystemTransaction],
     ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        self.append_system_transactions(&mut batch, block_hash, block_number, system_txs)?;
+        self.store.write_batch(batch)
+    }
+
+    fn append_system_transactions(
+        &self,
+        batch: &mut WriteBatch,
+        block_hash: &ShellHash,
+        block_number: u64,
+        system_txs: &[SystemTransaction],
+    ) -> Result<(), StorageError> {
         let data = serde_json::to_vec(system_txs)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        self.store.put(&Self::system_txs_key(block_hash), &data)?;
+        batch.put(Self::system_txs_key(block_hash), data);
 
         for tx in system_txs {
             let tx_hash = tx.hash();
             let mut index_value = block_hash.as_bytes().to_vec();
             index_value.extend_from_slice(&tx.tx_index.to_be_bytes());
-            self.store
-                .put(&Self::tx_index_key(&tx_hash), &index_value)?;
-            self.store.put(
-                &Self::addr_tx_key(&tx.to, block_number, tx.tx_index),
-                tx_hash.as_bytes(),
-            )?;
+            batch.put(Self::tx_index_key(&tx_hash), index_value);
+            batch.put(
+                Self::addr_tx_key(&tx.to, block_number, tx.tx_index),
+                tx_hash.as_bytes().to_vec(),
+            );
         }
 
         Ok(())
+    }
+
+    /// Atomically commit all canonical block artifacts in one batch.
+    ///
+    /// This prevents partial storage visibility where only some of the block,
+    /// receipt, tx-index, canonical, or HEAD records are written.
+    pub fn commit_canonical_block(
+        &self,
+        block: &Block,
+        receipts: Option<&[TransactionReceipt]>,
+    ) -> Result<(), StorageError> {
+        let block_hash = block.hash();
+        let mut batch = WriteBatch::new();
+
+        Self::append_block_parts(&mut batch, block, true);
+        if let Some(receipts) = receipts {
+            let data = encode_rlp_list(receipts);
+            batch.put(Self::receipts_key(&block_hash), data);
+        }
+        self.append_system_transactions(
+            &mut batch,
+            &block_hash,
+            block.number(),
+            &block.system_transactions,
+        )?;
+        batch.put(
+            Self::number_key(block.number()),
+            block_hash.as_bytes().to_vec(),
+        );
+        batch.put(prefix::HEAD_BLOCK.to_vec(), block_hash.as_bytes().to_vec());
+
+        self.store.write_batch(batch)
+    }
+
+    /// Atomically commit the genesis block, canonical/head pointers, and chain config.
+    ///
+    /// This keeps bootstrap metadata aligned with the genesis state root so
+    /// startup never observes only part of the genesis chain records.
+    pub fn commit_genesis_block(
+        &self,
+        block: &Block,
+        config: &ChainConfig,
+    ) -> Result<(), StorageError> {
+        let genesis_hash = block.hash();
+        let config_bytes =
+            serde_json::to_vec(config).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut batch = WriteBatch::new();
+
+        Self::append_block_parts(&mut batch, block, true);
+        batch.put(
+            Self::number_key(block.number()),
+            genesis_hash.as_bytes().to_vec(),
+        );
+        batch.put(
+            prefix::HEAD_BLOCK.to_vec(),
+            genesis_hash.as_bytes().to_vec(),
+        );
+        batch.put(prefix::CHAIN_CONFIG.to_vec(), config_bytes);
+
+        self.store.write_batch(batch)
     }
 
     /// Return system transactions attached to a block hash.
@@ -1413,8 +1485,70 @@ impl<S: KvStore> SettledSourceIndex<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryDb;
+    use crate::{MemoryDb, WriteBatch};
     use shell_primitives::{Address, Bytes};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FailingBatchStore {
+        inner: MemoryDb,
+        fail_next_batch: AtomicBool,
+        fail_put_after: AtomicUsize,
+        put_calls: AtomicUsize,
+    }
+
+    impl FailingBatchStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryDb::new(),
+                fail_next_batch: AtomicBool::new(false),
+                fail_put_after: AtomicUsize::new(usize::MAX),
+                put_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_batch(&self) {
+            self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_put_after(&self, put_count: usize) {
+            self.fail_put_after.store(put_count, Ordering::SeqCst);
+            self.put_calls.store(0, Ordering::SeqCst);
+        }
+    }
+
+    impl KvStore for FailingBatchStore {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            let call_num = self.put_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call_num >= self.fail_put_after.load(Ordering::SeqCst) {
+                return Err(StorageError::Database("injected put failure".into()));
+            }
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            if self.fail_next_batch.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected batch failure".into()));
+            }
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn empty_block(number: u64) -> Block {
         Block {
@@ -2487,5 +2621,126 @@ mod tests {
             "no w/<hash> for empty block"
         );
         assert!(!cs.has_witness_bundle(&hash).unwrap());
+    }
+
+    #[test]
+    fn commit_canonical_block_writes_all_required_records() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(5);
+        let hash = block.hash();
+        let tx_hash = block.transactions[0].hash();
+        let receipt = TransactionReceipt {
+            tx_hash,
+            block_number: block.number(),
+            tx_index: 0,
+            status: 1,
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            contract_address: None,
+            logs_bloom: Bytes::default(),
+            logs: vec![],
+        };
+
+        cs.commit_canonical_block(&block, Some(std::slice::from_ref(&receipt)))
+            .unwrap();
+
+        assert_eq!(cs.get_head_hash().unwrap(), Some(hash));
+        assert_eq!(
+            cs.get_block_by_number(block.number())
+                .unwrap()
+                .unwrap()
+                .hash(),
+            hash
+        );
+        assert_eq!(
+            cs.get_receipts(&hash).unwrap().unwrap(),
+            vec![receipt.clone()]
+        );
+        assert_eq!(cs.get_tx_location(&tx_hash).unwrap(), Some((hash, 0)));
+    }
+
+    #[test]
+    fn commit_canonical_block_is_atomic_on_batch_error() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(9);
+        let hash = block.hash();
+        let tx_hash = block.transactions[0].hash();
+        let receipt = TransactionReceipt {
+            tx_hash,
+            block_number: block.number(),
+            tx_index: 0,
+            status: 1,
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            contract_address: None,
+            logs_bloom: Bytes::default(),
+            logs: vec![],
+        };
+
+        // If this ever regresses to per-key puts, this injected put failure
+        // would leave partial data behind.
+        db.fail_put_after(2);
+        db.fail_next_batch();
+        let err = cs
+            .commit_canonical_block(&block, Some(std::slice::from_ref(&receipt)))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected batch failure"),
+            "unexpected error: {err}"
+        );
+
+        assert!(cs.get_head_hash().unwrap().is_none());
+        assert!(cs.get_block_by_hash(&hash).unwrap().is_none());
+        assert!(cs.get_block_by_number(block.number()).unwrap().is_none());
+        assert!(cs.get_receipts(&hash).unwrap().is_none());
+        assert!(cs.get_tx_location(&tx_hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn commit_genesis_block_writes_all_required_records() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = empty_block(0);
+        let genesis_hash = block.hash();
+        let config = ChainConfig {
+            chain_id: 1337,
+            genesis_hash,
+        };
+
+        cs.commit_genesis_block(&block, &config).unwrap();
+
+        assert_eq!(cs.get_head_hash().unwrap(), Some(genesis_hash));
+        assert_eq!(
+            cs.get_block_by_number(0).unwrap().unwrap().hash(),
+            genesis_hash
+        );
+        assert_eq!(cs.get_chain_config().unwrap(), Some(config));
+    }
+
+    #[test]
+    fn commit_genesis_block_is_atomic_on_batch_error() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = empty_block(0);
+        let genesis_hash = block.hash();
+        let config = ChainConfig {
+            chain_id: 1337,
+            genesis_hash,
+        };
+
+        db.fail_put_after(2);
+        db.fail_next_batch();
+        let err = cs.commit_genesis_block(&block, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("injected batch failure"),
+            "unexpected error: {err}"
+        );
+
+        assert!(cs.get_head_hash().unwrap().is_none());
+        assert!(cs.get_block_by_hash(&genesis_hash).unwrap().is_none());
+        assert!(cs.get_block_by_number(0).unwrap().is_none());
+        assert!(cs.get_chain_config().unwrap().is_none());
     }
 }

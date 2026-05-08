@@ -19,6 +19,10 @@
 //! The owner sends `true` on the `shutdown_tx` watch channel.  The service
 //! loop checks the channel on each iteration and exits gracefully, allowing
 //! in-flight proofs to complete before stopping.
+//!
+//! Dropping the handle also aborts the async service loop to avoid leaving an
+//! orphaned task. This does **not** hard-cancel CPU work already running inside
+//! `spawn_blocking`; those proof jobs may run to completion.
 
 use std::sync::Arc;
 
@@ -73,20 +77,38 @@ pub enum ProvingPriority {
 
 /// Handle returned by [`ProverService::start`].
 ///
-/// Dropping this handle does **not** stop the service — call [`shutdown`]
-/// explicitly for graceful termination.
+/// Call [`shutdown`] for graceful termination.
+///
+/// Dropping the handle sends shutdown and aborts the async service loop to
+/// avoid leaving an orphaned prover task. This is best-effort: proof generation
+/// already running in `spawn_blocking` cannot be forcibly interrupted.
 ///
 /// [`shutdown`]: ProverServiceHandle::shutdown
 pub struct ProverServiceHandle {
-    shutdown_tx: watch::Sender<bool>,
-    join_handle: tokio::task::JoinHandle<()>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProverServiceHandle {
     /// Signal the prover service to stop and wait for it to finish.
-    pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = self.join_handle.await;
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.await;
+        }
+    }
+}
+
+impl Drop for ProverServiceHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = &self.shutdown_tx {
+            let _ = shutdown_tx.send(true);
+        }
+        if let Some(join_handle) = &self.join_handle {
+            join_handle.abort();
+        }
     }
 }
 
@@ -148,8 +170,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let join_handle = tokio::spawn(self.run_loop(shutdown_rx));
         ProverServiceHandle {
-            shutdown_tx,
-            join_handle,
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Some(join_handle),
         }
     }
 
@@ -228,7 +250,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         } = task;
 
         // Run the CPU-intensive proof generation on a blocking thread so the
-        // tokio executor is not starved.
+        // tokio executor is not starved. Note: once started, this blocking job
+        // is not hard-cancelable via JoinHandle::abort.
         let proof_result = tokio::task::spawn_blocking(move || prove_sig_batch(&entries)).await;
 
         match proof_result {
@@ -364,6 +387,33 @@ mod tests {
         let handle = service.start();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_handle_stops_service_loop() {
+        let (service, backlog) = make_service();
+        let handle = service.start();
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        drop(handle);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        {
+            let mut backlog = backlog.lock();
+            backlog.push(ProofTask::new([9u8; 32], 9, vec![]));
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        let backlog = backlog.lock();
+        assert_eq!(
+            backlog.len(),
+            1,
+            "dropped handle must stop the service task"
+        );
+        assert_eq!(
+            backlog.total_completed(),
+            0,
+            "dropped handle must not leave the async prover loop running"
+        );
     }
 
     #[tokio::test]

@@ -137,15 +137,31 @@ impl<S: KvStore + 'static> Node<S> {
         if entry_count == 0 {
             return Ok(Some(0));
         }
+        // Prefer the canonical witness blob from storage when available.
         if let Some(size) = self.witness_store.bundle_size(source_hash)? {
             return Ok(Some(size));
+        }
+
+        // Blocks reconstructed after witness pruning carry stub signatures
+        // (empty signature bytes for each tx). Splitting those stubs would
+        // fabricate a tiny "witness bundle" and undercount original_size.
+        let has_real_witness_material = source_block
+            .transactions
+            .iter()
+            .any(|tx| !tx.signature.data.is_empty());
+        if has_real_witness_material {
+            let (_, witness_bundle) = shell_core::StrippedBlock::split(source_block);
+            if !witness_bundle.is_empty() {
+                let witness_bytes = alloy_rlp::encode(&witness_bundle);
+                return Ok(Some(witness_bytes.len() as u64));
+            }
         }
 
         // If a full node pruned the raw witness before the prover caught up, the
         // exact bytes are gone. Use a conservative reference-witness estimate so
         // the ordered STARK frontier can still advance instead of wedging forever.
         Ok(Some(
-            source_block.transactions.len() as u64
+            source_block.transactions.len().max(entry_count) as u64
                 * (ESTIMATED_DILITHIUM3_SIG_BYTES + ESTIMATED_REFERENCE_WITNESS_RLP_OVERHEAD_BYTES),
         ))
     }

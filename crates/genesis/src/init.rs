@@ -81,19 +81,13 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     let genesis_hash = block.hash();
 
     chain_store
-        .put_block(&block)
-        .map_err(|e| GenesisError::StateInit(e.to_string()))?;
-    chain_store
-        .set_canonical(0, &genesis_hash)
-        .map_err(|e| GenesisError::StateInit(e.to_string()))?;
-    chain_store
-        .set_head(&genesis_hash)
-        .map_err(|e| GenesisError::StateInit(e.to_string()))?;
-    chain_store
-        .put_chain_config(&ChainConfig {
-            chain_id: config.chain_id,
-            genesis_hash,
-        })
+        .commit_genesis_block(
+            &block,
+            &ChainConfig {
+                chain_id: config.chain_id,
+                genesis_hash,
+            },
+        )
         .map_err(|e| GenesisError::StateInit(e.to_string()))?;
 
     Ok(block)
@@ -176,9 +170,58 @@ mod tests {
     use super::*;
     use crate::ConsensusConfig;
     use shell_primitives::U256;
-    use shell_storage::{ChainStore, MemoryDb};
+    use shell_storage::{ChainStore, KvStore, MemoryDb, StorageError, WriteBatch};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct FailingBatchDb {
+        inner: MemoryDb,
+        fail_next_batch: AtomicBool,
+    }
+
+    impl FailingBatchDb {
+        fn new() -> Self {
+            Self {
+                inner: MemoryDb::new(),
+                fail_next_batch: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_batch(&self) {
+            self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl KvStore for FailingBatchDb {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            if self.fail_next_batch.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected batch failure".into()));
+            }
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn test_genesis() -> GenesisConfig {
         let mut alloc = HashMap::new();
@@ -353,6 +396,26 @@ mod tests {
         assert_eq!(chain_store.get_head_hash().unwrap().unwrap(), block.hash());
         let loaded = chain_store.get_block_by_number(0).unwrap().unwrap();
         assert_eq!(loaded.hash(), block.hash());
+    }
+
+    #[test]
+    fn genesis_commit_is_atomic_on_batch_error() {
+        let config = test_genesis();
+        let expected_block = initialize_genesis(&config, Arc::new(MemoryDb::new())).unwrap();
+        let store = Arc::new(FailingBatchDb::new());
+        store.fail_next_batch();
+
+        let err = initialize_genesis(&config, Arc::clone(&store)).unwrap_err();
+        assert!(matches!(err, GenesisError::StateInit(_)));
+
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        assert!(chain_store.get_head_hash().unwrap().is_none());
+        assert!(chain_store
+            .get_block_by_hash(&expected_block.hash())
+            .unwrap()
+            .is_none());
+        assert!(chain_store.get_block_by_number(0).unwrap().is_none());
+        assert!(chain_store.get_chain_config().unwrap().is_none());
     }
 
     #[test]

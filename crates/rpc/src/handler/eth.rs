@@ -1,5 +1,18 @@
 use super::*;
 
+fn rpc_logs_from_core(logs: Vec<shell_core::Log>) -> Vec<RpcLog> {
+    logs.into_iter()
+        .map(|log| {
+            let data = hex_bytes(log.data.as_ref());
+            RpcLog {
+                address: log.address,
+                topics: log.topics,
+                data,
+            }
+        })
+        .collect()
+}
+
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
@@ -293,7 +306,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .get_receipts(&block_hash)
                 .map_err(internal_err)?;
             if let (Some(block), Some(receipts)) = (block, receipts) {
-                if let Some(receipt) = receipts.get(tx_index as usize) {
+                if let Some(receipt) = receipts.into_iter().nth(tx_index as usize) {
                     // F-067: populate from/to/effective_gas_price from the transaction.
                     let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
                         if let Some(tx) = block.transactions.get(tx_index as usize) {
@@ -348,15 +361,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                         effective_gas_price: hex_u64(eff_gas_price),
                         contract_address: receipt.contract_address,
-                        logs: receipt
-                            .logs
-                            .iter()
-                            .map(|log| RpcLog {
-                                address: log.address,
-                                topics: log.topics.clone(),
-                                data: hex_bytes(log.data.as_ref()),
-                            })
-                            .collect(),
+                        logs: rpc_logs_from_core(receipt.logs),
                         logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
                         tx_type: format!("{:#x}", tx_type_val),
                         shell_type,
@@ -401,9 +406,16 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             .get_receipts(&block_hash)
             .map_err(internal_err)?
             .unwrap_or_default();
+        let system_txs_by_index: std::collections::HashMap<usize, SystemTransaction> = self
+            .chain_store
+            .get_system_transactions(&block_hash)
+            .map_err(internal_err)?
+            .into_iter()
+            .map(|tx| (tx.tx_index as usize, tx))
+            .collect();
 
         let mut rpc_receipts = Vec::with_capacity(receipts.len());
-        for (i, receipt) in receipts.iter().enumerate() {
+        for (i, receipt) in receipts.into_iter().enumerate() {
             let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
                 if let Some(tx) = block_obj.transactions.get(i) {
                     let price = shell_core::effective_gas_price(
@@ -428,13 +440,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         Some(shell_type.into()),
                         None,
                     )
-                } else if let Some(system_tx) = self
-                    .chain_store
-                    .get_system_transactions(&block_hash)
-                    .map_err(internal_err)?
-                    .into_iter()
-                    .find(|tx| tx.tx_index as usize == i)
-                {
+                } else if let Some(system_tx) = system_txs_by_index.get(&i) {
                     (
                         system_tx.from,
                         Some(system_tx.to),
@@ -459,15 +465,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                 effective_gas_price: hex_u64(eff_gas_price),
                 contract_address: receipt.contract_address,
-                logs: receipt
-                    .logs
-                    .iter()
-                    .map(|log| RpcLog {
-                        address: log.address,
-                        topics: log.topics.clone(),
-                        data: hex_bytes(log.data.as_ref()),
-                    })
-                    .collect(),
+                logs: rpc_logs_from_core(receipt.logs),
                 logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
                 tx_type: format!("{:#x}", tx_type_val),
                 shell_type,
@@ -747,7 +745,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             // Global log index across all receipts in this block.
             let mut global_log_index: u64 = 0;
 
-            for (tx_idx, receipt) in receipts.iter().enumerate() {
+            for (tx_idx, receipt) in receipts.into_iter().enumerate() {
                 // Per-receipt bloom fast path.
                 if receipt.logs_bloom.len() == BLOOM_SIZE
                     && !filter.matches_bloom(receipt.logs_bloom.as_ref())
@@ -756,15 +754,17 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     continue;
                 }
 
-                for log in &receipt.logs {
-                    if filter.matches_log(log) {
+                let tx_hash = receipt.tx_hash;
+                for log in receipt.logs {
+                    if filter.matches_log(&log) {
+                        let data = hex_bytes(log.data.as_ref());
                         results.push(RpcLogWithMeta {
                             address: log.address,
-                            topics: log.topics.clone(),
-                            data: hex_bytes(log.data.as_ref()),
+                            topics: log.topics,
+                            data,
                             block_number: hex_u64(block_num),
                             block_hash,
-                            transaction_hash: receipt.tx_hash,
+                            transaction_hash: tx_hash,
                             transaction_index: hex_u64(tx_idx as u64),
                             log_index: hex_u64(global_log_index),
                             removed: false,
@@ -831,7 +831,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .filter_registry
                 .get_log_filter(&id)
                 .ok_or_else(|| not_found("filter not found"))?;
-            let filter = raw.into_filter(latest);
+            let filter = raw.into_match_filter();
 
             let mut results = Vec::new();
             let actual_to = latest.min(from + MAX_BLOCK_RANGE - 1);
@@ -858,16 +858,18 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     .unwrap_or_default();
 
                 let mut global_log_index: u64 = 0;
-                for (tx_idx, receipt) in receipts.iter().enumerate() {
-                    for log in &receipt.logs {
-                        if filter.matches_log(log) {
+                for (tx_idx, receipt) in receipts.into_iter().enumerate() {
+                    let tx_hash = receipt.tx_hash;
+                    for log in receipt.logs {
+                        if filter.matches_log(&log) {
+                            let data = hex_bytes(log.data.as_ref());
                             results.push(RpcLogWithMeta {
                                 address: log.address,
-                                topics: log.topics.clone(),
-                                data: hex_bytes(log.data.as_ref()),
+                                topics: log.topics,
+                                data,
                                 block_number: hex_u64(block_num),
                                 block_hash,
-                                transaction_hash: receipt.tx_hash,
+                                transaction_hash: tx_hash,
                                 transaction_index: hex_u64(tx_idx as u64),
                                 log_index: hex_u64(global_log_index),
                                 removed: false,

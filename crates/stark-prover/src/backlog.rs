@@ -347,6 +347,7 @@ impl Default for ProofBacklog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     fn make_task(n: u64) -> ProofTask {
         ProofTask::new([n as u8; 32], n, vec![])
@@ -357,6 +358,35 @@ mod tests {
             msg_hash: [n; 32],
             pk_hash: [n.wrapping_add(1); 32],
         }
+    }
+
+    fn make_hash(prefix: u8, n: u64) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[0] = prefix;
+        hash[1..9].copy_from_slice(&n.to_le_bytes());
+        hash
+    }
+
+    fn assert_index_consistency(backlog: &ProofBacklog) {
+        let mut expected_sources = HashSet::new();
+        let mut expected_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+
+        for task in &backlog.pending {
+            if task.source_hashes.is_empty() {
+                expected_sources.insert((task.layer, ShellHash::from(task.block_hash)));
+            } else {
+                for source_hash in &task.source_hashes {
+                    expected_sources.insert((task.layer, *source_hash));
+                }
+            }
+            expected_blocks
+                .entry(task.layer)
+                .or_default()
+                .insert(task.block_number);
+        }
+
+        assert_eq!(backlog.source_index, expected_sources);
+        assert_eq!(backlog.layer_blocks, expected_blocks);
     }
 
     #[test]
@@ -757,5 +787,185 @@ mod tests {
         assert!(b.contains_source(1, &bh_hash));
         b.pop();
         assert!(!b.contains_source(1, &bh_hash));
+    }
+
+    #[test]
+    fn indexes_remain_consistent_after_mixed_operations() {
+        let mut b = ProofBacklog::new();
+
+        let source10 = ShellHash::from(make_hash(10, 10));
+        let source11 = ShellHash::from(make_hash(10, 11));
+        let source_l2 = ShellHash::from(make_hash(20, 4));
+        let source_l2_front = ShellHash::from(make_hash(20, 3));
+
+        b.push(ProofTask::with_sources(
+            make_hash(100, 10),
+            10,
+            vec![],
+            1,
+            vec![source10],
+            None,
+        ));
+        b.push(ProofTask::with_sources(
+            make_hash(100, 11),
+            11,
+            vec![],
+            1,
+            vec![source11],
+            None,
+        ));
+        let fallback_hash = ShellHash::from(make_hash(99, 9));
+        b.push_front(ProofTask::with_sources(
+            make_hash(99, 9),
+            9,
+            vec![],
+            1,
+            vec![],
+            None,
+        ));
+        b.push(ProofTask::with_sources(
+            make_hash(110, 4),
+            4,
+            vec![],
+            2,
+            vec![source_l2],
+            None,
+        ));
+
+        assert!(b.contains_source(1, &fallback_hash));
+        assert!(b.contains_source(1, &source10));
+        assert_eq!(b.min_block_number_for_layer(1), Some(9));
+        assert_index_consistency(&b);
+
+        let popped = b.pop().expect("fallback task should pop first");
+        assert_eq!(popped.block_number, 9);
+        assert!(!b.contains_source(1, &fallback_hash));
+        assert_eq!(b.min_block_number_for_layer(1), Some(10));
+        assert_index_consistency(&b);
+
+        let merged_l1 = b.pop_contiguous(8).expect("L1 contiguous range should pop");
+        assert_eq!(merged_l1.layer, 1);
+        assert_eq!(merged_l1.block_number, 11);
+        assert!(!b.contains_source(1, &source10));
+        assert!(!b.contains_source(1, &source11));
+        assert_eq!(b.min_block_number_for_layer(1), None);
+        assert_index_consistency(&b);
+
+        b.push_front(ProofTask::with_sources(
+            make_hash(110, 3),
+            3,
+            vec![],
+            2,
+            vec![source_l2_front],
+            None,
+        ));
+        assert_index_consistency(&b);
+        let merged_l2 = b.pop_contiguous(8).expect("L2 contiguous range should pop");
+        assert_eq!(merged_l2.layer, 2);
+        assert_eq!(merged_l2.block_number, 4);
+        assert!(!b.contains_source(2, &source_l2));
+        assert!(!b.contains_source(2, &source_l2_front));
+        assert_eq!(b.min_block_number_for_layer(2), None);
+        assert_index_consistency(&b);
+
+        b.push(make_task(100));
+        b.push(make_task(101));
+        assert_eq!(b.min_block_number_for_layer(1), Some(100));
+        assert_index_consistency(&b);
+
+        b.drain();
+        assert!(b.is_empty());
+        assert!(b.source_index.is_empty());
+        assert!(b.layer_blocks.is_empty());
+    }
+
+    #[test]
+    fn stress_indices_under_large_workload() {
+        const TASKS_PER_LAYER: u64 = 512;
+        let mut b = ProofBacklog::new();
+        let mut source_keys = Vec::new();
+        let mut fallback_keys = Vec::new();
+        let mut layer2_first_fallback = None;
+        let mut layer2_second_source = None;
+        let mut layer3_first_fallback = None;
+
+        for layer in 1..=3u32 {
+            for block_number in 1..=TASKS_PER_LAYER {
+                let block_hash =
+                    make_hash(0x80 + layer as u8, ((layer as u64) << 32) | block_number);
+                if block_number % 2 == 0 {
+                    let source_hash = ShellHash::from(make_hash(
+                        0x10 + layer as u8,
+                        ((layer as u64) << 32) | block_number,
+                    ));
+                    b.push(ProofTask::with_sources(
+                        block_hash,
+                        block_number,
+                        vec![],
+                        layer,
+                        vec![source_hash],
+                        None,
+                    ));
+                    source_keys.push((layer, source_hash));
+                    if layer == 2 && block_number == 2 {
+                        layer2_second_source = Some(source_hash);
+                    }
+                } else {
+                    b.push(ProofTask::with_sources(
+                        block_hash,
+                        block_number,
+                        vec![],
+                        layer,
+                        vec![],
+                        None,
+                    ));
+                    let fallback_hash = ShellHash::from(block_hash);
+                    fallback_keys.push((layer, fallback_hash));
+                    if layer == 2 && block_number == 1 {
+                        layer2_first_fallback = Some(fallback_hash);
+                    }
+                    if layer == 3 && block_number == 1 {
+                        layer3_first_fallback = Some(fallback_hash);
+                    }
+                }
+            }
+        }
+
+        for _ in 0..8 {
+            for (layer, hash) in source_keys.iter().step_by(41) {
+                assert!(b.contains_source(*layer, hash));
+            }
+            for (layer, hash) in fallback_keys.iter().step_by(41) {
+                assert!(b.contains_source(*layer, hash));
+            }
+            assert_eq!(b.min_block_number_for_layer(1), Some(1));
+            assert_eq!(b.min_block_number_for_layer(2), Some(1));
+            assert_eq!(b.min_block_number_for_layer(3), Some(1));
+        }
+        assert!(!b.contains_source(2, &ShellHash::from(make_hash(0xFF, 999_999))));
+        assert_index_consistency(&b);
+
+        let merged_layer1 = b
+            .pop_contiguous(TASKS_PER_LAYER as usize + 1)
+            .expect("layer1 range should be contiguous");
+        assert_eq!(merged_layer1.layer, 1);
+        assert_eq!(merged_layer1.block_number, TASKS_PER_LAYER);
+        assert_eq!(b.min_block_number_for_layer(1), None);
+        assert_eq!(b.min_block_number_for_layer(2), Some(1));
+        assert_eq!(b.min_block_number_for_layer(3), Some(1));
+        assert_index_consistency(&b);
+
+        for _ in 0..128 {
+            b.pop().expect("layer2 still has entries");
+        }
+        assert_eq!(b.min_block_number_for_layer(2), Some(129));
+        assert!(!b.contains_source(2, &layer2_first_fallback.expect("set above")));
+        assert!(!b.contains_source(2, &layer2_second_source.expect("set above")));
+        assert!(b.contains_source(3, &layer3_first_fallback.expect("set above")));
+        assert_index_consistency(&b);
+
+        b.drain();
+        assert!(b.source_index.is_empty());
+        assert!(b.layer_blocks.is_empty());
     }
 }

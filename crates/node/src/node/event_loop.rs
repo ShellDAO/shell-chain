@@ -1,5 +1,45 @@
 use super::*;
 
+struct NodeTaskLifecycle {
+    tasks: tokio::task::JoinSet<()>,
+    prover_service: Option<ProverServiceHandle>,
+}
+
+impl NodeTaskLifecycle {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            prover_service: None,
+        }
+    }
+
+    fn spawn<F>(&mut self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.tasks.spawn(task);
+    }
+
+    fn attach_prover_service(&mut self, handle: ProverServiceHandle) {
+        self.prover_service = Some(handle);
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(prover_service) = self.prover_service.take() {
+            prover_service.shutdown().await;
+        }
+
+        self.tasks.abort_all();
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(err) = result {
+                if !err.is_cancelled() {
+                    warn!(error = %err, "background task exited unexpectedly");
+                }
+            }
+        }
+    }
+}
+
 impl<S: KvStore + 'static> Node<S> {
     /// Run the async event loop.
     ///
@@ -19,14 +59,16 @@ impl<S: KvStore + 'static> Node<S> {
         use tokio::time::{interval, Duration};
 
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
+        let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let mut task_lifecycle = NodeTaskLifecycle::new();
 
         // Spawn the Prometheus metrics HTTP server if enabled.
         if self.config.metrics.enabled {
             let metrics = Arc::clone(&self.metrics);
             let metrics_addr = self.config.metrics.listen_addr;
-            tokio::spawn(crate::metrics::serve_metrics(metrics, metrics_addr));
+            task_lifecycle.spawn(crate::metrics::serve_metrics(metrics, metrics_addr));
         }
 
         // Create a bounded channel for the RPC layer to forward submitted transactions
@@ -163,7 +205,7 @@ impl<S: KvStore + 'static> Node<S> {
         );
         if startup_peers > 0 {
             self.request_missing_blocks(
-                network,
+                &network,
                 None,
                 &mut sync_requested,
                 &mut sync_request_nonce,
@@ -206,7 +248,7 @@ impl<S: KvStore + 'static> Node<S> {
             )
             .with_amendment_sender(prover_amendment_tx);
             let handle = service.start();
-            *self.prover_service_handle.lock() = Some(handle);
+            task_lifecycle.attach_prover_service(handle);
             info!(
                 role = ?self.config.node_role,
                 "H3: Background prover service started"
@@ -667,7 +709,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             // NOT on invalid signatures or other errors (F-037).
                                             if !sync_requested {
                                                 self.request_missing_blocks(
-                                                    network,
+                                                    &network,
                                                     Some(&peer),
                                                     &mut sync_requested,
                                                     &mut sync_request_nonce,
@@ -1272,7 +1314,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     SYNC_RETRY_BASE_INTERVAL_SECS,
                                 ));
                                 self.request_missing_blocks(
-                                    network,
+                                    &network,
                                     Some(&peer),
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
@@ -1292,7 +1334,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 );
                             }
                             self.rebroadcast_pending_transactions(
-                                network,
+                                &network,
                                 Some(&peer),
                                 MAX_TX_REBROADCAST_PER_TICK,
                                 "peer-connected",
@@ -1325,7 +1367,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     SYNC_RETRY_BASE_INTERVAL_SECS,
                                 ));
                                 self.request_missing_blocks(
-                                    network,
+                                    &network,
                                     None,
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
@@ -1356,7 +1398,7 @@ impl<S: KvStore + 'static> Node<S> {
                 _ = tx_rebroadcast_timer.tick() => {
                     if network.peer_count().await > 0 && !self.tx_pool.is_empty() {
                         self.rebroadcast_pending_transactions(
-                            network,
+                            &network,
                             None,
                             MAX_TX_REBROADCAST_PER_TICK,
                             "periodic",
@@ -1444,7 +1486,7 @@ impl<S: KvStore + 'static> Node<S> {
                             continue;
                         }
                         self.request_missing_blocks(
-                            network,
+                            &network,
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
@@ -1471,7 +1513,7 @@ impl<S: KvStore + 'static> Node<S> {
                         // ask peers for head+1 as a cheap head probe; an empty response clears
                         // the sync request without moving readiness out of Ready.
                         self.request_missing_blocks(
-                            network,
+                            &network,
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
@@ -1506,6 +1548,8 @@ impl<S: KvStore + 'static> Node<S> {
             ws.stop().ok();
         }
         eprintln!("✓ RPC server stopped");
+
+        task_lifecycle.shutdown().await;
 
         // Flush storage to disk.
         if let Err(e) = self.store.flush() {

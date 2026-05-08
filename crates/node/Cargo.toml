@@ -17,6 +17,7 @@ shell-evm = { path = "../evm" }
 shell-mempool = { path = "../mempool" }
 shell-rpc = { path = "../rpc" }
 shell-network = { path = "../network" }
+alloy-rlp.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -30,4 +31,3 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
-alloy-rlp.workspace = true

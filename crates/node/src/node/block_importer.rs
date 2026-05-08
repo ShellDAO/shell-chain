@@ -12,15 +12,17 @@ impl<S: KvStore + 'static> Node<S> {
     /// potential fork and skipped. If there is a gap (block number is
     /// more than one ahead of head), missing blocks are requested.
     pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
-        let head = self
-            .chain_store
-            .get_head_block()?
-            .ok_or(NodeError::NoGenesis)?;
+        let block_store = self.block_store();
+        let consensus = self.consensus_manager();
+        let prover = self.prover_orchestrator();
+        let mem_pool = self.mem_pool();
+
+        let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
 
         let incoming = block.number();
         let incoming_hash = block.hash();
-        let canonical_hash_at_incoming = self.chain_store.get_block_hash_by_number(incoming)?;
-        let finalized_number = self.finality.read().last_finalized_number();
+        let canonical_hash_at_incoming = block_store.block_hash_by_number(incoming)?;
+        let finalized_number = consensus.finalized_number();
         let transition = ChainStateMachine::classify_import(
             head.number(),
             head.hash(),
@@ -34,15 +36,11 @@ impl<S: KvStore + 'static> Node<S> {
         // Fork detection: same height, different hash. Keep the side block so
         // fork-choice/reorg can inspect it later instead of dropping evidence.
         if transition == BlockImportTransition::SameHeightFork {
-            self.consensus.read().verify_header(&block.header)?;
+            consensus.verify_header(&block.header)?;
             let remote_hash = incoming_hash;
-            self.chain_store.put_side_fork_block(&block)?;
-            self.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
-            let side_forks = self
-                .chain_store
-                .get_side_fork_hashes(incoming)
-                .map(|hashes| hashes.len())
-                .unwrap_or(0);
+            block_store.put_side_fork_block(&block)?;
+            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
+            let side_forks = block_store.side_fork_count(incoming);
             warn!(
                 number = incoming,
                 local_hash = %head.hash(),
@@ -68,15 +66,11 @@ impl<S: KvStore + 'static> Node<S> {
         // Keep it as a fork candidate instead of corrupting the canonical
         // number->hash mapping with a disconnected block.
         if transition == BlockImportTransition::NextHeightFork {
-            self.consensus.read().verify_header(&block.header)?;
+            consensus.verify_header(&block.header)?;
             let remote_hash = incoming_hash;
-            self.chain_store.put_side_fork_block(&block)?;
-            self.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
-            let side_forks = self
-                .chain_store
-                .get_side_fork_hashes(incoming)
-                .map(|hashes| hashes.len())
-                .unwrap_or(0);
+            block_store.put_side_fork_block(&block)?;
+            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
+            let side_forks = block_store.side_fork_count(incoming);
             warn!(
                 number = incoming,
                 expected_parent = %head.hash(),
@@ -91,7 +85,7 @@ impl<S: KvStore + 'static> Node<S> {
         // I1: Equivocation detection — check if the incoming block's proposer has
         // already produced a block at this height. Only fires for truly new blocks
         // (incoming == expected), preventing false positives from stale gossip.
-        if let Ok(Some(existing)) = self.chain_store.get_block_by_number(incoming) {
+        if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
             if existing.hash() != block.hash() && existing.header.proposer == block.header.proposer
             {
                 let slash_record = detect_double_sign(&existing.header, &block.header);
@@ -123,7 +117,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Verify consensus rules.
-        self.consensus.read().verify_header(&block.header)?;
+        consensus.verify_header(&block.header)?;
 
         // Verify EIP-1559 base fee is correct.
         let expected_base_fee = calculate_base_fee(
@@ -142,33 +136,24 @@ impl<S: KvStore + 'static> Node<S> {
         match &block.proposer_seal {
             Some(seal) => {
                 let proposer = &block.header.proposer;
-                let known = self.known_authorities.read();
-                if let Some(pubkey) = known.get(proposer) {
+                if let Some(pubkey) = consensus.known_authority_pubkey(proposer) {
                     let verifier = MultiVerifier;
                     self.consensus
                         .read()
-                        .verify_seal(&block.header, seal, pubkey, &verifier)?;
+                        .verify_seal(&block.header, seal, &pubkey, &verifier)?;
+                } else if let Some(pubkey) = block_store.stored_pubkey(proposer)? {
+                    let verifier = MultiVerifier;
+                    self.consensus
+                        .read()
+                        .verify_seal(&block.header, seal, &pubkey, &verifier)?;
+                    consensus.register_authority_pubkey(*proposer, pubkey);
                 } else {
-                    // Try chain store as fallback.
-                    drop(known);
-                    if let Ok(Some(pubkey)) = self.chain_store.get_pubkey(proposer) {
-                        let verifier = MultiVerifier;
-                        self.consensus.read().verify_seal(
-                            &block.header,
-                            seal,
-                            &pubkey,
-                            &verifier,
-                        )?;
-                        // Cache for future lookups.
-                        self.known_authorities.write().insert(*proposer, pubkey);
-                    } else {
-                        // F-308: Reject blocks from unknown proposers.
-                        return Err(NodeError::Startup(format!(
-                            "block {} seal verification failed: proposer {} pubkey unknown",
-                            block.number(),
-                            proposer
-                        )));
-                    }
+                    // F-308: Reject blocks from unknown proposers.
+                    return Err(NodeError::Startup(format!(
+                        "block {} seal verification failed: proposer {} pubkey unknown",
+                        block.number(),
+                        proposer
+                    )));
                 }
             }
             None => {
@@ -208,10 +193,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
-        let current_root = {
-            let mut ws = self.world_state.write();
-            ws.state_root()?
-        };
+        let current_root = block_store.current_state_root()?;
 
         // Re-execute transactions against an isolated state snapshot.
         // The live WorldState is only swapped to the imported root after the
@@ -356,9 +338,7 @@ impl<S: KvStore + 'static> Node<S> {
                     })?;
             }
 
-            let ws = WorldState::at_root(self.store.clone(), &current_root)?;
-            let cs = ChainStore::new(self.store.clone());
-            let state_db = ShellStateDb::new(ws, cs);
+            let (state_db, _) = block_store.isolated_state_db()?;
             let mut evm = ShellEvm::new(state_db, self.config.chain_id);
 
             // Non-signature validation (chain-id, gas, sender binding).
@@ -535,7 +515,7 @@ impl<S: KvStore + 'static> Node<S> {
         // If the header declares a witness_root, the stored bundle must hash to it.
         if let Some(expected_root) = block.header.witness_root {
             let block_hash_for_witness = block.hash();
-            match self.witness_store.get_bundle(&block_hash_for_witness) {
+            match block_store.witness_bundle(&block_hash_for_witness) {
                 Ok(Some(bundle)) => {
                     let computed = bundle.compute_root();
                     if computed != expected_root {
@@ -566,26 +546,12 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
-        let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
-        {
-            let mut live_ws = self.world_state.write();
-            *live_ws = committed_world_state;
-        }
-
         // Commit to storage.
+        let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();
-        self.chain_store.put_block(&block)?;
-        if !receipts.is_empty() {
-            self.chain_store.put_receipts(&block_hash, &receipts)?;
-        }
-        self.chain_store.put_system_transactions(
-            &block_hash,
-            block.number(),
-            &block.system_transactions,
-        )?;
-        self.chain_store
-            .set_canonical(block.number(), &block_hash)?;
-        self.chain_store.set_head(&block_hash)?;
+        let receipts_to_store = (!receipts.is_empty()).then_some(receipts.as_slice());
+        block_store.commit_canonical_block(&block, receipts_to_store)?;
+        block_store.replace_world_state(committed_world_state);
         let settlement_hashes: Vec<ShellHash> = block
             .system_transactions
             .iter()
@@ -601,51 +567,18 @@ impl<S: KvStore + 'static> Node<S> {
                 "materialized canonical STARK proof artifacts from imported block"
             );
         }
-        self.settled_stark_sources
-            .lock()
-            .extend(stark_settlements.iter().flat_map(|amendment| {
-                amendment
-                    .covered_hashes()
-                    .into_iter()
-                    .map(move |source| (amendment.layer, source))
-            }));
-        for amendment in stark_settlements.iter() {
-            for source in amendment.covered_hashes() {
-                let _ = self.settled_source_index.put(amendment.layer, &source);
-            }
-        }
-        self.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
+        prover.record_settled_sources(&stark_settlements);
+        consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
         for (address, pubkey) in new_pubkeys {
-            self.chain_store.put_pubkey(&address, &pubkey)?;
+            block_store.store_pubkey(&address, &pubkey)?;
         }
 
         // L2 grace-window: flush any witnesses whose delete_at block has been reached.
-        {
-            let current_head = block.number();
-            let mut grace_map = self.pending_grace_deletes.lock();
-            grace_map.retain(|hash, delete_at| {
-                if current_head >= *delete_at {
-                    match self.chain_store.delete_witness_bundle(hash) {
-                        Ok(()) => info!(
-                            block = *delete_at,
-                            "L2: grace-window expired, witness bundle deleted"
-                        ),
-                        Err(e) => warn!(block = *delete_at, "L2: grace-window delete failed: {e}"),
-                    }
-                    false // remove from map
-                } else {
-                    true // keep pending
-                }
-            });
-        }
+        block_store.prune_grace_witnesses(block.number());
 
         // Remove any included transactions from our mempool.
         let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        self.tx_pool.remove_batch(&tx_hashes);
-        let pruned = {
-            let ws = self.world_state.read();
-            self.tx_pool.prune_nonce_too_low(&ws)
-        };
+        let pruned = mem_pool.remove_committed_hashes(&tx_hashes);
         if pruned > 0 {
             debug!(
                 count = pruned,
@@ -654,7 +587,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Update canonical aggregate counters for shell_* stats RPCs.
-        if let Err(e) = self.chain_store.add_canonical_block_to_totals(
+        if let Err(e) = block_store.update_chain_totals(
             block.number(),
             block.transactions.len() as u64,
             block.header.gas_used,
@@ -710,7 +643,7 @@ impl<S: KvStore + 'static> Node<S> {
                 vec![block_hash],
                 original_size,
             );
-            self.proof_backlog.lock().push(task);
+            prover.queue_task(task);
             debug!(
                 block = block_number,
                 n_entries = n,
