@@ -549,8 +549,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();
-        let receipts_to_store = (!receipts.is_empty()).then_some(receipts.as_slice());
-        block_store.commit_canonical_block(&block, receipts_to_store)?;
+        block_store.commit_canonical_block(&block, Some(receipts.as_slice()))?;
         block_store.replace_world_state(committed_world_state);
         let settlement_hashes: Vec<ShellHash> = block
             .system_transactions

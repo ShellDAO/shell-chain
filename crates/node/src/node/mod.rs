@@ -396,6 +396,15 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
         std::mem::take(&mut *pending)
     }
 
+    fn restore_pending_stark_settlements(&self, mut settlements: Vec<ProofAmendment>) {
+        if settlements.is_empty() {
+            return;
+        }
+        let mut pending = self.pending_stark_settlements.lock();
+        settlements.append(&mut *pending);
+        *pending = settlements;
+    }
+
     fn has_settled_source(&self, key: (u32, ShellHash)) -> bool {
         self.settled_stark_sources.lock().contains(&key)
     }
@@ -404,8 +413,10 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
         self.proof_backlog.lock().push(task);
     }
 
-    fn record_accepted_settlement(&self) {
-        self.metrics.stark_settlements_accepted.inc();
+    fn record_accepted_settlements(&self, count: usize) {
+        if count > 0 {
+            self.metrics.stark_settlements_accepted.inc_by(count as u64);
+        }
     }
 
     fn record_settled_sources(&self, amendments: &[ProofAmendment]) {

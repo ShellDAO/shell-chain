@@ -306,7 +306,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .get_receipts(&block_hash)
                 .map_err(internal_err)?;
             if let (Some(block), Some(receipts)) = (block, receipts) {
-                if let Some(receipt) = receipts.into_iter().nth(tx_index as usize) {
+                if let Some(receipt) = receipts.get(tx_index as usize).cloned() {
                     // F-067: populate from/to/effective_gas_price from the transaction.
                     let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
                         if let Some(tx) = block.transactions.get(tx_index as usize) {

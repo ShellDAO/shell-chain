@@ -369,12 +369,12 @@ async fn run_with_store<S: KvStore + 'static>(
                 let scan_end = fin.saturating_sub(MAX_RECOVERY_SCAN_DEPTH);
                 let mut num = scan_start;
                 loop {
-                    if let Ok(Some(block)) = chain_store.get_block_by_number(num) {
+                    if let Ok(Some(hash)) = chain_store.get_block_hash_by_number(num) {
                         warn!(
                             "Recovering lost HEAD from canonical block #{n} (FINALIZED was {fin})",
                             n = num
                         );
-                        chain_store.set_head(&block.hash())?;
+                        chain_store.set_head(&hash)?;
                         recovered = true;
                         resumed = true;
                         break;
@@ -407,13 +407,13 @@ async fn run_with_store<S: KvStore + 'static>(
                 let scan_end = fin.saturating_sub(MAX_RECOVERY_SCAN_DEPTH);
                 let mut num = scan_start;
                 loop {
-                    if let Ok(Some(block)) = chain_store.get_block_by_number(num) {
-                        if block.number() > 0 {
+                    if num > 0 {
+                        if let Ok(Some(hash)) = chain_store.get_block_hash_by_number(num) {
                             warn!(
                                 "Recovering HEAD from canonical block #{n} (FINALIZED was {fin})",
                                 n = num
                             );
-                            chain_store.set_head(&block.hash())?;
+                            chain_store.set_head(&hash)?;
                             recovered = true;
                             break;
                         }

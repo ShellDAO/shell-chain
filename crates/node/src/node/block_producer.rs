@@ -190,8 +190,8 @@ impl<S: KvStore + 'static> Node<S> {
             system_txs.push(reward_tx);
         }
 
-        let mut pending_stark_settlements = prover.take_pending_stark_settlements();
-        pending_stark_settlements.sort_by(|a, b| {
+        let mut drained_stark_settlements = prover.take_pending_stark_settlements();
+        drained_stark_settlements.sort_by(|a, b| {
             (
                 a.layer,
                 a.block_number,
@@ -208,7 +208,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut settled_stark_proofs = Vec::new();
         let mut settled_stark_artifacts = Vec::new();
         let mut seen_stark_sources = HashSet::new();
-        for amendment in pending_stark_settlements {
+        for amendment in drained_stark_settlements.iter().cloned() {
             let settlement_keys: Vec<(u32, ShellHash)> = amendment
                 .covered_hashes()
                 .into_iter()
@@ -269,7 +269,6 @@ impl<S: KvStore + 'static> Node<S> {
             let reward_hash = reward_tx.hash();
             system_txs.push(reward_tx);
             settled_stark_artifacts.push((amendment.clone(), reward_hash));
-            prover.record_accepted_settlement();
             settled_stark_proofs.push(amendment);
         }
         header.extra_data = Bytes::default();
@@ -341,20 +340,41 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Commit to storage.
         let block_hash = block.hash();
-        // G4: Push proof task with real block hash and stored witness size.
-        if let Some(entries) = stark_entries {
+        // Prepare proof task with the real block hash; enqueue only after
+        // canonical commit succeeds so backlog never references non-canonical blocks.
+        let pending_proof_task = if let Some(entries) = stark_entries {
             let block_num = block.header.number;
             let hash_bytes: [u8; 32] = *block_hash.as_bytes();
             let original_size =
                 self.stark_source_original_size(&block_hash, &block, entries.len())?;
-            prover.queue_task(ProofTask::with_sources(
-                hash_bytes,
+            Some((
+                ProofTask::with_sources(
+                    hash_bytes,
+                    block_num,
+                    entries,
+                    1,
+                    vec![block_hash],
+                    original_size,
+                ),
                 block_num,
-                entries,
-                1,
-                vec![block_hash],
                 original_size,
-            ));
+            ))
+        } else {
+            None
+        };
+        if let Err(err) = block_store.commit_canonical_block(&block, Some(receipts.as_slice())) {
+            prover.restore_pending_stark_settlements(drained_stark_settlements);
+            if let Err(rollback_err) = block_store.rollback_world_state(&current_root) {
+                warn!(
+                    error = %rollback_err,
+                    target_root = %current_root,
+                    "produce_block: failed to roll back world state after storage commit error"
+                );
+            }
+            return Err(err);
+        }
+        if let Some((task, block_num, original_size)) = pending_proof_task {
+            prover.queue_task(task);
             debug!(
                 block = block_num,
                 original_size, "G4: proof task queued in backlog (async proving)"
@@ -367,16 +387,7 @@ impl<S: KvStore + 'static> Node<S> {
                 "queued additional historical STARK frontier proof tasks after block production"
             );
         }
-        if let Err(err) = block_store.commit_canonical_block(&block, Some(receipts.as_slice())) {
-            if let Err(rollback_err) = block_store.rollback_world_state(&current_root) {
-                warn!(
-                    error = %rollback_err,
-                    target_root = %current_root,
-                    "produce_block: failed to roll back world state after storage commit error"
-                );
-            }
-            return Err(err);
-        }
+        prover.record_accepted_settlements(settled_stark_proofs.len());
         for (amendment, settlement_tx_hash) in &settled_stark_artifacts {
             self.store_stark_artifacts(amendment, Some(*settlement_tx_hash))?;
         }
