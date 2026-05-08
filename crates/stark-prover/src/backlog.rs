@@ -788,7 +788,6 @@ mod tests {
         b.pop();
         assert!(!b.contains_source(1, &bh_hash));
     }
-
     #[test]
     fn indexes_remain_consistent_after_mixed_operations() {
         let mut b = ProofBacklog::new();

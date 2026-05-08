@@ -4753,7 +4753,6 @@ mod tests {
             "fallback size must not undercount to stub witness bytes"
         );
     }
-
     /// STARK compression: verify ProverService proves isolated L1 runs immediately
     /// even when the tx-entry count is below the minimum threshold.
     ///
