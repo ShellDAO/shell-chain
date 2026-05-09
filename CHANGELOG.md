@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.1] — 2026-05-10
+
+### Changed
+
+- Version bump for the next coordinated ShellDAO release cut.
+
 ## [0.22.0] — 2026-05-06 — Stability, STARK hardening, and ops maturity
 
 ### Added

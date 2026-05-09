@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "alloy-rlp",
  "serde",
@@ -3370,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "shell-crypto"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "alloy-rlp",
  "fips204",
@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "shell-evm"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "alloy-primitives",
  "hex",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "shell-primitives"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "shell-storage"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "alloy-rlp",
  "base64",
