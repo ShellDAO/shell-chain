@@ -1584,6 +1584,9 @@ impl<S: KvStore + 'static> Node<S> {
         // ── Step 1: build the canonical settled set from chain ────────────────
         let mut canonical: std::collections::HashSet<(u32, ShellHash)> =
             std::collections::HashSet::new();
+        // Track L1 final source hashes for l2i/ reconcile (one per L1 amendment).
+        let mut canonical_l1_finals: std::collections::HashSet<ShellHash> =
+            std::collections::HashSet::new();
         for number in 0..=head {
             let Some(block) = self.chain_store.get_block_by_number(number)? else {
                 continue;
@@ -1606,6 +1609,10 @@ impl<S: KvStore + 'static> Node<S> {
                 self.store_stark_artifacts(&amendment, settlement_tx_hash)?;
                 for source in amendment.covered_hashes() {
                     canonical.insert((amendment.layer, source));
+                }
+                // Collect L1 final source hashes for l2i/ reconcile.
+                if amendment.layer == 1 {
+                    canonical_l1_finals.insert(amendment.block_hash);
                 }
             }
         }
@@ -1631,6 +1638,29 @@ impl<S: KvStore + 'static> Node<S> {
             if !index_set.contains(&(*layer, *hash)) {
                 let _ = self.settled_source_index.put(*layer, hash);
             }
+        }
+
+        // ── Step 2b: reconcile the `l2i/` L2 input index ─────────────────────
+        // Mirrors Step 2 but tracks final-source hashes of L1 amendments.
+        let l2i_entries = self.l2_input_index.all_hashes()?;
+        let mut l2i_removed = 0usize;
+        for hash in &l2i_entries {
+            if !canonical_l1_finals.contains(hash) {
+                if let Err(e) = self.l2_input_index.delete(hash) {
+                    warn!("rebuild_settled: failed to delete stale l2i/ entry ({hash}): {e}");
+                } else {
+                    l2i_removed += 1;
+                }
+            }
+        }
+        let l2i_set: std::collections::HashSet<ShellHash> = l2i_entries.into_iter().collect();
+        for hash in &canonical_l1_finals {
+            if !l2i_set.contains(hash) {
+                let _ = self.l2_input_index.put(hash);
+            }
+        }
+        if l2i_removed > 0 {
+            info!("rebuild_settled: removed {l2i_removed} stale `l2i/` index entries after reorg");
         }
 
         // ── Step 3: update the in-memory settled set ──────────────────────────

@@ -37,11 +37,11 @@ pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
-    validator_registry_addr, BodyPruner, ChainStore, KvStore, ProofAmendmentStore,
+    validator_registry_addr, BodyPruner, ChainStore, KvStore, L2InputIndex, ProofAmendmentStore,
     SettledSourceIndex, StatePruner, WitnessPruner, WitnessStore, WorldState,
 };
 
-pub(crate) use crate::config::NodeConfig;
+pub(crate) use crate::config::{L2StarkMode, NodeConfig};
 pub(crate) use crate::error::NodeError;
 pub(crate) use crate::metrics::Metrics;
 pub(crate) use crate::prover_service::{ProverConfig, ProverService, ProverServiceHandle};
@@ -88,6 +88,11 @@ pub struct Node<S: KvStore + 'static> {
     /// Persistent index of settled (layer, source_hash) pairs. Written on every
     /// settlement; loaded at startup to skip the O(n-blocks) chain rebuild.
     settled_source_index: SettledSourceIndex<S>,
+    /// Durable index of canonical L1 amendments available as L2 aggregation inputs.
+    /// Keyed by the amendment's final source hash (`l2i/` prefix in KV).
+    /// Only populated from canonical `StarkReward` system txs during
+    /// `rebuild_settled_stark_sources_from_chain` and `record_settled_sources`.
+    pub(crate) l2_input_index: L2InputIndex<S>,
     /// Compression-valid STARK proof amendments waiting to be settled in the
     /// next locally produced block.
     pending_stark_settlements: Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
@@ -388,6 +393,7 @@ struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
     pending_stark_settlements: &'a Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
     settled_stark_sources: &'a parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
     settled_source_index: &'a SettledSourceIndex<S>,
+    l2_input_index: &'a L2InputIndex<S>,
     metrics: &'a Arc<Metrics>,
 }
 
@@ -432,6 +438,10 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
         for amendment in amendments {
             for source in amendment.covered_hashes() {
                 let _ = self.settled_source_index.put(amendment.layer, &source);
+            }
+            // Record the final source of each L1 amendment as a canonical L2 input.
+            if amendment.layer == 1 {
+                let _ = self.l2_input_index.put(&amendment.block_hash);
             }
         }
     }
@@ -543,6 +553,7 @@ impl<S: KvStore + 'static> Node<S> {
         let metrics = Arc::new(Metrics::new().expect("failed to register Prometheus metrics"));
         let amendment_store = ProofAmendmentStore::new(store.clone());
         let settled_source_index = SettledSourceIndex::new(store.clone());
+        let l2_input_index = L2InputIndex::new(store.clone());
 
         // F-094: Recover finalized state from persistent storage on restart.
         let (fin_number, fin_hash) = {
@@ -594,6 +605,7 @@ impl<S: KvStore + 'static> Node<S> {
             proof_backlog: Arc::new(parking_lot::Mutex::new(ProofBacklog::new())),
             amendment_store,
             settled_source_index,
+            l2_input_index,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
             equivocation_queue: parking_lot::Mutex::new(Vec::new()),
@@ -648,6 +660,7 @@ impl<S: KvStore + 'static> Node<S> {
             pending_stark_settlements: &self.pending_stark_settlements,
             settled_stark_sources: &self.settled_stark_sources,
             settled_source_index: &self.settled_source_index,
+            l2_input_index: &self.l2_input_index,
             metrics: &self.metrics,
         }
     }

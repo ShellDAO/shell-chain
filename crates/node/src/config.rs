@@ -113,6 +113,77 @@ impl ConsensusEngineConfig {
     }
 }
 
+/// Operational state of L2 STARK recursive aggregation.
+///
+/// Controls whether the node builds and maintains the L2 input index, triggers
+/// the aggregation scheduler, and (eventually) executes recursive proving.
+/// Defaults to [`Disabled`] for testnet safety — recursive proving is not yet
+/// production-ready and enabling it prematurely would emit invalid L2 settlements.
+///
+/// [`Disabled`]: L2StarkMode::Disabled
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum L2StarkMode {
+    /// No L2 activity: input index is not maintained, scheduler never fires,
+    /// no L2 settlements are produced.  Safe default for all current deployments.
+    #[default]
+    Disabled,
+    /// Input index and job tracking are active; scheduler windows are computed
+    /// and logged; but recursive proving is NOT executed.  Use this to gain
+    /// operational visibility (metrics, gap detection) without emitting L2 proofs.
+    Scaffold,
+    /// Full recursive aggregation: input index, job store, scheduler, and the
+    /// recursive prover all run.  Requires the `recursive` cargo feature; the
+    /// node will refuse to start in Active mode if the feature is absent.
+    Active,
+}
+
+impl L2StarkMode {
+    /// Returns `true` for [`Scaffold`] and [`Active`] — i.e. any mode where the
+    /// L2 input index and observability infrastructure are maintained.
+    ///
+    /// [`Scaffold`]: L2StarkMode::Scaffold
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Returns `true` only for [`Active`] — i.e. when recursive proving should run.
+    ///
+    /// [`Active`]: L2StarkMode::Active
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Parse from a CLI/config string: `"disabled"`, `"scaffold"`, or `"active"`.
+    pub fn from_mode_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "scaffold" => Ok(Self::Scaffold),
+            "active" => Ok(Self::Active),
+            other => Err(format!(
+                "unknown L2 STARK mode '{other}'; expected disabled, scaffold, or active"
+            )),
+        }
+    }
+}
+
+impl std::str::FromStr for L2StarkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_mode_str(s)
+    }
+}
+
+impl std::fmt::Display for L2StarkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled"),
+            Self::Scaffold => f.write_str("scaffold"),
+            Self::Active => f.write_str("active"),
+        }
+    }
+}
+
 /// Top-level configuration for a shell-chain node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -162,6 +233,10 @@ pub struct NodeConfig {
     /// entries and stores the result in `BlockHeader::sig_aggregate_proof`.
     /// Off by default — generating a STARK proof per block is expensive (~150ms).
     pub enable_stark_aggregation: bool,
+    /// Operational mode for L2 recursive STARK aggregation.
+    /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
+    /// [`L2StarkMode::Scaffold`] to activate observability without proving.
+    pub l2_stark_mode: L2StarkMode,
     /// H2: Operational role of this node in the wPoA+STARK network.
     pub node_role: NodeRole,
 }
@@ -218,6 +293,7 @@ impl NodeConfig {
             state_cache_size_mb: 64,
             parallel_evm: ParallelEvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
+            l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }
     }
@@ -408,5 +484,55 @@ mod tests {
     fn node_config_default_role_is_validator() {
         let cfg = NodeConfig::dev(Address::ZERO);
         assert_eq!(cfg.node_role, NodeRole::Validator);
+    }
+
+    // ── L2StarkMode tests ──────────────────────────────────────
+
+    #[test]
+    fn l2_stark_mode_default_is_disabled() {
+        assert_eq!(L2StarkMode::default(), L2StarkMode::Disabled);
+        let cfg = NodeConfig::dev(Address::ZERO);
+        assert_eq!(cfg.l2_stark_mode, L2StarkMode::Disabled);
+    }
+
+    #[test]
+    fn l2_stark_mode_is_enabled() {
+        assert!(!L2StarkMode::Disabled.is_enabled());
+        assert!(L2StarkMode::Scaffold.is_enabled());
+        assert!(L2StarkMode::Active.is_enabled());
+    }
+
+    #[test]
+    fn l2_stark_mode_is_active() {
+        assert!(!L2StarkMode::Disabled.is_active());
+        assert!(!L2StarkMode::Scaffold.is_active());
+        assert!(L2StarkMode::Active.is_active());
+    }
+
+    #[test]
+    fn l2_stark_mode_from_str_valid() {
+        assert_eq!("disabled".parse::<L2StarkMode>().unwrap(), L2StarkMode::Disabled);
+        assert_eq!("scaffold".parse::<L2StarkMode>().unwrap(), L2StarkMode::Scaffold);
+        assert_eq!("active".parse::<L2StarkMode>().unwrap(), L2StarkMode::Active);
+    }
+
+    #[test]
+    fn l2_stark_mode_from_str_case_insensitive() {
+        assert_eq!("DISABLED".parse::<L2StarkMode>().unwrap(), L2StarkMode::Disabled);
+        assert_eq!("Scaffold".parse::<L2StarkMode>().unwrap(), L2StarkMode::Scaffold);
+        assert_eq!("ACTIVE".parse::<L2StarkMode>().unwrap(), L2StarkMode::Active);
+    }
+
+    #[test]
+    fn l2_stark_mode_from_str_unknown_is_error() {
+        assert!("recursive".parse::<L2StarkMode>().is_err());
+        assert!("".parse::<L2StarkMode>().is_err());
+    }
+
+    #[test]
+    fn l2_stark_mode_display() {
+        assert_eq!(L2StarkMode::Disabled.to_string(), "disabled");
+        assert_eq!(L2StarkMode::Scaffold.to_string(), "scaffold");
+        assert_eq!(L2StarkMode::Active.to_string(), "active");
     }
 }

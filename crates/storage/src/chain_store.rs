@@ -1488,6 +1488,85 @@ impl<S: KvStore> SettledSourceIndex<S> {
     }
 }
 
+// ── L2InputIndex ───────────────────────────────────────────────────────────
+
+/// Durable index of canonical L1 STARK amendments available as inputs for L2
+/// recursive aggregation.
+///
+/// Keyed as `l2i/` + final_source_hash (32 bytes) → `[1u8]`.
+///
+/// **Only** populated from canonical [`StarkReward`] system transactions; gossiped
+/// or locally-queued amendments are never written here.  This invariant ensures
+/// the L2 aggregation pipeline only sees cryptographically committed L1 inputs.
+///
+/// The amendment payload itself is retrieved via [`ProofAmendmentStore`] using
+/// the same hash as the key.
+///
+/// [`StarkReward`]: shell_core::SystemTxKind::StarkReward
+pub struct L2InputIndex<S: KvStore> {
+    store: Arc<S>,
+}
+
+impl<S: KvStore> Clone for L2InputIndex<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+/// Key prefix for the L2 input index (`l2i/`).
+const L2I_PREFIX: &[u8] = b"l2i/";
+
+impl<S: KvStore> L2InputIndex<S> {
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
+    }
+
+    fn key(final_hash: &ShellHash) -> Vec<u8> {
+        let mut k = L2I_PREFIX.to_vec();
+        k.extend_from_slice(final_hash.as_bytes());
+        k
+    }
+
+    /// Record that the L1 amendment ending at `final_hash` is a canonical L2 input.
+    pub fn put(&self, final_hash: &ShellHash) -> Result<(), StorageError> {
+        self.store.put(&Self::key(final_hash), &[1u8])
+    }
+
+    /// Remove the L2 input entry for `final_hash`.  Used during reconcile to
+    /// purge entries whose backing L1 amendment is no longer on the canonical chain.
+    pub fn delete(&self, final_hash: &ShellHash) -> Result<(), StorageError> {
+        self.store.delete(&Self::key(final_hash))
+    }
+
+    /// Returns `true` if `final_hash` is recorded as a canonical L2 input.
+    pub fn has(&self, final_hash: &ShellHash) -> Result<bool, StorageError> {
+        Ok(self.store.get(&Self::key(final_hash))?.is_some())
+    }
+
+    /// Return all recorded final source hashes.  Used at startup to reconstruct
+    /// the in-memory L2 input set and by the scheduler to enumerate available inputs.
+    pub fn all_hashes(&self) -> Result<Vec<ShellHash>, StorageError> {
+        let raw = self.store.scan_prefix(L2I_PREFIX)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (key, _) in raw {
+            // key = b"l2i/" (4) + hash (32)
+            if key.len() != L2I_PREFIX.len() + 32 {
+                continue;
+            }
+            let hash_bytes: [u8; 32] = key[L2I_PREFIX.len()..].try_into().unwrap();
+            out.push(ShellHash::from(hash_bytes));
+        }
+        Ok(out)
+    }
+
+    /// Returns true if any entry exists.
+    pub fn is_populated(&self) -> Result<bool, StorageError> {
+        Ok(!self.store.scan_prefix(L2I_PREFIX)?.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2748,5 +2827,79 @@ mod tests {
         assert!(cs.get_block_by_hash(&genesis_hash).unwrap().is_none());
         assert!(cs.get_block_by_number(0).unwrap().is_none());
         assert!(cs.get_chain_config().unwrap().is_none());
+    }
+
+    // ── L2InputIndex tests ────────────────────────────────────────────────
+
+    fn l2_hash(seed: u8) -> ShellHash {
+        ShellHash::from([seed; 32])
+    }
+
+    #[test]
+    fn l2_input_index_put_has_delete() {
+        let store = Arc::new(MemoryDb::default());
+        let idx = L2InputIndex::new(store);
+        let h = l2_hash(0xAA);
+
+        assert!(!idx.has(&h).unwrap());
+        idx.put(&h).unwrap();
+        assert!(idx.has(&h).unwrap());
+        idx.delete(&h).unwrap();
+        assert!(!idx.has(&h).unwrap());
+    }
+
+    #[test]
+    fn l2_input_index_all_hashes_returns_inserted() {
+        let store = Arc::new(MemoryDb::default());
+        let idx = L2InputIndex::new(store);
+
+        let h1 = l2_hash(1);
+        let h2 = l2_hash(2);
+        let h3 = l2_hash(3);
+        idx.put(&h1).unwrap();
+        idx.put(&h2).unwrap();
+        idx.put(&h3).unwrap();
+
+        let mut all = idx.all_hashes().unwrap();
+        all.sort_by_key(|h| h.as_bytes().to_vec());
+        let mut expected = vec![h1, h2, h3];
+        expected.sort_by_key(|h| h.as_bytes().to_vec());
+        assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn l2_input_index_delete_removes_from_all_hashes() {
+        let store = Arc::new(MemoryDb::default());
+        let idx = L2InputIndex::new(store);
+
+        let h1 = l2_hash(10);
+        let h2 = l2_hash(20);
+        idx.put(&h1).unwrap();
+        idx.put(&h2).unwrap();
+        idx.delete(&h1).unwrap();
+
+        let all = idx.all_hashes().unwrap();
+        assert_eq!(all, vec![h2]);
+    }
+
+    #[test]
+    fn l2_input_index_is_populated() {
+        let store = Arc::new(MemoryDb::default());
+        let idx = L2InputIndex::new(store);
+
+        assert!(!idx.is_populated().unwrap());
+        idx.put(&l2_hash(0xFF)).unwrap();
+        assert!(idx.is_populated().unwrap());
+    }
+
+    #[test]
+    fn l2_input_index_duplicate_put_is_idempotent() {
+        let store = Arc::new(MemoryDb::default());
+        let idx = L2InputIndex::new(store);
+        let h = l2_hash(0x42);
+
+        idx.put(&h).unwrap();
+        idx.put(&h).unwrap(); // second put must not panic or duplicate
+        assert_eq!(idx.all_hashes().unwrap().len(), 1);
     }
 }

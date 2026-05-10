@@ -16,7 +16,7 @@ mod rocks_db;
 pub use body_pruner::{BodyPruneResult, BodyPruner, DEFAULT_BODY_RETENTION};
 pub use chain_store::{
     BlockAvailability, ChainConfig, ChainStore, GuardianConfig, ProofAmendmentStore,
-    RecoveryProposal, SettledSourceIndex, WitnessStore, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
+    RecoveryProposal, SettledSourceIndex, L2InputIndex, WitnessStore, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
 };
 pub use error::StorageError;
 pub use kv_store::{KvStore, WriteBatch, WriteBatchOp};
