@@ -1663,6 +1663,55 @@ impl<S: KvStore + 'static> Node<S> {
             info!("rebuild_settled: removed {l2i_removed} stale `l2i/` index entries after reorg");
         }
 
+        // ── Step 2c: reconcile the `l2j/` L2 job store ───────────────────────
+        // Any L2 job whose source L1 hashes were orphaned by a reorg must be
+        // reset to PendingInputs so it can re-accumulate canonical inputs rather
+        // than attempting to prove with stale/phantom L1 roots.
+        let all_l2_jobs = self.l2_job_store.all_jobs()?;
+        let mut l2j_reset = 0usize;
+        for job in &all_l2_jobs {
+            // PendingInputs and FailedPermanent don't need to be touched.
+            if matches!(job.status, L2JobStatus::PendingInputs | L2JobStatus::FailedPermanent) {
+                continue;
+            }
+            let sources_canonical = job
+                .l1_source_hashes
+                .iter()
+                .all(|h| canonical_l1_finals.contains(h));
+            if !sources_canonical {
+                // One or more source L1 amendments were orphaned — reset the job.
+                let updated = L2AggregationJob {
+                    status: L2JobStatus::PendingInputs,
+                    retry_count: job.retry_count,
+                    last_error: Some("reset after reorg: source L1 amendment(s) no longer canonical".into()),
+                    updated_at_block: head,
+                    ..job.clone()
+                };
+                if let Err(e) = self.l2_job_store.put(&updated) {
+                    warn!("rebuild_settled: failed to reset L2 job {}: {e}", job.id);
+                } else {
+                    l2j_reset += 1;
+                }
+            }
+        }
+        if l2j_reset > 0 {
+            warn!("rebuild_settled: reset {l2j_reset} L2 jobs to PendingInputs after reorg");
+        }
+
+        // ── Step 2d: update L2 observability metrics ─────────────────────────
+        {
+            let pending_inputs = all_l2_jobs
+                .iter()
+                .filter(|j| matches!(j.status, L2JobStatus::PendingInputs))
+                .count() as i64;
+            let ready_jobs = all_l2_jobs
+                .iter()
+                .filter(|j| matches!(j.status, L2JobStatus::Ready))
+                .count() as i64;
+            self.metrics.stark_l2_pending_inputs.set(pending_inputs);
+            self.metrics.stark_l2_ready_jobs.set(ready_jobs);
+        }
+
         // ── Step 3: update the in-memory settled set ──────────────────────────
         let count = canonical.len();
         let mut settled = self.settled_stark_sources.lock();
