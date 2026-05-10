@@ -1753,8 +1753,21 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or(0);
         let mut queued = 0usize;
         let mut tasks = Vec::new();
+        // Scan past max_blocks if all seeded tasks are empty, to ensure the
+        // backlog always contains the first non-empty block. Without this,
+        // a chain with a long 0-tx prefix (e.g. pre-tx-worker genesis) would
+        // fill the backlog with empty blocks and deadlock the prover.
+        // Hard cap = 4 × max_blocks (at least DEFAULT_MAX_L1_RANGE_SOURCES × 4)
+        // to bound startup cost while covering reasonable empty prefixes.
+        let hard_cap = max_blocks
+            .saturating_mul(4)
+            .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4);
+        let mut found_nonempty = false;
         for number in 0..=head {
-            if queued >= max_blocks {
+            if queued >= max_blocks && found_nonempty {
+                break;
+            }
+            if queued >= hard_cap {
                 break;
             }
             let Some(hash) = self.chain_store.get_block_hash_by_number(number)? else {
@@ -1800,6 +1813,9 @@ impl<S: KvStore + 'static> Node<S> {
             let mut hash_bytes = [0u8; 32];
             hash_bytes.copy_from_slice(hash.as_bytes());
             let original_size = self.stark_source_original_size(&hash, &block, entries.len())?;
+            if !entries.is_empty() {
+                found_nonempty = true;
+            }
             tasks.push(ProofTask::with_sources(
                 hash_bytes,
                 number,

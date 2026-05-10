@@ -263,15 +263,14 @@ impl ProofBacklog {
         // min_l1_entries=0) is not affected.
         //
         // Special case: if we hit the capacity cap (take == max_sources) but every
-        // block in the window is empty (entries == 0), extend past max_sources to
-        // find the first contiguous non-empty block. Without this, a long historical
-        // prefix of 0-tx blocks fills the window and returns None permanently —
-        // the prover deadlocks because the window can never shrink or grow.
+        // block in the window is empty (entries == 0), extend past max_sources scanning
+        // all remaining contiguous pending blocks until a non-empty one is found. The
+        // cap is the entire pending queue length rather than another max_sources: the
+        // first non-empty block may be thousands of blocks away when the chain has a
+        // long 0-tx historical prefix (e.g. pre-tx-worker testnet genesis blocks).
         if layer == 1 && min_l1_entries > 0 && entries == 0 && take == max_sources {
             let mut scan = take;
-            let extension_cap = max_sources; // scan at most another max_sources blocks
-            let mut extended = 0usize;
-            while extended < extension_cap {
+            while scan < self.pending.len() {
                 let Some(next) = self.pending.get(scan) else {
                     break;
                 };
@@ -281,7 +280,6 @@ impl ProofBacklog {
                 entries = entries.saturating_add(next.entries.len());
                 end_block = next.block_number;
                 scan += 1;
-                extended += 1;
                 take = scan;
                 if entries > 0 {
                     break;
