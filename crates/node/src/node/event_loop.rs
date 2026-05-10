@@ -1812,14 +1812,14 @@ impl<S: KvStore + 'static> Node<S> {
         }
         if !tasks.is_empty() {
             let mut backlog = self.proof_backlog.lock();
-            // Guard against starvation: if the backlog already contains tasks at a
-            // LOWER block number than what we're about to push_front, adding our tasks
-            // would displace the actual frontier and cause the prover to loop over
-            // already-cached ranges while the true frontier is never reached.
-            // Skip this seeding pass — the frontier blocks will be processed on the
-            // next prover iteration, and we'll re-seed on the following call.
             let first_new_block = tasks[0].block_number;
-            let min_existing = backlog.min_block_number_for_layer(tasks[0].layer);
+            let layer = tasks[0].layer;
+            let min_existing = backlog.min_block_number_for_layer(layer);
+            let max_existing = backlog.max_block_number_for_layer(layer);
+
+            // Case 1: backlog is empty, or new tasks are at/before the existing
+            // minimum → insert at the front so the prover processes the lowest
+            // numbered block next (priority frontier catch-up).
             if min_existing.is_none_or(|min| first_new_block <= min) {
                 for task in tasks.into_iter().rev() {
                     if !task
@@ -1830,7 +1830,28 @@ impl<S: KvStore + 'static> Node<S> {
                         backlog.push_front(task);
                     }
                 }
+            } else if max_existing.is_some_and(|max| first_new_block == max + 1) {
+                // Case 2: new tasks start immediately after the backlog tail →
+                // append to the back. This is contiguous extension: the prover
+                // will process the existing window first, then pick up these
+                // blocks without any ordering inversion. Crucially, this is
+                // what breaks the deadlock when blocks 1-1024 are all empty
+                // and block 1025+ contains the first transactions: the
+                // pop_contiguous extension scan can see block 1025 at
+                // pending[1024] and extend the window past max_sources.
+                for task in tasks.into_iter() {
+                    if !task
+                        .source_hashes
+                        .iter()
+                        .any(|source| backlog.contains_source(task.layer, source))
+                    {
+                        backlog.push(task);
+                    }
+                }
             }
+            // Case 3: new tasks jump the frontier (first_new_block > min + gap)
+            // → skip this seeding pass; the next prover iteration will advance
+            // the frontier and re-seed correctly.
         }
         Ok(queued)
     }

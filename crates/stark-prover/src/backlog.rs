@@ -375,6 +375,13 @@ impl ProofBacklog {
         self.layer_blocks.get(&layer)?.first().copied()
     }
 
+    /// Returns the highest block number tracked for the given STARK layer, or
+    /// `None` if the layer has no pending tasks. Used to detect when newly-seeded
+    /// tasks extend the backlog tail (contiguous append) vs. jump the frontier.
+    pub fn max_block_number_for_layer(&self, layer: u32) -> Option<u64> {
+        self.layer_blocks.get(&layer)?.last().copied()
+    }
+
     /// Drain all pending tasks, returning them in FIFO order.
     ///
     /// Useful for graceful shutdown — the caller can persist or re-queue tasks.
