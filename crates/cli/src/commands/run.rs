@@ -16,8 +16,7 @@ use shell_genesis::{
 use shell_keystore::{decrypt_any, EncryptedKey};
 use shell_mempool::MempoolConfig;
 use shell_network::{NetworkBus, NetworkConfig};
-use shell_node::config::{ConsensusEngineConfig, NodeConfig, NodeRole};
-use shell_stark_prover::L2StarkMode;
+use shell_node::config::{ConsensusEngineConfig, L2StarkMode, NodeConfig, NodeRole};
 use shell_node::pruning::StorageProfile;
 use shell_primitives::{Address, ShellHash};
 use shell_rpc::RpcConfig;
