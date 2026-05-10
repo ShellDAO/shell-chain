@@ -17,6 +17,7 @@ use shell_keystore::{decrypt_any, EncryptedKey};
 use shell_mempool::MempoolConfig;
 use shell_network::{NetworkBus, NetworkConfig};
 use shell_node::config::{ConsensusEngineConfig, NodeConfig, NodeRole};
+use shell_stark_prover::L2StarkMode;
 use shell_node::pruning::StorageProfile;
 use shell_primitives::{Address, ShellHash};
 use shell_rpc::RpcConfig;
@@ -667,6 +668,7 @@ async fn run_with_store<S: KvStore + 'static>(
             ..shell_node::config::ParallelEvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
+        l2_stark_mode: L2StarkMode::Disabled,
         node_role,
     };
 
