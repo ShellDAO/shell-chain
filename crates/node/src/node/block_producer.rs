@@ -305,29 +305,7 @@ impl<S: KvStore + 'static> Node<S> {
         // C3: If STARK aggregation is enabled, collect sig batch entries now.
         // G4: ProofTask pushed to backlog AFTER signing so we have the real block hash.
         let stark_entries: Option<Vec<SigBatchEntry>> = if self.stark_aggregation {
-            let entries: Vec<SigBatchEntry> = included_txs
-                .iter()
-                .map(|tx| {
-                    let mut msg_hash = [0u8; 32];
-                    msg_hash.copy_from_slice(tx.hash().as_bytes());
-                    let pk_hash = match &tx.pubkey_mode {
-                        shell_core::PubkeyMode::Embedded(ref pk) => {
-                            let mut h = [0u8; 32];
-                            let copy_len = pk.len().min(32);
-                            h[..copy_len].copy_from_slice(&pk[..copy_len]);
-                            h
-                        }
-                        shell_core::PubkeyMode::Reference => {
-                            // Use sender address bytes as pk identifier for Reference-mode txs.
-                            let mut h = [0u8; 32];
-                            h[..20].copy_from_slice(tx.from.0.as_slice());
-                            h
-                        }
-                    };
-                    SigBatchEntry { msg_hash, pk_hash }
-                })
-                .collect();
-            Some(entries)
+            Some(stark_sources::entries_from_txs(&included_txs))
         } else {
             None
         };

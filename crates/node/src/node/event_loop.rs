@@ -1093,6 +1093,14 @@ impl<S: KvStore + 'static> Node<S> {
                                          );
                                          continue;
                                      }
+                                     if let Err(e) = self.validate_stark_proof_source_binding(&amendment) {
+                                         warn!(
+                                             block = block_number,
+                                             layer = amendment.layer,
+                                             "STARK proof rejected by proof-source binding check: {e}"
+                                         );
+                                         continue;
+                                     }
                                     match self.store_stark_artifacts(&amendment, None) {
                                         Ok(stored) => {
                                             info!(
@@ -1563,34 +1571,19 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     pub(crate) fn rebuild_settled_stark_sources_from_chain(&self) -> Result<usize, NodeError> {
-        // Fast path: load from the persistent index if it has been populated.
-        let index_entries = self.settled_source_index.all_entries()?;
-        if !index_entries.is_empty() {
-            let mut settled = self.settled_stark_sources.lock();
-            settled.clear();
-            let count = index_entries.len();
-            let l1_count = index_entries.iter().filter(|(l, _)| *l == 1).count() as i64;
-            settled.extend(index_entries);
-            let head = self
-                .chain_store
-                .get_head_block()?
-                .map(|block| block.number())
-                .unwrap_or(0);
-            let lag = (head as i64 + 1).saturating_sub(l1_count).max(0);
-            self.metrics.stark_frontier_lag.set(lag);
-            return Ok(count);
-        }
-
-        // Slow path: rebuild by scanning every block (first run / index missing).
-        // Backfill the index as we go so subsequent restarts use the fast path.
+        // Always do a canonical scan so the persistent index cannot diverge from
+        // the canonical chain after a reorg.  We collect all settled sources from
+        // canonical StarkReward system-txs first, then reconcile the durable
+        // `ss/` index by removing stale entries and back-filling missing ones.
         let head = self
             .chain_store
             .get_head_block()?
             .map(|block| block.number())
             .unwrap_or(0);
-        let mut rebuilt = 0usize;
-        let mut settled = self.settled_stark_sources.lock();
-        settled.clear();
+
+        // ── Step 1: build the canonical settled set from chain ────────────────
+        let mut canonical: std::collections::HashSet<(u32, ShellHash)> =
+            std::collections::HashSet::new();
         for number in 0..=head {
             let Some(block) = self.chain_store.get_block_by_number(number)? else {
                 continue;
@@ -1612,17 +1605,54 @@ impl<S: KvStore + 'static> Node<S> {
             {
                 self.store_stark_artifacts(&amendment, settlement_tx_hash)?;
                 for source in amendment.covered_hashes() {
-                    if settled.insert((amendment.layer, source)) {
-                        let _ = self.settled_source_index.put(amendment.layer, &source);
-                        rebuilt += 1;
-                    }
+                    canonical.insert((amendment.layer, source));
                 }
             }
         }
-        let l1_count = settled.iter().filter(|(l, _)| *l == 1).count() as i64;
+
+        // ── Step 2: reconcile the persistent `ss/` index ─────────────────────
+        // Remove stale entries that no longer exist on the canonical chain.
+        let index_entries = self.settled_source_index.all_entries()?;
+        let mut removed = 0usize;
+        for (layer, hash) in &index_entries {
+            if !canonical.contains(&(*layer, *hash)) {
+                if let Err(e) = self.settled_source_index.delete(*layer, hash) {
+                    warn!("rebuild_settled: failed to delete stale index entry ({layer}, {hash}): {e}");
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+
+        // Add missing canonical entries to the index.
+        let index_set: std::collections::HashSet<(u32, ShellHash)> =
+            index_entries.into_iter().collect();
+        for (layer, hash) in &canonical {
+            if !index_set.contains(&(*layer, *hash)) {
+                let _ = self.settled_source_index.put(*layer, hash);
+            }
+        }
+
+        // ── Step 3: update the in-memory settled set ──────────────────────────
+        let count = canonical.len();
+        let mut settled = self.settled_stark_sources.lock();
+        settled.clear();
+        settled.extend(canonical);
+        drop(settled);
+
+        let l1_count = self
+            .settled_stark_sources
+            .lock()
+            .iter()
+            .filter(|(l, _)| *l == 1)
+            .count() as i64;
         let lag = (head as i64 + 1).saturating_sub(l1_count).max(0);
         self.metrics.stark_frontier_lag.set(lag);
-        Ok(rebuilt)
+
+        if removed > 0 {
+            info!("rebuild_settled: removed {removed} stale `ss/` index entries after reorg");
+        }
+        Ok(count)
     }
 
     pub(crate) fn enqueue_stark_frontier_backlog(
@@ -1685,28 +1715,7 @@ impl<S: KvStore + 'static> Node<S> {
             let Some(block) = self.chain_store.get_block_by_hash(&hash)? else {
                 continue;
             };
-            let entries: Vec<SigBatchEntry> = block
-                .transactions
-                .iter()
-                .map(|tx| {
-                    let mut msg_hash = [0u8; 32];
-                    msg_hash.copy_from_slice(tx.hash().as_bytes());
-                    let pk_hash = match &tx.pubkey_mode {
-                        shell_core::PubkeyMode::Embedded(pk) => {
-                            let mut h = [0u8; 32];
-                            let copy_len = pk.len().min(32);
-                            h[..copy_len].copy_from_slice(&pk[..copy_len]);
-                            h
-                        }
-                        shell_core::PubkeyMode::Reference => {
-                            let mut h = [0u8; 32];
-                            h[..20].copy_from_slice(tx.from.0.as_slice());
-                            h
-                        }
-                    };
-                    SigBatchEntry { msg_hash, pk_hash }
-                })
-                .collect();
+            let entries: Vec<SigBatchEntry> = stark_sources::block_to_sig_batch_entries(&block);
             let mut hash_bytes = [0u8; 32];
             hash_bytes.copy_from_slice(hash.as_bytes());
             let original_size = self.stark_source_original_size(&hash, &block, entries.len())?;

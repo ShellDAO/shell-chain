@@ -1449,6 +1449,12 @@ impl<S: KvStore> SettledSourceIndex<S> {
         self.store.put(&Self::key(layer, hash), &[1u8])
     }
 
+    /// Remove the settled record for `(layer, hash)`. Used by reconcile to
+    /// purge stale entries that are no longer backed by canonical StarkReward txs.
+    pub fn delete(&self, layer: u32, hash: &ShellHash) -> Result<(), StorageError> {
+        self.store.delete(&Self::key(layer, hash))
+    }
+
     /// Returns true if `(layer, hash)` is recorded as settled.
     pub fn has(&self, layer: u32, hash: &ShellHash) -> Result<bool, StorageError> {
         Ok(self.store.get(&Self::key(layer, hash))?.is_some())

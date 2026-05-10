@@ -166,6 +166,93 @@ impl<S: KvStore + 'static> Node<S> {
         ))
     }
 
+    /// Cryptographically verify that a [`ProofAmendment`] is bound to the
+    /// canonical source entries it claims to cover.
+    ///
+    /// This is a **separate, more expensive check** from
+    /// [`validate_stark_amendment_ordering`].  Call it after ordering passes,
+    /// at gossip-receipt and settlement-import time (not for locally-generated
+    /// proofs, which are already valid by construction).
+    ///
+    /// For L1 amendments the check reconstructs every [`SigBatchEntry`] from
+    /// the covered source blocks and verifies:
+    ///
+    /// 1. `proof.n_sigs == entries.len()` — declared entry count matches
+    ///    canonical transaction count in the covered range.
+    /// 2. `proof.batch_root_bytes == compute_batch_root(entries)` — the
+    ///    declared batch root is the true accumulator for those entries.
+    /// 3. `verify_sig_batch(&proof)` — the Winterfell STARK proof is valid
+    ///    for the declared (batch_root, n_sigs) public inputs.
+    ///
+    /// L2+ amendments are not yet validated by this path (full recursive
+    /// verifier is scaffold-only); they pass trivially so callers are not
+    /// blocked. See `stark-l2-settlement-validation` todo.
+    pub(crate) fn validate_stark_proof_source_binding(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(), NodeError> {
+        // L2+ recursive verification is deferred; only L1 sig-batch proofs can
+        // be fully validated with the current verifier implementation.
+        if amendment.layer != 1 {
+            return Ok(());
+        }
+
+        // Reconstruct canonical entries from all covered source blocks.
+        let covered = amendment.covered_hashes();
+        let mut all_entries: Vec<shell_stark_prover::prover::SigBatchEntry> = Vec::new();
+        for source_hash in &covered {
+            let block = self
+                .chain_store
+                .get_block_by_hash(source_hash)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "STARK proof binding: source block {source_hash} not found"
+                    ))
+                })?;
+            all_entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+        }
+
+        // Check 1: declared n_sigs must match the actual canonical entry count.
+        if all_entries.len() != amendment.proof.n_sigs {
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(format!(
+                "STARK proof n_sigs {} does not match reconstructed entry count {} \
+                 for source range #{}..=#{}",
+                amendment.proof.n_sigs,
+                all_entries.len(),
+                amendment
+                    .range_start_block()
+                    .unwrap_or(amendment.block_number),
+                amendment.block_number,
+            )));
+        }
+
+        // Check 2: recompute the batch root and compare.
+        let expected_root =
+            shell_stark_prover::prover::compute_batch_root(&all_entries);
+        if expected_root != amendment.proof.batch_root_bytes {
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(format!(
+                "STARK proof batch_root_bytes mismatch for source range #{}..=#{}",
+                amendment
+                    .range_start_block()
+                    .unwrap_or(amendment.block_number),
+                amendment.block_number,
+            )));
+        }
+
+        // Check 3: full Winterfell STARK verification.
+        verify_sig_batch(&amendment.proof).map_err(|e| {
+            self.metrics.stark_settlements_rejected.inc();
+            NodeError::Startup(format!(
+                "STARK proof verification failed for block #{}: {e}",
+                amendment.block_number
+            ))
+        })?;
+
+        Ok(())
+    }
+
     pub(crate) fn validate_stark_amendment_ordering(
         &self,
         amendment: &ProofAmendment,

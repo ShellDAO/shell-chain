@@ -63,7 +63,7 @@ pub use metadata::{
     PROOF_METADATA_VERSION,
 };
 pub use proof::{SigBatchProof, SIG_BATCH_PROOF_VERSION};
-pub use prover::{prove_sig_batch, verify_sig_batch, SigBatchEntry};
+pub use prover::{compute_batch_root, prove_sig_batch, verify_sig_batch, SigBatchEntry};
 pub use prover_health::{HealthStatus, ProverHealth, ProverHealthConfig};
 pub use recursive_air::{
     compute_aggregate_root, AggregationJob, RecursivePublicInputs, RecursiveVerifierAir,

@@ -249,6 +249,19 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             ..
         } = task;
 
+        // Defense-in-depth: the backlog should never dispatch an all-empty L1
+        // task (pop_contiguous_with_min_entries returns None for zero entries),
+        // but guard here too so we never call prove_sig_batch with an empty
+        // batch. This avoids a panic/error cycle if the guard is ever bypassed.
+        if layer == 1 && entries.is_empty() {
+            warn!(
+                "ProverService: skipping empty L1 task for block #{block_number} \
+                 ({} source hashes) — waiting for non-empty successor",
+                source_hashes.len()
+            );
+            return;
+        }
+
         // Run the CPU-intensive proof generation on a blocking thread so the
         // tokio executor is not starved. Note: once started, this blocking job
         // is not hard-cancelable via JoinHandle::abort.

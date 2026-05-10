@@ -8,6 +8,7 @@ mod event_loop;
 mod invariants;
 mod p2p_handlers;
 mod readiness;
+pub(crate) mod stark_sources;
 mod system_rewards;
 
 pub(crate) use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2017,6 +2018,67 @@ mod tests {
         );
     }
 
+    /// Simulate a reorg: a stale `ss/` index entry (from an old fork) must be
+    /// purged by `rebuild_settled_stark_sources_from_chain` so it cannot
+    /// incorrectly block the new canonical frontier.
+    #[test]
+    fn rebuild_settled_removes_stale_index_entries_after_reorg() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 1);
+
+        // Inject a stale `ss/` entry for a hash that is NOT on the canonical
+        // chain (simulates a block that existed on a fork before a reorg).
+        let stale_hash = ShellHash::from([0xDE; 32]);
+        node.settled_source_index.put(1, &stale_hash).unwrap();
+
+        // Also add a legitimate canonical settlement for genesis so the index
+        // is "populated" (previously this triggered the fast path that trusted
+        // the index blindly).
+        node.settled_source_index.put(1, &genesis_hash).unwrap();
+        node.settled_source_index.put(1, &hashes[0]).unwrap();
+
+        // Settle genesis + block 1 on the canonical chain so the slow scan
+        // finds them.
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        node.pending_stark_settlements
+            .lock()
+            .push(amendment.clone());
+        node.produce_block(&signer, 100).unwrap();
+
+        // Now rebuild: canonical scan should find genesis+block1, remove stale_hash.
+        node.settled_stark_sources.lock().clear();
+        let count = node.rebuild_settled_stark_sources_from_chain().unwrap();
+
+        // Only the two canonical sources should survive.
+        assert_eq!(count, 2, "only canonical settled sources should remain");
+        assert!(
+            node.settled_stark_sources.lock().contains(&(1, genesis_hash)),
+            "genesis still settled"
+        );
+        assert!(
+            node.settled_stark_sources.lock().contains(&(1, hashes[0])),
+            "block 1 still settled"
+        );
+        assert!(
+            !node
+                .settled_stark_sources
+                .lock()
+                .contains(&(1, stale_hash)),
+            "stale fork entry must be removed"
+        );
+        // The persistent index must also be clean.
+        assert!(
+            !node.settled_source_index.has(1, &stale_hash).unwrap(),
+            "stale `ss/` index entry must be deleted"
+        );
+    }
+
     #[test]
     fn produce_block_backfills_pointer_metadata_and_anchors_full_proof_on_final_source() {
         let (node, signer) = setup_node();
@@ -2155,6 +2217,156 @@ mod tests {
             other => panic!("expected full proof, got {other:?}"),
         }
     }
+
+    // ── stark-add-empty-range-tests ─────────────────────────────────────────
+
+    /// `validate_stark_proof_source_binding` must reject an amendment whose
+    /// declared `n_sigs` does not match the reconstructed entry count for the
+    /// covered canonical source blocks.
+    #[test]
+    fn source_binding_rejects_wrong_n_sigs() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        // Two 0-tx blocks → reconstructed entry count = 0.
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+
+        let bad = ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: hashes[1],
+            block_number: 2,
+            start_block: Some(0),
+            proof: shell_stark_prover::proof::SigBatchProof {
+                version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
+                batch_root_bytes: [0u8; 16],
+                n_sigs: 999, // wrong — actual canonical entry count is 0
+                proof_bytes: vec![0x33; 128],
+            },
+            prover: Address::from([0x44; 20]),
+            prover_signature: Bytes::from(vec![0x55; 8]),
+            layer: 1,
+            source_hashes: vec![genesis_hash, hashes[0], hashes[1]],
+            original_size: Some(0),
+            compressed_size: Some(128),
+            settlement_tx_hash: None,
+        };
+
+        let err = node.validate_stark_proof_source_binding(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("n_sigs"),
+            "expected n_sigs mismatch error, got: {err}"
+        );
+    }
+
+    /// `validate_stark_proof_source_binding` must reject an amendment whose
+    /// `batch_root_bytes` does not match the root recomputed from canonical
+    /// source entries (even when `n_sigs` is correct).
+    #[test]
+    fn source_binding_rejects_wrong_batch_root() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        // One 0-tx block → reconstructed entries = [], n_sigs must be 0.
+        let hashes = produce_witnessed_blocks(&node, &signer, 1);
+
+        // Compute the correct root for an empty entry set, then flip a byte.
+        let correct_root = shell_stark_prover::compute_batch_root(&[]);
+        let mut wrong_root = correct_root;
+        wrong_root[0] ^= 0xFF;
+
+        let bad = ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: hashes[0],
+            block_number: 1,
+            start_block: Some(0),
+            proof: shell_stark_prover::proof::SigBatchProof {
+                version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
+                batch_root_bytes: wrong_root, // wrong root
+                n_sigs: 0,                   // correct count for 0-tx blocks
+                proof_bytes: vec![0x33; 128],
+            },
+            prover: Address::from([0x44; 20]),
+            prover_signature: Bytes::from(vec![0x55; 8]),
+            layer: 1,
+            source_hashes: vec![genesis_hash, hashes[0]],
+            original_size: Some(0),
+            compressed_size: Some(128),
+            settlement_tx_hash: None,
+        };
+
+        let err = node.validate_stark_proof_source_binding(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("batch_root_bytes"),
+            "expected batch_root_bytes mismatch error, got: {err}"
+        );
+    }
+
+    /// The ordering validator must reject an amendment whose `source_hashes`
+    /// skips a canonical empty block (i.e., the declared range is not contiguous
+    /// with the actual canonical chain).
+    #[test]
+    fn ordering_rejects_amendment_skipping_empty_canonical_block() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        // Produce 3 empty blocks: B1 (#1), B2 (#2), B3 (#3).
+        let hashes = produce_witnessed_blocks(&node, &signer, 3);
+
+        // Build amendment that claims to cover blocks 0..=2 but skips B2 (#2)
+        // and substitutes B3 (#3) instead.  The canonical hash for block #2 is
+        // B2, not B3, so the contiguity check must fail.
+        let skip_b2 = dummy_ordered_amendment(
+            1,
+            vec![genesis_hash, hashes[0], hashes[2]], // skips hashes[1] = B2
+            2,
+        );
+
+        let err = node
+            .validate_stark_amendment_ordering(&skip_b2)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not canonical"),
+            "expected 'not canonical' rejection for skipped block, got: {err}"
+        );
+    }
+
+    /// The ordering validator must accept an amendment that correctly covers a
+    /// contiguous range of empty (0-tx) canonical blocks.  Empty blocks are
+    /// valid compression sources via the header-existence check in
+    /// `is_stark_compression_source`, so they must be includable in any range.
+    #[test]
+    fn ordering_accepts_range_with_empty_leading_blocks() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        // Two more 0-tx blocks so the range is [genesis(0tx), B1(0tx), B2(0tx)].
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+
+        // `dummy_ordered_amendment` sets n_sigs = MIN_L1_STARK_TXS which
+        // satisfies the layer-1 threshold; source_hashes are contiguous canonical.
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+
+        node.validate_stark_amendment_ordering(&amendment)
+            .expect("ordering should accept a contiguous range of empty canonical blocks");
+    }
+
+    // ── end stark-add-empty-range-tests ─────────────────────────────────────
 
     #[test]
     fn produce_empty_block() {

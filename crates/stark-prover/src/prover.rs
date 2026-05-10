@@ -205,7 +205,29 @@ impl Prover for SigBatchProverImpl {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Generate a STARK proof for a batch of (already-verified) signature entries.
+/// Recompute the batch root for a slice of entries without building the full
+/// Winterfell execution trace.
+///
+/// Uses the same degree-3 accumulator as [`build_trace`]:
+/// `acc[t+1] = acc[t]^3 + entry[t]`, starting from `acc = 0`.
+///
+/// Returns 16 little-endian bytes of the final field element (identical to
+/// [`SigBatchProof::batch_root_bytes`]).  For an empty slice the result is
+/// all-zero bytes (BaseElement::ZERO).
+///
+/// Callers can compare the returned bytes against `proof.batch_root_bytes` to
+/// verify that a proof covers exactly the canonical entries they expect.
+pub fn compute_batch_root(entries: &[SigBatchEntry]) -> [u8; 16] {
+    let mut acc = BaseElement::ZERO;
+    for entry in entries {
+        acc = acc.exp(3u32.into()) + entry.to_field_element();
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&acc.as_int().to_le_bytes());
+    bytes
+}
+
+
 ///
 /// The caller is responsible for verifying all Dilithium3 signatures natively
 /// before calling this function.  The STARK proves only that the hash-chain

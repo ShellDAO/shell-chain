@@ -207,6 +207,20 @@ impl ProofBacklog {
             .get(take)
             .map(|next| next.layer == layer && next.block_number == end_block.saturating_add(1))
             .unwrap_or(false);
+
+        // L1 empty-batch guard: prove_sig_batch rejects empty inputs, so we must
+        // never dispatch a run whose merged entry count is zero. Hold the window in
+        // the backlog until a non-empty successor block is merged in, at which point
+        // the accumulated source_hashes (including all the leading empty blocks) will
+        // be part of the proof range. This also prevents infinite prove-fail cycles
+        // when the chain tail consists entirely of 0-tx blocks.
+        // The guard is conditioned on min_l1_entries > 0 so that the utility
+        // pop_contiguous(max_sources) variant (used in index/merge tests with
+        // min_l1_entries=0) is not affected.
+        if layer == 1 && min_l1_entries > 0 && entries == 0 {
+            return None;
+        }
+
         // Also require take < max_sources: a run that has hit the capacity cap cannot
         // grow further even if a contiguous successor exists, so it must not stall.
         if layer == 1
@@ -534,18 +548,74 @@ mod tests {
     fn l1_pop_advances_when_max_sources_reached_below_minimum() {
         let mut b = ProofBacklog::new();
         for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
+            // One entry per block so the window has a non-zero entry count
+            // (well below MIN_L1_STARK_TXS). The capacity cap must still force
+            // a pop even though entries < MIN_L1_STARK_TXS.
             b.push(ProofTask::new(
                 [block_number as u8; 32],
                 block_number,
-                vec![],
+                vec![make_entry(block_number as u8)],
             ));
         }
 
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
-            .expect("max source window must make forward progress");
+            .expect("max source window must make forward progress when entries are non-zero");
         assert_eq!(merged.block_number, DEFAULT_MAX_L1_RANGE_SOURCES as u64);
-        assert!(merged.entries.is_empty());
+        assert_eq!(merged.entries.len(), DEFAULT_MAX_L1_RANGE_SOURCES);
+        assert!(b.is_empty());
+    }
+
+    /// An all-empty L1 window (all 0-tx blocks) must never be dispatched to the
+    /// prover, regardless of window size. The tasks stay in the backlog so they can
+    /// be merged with the first non-empty successor block.
+    #[test]
+    fn l1_pop_all_empty_window_always_waits() {
+        let mut b = ProofBacklog::new();
+        // Push a few empty blocks (small window, no contiguous successor).
+        for block_number in 1u64..=5 {
+            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+        }
+        let result =
+            b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+        assert!(result.is_none(), "small all-empty frontier must not be dispatched");
+        assert_eq!(b.len(), 5, "empty tasks must remain in backlog");
+
+        // Same behaviour when the window is at max capacity.
+        let mut b2 = ProofBacklog::new();
+        for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
+            b2.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+        }
+        let result2 =
+            b2.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+        assert!(result2.is_none(), "full-capacity all-empty window must not be dispatched");
+        assert_eq!(b2.len(), DEFAULT_MAX_L1_RANGE_SOURCES, "tasks must remain in backlog");
+    }
+
+    /// Leading empty blocks are included in the merged source_hashes when the window
+    /// is eventually sealed by a trailing non-empty block.
+    #[test]
+    fn l1_pop_empty_leading_blocks_merge_with_non_empty_tail() {
+        let mut b = ProofBacklog::new();
+        // 3 empty blocks followed by 1 non-empty block (well above MIN_L1_STARK_TXS).
+        for block_number in 1u64..=3 {
+            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+        }
+        let entries_4: Vec<SigBatchEntry> =
+            (0..MIN_L1_STARK_TXS).map(|i| make_entry(i as u8)).collect();
+        b.push(ProofTask::new([4u8; 32], 4, entries_4));
+
+        let merged = b
+            .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
+            .expect("non-empty tail should trigger a pop");
+        // All 4 blocks merged: source_hashes contains empty blocks + non-empty block.
+        assert_eq!(merged.block_number, 4);
+        assert_eq!(merged.source_hashes.len(), 4, "all 4 source hashes must be present");
+        assert_eq!(
+            merged.entries.len(),
+            MIN_L1_STARK_TXS,
+            "entries come only from the non-empty block"
+        );
         assert!(b.is_empty());
     }
 
