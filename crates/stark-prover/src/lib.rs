@@ -68,6 +68,9 @@ pub use prover_health::{HealthStatus, ProverHealth, ProverHealthConfig};
 pub use recursive_air::{
     compute_aggregate_root, AggregationJob, RecursivePublicInputs, RecursiveVerifierAir,
     REC_COL_ACC, REC_COL_ROOT, REC_TRACE_WIDTH,
+    // Boundary types
+    RecursiveProof, RecursiveProverError, RecursiveProver, ScaffoldRecursiveProver,
+    get_recursive_prover,
 };
 pub use scheduler::{AggregationConfig, AggregationScheduler, AggregationTrigger, L1Gap, SettledL1Input, TriggerReason};
 pub use state_machine::{BlockProofState, BlockStateMachine, InvalidTransition};

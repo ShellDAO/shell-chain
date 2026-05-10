@@ -16,5 +16,11 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# Enable the real recursive (L2) prover implementation.
+# Off by default — the scaffold boundary is always compiled in so that
+# ProverService can reason about L2 status without linking the full prover.
+recursive = []
+
 [dev-dependencies]
 criterion = { workspace = true }

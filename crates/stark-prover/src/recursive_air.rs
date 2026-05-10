@@ -60,6 +60,117 @@ use winterfell::{
     TransitionConstraintDegree,
 };
 
+// ── Recursive Prover Boundary ─────────────────────────────────────────────────
+
+/// Error type for the recursive prover boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum RecursiveProverError {
+    /// The recursive prover is not yet implemented.
+    ///
+    /// This is the only variant returned by [`ScaffoldRecursiveProver`].
+    /// Real implementations will add `ProofFailed`, `InvalidInputs`, etc.
+    #[error("recursive prover not implemented (feature = \"recursive\" not enabled or stub active)")]
+    NotImplemented,
+
+    /// The inputs were structurally invalid (wrong range, empty root list, …).
+    #[error("invalid recursive prover inputs: {0}")]
+    InvalidInputs(String),
+
+    /// The proof was generated but verification failed.
+    #[error("recursive proof verification failed: {0}")]
+    VerificationFailed(String),
+}
+
+/// Opaque recursive (L2) STARK proof bytes.
+///
+/// The exact serialisation format is defined by the concrete [`RecursiveProver`]
+/// implementation; callers must not inspect the bytes directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecursiveProof {
+    /// Serialised proof bytes (Winterfell proof when real impl is active).
+    pub bytes: Vec<u8>,
+    /// Aggregate root attested by this proof.
+    pub aggregate_root: u128,
+    /// First block covered (inclusive).
+    pub start_block: u64,
+    /// Last block covered (inclusive).
+    pub end_block: u64,
+    /// Number of L1 proofs aggregated.
+    pub n_l1_proofs: usize,
+}
+
+/// Trait that a real recursive L2 prover must satisfy.
+///
+/// # Scaffold boundary
+///
+/// This trait exists to define the surface that testnet L2 proving needs.
+/// [`ScaffoldRecursiveProver`] implements it by returning
+/// [`RecursiveProverError::NotImplemented`] from every method.  The real
+/// implementation (gated behind `feature = "recursive"`) will replace that.
+///
+/// **No code outside this module should produce a `RecursiveProof` without
+/// going through an implementation of this trait.**
+pub trait RecursiveProver: Send + Sync {
+    /// Generate a recursive L2 proof that aggregates the given L1 proofs.
+    ///
+    /// `inputs.l1_roots` must be non-empty and ordered; `inputs.aggregate_root`
+    /// must equal `compute_aggregate_root(&inputs.l1_roots)`.
+    fn prove_aggregation(
+        &self,
+        inputs: &RecursivePublicInputs,
+    ) -> Result<RecursiveProof, RecursiveProverError>;
+
+    /// Verify a [`RecursiveProof`] against the expected public inputs.
+    fn verify_aggregation(
+        &self,
+        proof: &RecursiveProof,
+        inputs: &RecursivePublicInputs,
+    ) -> Result<(), RecursiveProverError>;
+}
+
+/// Scaffold implementation of [`RecursiveProver`] that always returns
+/// [`RecursiveProverError::NotImplemented`].
+///
+/// Used at runtime whenever `L2StarkMode` is not `Active` or the `recursive`
+/// cargo feature is not enabled.
+pub struct ScaffoldRecursiveProver;
+
+impl RecursiveProver for ScaffoldRecursiveProver {
+    fn prove_aggregation(
+        &self,
+        _inputs: &RecursivePublicInputs,
+    ) -> Result<RecursiveProof, RecursiveProverError> {
+        Err(RecursiveProverError::NotImplemented)
+    }
+
+    fn verify_aggregation(
+        &self,
+        _proof: &RecursiveProof,
+        _inputs: &RecursivePublicInputs,
+    ) -> Result<(), RecursiveProverError> {
+        Err(RecursiveProverError::NotImplemented)
+    }
+}
+
+/// Return the active [`RecursiveProver`] for the current build configuration.
+///
+/// - When `feature = "recursive"` is enabled: returns the real prover (once
+///   implemented; currently still returns the scaffold).
+/// - Otherwise: returns [`ScaffoldRecursiveProver`].
+///
+/// Callers should log the result and surface it in metrics when L2 is active.
+pub fn get_recursive_prover() -> Box<dyn RecursiveProver> {
+    #[cfg(feature = "recursive")]
+    {
+        // TODO: replace with the real implementation when available.
+        tracing::warn!(
+            "shell-stark-prover: feature `recursive` is enabled but real \
+             recursive prover is not yet implemented — using scaffold"
+        );
+    }
+    Box::new(ScaffoldRecursiveProver)
+}
+
 // ── Public Inputs ─────────────────────────────────────────────────────────────
 
 /// Public inputs for the L2 recursive aggregation proof.
