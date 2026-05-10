@@ -1567,6 +1567,174 @@ impl<S: KvStore> L2InputIndex<S> {
     }
 }
 
+// ── L2AggregationJob / L2JobStore ─────────────────────────────────────────
+
+/// Status of a durable L2 aggregation proving job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum L2JobStatus {
+    /// Waiting for more canonical L1 proofs to fill the input window.
+    PendingInputs,
+    /// All inputs are present; ready to be submitted to the recursive prover.
+    Ready,
+    /// The recursive prover is currently working on this job.
+    Proving,
+    /// Recursive proof is generated and stored locally.
+    ProofStored,
+    /// Proof is queued for on-chain settlement.
+    QueuedForSettlement,
+    /// Settlement tx has been included in a canonical block.
+    Settled,
+    /// Proving or settlement failed transiently; eligible for retry.
+    FailedRetryable,
+    /// Permanently failed; will not be retried without manual intervention.
+    FailedPermanent,
+}
+
+/// A durable record of one L2 recursive aggregation job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2AggregationJob {
+    /// Deterministic ID: blake3 of sorted `l1_source_hashes`.
+    pub id: ShellHash,
+    pub status: L2JobStatus,
+    /// Settled L1 amendment hashes that form the input to this L2 proof.
+    pub l1_source_hashes: Vec<ShellHash>,
+    /// First canonical block covered by the earliest L1 input.
+    pub start_block: u64,
+    /// Last canonical block covered by the latest L1 input.
+    pub end_block: u64,
+    /// `batch_root_bytes` of each contributing L1 proof, in order.
+    pub l1_batch_roots: Vec<[u8; 32]>,
+    /// Aggregate root produced by the recursive proof (set after ProofStored).
+    pub aggregate_root: Option<[u8; 32]>,
+    /// Number of times proving has been attempted.
+    pub retry_count: u32,
+    /// Human-readable reason for the last failure (if any).
+    pub last_error: Option<String>,
+    /// Block number at which this job was first created.
+    pub created_at_block: u64,
+    /// Block number at which the status was last updated.
+    pub updated_at_block: u64,
+}
+
+impl L2AggregationJob {
+    /// Compute the deterministic job ID from a set of L1 source hashes.
+    ///
+    /// Sorts the hashes lexicographically before hashing so the ID is
+    /// independent of insertion order.
+    pub fn compute_id(l1_source_hashes: &[ShellHash]) -> ShellHash {
+        let mut sorted: Vec<&[u8]> = l1_source_hashes
+            .iter()
+            .map(|h| h.as_bytes().as_slice())
+            .collect();
+        sorted.sort_unstable();
+        let mut buf = Vec::with_capacity(sorted.len() * 32);
+        for h in sorted {
+            buf.extend_from_slice(h);
+        }
+        shell_primitives::blake3_hash(&buf)
+    }
+}
+
+const L2J_PREFIX: &[u8] = b"l2j/";
+
+/// Durable key-value store for [`L2AggregationJob`] records.
+///
+/// Key: `l2j/` (4 bytes) + job `id` (32 bytes) → JSON-encoded job.
+pub struct L2JobStore<S: KvStore> {
+    store: Arc<S>,
+}
+
+impl<S: KvStore> Clone for L2JobStore<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+impl<S: KvStore> L2JobStore<S> {
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
+    }
+
+    fn key(id: &ShellHash) -> Vec<u8> {
+        let mut k = Vec::with_capacity(L2J_PREFIX.len() + 32);
+        k.extend_from_slice(L2J_PREFIX);
+        k.extend_from_slice(id.as_bytes());
+        k
+    }
+
+    /// Persist (insert or overwrite) a job.
+    pub fn put(&self, job: &L2AggregationJob) -> Result<(), StorageError> {
+        let value = serde_json::to_vec(job)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.store.put(&Self::key(&job.id), &value)
+    }
+
+    /// Retrieve a job by its deterministic ID, or `None` if not present.
+    pub fn get(&self, id: &ShellHash) -> Result<Option<L2AggregationJob>, StorageError> {
+        match self.store.get(&Self::key(id))? {
+            None => Ok(None),
+            Some(bytes) => {
+                let job: L2AggregationJob = serde_json::from_slice(&bytes)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                Ok(Some(job))
+            }
+        }
+    }
+
+    /// Remove a job.
+    pub fn delete(&self, id: &ShellHash) -> Result<(), StorageError> {
+        self.store.delete(&Self::key(id))
+    }
+
+    /// Return every stored job.
+    pub fn all_jobs(&self) -> Result<Vec<L2AggregationJob>, StorageError> {
+        let mut out = Vec::new();
+        for (_k, v) in self.store.scan_prefix(L2J_PREFIX)? {
+            let job: L2AggregationJob = serde_json::from_slice(&v)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            out.push(job);
+        }
+        Ok(out)
+    }
+
+    /// Return all jobs whose status matches `filter`.
+    pub fn jobs_with_status(
+        &self,
+        filter: L2JobStatus,
+    ) -> Result<Vec<L2AggregationJob>, StorageError> {
+        Ok(self
+            .all_jobs()?
+            .into_iter()
+            .filter(|j| j.status == filter)
+            .collect())
+    }
+
+    /// Update the status (and optionally the error string) of an existing job
+    /// without loading the full job from scratch.
+    pub fn update_status(
+        &self,
+        id: &ShellHash,
+        status: L2JobStatus,
+        updated_at_block: u64,
+        error: Option<String>,
+    ) -> Result<(), StorageError> {
+        if let Some(mut job) = self.get(id)? {
+            job.status = status;
+            job.updated_at_block = updated_at_block;
+            job.last_error = error;
+            self.put(&job)?;
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if any job exists in the store.
+    pub fn is_populated(&self) -> Result<bool, StorageError> {
+        Ok(!self.store.scan_prefix(L2J_PREFIX)?.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2901,5 +3069,121 @@ mod tests {
         idx.put(&h).unwrap();
         idx.put(&h).unwrap(); // second put must not panic or duplicate
         assert_eq!(idx.all_hashes().unwrap().len(), 1);
+    }
+
+    // ── L2JobStore tests ──────────────────────────────────────────────────
+
+    fn make_job(seed: u8, status: L2JobStatus, start: u64, end: u64) -> L2AggregationJob {
+        let h1 = l2_hash(seed);
+        let h2 = l2_hash(seed.wrapping_add(1));
+        let hashes = vec![h1, h2];
+        let id = L2AggregationJob::compute_id(&hashes);
+        L2AggregationJob {
+            id,
+            status,
+            l1_source_hashes: hashes,
+            start_block: start,
+            end_block: end,
+            l1_batch_roots: vec![[seed; 32]],
+            aggregate_root: None,
+            retry_count: 0,
+            last_error: None,
+            created_at_block: start,
+            updated_at_block: start,
+        }
+    }
+
+    #[test]
+    fn l2_job_store_put_get_delete() {
+        let store = Arc::new(MemoryDb::default());
+        let js = L2JobStore::new(store);
+        let job = make_job(1, L2JobStatus::PendingInputs, 10, 20);
+
+        assert!(js.get(&job.id).unwrap().is_none());
+        js.put(&job).unwrap();
+        let retrieved = js.get(&job.id).unwrap().unwrap();
+        assert_eq!(retrieved.id, job.id);
+        assert_eq!(retrieved.status, L2JobStatus::PendingInputs);
+        assert_eq!(retrieved.start_block, 10);
+
+        js.delete(&job.id).unwrap();
+        assert!(js.get(&job.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn l2_job_store_all_jobs_and_filter_by_status() {
+        let store = Arc::new(MemoryDb::default());
+        let js = L2JobStore::new(store);
+
+        let j1 = make_job(10, L2JobStatus::Ready, 1, 5);
+        let j2 = make_job(20, L2JobStatus::Proving, 6, 10);
+        let j3 = make_job(30, L2JobStatus::Ready, 11, 15);
+        js.put(&j1).unwrap();
+        js.put(&j2).unwrap();
+        js.put(&j3).unwrap();
+
+        assert_eq!(js.all_jobs().unwrap().len(), 3);
+
+        let ready = js.jobs_with_status(L2JobStatus::Ready).unwrap();
+        assert_eq!(ready.len(), 2);
+
+        let proving = js.jobs_with_status(L2JobStatus::Proving).unwrap();
+        assert_eq!(proving.len(), 1);
+        assert_eq!(proving[0].start_block, 6);
+    }
+
+    #[test]
+    fn l2_job_store_update_status() {
+        let store = Arc::new(MemoryDb::default());
+        let js = L2JobStore::new(store);
+        let job = make_job(40, L2JobStatus::Ready, 20, 30);
+        js.put(&job).unwrap();
+
+        js.update_status(&job.id, L2JobStatus::Proving, 25, None).unwrap();
+        let updated = js.get(&job.id).unwrap().unwrap();
+        assert_eq!(updated.status, L2JobStatus::Proving);
+        assert_eq!(updated.updated_at_block, 25);
+        assert!(updated.last_error.is_none());
+
+        js.update_status(
+            &job.id,
+            L2JobStatus::FailedRetryable,
+            26,
+            Some("prover timeout".into()),
+        )
+        .unwrap();
+        let failed = js.get(&job.id).unwrap().unwrap();
+        assert_eq!(failed.status, L2JobStatus::FailedRetryable);
+        assert_eq!(failed.last_error.as_deref(), Some("prover timeout"));
+    }
+
+    #[test]
+    fn l2_job_store_is_populated() {
+        let store = Arc::new(MemoryDb::default());
+        let js = L2JobStore::new(store);
+
+        assert!(!js.is_populated().unwrap());
+        js.put(&make_job(50, L2JobStatus::PendingInputs, 0, 10)).unwrap();
+        assert!(js.is_populated().unwrap());
+    }
+
+    #[test]
+    fn l2_job_compute_id_is_order_independent() {
+        let h1 = l2_hash(1);
+        let h2 = l2_hash(2);
+        let id_ab = L2AggregationJob::compute_id(&[h1, h2]);
+        let id_ba = L2AggregationJob::compute_id(&[h2, h1]);
+        assert_eq!(id_ab, id_ba);
+    }
+
+    #[test]
+    fn l2_job_store_put_is_idempotent() {
+        let store = Arc::new(MemoryDb::default());
+        let js = L2JobStore::new(store);
+        let job = make_job(60, L2JobStatus::PendingInputs, 5, 15);
+
+        js.put(&job).unwrap();
+        js.put(&job).unwrap();
+        assert_eq!(js.all_jobs().unwrap().len(), 1);
     }
 }

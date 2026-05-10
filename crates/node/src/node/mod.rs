@@ -37,7 +37,7 @@ pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
-    validator_registry_addr, BodyPruner, ChainStore, KvStore, L2InputIndex, ProofAmendmentStore,
+    validator_registry_addr, BodyPruner, ChainStore, KvStore, L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, ProofAmendmentStore,
     SettledSourceIndex, StatePruner, WitnessPruner, WitnessStore, WorldState,
 };
 
@@ -93,6 +93,9 @@ pub struct Node<S: KvStore + 'static> {
     /// Only populated from canonical `StarkReward` system txs during
     /// `rebuild_settled_stark_sources_from_chain` and `record_settled_sources`.
     pub(crate) l2_input_index: L2InputIndex<S>,
+    /// Durable store for L2 recursive aggregation jobs (`l2j/` prefix in KV).
+    /// Keyed by deterministic job ID (blake3 of sorted L1 source hashes).
+    pub(crate) l2_job_store: L2JobStore<S>,
     /// Compression-valid STARK proof amendments waiting to be settled in the
     /// next locally produced block.
     pending_stark_settlements: Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
@@ -394,6 +397,7 @@ struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
     settled_stark_sources: &'a parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
     settled_source_index: &'a SettledSourceIndex<S>,
     l2_input_index: &'a L2InputIndex<S>,
+    l2_job_store: &'a L2JobStore<S>,
     metrics: &'a Arc<Metrics>,
 }
 
@@ -554,6 +558,7 @@ impl<S: KvStore + 'static> Node<S> {
         let amendment_store = ProofAmendmentStore::new(store.clone());
         let settled_source_index = SettledSourceIndex::new(store.clone());
         let l2_input_index = L2InputIndex::new(store.clone());
+        let l2_job_store = L2JobStore::new(store.clone());
 
         // F-094: Recover finalized state from persistent storage on restart.
         let (fin_number, fin_hash) = {
@@ -606,6 +611,7 @@ impl<S: KvStore + 'static> Node<S> {
             amendment_store,
             settled_source_index,
             l2_input_index,
+            l2_job_store,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
             equivocation_queue: parking_lot::Mutex::new(Vec::new()),
@@ -661,6 +667,7 @@ impl<S: KvStore + 'static> Node<S> {
             settled_stark_sources: &self.settled_stark_sources,
             settled_source_index: &self.settled_source_index,
             l2_input_index: &self.l2_input_index,
+            l2_job_store: &self.l2_job_store,
             metrics: &self.metrics,
         }
     }
