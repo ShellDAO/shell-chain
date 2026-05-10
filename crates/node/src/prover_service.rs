@@ -32,10 +32,12 @@ use tracing::{debug, error, info, warn};
 use parking_lot::Mutex;
 use shell_primitives::{Bytes, ShellHash};
 use shell_stark_prover::{
-    prove_sig_batch, ProofAmendment, ProofBacklog, ProofTask, DEFAULT_MAX_L1_RANGE_SOURCES,
-    MIN_L1_STARK_TXS, PROOF_AMENDMENT_VERSION,
+    prove_sig_batch, L2ProverTask, ProofAmendment, ProofBacklog, ProofTask, ProverTask,
+    DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS, PROOF_AMENDMENT_VERSION,
 };
 use shell_storage::{KvStore, ProofAmendmentStore};
+
+use crate::config::L2StarkMode;
 
 // ── ProverConfig ──────────────────────────────────────────────────────────────
 
@@ -123,6 +125,8 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     config: ProverConfig,
     /// The node's own address, used as `prover` field in [`ProofAmendment`].
     prover_address: shell_primitives::Address,
+    /// L2 STARK mode — controls whether recursive L2 proving is attempted.
+    l2_mode: L2StarkMode,
 }
 
 impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
@@ -140,7 +144,14 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             amendment_tx: None,
             config,
             prover_address,
+            l2_mode: L2StarkMode::Disabled,
         }
+    }
+
+    /// Set the L2 STARK mode for this service.
+    pub fn with_l2_mode(mut self, mode: L2StarkMode) -> Self {
+        self.l2_mode = mode;
+        self
     }
 
     /// Queue locally generated amendments for settlement by validator-prover
@@ -345,6 +356,38 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 }
             }
         }
+    }
+
+    /// Handle an L2 recursive aggregation task.
+    ///
+    /// When `L2StarkMode::Active` is configured (and the `recursive` cargo
+    /// feature is enabled), this would call a real recursive prover.
+    ///
+    /// Currently all L2 tasks are deferred: the job remains in `L2JobStore`
+    /// with `Ready` status and a clear log explains why no proof was generated.
+    pub(crate) async fn process_l2_task(&self, task: &L2ProverTask) {
+        if !self.l2_mode.is_active() {
+            info!(
+                job_id = %shell_primitives::ShellHash::from(*task.job_id.as_bytes()),
+                start_block = task.start_block,
+                end_block = task.end_block,
+                n_inputs = task.l1_source_hashes.len(),
+                mode = %self.l2_mode,
+                "ProverService: L2 recursive proving not active — job remains Ready; \
+                 set l2_stark_mode=Active to enable"
+            );
+            return;
+        }
+
+        // Gated path: recursive proving implementation goes here when available.
+        // For now, log that the prover is active but not yet implemented.
+        warn!(
+            job_id = %shell_primitives::ShellHash::from(*task.job_id.as_bytes()),
+            start_block = task.start_block,
+            end_block = task.end_block,
+            "ProverService: L2StarkMode::Active set but recursive prover is not \
+             yet implemented; no L2 proof generated"
+        );
     }
 }
 

@@ -68,7 +68,51 @@ impl ProofTask {
     }
 }
 
-// ── ProofBacklog ──────────────────────────────────────────────────────────────
+// ── L2ProverTask / ProverTask ─────────────────────────────────────────────────
+
+/// A single unit of L2 recursive aggregation work.
+///
+/// Created by the node event loop when [`AggregationScheduler::on_block`]
+/// fires a trigger.  Submitted to [`ProverService`] only when
+/// `L2StarkMode::Active` is configured; otherwise the service logs that
+/// recursive proving is unavailable and the job remains in `L2JobStore`
+/// with status `Ready`.
+///
+/// [`AggregationScheduler::on_block`]: crate::scheduler::AggregationScheduler::on_block
+#[derive(Debug, Clone)]
+pub struct L2ProverTask {
+    /// Deterministic job ID from [`L2AggregationJob::id`].
+    ///
+    /// Used to look up and update the durable job record in `L2JobStore`.
+    pub job_id: ShellHash,
+    /// The settled canonical L1 amendment hashes that form the input window.
+    pub l1_source_hashes: Vec<ShellHash>,
+    /// L1 `batch_root` field elements (u128) in canonical order.
+    pub l1_batch_roots: Vec<u128>,
+    /// First canonical block covered by the earliest L1 input.
+    pub start_block: u64,
+    /// Last canonical block covered by the latest L1 input (inclusive).
+    pub end_block: u64,
+    /// Sum of `original_size` from all contributing L1 amendments.
+    pub original_size: Option<u64>,
+}
+
+/// A task dispatched to [`ProverService`].
+///
+/// The service routes based on variant:
+/// - [`L1SigBatch`] → `prove_sig_batch()` (current implementation, always available).
+/// - [`L2Aggregation`] → recursive aggregation prover (gated behind `L2StarkMode::Active`).
+///
+/// [`L1SigBatch`]: ProverTask::L1SigBatch
+/// [`L2Aggregation`]: ProverTask::L2Aggregation
+#[derive(Debug)]
+pub enum ProverTask {
+    /// L1 signature-batch STARK proof.
+    L1SigBatch(ProofTask),
+    /// L2 recursive proof aggregating multiple settled L1 proofs.
+    L2Aggregation(L2ProverTask),
+}
+
 
 /// Default high-watermark: warn when the backlog exceeds this many tasks.
 pub const DEFAULT_WATERMARK_THRESHOLD: usize = 64;

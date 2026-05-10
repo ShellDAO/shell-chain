@@ -55,7 +55,7 @@ pub use amendment::{
 };
 pub use availability::{AvailabilityConfig, ProofAvailability, ProofAvailabilityTracker};
 pub use backlog::{
-    ProofBacklog, ProofTask, DEFAULT_MAX_L1_RANGE_SOURCES, DEFAULT_WATERMARK_THRESHOLD,
+    ProofBacklog, ProofTask, ProverTask, L2ProverTask, DEFAULT_MAX_L1_RANGE_SOURCES, DEFAULT_WATERMARK_THRESHOLD,
     MIN_L1_STARK_TXS,
 };
 pub use metadata::{
@@ -69,7 +69,7 @@ pub use recursive_air::{
     compute_aggregate_root, AggregationJob, RecursivePublicInputs, RecursiveVerifierAir,
     REC_COL_ACC, REC_COL_ROOT, REC_TRACE_WIDTH,
 };
-pub use scheduler::{AggregationConfig, AggregationScheduler, AggregationTrigger, TriggerReason};
+pub use scheduler::{AggregationConfig, AggregationScheduler, AggregationTrigger, L1Gap, SettledL1Input, TriggerReason};
 pub use state_machine::{BlockProofState, BlockStateMachine, InvalidTransition};
 
 /// Current protocol version for [`SigBatchProof`] serialization.

@@ -61,6 +61,24 @@ pub struct Metrics {
     pub stark_settlements_rejected: IntCounter,
     /// Current frontier lag: how many L0 blocks are not yet settled at L1.
     pub stark_frontier_lag: IntGauge,
+    // -----------------------------------------------------------------------
+    // L2 STARK observability
+    // -----------------------------------------------------------------------
+    /// Number of settled canonical L1 proofs currently pending in the L2 scheduler window.
+    pub stark_l2_pending_inputs: IntGauge,
+    /// Number of L2 aggregation jobs currently in `Ready` state (waiting for prover).
+    pub stark_l2_ready_jobs: IntGauge,
+    /// Block number of the last L2 scheduler trigger (0 if never triggered).
+    pub stark_l2_last_trigger_block: IntGauge,
+    /// Expected start block of the missing L1 proof when the L2 scheduler is
+    /// gap-blocked (0 if not blocked).
+    pub stark_l2_blocked_gap_start: IntGauge,
+    /// Total L2 recursive proofs generated.
+    pub stark_l2_proofs_generated: IntCounter,
+    /// Total L2 settlements accepted as canonical.
+    pub stark_l2_settlements_accepted: IntCounter,
+    /// Total L2 settlements rejected during validation.
+    pub stark_l2_settlements_rejected: IntCounter,
     /// Timestamp when the node started, used for uptime calculation.
     pub uptime_start: Instant,
     // -----------------------------------------------------------------------
@@ -180,6 +198,36 @@ impl Metrics {
             "Current frontier lag: how many L0 blocks are not yet settled at L1",
         ))?;
 
+        // L2 observability metrics
+        let stark_l2_pending_inputs = IntGauge::with_opts(Opts::new(
+            "shell_stark_l2_pending_inputs",
+            "Canonical L1 proofs pending in the L2 scheduler window",
+        ))?;
+        let stark_l2_ready_jobs = IntGauge::with_opts(Opts::new(
+            "shell_stark_l2_ready_jobs",
+            "L2 aggregation jobs in Ready state waiting for the prover",
+        ))?;
+        let stark_l2_last_trigger_block = IntGauge::with_opts(Opts::new(
+            "shell_stark_l2_last_trigger_block",
+            "Block number of the last L2 scheduler trigger (0 = never)",
+        ))?;
+        let stark_l2_blocked_gap_start = IntGauge::with_opts(Opts::new(
+            "shell_stark_l2_blocked_gap_start",
+            "Expected L1 proof start block when gap-blocked (0 = not blocked)",
+        ))?;
+        let stark_l2_proofs_generated = IntCounter::with_opts(Opts::new(
+            "shell_stark_l2_proofs_generated_total",
+            "Total L2 recursive proofs generated",
+        ))?;
+        let stark_l2_settlements_accepted = IntCounter::with_opts(Opts::new(
+            "shell_stark_l2_settlements_accepted_total",
+            "Total L2 settlements accepted as canonical",
+        ))?;
+        let stark_l2_settlements_rejected = IntCounter::with_opts(Opts::new(
+            "shell_stark_l2_settlements_rejected_total",
+            "Total L2 settlements rejected during validation",
+        ))?;
+
         // ops-metrics: per-CF storage size
         let storage_cf_size = GaugeVec::new(
             Opts::new(
@@ -222,6 +270,13 @@ impl Metrics {
         registry.register(Box::new(stark_settlements_accepted.clone()))?;
         registry.register(Box::new(stark_settlements_rejected.clone()))?;
         registry.register(Box::new(stark_frontier_lag.clone()))?;
+        registry.register(Box::new(stark_l2_pending_inputs.clone()))?;
+        registry.register(Box::new(stark_l2_ready_jobs.clone()))?;
+        registry.register(Box::new(stark_l2_last_trigger_block.clone()))?;
+        registry.register(Box::new(stark_l2_blocked_gap_start.clone()))?;
+        registry.register(Box::new(stark_l2_proofs_generated.clone()))?;
+        registry.register(Box::new(stark_l2_settlements_accepted.clone()))?;
+        registry.register(Box::new(stark_l2_settlements_rejected.clone()))?;
         registry.register(Box::new(storage_cf_size.clone()))?;
         registry.register(Box::new(rpc_request_duration_seconds.clone()))?;
 
@@ -247,6 +302,13 @@ impl Metrics {
             stark_settlements_accepted,
             stark_settlements_rejected,
             stark_frontier_lag,
+            stark_l2_pending_inputs,
+            stark_l2_ready_jobs,
+            stark_l2_last_trigger_block,
+            stark_l2_blocked_gap_start,
+            stark_l2_proofs_generated,
+            stark_l2_settlements_accepted,
+            stark_l2_settlements_rejected,
             uptime_start: Instant::now(),
             storage_cf_size,
             rpc_request_duration_seconds,
