@@ -1753,18 +1753,20 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or(0);
         let mut queued = 0usize;
         let mut tasks = Vec::new();
-        // Scan past max_blocks if all seeded tasks are empty, to ensure the
-        // backlog always contains the first non-empty block. Without this,
-        // a chain with a long 0-tx prefix (e.g. pre-tx-worker genesis) would
-        // fill the backlog with empty blocks and deadlock the prover.
+        // Scan past max_blocks until the backlog contains enough source entries
+        // to satisfy the L1 minimum (MIN_L1_STARK_TXS). Without this, a chain
+        // with a long 0-tx prefix (e.g. pre-tx-worker genesis) would seed only
+        // empty blocks and the prover would produce a proof with too few entries
+        // (e.g. 2 < 512), which passes local storage but fails settlement
+        // validation (n_sigs and embedded-compression checks).
         // Hard cap = 4 × max_blocks (at least DEFAULT_MAX_L1_RANGE_SOURCES × 4)
-        // to bound startup cost while covering reasonable empty prefixes.
+        // to bound startup cost.
         let hard_cap = max_blocks
             .saturating_mul(4)
             .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4);
-        let mut found_nonempty = false;
+        let mut seeded_entries = 0usize;
         for number in 0..=head {
-            if queued >= max_blocks && found_nonempty {
+            if queued >= max_blocks && seeded_entries >= MIN_L1_STARK_TXS {
                 break;
             }
             if queued >= hard_cap {
@@ -1814,7 +1816,7 @@ impl<S: KvStore + 'static> Node<S> {
             hash_bytes.copy_from_slice(hash.as_bytes());
             let original_size = self.stark_source_original_size(&hash, &block, entries.len())?;
             if !entries.is_empty() {
-                found_nonempty = true;
+                seeded_entries = seeded_entries.saturating_add(entries.len());
             }
             tasks.push(ProofTask::with_sources(
                 hash_bytes,
