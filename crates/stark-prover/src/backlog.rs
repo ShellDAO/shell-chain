@@ -242,34 +242,20 @@ impl ProofBacklog {
             take += 1;
         }
 
-        // Only block on min_entries when the run can still grow: there is an
-        // immediate contiguous successor waiting in the backlog. If the run
-        // ends at a gap or the backlog is exhausted, prove what we have rather
-        // than waiting indefinitely for entries that will never arrive.
-        let has_contiguous_successor = self
-            .pending
-            .get(take)
-            .map(|next| next.layer == layer && next.block_number == end_block.saturating_add(1))
-            .unwrap_or(false);
-
-        // L1 empty-batch guard: prove_sig_batch rejects empty inputs, so we must
-        // never dispatch a run whose merged entry count is zero. Hold the window in
-        // the backlog until a non-empty successor block is merged in, at which point
-        // the accumulated source_hashes (including all the leading empty blocks) will
-        // be part of the proof range. This also prevents infinite prove-fail cycles
-        // when the chain tail consists entirely of 0-tx blocks.
-        // The guard is conditioned on min_l1_entries > 0 so that the utility
+        // L1 empty/low-entry guard: the prover must never dispatch a L1 range
+        // whose merged entry count is below the settlement minimum.  Under-threshold
+        // proofs are always rejected by settlement validation (n_sigs and empty-batch
+        // checks), so generating them wastes prover work with no reward.
+        //
+        // The guard is conditioned on min_l1_entries > 0 so the utility
         // pop_contiguous(max_sources) variant (used in index/merge tests with
         // min_l1_entries=0) is not affected.
         //
-        // Special case: if we hit the capacity cap (take == max_sources) but the
-        // accumulated entries are below min_l1_entries, extend past max_sources scanning
-        // all remaining contiguous pending blocks until min_entries is satisfied or the
-        // backlog is exhausted. The cap is self.pending.len() rather than another
-        // max_sources: the first block with enough entries may be thousands of blocks
-        // away when the chain has a long 0-tx historical prefix. Stopping at the first
-        // non-empty block (entries > 0) is insufficient — we need entries ≥ min to avoid
-        // generating a proof that will fail the n_sigs settlement validation check.
+        // If the capacity cap is reached and entries are still below min_l1_entries,
+        // extend past max_sources scanning all remaining contiguous pending blocks.
+        // The chain may have a long 0-tx or low-tx historical prefix where the first
+        // threshold-satisfying block is far away; scanning past the cap avoids a
+        // permanent deadlock in that scenario.
         if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries && take == max_sources {
             let mut scan = take;
             while scan < self.pending.len() {
@@ -288,18 +274,11 @@ impl ProofBacklog {
                 }
             }
         }
-        if layer == 1 && min_l1_entries > 0 && entries == 0 {
-            return None;
-        }
-
-        // Also require take < max_sources: a run that has hit the capacity cap cannot
-        // grow further even if a contiguous successor exists, so it must not stall.
-        if layer == 1
-            && min_l1_entries > 0
-            && entries < min_l1_entries
-            && take < max_sources
-            && has_contiguous_successor
-        {
+        // Strict threshold: for L1, never prove a range below the minimum entry
+        // count regardless of position in the queue (tail, cap boundary, or gap).
+        // The frontier seeding extends the backlog as new canonical blocks arrive;
+        // the prover waits rather than produce a provably-invalid range.
+        if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries {
             return None;
         }
 
@@ -558,42 +537,34 @@ mod tests {
     }
 
     #[test]
-    fn l1_pop_waits_for_minimum_entries_when_run_is_extensible() {
-        // The min-entries threshold only applies while a contiguous successor
-        // exists in the backlog (the run can still grow).  Push three
-        // consecutive blocks but only the first two up front; block 3 acts as
-        // the contiguous successor that keeps the threshold active.
+    fn l1_pop_always_waits_when_below_threshold_even_at_tail() {
+        // Under the strict policy, L1 ranges with fewer than MIN_L1_STARK_TXS
+        // entries must never be dispatched, regardless of whether there is a
+        // contiguous successor.  Previously the prover would force-prove at the
+        // queue tail; now it must wait for the frontier seeding to add more
+        // blocks.
         let mut b = ProofBacklog::new();
         b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
         b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
-        // Block 3 is the contiguous successor — its presence means the run
-        // could grow further, so the prover should wait for min_entries.
         b.push(ProofTask::new([3u8; 32], 3, vec![make_entry(3); 1]));
-
-        // Blocks 1+2+3 = 301 entries; block 4 (the successor for 3) absent →
-        // has_contiguous_successor = false. Because the run cannot extend, the
-        // prover proves it immediately even though 301 < 512.
-        let merged = b
-            .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
-            .expect("non-extensible run proved immediately");
-        assert_eq!(merged.block_number, 3);
-        assert_eq!(merged.entries.len(), 301);
+        // 100+200+1 = 301 entries < MIN_L1_STARK_TXS (512), no block 4 → tail.
+        let result =
+            b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+        assert!(result.is_none(), "below-threshold run at tail must not be dispatched");
+        assert_eq!(b.len(), 3, "all tasks must remain in backlog");
     }
 
     #[test]
-    fn l1_pop_waits_while_run_can_grow() {
-        // When the backlog contains a run that has a contiguous successor, the
-        // prover waits until min_entries are accumulated.
+    fn l1_pop_pops_when_threshold_met_across_multiple_blocks() {
+        // 4 consecutive blocks whose combined entry count meets MIN_L1_STARK_TXS
+        // must be merged and popped.
         let mut b = ProofBacklog::new();
         b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
         b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
-        // Block 3 at the back is the contiguous successor for block 2.
-        // Accumulated entries for 1+2 = 300; block 3 would extend the run.
         b.push(ProofTask::new([3u8; 32], 3, vec![make_entry(3); 212]));
-        // Block 4 makes block 3 extensible, so the threshold stays active.
         b.push(ProofTask::new([4u8; 32], 4, vec![make_entry(4); 1]));
 
-        // Entries for 1+2+3+4 = 513 ≥ 512 → prove immediately.
+        // 100+200+212+1 = 513 ≥ 512 → pops successfully.
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
             .expect("L1 range reaches 512 entries");
@@ -602,33 +573,33 @@ mod tests {
     }
 
     #[test]
-    fn l1_pop_proves_isolated_range_below_minimum() {
-        // A historical range with a gap after it should be proved immediately,
-        // not blocked indefinitely by the min-entries threshold.
+    fn l1_pop_below_threshold_waits_even_with_gap_after() {
+        // A historical range with a gap after it must still wait if total
+        // entries are below MIN_L1_STARK_TXS.  Proving an under-threshold range
+        // produces a proof that settlement will always reject (n_sigs check),
+        // so waiting is always correct.
         let mut b = ProofBacklog::new();
         b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
         b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
         // Block 10 is non-contiguous — gap at blocks 3..=9.
         b.push(ProofTask::new([10u8; 32], 10, vec![make_entry(10); 500]));
 
-        // Run is blocks 1+2 (300 entries). The next entry (block 10) is NOT
-        // contiguous → has_contiguous_successor = false → prove immediately.
-        let merged = b
-            .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
-            .expect("isolated historical range proved immediately");
-        assert_eq!(merged.block_number, 2);
-        assert_eq!(merged.entries.len(), 300);
-        // Block 10 still in queue.
-        assert_eq!(b.len(), 1);
+        // Run is blocks 1+2 (300 entries < 512). Must return None.
+        let result =
+            b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+        assert!(result.is_none(), "under-threshold isolated run must not be dispatched");
+        // All tasks remain.
+        assert_eq!(b.len(), 3, "tasks must stay in backlog");
     }
 
+    /// A L1 window with DEFAULT_MAX_L1_RANGE_SOURCES blocks × 1 entry each
+    /// totals 1024 entries, which exceeds MIN_L1_STARK_TXS (512). The window
+    /// pops and merges correctly even though each individual block has few entries.
     #[test]
-    fn l1_pop_advances_when_max_sources_reached_below_minimum() {
+    fn l1_pop_advances_when_threshold_met_at_capacity() {
         let mut b = ProofBacklog::new();
         for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
-            // One entry per block so the window has a non-zero entry count
-            // (well below MIN_L1_STARK_TXS). The capacity cap must still force
-            // a pop even though entries < MIN_L1_STARK_TXS.
+            // One entry per block; 1024 blocks × 1 = 1024 entries ≥ MIN_L1_STARK_TXS (512).
             b.push(ProofTask::new(
                 [block_number as u8; 32],
                 block_number,
@@ -638,10 +609,52 @@ mod tests {
 
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
-            .expect("max source window must make forward progress when entries are non-zero");
+            .expect("window meets entry threshold and must pop");
         assert_eq!(merged.block_number, DEFAULT_MAX_L1_RANGE_SOURCES as u64);
         assert_eq!(merged.entries.len(), DEFAULT_MAX_L1_RANGE_SOURCES);
         assert!(b.is_empty());
+    }
+
+    /// A L1 window with fewer total entries than MIN_L1_STARK_TXS must never be
+    /// dispatched, even when the queue tail is reached (no contiguous successor).
+    /// Under-threshold proofs are rejected by settlement validation, so the prover
+    /// must wait for more canonical blocks to accumulate enough entries.
+    #[test]
+    fn l1_pop_low_entry_tail_always_waits() {
+        // 5 blocks × 1 entry = 5 entries, well below MIN_L1_STARK_TXS (512).
+        let mut b = ProofBacklog::new();
+        for block_number in 1u64..=5 {
+            b.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![make_entry(block_number as u8)],
+            ));
+        }
+        let result =
+            b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+        assert!(
+            result.is_none(),
+            "low-entry tail must not be dispatched (5 entries < {MIN_L1_STARK_TXS})"
+        );
+        assert_eq!(b.len(), 5, "low-entry tasks must remain in backlog");
+
+        // Same at max capacity with only 1 entry per block but total below threshold
+        // (using a small max_sources so threshold is not met).
+        let small_max = (MIN_L1_STARK_TXS / 2) as usize; // e.g. 256 blocks × 1 entry = 256 < 512
+        let mut b2 = ProofBacklog::new();
+        for block_number in 1..=small_max as u64 {
+            b2.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![make_entry(block_number as u8)],
+            ));
+        }
+        let result2 = b2.pop_contiguous_with_min_entries(small_max, MIN_L1_STARK_TXS);
+        assert!(
+            result2.is_none(),
+            "under-threshold at cap must not be dispatched ({small_max} entries < {MIN_L1_STARK_TXS})"
+        );
+        assert_eq!(b2.len(), small_max, "tasks must remain in backlog");
     }
 
     /// An all-empty L1 window (all 0-tx blocks) must never be dispatched to the

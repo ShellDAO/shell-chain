@@ -473,11 +473,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_proves_isolated_l1_run_below_minimum() {
-        // A task with fewer than MIN_L1_STARK_TXS entries but no contiguous
-        // successor is proved immediately to avoid permanent starvation of
-        // isolated/historical ranges. The min-entry gate only fires when the
-        // backlog has a contiguous successor (the run can still grow).
+    async fn service_waits_when_isolated_l1_run_is_below_threshold() {
+        // With the strict L1 threshold policy a task with fewer than
+        // MIN_L1_STARK_TXS entries must NEVER be dispatched to the prover,
+        // even when it sits alone at the queue tail with no contiguous
+        // successor.  Generating an under-threshold proof wastes work and
+        // produces a proof that settlement always rejects (n_sigs check).
         let (service, backlog) = make_service();
         {
             let mut b = backlog.lock();
@@ -487,8 +488,8 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         handle.shutdown().await;
         let b = backlog.lock();
-        assert_eq!(b.len(), 0, "isolated run must be proved immediately");
-        assert_eq!(b.total_completed(), 1);
+        assert_eq!(b.len(), 1, "below-threshold run must remain in backlog");
+        assert_eq!(b.total_completed(), 0, "no proof must be generated");
     }
 
     #[tokio::test]

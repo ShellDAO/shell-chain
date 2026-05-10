@@ -61,25 +61,32 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let covered_hashes = amendment.covered_hashes();
-        let source_count = covered_hashes.len().max(1);
         let mut mint = U256::from(BASE_STARK_MINT_WEI);
         for _ in 0..amendment.layer {
             mint /= U256::from(2u8);
         }
-        mint = mint.saturating_mul(U256::from(source_count));
 
         let mut gas_share = U256::ZERO;
+        let source_count;
         if amendment.layer == 1 {
+            // For L1 proofs, base mint counts only covered source blocks that have
+            // user transactions.  0tx canonical blocks are included in source_hashes
+            // for continuity but must not inflate the reward — they contribute no
+            // witness entries and earn no base mint multiplier.
+            let mut non_empty_count = 0usize;
             let mut total_effective_fees = U256::ZERO;
-            for source_hash in covered_hashes {
-                let Some(source_block) = self.chain_store.get_block_by_hash(&source_hash)? else {
+            for source_hash in &covered_hashes {
+                let Some(source_block) = self.chain_store.get_block_by_hash(source_hash)? else {
                     return Err(NodeError::Startup(format!(
                         "STARK reward source block not found: {source_hash}"
                     )));
                 };
+                if !source_block.transactions.is_empty() {
+                    non_empty_count += 1;
+                }
                 let receipts = self
                     .chain_store
-                    .get_receipts(&source_hash)?
+                    .get_receipts(source_hash)?
                     .unwrap_or_default();
                 for (idx, tx) in source_block.transactions.iter().enumerate() {
                     let gas_used = receipts.get(idx).map(|r| r.gas_used).unwrap_or(0);
@@ -93,8 +100,16 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
             gas_share = total_effective_fees / U256::from(2u8);
+            // At least 1 so a qualifying proof (n_sigs >= MIN_L1_STARK_TXS) always
+            // earns some base mint even if all tx blocks are covered by a single block.
+            source_count = non_empty_count.max(1);
+        } else {
+            // For L2+ proofs, source_hashes are lower-layer proof artifacts, not
+            // raw block hashes.  Count all covered sources for the base mint.
+            source_count = covered_hashes.len().max(1);
         }
 
+        mint = mint.saturating_mul(U256::from(source_count));
         Ok(mint.saturating_add(gas_share))
     }
 

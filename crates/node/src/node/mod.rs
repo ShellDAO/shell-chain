@@ -5005,15 +5005,14 @@ mod tests {
             "fallback size must not undercount to stub witness bytes"
         );
     }
-    /// STARK compression: verify ProverService proves isolated L1 runs immediately
-    /// even when the tx-entry count is below the minimum threshold.
+    /// STARK compression: verify ProverService correctly waits when the
+    /// accumulated entry count is below MIN_L1_STARK_TXS (512).
     ///
-    /// The min-entry threshold is only enforced while the backlog holds a
-    /// contiguous successor task (the run can still grow). Isolated ranges
-    /// are proved right away to avoid permanent starvation of historical or
-    /// sparse ranges.
+    /// With the strict threshold policy the prover must not drain the backlog
+    /// until enough entries accumulate — generating an under-threshold proof
+    /// wastes work and would always be rejected by settlement.
     #[tokio::test]
-    async fn stark_prover_service_proves_isolated_l1_run() {
+    async fn stark_prover_service_waits_when_entries_below_l1_threshold() {
         use crate::prover_service::{ProverConfig, ProverService};
         use shell_storage::ProofAmendmentStore;
 
@@ -5035,10 +5034,7 @@ mod tests {
         }
 
         // Produce block 1 → 5 embedded txs, plus the empty genesis frontier task.
-        let block = node.produce_block(&proposer_signer, 20).unwrap();
-
-        // produce_block pushes a ProofTask with the real post-seal block hash.
-        let block_hash = block.hash();
+        node.produce_block(&proposer_signer, 20).unwrap();
 
         assert_eq!(
             node.proof_backlog.lock().len(),
@@ -5046,10 +5042,10 @@ mod tests {
             "expected genesis + block proof tasks after producing 1 block with {TXS} embedded txs"
         );
 
-        // Start ProverService to process the backlog.
+        // Start ProverService; 5 entries < MIN_L1_STARK_TXS (512) so both tasks
+        // must remain in the backlog — the prover waits for more blocks.
         let db = node.store.clone();
         let amendment_store = ProofAmendmentStore::new(db);
-        let settlement_queue = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (amendment_tx, mut amendment_rx) = tokio::sync::mpsc::unbounded_channel();
         let svc = ProverService::new(
             Arc::clone(&node.proof_backlog),
@@ -5057,31 +5053,20 @@ mod tests {
             ProverConfig::default(),
             node.config.proposer_address.unwrap_or_default(),
         )
-        .with_amendment_sender(amendment_tx)
-        .with_settlement_queue(Arc::clone(&settlement_queue));
+        .with_amendment_sender(amendment_tx);
         let handle = svc.start();
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         handle.shutdown().await;
 
-        // Isolated runs (no contiguous successor) are proved immediately regardless
-        // of the min-entry threshold — both tasks must be gone from the backlog.
         assert_eq!(
             node.proof_backlog.lock().len(),
-            0,
-            "ProverService must prove isolated L1 runs immediately to avoid starvation"
-        );
-        // At least one proof amendment should have been generated and broadcast.
-        assert!(
-            amendment_rx.try_recv().is_ok(),
-            "at least one proof amendment must be broadcast for isolated L1 run"
+            2,
+            "below-threshold backlog must not be drained: prover waits for MIN_L1_STARK_TXS"
         );
         assert!(
-            amendment_store
-                .get_amendment(&block_hash)
-                .unwrap()
-                .is_some(),
-            "amendment for block_hash must be stored"
+            amendment_rx.try_recv().is_err(),
+            "no proof amendment must be broadcast when entries are below threshold"
         );
     }
 

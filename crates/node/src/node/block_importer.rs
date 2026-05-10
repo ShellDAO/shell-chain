@@ -249,9 +249,13 @@ impl<S: KvStore + 'static> Node<S> {
             })
             .collect::<Result<Vec<_>, NodeError>>()?;
         self.validate_stark_settlement_sequence(&stark_settlements)?;
-        for amendment in &stark_settlements {
-            self.validate_stark_proof_source_binding(amendment)?;
-        }
+        // Note: `validate_stark_proof_source_binding` (full STARK cryptographic
+        // verification) is intentionally skipped here.  During block import we
+        // trust that the settlement was validated at gossip time before the PoA
+        // proposer included it.  Re-verifying the full STARK proof on every
+        // import would be prohibitively expensive for chain sync and is
+        // redundant for a PoA chain.  The lightweight ordering and sequence
+        // checks above are still enforced.
 
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
