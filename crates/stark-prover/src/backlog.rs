@@ -261,6 +261,33 @@ impl ProofBacklog {
         // The guard is conditioned on min_l1_entries > 0 so that the utility
         // pop_contiguous(max_sources) variant (used in index/merge tests with
         // min_l1_entries=0) is not affected.
+        //
+        // Special case: if we hit the capacity cap (take == max_sources) but every
+        // block in the window is empty (entries == 0), extend past max_sources to
+        // find the first contiguous non-empty block. Without this, a long historical
+        // prefix of 0-tx blocks fills the window and returns None permanently —
+        // the prover deadlocks because the window can never shrink or grow.
+        if layer == 1 && min_l1_entries > 0 && entries == 0 && take == max_sources {
+            let mut scan = take;
+            let extension_cap = max_sources; // scan at most another max_sources blocks
+            let mut extended = 0usize;
+            while extended < extension_cap {
+                let Some(next) = self.pending.get(scan) else {
+                    break;
+                };
+                if next.layer != layer || next.block_number != end_block.saturating_add(1) {
+                    break;
+                }
+                entries = entries.saturating_add(next.entries.len());
+                end_block = next.block_number;
+                scan += 1;
+                extended += 1;
+                take = scan;
+                if entries > 0 {
+                    break;
+                }
+            }
+        }
         if layer == 1 && min_l1_entries > 0 && entries == 0 {
             return None;
         }
@@ -634,6 +661,41 @@ mod tests {
             b2.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
         assert!(result2.is_none(), "full-capacity all-empty window must not be dispatched");
         assert_eq!(b2.len(), DEFAULT_MAX_L1_RANGE_SOURCES, "tasks must remain in backlog");
+    }
+
+    /// When the first max_sources blocks are all empty but a non-empty block follows
+    /// contiguously, the prover must extend past the capacity cap and include that
+    /// non-empty block in the merged window instead of deadlocking forever.
+    #[test]
+    fn l1_pop_extends_past_max_sources_to_break_empty_deadlock() {
+        let mut b = ProofBacklog::new();
+        // Fill exactly max_sources empty blocks (the historical deadlock scenario).
+        for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
+            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+        }
+        // One non-empty block immediately after (block max_sources+1).
+        let next_block = DEFAULT_MAX_L1_RANGE_SOURCES as u64 + 1;
+        let entries: Vec<SigBatchEntry> = (0..MIN_L1_STARK_TXS).map(|i| make_entry(i as u8)).collect();
+        b.push(ProofTask::new([0xffu8; 32], next_block, entries));
+
+        let merged = b
+            .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
+            .expect("must break deadlock by extending past max_sources to reach non-empty block");
+        assert_eq!(
+            merged.block_number, next_block,
+            "merged range must end at the non-empty block"
+        );
+        assert_eq!(
+            merged.source_hashes.len(),
+            DEFAULT_MAX_L1_RANGE_SOURCES + 1,
+            "all empty blocks plus the non-empty block must be in source_hashes"
+        );
+        assert_eq!(
+            merged.entries.len(),
+            MIN_L1_STARK_TXS,
+            "entries come only from the non-empty block"
+        );
+        assert!(b.is_empty());
     }
 
     /// Leading empty blocks are included in the merged source_hashes when the window
