@@ -180,11 +180,15 @@ impl ProofAmendment {
     }
 
     /// Returns true when embedded source-size metadata proves strict <50%
-    /// compression. Returns false when metadata is missing.
+    /// compression, or when the source range has zero original bytes (empty
+    /// blocks whose witness data is trivially absent).
+    /// Returns false when metadata is missing entirely.
     pub fn has_valid_embedded_compression(&self) -> bool {
-        self.original_size
-            .map(|original| self.is_compression_valid_for(original))
-            .unwrap_or(false)
+        match self.original_size {
+            None => false,
+            Some(0) => true, // empty source range: trivially valid
+            Some(original) => self.is_compression_valid_for(original),
+        }
     }
 }
 

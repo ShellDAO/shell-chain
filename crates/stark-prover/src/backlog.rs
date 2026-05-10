@@ -262,13 +262,15 @@ impl ProofBacklog {
         // pop_contiguous(max_sources) variant (used in index/merge tests with
         // min_l1_entries=0) is not affected.
         //
-        // Special case: if we hit the capacity cap (take == max_sources) but every
-        // block in the window is empty (entries == 0), extend past max_sources scanning
-        // all remaining contiguous pending blocks until a non-empty one is found. The
-        // cap is the entire pending queue length rather than another max_sources: the
-        // first non-empty block may be thousands of blocks away when the chain has a
-        // long 0-tx historical prefix (e.g. pre-tx-worker testnet genesis blocks).
-        if layer == 1 && min_l1_entries > 0 && entries == 0 && take == max_sources {
+        // Special case: if we hit the capacity cap (take == max_sources) but the
+        // accumulated entries are below min_l1_entries, extend past max_sources scanning
+        // all remaining contiguous pending blocks until min_entries is satisfied or the
+        // backlog is exhausted. The cap is self.pending.len() rather than another
+        // max_sources: the first block with enough entries may be thousands of blocks
+        // away when the chain has a long 0-tx historical prefix. Stopping at the first
+        // non-empty block (entries > 0) is insufficient — we need entries ≥ min to avoid
+        // generating a proof that will fail the n_sigs settlement validation check.
+        if layer == 1 && min_l1_entries > 0 && entries < min_l1_entries && take == max_sources {
             let mut scan = take;
             while scan < self.pending.len() {
                 let Some(next) = self.pending.get(scan) else {
@@ -281,7 +283,7 @@ impl ProofBacklog {
                 end_block = next.block_number;
                 scan += 1;
                 take = scan;
-                if entries > 0 {
+                if entries >= min_l1_entries {
                     break;
                 }
             }
@@ -728,6 +730,61 @@ mod tests {
             "entries come only from the non-empty block"
         );
         assert!(b.is_empty());
+    }
+
+    /// When the initial max_sources window has some entries but below min_l1_entries,
+    /// the extension scan must continue past the cap until enough entries accumulate —
+    /// not stop at the first non-empty block. This mirrors the real SG testnet scenario
+    /// where block 3740 contributed only 2 entries but MIN_L1_STARK_TXS=512.
+    #[test]
+    fn l1_pop_extension_scan_accumulates_to_min_not_just_first_nonempty() {
+        let mut b = ProofBacklog::new();
+        // Fill max_sources blocks, each with 1 entry (well below MIN_L1_STARK_TXS).
+        for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
+            b.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![make_entry(block_number as u8)],
+            ));
+        }
+        // Extension blocks: each has 1 entry. We need MIN_L1_STARK_TXS - DEFAULT_MAX_L1_RANGE_SOURCES
+        // more entries. Since DEFAULT_MAX_L1_RANGE_SOURCES=1024 > MIN_L1_STARK_TXS=512, the
+        // initial window already satisfies min. So use a smaller initial window (64 blocks × 1 entry)
+        // and verify extension scan accumulates across multiple sparse blocks.
+        let mut b2 = ProofBacklog::new();
+        let small_max = 64usize;
+        for block_number in 1..=small_max as u64 {
+            b2.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+        }
+        // Sparse blocks after the cap: 2 entries each, need ~256 blocks to hit 512.
+        for block_number in (small_max as u64 + 1)..=(small_max as u64 + 400) {
+            b2.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![make_entry(block_number as u8), make_entry(block_number as u8 ^ 0xff)],
+            ));
+        }
+        let merged = b2
+            .pop_contiguous_with_min_entries(small_max, MIN_L1_STARK_TXS)
+            .expect("extension scan must accumulate enough entries across many sparse blocks");
+        assert!(
+            merged.entries.len() >= MIN_L1_STARK_TXS,
+            "must have at least {} entries, got {}",
+            MIN_L1_STARK_TXS,
+            merged.entries.len()
+        );
+        assert!(
+            merged.source_hashes.len() > small_max,
+            "source_hashes must extend past initial cap"
+        );
+        // entries come from 2-per-block, need at least 256 extension blocks → 64+256=320 sources
+        let expected_extension = MIN_L1_STARK_TXS.div_ceil(2); // 256 blocks at 2 entries each
+        assert!(
+            merged.source_hashes.len() >= small_max + expected_extension,
+            "expected at least {} sources, got {}",
+            small_max + expected_extension,
+            merged.source_hashes.len()
+        );
     }
 
     #[test]
