@@ -184,19 +184,38 @@ impl<S: KvStore + 'static> Node<S> {
     /// 3. `verify_sig_batch(&proof)` — the Winterfell STARK proof is valid
     ///    for the declared (batch_root, n_sigs) public inputs.
     ///
-    /// L2+ amendments are not yet validated by this path (full recursive
-    /// verifier is scaffold-only); they pass trivially so callers are not
-    /// blocked. See `stark-l2-settlement-validation` todo.
+    /// For L2 amendments the check:
+    ///
+    /// 1. Loads each covered source L1 [`ProofAmendment`] from the amendment
+    ///    store.
+    /// 2. Verifies every source is a settled L1 amendment (`layer == 1`).
+    /// 3. Computes `expected_aggregate_root = compute_aggregate_root(l1_roots)`
+    ///    and compares to `amendment.proof.batch_root_bytes`.
+    /// 4. Verifies `amendment.proof.n_sigs == l1_source_count`.
+    /// 5. Attempts recursive proof verification via [`get_recursive_prover()`].
+    ///    Until the recursive feature is enabled this returns a clear log that
+    ///    verification was skipped rather than silently accepting.
     pub(crate) fn validate_stark_proof_source_binding(
         &self,
         amendment: &ProofAmendment,
     ) -> Result<(), NodeError> {
-        // L2+ recursive verification is deferred; only L1 sig-batch proofs can
-        // be fully validated with the current verifier implementation.
-        if amendment.layer != 1 {
-            return Ok(());
+        if amendment.layer == 1 {
+            return self.validate_l1_proof_source_binding(amendment);
         }
+        if amendment.layer == 2 {
+            return self.validate_l2_proof_source_binding(amendment);
+        }
+        // layer > 2: not yet defined — reject rather than silently accept.
+        Err(NodeError::Startup(format!(
+            "STARK amendment layer {} is not supported (max layer == 2)",
+            amendment.layer
+        )))
+    }
 
+    fn validate_l1_proof_source_binding(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(), NodeError> {
         // Reconstruct canonical entries from all covered source blocks.
         let covered = amendment.covered_hashes();
         let mut all_entries: Vec<shell_stark_prover::prover::SigBatchEntry> = Vec::new();
@@ -249,6 +268,112 @@ impl<S: KvStore + 'static> Node<S> {
                 amendment.block_number
             ))
         })?;
+
+        Ok(())
+    }
+
+    fn validate_l2_proof_source_binding(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(), NodeError> {
+        debug_assert_eq!(amendment.layer, 2);
+
+        let covered = amendment.covered_hashes();
+
+        // Load each source L1 amendment and collect batch roots.
+        let mut l1_roots: Vec<u128> = Vec::with_capacity(covered.len());
+        for source_hash in &covered {
+            let bytes = self
+                .amendment_store
+                .get_amendment(source_hash)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "STARK L2 proof binding: source L1 amendment for {source_hash} not found"
+                    ))
+                })?;
+            let source_amendment: ProofAmendment =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    NodeError::Startup(format!(
+                        "STARK L2 proof binding: failed to deserialise source amendment \
+                         for {source_hash}: {e}"
+                    ))
+                })?;
+
+            // Every source must be a settled L1 amendment.
+            if source_amendment.layer != 1 {
+                self.metrics.stark_settlements_rejected.inc();
+                return Err(NodeError::Startup(format!(
+                    "STARK L2 amendment source {source_hash} is layer {} (expected L1)",
+                    source_amendment.layer
+                )));
+            }
+
+            // Extract the L1 batch root as a u128 for aggregate computation.
+            let root_bytes = source_amendment.proof.batch_root_bytes;
+            let root = u128::from_le_bytes(root_bytes);
+            l1_roots.push(root);
+        }
+
+        // Check 1: declared n_sigs (= number of L1 proofs) must match.
+        if amendment.proof.n_sigs != l1_roots.len() {
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(format!(
+                "STARK L2 amendment n_sigs {} does not match source L1 proof count {}",
+                amendment.proof.n_sigs,
+                l1_roots.len()
+            )));
+        }
+
+        // Check 2: aggregate root must match compute_aggregate_root(l1_roots).
+        let expected_agg_root =
+            shell_stark_prover::recursive_air::compute_aggregate_root(&l1_roots);
+        let declared_agg_root = u128::from_le_bytes(amendment.proof.batch_root_bytes);
+        if expected_agg_root != declared_agg_root {
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(format!(
+                "STARK L2 amendment aggregate_root mismatch: expected {expected_agg_root}, \
+                 got {declared_agg_root}"
+            )));
+        }
+
+        // Check 3: recursive proof verification.
+        let pub_inputs = shell_stark_prover::RecursivePublicInputs {
+            l1_roots,
+            aggregate_root: expected_agg_root,
+            start_block: amendment
+                .range_start_block()
+                .unwrap_or(amendment.block_number),
+            end_block: amendment.block_number,
+        };
+        let prover = shell_stark_prover::get_recursive_prover();
+        // Decode the recursive proof from amendment.proof.proof_bytes.
+        let rec_proof = serde_json::from_slice::<shell_stark_prover::RecursiveProof>(
+            &amendment.proof.proof_bytes,
+        )
+        .map_err(|e| {
+            NodeError::Startup(format!(
+                "STARK L2 amendment: failed to decode recursive proof bytes: {e}"
+            ))
+        })?;
+        match prover.verify_aggregation(&rec_proof, &pub_inputs) {
+            Ok(()) => {}
+            Err(shell_stark_prover::RecursiveProverError::NotImplemented) => {
+                // Scaffold: verification is not yet active.  Log clearly and
+                // reject L2 settlements until the real verifier is in place.
+                self.metrics.stark_settlements_rejected.inc();
+                return Err(NodeError::Startup(
+                    "STARK L2 amendment rejected: recursive proof verifier is not yet \
+                     implemented (feature = \"recursive\" not enabled)"
+                        .into(),
+                ));
+            }
+            Err(e) => {
+                self.metrics.stark_settlements_rejected.inc();
+                return Err(NodeError::Startup(format!(
+                    "STARK L2 recursive proof verification failed: {e}"
+                )));
+            }
+        }
 
         Ok(())
     }
