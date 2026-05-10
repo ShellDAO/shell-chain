@@ -300,6 +300,11 @@ impl<S: KvStore + 'static> Node<S> {
         loop {
             tokio::select! {
                 Some(amendment) = prover_amendment_rx.recv() => {
+                    if amendment.layer > 1 {
+                        self.metrics.stark_l2_proofs_generated.inc();
+                    } else {
+                        self.metrics.stark_proofs_generated.inc();
+                    }
                     if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
                         debug!(
                             block = amendment.block_number,

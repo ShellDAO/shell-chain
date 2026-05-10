@@ -370,6 +370,16 @@ impl<S: KvStore + 'static> Node<S> {
             self.store_stark_artifacts(amendment, Some(*settlement_tx_hash))?;
         }
         prover.record_settled_sources(&settled_stark_proofs);
+        if !settled_stark_proofs.is_empty() {
+            let l1_count = self
+                .settled_stark_sources
+                .lock()
+                .iter()
+                .filter(|(l, _)| *l == 1)
+                .count() as i64;
+            let lag = (block.number() as i64 + 1).saturating_sub(l1_count).max(0);
+            self.metrics.stark_frontier_lag.set(lag);
+        }
         self.feed_l2_scheduler_from_settlements(&settled_stark_proofs, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
