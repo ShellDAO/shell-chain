@@ -370,6 +370,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.store_stark_artifacts(amendment, Some(*settlement_tx_hash))?;
         }
         prover.record_settled_sources(&settled_stark_proofs);
+        self.feed_l2_scheduler_from_settlements(&settled_stark_proofs, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.

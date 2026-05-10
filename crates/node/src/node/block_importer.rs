@@ -571,6 +571,7 @@ impl<S: KvStore + 'static> Node<S> {
             );
         }
         prover.record_settled_sources(&stark_settlements);
+        self.feed_l2_scheduler_from_settlements(&stark_settlements, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
         for (address, pubkey) in new_pubkeys {
             block_store.store_pubkey(&address, &pubkey)?;

@@ -401,6 +401,162 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    /// Feed canonical L1 STARK settlements into the L2 aggregation scheduler.
+    ///
+    /// Called after each block's settlements are committed and recorded.
+    /// For each L1 amendment in `settlements`:
+    ///  - builds a [`SettledL1Input`] and feeds it to `aggregation_scheduler`;
+    ///  - if the amendment creates a gap, logs it and updates the gap metric;
+    ///  - after all amendments, ticks the scheduler's block clock with
+    ///    `on_block(current_block)` to check interval / epoch triggers.
+    ///
+    /// When any trigger fires, creates and durably stores an [`L2AggregationJob`]
+    /// so restart safety and observability are immediate.
+    pub(crate) fn feed_l2_scheduler_from_settlements(
+        &self,
+        settlements: &[ProofAmendment],
+        current_block: u64,
+    ) {
+        let l1_amendments: Vec<&ProofAmendment> = settlements
+            .iter()
+            .filter(|a| a.layer == 1)
+            .collect();
+
+        if l1_amendments.is_empty() {
+            // Still tick on_block so interval/epoch triggers can fire.
+            let trigger = self.aggregation_scheduler.lock().on_block(current_block);
+            if let Some(t) = trigger {
+                self.create_l2_job_from_trigger(t, current_block);
+            }
+            return;
+        }
+
+        for amendment in &l1_amendments {
+            let start_block = amendment
+                .range_start_block()
+                .unwrap_or(amendment.block_number);
+            let batch_root = u128::from_le_bytes(amendment.proof.batch_root_bytes);
+            let input = SettledL1Input {
+                start_block,
+                end_block: amendment.block_number,
+                batch_root,
+                source_hash: *amendment.block_hash.as_bytes(),
+            };
+
+            match self.aggregation_scheduler.lock().on_settled_l1_amendment(input) {
+                Ok(()) => {
+                    // Input accepted; no trigger yet (trigger fires on on_block).
+                    self.metrics.stark_l2_blocked_gap_start.set(0);
+                }
+                Err(gap) => {
+                    warn!(
+                        expected = gap.expected_start,
+                        received = gap.received_start,
+                        "L2 scheduler blocked: L1 proof gap detected; waiting for source"
+                    );
+                    self.metrics
+                        .stark_l2_blocked_gap_start
+                        .set(gap.expected_start as i64);
+                }
+            }
+        }
+
+        // Tick block clock for interval / epoch triggers.
+        let trigger = self.aggregation_scheduler.lock().on_block(current_block);
+        if let Some(t) = trigger {
+            self.metrics.stark_l2_last_trigger_block.set(current_block as i64);
+            self.create_l2_job_from_trigger(t, current_block);
+        }
+
+        // Update pending-inputs metric.
+        let pending = self
+            .aggregation_scheduler
+            .lock()
+            .pending_proof_count() as i64;
+        self.metrics.stark_l2_pending_inputs.set(pending);
+    }
+
+    fn create_l2_job_from_trigger(&self, trigger: AggregationTrigger, current_block: u64) {
+        let l1_source_hashes: Vec<ShellHash> = trigger
+            .inputs
+            .iter()
+            .map(|i| ShellHash::from(i.source_hash))
+            .collect();
+        let l1_batch_roots: Vec<[u8; 32]> = trigger
+            .inputs
+            .iter()
+            .map(|i| {
+                let mut arr = [0u8; 32];
+                arr[..16].copy_from_slice(&i.batch_root.to_le_bytes());
+                arr
+            })
+            .collect();
+        let start_block = trigger
+            .inputs
+            .first()
+            .map(|i| i.start_block)
+            .unwrap_or(current_block);
+        let end_block = trigger
+            .inputs
+            .last()
+            .map(|i| i.end_block)
+            .unwrap_or(current_block);
+
+        let id = L2AggregationJob::compute_id(&l1_source_hashes);
+
+        // Skip if a job with this ID already exists (idempotent).
+        match self.l2_job_store.get(&id) {
+            Ok(Some(existing)) => {
+                debug!(
+                    job_id = %id,
+                    status = ?existing.status,
+                    "L2 scheduler trigger: job already exists, skipping"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("L2 scheduler trigger: failed to check existing job {id}: {e}");
+                return;
+            }
+            Ok(None) => {}
+        }
+
+        let job = L2AggregationJob {
+            id,
+            status: L2JobStatus::Ready,
+            l1_source_hashes,
+            start_block,
+            end_block,
+            l1_batch_roots,
+            aggregate_root: None,
+            retry_count: 0,
+            last_error: None,
+            created_at_block: current_block,
+            updated_at_block: current_block,
+        };
+
+        if let Err(e) = self.l2_job_store.put(&job) {
+            warn!("L2 scheduler trigger: failed to store job {}: {e}", job.id);
+            return;
+        }
+
+        // Update ready-jobs metric.
+        let ready = self
+            .l2_job_store
+            .jobs_with_status(L2JobStatus::Ready)
+            .map(|v| v.len())
+            .unwrap_or(0) as i64;
+        self.metrics.stark_l2_ready_jobs.set(ready);
+
+        info!(
+            job_id = %job.id,
+            start_block = job.start_block,
+            end_block = job.end_block,
+            n_l1_proofs = job.l1_batch_roots.len(),
+            "L2 aggregation job created and stored"
+        );
+    }
+
     pub(crate) fn store_stark_artifacts(
         &self,
         amendment: &ProofAmendment,

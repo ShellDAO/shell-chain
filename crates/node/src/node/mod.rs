@@ -51,6 +51,7 @@ pub(crate) use readiness::{ProductionReadiness, ProductionReadinessState};
 
 pub(crate) use shell_stark_prover::{
     prover::{verify_sig_batch, SigBatchEntry},
+    AggregationConfig, AggregationScheduler, AggregationTrigger, SettledL1Input,
     ProofAmendment, ProofBacklog, ProofTask, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
 };
 
@@ -96,6 +97,9 @@ pub struct Node<S: KvStore + 'static> {
     /// Durable store for L2 recursive aggregation jobs (`l2j/` prefix in KV).
     /// Keyed by deterministic job ID (blake3 of sorted L1 source hashes).
     pub(crate) l2_job_store: L2JobStore<S>,
+    /// L2 aggregation scheduler — fed canonical settled L1 proofs and emits
+    /// triggers when a contiguous window is ready for recursive proving.
+    aggregation_scheduler: parking_lot::Mutex<AggregationScheduler>,
     /// Compression-valid STARK proof amendments waiting to be settled in the
     /// next locally produced block.
     pending_stark_settlements: Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
@@ -559,6 +563,10 @@ impl<S: KvStore + 'static> Node<S> {
         let settled_source_index = SettledSourceIndex::new(store.clone());
         let l2_input_index = L2InputIndex::new(store.clone());
         let l2_job_store = L2JobStore::new(store.clone());
+        let aggregation_scheduler = parking_lot::Mutex::new(AggregationScheduler::new(
+            AggregationConfig::default(),
+            0,
+        ));
 
         // F-094: Recover finalized state from persistent storage on restart.
         let (fin_number, fin_hash) = {
@@ -612,6 +620,7 @@ impl<S: KvStore + 'static> Node<S> {
             settled_source_index,
             l2_input_index,
             l2_job_store,
+            aggregation_scheduler,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
             equivocation_queue: parking_lot::Mutex::new(Vec::new()),
