@@ -37,11 +37,12 @@ pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
-    validator_registry_addr, BodyPruner, ChainStore, KvStore, L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, ProofAmendmentStore,
-    SettledSourceIndex, StatePruner, WitnessPruner, WitnessStore, WorldState,
+    validator_registry_addr, BodyPruner, ChainStore, KvStore, L2AggregationJob, L2InputIndex,
+    L2JobStatus, L2JobStore, ProofAmendmentStore, SettledSourceIndex, StatePruner, WitnessPruner,
+    WitnessStore, WorldState,
 };
 
-pub(crate) use crate::config::{L2StarkMode, NodeConfig};
+pub(crate) use crate::config::NodeConfig;
 pub(crate) use crate::error::NodeError;
 pub(crate) use crate::metrics::Metrics;
 pub(crate) use crate::prover_service::{ProverConfig, ProverService, ProverServiceHandle};
@@ -51,8 +52,8 @@ pub(crate) use readiness::{ProductionReadiness, ProductionReadinessState};
 
 pub(crate) use shell_stark_prover::{
     prover::{verify_sig_batch, SigBatchEntry},
-    AggregationConfig, AggregationScheduler, AggregationTrigger, SettledL1Input,
-    ProofAmendment, ProofBacklog, ProofTask, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
+    AggregationConfig, AggregationScheduler, AggregationTrigger, ProofAmendment, ProofBacklog,
+    ProofTask, SettledL1Input, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
 };
 
 /// A running shell-chain node.
@@ -563,10 +564,8 @@ impl<S: KvStore + 'static> Node<S> {
         let settled_source_index = SettledSourceIndex::new(store.clone());
         let l2_input_index = L2InputIndex::new(store.clone());
         let l2_job_store = L2JobStore::new(store.clone());
-        let aggregation_scheduler = parking_lot::Mutex::new(AggregationScheduler::new(
-            AggregationConfig::default(),
-            0,
-        ));
+        let aggregation_scheduler =
+            parking_lot::Mutex::new(AggregationScheduler::new(AggregationConfig::default(), 0));
 
         // F-094: Recover finalized state from persistent storage on restart.
         let (fin_number, fin_hash) = {
@@ -1964,6 +1963,35 @@ mod tests {
     }
 
     #[test]
+    fn disabled_l2_mode_does_not_feed_scheduler_or_create_jobs() {
+        let (node, _signer) = setup_node();
+        assert_eq!(
+            node.config.l2_stark_mode,
+            crate::config::L2StarkMode::Disabled
+        );
+
+        node.metrics.stark_l2_blocked_gap_start.set(123);
+        node.metrics.stark_l2_pending_inputs.set(456);
+        node.metrics.stark_l2_ready_jobs.set(789);
+
+        let settlements: Vec<ProofAmendment> = (10u64..18)
+            .map(|block| {
+                dummy_ordered_amendment(1, vec![ShellHash::from([block as u8; 32])], block)
+            })
+            .collect();
+        node.feed_l2_scheduler_from_settlements(&settlements, 100);
+
+        assert_eq!(node.metrics.stark_l2_blocked_gap_start.get(), 0);
+        assert_eq!(node.metrics.stark_l2_pending_inputs.get(), 0);
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 0);
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 0);
+        assert!(
+            node.l2_job_store.all_jobs().unwrap().is_empty(),
+            "disabled mode must not create L2 jobs"
+        );
+    }
+
+    #[test]
     fn stark_settled_index_survives_simulated_restart() {
         let (node, signer) = setup_node();
         store_genesis(&node);
@@ -2087,7 +2115,9 @@ mod tests {
         // Only the two canonical sources should survive.
         assert_eq!(count, 2, "only canonical settled sources should remain");
         assert!(
-            node.settled_stark_sources.lock().contains(&(1, genesis_hash)),
+            node.settled_stark_sources
+                .lock()
+                .contains(&(1, genesis_hash)),
             "genesis still settled"
         );
         assert!(
@@ -2095,10 +2125,7 @@ mod tests {
             "block 1 still settled"
         );
         assert!(
-            !node
-                .settled_stark_sources
-                .lock()
-                .contains(&(1, stale_hash)),
+            !node.settled_stark_sources.lock().contains(&(1, stale_hash)),
             "stale fork entry must be removed"
         );
         // The persistent index must also be clean.
@@ -2319,7 +2346,7 @@ mod tests {
             proof: shell_stark_prover::proof::SigBatchProof {
                 version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
                 batch_root_bytes: wrong_root, // wrong root
-                n_sigs: 0,                   // correct count for 0-tx blocks
+                n_sigs: 0,                    // correct count for 0-tx blocks
                 proof_bytes: vec![0x33; 128],
             },
             prover: Address::from([0x44; 20]),

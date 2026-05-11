@@ -232,6 +232,14 @@ enum Commands {
         #[arg(long, default_value = "true")]
         enable_stark_aggregation: bool,
 
+        /// L2 STARK aggregation mode: disabled, scaffold, or active.
+        ///
+        /// disabled — no L2 scheduler/input/job activity.
+        /// scaffold — maintain L2 observability and durable jobs, but do not prove.
+        /// active   — reserved for the real recursive prover path.
+        #[arg(long, default_value = "disabled")]
+        l2_stark_mode: String,
+
         /// Consensus engine: "poa" (default) or "wpoa".
         #[arg(long)]
         consensus_engine: Option<String>,
@@ -485,6 +493,7 @@ async fn main() {
             witness_retention,
             body_retention,
             enable_stark_aggregation,
+            l2_stark_mode,
             consensus_engine,
             node_role,
         } => {
@@ -639,6 +648,7 @@ async fn main() {
                 witness_retention,
                 body_retention,
                 enable_stark_aggregation,
+                l2_stark_mode,
                 consensus_engine,
                 node_role,
                 password_args: password_args.clone(),

@@ -177,10 +177,24 @@ impl AggregationScheduler {
     /// [`clear_gap`] is called or a reconciliation pass fills the hole.
     ///
     /// [`clear_gap`]: AggregationScheduler::clear_gap
-    pub fn on_settled_l1_amendment(
-        &mut self,
-        input: SettledL1Input,
-    ) -> Result<(), L1Gap> {
+    pub fn on_settled_l1_amendment(&mut self, input: SettledL1Input) -> Result<(), L1Gap> {
+        // Existing chains may have their first canonical L1 proof start well
+        // after block 0 (for example after enabling L2 observability on a live
+        // testnet). Anchor the initial empty window to that first canonical
+        // proof instead of permanently gap-blocking on `expected=0`.
+        if self.pending_inputs.is_empty()
+            && self.window_start == 0
+            && self.last_trigger_block == 0
+            && self.gap.is_none()
+            && input.start_block > 0
+        {
+            tracing::info!(
+                start_block = input.start_block,
+                "L2 scheduler: anchoring initial window to first canonical L1 proof"
+            );
+            self.window_start = input.start_block;
+        }
+
         // Duplicate / already-covered: ignore silently.
         if input.end_block < self.window_start {
             return Ok(());
@@ -271,10 +285,7 @@ impl AggregationScheduler {
 
     /// Total block span currently accumulated in the pending window.
     pub fn pending_block_span(&self) -> u64 {
-        self.pending_inputs
-            .iter()
-            .map(|i| i.block_count())
-            .sum()
+        self.pending_inputs.iter().map(|i| i.block_count()).sum()
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
@@ -316,7 +327,10 @@ impl AggregationScheduler {
     fn emit_trigger(&mut self, block_number: u64, reason: TriggerReason) -> AggregationTrigger {
         let inputs = std::mem::take(&mut self.pending_inputs);
         let l1_roots: Vec<u128> = inputs.iter().map(|i| i.batch_root).collect();
-        let window_start = inputs.first().map(|i| i.start_block).unwrap_or(block_number);
+        let window_start = inputs
+            .first()
+            .map(|i| i.start_block)
+            .unwrap_or(block_number);
         let window_end = inputs.last().map(|i| i.end_block).unwrap_or(block_number);
 
         let mut job = AggregationJob::new(window_start, window_end);
@@ -379,9 +393,7 @@ mod tests {
     #[test]
     fn no_trigger_when_fewer_than_2_inputs() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 0, 10))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 0, 10)).unwrap();
         assert!(sched.on_block(5).is_none());
     }
 
@@ -391,6 +403,34 @@ mod tests {
         feed_inputs(&mut sched, 0, 2, 1);
         // Only 2 proofs, block 5, interval=50 — none of the triggers fire.
         assert!(sched.on_block(5).is_none());
+    }
+
+    #[test]
+    fn first_existing_chain_input_anchors_window_instead_of_gap_blocking() {
+        let mut sched = default_scheduler();
+        sched
+            .on_settled_l1_amendment(make_input(54_232, 54_335, 10))
+            .expect("first canonical L1 proof on an existing chain should anchor the window");
+
+        assert!(sched.gap().is_none());
+        assert_eq!(sched.window_start(), 54_336);
+        assert_eq!(sched.pending_proof_count(), 1);
+    }
+
+    #[test]
+    fn later_non_contiguous_input_still_gap_blocks() {
+        let mut sched = default_scheduler();
+        sched
+            .on_settled_l1_amendment(make_input(54_232, 54_335, 10))
+            .unwrap();
+
+        let gap = sched
+            .on_settled_l1_amendment(make_input(54_400, 54_500, 11))
+            .expect_err("non-contiguous follow-up must remain a real gap");
+
+        assert_eq!(gap.expected_start, 54_336);
+        assert_eq!(gap.received_start, 54_400);
+        assert!(sched.gap().is_some());
     }
 
     // ── proof threshold ───────────────────────────────────────────────────
@@ -427,9 +467,7 @@ mod tests {
     #[test]
     fn interval_does_not_trigger_with_fewer_than_2_inputs() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 0, 1))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 0, 1)).unwrap();
         // Only 1 input; on_block guards with < 2 check.
         assert!(sched.on_block(50).is_none());
     }
@@ -462,12 +500,8 @@ mod tests {
         };
         let mut sched = AggregationScheduler::new(config, 0);
         // 2 inputs each covering 5 blocks → span = 10 → cap fires.
-        sched
-            .on_settled_l1_amendment(make_input(0, 4, 1))
-            .unwrap();
-        sched
-            .on_settled_l1_amendment(make_input(5, 9, 2))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 4, 1)).unwrap();
+        sched.on_settled_l1_amendment(make_input(5, 9, 2)).unwrap();
         let trigger = sched.on_block(9).expect("range cap should fire");
         assert_eq!(trigger.reason, TriggerReason::RangeCap);
     }
@@ -488,9 +522,7 @@ mod tests {
     #[test]
     fn gap_blocks_trigger() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 0, 1))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 0, 1)).unwrap();
         // Gap: expected 1, got 5.
         let err = sched
             .on_settled_l1_amendment(make_input(5, 5, 2))
@@ -505,9 +537,7 @@ mod tests {
     #[test]
     fn gap_is_cleared_by_clear_gap() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 0, 1))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 0, 1)).unwrap();
         sched
             .on_settled_l1_amendment(make_input(5, 5, 2))
             .unwrap_err(); // gap
@@ -522,13 +552,9 @@ mod tests {
     #[test]
     fn duplicate_amendment_silently_ignored() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 4, 1))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 4, 1)).unwrap();
         // Second call with end_block < window_start is a duplicate — ignored.
-        sched
-            .on_settled_l1_amendment(make_input(0, 4, 1))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 4, 1)).unwrap();
         // window_start should still be 5.
         assert_eq!(sched.window_start(), 5);
         assert_eq!(sched.pending_proof_count(), 1);
@@ -538,9 +564,7 @@ mod tests {
     fn multi_block_amendment_advances_window_correctly() {
         let mut sched = default_scheduler();
         // One amendment covering blocks 0–9.
-        sched
-            .on_settled_l1_amendment(make_input(0, 9, 42))
-            .unwrap();
+        sched.on_settled_l1_amendment(make_input(0, 9, 42)).unwrap();
         assert_eq!(sched.window_start(), 10);
         assert_eq!(sched.pending_block_span(), 10);
     }
@@ -602,12 +626,8 @@ mod tests {
     #[test]
     fn pending_block_span_accessor() {
         let mut sched = default_scheduler();
-        sched
-            .on_settled_l1_amendment(make_input(0, 4, 1))
-            .unwrap(); // 5 blocks
-        sched
-            .on_settled_l1_amendment(make_input(5, 7, 2))
-            .unwrap(); // 3 blocks
+        sched.on_settled_l1_amendment(make_input(0, 4, 1)).unwrap(); // 5 blocks
+        sched.on_settled_l1_amendment(make_input(5, 7, 2)).unwrap(); // 3 blocks
         assert_eq!(sched.pending_block_span(), 8);
     }
 

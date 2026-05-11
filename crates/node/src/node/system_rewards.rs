@@ -262,8 +262,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Check 2: recompute the batch root and compare.
-        let expected_root =
-            shell_stark_prover::prover::compute_batch_root(&all_entries);
+        let expected_root = shell_stark_prover::prover::compute_batch_root(&all_entries);
         if expected_root != amendment.proof.batch_root_bytes {
             self.metrics.stark_settlements_rejected.inc();
             return Err(NodeError::Startup(format!(
@@ -306,13 +305,12 @@ impl<S: KvStore + 'static> Node<S> {
                         "STARK L2 proof binding: source L1 amendment for {source_hash} not found"
                     ))
                 })?;
-            let source_amendment: ProofAmendment =
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    NodeError::Startup(format!(
-                        "STARK L2 proof binding: failed to deserialise source amendment \
+            let source_amendment: ProofAmendment = serde_json::from_slice(&bytes).map_err(|e| {
+                NodeError::Startup(format!(
+                    "STARK L2 proof binding: failed to deserialise source amendment \
                          for {source_hash}: {e}"
-                    ))
-                })?;
+                ))
+            })?;
 
             // Every source must be a settled L1 amendment.
             if source_amendment.layer != 1 {
@@ -432,10 +430,15 @@ impl<S: KvStore + 'static> Node<S> {
         settlements: &[ProofAmendment],
         current_block: u64,
     ) {
-        let l1_amendments: Vec<&ProofAmendment> = settlements
-            .iter()
-            .filter(|a| a.layer == 1)
-            .collect();
+        if !self.config.l2_stark_mode.is_enabled() {
+            self.metrics.stark_l2_blocked_gap_start.set(0);
+            self.metrics.stark_l2_pending_inputs.set(0);
+            self.metrics.stark_l2_ready_jobs.set(0);
+            return;
+        }
+
+        let l1_amendments: Vec<&ProofAmendment> =
+            settlements.iter().filter(|a| a.layer == 1).collect();
 
         if l1_amendments.is_empty() {
             // Still tick on_block so interval/epoch triggers can fire.
@@ -458,7 +461,11 @@ impl<S: KvStore + 'static> Node<S> {
                 source_hash: *amendment.block_hash.as_bytes(),
             };
 
-            match self.aggregation_scheduler.lock().on_settled_l1_amendment(input) {
+            match self
+                .aggregation_scheduler
+                .lock()
+                .on_settled_l1_amendment(input)
+            {
                 Ok(()) => {
                     // Input accepted; no trigger yet (trigger fires on on_block).
                     self.metrics.stark_l2_blocked_gap_start.set(0);
@@ -479,15 +486,14 @@ impl<S: KvStore + 'static> Node<S> {
         // Tick block clock for interval / epoch triggers.
         let trigger = self.aggregation_scheduler.lock().on_block(current_block);
         if let Some(t) = trigger {
-            self.metrics.stark_l2_last_trigger_block.set(current_block as i64);
+            self.metrics
+                .stark_l2_last_trigger_block
+                .set(current_block as i64);
             self.create_l2_job_from_trigger(t, current_block);
         }
 
         // Update pending-inputs metric.
-        let pending = self
-            .aggregation_scheduler
-            .lock()
-            .pending_proof_count() as i64;
+        let pending = self.aggregation_scheduler.lock().pending_proof_count() as i64;
         self.metrics.stark_l2_pending_inputs.set(pending);
     }
 

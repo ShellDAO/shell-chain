@@ -77,6 +77,8 @@ pub struct RunArgs {
     pub storage_profile: String,
     /// Enable STARK aggregate proof generation during block production (on by default).
     pub enable_stark_aggregation: bool,
+    /// L2 STARK aggregation mode: disabled, scaffold, or active.
+    pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
     pub consensus_engine: Option<String>,
     /// Node role: "validator", "validator-prover", or "prover".
@@ -667,7 +669,10 @@ async fn run_with_store<S: KvStore + 'static>(
             ..shell_node::config::ParallelEvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
-        l2_stark_mode: L2StarkMode::Disabled,
+        l2_stark_mode: args
+            .l2_stark_mode
+            .parse::<L2StarkMode>()
+            .map_err(|e| format!("invalid --l2-stark-mode: {e}"))?,
         node_role,
     };
 
@@ -876,6 +881,7 @@ mod tests {
             body_retention: Some(DEFAULT_BODY_RETENTION),
             storage_profile: "full".into(),
             enable_stark_aggregation: false,
+            l2_stark_mode: "disabled".into(),
             network: "dev".into(),
             consensus_engine: None,
             node_role: "validator".into(),
@@ -897,6 +903,23 @@ mod tests {
             expected.max_workers, 4,
             "--parallel-evm-workers 4 must set max_workers = 4"
         );
+    }
+
+    #[test]
+    fn l2_stark_mode_cli_values_parse() {
+        assert_eq!(
+            "disabled".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Disabled
+        );
+        assert_eq!(
+            "scaffold".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Scaffold
+        );
+        assert_eq!(
+            "active".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Active
+        );
+        assert!("recursive".parse::<L2StarkMode>().is_err());
     }
 
     #[test]
