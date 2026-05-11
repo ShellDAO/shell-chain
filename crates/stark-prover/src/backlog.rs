@@ -113,7 +113,6 @@ pub enum ProverTask {
     L2Aggregation(L2ProverTask),
 }
 
-
 /// Default high-watermark: warn when the backlog exceeds this many tasks.
 pub const DEFAULT_WATERMARK_THRESHOLD: usize = 64;
 /// Minimum L1 witness entries before the prover may seal an L1 compression range.
@@ -550,7 +549,10 @@ mod tests {
         // 100+200+1 = 301 entries < MIN_L1_STARK_TXS (512), no block 4 → tail.
         let result =
             b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
-        assert!(result.is_none(), "below-threshold run at tail must not be dispatched");
+        assert!(
+            result.is_none(),
+            "below-threshold run at tail must not be dispatched"
+        );
         assert_eq!(b.len(), 3, "all tasks must remain in backlog");
     }
 
@@ -587,7 +589,10 @@ mod tests {
         // Run is blocks 1+2 (300 entries < 512). Must return None.
         let result =
             b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
-        assert!(result.is_none(), "under-threshold isolated run must not be dispatched");
+        assert!(
+            result.is_none(),
+            "under-threshold isolated run must not be dispatched"
+        );
         // All tasks remain.
         assert_eq!(b.len(), 3, "tasks must stay in backlog");
     }
@@ -665,22 +670,40 @@ mod tests {
         let mut b = ProofBacklog::new();
         // Push a few empty blocks (small window, no contiguous successor).
         for block_number in 1u64..=5 {
-            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+            b.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![],
+            ));
         }
         let result =
             b.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
-        assert!(result.is_none(), "small all-empty frontier must not be dispatched");
+        assert!(
+            result.is_none(),
+            "small all-empty frontier must not be dispatched"
+        );
         assert_eq!(b.len(), 5, "empty tasks must remain in backlog");
 
         // Same behaviour when the window is at max capacity.
         let mut b2 = ProofBacklog::new();
         for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
-            b2.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+            b2.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![],
+            ));
         }
         let result2 =
             b2.pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
-        assert!(result2.is_none(), "full-capacity all-empty window must not be dispatched");
-        assert_eq!(b2.len(), DEFAULT_MAX_L1_RANGE_SOURCES, "tasks must remain in backlog");
+        assert!(
+            result2.is_none(),
+            "full-capacity all-empty window must not be dispatched"
+        );
+        assert_eq!(
+            b2.len(),
+            DEFAULT_MAX_L1_RANGE_SOURCES,
+            "tasks must remain in backlog"
+        );
     }
 
     /// When the first max_sources blocks are all empty but a non-empty block follows
@@ -691,11 +714,16 @@ mod tests {
         let mut b = ProofBacklog::new();
         // Fill exactly max_sources empty blocks (the historical deadlock scenario).
         for block_number in 1..=DEFAULT_MAX_L1_RANGE_SOURCES as u64 {
-            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+            b.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![],
+            ));
         }
         // One non-empty block immediately after (block max_sources+1).
         let next_block = DEFAULT_MAX_L1_RANGE_SOURCES as u64 + 1;
-        let entries: Vec<SigBatchEntry> = (0..MIN_L1_STARK_TXS).map(|i| make_entry(i as u8)).collect();
+        let entries: Vec<SigBatchEntry> =
+            (0..MIN_L1_STARK_TXS).map(|i| make_entry(i as u8)).collect();
         b.push(ProofTask::new([0xffu8; 32], next_block, entries));
 
         let merged = b
@@ -725,7 +753,11 @@ mod tests {
         let mut b = ProofBacklog::new();
         // 3 empty blocks followed by 1 non-empty block (well above MIN_L1_STARK_TXS).
         for block_number in 1u64..=3 {
-            b.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+            b.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![],
+            ));
         }
         let entries_4: Vec<SigBatchEntry> =
             (0..MIN_L1_STARK_TXS).map(|i| make_entry(i as u8)).collect();
@@ -736,7 +768,11 @@ mod tests {
             .expect("non-empty tail should trigger a pop");
         // All 4 blocks merged: source_hashes contains empty blocks + non-empty block.
         assert_eq!(merged.block_number, 4);
-        assert_eq!(merged.source_hashes.len(), 4, "all 4 source hashes must be present");
+        assert_eq!(
+            merged.source_hashes.len(),
+            4,
+            "all 4 source hashes must be present"
+        );
         assert_eq!(
             merged.entries.len(),
             MIN_L1_STARK_TXS,
@@ -767,14 +803,21 @@ mod tests {
         let mut b2 = ProofBacklog::new();
         let small_max = 64usize;
         for block_number in 1..=small_max as u64 {
-            b2.push(ProofTask::new([block_number as u8; 32], block_number, vec![]));
+            b2.push(ProofTask::new(
+                [block_number as u8; 32],
+                block_number,
+                vec![],
+            ));
         }
         // Sparse blocks after the cap: 2 entries each, need ~256 blocks to hit 512.
         for block_number in (small_max as u64 + 1)..=(small_max as u64 + 400) {
             b2.push(ProofTask::new(
                 [block_number as u8; 32],
                 block_number,
-                vec![make_entry(block_number as u8), make_entry(block_number as u8 ^ 0xff)],
+                vec![
+                    make_entry(block_number as u8),
+                    make_entry(block_number as u8 ^ 0xff),
+                ],
             ));
         }
         let merged = b2

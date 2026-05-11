@@ -227,7 +227,6 @@ pub fn compute_batch_root(entries: &[SigBatchEntry]) -> [u8; 16] {
     bytes
 }
 
-
 ///
 /// The caller is responsible for verifying all Dilithium3 signatures natively
 /// before calling this function.  The STARK proves only that the hash-chain

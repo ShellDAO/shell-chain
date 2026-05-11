@@ -69,7 +69,9 @@ pub enum RecursiveProverError {
     ///
     /// This is the only variant returned by [`ScaffoldRecursiveProver`].
     /// Real implementations will add `ProofFailed`, `InvalidInputs`, etc.
-    #[error("recursive prover not implemented (feature = \"recursive\" not enabled or stub active)")]
+    #[error(
+        "recursive prover not implemented (feature = \"recursive\" not enabled or stub active)"
+    )]
     NotImplemented,
 
     /// The inputs were structurally invalid (wrong range, empty root list, …).

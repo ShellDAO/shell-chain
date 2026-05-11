@@ -1666,8 +1666,8 @@ impl<S: KvStore> L2JobStore<S> {
 
     /// Persist (insert or overwrite) a job.
     pub fn put(&self, job: &L2AggregationJob) -> Result<(), StorageError> {
-        let value = serde_json::to_vec(job)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let value =
+            serde_json::to_vec(job).map_err(|e| StorageError::Serialization(e.to_string()))?;
         self.store.put(&Self::key(&job.id), &value)
     }
 
@@ -3139,7 +3139,8 @@ mod tests {
         let job = make_job(40, L2JobStatus::Ready, 20, 30);
         js.put(&job).unwrap();
 
-        js.update_status(&job.id, L2JobStatus::Proving, 25, None).unwrap();
+        js.update_status(&job.id, L2JobStatus::Proving, 25, None)
+            .unwrap();
         let updated = js.get(&job.id).unwrap().unwrap();
         assert_eq!(updated.status, L2JobStatus::Proving);
         assert_eq!(updated.updated_at_block, 25);
@@ -3163,7 +3164,8 @@ mod tests {
         let js = L2JobStore::new(store);
 
         assert!(!js.is_populated().unwrap());
-        js.put(&make_job(50, L2JobStatus::PendingInputs, 0, 10)).unwrap();
+        js.put(&make_job(50, L2JobStatus::PendingInputs, 0, 10))
+            .unwrap();
         assert!(js.is_populated().unwrap());
     }
 

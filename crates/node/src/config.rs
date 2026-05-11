@@ -511,16 +511,34 @@ mod tests {
 
     #[test]
     fn l2_stark_mode_from_str_valid() {
-        assert_eq!("disabled".parse::<L2StarkMode>().unwrap(), L2StarkMode::Disabled);
-        assert_eq!("scaffold".parse::<L2StarkMode>().unwrap(), L2StarkMode::Scaffold);
-        assert_eq!("active".parse::<L2StarkMode>().unwrap(), L2StarkMode::Active);
+        assert_eq!(
+            "disabled".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Disabled
+        );
+        assert_eq!(
+            "scaffold".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Scaffold
+        );
+        assert_eq!(
+            "active".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Active
+        );
     }
 
     #[test]
     fn l2_stark_mode_from_str_case_insensitive() {
-        assert_eq!("DISABLED".parse::<L2StarkMode>().unwrap(), L2StarkMode::Disabled);
-        assert_eq!("Scaffold".parse::<L2StarkMode>().unwrap(), L2StarkMode::Scaffold);
-        assert_eq!("ACTIVE".parse::<L2StarkMode>().unwrap(), L2StarkMode::Active);
+        assert_eq!(
+            "DISABLED".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Disabled
+        );
+        assert_eq!(
+            "Scaffold".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Scaffold
+        );
+        assert_eq!(
+            "ACTIVE".parse::<L2StarkMode>().unwrap(),
+            L2StarkMode::Active
+        );
     }
 
     #[test]
