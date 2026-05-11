@@ -1857,6 +1857,39 @@ mod tests {
     }
 
     #[test]
+    fn stark_settlement_prefers_widest_same_start_range() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 3);
+
+        let short = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        let wide =
+            dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1], hashes[2]], 3);
+
+        node.pending_stark_settlements.lock().extend([short, wide]);
+        let settlement_block = node.produce_block(&signer, 100).unwrap();
+
+        assert_eq!(
+            settlement_block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            1,
+            "overlapping same-start proofs should produce only one reward settlement"
+        );
+        assert!(
+            node.settled_stark_sources.lock().contains(&(1, hashes[2])),
+            "the widest same-start proof should be settled first"
+        );
+    }
+
+    #[test]
     fn import_invalid_stark_settlement_does_not_poison_settled_index() {
         let (leader, signer) = setup_node();
         store_genesis(&leader);

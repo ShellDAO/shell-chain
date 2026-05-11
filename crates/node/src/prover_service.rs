@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use parking_lot::Mutex;
 use shell_primitives::{Bytes, ShellHash};
 use shell_stark_prover::{
-    prove_sig_batch, L2ProverTask, ProofAmendment, ProofBacklog, ProofTask, ProverTask,
+    prove_sig_batch, L2ProverTask, ProofAmendment, ProofBacklog, ProofTask,
     DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS, PROOF_AMENDMENT_VERSION,
 };
 use shell_storage::{KvStore, ProofAmendmentStore};
@@ -120,7 +120,6 @@ impl Drop for ProverServiceHandle {
 pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     backlog: Arc<Mutex<ProofBacklog>>,
     amendment_store: ProofAmendmentStore<S>,
-    settlement_queue: Option<Arc<Mutex<Vec<ProofAmendment>>>>,
     amendment_tx: Option<mpsc::UnboundedSender<ProofAmendment>>,
     config: ProverConfig,
     /// The node's own address, used as `prover` field in [`ProofAmendment`].
@@ -140,7 +139,6 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         Self {
             backlog,
             amendment_store,
-            settlement_queue: None,
             amendment_tx: None,
             config,
             prover_address,
@@ -154,18 +152,9 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         self
     }
 
-    /// Queue locally generated amendments for settlement by validator-prover
-    /// nodes. Pure prover nodes may omit this and only persist/broadcast proofs.
-    pub fn with_settlement_queue(
-        mut self,
-        settlement_queue: Arc<Mutex<Vec<ProofAmendment>>>,
-    ) -> Self {
-        self.settlement_queue = Some(settlement_queue);
-        self
-    }
-
     /// Send locally generated amendments back to the node event loop for P2P
-    /// broadcast after they are durably stored.
+    /// settlement ordering, reward queueing, and P2P broadcast after they are
+    /// durably stored.
     pub fn with_amendment_sender(
         mut self,
         amendment_tx: mpsc::UnboundedSender<ProofAmendment>,
@@ -338,12 +327,6 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                             info!(
                                 "ProverService: proof amendment stored for range ending at block #{block_number} ({stored} source hashes)"
                             );
-                            if let Some(queue) = &self.settlement_queue {
-                                queue.lock().push(amendment.clone());
-                                info!(
-                                    "ProverService: proof amendment queued for STARK reward settlement at block #{block_number}"
-                                );
-                            }
                             if let Some(tx) = &self.amendment_tx {
                                 if tx.send(amendment).is_err() {
                                     warn!(

@@ -247,7 +247,6 @@ impl<S: KvStore + 'static> Node<S> {
                 prover_address,
             )
             .with_amendment_sender(prover_amendment_tx)
-            .with_settlement_queue(Arc::clone(&self.pending_stark_settlements))
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
             task_lifecycle.attach_prover_service(handle);

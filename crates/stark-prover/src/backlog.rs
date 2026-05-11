@@ -239,6 +239,9 @@ impl ProofBacklog {
             entries = entries.saturating_add(next.entries.len());
             end_block = next.block_number;
             take += 1;
+            if layer == 1 && min_l1_entries > 0 && entries >= min_l1_entries {
+                break;
+            }
         }
 
         // L1 empty/low-entry guard: the prover must never dispatch a L1 range
@@ -597,9 +600,9 @@ mod tests {
         assert_eq!(b.len(), 3, "tasks must stay in backlog");
     }
 
-    /// A L1 window with DEFAULT_MAX_L1_RANGE_SOURCES blocks × 1 entry each
-    /// totals 1024 entries, which exceeds MIN_L1_STARK_TXS (512). The window
-    /// pops and merges correctly even though each individual block has few entries.
+    /// A L1 window with 1 entry per block pops as soon as MIN_L1_STARK_TXS is
+    /// reached instead of greedily swallowing the full source cap. This keeps
+    /// live proofs bounded under sustained transaction load.
     #[test]
     fn l1_pop_advances_when_threshold_met_at_capacity() {
         let mut b = ProofBacklog::new();
@@ -615,9 +618,9 @@ mod tests {
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
             .expect("window meets entry threshold and must pop");
-        assert_eq!(merged.block_number, DEFAULT_MAX_L1_RANGE_SOURCES as u64);
-        assert_eq!(merged.entries.len(), DEFAULT_MAX_L1_RANGE_SOURCES);
-        assert!(b.is_empty());
+        assert_eq!(merged.block_number, MIN_L1_STARK_TXS as u64);
+        assert_eq!(merged.entries.len(), MIN_L1_STARK_TXS);
+        assert_eq!(b.len(), DEFAULT_MAX_L1_RANGE_SOURCES - MIN_L1_STARK_TXS);
     }
 
     /// A L1 window with fewer total entries than MIN_L1_STARK_TXS must never be

@@ -192,18 +192,17 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut drained_stark_settlements = prover.take_pending_stark_settlements();
         drained_stark_settlements.sort_by(|a, b| {
-            (
-                a.layer,
-                a.block_number,
-                a.block_hash.as_bytes(),
-                a.prover.0.as_slice(),
-            )
-                .cmp(&(
-                    b.layer,
-                    b.block_number,
-                    b.block_hash.as_bytes(),
-                    b.prover.0.as_slice(),
-                ))
+            let a_start = a.range_start_block().unwrap_or(a.block_number);
+            let b_start = b.range_start_block().unwrap_or(b.block_number);
+            a.layer
+                .cmp(&b.layer)
+                .then_with(|| a_start.cmp(&b_start))
+                // If multiple proofs cover the same frontier start, settle the
+                // widest range first so short overlapping proofs cannot starve
+                // historical catch-up.
+                .then_with(|| b.block_number.cmp(&a.block_number))
+                .then_with(|| a.block_hash.as_bytes().cmp(b.block_hash.as_bytes()))
+                .then_with(|| a.prover.0.as_slice().cmp(b.prover.0.as_slice()))
         });
         let mut settled_stark_proofs = Vec::new();
         let mut settled_stark_artifacts = Vec::new();
