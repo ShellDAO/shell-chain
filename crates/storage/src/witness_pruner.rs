@@ -348,8 +348,8 @@ mod tests {
             store_bundle(&ws, h);
         }
 
-        // Without STARK guard: retention=4, head=19 → cutoff=16 → prune 0..16.
-        // With STARK guard at frontier=10: effective cutoff = min(16, 10) = 10 → prune 0..10.
+        // Without STARK guard: retention=4, head=19 → cutoff=16 → prune [0, 16) (blocks 0–15).
+        // With STARK guard at frontier=10: effective cutoff = min(16, 10) = 10 → prune [0, 10) (blocks 0–9).
         let mut pruner = WitnessPruner::new(4);
         let result = pruner.prune_before(19, 10, &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 10); // blocks 0..10 pruned

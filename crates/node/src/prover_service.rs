@@ -198,6 +198,10 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         let mut last_stall_log = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(300))
             .unwrap_or_else(std::time::Instant::now);
+        // Track consecutive stall observations at the same gap block before
+        // draining. We require the same gap_at_block to appear on 2+ consecutive
+        // 60-second stall checks (≥ 120 s) before treating it as permanent.
+        let mut consecutive_gap: Option<(u64, u32)> = None; // (gap_block, count)
 
         loop {
             // Check shutdown signal.
@@ -251,25 +255,51 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                         contiguous_take = take,
                                         "STARK prover stalled: gap in backlog prevents reaching min_entries threshold"
                                     );
-                                    // The gap block's witness is permanently missing (pruned).
-                                    // The pre-gap range can never accumulate enough entries.
-                                    // Drain those tasks so the prover can advance past the gap.
-                                    warn!(
-                                        draining = take,
-                                        entries_lost = entries,
-                                        gap_at_block = gap,
-                                        "STARK prover: draining {} stuck tasks before permanent gap at block {}",
-                                        take, gap
-                                    );
-                                    backlog.drain_front(take);
-                                    // Advance the drain frontier so the seeder
-                                    // won't re-insert blocks below this gap on
-                                    // the very next seeding pass.
-                                    let prev = self
-                                        .drain_frontier
-                                        .fetch_max(gap, std::sync::atomic::Ordering::Release);
-                                    if gap > prev {
-                                        info!(gap_at_block = gap, "STARK drain frontier advanced");
+                                    // Guard against transient gaps: require the same
+                                    // gap_at_block to appear on 2 consecutive stall
+                                    // checks (≥ 120 s) before treating it as permanent.
+                                    let count = match consecutive_gap {
+                                        Some((prev_gap, n)) if prev_gap == gap as u64 => {
+                                            consecutive_gap = Some((gap as u64, n + 1));
+                                            n + 1
+                                        }
+                                        _ => {
+                                            consecutive_gap = Some((gap as u64, 1));
+                                            1
+                                        }
+                                    };
+                                    if count >= 2 {
+                                        // The gap block's witness is permanently missing (pruned).
+                                        // The pre-gap range can never accumulate enough entries.
+                                        // Drain those tasks so the prover can advance past the gap.
+                                        warn!(
+                                            draining = take,
+                                            entries_lost = entries,
+                                            gap_at_block = gap,
+                                            consecutive_checks = count,
+                                            "STARK prover: draining {} stuck tasks before confirmed permanent gap at block {}",
+                                            take, gap
+                                        );
+                                        backlog.drain_front(take);
+                                        consecutive_gap = None;
+                                        // Advance the drain frontier so the seeder
+                                        // won't re-insert blocks below this gap on
+                                        // the very next seeding pass.
+                                        let prev = self
+                                            .drain_frontier
+                                            .fetch_max(gap, std::sync::atomic::Ordering::Release);
+                                        if gap > prev {
+                                            info!(
+                                                gap_at_block = gap,
+                                                "STARK drain frontier advanced"
+                                            );
+                                        }
+                                    } else {
+                                        info!(
+                                            gap_at_block = gap,
+                                            consecutive_checks = count,
+                                            "STARK prover: gap observed, waiting for confirmation before drain"
+                                        );
                                     }
                                 }
                                 Some((entries, None, take)) => {

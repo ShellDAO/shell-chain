@@ -132,8 +132,8 @@ pub enum L2StarkMode {
     /// operational visibility (metrics, gap detection) without emitting L2 proofs.
     Scaffold,
     /// Full recursive aggregation: input index, job store, scheduler, and the
-    /// recursive prover all run.  Requires the `recursive` cargo feature; the
-    /// node will refuse to start in Active mode if the feature is absent.
+    /// recursive prover all run.  Requires the `recursive` cargo feature to have
+    /// any effect; without it the mode is accepted but recursive proving is skipped.
     Active,
 }
 

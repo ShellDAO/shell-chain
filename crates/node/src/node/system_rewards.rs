@@ -313,6 +313,9 @@ impl<S: KvStore + 'static> Node<S> {
             })?;
 
             // Every source must be a settled L1 amendment.
+            // TODO: also verify canonical/settled status via settled_source_index
+            // or l2_input_index once L2 paths are fully wired (currently only
+            // `layer == 1` is enforced; un-settled L1 amendments are not rejected).
             if source_amendment.layer != 1 {
                 self.metrics.stark_settlements_rejected.inc();
                 return Err(NodeError::Startup(format!(
