@@ -630,20 +630,25 @@ mod tests {
 
     #[test]
     fn l1_pop_pops_when_threshold_met_across_multiple_blocks() {
-        // 4 consecutive blocks whose combined entry count meets MIN_L1_STARK_TXS
-        // must be merged and popped.
+        // 4 consecutive blocks whose combined entry count meets MIN_L1_STARK_TXS.
+        // The loop exits as soon as the threshold is reached, so blocks 1-3
+        // (100+200+212 = 512) are popped; block 4 (1 entry) stays in the backlog.
         let mut b = ProofBacklog::new();
         b.push(ProofTask::new([1u8; 32], 1, vec![make_entry(1); 100]));
         b.push(ProofTask::new([2u8; 32], 2, vec![make_entry(2); 200]));
         b.push(ProofTask::new([3u8; 32], 3, vec![make_entry(3); 212]));
         b.push(ProofTask::new([4u8; 32], 4, vec![make_entry(4); 1]));
 
-        // 100+200+212+1 = 513 ≥ 512 → pops successfully.
+        // 100+200+212 = 512 ≥ MIN_L1_STARK_TXS — threshold reached at block 3.
         let merged = b
             .pop_contiguous_with_min_entries(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
             .expect("L1 range reaches 512 entries");
-        assert_eq!(merged.block_number, 4);
-        assert_eq!(merged.entries.len(), 513);
+        assert_eq!(
+            merged.block_number, 3,
+            "stops at the block that hits threshold"
+        );
+        assert_eq!(merged.entries.len(), 512);
+        assert_eq!(b.len(), 1, "block 4 with 1 entry remains in backlog");
     }
 
     #[test]
