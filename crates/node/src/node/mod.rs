@@ -1162,7 +1162,12 @@ impl<S: KvStore + 'static> Node<S> {
                     .iter()
                     .filter(|(l, _)| *l == 1)
                     .count() as u64;
-                match wpruner.prune_before(block_number, stark_frontier, &self.chain_store, &self.witness_store) {
+                match wpruner.prune_before(
+                    block_number,
+                    stark_frontier,
+                    &self.chain_store,
+                    &self.witness_store,
+                ) {
                     Ok(result) => {
                         if result.pruned_count > 0 {
                             tracing::info!(

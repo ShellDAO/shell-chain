@@ -169,7 +169,10 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
 
     /// Share the drain-frontier atomic with the node's event loop so the
     /// seeder can skip blocks below the last drained gap.
-    pub fn with_drain_frontier(mut self, drain_frontier: Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub fn with_drain_frontier(
+        mut self,
+        drain_frontier: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         self.drain_frontier = drain_frontier;
         self
     }
@@ -235,7 +238,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                             last_stall_log = std::time::Instant::now();
                             let first_block = backlog.min_block_number_for_layer(1).unwrap_or(0);
                             let last_block = backlog.max_block_number_for_layer(1).unwrap_or(0);
-                            let stall_info = backlog.diagnose_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+                            let stall_info = backlog
+                                .diagnose_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
                             match stall_info {
                                 Some((entries, Some(gap), take)) => {
                                     warn!(
@@ -261,7 +265,9 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                     // Advance the drain frontier so the seeder
                                     // won't re-insert blocks below this gap on
                                     // the very next seeding pass.
-                                    let prev = self.drain_frontier.fetch_max(gap, std::sync::atomic::Ordering::Release);
+                                    let prev = self
+                                        .drain_frontier
+                                        .fetch_max(gap, std::sync::atomic::Ordering::Release);
                                     if gap > prev {
                                         info!(gap_at_block = gap, "STARK drain frontier advanced");
                                     }

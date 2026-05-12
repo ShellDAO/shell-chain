@@ -380,6 +380,7 @@ async fn coordinator(
         epoch_length,
         min_l1_proofs_for_l2: l2_threshold,
         trigger_block_interval: l2_block_interval,
+        max_source_range: 0,
     };
     let mut scheduler = AggregationScheduler::new(config, 0);
 
@@ -419,7 +420,6 @@ async fn coordinator(
         match msg {
             CoordMsg::Block(block) => {
                 current_block = block;
-                scheduler.on_proof(block); // no-op for block events directly
                 if let Some(trigger) = scheduler.on_block(block) {
                     // Run L2 aggregation.
                     if !pending_roots.is_empty() {
@@ -503,8 +503,8 @@ async fn coordinator(
                     pending_roots.push(ev.batch_root);
                     pending_l1_bytes += ev.proof_bytes;
 
-                    // Notify scheduler of a new L1 proof.
-                    scheduler.on_proof(ev.block_number);
+                    // Notify scheduler a new block's proof is available.
+                    let _ = scheduler.on_block(ev.block_number);
                 } else {
                     total_l1_fail += 1;
                 }

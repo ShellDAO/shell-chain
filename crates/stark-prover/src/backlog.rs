@@ -306,7 +306,11 @@ impl ProofBacklog {
     ///
     /// Returns `(total_entries, gap_at_block, contiguous_take)` for the
     /// current front of the backlog. Used for rate-limited logging.
-    pub fn diagnose_stall(&self, max_sources: usize, min_l1_entries: usize) -> Option<(usize, Option<u64>, usize)> {
+    pub fn diagnose_stall(
+        &self,
+        max_sources: usize,
+        min_l1_entries: usize,
+    ) -> Option<(usize, Option<u64>, usize)> {
         let first = self.pending.front()?;
         if first.layer != 1 || min_l1_entries == 0 {
             return None;
@@ -335,7 +339,9 @@ impl ProofBacklog {
         if take == max_sources && entries < min_l1_entries {
             let mut scan = take;
             while scan < self.pending.len() {
-                let Some(next) = self.pending.get(scan) else { break; };
+                let Some(next) = self.pending.get(scan) else {
+                    break;
+                };
                 if next.layer != 1 || next.block_number != end_block.saturating_add(1) {
                     break;
                 }

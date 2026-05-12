@@ -1887,17 +1887,15 @@ impl<S: KvStore + 'static> Node<S> {
         // permanent gap, we must not re-seed those blocks — they can never
         // accumulate enough entries to form a valid proof and would cause a
         // drain-reseed infinite loop.
-        let drain_floor = self.stark_drain_frontier.load(std::sync::atomic::Ordering::Acquire);
+        let drain_floor = self
+            .stark_drain_frontier
+            .load(std::sync::atomic::Ordering::Acquire);
         let scan_start = contiguous_pending_end
             .saturating_sub(16)  // small lookback for safety
             .max(drain_floor);
         info!(
             settled_l1_count,
-            contiguous_pending_end,
-            drain_floor,
-            scan_start,
-            head,
-            "STARK seeding: scan parameters"
+            contiguous_pending_end, drain_floor, scan_start, head, "STARK seeding: scan parameters"
         );
 
         for number in scan_start..=head {
@@ -1956,8 +1954,7 @@ impl<S: KvStore + 'static> Node<S> {
                         // Recompute seeded_entries from the retained tasks.
                         seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
                         // Recompute queued: retained regular tasks + all pending covered blocks.
-                        pending_covered_sum =
-                            pending_covered_sum.saturating_add(covered_count);
+                        pending_covered_sum = pending_covered_sum.saturating_add(covered_count);
                         queued = tasks.len().saturating_add(pending_covered_sum);
                         self.pending_stark_settlements.lock().push(amendment);
                         continue;

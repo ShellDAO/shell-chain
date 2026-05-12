@@ -743,10 +743,7 @@ impl<S: KvStore + 'static> Node<S> {
             let lock = self.settled_stark_sources.lock();
             lock.iter().filter(|(l, _)| *l == layer).count() as u64
         };
-        let overlay_count = overlay_layers
-            .values()
-            .filter(|&&l| l >= layer)
-            .count() as u64;
+        let overlay_count = overlay_layers.values().filter(|&&l| l >= layer).count() as u64;
         let scan_start = settled_count
             .saturating_add(overlay_count)
             .saturating_sub(16); // small lookback to guard against gaps
