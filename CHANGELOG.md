@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.2] — 2026-05-12
+
+### Fixed
+
+- **STARK drain-reseed infinite loop** (`stark_drain_frontier` atomic): the
+  prover could enter a permanent cycle where sparse blocks before a settled gap
+  were drained every 60 s and immediately re-seeded because `scan_start` never
+  advanced past the gap. A shared `Arc<AtomicU64>` is now updated to
+  `gap_at_block` after every `drain_front()` call; the seeder clamps
+  `scan_start` to `max(contiguous_pending_end − 16, drain_frontier)`, breaking
+  the loop permanently. Verified on testnet-sg3: `frontier_lag` dropped from
+  4 807 to **1** within five minutes of deployment.
+- **Reseed anchored at contiguous settled frontier** (Fix B): `scan_start` is
+  now derived from `contiguous_pending_end` — the highest block reachable
+  without gaps through settled + gapless-pending amendments — instead of raw
+  `pending_max_block`. This prevents re-seeding already-proven ranges when
+  pending amendments arrive out-of-order.
+- **Pre-gap sparse drain** (Fix A): when `pop_contiguous_with_min_entries`
+  returns `None` due to a gap and the contiguous prefix has stalled for
+  `stall_timeout`, the prover now drains and discards the stuck prefix and
+  signals `needs_reseed`, allowing the backlog to advance past the gap.
+- **Amendment artifact cleanup on ordering failure**: local proof amendments
+  that fail the ordering-validation check are now deleted from the amendment
+  store instead of being left as orphaned artifacts that could trigger spurious
+  reseeds on restart.
+- **Witness pruner safety**: witness data is no longer pruned for blocks that
+  do not yet have a settled STARK proof, preventing data-loss races during
+  catch-up.
+
 ## [0.22.1] — 2026-05-10
 
 ### Changed
