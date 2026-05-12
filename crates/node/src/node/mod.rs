@@ -409,6 +409,7 @@ struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
     settled_stark_sources: &'a parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
     settled_source_index: &'a SettledSourceIndex<S>,
     l2_input_index: &'a L2InputIndex<S>,
+    #[allow(dead_code)] // scaffolded for future L2 orchestration
     l2_job_store: &'a L2JobStore<S>,
     metrics: &'a Arc<Metrics>,
 }

@@ -11,8 +11,8 @@
 //!
 //! * `msg_hash` – the 32-byte transaction hash.
 //! * `pk_hash`  – for [`PubkeyMode::Embedded`], the first ≤32 bytes of the
-//!                inline public key; for [`PubkeyMode::Reference`], the 20-
-//!                byte sender address zero-padded to 32 bytes.
+//!   inline public key; for [`PubkeyMode::Reference`], the 20-
+//!   byte sender address zero-padded to 32 bytes.
 
 use shell_core::PubkeyMode;
 

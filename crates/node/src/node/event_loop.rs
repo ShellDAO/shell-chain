@@ -381,7 +381,7 @@ impl<S: KvStore + 'static> Node<S> {
                     if self.config.node_role.runs_prover() {
                         let needs_reseed = {
                             let backlog = self.proof_backlog.lock();
-                            if backlog.len() == 0 {
+                            if backlog.is_empty() {
                                 true
                             } else {
                                 // If the contiguous front run has fewer entries than

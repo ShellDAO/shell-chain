@@ -429,6 +429,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     ///
     /// Currently all L2 tasks are deferred: the job remains in `L2JobStore`
     /// with `Ready` status and a clear log explains why no proof was generated.
+    #[allow(dead_code)] // scaffolded for future L2 proving
     pub(crate) async fn process_l2_task(&self, task: &L2ProverTask) {
         if !self.l2_mode.is_active() {
             info!(
