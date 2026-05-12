@@ -259,12 +259,12 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                     // gap_at_block to appear on 2 consecutive stall
                                     // checks (≥ 120 s) before treating it as permanent.
                                     let count = match consecutive_gap {
-                                        Some((prev_gap, n)) if prev_gap == gap as u64 => {
-                                            consecutive_gap = Some((gap as u64, n + 1));
+                                        Some((prev_gap, n)) if prev_gap == gap => {
+                                            consecutive_gap = Some((gap, n + 1));
                                             n + 1
                                         }
                                         _ => {
-                                            consecutive_gap = Some((gap as u64, 1));
+                                            consecutive_gap = Some((gap, 1));
                                             1
                                         }
                                     };
