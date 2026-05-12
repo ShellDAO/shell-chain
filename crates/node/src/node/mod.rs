@@ -1145,7 +1145,16 @@ impl<S: KvStore + 'static> Node<S> {
         {
             let mut wpruner = self.witness_pruner.write();
             if !wpruner.is_archive() {
-                match wpruner.prune_before(block_number, &self.chain_store, &self.witness_store) {
+                // Guard: never prune witnesses for blocks that have not yet been
+                // STARK-proved.  The frontier is the count of settled L1 sources,
+                // i.e. the first unproved block number.
+                let stark_frontier = self
+                    .settled_stark_sources
+                    .lock()
+                    .iter()
+                    .filter(|(l, _)| *l == 1)
+                    .count() as u64;
+                match wpruner.prune_before(block_number, stark_frontier, &self.chain_store, &self.witness_store) {
                     Ok(result) => {
                         if result.pruned_count > 0 {
                             tracing::info!(

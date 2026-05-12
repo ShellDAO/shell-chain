@@ -354,6 +354,17 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
                 _ = block_timer.tick() => {
+                    // Periodically reseed the STARK backlog even when the prover
+                    // has been idle (e.g. after a long gap since last restart),
+                    // so the prover never permanently stalls with an empty backlog.
+                    if self.config.node_role.runs_prover() {
+                        let backlog_depth = self.proof_backlog.lock().len();
+                        if backlog_depth == 0 {
+                            if let Err(e) = self.enqueue_stark_frontier_backlog(DEFAULT_MAX_L1_RANGE_SOURCES) {
+                                warn!("failed to reseed STARK backlog on timer: {e}");
+                            }
+                        }
+                    }
                     if can_produce_blocks {
                         let peers = network.peer_count().await;
                         production_readiness.refresh(
@@ -1761,15 +1772,20 @@ impl<S: KvStore + 'static> Node<S> {
         if max_blocks == 0 || !self.config.node_role.runs_prover() {
             return Ok(0);
         }
-        if !self.pending_stark_settlements.lock().is_empty() {
-            return Ok(0);
-        }
+        // Note: we intentionally do NOT skip when pending_stark_settlements is
+        // non-empty.  The inner loop already skips blocks that are covered by a
+        // pending settlement, so the early-return here would incorrectly prevent
+        // seeding frontier blocks that come *after* the already-proved range.
         let head = self
             .chain_store
             .get_head_block()?
             .map(|block| block.number())
             .unwrap_or(0);
         let mut queued = 0usize;
+        // `pending_covered_sum` tracks blocks contributed to `queued` by old
+        // amendments pushed to `pending_stark_settlements`. Used to recompute
+        // `queued` after tasks.retain() removes covered source blocks.
+        let mut pending_covered_sum = 0usize;
         let mut tasks = Vec::new();
         // Scan past max_blocks until the backlog contains enough source entries
         // to satisfy the L1 minimum (MIN_L1_STARK_TXS). Without this, a chain
@@ -1783,7 +1799,42 @@ impl<S: KvStore + 'static> Node<S> {
             .saturating_mul(4)
             .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4);
         let mut seeded_entries = 0usize;
-        for number in 0..=head {
+
+        // Fast-path: compute an approximate scan start block so we skip over
+        // already-settled blocks without issuing a DB read per block.
+        //
+        // * Settled L1 source count ≈ frontier block number (sources are
+        //   sequential, one per canonical block from genesis).
+        // * We also check the highest block_number in pending_stark_settlements
+        //   so that we start seeding after the already-proved-but-unsettled range.
+        //
+        // A small lookback (16 blocks) guards against off-by-one or gap cases.
+        let settled_l1_count = self
+            .settled_stark_sources
+            .lock()
+            .iter()
+            .filter(|(l, _)| *l == 1)
+            .count() as u64;
+        let pending_max_block = self
+            .pending_stark_settlements
+            .lock()
+            .iter()
+            .filter(|a| a.layer == 1)
+            .map(|a| a.block_number)
+            .max()
+            .unwrap_or(0);
+        // Also account for any tasks already in the backlog.
+        let backlog_max_block = self
+            .proof_backlog
+            .lock()
+            .max_block_number_for_layer(1)
+            .unwrap_or(0);
+        let scan_start = settled_l1_count
+            .max(pending_max_block)
+            .max(backlog_max_block)
+            .saturating_sub(16); // small lookback for safety
+
+        for number in scan_start..=head {
             if queued >= max_blocks && seeded_entries >= MIN_L1_STARK_TXS {
                 break;
             }
@@ -1816,9 +1867,33 @@ impl<S: KvStore + 'static> Node<S> {
             if let Some(bytes) = self.amendment_store.get_amendment(&hash)? {
                 if let Ok(amendment) = ProofAmendment::from_json(&bytes) {
                     if self.validate_stark_amendment_ordering(&amendment).is_ok() {
-                        let covered = amendment.covered_hashes().len().max(1);
+                        let covered_hashes = amendment.covered_hashes();
+                        let covered_count = covered_hashes.len().max(1);
+                        let start = amendment.range_start_block().unwrap_or(0);
+                        info!(
+                            block = amendment.block_number,
+                            start_block = start,
+                            sources = covered_count,
+                            n_sigs = amendment.proof.n_sigs,
+                            "STARK seeding: existing amendment passes ordering; skipping covered range"
+                        );
+                        // Remove any source blocks already queued in `tasks` that
+                        // are covered by this amendment. Without this, the source
+                        // blocks inserted before we reach the end block create a
+                        // gap in the contiguous backlog run, causing
+                        // `pop_contiguous_with_min_entries` to return None.
+                        let covered_set: std::collections::HashSet<_> =
+                            covered_hashes.into_iter().collect();
+                        tasks.retain(|t: &ProofTask| {
+                            !t.source_hashes.iter().any(|s| covered_set.contains(s))
+                        });
+                        // Recompute seeded_entries from the retained tasks.
+                        seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
+                        // Recompute queued: retained regular tasks + all pending covered blocks.
+                        pending_covered_sum =
+                            pending_covered_sum.saturating_add(covered_count);
+                        queued = tasks.len().saturating_add(pending_covered_sum);
                         self.pending_stark_settlements.lock().push(amendment);
-                        queued = queued.saturating_add(covered);
                         continue;
                     }
                 }
@@ -1847,11 +1922,24 @@ impl<S: KvStore + 'static> Node<S> {
             queued += 1;
         }
         if !tasks.is_empty() {
+            let tasks_count = tasks.len();
+            let tasks_entries: usize = tasks.iter().map(|t| t.entries.len()).sum();
+            let tasks_first = tasks.first().map(|t| t.block_number).unwrap_or(0);
+            let tasks_last = tasks.last().map(|t| t.block_number).unwrap_or(0);
             let mut backlog = self.proof_backlog.lock();
             let first_new_block = tasks[0].block_number;
             let layer = tasks[0].layer;
             let min_existing = backlog.min_block_number_for_layer(layer);
             let max_existing = backlog.max_block_number_for_layer(layer);
+            info!(
+                tasks = tasks_count,
+                entries = tasks_entries,
+                first_block = tasks_first,
+                last_block = tasks_last,
+                backlog_min = min_existing,
+                backlog_max = max_existing,
+                "STARK seeding: inserting tasks into backlog"
+            );
 
             // Case 1: backlog is empty, or new tasks are at/before the existing
             // minimum → insert at the front so the prover processes the lowest

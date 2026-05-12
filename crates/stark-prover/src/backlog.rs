@@ -302,6 +302,57 @@ impl ProofBacklog {
         Some(merged)
     }
 
+    /// Diagnose why `pop_contiguous_with_min_entries` would return `None`.
+    ///
+    /// Returns `(total_entries, gap_at_block, contiguous_take)` for the
+    /// current front of the backlog. Used for rate-limited logging.
+    pub fn diagnose_stall(&self, max_sources: usize, min_l1_entries: usize) -> Option<(usize, Option<u64>, usize)> {
+        let first = self.pending.front()?;
+        if first.layer != 1 || min_l1_entries == 0 {
+            return None;
+        }
+        let mut take = 1usize;
+        let mut entries = first.entries.len();
+        let mut end_block = first.block_number;
+        let mut gap_at: Option<u64> = None;
+
+        while take < max_sources {
+            let Some(next) = self.pending.get(take) else {
+                break;
+            };
+            if next.layer != 1 || next.block_number != end_block.saturating_add(1) {
+                gap_at = Some(end_block.saturating_add(1));
+                break;
+            }
+            entries = entries.saturating_add(next.entries.len());
+            end_block = next.block_number;
+            take += 1;
+            if entries >= min_l1_entries {
+                return None; // would succeed, not stuck
+            }
+        }
+        // extension scan
+        if take == max_sources && entries < min_l1_entries {
+            let mut scan = take;
+            while scan < self.pending.len() {
+                let Some(next) = self.pending.get(scan) else { break; };
+                if next.layer != 1 || next.block_number != end_block.saturating_add(1) {
+                    break;
+                }
+                entries = entries.saturating_add(next.entries.len());
+                end_block = next.block_number;
+                scan += 1;
+                if entries >= min_l1_entries {
+                    return None; // would succeed
+                }
+            }
+        }
+        if entries >= min_l1_entries {
+            return None; // would succeed
+        }
+        Some((entries, gap_at, take))
+    }
+
     /// Peek at the next task without removing it.
     pub fn peek(&self) -> Option<&ProofTask> {
         self.pending.front()

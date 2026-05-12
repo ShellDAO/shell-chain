@@ -395,7 +395,19 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         amendment: &ProofAmendment,
     ) -> Result<(), NodeError> {
-        self.validate_stark_amendment_ordering_with_overlay(amendment, &HashMap::new())
+        // Include pending (queued-but-unsettled) settlements in the overlay so that
+        // consecutive amendments pass the frontier ordering check even when the
+        // preceding range hasn't yet been mined into a canonical block.
+        let mut overlay: HashMap<ShellHash, u32> = HashMap::new();
+        {
+            let pending = self.pending_stark_settlements.lock();
+            for pending_amendment in pending.iter() {
+                for source in pending_amendment.covered_hashes() {
+                    overlay.insert(source, pending_amendment.layer);
+                }
+            }
+        }
+        self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay)
             .inspect_err(|_| self.metrics.stark_settlements_rejected.inc())
     }
 
@@ -717,7 +729,29 @@ impl<S: KvStore + 'static> Node<S> {
             .get_head_block()?
             .map(|block| block.number())
             .unwrap_or(0);
-        for number in 0..=head {
+
+        // Fast-path: estimate the frontier to avoid an O(n) scan from genesis.
+        //
+        // The number of L1-settled sources in `settled_stark_sources` ≈ the block
+        // number of the canonical settlement frontier (one source per canonical block
+        // from genesis in normal operation).  The overlay contains pending-but-unsettled
+        // sources that have already passed validation and are queued for inclusion.
+        //
+        // Combined count - small lookback ≈ the first unsettled block, so we only
+        // need to scan a handful of blocks rather than the entire chain.
+        let settled_count = {
+            let lock = self.settled_stark_sources.lock();
+            lock.iter().filter(|(l, _)| *l == layer).count() as u64
+        };
+        let overlay_count = overlay_layers
+            .values()
+            .filter(|&&l| l >= layer)
+            .count() as u64;
+        let scan_start = settled_count
+            .saturating_add(overlay_count)
+            .saturating_sub(16); // small lookback to guard against gaps
+
+        for number in scan_start..=head {
             let Some(hash) = self.chain_store.get_block_hash_by_number(number)? else {
                 continue;
             };

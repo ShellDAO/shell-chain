@@ -181,6 +181,9 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             self.config.max_concurrent_proofs
         );
         let idle_sleep = tokio::time::Duration::from_millis(self.config.idle_poll_ms);
+        let mut last_stall_log = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(300))
+            .unwrap_or_else(std::time::Instant::now);
 
         loop {
             // Check shutdown signal.
@@ -212,7 +215,50 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
 
             match task {
                 None => {
-                    // Backlog empty — sleep briefly before polling again.
+                    // If the backlog is non-empty but pop returns None, log a stall
+                    // warning at most once per 60 seconds so it doesn't spam the log.
+                    {
+                        let backlog = self.backlog.lock();
+                        let depth = backlog.len();
+                        if depth > 0 && last_stall_log.elapsed().as_secs() >= 60 {
+                            last_stall_log = std::time::Instant::now();
+                            let first_block = backlog.min_block_number_for_layer(1).unwrap_or(0);
+                            let last_block = backlog.max_block_number_for_layer(1).unwrap_or(0);
+                            let stall_info = backlog.diagnose_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS);
+                            match stall_info {
+                                Some((entries, Some(gap), take)) => {
+                                    warn!(
+                                        depth,
+                                        first_block,
+                                        last_block,
+                                        entries,
+                                        gap_at_block = gap,
+                                        contiguous_take = take,
+                                        "STARK prover stalled: gap in backlog prevents reaching min_entries threshold"
+                                    );
+                                }
+                                Some((entries, None, take)) => {
+                                    warn!(
+                                        depth,
+                                        first_block,
+                                        last_block,
+                                        entries,
+                                        contiguous_take = take,
+                                        "STARK prover stalled: not enough entries in full backlog range (all 0-tx blocks?)"
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        depth,
+                                        first_block,
+                                        last_block,
+                                        "STARK prover stalled: pop returned None with non-empty backlog (diagnose_stall says OK?)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Backlog empty (or insufficient entries) — sleep briefly before polling again.
                     tokio::select! {
                         _ = tokio::time::sleep(idle_sleep) => {}
                         _ = shutdown_rx.changed() => {
