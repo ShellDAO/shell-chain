@@ -31,3 +31,22 @@ tools/tx-generator/target/
 /test-logs/
 /clippy_warnings.txt
 /warnings_output.txt
+# --- AI / Agent local state ---
+# Local AI/agent caches, configs, and scratch — do NOT commit.
+# The tracked SSoT files (AGENTS.md, CLAUDE.md, docs/agents/) are
+# intentional and remain version-controlled.
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.antigravity/
+.aider*
+.continue/
+.roo/
+.windsurf/
+.copilot/
+.copilot-session-state/
+.github/copilot-session-state/
+AGENTS.local.md
+CLAUDE.local.md
+*.agent.local.md
