@@ -218,7 +218,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     // If the backlog is non-empty but pop returns None, log a stall
                     // warning at most once per 60 seconds so it doesn't spam the log.
                     {
-                        let backlog = self.backlog.lock();
+                        let mut backlog = self.backlog.lock();
                         let depth = backlog.len();
                         if depth > 0 && last_stall_log.elapsed().as_secs() >= 60 {
                             last_stall_log = std::time::Instant::now();
@@ -236,6 +236,17 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                         contiguous_take = take,
                                         "STARK prover stalled: gap in backlog prevents reaching min_entries threshold"
                                     );
+                                    // The gap block's witness is permanently missing (pruned).
+                                    // The pre-gap range can never accumulate enough entries.
+                                    // Drain those tasks so the prover can advance past the gap.
+                                    warn!(
+                                        draining = take,
+                                        entries_lost = entries,
+                                        gap_at_block = gap,
+                                        "STARK prover: draining {} stuck tasks before permanent gap at block {}",
+                                        take, gap
+                                    );
+                                    backlog.drain_front(take);
                                 }
                                 Some((entries, None, take)) => {
                                     warn!(

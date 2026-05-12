@@ -354,12 +354,27 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
                 _ = block_timer.tick() => {
-                    // Periodically reseed the STARK backlog even when the prover
-                    // has been idle (e.g. after a long gap since last restart),
-                    // so the prover never permanently stalls with an empty backlog.
+                    // Periodically reseed the STARK backlog so the prover is never
+                    // starved of historical tasks.  Reseed when:
+                    //   a) the backlog is completely empty, OR
+                    //   b) the front of the backlog has a contiguous run whose total
+                    //      entries fall below the proving threshold (prover consumed
+                    //      most of the previously-seeded window; needs more history).
                     if self.config.node_role.runs_prover() {
-                        let backlog_depth = self.proof_backlog.lock().len();
-                        if backlog_depth == 0 {
+                        let needs_reseed = {
+                            let backlog = self.proof_backlog.lock();
+                            if backlog.len() == 0 {
+                                true
+                            } else {
+                                // If the contiguous front run has fewer entries than
+                                // the minimum, the prover is stalled — seed more.
+                                matches!(
+                                    backlog.diagnose_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS),
+                                    Some((entries, _, _)) if entries < MIN_L1_STARK_TXS
+                                )
+                            }
+                        };
+                        if needs_reseed {
                             if let Err(e) = self.enqueue_stark_frontier_backlog(DEFAULT_MAX_L1_RANGE_SOURCES) {
                                 warn!("failed to reseed STARK backlog on timer: {e}");
                             }

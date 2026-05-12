@@ -425,6 +425,18 @@ impl ProofBacklog {
         tasks
     }
 
+    /// Discard the first `n` tasks from the front of the backlog (e.g. to skip
+    /// a stuck pre-gap range whose witnesses are permanently missing).
+    pub fn drain_front(&mut self, n: usize) {
+        let count = n.min(self.pending.len());
+        for _ in 0..count {
+            if let Some(task) = self.pending.pop_front() {
+                self.total_completed += 1;
+                self.index_remove(&task);
+            }
+        }
+    }
+
     // ── Private index helpers ────────────────────────────────────────────────
 
     fn index_add(&mut self, task: &ProofTask) {
