@@ -2464,6 +2464,80 @@ mod tests {
             .expect("ordering should accept a contiguous range of empty canonical blocks");
     }
 
+    /// A STARK L1 reward that covers only 0-tx canonical blocks must return the
+    /// minimum base-mint reward (1 source × mint), not a multiple proportional
+    /// to the number of empty blocks in the range.
+    #[test]
+    fn stark_reward_value_empty_source_blocks_get_minimum_reward() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        // 4 more 0-tx blocks.
+        let hashes = produce_witnessed_blocks(&node, &signer, 4);
+
+        let amendment = dummy_ordered_amendment(
+            1,
+            vec![genesis_hash, hashes[0], hashes[1], hashes[2], hashes[3]],
+            4,
+        );
+
+        let reward = node.stark_reward_value(4, &amendment).unwrap();
+        // All 5 sources are 0-tx → non_empty_count=0 → source_count=1 (min).
+        // Layer-1 mint = BASE_STARK_MINT_WEI / 2¹.
+        const BASE: u128 = 100_000_000_000_000_000_000;
+        assert_eq!(
+            reward,
+            U256::from(BASE / 2),
+            "all-empty range must return minimum reward (1 × L1 mint), got {reward}"
+        );
+    }
+
+    /// Empty (0-tx) canonical blocks must NOT appear in `settled_stark_sources`
+    /// before a StarkReward is accepted, but MUST appear after the settlement
+    /// block is produced.  This ensures the seeding loop never skips empty
+    /// frontier blocks prematurely.
+    #[test]
+    fn empty_canonical_blocks_not_settled_until_stark_reward_accepted() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 3);
+
+        // Before any settlement, no block should be in settled_stark_sources.
+        {
+            let settled = node.settled_stark_sources.lock();
+            for hash in [genesis_hash, hashes[0], hashes[1], hashes[2]] {
+                assert!(
+                    !settled.contains(&(1, hash)),
+                    "block {hash:?} should not be settled before proof acceptance"
+                );
+            }
+        }
+
+        // Accept a StarkReward that covers all 4 empty blocks.
+        let amendment =
+            dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1], hashes[2]], 3);
+        node.pending_stark_settlements.lock().push(amendment);
+        node.produce_block(&signer, 100).unwrap();
+
+        // After settlement, all 4 empty-gap blocks must be marked settled.
+        let settled = node.settled_stark_sources.lock();
+        for hash in [genesis_hash, hashes[0], hashes[1], hashes[2]] {
+            assert!(
+                settled.contains(&(1, hash)),
+                "empty block {hash:?} must be settled after StarkReward accepted"
+            );
+        }
+    }
+
     // ── end stark-add-empty-range-tests ─────────────────────────────────────
 
     #[test]

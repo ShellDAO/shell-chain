@@ -1838,15 +1838,14 @@ impl<S: KvStore + 'static> Node<S> {
             .map(|a| a.block_number)
             .max()
             .unwrap_or(0);
-        // Also account for any tasks already in the backlog.
-        let backlog_max_block = self
-            .proof_backlog
-            .lock()
-            .max_block_number_for_layer(1)
-            .unwrap_or(0);
+        // Anchor scan at the actual frontier (settled/pending), NOT at
+        // backlog_max_block. backlog_max_block can be at the chain tip when
+        // the block-timer has added recent blocks, which would cause the
+        // reseed to skip the unsettled frontier window entirely.
+        // The inner loop's contains_source() check deduplicates any overlap
+        // with blocks already in the backlog.
         let scan_start = settled_l1_count
             .max(pending_max_block)
-            .max(backlog_max_block)
             .saturating_sub(16); // small lookback for safety
 
         for number in scan_start..=head {
