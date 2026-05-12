@@ -128,7 +128,7 @@ The keystore file is a JSON document inspired by the Ethereum Web3 Secret Storag
 ```json
 {
   "version": 1,
-  "address": "742d35cc6634c0532925a3b844bc9e7595f2bd18",
+  "address": "pq1...YOUR_PQ1_ADDRESS",
   "key_type": "dilithium3",
   "kdf": "argon2id",
   "kdf_params": {
@@ -209,6 +209,7 @@ version || algo_id || public_key  ──→  blake3()  ──→  32-byte hash  
 | Algorithm | Public Key | Secret Key | Signature | PQ Security |
 |-----------|-----------|------------|-----------|-------------|
 | **Dilithium3** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (128-bit) |
+| **ML-DSA-65** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (FIPS 204) |
 | **SPHINCS+-SHA2-256f** (shell-chain, secondary) | 32 B | 64 B | ~49,856 B | NIST Level 5 (256-bit) |
 | ECDSA secp256k1 (Ethereum) | 64 B | 32 B | 64 B | 0-bit PQ (broken) |
 | Ed25519 (Solana) | 32 B | 64 B | 64 B | 0-bit PQ (broken) |
@@ -292,9 +293,9 @@ SPHINCS+ keystores use `"key_type": "sphincs-sha2-256f"` and are managed with th
 
 The `MultiVerifier` automatically detects the algorithm from the signature's embedded type tag, enabling mixed validator sets where some validators use Dilithium3 and others use SPHINCS+.
 
-### ML-DSA-65 (Planned)
+### ML-DSA-65 (Available)
 
-The `SignatureType` enum includes a reserved variant for **ML-DSA-65** (FIPS 204), the finalized NIST standard based on Dilithium. Shell-chain will add ML-DSA-65 support when stable implementations are available in the Rust ecosystem. This will be a non-breaking upgrade — existing Dilithium3 keys and signatures remain valid.
+ML-DSA-65 (FIPS 204) shipped in the F-TESTNET-FIXES sprint using the `fips204` crate. Use `--algo ml-dsa-65` with `shell-node key generate`. Existing Dilithium3 keys and signatures remain valid.
 
 ### Hybrid Schemes (Research)
 
@@ -332,4 +333,4 @@ Shell-chain is quantum-ready today. No migration will be needed when quantum com
 
 ---
 
-*Last updated: 2025*
+*Last updated: 2026-05-13*

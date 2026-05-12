@@ -36,9 +36,7 @@ ws://127.0.0.1:8546
 
 All requests use POST with `Content-Type: application/json`.
 
-**Address note:** the canonical external account format is `pq1...`. Some
-input paths still accept legacy `0x...` addresses as a migration shim, but the
-examples below use `pq1...` placeholders for account addresses.
+**Address note:** All RPC input and output addresses use bech32m `pq1...` format (since v0.21.0 / F-PQ1-ONLY). Legacy `0x` hex addresses are rejected on every input path.
 
 ## CORS Configuration
 
@@ -337,7 +335,7 @@ Returns the balance of an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical; legacy `0x...` accepted on some input paths) |
+| 1 | `String` | Yes | Address (`pq1...` canonical) |
 | 2 | `String` | No | Block tag (`"latest"`, `"earliest"`, `"pending"`, `"safe"`, `"finalized"`, or hex number) |
 
 **Returns:** `String` — Hex-encoded balance in wei.
@@ -361,7 +359,7 @@ Returns the nonce (transaction count) for an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical; legacy `0x...` accepted on some input paths) |
+| 1 | `String` | Yes | Address (`pq1...` canonical) |
 | 2 | `String` | No | Block tag |
 
 **Returns:** `String` — Hex-encoded nonce.
@@ -810,7 +808,7 @@ Returns the post-quantum public key associated with an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical; legacy `0x...` accepted on some input paths) |
+| 1 | `String` | Yes | Address (`pq1...` canonical) |
 
 **Returns:** `String|null` — Hex-encoded PQ public key, or `null` if not found.
 
@@ -1425,75 +1423,80 @@ curl -s http://localhost:8545 \
   -d '{"jsonrpc":"2.0","method":"trace_transaction","params":["0xabc123..."],"id":1}'
 ```
 
+### shell_getProofAmendment
+
+Returns the STARK proof amendment for a block if one has been generated asynchronously. See [stark-aggregation.md](stark-aggregation.md) for the full response schema.
+
+**Parameters:**
+| # | Type | Required | Description |
+|---|------|----------|-------------|
+| 1 | `String` | Yes | Block hash (`0x...`) |
+
+**Returns:** `Object|null` — Proof amendment object or `null` if not yet generated.
+
+---
+
+### shell_estimateBatch
+
+Estimates gas for an AA batch transaction.
+
+**Parameters:**
+| # | Type | Required | Description |
+|---|------|----------|-------------|
+| 1 | `Object` | Yes | Batch transaction object |
+
+**Returns:** `String` — Hex-encoded gas estimate.
+
+---
+
+### shell_getPaymasterPolicy
+
+Returns the paymaster policy for a given paymaster address.
+
+**Parameters:**
+| # | Type | Required | Description |
+|---|------|----------|-------------|
+| 1 | `String` | Yes | Paymaster address (`pq1...`) |
+
+**Returns:** `Object|null` — Policy object or `null` if no policy registered.
+
+---
+
+### shell_isSponsored
+
+Returns whether a transaction would be sponsored by a paymaster.
+
+**Parameters:**
+| # | Type | Required | Description |
+|---|------|----------|-------------|
+| 1 | `Object` | Yes | Transaction object |
+
+**Returns:** `Boolean` — `true` if the transaction would be sponsored.
+
+---
+
+### shell_consensusInfo
+
+Returns current consensus engine state.
+
+**Parameters:** None
+
+**Returns:**
+```json
+{
+  "engine": "wpoa",
+  "currentProposer": "pq1...",
+  "epochNumber": 5,
+  "validatorCount": 3,
+  "finalizedHeight": "0x18"
+}
+```
+
 ---
 
 ## Method Summary
 
-| Namespace | Method | Params | Description |
-|-----------|--------|--------|-------------|
-| eth_ | `eth_blockNumber` | — | Current block height |
-| eth_ | `eth_chainId` | — | Chain ID |
-| eth_ | `eth_syncing` | — | Sync status |
-| eth_ | `eth_mining` | — | Is validator active |
-| eth_ | `eth_hashrate` | — | Always 0x0 |
-| eth_ | `eth_accounts` | — | Always [] |
-| eth_ | `eth_protocolVersion` | — | Protocol version |
-| eth_ | `eth_gasPrice` | — | Current base fee |
-| eth_ | `eth_maxPriorityFeePerGas` | — | Always 0x0 |
-| eth_ | `eth_feeHistory` | count, block, percentiles | Fee history |
-| eth_ | `eth_getBalance` | addr, block? | Account balance |
-| eth_ | `eth_getTransactionCount` | addr, block? | Account nonce |
-| eth_ | `eth_getBlockByNumber` | num, full? | Block by number |
-| eth_ | `eth_getBlockByHash` | hash, full? | Block by hash |
-| eth_ | `eth_getTransactionByHash` | hash | Transaction details |
-| eth_ | `eth_getTransactionReceipt` | hash | Transaction receipt |
-| eth_ | `eth_sendRawTransaction` | data | Submit signed tx |
-| eth_ | `eth_call` | tx, block? | Read-only EVM call |
-| eth_ | `eth_estimateGas` | tx | Gas estimation |
-| eth_ | `eth_createAccessList` | tx, block? | Access list |
-| eth_ | `eth_getCode` | addr, block? | Contract bytecode |
-| eth_ | `eth_getStorageAt` | addr, pos, block? | Storage slot |
-| eth_ | `eth_getLogs` | filter | Event logs |
-| eth_ | `eth_newFilter` | filter | Create log filter |
-| eth_ | `eth_newBlockFilter` | — | Create block filter |
-| eth_ | `eth_getFilterChanges` | id | Poll filter |
-| eth_ | `eth_getFilterLogs` | id | Re-query filter |
-| eth_ | `eth_uninstallFilter` | id | Remove filter |
-| eth_ | `eth_blobBaseFee` | — | Blob gas price |
-| eth_ | `eth_subscribe` | type, filter? | WebSocket subscription |
-| eth_ | `eth_unsubscribe` | id | Cancel subscription |
-| net_ | `net_version` | — | Chain ID (string) |
-| net_ | `net_listening` | — | Always true |
-| net_ | `net_peerCount` | — | Peer count |
-| web3_ | `web3_clientVersion` | — | Client version |
-| web3_ | `web3_sha3` | data | Keccak-256 hash |
-| shell_ | `shell_getPqPubkey` | addr | PQ public key |
-| shell_ | `shell_pendingCount` | — | Mempool size |
-| shell_ | `shell_sendTransaction` | tx | Submit PQ tx |
-| shell_ | `shell_getValidators` | — | Validator list |
-| shell_ | `shell_getValidatorStatus` | addr | Validator check |
-| shell_ | `shell_proposeAddValidator` | addr | Governance: add |
-| shell_ | `shell_proposeRemoveValidator` | addr | Governance: remove |
-| shell_ | `shell_encodeAddValidator` | addr | Encode calldata |
-| shell_ | `shell_encodeRemoveValidator` | addr | Encode calldata |
-| shell_ | `shell_estimateGovernanceGas` | op | Gov gas estimate |
-| shell_ | `shell_getGovernanceInfo` | — | Gov config |
-| shell_ | `shell_getNodeInfo` | — | Node status |
-| shell_ | `shell_getNetworkStats` | — | Network stats |
-| shell_ | `shell_getChainStats` | — | Chain statistics |
-| shell_ | `shell_getFinalityInfo` | — | Finality status |
-| shell_ | `shell_getBlockSigners` | num | Block PQ signers |
-| shell_ | `shell_verifyPqSignature` | msg, sig, pubkey | Verify PQ signature |
-| shell_ | `shell_getEpochInfo` | — | Epoch info |
-| shell_ | `shell_getValidatorVotes` | — | Validator activity |
-| shell_ | `shell_getPendingGovernanceProposals` | — | Pending proposals |
-| debug_ | `debug_traceTransaction` | hash, opts? | Tx trace |
-| debug_ | `debug_traceBlockByNumber` | num, opts? | Block trace |
-| trace_ | `trace_block` | num | OE block traces |
-| trace_ | `trace_oeTransaction` | hash | OE tx trace |
-| trace_ | `trace_transaction` | hash | Standard tx trace |
-
-**Total: 61 methods** (31 eth, 3 net, 2 web3, 20 shell, 2 debug, 3 trace)
+For the canonical method list (currently 79 methods across `web3_`, `net_`, `eth_`, `debug_`, `trace_`, `evm_`, `shell_` namespaces), see `docs/rpc-reference.md`, which is auto-generated from `crates/rpc/src/api.rs`.
 
 ---
 

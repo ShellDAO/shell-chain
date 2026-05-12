@@ -216,11 +216,13 @@ cp .env.example .env
 docker compose -f docker-compose.alpha.yml up -d
 ```
 
+> The production testnet uses `wpoa` consensus engine; see `genesis-format.md`.
+
 ### Health Check
 
 ```bash
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.21.0","block_height":...}
+# {"status":"ok","version":"0.22.2","block_height":...}
 
 curl http://localhost:9090/ready
 # {"ready":true} or {"ready":false,"reason":"..."}
@@ -235,7 +237,7 @@ For more details on alpha testnet operations, see the [Testnet Operator Guide](T
 - **Run a multi-node testnet:** See the [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md) for Docker deployment with 3 validators + monitoring.
 - **Choose a storage profile:** `--storage-profile archive` (full history), `full` (default — TX history forever, STARK replaces PQ witnesses), or `light` (~2 h rolling window). See [Block Pruning & Compression](BLOCK_PRUNING_AND_COMPRESSION.md).
 - **Deploy smart contracts:** See [Smart Contract Guide](SMART_CONTRACT_GUIDE.md) for deploying Solidity/Vyper contracts with Hardhat or Foundry.
-- **Full API reference:** See [JSON-RPC API Reference](JSON_RPC_API.md) for all 61 RPC methods.
+- **Full API reference:** See [JSON-RPC API Reference](JSON_RPC_API.md) for all 79 RPC methods.
 - **Understand the cryptography:** See [PQ Crypto Guide](PQ_CRYPTO_GUIDE.md) for details on Dilithium3, key formats, and quantum resistance.
 - **Deploy a contract:** Use `shell-node tx deploy --code 0x... --keystore my-key.json`.
 - **Make a read-only call:** Use `shell-node tx call --to pq1CONTRACT_ADDRESS --data 0x...`.
@@ -243,4 +245,4 @@ For more details on alpha testnet operations, see the [Testnet Operator Guide](T
 
 ---
 
-*Last updated: 2026-04-20*
+*Last updated: 2026-05-13*

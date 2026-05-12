@@ -9,7 +9,9 @@ All benchmarks run on the Criterion framework (`cargo bench -p bench`).
 
 ---
 
-## A3: STARK Signature Aggregation (v0.15.0)
+## A3: STARK Signature Aggregation (v0.15.0 baseline)
+
+> **v0.22.x note:** v0.22.x ships multi-layer (L1/L2/L3) recursive STARK compression. For current per-layer compression numbers, see [`docs/BLOCK_PRUNING_AND_COMPRESSION.md`](BLOCK_PRUNING_AND_COMPRESSION.md).
 
 ### Methodology
 
@@ -141,10 +143,10 @@ At 95% dedup: ~1.77 MB/block = **~34% reduction from A2 alone**
 
 | Scenario | Per-block | Per-hour | Per-day |
 |---------|----------|---------|--------|
-| Baseline (no optimization) | 2.70 MB | 4.70 GB | 113 GB |
-| A1 only (Zstd, ~12% disk) | 2.38 MB | 4.13 GB | ~99 GB |
-| A2 only (95% dedup) | 1.77 MB | 3.07 GB | ~74 GB |
-| A1 + A2 combined | ~1.56 MB | ~2.71 GB | ~65 GB |
+| Baseline (no optimization) | 2.70 MB | 2.35 GB | ~56 GB |
+| A1 only (Zstd, ~12% disk) | 2.38 MB | 2.07 GB | ~49 GB |
+| A2 only (95% dedup) | 1.77 MB | 1.54 GB | ~37 GB |
+| A1 + A2 combined | ~1.56 MB | ~1.36 GB | ~32 GB |
 
 **Combined reduction: ~42% vs baseline** at 95% dedup rate. The 50% design target is
 achievable at ≥99% dedup rate or when account deduplication extends to intra-epoch reuse.
@@ -182,3 +184,13 @@ open target/criterion/rocksdb_write/write_zstd_cold/report/index.html
 | Signature scheme | Dilithium3 (CRYSTALS-Dilithium, NIST PQC standard) |
 | Pubkey size | 1,952 bytes (`DILITHIUM3_PUBKEY_LEN`) |
 | Signature size | 3,309 bytes |
+
+### v0.22.0 Settlement Metrics
+
+The following Prometheus metrics were added in v0.22.0 to monitor STARK settlement liveness:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `shell_stark_frontier_lag` | Gauge | Blocks between chain tip and highest contiguous settled layer |
+| `shell_stark_settlements_accepted_total` | Counter | STARK settlement transactions accepted |
+| `shell_stark_settlements_rejected_total` | Counter | STARK settlements rejected (ordering/layer violations) |

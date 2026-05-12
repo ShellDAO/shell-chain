@@ -10,7 +10,7 @@ Bring up the 3-validator wPoA testnet (chain_id=10) and observe stable block pro
 - [ ] Ports open: 30303/tcp (P2P), 8545/tcp (RPC), 9090/tcp (metrics)
 - [ ] DNS configured: `rpc.testnet.shell.network` → node1 IP
 - [ ] Keystores for all 3 validators generated and backed up
-- [ ] `SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.21.0` available or built locally
+- [ ] `SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.22.2` available or built locally
 
 ## Step-by-Step Bring-Up
 
@@ -33,7 +33,7 @@ cp /path/to/node1-validator.key keys/node1.key
 
 # Configure
 cat > .env << 'EOF'
-SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.21.0
+SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.22.2
 NODE1_KEY_PATH=./keys/node1.key
 KEY_PASSWORD=<secure-password>
 EXTERNAL_IP=<node1-public-ip>
@@ -66,7 +66,7 @@ its environment as follows once cloned:
 ```bash
 cd /path/to/your/faucet/checkout
 cp .env.example .env
-# Edit .env: FAUCET_PRIVATE_KEY=<funded-key>, RPC_URL=http://rpc.testnet.shell.network:8545
+# Edit .env: FAUCET_KEYSTORE_FILE=<path/to/faucet-keystore.json>, FAUCET_KEYSTORE_PASSWORD=<password>, RPC_URL=http://rpc.testnet.shell.network:8545
 npm install && npm run build
 npm start &
 ```
@@ -78,7 +78,7 @@ Check every 2h during the first 24h:
 ```bash
 # Block production still advancing?
 curl -s http://rpc.testnet.shell.network:8545 \
-  -d '{"jsonrpc":"2.0","method":"shell_blockNumber","params":[],"id":1}' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
   -H 'Content-Type: application/json' | jq .result
 
 # All 3 nodes healthy?
@@ -89,7 +89,7 @@ docker compose logs node1 | grep "view.change\|WPoA" | tail -20
 
 # Peer counts
 curl -s http://localhost:8545 \
-  -d '{"jsonrpc":"2.0","method":"shell_peerCount","params":[],"id":1}' \
+  -d '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
   -H 'Content-Type: application/json'
 ```
 
@@ -98,7 +98,7 @@ curl -s http://localhost:8545 \
 - [ ] Block production continuous for 24h (no gaps > 30s)
 - [ ] 0 unplanned view-changes
 - [ ] All 3 nodes maintain ≥ 2 peers
-- [ ] Finalized block advances (shell_getFinalizedBlock)
+- [ ] Finalized block advances (shell_getFinalityInfo)
 - [ ] Grafana dashboard green for all 24h
 - [ ] Faucet successfully funded test accounts
 

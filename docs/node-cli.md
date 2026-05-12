@@ -1,6 +1,6 @@
 # Shell-Node CLI Reference
 
-> `shell-node` v0.21.0 — post-quantum blockchain node (ML-DSA-65 / Dilithium3)
+> `shell-node` v0.22.2 — post-quantum blockchain node (ML-DSA-65 / Dilithium3)
 
 ---
 
@@ -82,7 +82,7 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--storage-profile <PROFILE>` | `full` | Storage classification: `archive`, `full`, or `light` |
 | `--witness-retention <N>` | profile default | Override witness bundle retention (0 = keep forever) |
 | `--body-retention <N>` | profile default | Override TX body retention (0 = keep forever) |
-| `--enable-stark-aggregation` | `false` | Enable STARK aggregate proof generation (expensive) |
+| `--enable-stark-aggregation` | `true` | Enable STARK aggregate proof generation (expensive; default `true` since v0.21.0) |
 | `--consensus-engine <ENGINE>` | `poa` | Consensus engine: `poa` or `wpoa` |
 
 **Network Profile Defaults:**

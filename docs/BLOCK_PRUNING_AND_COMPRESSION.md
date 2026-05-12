@@ -72,11 +72,11 @@ ProofAmendment total ≈ 15 KB  (constant per block, independent of tx count)
 ### Daily savings at sustained load
 
 ```
-Block time: 1 s  →  86,400 blocks/day
+Block time: 2 s  →  43,200 blocks/day
 
-@ 50 tx/block:   86,400 × 180 KB  ≈  15 GB/day
-@ 100 tx/block:  86,400 × 375 KB  ≈  31 GB/day
-@ 200 tx/block:  86,400 × 765 KB  ≈  64 GB/day
+@ 50 tx/block:   43,200 × 180 KB  ≈  7.5 GB/day
+@ 100 tx/block:  43,200 × 375 KB  ≈  15.5 GB/day
+@ 200 tx/block:  43,200 × 765 KB  ≈  32 GB/day
 ```
 
 TX Detail (`b/`) + ProofAmendment (`pa/`) together add only ~22 KB/block, so

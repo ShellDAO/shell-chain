@@ -160,6 +160,9 @@ witness bundle if the storage profile is not `"archive"` and the
 | Metric | Description |
 |--------|-------------|
 | `stark_amendments_queried_total` | Incremented each time `shell_getProofAmendment` returns a non-null proof. |
+| `shell_stark_settlements_accepted_total` | STARK settlement transactions accepted into chain state (v0.22.x). |
+| `shell_stark_settlements_rejected_total` | STARK settlements rejected due to ordering, layer, or frontier violations (v0.22.x). |
+| `shell_stark_frontier_lag` | Blocks between the chain tip and the highest continuously-settled STARK layer. Alert if > 100 (v0.22.x). |
 
 ---
 
@@ -171,8 +174,23 @@ witness bundle if the storage profile is not `"archive"` and the
    Verifiers check `sig over (block_hash ‖ block_number ‖ proof.batch_root_bytes)`.
 3. **STARK soundness** — The STARK proof itself proves that all transaction signatures in
    the block are valid PQ signatures without revealing the raw signatures.
-4. **Amendment ordering** — Only one amendment per block hash is stored. Later amendments
-   overwrite earlier ones only if from a higher-priority registered prover.
+4. **Amendment ordering** — Only one amendment per `(layer, source_hash)` pair is stored (tracked by `SettledSourceIndex`, `ss/` key prefix). A settlement from a lower-priority prover cannot overwrite one from a higher-priority prover. The index is rebuilt from genesis on first v0.22.x boot.
+
+---
+
+## Multi-Layer Settlement (v0.22.x)
+
+v0.22.x introduced **recursive multi-layer STARK compression** with three compression layers:
+
+| Layer | Description |
+|-------|-------------|
+| **L1** | Per-block STARK proofs over raw PQ signatures (`ProofAmendment`) |
+| **L2** | Epoch-level STARK proofs recursively compressing L1 proofs from an epoch |
+| **L3** | Long-horizon STARK proofs recursively compressing L2 epoch proofs |
+
+Settlement pairs `(layer, source_hash)` are durably tracked in `SettledSourceIndex` (RocksDB key prefix `ss/`). On first boot after upgrading to v0.22.x, the index is rebuilt from genesis — expect a one-time warmup delay.
+
+StarkReward system transactions (`shellType: "starkReward"`) carry settlement payloads and appear as ordinary transactions in blocks. The `decodedInput` field in `eth_getTransactionByHash` responses describes the settlement layer and source range.
 
 ---
 

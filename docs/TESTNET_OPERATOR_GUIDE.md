@@ -146,7 +146,7 @@ All nodes use an `eth_blockNumber` JSON-RPC health check (10s interval, 5s timeo
 
 ## Alpha Testnet Deployment
 
-Shell-Chain provides a dedicated `docker-compose.alpha.yml` for joining the public alpha testnet.
+Shell-Chain provides a dedicated `docker-compose.alpha.yml` for joining the public alpha testnet. At v0.22.x, this file is for reference only; the production topology is systemd-based — see `infra/testnet/setup-systemd.sh`.
 
 ### Quick start
 
@@ -202,7 +202,7 @@ curl http://localhost:9090/health
 **Response (200 OK):**
 
 ```json
-{"status":"ok","version":"0.21.0","block_height":1234}
+{"status":"ok","version":"0.22.2","block_height":1234}
 ```
 
 The node is considered alive if the process is running and can respond to HTTP requests.
@@ -688,6 +688,30 @@ When using `--log-format json`, pipe logs to a file and use `logrotate` or simil
 shell-node run --config config.toml --log-format json 2>&1 | \
   tee -a /var/log/shell-chain/node.log
 ```
+
+---
+
+## v0.22.x STARK Settlement Operations
+
+### SettledSourceIndex warm-up
+
+On the first boot after upgrading to v0.22.x, `SettledSourceIndex` is rebuilt from genesis automatically. Expect a one-time longer startup (seconds to minutes depending on chain length). Normal operation resumes once backfill completes.
+
+### STARK frontier monitoring
+
+Monitor `shell_stark_frontier_lag` (the difference in blocks between the chain tip and the highest continuously-settled STARK layer). Alert if it exceeds **100 blocks** — this indicates the prover is falling behind.
+
+### New v0.22.x metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `shell_stark_settlements_accepted_total` | Counter | STARK settlement transactions accepted into chain state |
+| `shell_stark_settlements_rejected_total` | Counter | STARK settlements rejected (ordering/layer/frontier violations) |
+| `shell_stark_frontier_lag` | Gauge | Blocks between chain tip and highest contiguous settled layer |
+
+### StarkReward system transactions
+
+v0.22.x introduces `StarkReward` system transactions that carry STARK proof settlement payloads. These appear as ordinary transactions in blocks with `shellType: "starkReward"`. Block explorers may need to update their rendering to decode the `decodedInput` field returned by `eth_getTransactionByHash`.
 
 ---
 

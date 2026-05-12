@@ -212,21 +212,6 @@ Ethereum add-on AA layer.
 
 ---
 
-## 7. Rollout boundary for testnet
-
-Native AA + `pq1...` addressing is a release-boundary change.
-
-For the first public M9-compatible testnet:
-
-- a **one-time testnet reset** is required
-- genesis must be **rebuilt** with the new `pq1...` address space
-- old world-state / RocksDB / mempool data is **not** migrated in place
-
-The same private keys may be reused, but their exported Shell-Chain addresses
-must be re-derived under the new address scheme.
-
----
-
 ## 8. Implementation status
 
 | Area | Status | Notes |

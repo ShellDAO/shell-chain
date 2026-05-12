@@ -2,7 +2,7 @@
 
 <!-- [![Build Status](https://img.shields.io/github/actions/workflow/status/LucienSong/shell-chain/ci.yml?branch=main)](https://github.com/LucienSong/shell-chain/actions) -->
 <!-- [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) -->
-<!-- [![Version](https://img.shields.io/badge/version-0.15.0-green.svg)](CHANGELOG.md) -->
+<!-- [![Version](https://img.shields.io/badge/version-0.22.2-green.svg)](CHANGELOG.md) -->
 
 The first EVM-compatible, post-quantum blockchain — quantum-safe **before Q-Day**, no migration needed.
 
@@ -17,7 +17,7 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 - 🏗️ **Native Account Abstraction** — protocol-level smart accounts with built-in PQ validation, key rotation, and custom validator hooks
 - 🧩 **PQ Precompiles** — on-chain Dilithium/SPHINCS+ verification, Kyber decapsulation, STARK proof verification
 - ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with stake-weighted proposer selection, slashing, and finality tracking
-- ⚡ **STARK Sig-Aggregation** — Winterfell STARK proofs compress Dilithium3 signatures **7× per block**; 157 proofs/sec sustained throughput
+- ⚡ **STARK Sig-Aggregation** — Winterfell STARK proofs compress Dilithium3 signatures **7× per block**; 157 proofs/sec sustained throughput. v0.22.x introduces multi-layer (L1/L2/L3) recursive STARK compression for further on-chain data reduction.
 - 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
 - 🛠️ **Developer Ecosystem** — TypeScript SDK (`shell-sdk`) with viem-based PQ signers and AA transaction builders
 - 🌐 **P2P Networking** — libp2p with GossipSub, Kademlia DHT, peer scoring, and message signature verification
@@ -97,6 +97,7 @@ For the full design and current implementation status, see
 | `shell-cli` | CLI binary: `run`, `init`, `key`, `tx`, `account`, TOML config, structured logging |
 | `shell-genesis` | Genesis block initialization from config |
 | `shell-keystore` | PQ keystore with argon2id + XChaCha20-Poly1305 encryption |
+| `shell-stark-prover` | STARK proof generation and aggregation service (`crates/stark-prover/`) |
 
 ### Project Structure
 
@@ -147,6 +148,9 @@ For details, see [docs/PQ_CRYPTO_GUIDE.md](docs/PQ_CRYPTO_GUIDE.md).
 - [PQ Crypto Guide](docs/PQ_CRYPTO_GUIDE.md) — post-quantum cryptography details
 - [Native Account Abstraction Guide](docs/ACCOUNT_ABSTRACTION_GUIDE.md) — `pq1...` addresses, validation layers, and AA rollout
 - [Block Pruning & Compression](docs/BLOCK_PRUNING_AND_COMPRESSION.md) — storage profiles (archive/full/light), block body lifecycle, STARK compression
+- [STARK Aggregation](docs/stark-aggregation.md) — STARK aggregate proof architecture and multi-layer settlement
+- [Prover Guide](docs/PROVER_GUIDE.md) — running a dedicated prover node
+- [Consensus Details](docs/CONSENSUS_DETAILS.md) — wPoA consensus engine internals
 - [Changelog](CHANGELOG.md) — full release history
 
 ## Contributing

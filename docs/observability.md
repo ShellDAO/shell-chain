@@ -30,7 +30,7 @@ listen_addr = "0.0.0.0:9000"   # default
 ```json
 {
   "status": "ok",
-  "version": "0.18.0",
+  "version": "0.22.2",
   "block_height": 12345,
   "peer_count": 4,
   "syncing": false
@@ -92,6 +92,9 @@ All metrics are prefixed `shell_`.
 | `shell_stark_backlog_depth` | Gauge | Pending proof tasks in queue |
 | `shell_stark_amendments_broadcast_total` | Counter | ProofAmendment messages broadcast |
 | `shell_stark_equivocations_detected_total` | Counter | Equivocation proofs detected |
+| `shell_stark_settlements_accepted_total` | Counter | STARK settlement transactions accepted (v0.22.x) |
+| `shell_stark_settlements_rejected_total` | Counter | STARK settlements rejected — ordering/layer/frontier violations (v0.22.x) |
+| `shell_stark_frontier_lag` | Gauge | Blocks between chain tip and highest contiguous settled layer (alert if > 100) (v0.22.x) |
 
 ### RPC
 
@@ -100,7 +103,7 @@ All metrics are prefixed `shell_`.
 | `shell_rpc_request_duration_seconds` | Histogram | `method` | Request latency per JSON-RPC method |
 
 Use `record_rpc_call(method, duration_secs)` on the `Metrics` handle to record
-a completed call. Integration with jsonrpsee middleware is tracked in OPS-4.
+a completed call. Integration with jsonrpsee middleware is planned for a future release.
 
 ### Storage
 

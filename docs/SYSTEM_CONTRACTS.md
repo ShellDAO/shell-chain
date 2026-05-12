@@ -138,8 +138,8 @@ interface IAccountManager {
 ### Key rotation example
 
 ```bash
-# Encode a rotateKey calldata with shell-cli
-shell-cli encode-rotate-key --pubkey /path/to/new_pubkey.bin --algo dilithium3
+# Encode a rotateKey calldata with shell-node
+shell-node encode-rotate-key --pubkey /path/to/new_pubkey.bin --algo dilithium3
 
 # Submit via RPC
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
@@ -168,10 +168,10 @@ for the full `IAccountValidator` interface and examples.
 
 ```bash
 # Set validation code
-shell-cli encode-set-validation-code --code-hash 0xabc123...
+shell-node encode-set-validation-code --code-hash 0xabc123...
 
 # Clear (revert to PQ default)
-shell-cli encode-clear-validation-code
+shell-node encode-clear-validation-code
 ```
 
 ---

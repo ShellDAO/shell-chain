@@ -26,7 +26,7 @@ Shell-Chain is fully EVM-compatible (Cancun spec). Any contract written in Solid
 | Network | RPC URL | Chain ID |
 |---------|---------|----------|
 | **Local** | `http://localhost:8545` | 1337 |
-| **Alpha Testnet** | `http://testnet.shell.xyz` | 1337 |
+| **Alpha Testnet** | `http://testnet.shell.xyz` | 10 |
 
 The local endpoint is the default JSON-RPC server started by `shell-node run`. The alpha testnet endpoint is served via nginx reverse proxy (see [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md)).
 
@@ -56,7 +56,7 @@ module.exports = {
     },
     shellAlpha: {
       url: "http://testnet.shell.xyz",
-      chainId: 1337,
+      chainId: 10,
     }
   }
 };
@@ -192,13 +192,10 @@ curl -s http://localhost:8545 \
 
 Or with Hardhat:
 
-> **Compatibility note:** raw Shell RPC examples prefer canonical `pq1...`
-> addresses. Some Ethereum toolchains such as ethers.js still expect a 20-byte
-> hex/debug address string today, so the Hardhat snippets below keep using the
-> legacy compatibility form for the contract address only.
+> **Compatibility note:** Shell-native EOA and contract addresses use bech32m `pq1...` format. Tooling that hardcodes 20-byte hex inputs (e.g., default Hardhat scripts) will fail at the Shell RPC boundary; use the shell-sdk pq1 helpers.
 
 ```js
-const counter = await hre.ethers.getContractAt("Counter", "0xYOUR_CONTRACT_HEX_ADDRESS");
+const counter = await hre.ethers.getContractAt("Counter", "pq1...YOUR_CONTRACT_PQ1_ADDRESS");
 const count = await counter.get();
 console.log("Current count:", count.toString());
 ```
@@ -222,7 +219,7 @@ curl -s http://localhost:8545 \
 Or with Hardhat:
 
 ```js
-const counter = await hre.ethers.getContractAt("Counter", "0xYOUR_CONTRACT_HEX_ADDRESS");
+const counter = await hre.ethers.getContractAt("Counter", "pq1...YOUR_CONTRACT_PQ1_ADDRESS");
 const tx = await counter.increment();
 await tx.wait();
 console.log("Incremented! New count:", (await counter.get()).toString());
@@ -400,11 +397,11 @@ Shell-Chain uses the **EIP-1559** gas model:
 
 ## Further Reading
 
-- [JSON-RPC API Reference](JSON_RPC_API.md) — Full list of all 61 RPC methods
+- [JSON-RPC API Reference](JSON_RPC_API.md) — Full list of all 79 RPC methods
 - [PQ Crypto Guide](PQ_CRYPTO_GUIDE.md) — Post-quantum signature details
 - [Testnet Operator Guide](TESTNET_OPERATOR_GUIDE.md) — Running testnet nodes
 - [Quickstart Guide](QUICKSTART.md) — Get a node running in 5 minutes
 
 ---
 
-*Last updated: 2025*
+*Last updated: 2026-05-13*

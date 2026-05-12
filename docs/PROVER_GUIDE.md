@@ -108,7 +108,7 @@ A prover node does not need a validator keystore. It needs:
 ### Step 1: Generate a prover key
 
 ```bash
-shell-cli keygen --algo dilithium3 --out /data/prover-keystore.json
+shell-node key generate --algorithm dilithium3 --output /data/prover-keystore.json
 # Enter passphrase when prompted
 ```
 
@@ -181,7 +181,7 @@ proving_priority = "sequential"
 node_role = "validator"       # "validator" | "validator-prover" | "prover"
 
 [consensus]
-enable_stark_aggregation = false  # set true to enable ProofAmendment flow
+enable_stark_aggregation = true   # defaults to true since v0.21.0; set false only to disable
 
 [prover]
 max_concurrent_proofs = 1         # parallel proof jobs

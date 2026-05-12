@@ -50,7 +50,152 @@ No migration required. Two new RocksDB column families are created automatically
 
 ---
 
-## v0.9 → v0.13.0 (M10: Mainnet Readiness)
+## v0.15.0 → v0.20.0 (wPoA Genesis & Testnet Launch)
+
+### Overview
+
+v0.20.0 activates the Weighted Proof of Authority (wPoA) consensus engine as a first-class production path, launches the public testnet (chain ID 10), and autogenerates the canonical RPC reference doc (79 methods).
+
+### Breaking: Genesis format
+
+Genesis files with a `[consensus]` section must now use the `"engine"` field:
+
+```json
+{
+  "engine": "wpoa",
+  "chainId": 10,
+  "authorities": [
+    { "address": "pq1...", "weight": 2 },
+    { "address": "pq1...", "weight": 1 },
+    { "address": "pq1...", "weight": 1 }
+  ]
+}
+```
+
+The old `"engine": "poa"` single-authority format still works but receives no new features.
+
+### New CLI flag
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--consensus-engine poa\|wpoa` | auto | Override consensus engine (auto-detected from genesis `engine` field) |
+
+### New RPC method
+
+| Method | Description |
+|--------|-------------|
+| `shell_consensusInfo` | Returns current engine type, epoch length, and live validator set with weights |
+
+### Data directory
+
+No migration required. New column family `validator_registry` created automatically.
+
+### Docker image
+
+```yaml
+image: ghcr.io/shelldao/shell-chain:0.22.2
+```
+
+---
+
+## v0.20.0 → v0.21.0 (F-PQ1-ONLY: `pq1...` address enforcement)
+
+### Overview
+
+v0.21.0 is a **breaking** release. All `0x` hex addresses are completely removed from every input path. Operators must update keystores, genesis files, scripts, and SDK calls before upgrading.
+
+### Breaking: `0x` addresses rejected everywhere
+
+- **RPC**: `eth_getBalance`, `eth_getTransactionCount`, `shell_getPqPubkey`, and all other methods reject `0x...` address parameters. Use `pq1...` bech32m addresses exclusively.
+- **CLI**: `shell-node tx send --to`, `genesis add-alloc`, `key inspect` all output and accept `pq1...` only.
+- **Genesis files**: `alloc` map keys must be `pq1...`. Re-derive addresses with `shell-node key inspect <keystore.json>`.
+- **SDK**: `signer.getHexAddress()` removed. Use `signer.getAddress()` (returns `pq1...`).
+- **Keystores**: `address` field stored as `pq1...`. Old keystores with `0x` hex address are still **readable** (backwards compat for decryption), but all newly generated keystores use `pq1...`.
+
+### Breaking: Faucet environment variables
+
+The faucet service no longer accepts a raw private key. Replace:
+
+```bash
+# Old (< v0.21.0)
+FAUCET_PRIVATE_KEY=<hex-private-key>
+
+# New (v0.21.0+)
+FAUCET_KEYSTORE_FILE=/path/to/faucet-keystore.json
+FAUCET_KEYSTORE_PASSWORD=<password>
+```
+
+Also note the faucet endpoint changed from `POST /faucet` to `POST /drip`, and the address parameter must now be a `pq1...` address.
+
+### Breaking: ML-DSA-65 algo_id changed
+
+If you have **ML-DSA-65** keystores generated before F-TESTNET-FIXES (when ML-DSA-65 was a Dilithium3 alias), re-generate them:
+
+```bash
+shell-node key generate --algorithm mldsa65 --output new-keystore.json
+```
+
+All **Dilithium3** keystores (`algo_id=0`) are unaffected.
+
+### New: `--enable-stark-aggregation` default changed
+
+`--enable-stark-aggregation` now defaults to **`true`** (was `false`). To keep the prover disabled, explicitly pass `--enable-stark-aggregation=false` or set `enable_stark_aggregation = false` in `config.toml`.
+
+### New RPC methods
+
+| Method | Description |
+|--------|-------------|
+| `shell_getFinalityInfo` | Returns the latest finalized block and quorum state |
+| `shell_finalityProof` | Returns the commit certificate for a finalized block |
+| `shell_getProofAmendment` | Returns the async STARK proof amendment for a block |
+
+### Migration checklist
+
+- [ ] Replace all `0x` addresses in genesis files with `pq1...` equivalents
+- [ ] Update faucet env vars: `FAUCET_PRIVATE_KEY` → `FAUCET_KEYSTORE_FILE` + `FAUCET_KEYSTORE_PASSWORD`
+- [ ] Update SDK: `signer.getHexAddress()` → `signer.getAddress()`
+- [ ] Re-generate any ML-DSA-65 keystores created before F-TESTNET-FIXES
+- [ ] Update scripts/docker-compose/.env files that reference `0x` addresses
+
+---
+
+## v0.21.x → v0.22.x (STARK Multi-Layer Settlement)
+
+### Overview
+
+v0.22.x ships durable multi-layer STARK compression (L1/L2/L3), settlement liveness metrics, and several prover correctness fixes. The upgrade is **non-breaking** for block format — no genesis reset required.
+
+### One-time startup: SettledSourceIndex backfill
+
+On the **first boot after upgrading**, `SettledSourceIndex` (RocksDB key prefix `ss/`) is rebuilt from genesis automatically. Depending on chain length, this may add seconds to minutes to startup. Normal operation resumes once backfill completes.
+
+### New Prometheus metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `shell_stark_settlements_accepted_total` | Counter | STARK settlement txs accepted |
+| `shell_stark_settlements_rejected_total` | Counter | STARK settlements rejected (ordering/layer/frontier violations) |
+| `shell_stark_frontier_lag` | Gauge | Blocks between chain tip and highest contiguous settled layer |
+
+**Alert rule**: page if `shell_stark_frontier_lag > 100` for more than 5 minutes.
+
+### New system transaction type: StarkReward
+
+v0.22.x introduces `StarkReward` system transactions that carry STARK proof settlement payloads. These appear in blocks with `shellType: "starkReward"` and include a structured `decodedInput` field in `eth_getTransactionByHash` responses (block range, layer, entry count). Block explorers or indexers that parse system transactions may need to be updated.
+
+### Docker image
+
+```yaml
+image: ghcr.io/shelldao/shell-chain:0.22.2
+```
+
+### Migration checklist
+
+- [ ] Update image tag to `0.22.2`
+- [ ] Allow extra startup time on first boot (SettledSourceIndex backfill)
+- [ ] Add `shell_stark_frontier_lag` alert to monitoring
+- [ ] Update block explorer or indexer if it processes system transactions
+
 
 This guide covers breaking changes and migration steps when upgrading a
 `shell-chain` node from any v0.9.x release to v0.13.0.
