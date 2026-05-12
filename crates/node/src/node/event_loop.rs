@@ -247,6 +247,7 @@ impl<S: KvStore + 'static> Node<S> {
                 prover_address,
             )
             .with_amendment_sender(prover_amendment_tx)
+            .with_drain_frontier(Arc::clone(&self.stark_drain_frontier))
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
             task_lifecycle.attach_prover_service(handle);
@@ -305,11 +306,28 @@ impl<S: KvStore + 'static> Node<S> {
                         self.metrics.stark_proofs_generated.inc();
                     }
                     if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
-                        debug!(
+                        warn!(
                             block = amendment.block_number,
                             layer = amendment.layer,
-                            "local STARK proof is stored but not settlement-ready: {e}"
+                            "local STARK proof ordering check failed; discarding stored amendment: {e}"
                         );
+                        // Delete all stored artifacts for this proof range so the source
+                        // blocks are re-seeded as fresh tasks once the frontier catches up.
+                        // Without this deletion, the next seed pass re-loads the failing
+                        // amendment, creates new backlog tasks for the same tip range, the
+                        // prover regenerates the same out-of-order proof, and the rejection
+                        // counter spins indefinitely.
+                        for source_hash in amendment.covered_hashes() {
+                            if let Err(del_err) =
+                                self.amendment_store.delete_amendment(&source_hash)
+                            {
+                                warn!(
+                                    block = amendment.block_number,
+                                    %source_hash,
+                                    "failed to delete out-of-order amendment artifact: {del_err}"
+                                );
+                            }
+                        }
                         continue;
                     }
                     if can_produce_blocks {
@@ -1830,23 +1848,57 @@ impl<S: KvStore + 'static> Node<S> {
             .iter()
             .filter(|(l, _)| *l == 1)
             .count() as u64;
-        let pending_max_block = self
-            .pending_stark_settlements
-            .lock()
-            .iter()
-            .filter(|a| a.layer == 1)
-            .map(|a| a.block_number)
-            .max()
-            .unwrap_or(0);
-        // Anchor scan at the actual frontier (settled/pending), NOT at
-        // backlog_max_block. backlog_max_block can be at the chain tip when
-        // the block-timer has added recent blocks, which would cause the
-        // reseed to skip the unsettled frontier window entirely.
-        // The inner loop's contains_source() check deduplicates any overlap
-        // with blocks already in the backlog.
-        let scan_start = settled_l1_count
-            .max(pending_max_block)
-            .saturating_sub(16); // small lookback for safety
+        // Compute the *contiguous* pending frontier: how far L1 pending amendments
+        // extend from the settled frontier WITHOUT gaps.  Using the raw
+        // `pending_max_block` would cause scan_start to jump past gap-pending proofs
+        // (proofs generated for tip blocks before the historical gap is filled),
+        // making the prover repeatedly generate tip proofs that fail ordering —
+        // a rejection-counter spin-loop.
+        let contiguous_pending_end = {
+            let pending = self.pending_stark_settlements.lock();
+            let mut ranges: Vec<(u64, u64)> = pending
+                .iter()
+                .filter(|a| a.layer == 1)
+                .filter_map(|a| {
+                    let start = a.range_start_block()?;
+                    Some((start, a.block_number))
+                })
+                .collect();
+            // Sort by range start so we can walk the chain in order.
+            ranges.sort_by_key(|(start, _)| *start);
+            let mut frontier = settled_l1_count;
+            for (start, end) in &ranges {
+                if *start <= frontier {
+                    // This amendment overlaps or immediately follows the current frontier.
+                    frontier = frontier.max(end.saturating_add(1));
+                } else {
+                    // Gap found — stop extending; don't jump past it.
+                    break;
+                }
+            }
+            frontier
+        };
+        // Anchor scan at the contiguous frontier (settled + gapless pending),
+        // NOT at backlog_max_block or raw pending_max_block.
+        // The inner loop's contains_source() check deduplicates overlap with
+        // blocks already in the backlog or settled.
+        //
+        // Also clamp to the drain frontier: if the prover drained tasks before a
+        // permanent gap, we must not re-seed those blocks — they can never
+        // accumulate enough entries to form a valid proof and would cause a
+        // drain-reseed infinite loop.
+        let drain_floor = self.stark_drain_frontier.load(std::sync::atomic::Ordering::Acquire);
+        let scan_start = contiguous_pending_end
+            .saturating_sub(16)  // small lookback for safety
+            .max(drain_floor);
+        info!(
+            settled_l1_count,
+            contiguous_pending_end,
+            drain_floor,
+            scan_start,
+            head,
+            "STARK seeding: scan parameters"
+        );
 
         for number in scan_start..=head {
             if queued >= max_blocks && seeded_entries >= MIN_L1_STARK_TXS {

@@ -141,6 +141,13 @@ pub struct Node<S: KvStore + 'static> {
     /// Recent tx gossip timestamps used to avoid rebroadcasting the same large
     /// PQ-signed transactions too frequently.
     tx_rebroadcast_seen: parking_lot::Mutex<HashMap<ShellHash, std::time::Instant>>,
+    /// Drain frontier: the highest gap-at-block seen across all prover drain
+    /// operations in this process lifetime.  Shared with ProverService so the
+    /// seeding function can skip blocks that were already drained (and therefore
+    /// can never accumulate enough entries to form a valid proof on their own).
+    /// This prevents the drain-reseed infinite loop where drained sparse blocks
+    /// are immediately re-inserted at the backlog front by the seeder.
+    pub(crate) stark_drain_frontier: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const SYNC_RETRY_BASE_INTERVAL_SECS: u64 = 5;
@@ -645,6 +652,7 @@ impl<S: KvStore + 'static> Node<S> {
                 std::time::Duration::from_secs(300),
             )),
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
+            stark_drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

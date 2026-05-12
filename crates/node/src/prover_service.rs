@@ -126,6 +126,9 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     prover_address: shell_primitives::Address,
     /// L2 STARK mode — controls whether recursive L2 proving is attempted.
     l2_mode: L2StarkMode,
+    /// Shared drain frontier: updated after each drain_front so the seeder
+    /// knows not to re-seed blocks before the gap that caused the drain.
+    drain_frontier: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
@@ -143,6 +146,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             config,
             prover_address,
             l2_mode: L2StarkMode::Disabled,
+            drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -160,6 +164,13 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         amendment_tx: mpsc::UnboundedSender<ProofAmendment>,
     ) -> Self {
         self.amendment_tx = Some(amendment_tx);
+        self
+    }
+
+    /// Share the drain-frontier atomic with the node's event loop so the
+    /// seeder can skip blocks below the last drained gap.
+    pub fn with_drain_frontier(mut self, drain_frontier: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.drain_frontier = drain_frontier;
         self
     }
 
@@ -247,6 +258,13 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                         take, gap
                                     );
                                     backlog.drain_front(take);
+                                    // Advance the drain frontier so the seeder
+                                    // won't re-insert blocks below this gap on
+                                    // the very next seeding pass.
+                                    let prev = self.drain_frontier.fetch_max(gap, std::sync::atomic::Ordering::Release);
+                                    if gap > prev {
+                                        info!(gap_at_block = gap, "STARK drain frontier advanced");
+                                    }
                                 }
                                 Some((entries, None, take)) => {
                                     warn!(
