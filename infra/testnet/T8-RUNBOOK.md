@@ -60,8 +60,11 @@ docker compose up -d node3   # on node3 VM
 
 ### Faucet
 
+The faucet service is deployed separately from this repository. Configure
+its environment as follows once cloned:
+
 ```bash
-cd /path/to/shell-dev/agents/faucet
+cd /path/to/your/faucet/checkout
 cp .env.example .env
 # Edit .env: FAUCET_PRIVATE_KEY=<funded-key>, RPC_URL=http://rpc.testnet.shell.network:8545
 npm install && npm run build

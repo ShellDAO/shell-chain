@@ -15,7 +15,7 @@ Closes #
 
 ## Related Feature
 
-<!-- Feature ID from shell-dev/features/ (if applicable) -->
+<!-- Feature ID (if applicable) -->
 
 Feature: `<feature-id>`
 

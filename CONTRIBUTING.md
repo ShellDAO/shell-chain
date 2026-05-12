@@ -92,7 +92,8 @@ shell-primitives  ←  shell-crypto  ←  shell-core
                         node ← rpc ──────────┘
 ```
 
-For detailed designs, refer to the upstream repository `shell-dev/plans/harness-design.md`.
+For detailed designs, refer to `docs/agents/ARCHITECTURE.md` and the
+ADRs under `docs/agents/adrs/` in this repository.
 
 ## Reporting Issues
 
