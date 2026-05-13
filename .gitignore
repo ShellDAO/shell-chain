@@ -50,3 +50,8 @@ tools/tx-generator/target/
 AGENTS.local.md
 CLAUDE.local.md
 *.agent.local.md
+
+# --- Operator-local agent SSoT (private; not distributed) ---
+# This subtree contains operator-specific design docs and learnings
+# that may include private operational details. Maintained out-of-band.
+docs/agents/

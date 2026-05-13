@@ -92,8 +92,10 @@ shell-primitives  ←  shell-crypto  ←  shell-core
                         node ← rpc ──────────┘
 ```
 
-For detailed designs, refer to `docs/agents/ARCHITECTURE.md` and the
-ADRs under `docs/agents/adrs/` in this repository.
+For detailed protocol designs, refer to `CHANGELOG.md`,
+`docs/CONSENSUS_DETAILS.md`, `docs/stark-aggregation.md`,
+`docs/BLOCK_PRUNING_AND_COMPRESSION.md`, and the per-crate source under
+`crates/*/src/`.
 
 ## Reporting Issues
 

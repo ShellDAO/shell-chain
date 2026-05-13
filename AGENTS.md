@@ -19,15 +19,18 @@ Currently at **v0.22.2**.
 
 ## Read order before editing
 
-1. **`docs/agents/CONSTITUTION.md`** — *highest authority*. On any conflict
-   between code, spec, CHANGELOG, or README and the Constitution, the
-   Constitution wins; flag drift, do not silently reconcile.
-2. **`docs/agents/ARCHITECTURE.md`** — system overview, component graph,
-   safety contract.
-3. **`docs/agents/learnings.md`** — distilled patterns and pitfalls from
-   prior development sessions (build, STARK, storage, ops, git, review).
-4. The relevant **feature spec** at `docs/agents/features/<crate>/spec.md`.
-5. The relevant **ADR** at `docs/agents/adrs/`.
+This repository ships a public, self-contained agent SSoT (this file).
+Operators may also maintain a private `docs/agents/` subtree locally
+(gitignored, not distributed) containing CONSTITUTION, ARCHITECTURE,
+ADRs, learnings, and per-crate feature specs. If that subtree is
+present in your working copy, prefer it as the highest-authority source
+and read it in this order: `CONSTITUTION.md` → `ARCHITECTURE.md` →
+`learnings.md` → relevant `features/<crate>/spec.md` → relevant ADR.
+
+If `docs/agents/` is not present, this file plus `CHANGELOG.md`,
+`docs/CONSENSUS_DETAILS.md`, `docs/stark-aggregation.md`,
+`docs/BLOCK_PRUNING_AND_COMPRESSION.md`, `docs/ACCOUNT_ABSTRACTION_GUIDE.md`,
+and the `crates/*/src/` source are the canonical references.
 
 ## Quick commands
 
@@ -42,46 +45,51 @@ make chaos-test    # tests/e2e/run-chaos-test.sh
 ```
 
 Single test: `cargo test -p <crate> <test_name> -- --nocapture`.
-Toolchain pinned by `rust-toolchain.toml` (stable + rustfmt + clippy).
+Toolchain uses the `stable` channel via `rust-toolchain.toml` (+ rustfmt + clippy).
 
 ## Crate map (15 crates)
 
-| Crate | Role | Spec |
-|---|---|---|
-| `primitives` | Core types (ShellHash, Address, U256) | `docs/agents/features/primitives/spec.md` |
-| `crypto` | PQ signature stack (Dilithium3 / ML-DSA-65 / SPHINCS+) | `docs/agents/features/crypto-core/spec.md` |
-| `core` | Shared trait definitions, transaction model | `docs/agents/features/core-types/spec.md` |
-| `storage` | KvStore, witness pruner, settled-source index | `docs/agents/features/storage/spec.md` |
-| `consensus` | wPoA engine, validator set, slashing | `docs/agents/features/consensus-poa/spec.md` |
-| `genesis` | Genesis block construction | `docs/agents/features/genesis/spec.md` |
-| `evm` | revm wrapper, parallel scheduler | `docs/agents/features/evm-executor/spec.md` |
-| `mempool` | Transaction pool | `docs/agents/features/mempool/spec.md` |
-| `network` | libp2p gossipsub | `docs/agents/features/network-p2p/spec.md` |
-| `rpc` | JSON-RPC, TLS, three-RPC fanout | `docs/agents/features/rpc-server/spec.md` |
-| `keystore` | PQ keystore (argon2id + XChaCha20-Poly1305) | `docs/agents/features/keystore/spec.md` |
-| `stark-prover` | STARK AIR + ProverService | `docs/agents/features/stark-prover/spec.md` |
-| `node` | NodeBuilder, ProverService orchestrator, AA, system_rewards | `docs/agents/features/node-harness/spec.md` |
-| `cli` | `shell-chain` binary | `docs/agents/features/cli/spec.md` |
-| `bench` | Criterion benches (dev-only) | (no spec) |
+| Crate | Role |
+|---|---|
+| `primitives` | Core types (ShellHash, Address, U256) |
+| `crypto` | PQ signature stack (Dilithium3 / ML-DSA-65 / SPHINCS+) |
+| `core` | Shared trait definitions, transaction model |
+| `storage` | KvStore, witness pruner, settled-source index |
+| `consensus` | wPoA engine, validator set, slashing |
+| `genesis` | Genesis block construction |
+| `evm` | revm wrapper, parallel scheduler |
+| `mempool` | Transaction pool |
+| `network` | libp2p gossipsub |
+| `rpc` | JSON-RPC, TLS, three-RPC fanout |
+| `keystore` | PQ keystore (argon2id + XChaCha20-Poly1305) |
+| `stark-prover` | STARK AIR + ProverService |
+| `node` | NodeBuilder, ProverService orchestrator, AA, system_rewards |
+| `cli` | `shell-chain` binary |
+| `bench` | Criterion benches (dev-only) |
+
+For a deeper per-crate spec, consult the operator-local
+`docs/agents/features/<crate>/spec.md` if present.
 
 For navigating `crates/node/` specifically, see
-`crates/node/MODULES.md` (logical group map; ADR-005 explains why the
-node crate is kept singular).
+`crates/node/MODULES.md` (logical group map).
 
 ## Cardinal rules
 
-- **CONSTITUTION precedence**: see "Read order" above.
-- **All PQ signatures verified at mempool entry** (Constitution §7).
+- **CONSTITUTION precedence**: if an operator-local
+  `docs/agents/CONSTITUTION.md` is present, it is the highest authority
+  on protocol/consensus/RPC/security invariants — flag drift, do not
+  silently reconcile.
+- **All PQ signatures verified at mempool entry.**
 - **STARK proof settlements**: only via the `StarkReward` system
-  transaction (Constitution clause P-1, ADR-002). `BlockHeader::extra_data`
-  is permanently deprecated as a settlement carrier.
+  transaction. `BlockHeader::extra_data` is permanently deprecated as a
+  settlement carrier.
 - **Witness pruner cutoff** is always
-  `min(retention_cutoff, stark_frontier)` (clause P-3, ADR-007).
+  `min(retention_cutoff, stark_frontier)`.
 - **Drain-frontier** is an `Arc<AtomicU64>` that is monotonic per process;
   the seeder must clamp `scan_start` to
-  `max(contiguous_pending_end - 16, drain_frontier)` (clause P-2, ADR-003).
-- **`L2StarkMode::Active` is FORBIDDEN** until §13.1 promotion in the
-  Constitution (clause P-4, ADR-004).
+  `max(contiguous_pending_end - 16, drain_frontier)`.
+- **`L2StarkMode::Active` is FORBIDDEN** until explicitly promoted by
+  the Constitution.
 
 ## Quality gates (local mirror of CI)
 
@@ -90,10 +98,11 @@ A change is mergeable when:
 1. `cargo fmt --check` passes
 2. `cargo clippy --workspace -- -D warnings` passes
 3. `cargo test --workspace` passes
-4. New invariants are reflected in `docs/agents/CONSTITUTION.md` (or
-   flagged as drift)
-5. New designs have a feature spec entry in `docs/agents/features/` and,
-   if non-obvious, an ADR in `docs/agents/adrs/`
+4. New protocol invariants are recorded somewhere durable (operator
+   CONSTITUTION if maintained, otherwise CHANGELOG and the relevant
+   `docs/` file)
+5. Non-obvious design choices are recorded in an ADR (operator-local if
+   the `docs/agents/adrs/` subtree is in use)
 
 ## Commit / PR conventions
 
@@ -105,9 +114,7 @@ A change is mergeable when:
 - Commit messages and code comments are **English**. PR/Issue
   descriptions may be Chinese.
 - AI-authored commits include a `Co-authored-by: Copilot
-  <223556219+Copilot@users.noreply.github.com>` trailer; AI-authored
-  PR/Issue bodies start with `🤖 本 [Issue/PR] 由 AI Agent 创建`
-  (literal template — do not translate).
+  <223556219+Copilot@users.noreply.github.com>` trailer.
 
 ## Things to never commit
 
@@ -118,5 +125,4 @@ runtime artifact.
 ## Tool pointers (this file is the SSoT)
 
 - `CLAUDE.md` → read this file
-- `.cursor/rules/main.mdc` → read this file
-- `.github/copilot-instructions.md` → read this file
+- If your tool reads `.cursor/rules/*.mdc` or `.github/copilot-instructions.md`, treat `AGENTS.md` as the canonical source — these pointer files are not maintained in this repository.
