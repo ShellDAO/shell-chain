@@ -84,6 +84,79 @@ impl MempoolError {
 mod tests {
     use super::*;
 
+    // --- kind_str() tests: assert static labels and that they contain no
+    // numeric or address values that could leak account state.
+
+    #[test]
+    fn kind_str_sensitive_variants_have_no_values() {
+        // These variants normally embed nonce/balance/address in Display.
+        // kind_str() must return a plain static label with no numbers/0x.
+        let cases: &[(&str, MempoolError)] = &[
+            (
+                "nonce_too_low",
+                MempoolError::NonceTooLow { got: 7, pending: 42 },
+            ),
+            (
+                "nonce_gap",
+                MempoolError::NonceGap { expected: 1, got: 5 },
+            ),
+            (
+                "insufficient_balance",
+                MempoolError::InsufficientBalance {
+                    needed: U256::from(1000u64),
+                    have: U256::from(1u64),
+                },
+            ),
+            (
+                "sender_queue_full",
+                MempoolError::SenderQueueFull {
+                    sender: Address::ZERO,
+                    count: 64,
+                },
+            ),
+            (
+                "address_mismatch",
+                MempoolError::AddressMismatch {
+                    from: Address::ZERO,
+                    derived: Address::ZERO,
+                },
+            ),
+        ];
+        for (expected_label, err) in cases {
+            let label = err.kind_str();
+            assert_eq!(label, *expected_label, "wrong label for {err:?}");
+            // The label itself must not contain any digit or "0x" prefix.
+            assert!(
+                !label.chars().any(|c| c.is_ascii_digit()),
+                "kind_str label '{label}' must not contain numeric data"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_str_all_variants_are_static() {
+        // Smoke-test that every variant returns a non-empty static label.
+        let variants: &[MempoolError] = &[
+            MempoolError::PoolFull { capacity: 1 },
+            MempoolError::SenderQueueFull { sender: Address::ZERO, count: 1 },
+            MempoolError::Duplicate { hash: ShellHash::default() },
+            MempoolError::ChainIdMismatch { expected: 1, got: 2 },
+            MempoolError::GasPriceTooLow { got: 1, min: 2 },
+            MempoolError::GasTooLow { got: 1, minimum: 2 },
+            MempoolError::NonceTooLow { got: 1, pending: 2 },
+            MempoolError::NonceGap { expected: 1, got: 3 },
+            MempoolError::InsufficientBalance { needed: U256::from(2u64), have: U256::from(1u64) },
+            MempoolError::ReplacementFeeTooLow { got: 1, required: 2 },
+            MempoolError::InvalidSignature("x".into()),
+            MempoolError::PubkeyRequired { sender: Address::ZERO },
+            MempoolError::AddressMismatch { from: Address::ZERO, derived: Address::ZERO },
+            MempoolError::InvalidTransaction("x".into()),
+        ];
+        for err in variants {
+            assert!(!err.kind_str().is_empty(), "kind_str() empty for {err:?}");
+        }
+    }
+
     #[test]
     fn pool_full_display() {
         let err = MempoolError::PoolFull { capacity: 4096 };

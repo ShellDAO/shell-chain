@@ -797,12 +797,19 @@ impl<S: KvStore + 'static> Node<S> {
                                             // MempoolError::Duplicate and nonce-gap errors are
                                             // high-frequency under load; suppress them to keep
                                             // logs quiet during normal operation.
-                                            let kind = e.to_string();
-                                            if !kind.contains("duplicate")
-                                                && !kind.contains("nonce_gap")
-                                                && !kind.contains("nonce_too_low")
-                                            {
-                                                warn!(kind, "mempool rejection");
+                                            // handle_incoming_tx() wraps mempool errors as
+                                            // NodeError::Startup(<kind_str>) — match directly
+                                            // to avoid a heap allocation and any risk of
+                                            // account-state values reaching the log sink.
+                                            if let NodeError::Startup(kind) = &e {
+                                                if kind != "duplicate"
+                                                    && kind != "nonce_gap"
+                                                    && kind != "nonce_too_low"
+                                                {
+                                                    warn!(kind = kind.as_str(), "mempool rejection");
+                                                }
+                                            } else {
+                                                warn!(error = %e, "incoming tx error");
                                             }
                                         }
                                     }

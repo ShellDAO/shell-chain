@@ -1323,4 +1323,75 @@ mod tests {
         let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
         assert!(matches!(res, Err(TxValidationError::SignatureInvalid)));
     }
+
+    // --- kind_str() tests: assert static labels contain no account-state values.
+
+    #[test]
+    fn kind_str_sensitive_variants_have_no_values() {
+        let cases: &[(&str, TxValidationError)] = &[
+            (
+                "nonce_mismatch",
+                TxValidationError::NonceMismatch { expected: 5, got: 3 },
+            ),
+            (
+                "insufficient_balance",
+                TxValidationError::InsufficientBalance {
+                    needed: U256::from(1000u64),
+                    have: U256::from(0u64),
+                },
+            ),
+            (
+                "address_mismatch",
+                TxValidationError::AddressMismatch {
+                    from: Address::ZERO,
+                    derived: Address::ZERO,
+                },
+            ),
+            (
+                "paymaster_insufficient_balance",
+                TxValidationError::PaymasterInsufficientBalance {
+                    paymaster: Address::ZERO,
+                    needed: U256::from(50u64),
+                    have: U256::from(10u64),
+                },
+            ),
+        ];
+        for (expected_label, err) in cases {
+            let label = err.kind_str();
+            assert_eq!(label, *expected_label, "wrong label for {err:?}");
+            assert!(
+                !label.chars().any(|c| c.is_ascii_digit()),
+                "kind_str label '{label}' must not contain numeric data"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_str_all_variants_are_non_empty() {
+        let variants: &[TxValidationError] = &[
+            TxValidationError::PubkeyNotFound,
+            TxValidationError::AddressMismatch { from: Address::ZERO, derived: Address::ZERO },
+            TxValidationError::SignatureInvalid,
+            TxValidationError::NonceMismatch { expected: 1, got: 0 },
+            TxValidationError::InsufficientBalance { needed: U256::from(1u64), have: U256::ZERO },
+            TxValidationError::ChainIdMismatch { expected: 1, got: 2 },
+            TxValidationError::GasTooLow(21_000),
+            TxValidationError::PubkeyConflict,
+            TxValidationError::InvalidAccessList("x".into()),
+            TxValidationError::InvalidBlobTx("x".into()),
+            TxValidationError::InvalidAaBundle("x".into()),
+            TxValidationError::PaymasterSignatureInvalid,
+            TxValidationError::PaymasterRejected,
+            TxValidationError::PaymasterValidationFailed("x".into()),
+            TxValidationError::SessionValueCapExceeded,
+            TxValidationError::SessionTargetMismatch,
+            TxValidationError::SessionRootSignatureInvalid,
+            TxValidationError::SessionKeySignatureInvalid,
+            TxValidationError::SessionKeyDisallowedAlgorithm(0),
+            TxValidationError::AaValidation("x".into()),
+        ];
+        for err in variants {
+            assert!(!err.kind_str().is_empty(), "kind_str() empty for {err:?}");
+        }
+    }
 }
