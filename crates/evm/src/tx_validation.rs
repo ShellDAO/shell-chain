@@ -1331,7 +1331,10 @@ mod tests {
         let cases: &[(&str, TxValidationError)] = &[
             (
                 "nonce_mismatch",
-                TxValidationError::NonceMismatch { expected: 5, got: 3 },
+                TxValidationError::NonceMismatch {
+                    expected: 5,
+                    got: 3,
+                },
             ),
             (
                 "insufficient_balance",
@@ -1370,11 +1373,23 @@ mod tests {
     fn kind_str_all_variants_are_non_empty() {
         let variants: &[TxValidationError] = &[
             TxValidationError::PubkeyNotFound,
-            TxValidationError::AddressMismatch { from: Address::ZERO, derived: Address::ZERO },
+            TxValidationError::AddressMismatch {
+                from: Address::ZERO,
+                derived: Address::ZERO,
+            },
             TxValidationError::SignatureInvalid,
-            TxValidationError::NonceMismatch { expected: 1, got: 0 },
-            TxValidationError::InsufficientBalance { needed: U256::from(1u64), have: U256::ZERO },
-            TxValidationError::ChainIdMismatch { expected: 1, got: 2 },
+            TxValidationError::NonceMismatch {
+                expected: 1,
+                got: 0,
+            },
+            TxValidationError::InsufficientBalance {
+                needed: U256::from(1u64),
+                have: U256::ZERO,
+            },
+            TxValidationError::ChainIdMismatch {
+                expected: 1,
+                got: 2,
+            },
             TxValidationError::GasTooLow(21_000),
             TxValidationError::PubkeyConflict,
             TxValidationError::InvalidAccessList("x".into()),

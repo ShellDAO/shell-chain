@@ -94,11 +94,17 @@ mod tests {
         let cases: &[(&str, MempoolError)] = &[
             (
                 "nonce_too_low",
-                MempoolError::NonceTooLow { got: 7, pending: 42 },
+                MempoolError::NonceTooLow {
+                    got: 7,
+                    pending: 42,
+                },
             ),
             (
                 "nonce_gap",
-                MempoolError::NonceGap { expected: 1, got: 5 },
+                MempoolError::NonceGap {
+                    expected: 1,
+                    got: 5,
+                },
             ),
             (
                 "insufficient_balance",
@@ -138,18 +144,40 @@ mod tests {
         // Smoke-test that every variant returns a non-empty static label.
         let variants: &[MempoolError] = &[
             MempoolError::PoolFull { capacity: 1 },
-            MempoolError::SenderQueueFull { sender: Address::ZERO, count: 1 },
-            MempoolError::Duplicate { hash: ShellHash::default() },
-            MempoolError::ChainIdMismatch { expected: 1, got: 2 },
+            MempoolError::SenderQueueFull {
+                sender: Address::ZERO,
+                count: 1,
+            },
+            MempoolError::Duplicate {
+                hash: ShellHash::default(),
+            },
+            MempoolError::ChainIdMismatch {
+                expected: 1,
+                got: 2,
+            },
             MempoolError::GasPriceTooLow { got: 1, min: 2 },
             MempoolError::GasTooLow { got: 1, minimum: 2 },
             MempoolError::NonceTooLow { got: 1, pending: 2 },
-            MempoolError::NonceGap { expected: 1, got: 3 },
-            MempoolError::InsufficientBalance { needed: U256::from(2u64), have: U256::from(1u64) },
-            MempoolError::ReplacementFeeTooLow { got: 1, required: 2 },
+            MempoolError::NonceGap {
+                expected: 1,
+                got: 3,
+            },
+            MempoolError::InsufficientBalance {
+                needed: U256::from(2u64),
+                have: U256::from(1u64),
+            },
+            MempoolError::ReplacementFeeTooLow {
+                got: 1,
+                required: 2,
+            },
             MempoolError::InvalidSignature("x".into()),
-            MempoolError::PubkeyRequired { sender: Address::ZERO },
-            MempoolError::AddressMismatch { from: Address::ZERO, derived: Address::ZERO },
+            MempoolError::PubkeyRequired {
+                sender: Address::ZERO,
+            },
+            MempoolError::AddressMismatch {
+                from: Address::ZERO,
+                derived: Address::ZERO,
+            },
             MempoolError::InvalidTransaction("x".into()),
         ];
         for err in variants {
