@@ -102,6 +102,42 @@ pub enum TxValidationError {
     AaValidation(String),
 }
 
+impl TxValidationError {
+    /// Returns a short, static label for this error variant that contains no
+    /// account-state values (nonce, balance, addresses).  Use this for
+    /// structured logging to avoid leaking account data into log files.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::PubkeyNotFound => "pubkey_not_found",
+            Self::AddressMismatch { .. } => "address_mismatch",
+            Self::SignatureInvalid => "signature_invalid",
+            Self::NonceMismatch { .. } => "nonce_mismatch",
+            Self::InsufficientBalance { .. } => "insufficient_balance",
+            Self::ChainIdMismatch { .. } => "chain_id_mismatch",
+            Self::GasTooLow(_) => "gas_too_low",
+            Self::PubkeyConflict => "pubkey_conflict",
+            Self::DisallowedAlgorithm(_) => "disallowed_algorithm",
+            Self::Crypto(_) => "crypto_error",
+            Self::Storage(_) => "storage_error",
+            Self::InvalidAccessList(_) => "invalid_access_list",
+            Self::InvalidBlobTx(_) => "invalid_blob_tx",
+            Self::InvalidAaBundle(_) => "invalid_aa_bundle",
+            Self::PaymasterPubkeyNotFound(_) => "paymaster_pubkey_not_found",
+            Self::PaymasterSignatureInvalid => "paymaster_signature_invalid",
+            Self::PaymasterInsufficientBalance { .. } => "paymaster_insufficient_balance",
+            Self::PaymasterRejected => "paymaster_rejected",
+            Self::PaymasterValidationFailed(_) => "paymaster_validation_failed",
+            Self::SessionKeyExpired { .. } => "session_key_expired",
+            Self::SessionValueCapExceeded => "session_value_cap_exceeded",
+            Self::SessionTargetMismatch => "session_target_mismatch",
+            Self::SessionRootSignatureInvalid => "session_root_signature_invalid",
+            Self::SessionKeySignatureInvalid => "session_key_signature_invalid",
+            Self::SessionKeyDisallowedAlgorithm(_) => "session_key_disallowed_algorithm",
+            Self::AaValidation(_) => "aa_validation_failed",
+        }
+    }
+}
+
 /// Minimum gas for a plain transfer (no data).
 const INTRINSIC_GAS_TX: u64 = 21_000;
 /// Per-byte cost for non-zero calldata.

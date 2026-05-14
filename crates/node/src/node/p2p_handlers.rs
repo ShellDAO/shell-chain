@@ -14,7 +14,9 @@ impl<S: KvStore + 'static> Node<S> {
         let hash = self
             .tx_pool
             .insert(tx, &mut world_state_guard, chain_store.as_ref(), &dv)
-            .map_err(|e| NodeError::Startup(e.to_string()))?;
+            // Use kind_str() so NodeError::Startup never carries account-state
+            // values (nonce, balance) that would be logged as cleartext.
+            .map_err(|e| NodeError::Startup(e.kind_str().to_string()))?;
 
         Ok(hash)
     }

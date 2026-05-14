@@ -795,15 +795,14 @@ impl<S: KvStore + 'static> Node<S> {
                                         }
                                         Err(e) => {
                                             // MempoolError::Duplicate and nonce-gap errors are
-                                            // high-frequency under load; suppress them to avoid
-                                            // blocking the event loop with eprintln! syscalls.
-                                            let msg = format!("{e}");
-                                            if !msg.contains("duplicate")
-                                                && !msg.contains("Duplicate")
-                                                && !msg.contains("nonce gap")
-                                                && !msg.contains("nonce too low")
+                                            // high-frequency under load; suppress them to keep
+                                            // logs quiet during normal operation.
+                                            let kind = e.to_string();
+                                            if !kind.contains("duplicate")
+                                                && !kind.contains("nonce_gap")
+                                                && !kind.contains("nonce_too_low")
                                             {
-                                                eprintln!("⚠  Tx handling error: {e}");
+                                                warn!(kind, "mempool rejection");
                                             }
                                         }
                                     }

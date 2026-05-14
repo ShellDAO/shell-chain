@@ -54,6 +54,32 @@ pub enum MempoolError {
     Storage(#[from] StorageError),
 }
 
+impl MempoolError {
+    /// Returns a short, static label for this error variant that contains no
+    /// account-state values (nonce, balance, addresses).  Use this for
+    /// structured logging to avoid leaking account data into log files.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::PoolFull { .. } => "pool_full",
+            Self::SenderQueueFull { .. } => "sender_queue_full",
+            Self::Duplicate { .. } => "duplicate",
+            Self::ChainIdMismatch { .. } => "chain_id_mismatch",
+            Self::GasPriceTooLow { .. } => "gas_price_too_low",
+            Self::GasTooLow { .. } => "gas_too_low",
+            Self::NonceTooLow { .. } => "nonce_too_low",
+            Self::NonceGap { .. } => "nonce_gap",
+            Self::InsufficientBalance { .. } => "insufficient_balance",
+            Self::ReplacementFeeTooLow { .. } => "replacement_fee_too_low",
+            Self::InvalidSignature(_) => "invalid_signature",
+            Self::PubkeyRequired { .. } => "pubkey_required",
+            Self::AddressMismatch { .. } => "address_mismatch",
+            Self::Crypto(_) => "crypto_error",
+            Self::InvalidTransaction(_) => "invalid_transaction",
+            Self::Storage(_) => "storage_error",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
