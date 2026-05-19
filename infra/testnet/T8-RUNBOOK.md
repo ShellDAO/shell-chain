@@ -64,7 +64,7 @@ The faucet service is deployed separately from this repository. Configure
 its environment as follows once cloned:
 
 ```bash
-cd /path/to/your/faucet/checkout
+cd /path/to/shell-chain/tools/faucet
 cp .env.example .env
 # Edit .env: FAUCET_KEYSTORE_FILE=<path/to/faucet-keystore.json>, FAUCET_KEYSTORE_PASSWORD=<password>, RPC_URL=http://rpc.testnet.shell.network:8545
 npm install && npm run build

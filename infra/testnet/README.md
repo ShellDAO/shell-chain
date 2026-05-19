@@ -37,7 +37,7 @@ docker compose up -d
 # 5. Check health
 docker compose ps
 curl http://localhost:8545 \
-  -d '{"jsonrpc":"2.0","method":"shell_blockNumber","params":[],"id":1}' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
   -H 'Content-Type: application/json'
 ```
 

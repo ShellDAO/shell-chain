@@ -90,7 +90,7 @@ shell-node run \
   --keystore authority.json
 ```
 
-As of **v0.21.0**, `--enable-stark-aggregation` defaults to **`true`** (previously `false`).
+As of **v0.21.0**, `--enable-stark-aggregation` defaults to **`true`** for `testnet` and `mainnet` profiles (previously `false` everywhere). The `dev` profile still defaults to `false`.
 
 ---
 

@@ -1,5 +1,54 @@
 # Upgrade Guide
 
+## v0.15.0 → v0.22.2 (M14–M16: STARK hardening, ops maturity)
+
+### Overview
+
+This covers all breaking and notable changes from v0.15.0 through v0.22.2.
+
+| Area | Change |
+|------|--------|
+| STARK aggregation | Prover defaults, ordered-frontier validation, settled-source index |
+| Consensus | wPoA finality hardening, commit-certificate sidecars |
+| Storage | Three-segment block model (TX detail / WitnessBundle / STARK proof) |
+| RPC | `compressionLayer` and `pruningStatus` fields on block responses |
+| Metrics | `shell_stark_frontier_lag`, `shell_stark_settlements_accepted_total`, `shell_stark_settlements_rejected_total` |
+| CLI | `--algorithm mldsa65` (FIPS 204 ML-DSA-65) now available in `key generate` |
+
+### STARK aggregation — `enable_stark_aggregation` default
+
+In v0.15.0, STARK aggregation was disabled by default (`false`). From v0.21.0+, the
+default depends on the **network profile**:
+
+| Profile | Default |
+|---------|---------|
+| `mainnet` | `true` |
+| `testnet` | `true` |
+| `dev` | `false` |
+
+If you were previously setting `--enable-stark-aggregation` explicitly and have upgraded
+to a testnet/mainnet profile, the flag is no longer needed.
+
+### New RocksDB column families (auto-created on first start)
+
+`witness_store`, `proof_amendments`, `ss/` (settled-source index — v0.22.0+).
+
+No manual migration required; new column families are created automatically.
+
+### Storage profiles (replaces --body-retention / --witness-retention)
+
+The `--storage-profile <archive|full|light>` flag replaces the confusing
+`--body-retention` / `--witness-retention` pair as the primary UX. The old flags
+still work as overrides but are no longer recommended as primary configuration.
+
+### Docker image
+
+```yaml
+image: ghcr.io/shelldao/shell-chain:0.22.2
+```
+
+---
+
 ## v0.14.0 → v0.15.0 (M13: wPoA+STARK)
 
 ### Overview
@@ -333,8 +382,8 @@ offline_window_blocks      = 50    # blocks (default: 50)
 
 | Method | Description |
 |--------|-------------|
-| `shell_getValidatorSet` | Returns current active validator set with weights |
-| `shell_getValidatorInfo(addr)` | Returns single validator state + stake |
+| `shell_getValidators` | Returns current active validator set with weights |
+| `shell_getValidatorStatus(addr)` | Returns single validator state + stake |
 | `shell_submitSlashEvidence(evidence)` | Submit double-sign proof |
 | `admin_nodeInfo` | Node info (requires `--admin-api`) |
 | `admin_peers` | Peer list (requires `--admin-api`) |

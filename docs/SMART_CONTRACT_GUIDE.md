@@ -94,7 +94,7 @@ forge create --rpc-url http://localhost:8545 --chain-id 1337 src/Counter.sol:Cou
 For the alpha testnet:
 
 ```bash
-forge create --rpc-url http://testnet.shell.xyz --chain-id 1337 src/Counter.sol:Counter
+forge create --rpc-url http://testnet.shell.xyz --chain-id 10 src/Counter.sol:Counter
 ```
 
 ---

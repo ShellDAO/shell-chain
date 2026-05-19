@@ -92,10 +92,7 @@ shell-primitives  ←  shell-crypto  ←  shell-core
                         node ← rpc ──────────┘
 ```
 
-For detailed protocol designs, refer to `CHANGELOG.md`,
-`docs/CONSENSUS_DETAILS.md`, `docs/stark-aggregation.md`,
-`docs/BLOCK_PRUNING_AND_COMPRESSION.md`, and the per-crate source under
-`crates/*/src/`.
+For detailed designs, refer to the [docs/](docs/) directory in this repository.
 
 ## Reporting Issues
 

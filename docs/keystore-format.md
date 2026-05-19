@@ -120,7 +120,7 @@ dk = argon2id(
 The derived key `dk` is 32 bytes and is used directly as the XChaCha20-Poly1305 key.
 It is zeroed from memory immediately after use.
 
-**CLI defaults** (v0.21.0):
+**CLI defaults** (v0.22.2):
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
@@ -242,7 +242,7 @@ The TypeScript SDK (`shell-sdk`) uses the same format. Key details:
 - `decryptKeystore()` reads `public_key` from the JSON for address verification
 - `SIG_IDS`: `{ dilithium3: 0, mldsa65: 1 }` — used to derive the correct address
 
-The SDK and CLI are **fully cross-compatible** since shell-chain v0.21.0 / shell-sdk v0.7.0 (fixed in F-TESTNET-FIXES):
+The SDK and CLI are **fully cross-compatible** since shell-chain v0.21.0 / shell-sdk v0.7.0:
 - A Rust CLI keystore can be decrypted by `shell-sdk`
 - An SDK keystore can be decrypted by the Rust CLI / `shell-keystore` crate
 

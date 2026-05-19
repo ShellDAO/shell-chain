@@ -245,4 +245,4 @@ For more details on alpha testnet operations, see the [Testnet Operator Guide](T
 
 ---
 
-*Last updated: 2026-05-13*
+*Last updated: 2026-05-20*

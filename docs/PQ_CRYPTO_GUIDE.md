@@ -295,7 +295,13 @@ The `MultiVerifier` automatically detects the algorithm from the signature's emb
 
 ### ML-DSA-65 (Available)
 
-ML-DSA-65 (FIPS 204) shipped in the F-TESTNET-FIXES sprint using the `fips204` crate. Use `--algo ml-dsa-65` with `shell-node key generate`. Existing Dilithium3 keys and signatures remain valid.
+**ML-DSA-65** (FIPS 204) is now supported alongside Dilithium3. Generate ML-DSA-65 keys with:
+
+```bash
+shell-node key generate --algorithm mldsa65 --output keystore.json
+```
+
+Existing Dilithium3 keys remain fully valid. The `MultiVerifier` dispatches to the correct algorithm at runtime using the embedded `sig_type` tag.
 
 ### Hybrid Schemes (Research)
 
@@ -333,4 +339,4 @@ Shell-chain is quantum-ready today. No migration will be needed when quantum com
 
 ---
 
-*Last updated: 2026-05-13*
+*Last updated: 2026-05-20*
