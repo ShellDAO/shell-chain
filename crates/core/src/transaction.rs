@@ -1,5 +1,5 @@
 use alloy_rlp::{Decodable, Encodable};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use shell_crypto::{PQSignature, SignatureType};
 use shell_primitives::{Address, Bytes, ShellHash, U256};
 use std::sync::OnceLock;
@@ -314,11 +314,26 @@ impl Transaction {
         }
     }
 
-    /// Compute the signing hash (keccak256 of the RLP-encoded transaction).
+    /// Compute the PQ signing hash using the spec payload and BLAKE3.
+    pub fn signing_hash(&self, sig_type: u8) -> ShellHash {
+        let mut preimage = Vec::with_capacity(8 + 8 + 20 + 32 + self.data.len() + 8 + 1);
+        preimage.extend_from_slice(&self.chain_id.to_be_bytes());
+        preimage.extend_from_slice(&self.nonce.to_be_bytes());
+        match &self.to {
+            Some(addr) => preimage.extend_from_slice(addr.0.as_slice()),
+            None => preimage.extend_from_slice(&[0u8; 20]),
+        }
+        let value = self.value.to_be_bytes::<32>();
+        preimage.extend_from_slice(&value);
+        preimage.extend_from_slice(self.data.as_ref());
+        preimage.extend_from_slice(&self.gas_limit.to_be_bytes());
+        preimage.push(sig_type);
+        shell_primitives::blake3_hash(&preimage)
+    }
+
+    /// Compute the default transaction hash using the Dilithium/ML-DSA domain byte.
     pub fn hash(&self) -> ShellHash {
-        let mut buf = Vec::new();
-        self.encode(&mut buf);
-        shell_primitives::keccak256(&buf)
+        self.signing_hash(SignatureType::Dilithium3.as_u8())
     }
 
     pub fn is_contract_creation(&self) -> bool {
@@ -1113,7 +1128,7 @@ impl PubkeyMode {
 /// intentionally prevented (`#[non_exhaustive]`) to ensure `pubkey_mode`
 /// defaults are not silently misapplied.
 #[non_exhaustive]
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SignedTransaction {
     /// The sender's address (derived from their PQ public key).
     /// Required because PQ signatures are not recoverable.
@@ -1121,30 +1136,70 @@ pub struct SignedTransaction {
     pub tx: Transaction,
     pub signature: PQSignature,
     /// How the sender's public key is provided (inline or registry reference).
-    #[serde(default)]
     pub pubkey_mode: PubkeyMode,
     /// Native AA payload (batch + optional sponsored gas). MUST be `Some`
     /// iff `tx.tx_type == AA_BUNDLE_TX_TYPE`. See `AaBundle` and
     /// `docs/AA_BATCH_AND_SPONSORED_SPEC.md`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_bundle: Option<AaBundle>,
     /// Lazily cached hash — computed from the unsigned tx on first access.
-    #[serde(skip)]
     tx_hash: OnceLock<ShellHash>,
 }
 
-// Helper struct for deserialization with compatibility for sender_pubkey field
+// Helper enum for deserializing either legacy structured signatures or the
+// flattened PQTx-style raw signature bytes.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SignedTransactionSignatureField {
+    Structured(PQSignature),
+    Raw(Bytes),
+}
+
+// Helper struct for deserialization with compatibility for both legacy
+// `sender_pubkey` and the PQTx-style `public_key` + `sig_type` fields.
 #[derive(Deserialize)]
 struct SignedTransactionHelper {
     from: Address,
     tx: Transaction,
-    signature: PQSignature,
+    signature: SignedTransactionSignatureField,
+    #[serde(default)]
+    sig_type: Option<u8>,
     #[serde(default)]
     pubkey_mode: Option<PubkeyMode>,
     #[serde(default)]
     sender_pubkey: Option<Vec<u8>>,
     #[serde(default)]
+    public_key: Option<Bytes>,
+    #[serde(default)]
     aa_bundle: Option<AaBundle>,
+}
+
+impl Serialize for SignedTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct SignedTransactionSerde<'a> {
+            from: &'a Address,
+            tx: &'a Transaction,
+            sig_type: u8,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            public_key: Option<Bytes>,
+            signature: Bytes,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            aa_bundle: Option<&'a AaBundle>,
+        }
+
+        SignedTransactionSerde {
+            from: &self.from,
+            tx: &self.tx,
+            sig_type: self.signature.sig_type.as_u8(),
+            public_key: self.public_key().map(Bytes::copy_from_slice),
+            signature: Bytes::copy_from_slice(&self.signature.data),
+            aa_bundle: self.aa_bundle.as_ref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for SignedTransaction {
@@ -1154,16 +1209,50 @@ impl<'de> Deserialize<'de> for SignedTransaction {
     {
         let helper = SignedTransactionHelper::deserialize(deserializer)?;
 
-        if helper.pubkey_mode.is_some() && helper.sender_pubkey.is_some() {
+        if helper.pubkey_mode.is_some()
+            && (helper.sender_pubkey.is_some() || helper.public_key.is_some())
+        {
             return Err(serde::de::Error::custom(
-                "signed transaction must not specify both pubkey_mode and sender_pubkey",
+                "signed transaction must not specify both pubkey_mode and public_key",
+            ));
+        }
+        if helper.sender_pubkey.is_some() && helper.public_key.is_some() {
+            return Err(serde::de::Error::custom(
+                "signed transaction must not specify both sender_pubkey and public_key",
             ));
         }
 
-        // Resolve pubkey_mode: prefer explicit pubkey_mode, fall back to sender_pubkey
+        let signature = match helper.signature {
+            SignedTransactionSignatureField::Structured(signature) => {
+                if let Some(sig_type) = helper.sig_type {
+                    let expected = SignatureType::from_u8(sig_type)
+                        .ok_or_else(|| serde::de::Error::custom("unknown sig_type"))?;
+                    if signature.sig_type != expected {
+                        return Err(serde::de::Error::custom(
+                            "sig_type does not match structured signature.sig_type",
+                        ));
+                    }
+                }
+                signature
+            }
+            SignedTransactionSignatureField::Raw(signature) => {
+                let sig_type = helper
+                    .sig_type
+                    .ok_or_else(|| serde::de::Error::custom("sig_type is required for raw signature bytes"))?;
+                let sig_type = SignatureType::from_u8(sig_type)
+                    .ok_or_else(|| serde::de::Error::custom("unknown sig_type"))?;
+                let signature = PQSignature::new(sig_type, signature.as_ref().to_vec());
+                signature
+                    .validate_size()
+                    .map_err(serde::de::Error::custom)?;
+                signature
+            }
+        };
+
+        let flat_public_key = helper.public_key.map(|bytes| bytes.as_ref().to_vec());
         let pubkey_mode = if let Some(mode) = helper.pubkey_mode {
             mode
-        } else if let Some(pk) = helper.sender_pubkey {
+        } else if let Some(pk) = flat_public_key.or(helper.sender_pubkey) {
             if !pk.is_empty() {
                 PubkeyMode::Embedded(pk)
             } else {
@@ -1172,10 +1261,11 @@ impl<'de> Deserialize<'de> for SignedTransaction {
         } else {
             PubkeyMode::Reference
         };
+
         Ok(SignedTransaction {
             from: helper.from,
             tx: helper.tx,
-            signature: helper.signature,
+            signature,
             pubkey_mode,
             aa_bundle: helper.aa_bundle,
             tx_hash: OnceLock::new(),
@@ -1290,11 +1380,12 @@ impl SignedTransaction {
     ///
     /// For AA-bundle transactions returns [`Self::batch_signing_hash`] (so the
     /// signature commits to both the outer envelope *and* the inner calls);
-    /// for any other tx_type returns the regular [`Self::hash`]. This single
+    /// for any other tx_type returns the BLAKE3 PQ signing payload hash. This single
     /// entry point lets validators uniformly compute "the hash the sender
     /// signed over" without branching on tx_type at every call site.
     pub fn sender_signing_hash(&self) -> ShellHash {
-        self.batch_signing_hash().unwrap_or_else(|| self.hash())
+        self.batch_signing_hash()
+            .unwrap_or_else(|| self.tx.signing_hash(self.signature.sig_type.as_u8()))
     }
 
     /// Returns `true` if this signed transaction carries a native AA bundle.
@@ -1308,7 +1399,7 @@ impl SignedTransaction {
     }
 
     /// Canonical signing hash for AA-bundle senders:
-    /// `keccak256( BATCH_SIGNING_HASH_DOMAIN || rlp(tx) || rlp(aa_bundle) )`.
+    /// `blake3( BATCH_SIGNING_HASH_DOMAIN || tx_signing_hash || rlp(aa_bundle_for_signing) )`.
     ///
     /// Returns `None` for non-AA transactions (callers should use [`Self::hash`]).
     pub fn batch_signing_hash(&self) -> Option<ShellHash> {
@@ -1316,15 +1407,16 @@ impl SignedTransaction {
         if self.tx.tx_type != AA_BUNDLE_TX_TYPE {
             return None;
         }
-        let mut buf = Vec::with_capacity(1 + self.tx.length() + bundle.signing_length());
+        let tx_hash = self.tx.signing_hash(self.signature.sig_type.as_u8());
+        let mut buf = Vec::with_capacity(1 + 32 + bundle.signing_length());
         buf.push(BATCH_SIGNING_HASH_DOMAIN);
-        self.tx.encode(&mut buf);
+        buf.extend_from_slice(tx_hash.as_bytes());
         bundle.encode_for_signing(&mut buf);
-        Some(shell_primitives::keccak256(&buf))
+        Some(shell_primitives::blake3_hash(&buf))
     }
 
     /// Canonical signing hash for the paymaster's authorization:
-    /// `keccak256( PAYMASTER_SIGNING_HASH_DOMAIN || from || batch_signing_hash )`.
+    /// `blake3( PAYMASTER_SIGNING_HASH_DOMAIN || from || batch_signing_hash )`.
     ///
     /// Returns `None` if no paymaster is set on the bundle (or the tx is not
     /// an AA bundle at all).
@@ -1336,13 +1428,17 @@ impl SignedTransaction {
         buf.push(PAYMASTER_SIGNING_HASH_DOMAIN);
         buf.extend_from_slice(self.from.0.as_slice());
         buf.extend_from_slice(batch_hash.0.as_slice());
-        Some(shell_primitives::keccak256(&buf))
+        Some(shell_primitives::blake3_hash(&buf))
     }
 
-    /// Transaction hash (excludes signature data and sender).
+    /// Transaction hash (excludes signature bytes but includes the PQ signature domain).
     /// Cached after first computation via `OnceLock`.
     pub fn hash(&self) -> ShellHash {
-        *self.tx_hash.get_or_init(|| self.tx.hash())
+        *self.tx_hash.get_or_init(|| self.sender_signing_hash())
+    }
+
+    pub fn public_key(&self) -> Option<&[u8]> {
+        self.pubkey_mode.pubkey_bytes()
     }
 
     pub fn sig_type(&self) -> SignatureType {

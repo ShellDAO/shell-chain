@@ -5,7 +5,7 @@
 //!
 //! - [`ShellStateDb`]: implements `revm::Database` over WorldState + ChainStore
 //! - [`ShellEvm`]: transaction executor (Shanghai spec)
-//! - [`ShellPrecompiles`]: PQ precompile provider (ecrecover disabled, PQ_DILITHIUM_VERIFY at 0x0100)
+//! - [`ShellPrecompiles`]: PQ precompile provider (6-precompile suite at 0x0001-0x0006)
 //! - [`validate_tx`]: PQ signature verification + hybrid pubkey registration
 
 mod aa_validation;
@@ -27,7 +27,7 @@ pub use parallel::{
     ConflictMetric, ConflictReason, ExecutionWave, ParallelEvmConfig, ParallelExecutionPlan,
     ParallelScheduler, TxConflict, TxConflictGraph,
 };
-pub use precompiles::{ShellPrecompiles, PQ_DILITHIUM_VERIFY_GAS};
+pub use precompiles::{BLAKE3_HASH_GAS, PQ_ADDR_DERIVE_GAS, PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_VERIFY_GAS, ShellPrecompiles};
 pub use rwset::{HeuristicRwSetExtractor, ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};
 pub use state_db::{ShellStateDb, StateDbError};
 pub use system_contracts::{

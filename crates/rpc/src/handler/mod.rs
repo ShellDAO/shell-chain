@@ -432,7 +432,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             blob_versioned_hashes: None,
         };
 
-        let tx_hash = tx.hash();
+        let tx_hash = tx.signing_hash(signer.sig_type().as_u8());
         let signature = signer
             .sign(tx_hash.0.as_slice())
             .map_err(|e| internal_err(format!("signing failed: {e}")))?;

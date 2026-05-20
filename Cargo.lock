@@ -5948,6 +5948,7 @@ version = "0.22.2"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "blake3",
  "criterion",
  "hex",
  "rayon",

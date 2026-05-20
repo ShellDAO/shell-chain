@@ -355,7 +355,7 @@ fn sign_and_build(
     signer: &dyn Signer,
     rpc_url: &str,
 ) -> Result<SignedTransaction, Box<dyn std::error::Error>> {
-    let tx_hash = tx.hash();
+    let tx_hash = tx.signing_hash(signer.sig_type().as_u8());
     let sig = signer.sign(tx_hash.as_bytes())?;
 
     let pubkey_registered = rpc_is_pubkey_registered(rpc_url, &from).unwrap_or(false);

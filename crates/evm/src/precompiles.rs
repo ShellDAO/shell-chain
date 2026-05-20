@@ -1,47 +1,58 @@
 //! Shell-chain custom precompiles.
 //!
-//! Wraps the standard Ethereum precompiles and adds:
-//! - **0x0100** (`PQ_DILITHIUM_VERIFY`): Dilithium3 signature verification
-//! - **0x01** (`ecrecover`): DISABLED — returns empty (forces PQ migration)
+//! Overrides the standard Ethereum precompiles at `0x0001`–`0x0006` with the
+//! Shell PQ suite:
+//! - `0x0001`: ML-DSA-65 verify (implemented with the existing Dilithium3-compatible verifier)
+//! - `0x0002`: SLH-DSA-SHA2-256f verify
+//! - `0x0003`: ML-DSA-65 batch verify
+//! - `0x0004`: BLAKE3-256 hash
+//! - `0x0005`: BLAKE3-512 hash
+//! - `0x0006`: PQAddr derive (`BLAKE3(algo_id || public_key)`)
 //!
-//! # PQ_DILITHIUM_VERIFY Input Format
-//!
-//! Simple length-prefixed binary (no ABI encoding overhead):
-//! ```text
-//! [4 bytes: pubkey_len (BE u32)] [pubkey bytes]
-//! [4 bytes: msg_len (BE u32)]    [message bytes]
-//! [remaining bytes]              [signature bytes]
-//! ```
-//!
-//! # Output
-//!
-//! 32 bytes: `0x..01` (valid) or `0x..00` (invalid/error).
+//! This keeps `ecrecover` disabled by overriding `0x0001` with the Shell PQ verifier.
 
 use alloy_primitives::{address, Address, Bytes};
-use interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
+use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::ContextTr;
 use revm::handler::PrecompileProvider;
-use revm::interpreter;
 use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::hardfork::SpecId;
-use shell_crypto::{DilithiumVerifier, PQSignature, SignatureType, Verifier};
+use shell_crypto::{DilithiumVerifier, PQSignature, SignatureType, SphincsVerifier, Verifier};
 use std::boxed::Box;
 
-/// Address of the ecrecover precompile (DISABLED in shell-chain).
-const ECRECOVER_ADDR: Address = address!("0x0000000000000000000000000000000000000001");
+pub const PQ_MLDSA65_VERIFY_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000001");
+pub const PQ_SLHDSA_SHA2_256F_VERIFY_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000002");
+pub const PQ_MLDSA65_BATCH_VERIFY_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000003");
+pub const PQ_BLAKE3_256_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000004");
+pub const PQ_BLAKE3_512_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000005");
+pub const PQ_ADDR_DERIVE_ADDR: Address =
+    address!("0x0000000000000000000000000000000000000006");
 
-/// Address of the PQ Dilithium3 verify precompile.
-const PQ_DILITHIUM_VERIFY_ADDR: Address = address!("0x0000000000000000000000000000000000000100");
+const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
+    PQ_MLDSA65_VERIFY_ADDR,
+    PQ_SLHDSA_SHA2_256F_VERIFY_ADDR,
+    PQ_MLDSA65_BATCH_VERIFY_ADDR,
+    PQ_BLAKE3_256_ADDR,
+    PQ_BLAKE3_512_ADDR,
+    PQ_ADDR_DERIVE_ADDR,
+];
 
-/// Gas cost for PQ Dilithium3 signature verification.
-pub const PQ_DILITHIUM_VERIFY_GAS: u64 = 10_000;
+pub const PQ_VERIFY_GAS: u64 = 10_000;
+pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 10_000;
+pub const BLAKE3_HASH_GAS: u64 = 500;
+pub const PQ_ADDR_DERIVE_GAS: u64 = 10_000;
 
-/// Shell-chain precompile provider.
-///
-/// Wraps standard Ethereum precompiles and overrides:
-/// - ecrecover (0x01): returns empty bytes (disabled)
-/// - 0x0100: Dilithium3 signature verification
+const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
+const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
+const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
+const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
+
 #[derive(Debug, Clone)]
 pub struct ShellPrecompiles {
     inner: &'static Precompiles,
@@ -56,11 +67,8 @@ impl ShellPrecompiles {
         }
     }
 
-    /// Check if the address is a precompile (inherent method for non-generic contexts).
     pub fn is_precompile(&self, address: &Address) -> bool {
-        *address == PQ_DILITHIUM_VERIFY_ADDR
-            || *address == ECRECOVER_ADDR
-            || self.inner.contains(address)
+        is_pq_precompile(address) || self.inner.contains(address)
     }
 }
 
@@ -84,21 +92,10 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
     ) -> Result<Option<Self::Output>, String> {
         let target = &inputs.bytecode_address;
 
-        // Override: ecrecover disabled
-        if *target == ECRECOVER_ADDR {
-            return Ok(Some(InterpreterResult {
-                result: InstructionResult::Return,
-                gas: Gas::new(inputs.gas_limit),
-                output: Bytes::new(), // empty = disabled
-            }));
+        if is_pq_precompile(target) {
+            return Ok(Some(run_pq_precompile(target, inputs, context)));
         }
 
-        // Override: PQ Dilithium3 verify
-        if *target == PQ_DILITHIUM_VERIFY_ADDR {
-            return Ok(Some(run_pq_verify(inputs, context)));
-        }
-
-        // Delegate to standard precompiles
         let Some(precompile) = self.inner.get(target) else {
             return Ok(None);
         };
@@ -109,16 +106,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
             output: Bytes::new(),
         };
 
-        let input_bytes = match &inputs.input {
-            CallInput::SharedBuffer(range) => {
-                if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
-                    slice.as_ref().to_vec()
-                } else {
-                    vec![]
-                }
-            }
-            CallInput::Bytes(bytes) => bytes.0.to_vec(),
-        };
+        let input_bytes = read_input(inputs, context);
 
         match precompile.execute(&input_bytes, inputs.gas_limit) {
             Ok(output) => {
@@ -144,248 +132,266 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
     }
 
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        let standard = self.inner.addresses().cloned().collect::<Vec<_>>();
-        Box::new(
-            standard
-                .into_iter()
-                .chain(std::iter::once(PQ_DILITHIUM_VERIFY_ADDR)),
-        )
+        let standard = self
+            .inner
+            .addresses()
+            .cloned()
+            .filter(|address| !is_pq_precompile(address))
+            .collect::<Vec<_>>();
+        Box::new(PQ_PRECOMPILE_ADDRS.into_iter().chain(standard))
     }
 
     fn contains(&self, address: &Address) -> bool {
-        *address == PQ_DILITHIUM_VERIFY_ADDR
-            || *address == ECRECOVER_ADDR
-            || self.inner.contains(address)
+        is_pq_precompile(address) || self.inner.contains(address)
     }
 }
 
-// ── PQ Dilithium3 verify implementation ───────────────────────
+fn is_pq_precompile(address: &Address) -> bool {
+    PQ_PRECOMPILE_ADDRS.contains(address)
+}
 
-/// Execute the PQ_DILITHIUM_VERIFY precompile.
-///
-/// Input format: `[4:pubkey_len][pubkey][4:msg_len][msg][signature]`
-/// Output: 32 bytes — 1 for valid, 0 for invalid.
-fn run_pq_verify<CTX: ContextTr>(inputs: &CallInputs, context: &mut CTX) -> InterpreterResult {
-    let mut result = InterpreterResult {
+fn run_pq_precompile<CTX: ContextTr>(
+    target: &Address,
+    inputs: &CallInputs,
+    context: &mut CTX,
+) -> InterpreterResult {
+    let input = read_input(inputs, context);
+    match *target {
+        PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify(inputs.gas_limit, &input),
+        PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => run_slhdsa_sha2_256f_verify(inputs.gas_limit, &input),
+        PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, &input),
+        PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, &input),
+        PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, &input),
+        PQ_ADDR_DERIVE_ADDR => run_pq_addr_derive(inputs.gas_limit, &input),
+        _ => InterpreterResult {
+            result: InstructionResult::PrecompileError,
+            gas: Gas::new(inputs.gas_limit),
+            output: Bytes::new(),
+        },
+    }
+}
+
+fn read_input<CTX: ContextTr>(inputs: &CallInputs, context: &mut CTX) -> Vec<u8> {
+    match &inputs.input {
+        CallInput::SharedBuffer(range) => context
+            .local()
+            .shared_memory_buffer_slice(range.clone())
+            .map(|slice| slice.as_ref().to_vec())
+            .unwrap_or_default(),
+        CallInput::Bytes(bytes) => bytes.0.to_vec(),
+    }
+}
+
+fn base_result(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
         result: InstructionResult::Return,
-        gas: Gas::new(inputs.gas_limit),
-        output: encode_bool(false),
-    };
+        gas: Gas::new(gas_limit),
+        output: Bytes::new(),
+    }
+}
 
-    // Charge gas
-    if !result.gas.record_cost(PQ_DILITHIUM_VERIFY_GAS) {
+fn charge_gas(result: &mut InterpreterResult, gas: u64) -> bool {
+    if !result.gas.record_cost(gas) {
         result.result = InstructionResult::PrecompileOOG;
+        return false;
+    }
+    true
+}
+
+fn run_mldsa65_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, PQ_VERIFY_GAS) {
         return result;
     }
-
-    let input_bytes: Vec<u8> = match &inputs.input {
-        CallInput::SharedBuffer(range) => {
-            if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
-                slice.as_ref().to_vec()
-            } else {
-                return result;
-            }
-        }
-        CallInput::Bytes(bytes) => bytes.0.to_vec(),
-    };
-
-    // Parse input
-    let parsed = match parse_pq_verify_input(&input_bytes) {
-        Some(p) => p,
-        None => return result, // malformed input → return false
-    };
-
-    // Verify signature
-    let verifier = DilithiumVerifier;
-    let sig = PQSignature::new(SignatureType::Dilithium3, parsed.signature.to_vec());
-    match verifier.verify(parsed.pubkey, parsed.message, &sig) {
-        Ok(true) => {
-            result.output = encode_bool(true);
-        }
-        _ => {
-            // Invalid signature or verification error → return false
-        }
-    }
-
+    result.output = bool_output(verify_mldsa65(input));
     result
 }
 
-struct PqVerifyInput<'a> {
-    pubkey: &'a [u8],
-    message: &'a [u8],
-    signature: &'a [u8],
+fn run_slhdsa_sha2_256f_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, PQ_VERIFY_GAS) {
+        return result;
+    }
+    result.output = bool_output(verify_slhdsa_sha2_256f(input));
+    result
 }
 
-/// Parse length-prefixed PQ verify input.
-fn parse_pq_verify_input(data: &[u8]) -> Option<PqVerifyInput<'_>> {
-    if data.len() < 8 {
-        return None;
+fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    let (count, valid) = verify_mldsa65_batch(input);
+    let gas = PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG.saturating_mul(count as u64);
+    if !charge_gas(&mut result, gas) {
+        return result;
     }
-
-    // Read pubkey
-    let pk_len = u32::from_be_bytes(
-        data.get(0..4)
-            .unwrap_or_else(|| unreachable!("data.len() >= 8 checked above"))
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let pk_end = 4usize.saturating_add(pk_len);
-    if data.len() < pk_end.saturating_add(4) {
-        return None;
-    }
-    let pubkey = data.get(4..pk_end)?;
-
-    // Read message
-    let msg_len = u32::from_be_bytes(
-        data.get(pk_end..pk_end.saturating_add(4))
-            .unwrap_or_else(|| unreachable!("data.len() >= pk_end + 4 checked above"))
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let msg_end = pk_end.saturating_add(4).saturating_add(msg_len);
-    if data.len() < msg_end {
-        return None;
-    }
-    let message = data.get(pk_end.saturating_add(4)..msg_end)?;
-
-    // Remaining = signature
-    let signature = data.get(msg_end..)?;
-    if signature.is_empty() {
-        return None;
-    }
-
-    Some(PqVerifyInput {
-        pubkey,
-        message,
-        signature,
-    })
+    result.output = bool_output(valid);
+    result
 }
 
-/// Encode a boolean as 32-byte ABI output.
-fn encode_bool(value: bool) -> Bytes {
-    let mut out = [0u8; 32];
-    if value {
-        out[31] = 1;
+fn run_blake3_256(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, BLAKE3_HASH_GAS) {
+        return result;
     }
-    Bytes::from(out.to_vec())
+    result.output = Bytes::copy_from_slice(blake3::hash(input).as_bytes());
+    result
+}
+
+fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, BLAKE3_HASH_GAS) {
+        return result;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(input);
+    let mut output = [0u8; 64];
+    hasher.finalize_xof().fill(&mut output);
+    result.output = Bytes::copy_from_slice(&output);
+    result
+}
+
+fn run_pq_addr_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, PQ_ADDR_DERIVE_GAS) {
+        return result;
+    }
+    let Some((&algo_id, public_key)) = input.split_first() else {
+        result.output = Bytes::copy_from_slice(&[0u8; 32]);
+        return result;
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[algo_id]);
+    hasher.update(public_key);
+    result.output = Bytes::copy_from_slice(hasher.finalize().as_bytes());
+    result
+}
+
+fn verify_mldsa65(input: &[u8]) -> bool {
+    if input.len() < DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES {
+        return false;
+    }
+
+    let public_key = &input[..DILITHIUM3_PUBLIC_KEY_BYTES];
+    let signature = &input
+        [DILITHIUM3_PUBLIC_KEY_BYTES..DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES];
+    let message = &input[DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES..];
+    let signature = PQSignature::new(SignatureType::Dilithium3, signature.to_vec());
+    DilithiumVerifier
+        .verify(public_key, message, &signature)
+        .unwrap_or(false)
+}
+
+fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
+    if input.len() < SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES {
+        return false;
+    }
+
+    let public_key = &input[..SPHINCS_PUBLIC_KEY_BYTES];
+    let signature = &input[SPHINCS_PUBLIC_KEY_BYTES..SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES];
+    let message = &input[SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES..];
+    let signature = PQSignature::new(SignatureType::SphincsSha2256f, signature.to_vec());
+    SphincsVerifier
+        .verify(public_key, message, &signature)
+        .unwrap_or(false)
+}
+
+fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
+    let Some(count_bytes) = input.get(..4) else {
+        return (0, false);
+    };
+    let count = u32::from_be_bytes(count_bytes.try_into().expect("slice length checked")) as usize;
+    let mut cursor = 4usize;
+    let mut valid = true;
+
+    for _ in 0..count {
+        let Some(len_bytes) = input.get(cursor..cursor + 4) else {
+            return (count, false);
+        };
+        cursor += 4;
+        let msg_len = u32::from_be_bytes(len_bytes.try_into().expect("slice length checked")) as usize;
+        let Some(end) = cursor
+            .checked_add(DILITHIUM3_PUBLIC_KEY_BYTES)
+            .and_then(|value| value.checked_add(DILITHIUM3_SIGNATURE_BYTES))
+            .and_then(|value| value.checked_add(msg_len))
+        else {
+            return (count, false);
+        };
+        let Some(item) = input.get(cursor..end) else {
+            return (count, false);
+        };
+        valid &= verify_mldsa65(item);
+        cursor = end;
+    }
+
+    (count, valid && cursor == input.len())
+}
+
+fn bool_output(valid: bool) -> Bytes {
+    Bytes::copy_from_slice(&[u8::from(valid)])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_crypto::{DilithiumSigner, Signer};
+    use shell_crypto::{DilithiumSigner, Signer, SphincsSigner};
 
     #[test]
-    fn parse_valid_input() {
-        let pubkey = vec![0xAA; 1952];
-        let message = b"hello world";
-        let signature = vec![0xBB; 3293];
-
-        let mut input = Vec::new();
-        input.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
-        input.extend_from_slice(&pubkey);
-        input.extend_from_slice(&(message.len() as u32).to_be_bytes());
-        input.extend_from_slice(message);
-        input.extend_from_slice(&signature);
-
-        let parsed = parse_pq_verify_input(&input).unwrap();
-        assert_eq!(parsed.pubkey.len(), 1952);
-        assert_eq!(parsed.message, b"hello world");
-        assert_eq!(parsed.signature.len(), 3293);
+    fn pq_suite_addresses_match_spec() {
+        assert_eq!(PQ_MLDSA65_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000001"));
+        assert_eq!(PQ_SLHDSA_SHA2_256F_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000002"));
+        assert_eq!(PQ_MLDSA65_BATCH_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000003"));
+        assert_eq!(PQ_BLAKE3_256_ADDR, address!("0x0000000000000000000000000000000000000004"));
+        assert_eq!(PQ_BLAKE3_512_ADDR, address!("0x0000000000000000000000000000000000000005"));
+        assert_eq!(PQ_ADDR_DERIVE_ADDR, address!("0x0000000000000000000000000000000000000006"));
     }
 
     #[test]
-    fn parse_empty_input_returns_none() {
-        assert!(parse_pq_verify_input(&[]).is_none());
+    fn blake3_256_precompile_hashes_input() {
+        let output = run_blake3_256(1_000, b"abc");
+        assert_eq!(output.output.as_ref(), blake3::hash(b"abc").as_bytes());
     }
 
     #[test]
-    fn parse_truncated_input_returns_none() {
-        let mut input = Vec::new();
-        input.extend_from_slice(&(100u32).to_be_bytes());
-        // Missing pubkey data
-        assert!(parse_pq_verify_input(&input).is_none());
-    }
-
-    #[test]
-    fn encode_bool_true() {
-        let out = encode_bool(true);
-        assert_eq!(out.len(), 32);
-        assert_eq!(out[31], 1);
-        assert!(out[..31].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn encode_bool_false() {
-        let out = encode_bool(false);
-        assert_eq!(out.len(), 32);
-        assert!(out.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn pq_verify_real_signature() {
+    fn mldsa_verify_precompile_accepts_valid_signature() {
         let signer = DilithiumSigner::generate();
-        let message = b"test message for precompile";
+        let message = b"pqvm ml-dsa precompile";
         let sig = signer.sign(message).unwrap();
-
         let mut input = Vec::new();
-        let pk = signer.public_key();
-        input.extend_from_slice(&(pk.len() as u32).to_be_bytes());
-        input.extend_from_slice(pk);
-        input.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        input.extend_from_slice(signer.public_key());
+        input.extend_from_slice(&sig.data);
         input.extend_from_slice(message);
-        input.extend_from_slice(&sig.data); // field name is `data`
 
-        let parsed = parse_pq_verify_input(&input).unwrap();
-        let verifier = DilithiumVerifier;
-        let pq_sig = PQSignature::new(SignatureType::Dilithium3, parsed.signature.to_vec());
-        let valid = verifier
-            .verify(parsed.pubkey, parsed.message, &pq_sig)
-            .unwrap();
-        assert!(valid);
+        let output = run_mldsa65_verify(PQ_VERIFY_GAS, &input);
+        assert_eq!(output.output.as_ref(), &[1]);
     }
 
     #[test]
-    fn pq_verify_bad_signature() {
-        let signer = DilithiumSigner::generate();
-        let message = b"test message";
-
+    fn slhdsa_verify_precompile_accepts_valid_signature() {
+        let signer = SphincsSigner::generate();
+        let message = b"pqvm slh-dsa precompile";
+        let sig = signer.sign(message).unwrap();
         let mut input = Vec::new();
-        let pk = signer.public_key();
-        input.extend_from_slice(&(pk.len() as u32).to_be_bytes());
-        input.extend_from_slice(pk);
-        input.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        input.extend_from_slice(signer.public_key());
+        input.extend_from_slice(&sig.data);
         input.extend_from_slice(message);
-        input.extend_from_slice(&[0xDE; 100]); // bad signature
 
-        let parsed = parse_pq_verify_input(&input).unwrap();
-        let verifier = DilithiumVerifier;
-        let pq_sig = PQSignature::new(SignatureType::Dilithium3, parsed.signature.to_vec());
-        let result = verifier.verify(parsed.pubkey, parsed.message, &pq_sig);
-        // Should either return Ok(false) or Err
-        assert!(!result.unwrap_or(false));
+        let output = run_slhdsa_sha2_256f_verify(PQ_VERIFY_GAS, &input);
+        assert_eq!(output.output.as_ref(), &[1]);
     }
 
     #[test]
-    fn ecrecover_address_is_0x01() {
-        assert_eq!(
-            ECRECOVER_ADDR,
-            address!("0x0000000000000000000000000000000000000001")
-        );
+    fn pq_addr_derive_precompile_outputs_32_bytes() {
+        let mut input = vec![0x01];
+        input.extend_from_slice(b"public-key");
+        let output = run_pq_addr_derive(PQ_ADDR_DERIVE_GAS, &input);
+        assert_eq!(output.output.len(), 32);
     }
 
     #[test]
-    fn pq_verify_address_is_0x0100() {
-        assert_eq!(
-            PQ_DILITHIUM_VERIFY_ADDR,
-            address!("0x0000000000000000000000000000000000000100")
-        );
-    }
-
-    #[test]
-    fn shell_precompiles_contains_custom() {
+    fn shell_precompiles_contains_custom_suite() {
         let sp = ShellPrecompiles::new(SpecId::CANCUN);
-        assert!(sp.is_precompile(&ECRECOVER_ADDR));
-        assert!(sp.is_precompile(&PQ_DILITHIUM_VERIFY_ADDR));
+        for address in PQ_PRECOMPILE_ADDRS {
+            assert!(sp.is_precompile(&address));
+        }
     }
 }
