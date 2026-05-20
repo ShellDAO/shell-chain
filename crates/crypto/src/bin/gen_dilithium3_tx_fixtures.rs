@@ -26,6 +26,7 @@ use shell_primitives::{blake3_hash, Address, U256};
 ///   data || gas_limit(8B be) || max_fee_per_gas(8B be) || max_priority_fee_per_gas(8B be) ||
 ///   sig_type(1B) || tx_type(1B)
 /// For tx_type == 3: also max_fee_per_blob_gas(8B be) || blob_hashes...
+#[allow(clippy::too_many_arguments)]
 fn signing_hash(
     chain_id: u64,
     nonce: u64,
