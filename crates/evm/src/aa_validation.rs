@@ -755,7 +755,7 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<S> {
                     .inner
                     .world_state()
                     .get_account(&self.validation_target)
-                    .map_err(|e| StateDbError::Storage(e))?
+                    .map_err(StateDbError::Storage)?
                     .map(|a| ShellStateDb::<S>::to_account_info(&a));
             }
             if let Some(ref mut account) = info {

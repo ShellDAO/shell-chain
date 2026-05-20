@@ -72,6 +72,7 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
 
     /// Resolve a 20-byte EVM address to the full 32-byte Shell address,
     /// using the PQ hints if available.
+    #[allow(dead_code)]
     pub(crate) fn resolve_shell_address(&self, evm_addr: EvmAddress) -> ShellAddress {
         self.pq_hints
             .get(&evm_addr)
@@ -121,6 +122,7 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
     /// Remap any zero-padded EVM address in `state` back to the full 32-byte
     /// PQ address where a hint exists. This ensures `commit_evm_state` writes
     /// nonce/balance updates to the same slot that `validate_tx` reads from.
+    #[allow(dead_code)]
     pub(crate) fn remap_state_to_pq(&self, state: revm::state::EvmState) -> revm::state::EvmState {
         if self.pq_hints.is_empty() {
             return state;

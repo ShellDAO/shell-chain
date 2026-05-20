@@ -46,6 +46,7 @@ pub const BLAKE3_BASE_GAS: u64 = 30;
 pub const BLAKE3_WORD_GAS: u64 = 6;
 pub const PQ_ADDR_DERIVE_GAS: u64 = 200;
 
+#[allow(dead_code)]
 const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
@@ -227,7 +228,7 @@ fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_blake3_256(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    let words = (input.len() as u64 + 31) / 32;
+    let words = (input.len() as u64).div_ceil(32);
     let gas = BLAKE3_BASE_GAS + BLAKE3_WORD_GAS * words;
     if !charge_gas(&mut result, gas) {
         return result;
@@ -238,7 +239,7 @@ fn run_blake3_256(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    let words = (input.len() as u64 + 31) / 32;
+    let words = (input.len() as u64).div_ceil(32);
     let gas = BLAKE3_BASE_GAS + BLAKE3_WORD_GAS * words;
     if !charge_gas(&mut result, gas) {
         return result;
