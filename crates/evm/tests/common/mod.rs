@@ -56,18 +56,13 @@ pub fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress, balance: 
         .unwrap();
 }
 
-pub fn tx_signing_hash(tx: &Transaction) -> ShellHash {
-    let encoded = alloy_rlp::encode(tx);
-    shell_primitives::keccak256(&encoded)
-}
-
 pub fn sign_tx<S: Signer>(
     from: ShellAddress,
     signer: &S,
     tx: Transaction,
     include_pubkey: bool,
 ) -> SignedTransaction {
-    let hash = tx_signing_hash(&tx);
+    let hash = tx.signing_hash(signer.sig_type().as_u8());
     let sig = signer.sign(hash.as_bytes()).expect("sign failed");
     if include_pubkey {
         SignedTransaction::with_pubkey(from, tx, sig, signer.public_key().to_vec())
@@ -104,12 +99,8 @@ pub fn apply_tx<V: Verifier>(
         .expect("execute_tx failed");
 
     if !result.is_system_tx {
-        commit_evm_state(
-            &result.state_changes,
-            evm.state_db_mut().world_state_mut(),
-            chain_store,
-        )
-        .expect("commit_evm_state failed");
+        commit_evm_state(&result, evm.state_db_mut().world_state_mut(), chain_store)
+            .expect("commit_evm_state failed");
     }
 
     result

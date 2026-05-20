@@ -323,7 +323,7 @@ impl<S: KvStore + 'static> WorldState<S> {
             let slot = self.get_storage(&registry, &Self::validator_slot_key(i))?;
             // Address::ZERO is a valid validator (slot value is all zeros).
             // We trust the count field to determine how many validators exist.
-            let addr = Address::try_from_slice(&slot.as_bytes()[12..32])
+            let addr = Address::try_from_slice(slot.as_bytes())
                 .map_err(|e| StorageError::Codec(e.to_string()))?;
             validators.push(addr);
         }
@@ -355,8 +355,7 @@ impl<S: KvStore + 'static> WorldState<S> {
 
         let new_count = validators.len() as u64;
         for (i, addr) in validators.iter().enumerate() {
-            let mut slot = [0u8; 32];
-            slot[12..32].copy_from_slice(addr.as_bytes());
+            let slot: [u8; 32] = addr.0;
             self.set_storage(
                 &registry,
                 &Self::validator_slot_key(i as u64),

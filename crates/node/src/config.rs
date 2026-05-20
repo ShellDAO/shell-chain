@@ -348,14 +348,14 @@ mod tests {
 
     #[test]
     fn dev_config_proposer_is_authority() {
-        let addr = Address::from_slice(&[0xAB; 20]);
+        let addr = Address::from_slice(&[0xAB; 32]);
         let cfg = NodeConfig::dev(addr);
         assert_eq!(cfg.proposer_address, Some(addr));
     }
 
     #[test]
     fn dev_config_consensus_has_authority() {
-        let addr = Address::from_slice(&[0xCD; 20]);
+        let addr = Address::from_slice(&[0xCD; 32]);
         let cfg = NodeConfig::dev(addr);
         assert_eq!(cfg.consensus.poa_config().authorities.len(), 1);
         assert_eq!(cfg.consensus.poa_config().authorities[0], addr);

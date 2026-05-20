@@ -289,8 +289,8 @@ mod tests {
 
     #[test]
     fn address_mismatch_display() {
-        let from = Address::from_slice(&[0x01; 20]);
-        let derived = Address::from_slice(&[0x02; 20]);
+        let from = Address::from_slice(&[0x01; 32]);
+        let derived = Address::from_slice(&[0x02; 32]);
         let err = MempoolError::AddressMismatch { from, derived };
         let msg = err.to_string();
         assert!(msg.contains("address mismatch"));

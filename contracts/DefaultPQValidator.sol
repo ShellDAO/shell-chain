@@ -11,12 +11,12 @@ interface IAccountValidator {
 
 /// @title DefaultPQValidator
 /// @notice Reference AA validator that mirrors Shell-Chain's built-in
-/// Dilithium verification in contract form.
-/// @dev Calls the Shell-Chain Dilithium precompile at 0x0100 using the native
+/// ML-DSA-65 verification in contract form.
+/// @dev Calls the Shell-Chain ML-DSA-65 precompile at 0x0001 using the native
 /// length-prefixed wire format:
 /// [4-byte pubkey length][pubkey][4-byte message length][32-byte tx hash][sig]
 contract DefaultPQValidator is IAccountValidator {
-    address internal constant PQ_DILITHIUM_VERIFY = address(0x0100);
+    address internal constant ML_DSA_65_VERIFY = address(0x0001);
 
     function validateTransaction(
         bytes32 txHash,
@@ -31,7 +31,7 @@ contract DefaultPQValidator is IAccountValidator {
             sig
         );
 
-        (bool ok, bytes memory output) = PQ_DILITHIUM_VERIFY.staticcall(input);
+        (bool ok, bytes memory output) = ML_DSA_65_VERIFY.staticcall(input);
         if (!ok || output.length < 32) {
             return 0x00;
         }

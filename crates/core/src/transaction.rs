@@ -315,8 +315,22 @@ impl Transaction {
     }
 
     /// Compute the PQ signing hash using the spec payload and BLAKE3.
+    ///
+    /// Preimage: `chain_id || nonce || to(32B) || value(32B) || data ||
+    ///            gas_limit || max_fee_per_gas || max_priority_fee_per_gas ||
+    ///            sig_type || tx_type`
+    /// For blob transactions (tx_type == 3), appends: `max_fee_per_blob_gas(8B) || blob_hash_0(32B) || ...`
     pub fn signing_hash(&self, sig_type: u8) -> ShellHash {
-        let mut preimage = Vec::with_capacity(8 + 8 + 32 + 32 + self.data.len() + 8 + 1);
+        let blob_extra = if self.tx_type == 3 {
+            8 + self
+                .blob_versioned_hashes
+                .as_ref()
+                .map_or(0, |h| h.len() * 32)
+        } else {
+            0
+        };
+        let mut preimage =
+            Vec::with_capacity(8 + 8 + 32 + 32 + self.data.len() + 8 + 8 + 8 + 1 + 1 + blob_extra);
         preimage.extend_from_slice(&self.chain_id.to_be_bytes());
         preimage.extend_from_slice(&self.nonce.to_be_bytes());
         match &self.to {
@@ -327,7 +341,19 @@ impl Transaction {
         preimage.extend_from_slice(&value);
         preimage.extend_from_slice(self.data.as_ref());
         preimage.extend_from_slice(&self.gas_limit.to_be_bytes());
+        preimage.extend_from_slice(&self.max_fee_per_gas.to_be_bytes());
+        preimage.extend_from_slice(&self.max_priority_fee_per_gas.to_be_bytes());
         preimage.push(sig_type);
+        preimage.push(self.tx_type);
+        if self.tx_type == 3 {
+            let fee = self.max_fee_per_blob_gas.unwrap_or(0);
+            preimage.extend_from_slice(&fee.to_be_bytes());
+            if let Some(hashes) = &self.blob_versioned_hashes {
+                for h in hashes {
+                    preimage.extend_from_slice(h.as_bytes());
+                }
+            }
+        }
         shell_primitives::blake3_hash(&preimage)
     }
 
@@ -649,6 +675,11 @@ impl Decodable for InnerCall {
         let to_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
         let to = if to_raw.is_empty() {
             None
+        } else if to_raw.len() == 32 {
+            Some(
+                Address::try_from_slice(to_raw)
+                    .map_err(|_| alloy_rlp::Error::Custom("invalid 'to' address bytes"))?,
+            )
         } else if to_raw.len() == 20 {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(to_raw);
@@ -1016,6 +1047,11 @@ impl Decodable for AaBundle {
         let paymaster_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
         let paymaster = if paymaster_raw.is_empty() {
             None
+        } else if paymaster_raw.len() == 32 {
+            Some(
+                Address::try_from_slice(paymaster_raw)
+                    .map_err(|_| alloy_rlp::Error::Custom("invalid paymaster address bytes"))?,
+            )
         } else if paymaster_raw.len() == 20 {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(paymaster_raw);
@@ -1213,7 +1249,7 @@ impl<'de> Deserialize<'de> for SignedTransaction {
             && (helper.sender_pubkey.is_some() || helper.public_key.is_some())
         {
             return Err(serde::de::Error::custom(
-                "signed transaction must not specify both pubkey_mode and public_key",
+                "signed transaction must not specify both pubkey_mode and sender_pubkey",
             ));
         }
         if helper.sender_pubkey.is_some() && helper.public_key.is_some() {
@@ -1236,9 +1272,9 @@ impl<'de> Deserialize<'de> for SignedTransaction {
                 signature
             }
             SignedTransactionSignatureField::Raw(signature) => {
-                let sig_type = helper
-                    .sig_type
-                    .ok_or_else(|| serde::de::Error::custom("sig_type is required for raw signature bytes"))?;
+                let sig_type = helper.sig_type.ok_or_else(|| {
+                    serde::de::Error::custom("sig_type is required for raw signature bytes")
+                })?;
                 let sig_type = SignatureType::from_u8(sig_type)
                     .ok_or_else(|| serde::de::Error::custom("unknown sig_type"))?;
                 let signature = PQSignature::new(sig_type, signature.as_ref().to_vec());
@@ -1431,10 +1467,13 @@ impl SignedTransaction {
         Some(shell_primitives::blake3_hash(&buf))
     }
 
-    /// Transaction hash (excludes signature bytes but includes the PQ signature domain).
+    /// Canonical transaction ID — the simple tx signing hash, independent of AA bundle.
+    /// AA bundle senders sign `batch_signing_hash()`, but the chain indexes txs by this hash.
     /// Cached after first computation via `OnceLock`.
     pub fn hash(&self) -> ShellHash {
-        *self.tx_hash.get_or_init(|| self.sender_signing_hash())
+        *self
+            .tx_hash
+            .get_or_init(|| self.tx.signing_hash(self.signature.sig_type.as_u8()))
     }
 
     pub fn public_key(&self) -> Option<&[u8]> {
@@ -1528,6 +1567,11 @@ impl Decodable for Transaction {
         let to_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
         let to = if to_raw.is_empty() {
             None
+        } else if to_raw.len() == 32 {
+            Some(
+                Address::try_from_slice(to_raw)
+                    .map_err(|_| alloy_rlp::Error::Custom("invalid 'to' address bytes"))?,
+            )
         } else if to_raw.len() == 20 {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(to_raw);
@@ -1940,12 +1984,12 @@ mod tests {
             blob_versioned_hashes: Some(vec![ShellHash::from([0x55; 32])]),
         };
 
-        // Generated by shell-sdk hashTransaction():
-        // 0xcc9b2cfd55bb83205daeb92128de039380fed2ae3ec36b07cfbecb80ade19f4c
+        // Generated by shell-sdk hashTransaction() (includes fees, tx_type + blob fields in preimage):
+        // 0xf5a14a12f556ff79fff941e944519f1c965b80e53c91503a676ff0a891ef0836
         let expected = ShellHash::from([
-            0xcc, 0x9b, 0x2c, 0xfd, 0x55, 0xbb, 0x83, 0x20, 0x5d, 0xae, 0xb9, 0x21, 0x28, 0xde,
-            0x03, 0x93, 0x80, 0xfe, 0xd2, 0xae, 0x3e, 0xc3, 0x6b, 0x07, 0xcf, 0xbe, 0xcb, 0x80,
-            0xad, 0xe1, 0x9f, 0x4c,
+            0xf5, 0xa1, 0x4a, 0x12, 0xf5, 0x56, 0xff, 0x79, 0xff, 0xf9, 0x41, 0xe9, 0x44, 0x51,
+            0x9f, 0x1c, 0x96, 0x5b, 0x80, 0xe5, 0x3c, 0x91, 0x50, 0x3a, 0x67, 0x6f, 0xf0, 0xa8,
+            0x91, 0xef, 0x08, 0x36,
         ]);
 
         assert_eq!(tx.hash(), expected);

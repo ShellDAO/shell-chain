@@ -11,9 +11,10 @@ use shell_core::SignedTransaction;
 use shell_primitives::Address;
 
 use crate::system_contracts::{
-    account_manager_address, is_system_contract, registry_address, ADD_VALIDATOR_SELECTOR,
-    CLEAR_VALIDATION_CODE_SELECTOR, GET_VALIDATORS_SELECTOR, IS_VALIDATOR_SELECTOR,
-    REMOVE_VALIDATOR_SELECTOR, ROTATE_KEY_SELECTOR, SET_VALIDATION_CODE_SELECTOR,
+    account_manager_address, decode_address, is_system_contract, registry_address,
+    ADD_VALIDATOR_SELECTOR, CLEAR_VALIDATION_CODE_SELECTOR, GET_VALIDATORS_SELECTOR,
+    IS_VALIDATOR_SELECTOR, REMOVE_VALIDATOR_SELECTOR, ROTATE_KEY_SELECTOR,
+    SET_VALIDATION_CODE_SELECTOR,
 };
 
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -228,7 +229,7 @@ fn decode_erc20_transfer_recipient(data: &[u8]) -> Option<Address> {
         return None;
     }
 
-    Address::try_from_slice(data.get(16..36).unwrap_or_default()).ok()
+    decode_address(data.get(4..36).unwrap_or_default()).ok()
 }
 
 #[cfg(test)]
@@ -286,7 +287,7 @@ mod tests {
         let token = Address::from([0x44; 20]);
         let recipient = Address::from([0x77; 20]);
         let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
-        data.extend_from_slice(&[0u8; 12]);
+        // ABI-encode address: 32-byte word with address right-aligned
         data.extend_from_slice(recipient.as_bytes());
         data.extend_from_slice(&[0u8; 31]);
         data.push(5);
@@ -318,7 +319,7 @@ mod tests {
         let token = Address::from([0x66; 20]);
         let recipient = Address::from([0x77; 20]);
         let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
-        data.extend_from_slice(&[0u8; 12]);
+        // ABI-encode address: 32-byte word with address right-aligned
         data.extend_from_slice(recipient.as_bytes());
         data.extend_from_slice(&[0u8; 31]);
         data.push(1);

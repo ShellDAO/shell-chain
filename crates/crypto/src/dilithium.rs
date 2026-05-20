@@ -217,7 +217,7 @@ mod tests {
     fn address_derivation() {
         let signer = DilithiumSigner::generate();
         let kp = signer.key_pair();
-        assert_eq!(kp.address.as_bytes().len(), 20);
+        assert_eq!(kp.address.as_bytes().len(), 32);
         // Deterministic: same pubkey → same address
         let addr2 = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         assert_eq!(kp.address, addr2);

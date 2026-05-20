@@ -4,6 +4,7 @@
 //! provides a high-level API for executing individual transactions and
 //! full blocks.
 
+use alloy_primitives::Address as EvmAddress;
 use alloy_primitives::{Bytes as AlBytes, B256, U256};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
@@ -45,6 +46,16 @@ pub struct TxExecutionResult {
     pub receipt: TransactionReceipt,
     /// State changes produced by this transaction (for committing).
     pub state_changes: EvmState,
+    /// Maps 20-byte EVM address → full 32-byte PQ Shell address for accounts
+    /// whose upper 12 bytes are non-zero. Required by `commit_evm_state` to
+    /// write state to the correct canonical key in world_state.
+    pub pq_addr_map: std::collections::HashMap<EvmAddress, ShellAddress>,
+    /// The sender's nonce after this transaction (= tx.nonce + 1). Used by
+    /// `commit_evm_state` to ensure the nonce is always advanced correctly even
+    /// when revm's `disable_nonce_check = true` suppresses the normal increment.
+    pub sender_shell_addr: ShellAddress,
+    /// Expected nonce of `sender_shell_addr` after tx (= tx.nonce + 1).
+    pub sender_nonce_after: u64,
     /// Gas actually used by this transaction.
     pub gas_used: u64,
     /// Raw output bytes returned by the EVM (return data or revert reason).
@@ -120,6 +131,12 @@ impl<S: KvStore + 'static> ShellEvm<S> {
 
         // ── Normal EVM execution path ──────────────────────────
         let tx = &signed_tx.tx;
+        let sender_shell_addr = signed_tx.from;
+        let sender_nonce_after = tx.nonce.saturating_add(1);
+
+        // Register the sender's full 32-byte PQ address so ShellStateDb::basic()
+        // can find it when revm queries by the 20-byte EVM address.
+        self.state_db.hint_pq_address(signed_tx.from);
 
         // Build revm TxEnv
         let kind = match &tx.to {
@@ -187,6 +204,10 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         let exec_result = result_and_state.result;
         let state = result_and_state.state;
 
+        // Capture PQ address hints for commit_evm_state so it writes to the
+        // canonical Shell address rather than the zero-padded EVM address.
+        let pq_addr_map = self.state_db.pq_hints.clone();
+
         // Build receipt
         let gas_used = exec_result.gas().spent();
         let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
@@ -239,6 +260,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         Ok(TxExecutionResult {
             receipt,
             state_changes: state,
+            pq_addr_map,
+            sender_shell_addr,
+            sender_nonce_after,
             gas_used,
             output: output_bytes,
             is_system_tx: false,
@@ -335,6 +359,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             return Ok(TxExecutionResult {
                 receipt,
                 state_changes: EvmState::default(),
+                pq_addr_map: Default::default(),
+                sender_shell_addr: ShellAddress::default(),
+                sender_nonce_after: 0,
                 gas_used: 0,
                 output: b"aa: payer balance shortfall at execution".to_vec(),
                 is_system_tx: true,
@@ -428,7 +455,21 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                     successful_values_sum = successful_values_sum.saturating_add(inner.value);
                     let cs_arc = std::sync::Arc::clone(self.state_db.chain_store().store());
                     let cs_view = ChainStore::new(cs_arc);
-                    commit_evm_state(&state, self.state_db.world_state_mut(), &cs_view)?;
+                    // Build a minimal result for commit_evm_state; no PQ addresses in AA
+                    // inner calls (they use EVM-canonical addresses), no nonce advance here
+                    // as outer tx handles it.
+                    let inner_result = TxExecutionResult {
+                        receipt: empty_receipt(),
+                        state_changes: state,
+                        pq_addr_map: Default::default(),
+                        sender_shell_addr: ShellAddress::default(),
+                        sender_nonce_after: 0,
+                        gas_used: 0,
+                        output: vec![],
+                        is_system_tx: false,
+                        system_contract_effects: SystemContractEffects::default(),
+                    };
+                    commit_evm_state(&inner_result, self.state_db.world_state_mut(), &cs_view)?;
                 }
                 ExecutionResult::Revert { output, .. } => {
                     atomic_failure = true;
@@ -555,6 +596,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         Ok(TxExecutionResult {
             receipt,
             state_changes: EvmState::default(),
+            pq_addr_map: Default::default(),
+            sender_shell_addr: ShellAddress::default(),
+            sender_nonce_after: 0,
             gas_used: total_gas_used,
             output,
             is_system_tx: true,
@@ -635,7 +679,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                                 let topic =
                                     ShellHash::from(system_contracts::validator_added_topic());
                                 let mut addr_word = [0u8; 32];
-                                addr_word[12..32].copy_from_slice(addr.as_bytes());
+                                addr_word[12..32].copy_from_slice(addr.to_alloy().as_slice());
                                 if let Ok(log) = shell_core::Log::new(
                                     registry_addr,
                                     vec![topic],
@@ -651,7 +695,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                                 let topic =
                                     ShellHash::from(system_contracts::validator_removed_topic());
                                 let mut addr_word = [0u8; 32];
-                                addr_word[12..32].copy_from_slice(addr.as_bytes());
+                                addr_word[12..32].copy_from_slice(addr.to_alloy().as_slice());
                                 if let Ok(log) = shell_core::Log::new(
                                     registry_addr,
                                     vec![topic],
@@ -681,6 +725,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 Ok(TxExecutionResult {
                     receipt,
                     state_changes: EvmState::default(),
+                    pq_addr_map: Default::default(),
+                    sender_shell_addr: ShellAddress::default(),
+                    sender_nonce_after: 0,
                     gas_used,
                     output,
                     is_system_tx: true,
@@ -715,6 +762,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 Ok(TxExecutionResult {
                     receipt,
                     state_changes: EvmState::default(),
+                    pq_addr_map: Default::default(),
+                    sender_shell_addr: ShellAddress::default(),
+                    sender_nonce_after: 0,
                     gas_used,
                     output: revert_msg,
                     is_system_tx: true,
@@ -722,6 +772,20 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 })
             }
         }
+    }
+}
+
+fn empty_receipt() -> TransactionReceipt {
+    TransactionReceipt {
+        tx_hash: ShellHash::default(),
+        block_number: 0,
+        tx_index: 0,
+        status: 0,
+        gas_used: 0,
+        cumulative_gas_used: 0,
+        contract_address: None,
+        logs_bloom: shell_primitives::Bytes::default(),
+        logs: vec![],
     }
 }
 
@@ -733,13 +797,23 @@ impl<S: KvStore + 'static> ShellEvm<S> {
 /// Call this after `ShellEvm::execute_tx()` to persist the computed state
 /// diff. For multi-transaction blocks, call after **each** transaction so
 /// subsequent transactions see prior state updates.
+///
+/// Uses `result.pq_addr_map` to write PQ-derived accounts to the correct
+/// 32-byte canonical key, and `result.sender_nonce_after` to ensure the
+/// sender's nonce advances even when revm's `disable_nonce_check = true`.
 pub fn commit_evm_state<S: KvStore + 'static>(
-    state: &EvmState,
+    result: &TxExecutionResult,
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<(), ExecutorError> {
+    let state = &result.state_changes;
+    let pq_addr_map = &result.pq_addr_map;
+
     for (addr, acct) in state {
-        let shell_addr = ShellAddress::from(*addr);
+        let shell_addr = pq_addr_map
+            .get(addr)
+            .copied()
+            .unwrap_or_else(|| ShellAddress::from(*addr));
         let info = &acct.info;
 
         let mut account = world_state
@@ -774,6 +848,23 @@ pub fn commit_evm_state<S: KvStore + 'static>(
             let val = ShellHash::from(B256::from(value.present_value));
             world_state.set_storage(&shell_addr, &key, &val)?;
         }
+    }
+
+    // Force-advance the sender's nonce to tx.nonce + 1.  When revm runs with
+    // `disable_nonce_check = true` the nonce in EvmState is not incremented,
+    // so we do it explicitly here for any non-system tx (sender_nonce_after > 0).
+    if result.sender_nonce_after > 0 {
+        let sender = &result.sender_shell_addr;
+        let mut account = world_state.get_account(sender)?.unwrap_or_else(|| Account {
+            pq_pubkey_hash: ShellHash::default(),
+            nonce: 0,
+            balance: U256::ZERO,
+            validation_code_hash: None,
+            code_hash: None,
+            storage_root: ShellHash::ZERO,
+        });
+        account.nonce = account.nonce.max(result.sender_nonce_after);
+        world_state.set_account(sender, &account)?;
     }
 
     Ok(())
@@ -836,8 +927,7 @@ mod tests {
     fn execute_simple_transfer() {
         let mut evm = setup_evm();
 
-        let signer = DilithiumSigner::generate();
-        let from = ShellAddress::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let from = ShellAddress::from([0x42; 20]);
         let to = ShellAddress::from([0x01; 20]);
 
         // Fund sender with plenty of balance
@@ -1204,7 +1294,7 @@ mod tests {
         );
         // Log data should be the ABI-encoded address
         let mut expected_data = [0u8; 32];
-        expected_data[12..32].copy_from_slice(new_val.as_bytes());
+        expected_data[12..32].copy_from_slice(new_val.to_alloy().as_slice());
         assert_eq!(log.data.as_ref(), &expected_data);
     }
 
@@ -1335,7 +1425,18 @@ mod tests {
 
     fn commit_state(evm: &mut ShellEvm<MemoryDb>, state: &EvmState) {
         let (ws, cs) = evm.state_db_mut().world_state_and_chain_store();
-        commit_evm_state(state, ws, cs).unwrap();
+        let fake_result = TxExecutionResult {
+            receipt: empty_receipt(),
+            state_changes: state.clone(),
+            pq_addr_map: Default::default(),
+            sender_shell_addr: ShellAddress::default(),
+            sender_nonce_after: 0,
+            gas_used: 0,
+            output: vec![],
+            is_system_tx: false,
+            system_contract_effects: SystemContractEffects::default(),
+        };
+        commit_evm_state(&fake_result, ws, cs).unwrap();
     }
 
     fn deploy_contract(
@@ -1493,16 +1594,20 @@ mod tests {
         );
         assert_eq!(result.receipt.status, 1, "CREATE2 call failed");
         assert_eq!(result.output.len(), 32);
-        let created_addr = ShellAddress::from_slice(&result.output[12..32]);
+        let created_addr = ShellAddress::from(alloy_primitives::Address::from_slice(
+            &result.output[12..32],
+        ));
 
         // Verify via CREATE2 formula: keccak256(0xff ++ factory ++ salt ++ keccak256(init))
         let init_hash = keccak256(&child_init);
         let salt = B256::from(U256::from(1));
         let mut pre = vec![0xff];
-        pre.extend_from_slice(factory_addr.as_bytes());
+        pre.extend_from_slice(factory_addr.to_alloy().as_slice());
         pre.extend_from_slice(salt.as_ref());
         pre.extend_from_slice(init_hash.as_ref());
-        let expected = ShellAddress::from_slice(&keccak256(&pre)[12..]);
+        let expected = ShellAddress::from(alloy_primitives::Address::from_slice(
+            &keccak256(&pre)[12..],
+        ));
         assert_eq!(created_addr, expected, "CREATE2 address mismatch");
     }
 
@@ -1589,15 +1694,17 @@ mod tests {
             5_000_000,
         );
         assert_eq!(r.receipt.status, 1);
-        let created = ShellAddress::from_slice(&r.output[12..32]);
+        let created = ShellAddress::from(alloy_primitives::Address::from_slice(&r.output[12..32]));
 
         let init_hash = keccak256(&child_init);
         let salt = B256::from(U256::from(0x42));
         let mut pre = vec![0xff];
-        pre.extend_from_slice(factory_addr.as_bytes());
+        pre.extend_from_slice(factory_addr.to_alloy().as_slice());
         pre.extend_from_slice(salt.as_ref());
         pre.extend_from_slice(init_hash.as_ref());
-        let expected = ShellAddress::from_slice(&keccak256(&pre)[12..]);
+        let expected = ShellAddress::from(alloy_primitives::Address::from_slice(
+            &keccak256(&pre)[12..],
+        ));
         assert_eq!(created, expected);
     }
 
@@ -1614,7 +1721,7 @@ mod tests {
 
         // Runtime: PUSH20 <beneficiary> SELFDESTRUCT
         let mut runtime = vec![0x73]; // PUSH20
-        runtime.extend_from_slice(beneficiary.as_bytes());
+        runtime.extend_from_slice(beneficiary.to_alloy().as_slice());
         runtime.push(0xFF); // SELFDESTRUCT
 
         let init_code = make_init_code(&runtime);
@@ -1690,7 +1797,7 @@ mod tests {
             0x60, 0x42, 0x60, 0x00, 0x55, // SSTORE(0, 0x42)
             0x73,
         ];
-        runtime.extend_from_slice(beneficiary.as_bytes());
+        runtime.extend_from_slice(beneficiary.to_alloy().as_slice());
         runtime.push(0xFF);
 
         let init_code = make_init_code(&runtime);
@@ -1746,7 +1853,7 @@ mod tests {
             0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // retSz retOff argsSz argsOff
             0x73,
         ];
-        proxy_rt.extend_from_slice(logic_addr.as_bytes());
+        proxy_rt.extend_from_slice(logic_addr.to_alloy().as_slice());
         proxy_rt.extend_from_slice(&[0x5A, 0xF4, 0x50, 0x00]);
         let (_, proxy_addr) = deploy_contract(
             &mut evm,
@@ -1805,7 +1912,7 @@ mod tests {
 
         // Proxy: DELEGATECALL to logic
         let mut proxy_rt = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
-        proxy_rt.extend_from_slice(logic_addr.as_bytes());
+        proxy_rt.extend_from_slice(logic_addr.to_alloy().as_slice());
         proxy_rt.extend_from_slice(&[0x5A, 0xF4, 0x50, 0x00]);
         let (_, proxy_addr) = deploy_contract(
             &mut evm,
@@ -1834,7 +1941,7 @@ mod tests {
             .get_storage(&proxy_addr, &slot)
             .unwrap();
         let mut expected = [0u8; 32];
-        expected[12..32].copy_from_slice(deployer.as_bytes());
+        expected[12..32].copy_from_slice(deployer.to_alloy().as_slice());
         assert_eq!(
             stored.as_bytes(),
             &expected,
@@ -1860,7 +1967,7 @@ mod tests {
 
         // Proxy: DELEGATECALL → RETURNDATASIZE → RETURNDATACOPY → RETURN
         let mut proxy_rt = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
-        proxy_rt.extend_from_slice(logic_addr.as_bytes());
+        proxy_rt.extend_from_slice(logic_addr.to_alloy().as_slice());
         proxy_rt.extend_from_slice(&[
             0x5A, 0xF4, 0x50, // DELEGATECALL, POP success
             0x3D, // RETURNDATASIZE
@@ -2146,7 +2253,7 @@ mod tests {
             0x60, 0x00, // value=0
             0x73,
         ];
-        caller_rt.extend_from_slice(callee_addr.as_bytes());
+        caller_rt.extend_from_slice(callee_addr.to_alloy().as_slice());
         caller_rt.extend_from_slice(&[
             0x5A, 0xF1, 0x50, // GAS, CALL, POP
             0x60, 0x20, 0x60, 0x00, 0xF3, // RETURN 32 bytes
@@ -2385,7 +2492,7 @@ mod tests {
 
         // Runtime: PUSH20 <beneficiary>, SELFDESTRUCT
         let mut runtime = vec![0x73]; // PUSH20
-        runtime.extend_from_slice(beneficiary.as_ref());
+        runtime.extend_from_slice(beneficiary.to_alloy().as_slice());
         runtime.push(0xFF); // SELFDESTRUCT
 
         // Deploy contract with 1 ETH value

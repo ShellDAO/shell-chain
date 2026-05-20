@@ -748,6 +748,16 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<S> {
     ) -> Result<Option<AccountInfo>, Self::Error> {
         let mut info = self.inner.basic(address)?;
         if address == self.validation_target.to_alloy() {
+            // If the inner lookup (which zero-pads to 32 bytes) didn't find the
+            // account, try again with the full 32-byte validation_target address.
+            if info.is_none() {
+                info = self
+                    .inner
+                    .world_state()
+                    .get_account(&self.validation_target)
+                    .map_err(|e| StateDbError::Storage(e))?
+                    .map(|a| ShellStateDb::<S>::to_account_info(&a));
+            }
             if let Some(ref mut account) = info {
                 account.code_hash = shell_hash_to_b256(&self.validation_code_hash);
                 account.code = None;

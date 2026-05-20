@@ -12,27 +12,23 @@
 //! This keeps `ecrecover` disabled by overriding `0x0001` with the Shell PQ verifier.
 
 use alloy_primitives::{address, Address, Bytes};
-use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::ContextTr;
 use revm::handler::PrecompileProvider;
+use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
 use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::hardfork::SpecId;
 use shell_crypto::{DilithiumVerifier, PQSignature, SignatureType, SphincsVerifier, Verifier};
 use std::boxed::Box;
 
-pub const PQ_MLDSA65_VERIFY_ADDR: Address =
-    address!("0x0000000000000000000000000000000000000001");
+pub const PQ_MLDSA65_VERIFY_ADDR: Address = address!("0x0000000000000000000000000000000000000001");
 pub const PQ_SLHDSA_SHA2_256F_VERIFY_ADDR: Address =
     address!("0x0000000000000000000000000000000000000002");
 pub const PQ_MLDSA65_BATCH_VERIFY_ADDR: Address =
     address!("0x0000000000000000000000000000000000000003");
-pub const PQ_BLAKE3_256_ADDR: Address =
-    address!("0x0000000000000000000000000000000000000004");
-pub const PQ_BLAKE3_512_ADDR: Address =
-    address!("0x0000000000000000000000000000000000000005");
-pub const PQ_ADDR_DERIVE_ADDR: Address =
-    address!("0x0000000000000000000000000000000000000006");
+pub const PQ_BLAKE3_256_ADDR: Address = address!("0x0000000000000000000000000000000000000004");
+pub const PQ_BLAKE3_512_ADDR: Address = address!("0x0000000000000000000000000000000000000005");
+pub const PQ_ADDR_DERIVE_ADDR: Address = address!("0x0000000000000000000000000000000000000006");
 
 const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
     PQ_MLDSA65_VERIFY_ADDR,
@@ -273,15 +269,24 @@ fn run_pq_addr_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 }
 
 fn verify_mldsa65(input: &[u8]) -> bool {
-    if input.len() < DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES {
+    // Wire format (length-prefixed):
+    // [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
+    if input.len() < 8 {
         return false;
     }
-
-    let public_key = &input[..DILITHIUM3_PUBLIC_KEY_BYTES];
-    let signature = &input
-        [DILITHIUM3_PUBLIC_KEY_BYTES..DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES];
-    let message = &input[DILITHIUM3_PUBLIC_KEY_BYTES + DILITHIUM3_SIGNATURE_BYTES..];
-    let signature = PQSignature::new(SignatureType::Dilithium3, signature.to_vec());
+    let pk_len = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    if input.len() < 4 + pk_len + 4 {
+        return false;
+    }
+    let public_key = &input[4..4 + pk_len];
+    let msg_len =
+        u32::from_be_bytes(input[4 + pk_len..4 + pk_len + 4].try_into().unwrap()) as usize;
+    if input.len() < 4 + pk_len + 4 + msg_len {
+        return false;
+    }
+    let message = &input[4 + pk_len + 4..4 + pk_len + 4 + msg_len];
+    let sig_bytes = &input[4 + pk_len + 4 + msg_len..];
+    let signature = PQSignature::new(SignatureType::Dilithium3, sig_bytes.to_vec());
     DilithiumVerifier
         .verify(public_key, message, &signature)
         .unwrap_or(false)
@@ -293,7 +298,8 @@ fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
     }
 
     let public_key = &input[..SPHINCS_PUBLIC_KEY_BYTES];
-    let signature = &input[SPHINCS_PUBLIC_KEY_BYTES..SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES];
+    let signature =
+        &input[SPHINCS_PUBLIC_KEY_BYTES..SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES];
     let message = &input[SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES..];
     let signature = PQSignature::new(SignatureType::SphincsSha2256f, signature.to_vec());
     SphincsVerifier
@@ -302,6 +308,9 @@ fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
 }
 
 fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
+    // Batch wire format:
+    // [4-byte count][item_0][item_1]...
+    // Each item: [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
     let Some(count_bytes) = input.get(..4) else {
         return (0, false);
     };
@@ -310,23 +319,34 @@ fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
     let mut valid = true;
 
     for _ in 0..count {
-        let Some(len_bytes) = input.get(cursor..cursor + 4) else {
+        // Read pubkey_len
+        let Some(pk_len_bytes) = input.get(cursor..cursor + 4) else {
             return (count, false);
         };
+        let pk_len = u32::from_be_bytes(pk_len_bytes.try_into().unwrap()) as usize;
         cursor += 4;
-        let msg_len = u32::from_be_bytes(len_bytes.try_into().expect("slice length checked")) as usize;
-        let Some(end) = cursor
-            .checked_add(DILITHIUM3_PUBLIC_KEY_BYTES)
-            .and_then(|value| value.checked_add(DILITHIUM3_SIGNATURE_BYTES))
-            .and_then(|value| value.checked_add(msg_len))
-        else {
+        // Read msg_len (after pubkey)
+        let Some(msg_len_bytes) = input.get(cursor + pk_len..cursor + pk_len + 4) else {
             return (count, false);
         };
-        let Some(item) = input.get(cursor..end) else {
+        let msg_len = u32::from_be_bytes(msg_len_bytes.try_into().unwrap()) as usize;
+        // Full item = pk_len_prefix(4) + pubkey + msg_len_prefix(4) + msg + sig_to_end_of_item
+        // sig ends at next item or end of input; we compute dynamically
+        let sig_start = cursor + pk_len + 4 + msg_len;
+        if sig_start > input.len() {
             return (count, false);
-        };
+        }
+        // Pass the item starting from cursor (i.e., includes 4-byte pk_len prefix)
+        let item_start = cursor - 4; // include pk_len prefix
+        let item = &input[item_start..];
         valid &= verify_mldsa65(item);
-        cursor = end;
+        // Advance cursor by pk_len + 4 (msg_len) + msg_len + sig_len
+        let sig_len = DILITHIUM3_SIGNATURE_BYTES;
+        let item_end = cursor + pk_len + 4 + msg_len + sig_len;
+        if item_end > input.len() {
+            return (count, false);
+        }
+        cursor = item_end;
     }
 
     (count, valid && cursor == input.len())
@@ -345,12 +365,30 @@ mod tests {
 
     #[test]
     fn pq_suite_addresses_match_spec() {
-        assert_eq!(PQ_MLDSA65_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000001"));
-        assert_eq!(PQ_SLHDSA_SHA2_256F_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000002"));
-        assert_eq!(PQ_MLDSA65_BATCH_VERIFY_ADDR, address!("0x0000000000000000000000000000000000000003"));
-        assert_eq!(PQ_BLAKE3_256_ADDR, address!("0x0000000000000000000000000000000000000004"));
-        assert_eq!(PQ_BLAKE3_512_ADDR, address!("0x0000000000000000000000000000000000000005"));
-        assert_eq!(PQ_ADDR_DERIVE_ADDR, address!("0x0000000000000000000000000000000000000006"));
+        assert_eq!(
+            PQ_MLDSA65_VERIFY_ADDR,
+            address!("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            PQ_SLHDSA_SHA2_256F_VERIFY_ADDR,
+            address!("0x0000000000000000000000000000000000000002")
+        );
+        assert_eq!(
+            PQ_MLDSA65_BATCH_VERIFY_ADDR,
+            address!("0x0000000000000000000000000000000000000003")
+        );
+        assert_eq!(
+            PQ_BLAKE3_256_ADDR,
+            address!("0x0000000000000000000000000000000000000004")
+        );
+        assert_eq!(
+            PQ_BLAKE3_512_ADDR,
+            address!("0x0000000000000000000000000000000000000005")
+        );
+        assert_eq!(
+            PQ_ADDR_DERIVE_ADDR,
+            address!("0x0000000000000000000000000000000000000006")
+        );
     }
 
     #[test]
@@ -364,10 +402,14 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let message = b"pqvm ml-dsa precompile";
         let sig = signer.sign(message).unwrap();
+        let pubkey = signer.public_key();
+        // Wire format: [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
         let mut input = Vec::new();
-        input.extend_from_slice(signer.public_key());
-        input.extend_from_slice(&sig.data);
+        input.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
+        input.extend_from_slice(pubkey);
+        input.extend_from_slice(&(message.len() as u32).to_be_bytes());
         input.extend_from_slice(message);
+        input.extend_from_slice(&sig.data);
 
         let output = run_mldsa65_verify(PQ_MLDSA65_VERIFY_GAS, &input);
         let mut expected = [0u8; 32];

@@ -35,3 +35,8 @@ harness = false
 name = "gen_mldsa_vectors"
 path = "src/bin/gen_mldsa_vectors.rs"
 required-features = []
+
+[[bin]]
+name = "gen_dilithium3_tx_fixtures"
+path = "src/bin/gen_dilithium3_tx_fixtures.rs"
+required-features = []

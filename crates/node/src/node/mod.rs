@@ -1495,7 +1495,7 @@ mod tests {
                 n_sigs: if layer == 1 { MIN_L1_STARK_TXS } else { 2 },
                 proof_bytes: vec![0x33; compressed_size as usize],
             },
-            prover: Address::from([0x44; 20]),
+            prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer,
             source_hashes: vec![
@@ -1566,7 +1566,7 @@ mod tests {
                 },
                 proof_bytes: vec![0x33; 128],
             },
-            prover: Address::from([0x44; 20]),
+            prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer,
             source_hashes,
@@ -2115,7 +2115,7 @@ mod tests {
                 n_sigs: MIN_L1_STARK_TXS,
                 proof_bytes: vec![0x33; 128],
             },
-            prover: Address::from([0x44; 20]),
+            prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer: 1,
             source_hashes: vec![genesis_hash, hashes[0], hashes[1]],
@@ -2358,7 +2358,7 @@ mod tests {
                 n_sigs: 999, // wrong — actual canonical entry count is 0
                 proof_bytes: vec![0x33; 128],
             },
-            prover: Address::from([0x44; 20]),
+            prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer: 1,
             source_hashes: vec![genesis_hash, hashes[0], hashes[1]],
@@ -2405,7 +2405,7 @@ mod tests {
                 n_sigs: 0,                    // correct count for 0-tx blocks
                 proof_bytes: vec![0x33; 128],
             },
-            prover: Address::from([0x44; 20]),
+            prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer: 1,
             source_hashes: vec![genesis_hash, hashes[0]],
@@ -2694,7 +2694,11 @@ mod tests {
         // Create sender and receiver
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xBB; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xBB);
+            a
+        });
         let transfer_value = U256::from(1_000_000);
 
         // Fund sender (enough for transfer + gas at INITIAL_BASE_FEE)
@@ -2727,10 +2731,7 @@ mod tests {
         };
 
         // Sign with real Dilithium key
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -2814,7 +2815,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xCC; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xCC);
+            a
+        });
         let initial_balance = U256::from(100_000_000_000_000u64);
         let transfer_value = U256::from(1_000_000u64);
         fund_account(&node, &sender, initial_balance);
@@ -2834,10 +2839,7 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -2959,10 +2961,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
 
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -3090,7 +3089,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xCC; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xCC);
+            a
+        });
         let initial_balance = U256::from(100_000_000_000_000u64);
         fund_account(&leader, &sender, initial_balance);
 
@@ -3109,10 +3112,7 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let tx0_hash = {
-            let encoded = alloy_rlp::encode(&tx0);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx0_hash = tx0.signing_hash(tx_signer.sig_type().as_u8());
         let sig0 = tx_signer.sign(tx0_hash.as_bytes()).expect("sign failed");
         let signed0 =
             SignedTransaction::with_pubkey(sender, tx0, sig0, tx_signer.public_key().to_vec());
@@ -3174,10 +3174,7 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let tx1_hash = {
-            let encoded = alloy_rlp::encode(&tx1);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx1_hash = tx1.signing_hash(tx_signer.sig_type().as_u8());
         let sig1 = tx_signer.sign(tx1_hash.as_bytes()).expect("sign failed");
         let signed1 = SignedTransaction::new(sender, tx1, sig1);
 
@@ -3238,7 +3235,11 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let register_sig = target_signer
-            .sign(register_tx.hash().0.as_slice())
+            .sign(
+                register_tx
+                    .signing_hash(target_signer.sig_type().as_u8())
+                    .as_bytes(),
+            )
             .expect("sign failed");
         let register_signed = SignedTransaction::with_pubkey(
             target,
@@ -3296,7 +3297,11 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let add_sig = proposer_signer
-            .sign(add_tx.hash().0.as_slice())
+            .sign(
+                add_tx
+                    .signing_hash(proposer_signer.sig_type().as_u8())
+                    .as_bytes(),
+            )
             .expect("sign failed");
         let add_signed = SignedTransaction::with_pubkey(
             proposer,
@@ -3356,7 +3361,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xEE; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xEE);
+            a
+        });
         let initial_balance = U256::from(100_000_000_000_000u64);
         fund_account(&leader, &sender, initial_balance);
 
@@ -3378,7 +3387,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let sig0 = tx_signer
-            .sign(tx0.hash().0.as_slice())
+            .sign(tx0.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
         let signed0 =
             SignedTransaction::with_pubkey(sender, tx0, sig0, tx_signer.public_key().to_vec());
@@ -3399,7 +3408,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let sig1 = tx_signer
-            .sign(tx1.hash().0.as_slice())
+            .sign(tx1.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
         let signed1 = SignedTransaction::new(sender, tx1, sig1);
 
@@ -3471,7 +3480,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xFF; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xFF);
+            a
+        });
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
 
         // TX₀: Reference — wrong order; no Embedded tx has preceded it in this block
@@ -3491,7 +3504,7 @@ mod tests {
         };
         // Sign tx0 properly so sig is structurally valid (error occurs before sig verify)
         let sig0 = tx_signer
-            .sign(tx0.hash().0.as_slice())
+            .sign(tx0.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
         let signed0 = SignedTransaction::new(sender, tx0, sig0); // Reference mode
 
@@ -3511,7 +3524,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let sig1 = tx_signer
-            .sign(tx1.hash().0.as_slice())
+            .sign(tx1.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
         let signed1 =
             SignedTransaction::with_pubkey(sender, tx1, sig1, tx_signer.public_key().to_vec());
@@ -3576,7 +3589,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xDD; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xDD);
+            a
+        });
         let initial_balance = U256::from(100_000_000_000_000u64);
         fund_account(&leader, &sender, initial_balance);
 
@@ -3595,10 +3612,7 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -3660,7 +3674,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xEE; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xEE);
+            a
+        });
         let initial_balance = U256::from(100_000_000_000_000u64);
         fund_account(&leader, &sender, initial_balance);
 
@@ -3679,10 +3697,7 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -3722,7 +3737,15 @@ mod tests {
         );
         store_genesis(&follower);
         fund_account(&follower, &sender, initial_balance);
-        fund_account(&follower, &Address::from([0xAB; 20]), U256::from(42u64));
+        fund_account(
+            &follower,
+            &Address::from({
+                let mut a = [0u8; 32];
+                a[12..].fill(0xAB);
+                a
+            }),
+            U256::from(42u64),
+        );
         follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
         let before_root = current_state_root(&follower);
@@ -3969,7 +3992,7 @@ mod tests {
         store_genesis(&node);
 
         // Write a new validator set to world state.
-        let new_validator = Address::from([0xAA; 20]);
+        let new_validator = Address::from([0xAA; 32]);
         {
             let mut ws = node.world_state.write();
             ws.set_validators(&[authority, new_validator]).unwrap();
@@ -4031,7 +4054,11 @@ mod tests {
         assert_eq!(node.consensus.read().poa_config().authorities.len(), 1);
 
         // Write validators mid-epoch.
-        let new_val = Address::from([0xCC; 20]);
+        let new_val = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xCC);
+            a
+        });
         {
             let mut ws = node.world_state.write();
             ws.set_validators(&[authority, new_val]).unwrap();
@@ -4065,7 +4092,11 @@ mod tests {
     fn authority_reload_uses_world_state_weights() {
         let signer = DilithiumSigner::generate();
         let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
-        let new_val = Address::from([0xDD; 20]);
+        let new_val = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xDD);
+            a
+        });
 
         let db = Arc::new(MemoryDb::new());
         let chain_store = Arc::new(ChainStore::new(db.clone()));
@@ -4585,7 +4616,11 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xCC; 20]);
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xCC);
+            a
+        });
 
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
 
@@ -4604,10 +4639,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
 
-        let tx_hash = {
-            let encoded = alloy_rlp::encode(&tx);
-            shell_primitives::keccak256(&encoded)
-        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
         let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
         let signed =
             SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
@@ -4933,7 +4965,11 @@ mod tests {
         let tx = Transaction {
             chain_id: 1337,
             nonce,
-            to: Some(Address::from([0xBE; 20])),
+            to: Some(Address::from({
+                let mut a = [0u8; 32];
+                a[12..].fill(0xBE);
+                a
+            })),
             value: U256::from(value),
             data: Bytes::default(),
             gas_limit: 21_000,
@@ -4944,7 +4980,9 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let sig = signer.sign(tx.hash().0.as_slice()).unwrap();
+        let sig = signer
+            .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+            .unwrap();
         SignedTransaction::with_pubkey(from, tx, sig, pubkey)
     }
 
@@ -5397,11 +5435,11 @@ mod tests {
 
         #[test]
         fn wpoa_state_machine_propose_vote_commit() {
-            let weights = (1u8..=3).map(|i| (Address::from([i; 20]), 1u64)).collect();
+            let weights = (1u8..=3).map(|i| (Address::from([i; 32]), 1u64)).collect();
             let mut round = WPoaRound::new(1, 0, weights);
             let bh = hash(1);
 
-            let events = round.on_block_proposed(bh, Address::from([1; 20]));
+            let events = round.on_block_proposed(bh, Address::from([1; 32]));
             assert_eq!(
                 events.len(),
                 2,
@@ -5411,11 +5449,11 @@ mod tests {
             assert!(matches!(&events[1], WPoaEvent::VoteNeeded { .. }));
 
             // First vote: not yet quorum (ceil(2/3 * 3) = 2 required)
-            let v1 = round.on_vote(Address::from([1; 20]), bh, dummy_sig());
+            let v1 = round.on_vote(Address::from([1; 32]), bh, dummy_sig());
             assert!(v1.is_empty(), "first vote must not yet trigger commit");
 
             // Second vote: reaches quorum
-            let v2 = round.on_vote(Address::from([2; 20]), bh, dummy_sig());
+            let v2 = round.on_vote(Address::from([2; 32]), bh, dummy_sig());
             assert_eq!(v2.len(), 1, "second vote should emit BlockCommitted");
             match &v2[0] {
                 WPoaEvent::BlockCommitted {
@@ -5434,20 +5472,20 @@ mod tests {
 
         #[test]
         fn wpoa_state_machine_view_change() {
-            let weights = (1u8..=3).map(|i| (Address::from([i; 20]), 1u64)).collect();
+            let weights = (1u8..=3).map(|i| (Address::from([i; 32]), 1u64)).collect();
             let mut round = WPoaRound::new(1, 0, weights);
             round.start_view_change(1);
             assert_eq!(round.phase_name(), "ViewChanging");
 
             // First view-change vote: not yet quorum
-            let e1 = round.on_view_change_vote(Address::from([1; 20]), 1);
+            let e1 = round.on_view_change_vote(Address::from([1; 32]), 1);
             assert!(
                 e1.is_empty(),
                 "single view-change vote must not yet reach quorum"
             );
 
             // Second view-change vote: reaches quorum
-            let e2 = round.on_view_change_vote(Address::from([2; 20]), 1);
+            let e2 = round.on_view_change_vote(Address::from([2; 32]), 1);
             assert_eq!(e2.len(), 1);
             assert!(
                 matches!(&e2[0], WPoaEvent::ViewChangeReady { new_view: 1 }),
@@ -5484,9 +5522,9 @@ mod tests {
             use shell_rpc::api::ShellApiServer;
             use shell_rpc::RpcHandler;
 
-            let authority1 = Address::from([0x01; 20]);
-            let authority2 = Address::from([0x02; 20]);
-            let authority3 = Address::from([0x03; 20]);
+            let authority1 = Address::from([0x01; 32]);
+            let authority2 = Address::from([0x02; 32]);
+            let authority3 = Address::from([0x03; 32]);
 
             let poa_cfg =
                 PoaConfig::new(vec![authority1, authority2, authority3], 1).with_epoch_length(100);
@@ -5531,8 +5569,8 @@ mod tests {
         fn wpoa_handle_vote_reaches_quorum() {
             let signer1 = DilithiumSigner::generate();
             let addr1 = Address::from_public_key(signer1.public_key(), signer1.sig_type().as_u8());
-            let addr2 = Address::from([0xaa; 20]);
-            let addr3 = Address::from([0xbb; 20]);
+            let addr2 = Address::from([0xaa; 32]);
+            let addr3 = Address::from([0xbb; 32]);
 
             let db = Arc::new(MemoryDb::new());
             let chain_store = Arc::new(ChainStore::new(db.clone()));
@@ -5610,7 +5648,7 @@ mod tests {
 
         #[test]
         fn wpoa_network_message_wpoavote_serde() {
-            let voter = Address::from([0xde; 20]);
+            let voter = Address::from([0xde; 32]);
             let block_hash = hash(7);
             let msg = NetworkMessage::WPoaVote {
                 block_hash,
@@ -5643,7 +5681,7 @@ mod tests {
 
         #[test]
         fn wpoa_network_message_wpoa_view_change_serde() {
-            let voter = Address::from([0xef; 20]);
+            let voter = Address::from([0xef; 32]);
             let msg = NetworkMessage::WPoaViewChange {
                 new_view: 3,
                 block_number: 10,

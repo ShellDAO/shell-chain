@@ -1,8 +1,7 @@
 //! End-to-end EVM integration tests.
 //!
 //! These tests exercise the full pipeline: tx validation → EVM execution → receipt,
-//! using real Dilithium3 signatures and the ShellPrecompiles (disabled ecrecover,
-//! PQ_DILITHIUM_VERIFY at 0x0100).
+//! using real Dilithium3 signatures and the Shell PQ precompile suite (0x0001–0x0006).
 
 use alloy_primitives::U256;
 use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
@@ -64,9 +63,8 @@ fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress, balance: U256
         .unwrap();
 }
 
-fn tx_signing_hash(tx: &Transaction) -> ShellHash {
-    let encoded = alloy_rlp::encode(tx);
-    shell_primitives::keccak256(&encoded)
+fn tx_signing_hash_for_signer<S: Signer>(tx: &Transaction, signer: &S) -> ShellHash {
+    tx.signing_hash(signer.sig_type().as_u8())
 }
 
 // ── Test 1: Simple ETH transfer with real Dilithium3 sig ─────────
@@ -97,7 +95,7 @@ fn e2e_transfer_with_real_dilithium_sig() {
         blob_versioned_hashes: None,
     };
 
-    let hash = tx_signing_hash(&tx);
+    let hash = tx_signing_hash_for_signer(&tx, &signer);
     let sig = signer.sign(hash.as_bytes()).expect("sign failed");
 
     let signed = SignedTransaction::with_pubkey(from, tx, sig, signer.public_key().to_vec());
@@ -244,7 +242,7 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
         blob_versioned_hashes: None,
     };
 
-    let hash1 = tx_signing_hash(&tx1);
+    let hash1 = tx_signing_hash_for_signer(&tx1, &signer);
     let sig1 = signer.sign(hash1.as_bytes()).unwrap();
     let signed1 = SignedTransaction::with_pubkey(from, tx1, sig1, signer.public_key().to_vec());
 
@@ -263,19 +261,10 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
     let r1 = evm.execute_tx(&signed1, &header, 0, 0).unwrap();
     assert_eq!(r1.receipt.status, 1);
 
-    // Commit the nonce change from execution
-    for (addr, acct_state) in &r1.state_changes {
-        let shell_addr = ShellAddress::from(*addr);
-        let info = &acct_state.info;
-        if let Ok(Some(mut existing)) = evm.state_db().world_state().get_account(&shell_addr) {
-            existing.nonce = info.nonce;
-            existing.balance = info.balance;
-            evm.state_db_mut()
-                .world_state_mut()
-                .set_account(&shell_addr, &existing)
-                .unwrap();
-        }
-    }
+    // Commit the nonce change from execution using commit_evm_state so PQ
+    // addresses are correctly resolved via the pq_addr_map.
+    shell_evm::commit_evm_state(&r1, evm.state_db_mut().world_state_mut(), &cs)
+        .expect("commit r1 failed");
 
     // Second tx: NO pubkey attached — should read from registry
     let tx2 = Transaction {
@@ -293,7 +282,7 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
         blob_versioned_hashes: None,
     };
 
-    let hash2 = tx_signing_hash(&tx2);
+    let hash2 = tx_signing_hash_for_signer(&tx2, &signer);
     let sig2 = signer.sign(hash2.as_bytes()).unwrap();
     let signed2 = SignedTransaction::new(from, tx2, sig2);
 
@@ -321,29 +310,32 @@ fn e2e_precompile_addresses() {
 
     let sp = ShellPrecompiles::new(SpecId::CANCUN);
 
-    // PQ precompile at 0x0100
-    let pq_addr = address!("0x0000000000000000000000000000000000000100");
+    // ML-DSA-65 verify at 0x0001 (replaces ecrecover)
+    let pq_addr = address!("0x0000000000000000000000000000000000000001");
     assert!(
         sp.is_precompile(&pq_addr),
-        "PQ precompile should be registered"
+        "ML-DSA-65 verify precompile should be registered"
     );
 
-    // ecrecover at 0x01 (disabled but still "registered")
-    let ecrecover_addr = address!("0x0000000000000000000000000000000000000001");
+    // SLH-DSA verify at 0x0002
+    let slhdsa_addr = address!("0x0000000000000000000000000000000000000002");
     assert!(
-        sp.is_precompile(&ecrecover_addr),
-        "ecrecover should be registered"
+        sp.is_precompile(&slhdsa_addr),
+        "SLH-DSA verify precompile should be registered"
     );
 
-    // Standard SHA256 at 0x02
-    let sha256_addr = address!("0x0000000000000000000000000000000000000002");
-    assert!(sp.is_precompile(&sha256_addr), "SHA256 should be present");
+    // PQAddr derive at 0x0006
+    let pqaddr_addr = address!("0x0000000000000000000000000000000000000006");
+    assert!(
+        sp.is_precompile(&pqaddr_addr),
+        "PQAddr derive precompile should be registered"
+    );
 
-    // Non-precompile address
-    let random_addr = address!("0x0000000000000000000000000000000000000200");
+    // Non-precompile address (old PQ addr 0x0100 no longer registered)
+    let random_addr = address!("0x0000000000000000000000000000000000000100");
     assert!(
         !sp.is_precompile(&random_addr),
-        "random addr should not be precompile"
+        "0x0100 should not be a precompile"
     );
 }
 

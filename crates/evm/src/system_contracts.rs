@@ -671,10 +671,7 @@ fn set_guardians<S: KvStore + 'static>(
     }
 
     let mut guardians: Vec<[u8; 20]> = Vec::with_capacity(array_len);
-    let caller_raw: [u8; 20] = caller
-        .as_ref()
-        .try_into()
-        .expect("Address is always 20 bytes");
+    let caller_raw: [u8; 20] = caller.to_alloy().into();
     for i in 0..array_len {
         let word_start = elem_start.saturating_add(i.saturating_mul(32));
         let addr = decode_address(
@@ -682,10 +679,7 @@ fn set_guardians<S: KvStore + 'static>(
                 .get(word_start..word_start.saturating_add(32))
                 .ok_or_else(|| SystemContractError::AbiDecode("address OOB".into()))?,
         )?;
-        let raw: [u8; 20] = addr
-            .as_ref()
-            .try_into()
-            .expect("Address is always 20 bytes");
+        let raw: [u8; 20] = addr.to_alloy().into();
         if raw == caller_raw {
             return Err(SystemContractError::GuardianIsSelf);
         }
@@ -775,10 +769,7 @@ fn submit_recovery<S: KvStore + 'static>(
         .map_err(|e| SystemContractError::Storage(e.to_string()))?
         .ok_or(SystemContractError::NoGuardianConfig(account))?;
 
-    let caller_raw: [u8; 20] = caller
-        .as_ref()
-        .try_into()
-        .expect("Address is always 20 bytes");
+    let caller_raw: [u8; 20] = caller.to_alloy().into();
     if !config.guardians.contains(&caller_raw) {
         return Err(SystemContractError::NotAGuardian);
     }
@@ -1067,13 +1058,15 @@ pub fn decode_address(input: &[u8]) -> Result<Address, SystemContractError> {
             input.len()
         )));
     }
-    // ABI: address is right-aligned in 32-byte word (bytes 12..32)
-    Address::try_from_slice(
-        input
-            .get(12..32)
-            .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above")),
-    )
-    .map_err(|e| SystemContractError::AbiDecode(e.to_string()))
+    // Shell uses 32-byte addresses. Read all 32 bytes from the ABI word.
+    let raw32: [u8; 32] = input
+        .get(0..32)
+        .unwrap_or_else(|| unreachable!("input.len() >= 32 checked above"))
+        .try_into()
+        .map_err(|_| {
+            SystemContractError::AbiDecode("invalid slice length: expected 32".to_string())
+        })?;
+    Ok(Address::from(raw32))
 }
 
 /// ABI-encode a `bool` as a 32-byte word.
@@ -1110,7 +1103,7 @@ pub fn encode_address_array(addrs: &[Address]) -> Vec<u8> {
     // Elements
     for addr in addrs {
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(addr.as_bytes());
+        word.copy_from_slice(addr.as_bytes());
         out.extend_from_slice(&word);
     }
 
@@ -1162,7 +1155,7 @@ pub fn encode_add_validator_calldata(address: &Address) -> Vec<u8> {
     let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&ADD_VALIDATOR_SELECTOR);
     let mut word = [0u8; 32];
-    word[12..32].copy_from_slice(address.as_bytes());
+    word.copy_from_slice(address.as_bytes());
     data.extend_from_slice(&word);
     data
 }
@@ -1172,7 +1165,7 @@ pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
     let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&REMOVE_VALIDATOR_SELECTOR);
     let mut word = [0u8; 32];
-    word[12..32].copy_from_slice(address.as_bytes());
+    word.copy_from_slice(address.as_bytes());
     data.extend_from_slice(&word);
     data
 }
@@ -1209,7 +1202,7 @@ pub fn encode_set_guardians_calldata(
     // array elements
     for addr in guardians {
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(addr.as_bytes());
+        word.copy_from_slice(addr.as_bytes());
         data.extend_from_slice(&word);
     }
     data
@@ -1235,7 +1228,7 @@ pub fn encode_submit_recovery_calldata(
     data.extend_from_slice(&SUBMIT_RECOVERY_SELECTOR);
     // account (address, right-aligned)
     let mut addr_word = [0u8; 32];
-    addr_word[12..32].copy_from_slice(account.as_bytes());
+    addr_word.copy_from_slice(account.as_bytes());
     data.extend_from_slice(&addr_word);
     // offset to bytes = 96 bytes from start of params
     data.extend_from_slice(&encode_usize_word(96));
@@ -1252,7 +1245,7 @@ pub fn encode_execute_recovery_calldata(account: &Address) -> Vec<u8> {
     let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&EXECUTE_RECOVERY_SELECTOR);
     let mut word = [0u8; 32];
-    word[12..32].copy_from_slice(account.as_bytes());
+    word.copy_from_slice(account.as_bytes());
     data.extend_from_slice(&word);
     data
 }
@@ -1262,7 +1255,7 @@ pub fn encode_cancel_recovery_calldata(account: &Address) -> Vec<u8> {
     let mut data = Vec::with_capacity(4usize.saturating_add(32));
     data.extend_from_slice(&CANCEL_RECOVERY_SELECTOR);
     let mut word = [0u8; 32];
-    word[12..32].copy_from_slice(account.as_bytes());
+    word.copy_from_slice(account.as_bytes());
     data.extend_from_slice(&word);
     data
 }
@@ -1855,9 +1848,9 @@ mod tests {
         assert_eq!(len, 3);
 
         // Check addresses
-        let a1 = Address::try_from_slice(&output[76..96]).unwrap();
-        let a2 = Address::try_from_slice(&output[108..128]).unwrap();
-        let a3 = Address::try_from_slice(&output[140..160]).unwrap();
+        let a1 = decode_address(&output[64..96]).unwrap();
+        let a2 = decode_address(&output[96..128]).unwrap();
+        let a3 = decode_address(&output[128..160]).unwrap();
         assert_eq!(a1, v1);
         assert_eq!(a2, v2);
         assert_eq!(a3, v3);
@@ -1885,7 +1878,7 @@ mod tests {
 
         let mut calldata = IS_VALIDATOR_SELECTOR.to_vec();
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(v1.as_bytes());
+        word.copy_from_slice(v1.as_bytes());
         calldata.extend_from_slice(&word);
 
         let (output, _) = execute_system_contract(&Address::ZERO, &calldata, &mut ws).unwrap();
@@ -1900,7 +1893,7 @@ mod tests {
 
         let mut calldata = IS_VALIDATOR_SELECTOR.to_vec();
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(outsider.as_bytes());
+        word.copy_from_slice(outsider.as_bytes());
         calldata.extend_from_slice(&word);
 
         let (output, _) = execute_system_contract(&Address::ZERO, &calldata, &mut ws).unwrap();
@@ -1913,7 +1906,7 @@ mod tests {
     fn decode_address_valid() {
         let addr = Address::from([0xAB; 20]);
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(addr.as_bytes());
+        word.copy_from_slice(addr.as_bytes());
 
         let decoded = decode_address(&word).unwrap();
         assert_eq!(decoded, addr);
@@ -1957,11 +1950,11 @@ mod tests {
         assert_eq!(len, 2);
 
         // First address
-        let a1 = Address::try_from_slice(&encoded[76..96]).unwrap();
+        let a1 = decode_address(&encoded[64..96]).unwrap();
         assert_eq!(a1, addrs[0]);
 
         // Second address
-        let a2 = Address::try_from_slice(&encoded[108..128]).unwrap();
+        let a2 = decode_address(&encoded[96..128]).unwrap();
         assert_eq!(a2, addrs[1]);
     }
 
@@ -2141,7 +2134,7 @@ mod tests {
         assert_eq!(len, 1);
 
         // Address
-        let decoded = Address::try_from_slice(&encoded[76..96]).unwrap();
+        let decoded = decode_address(&encoded[64..96]).unwrap();
         assert_eq!(decoded, addr);
     }
 
@@ -2164,7 +2157,7 @@ mod tests {
     fn decode_address_ignores_extra_bytes() {
         let addr = Address::from([0xCC; 20]);
         let mut input = vec![0u8; 64]; // 64 bytes, only first 32 matter
-        input[12..32].copy_from_slice(addr.as_bytes());
+        input[..32].copy_from_slice(addr.as_bytes());
 
         let decoded = decode_address(&input).unwrap();
         assert_eq!(decoded, addr);
@@ -2223,7 +2216,7 @@ mod tests {
         let mut ws = setup_with_validators(&[v1]);
         let mut calldata = IS_VALIDATOR_SELECTOR.to_vec();
         let mut word = [0u8; 32];
-        word[12..32].copy_from_slice(v1.as_bytes());
+        word.copy_from_slice(v1.as_bytes());
         calldata.extend_from_slice(&word);
         let (_, gas) = execute_system_contract(&Address::ZERO, &calldata, &mut ws).unwrap();
         assert_eq!(gas, SYSTEM_CALL_BASE_GAS);

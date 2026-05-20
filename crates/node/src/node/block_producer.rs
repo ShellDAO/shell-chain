@@ -113,12 +113,6 @@ impl<S: KvStore + 'static> Node<S> {
                         tx.tx.max_priority_fee_per_gas,
                         base_fee,
                     );
-                    total_effective_fees = total_effective_fees.saturating_add(
-                        U256::from(result.gas_used).saturating_mul(U256::from(price)),
-                    );
-                    receipts.push(result.receipt);
-                    included_txs.push(tx.clone());
-
                     if is_aa {
                         // AA dispatcher already mutated evm.state_db.world_state
                         // in place (including atomic rollback on failure). Mirror
@@ -135,7 +129,7 @@ impl<S: KvStore + 'static> Node<S> {
                     } else {
                         // Normal EVM tx: commit EvmState changeset.
                         commit_evm_state(
-                            &result.state_changes,
+                            &result,
                             evm.state_db_mut().world_state_mut(),
                             &self.chain_store,
                         )?;
@@ -143,9 +137,14 @@ impl<S: KvStore + 'static> Node<S> {
                         // Commit to the node's persistent WorldState.
                         {
                             let mut ws = self.world_state.write();
-                            commit_evm_state(&result.state_changes, &mut ws, &self.chain_store)?;
+                            commit_evm_state(&result, &mut ws, &self.chain_store)?;
                         }
                     }
+                    total_effective_fees = total_effective_fees.saturating_add(
+                        U256::from(result.gas_used).saturating_mul(U256::from(price)),
+                    );
+                    receipts.push(result.receipt);
+                    included_txs.push(tx.clone());
                 }
                 Err(_) => {
                     // Skip failed transactions.

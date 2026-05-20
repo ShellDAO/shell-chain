@@ -417,11 +417,6 @@ impl<S: KvStore + 'static> Node<S> {
                             tx.tx.max_priority_fee_per_gas,
                             block.header.base_fee_per_gas,
                         );
-                        total_effective_fees = total_effective_fees.saturating_add(
-                            U256::from(result.gas_used).saturating_mul(U256::from(price)),
-                        );
-                        receipts.push(result.receipt);
-
                         if tx.is_aa_bundle() {
                             // AA dispatcher already mutated state_db.world_state
                             // in-place (with atomic rollback on inner failure).
@@ -432,11 +427,15 @@ impl<S: KvStore + 'static> Node<S> {
                             )?;
                         } else {
                             commit_evm_state(
-                                &result.state_changes,
+                                &result,
                                 evm.state_db_mut().world_state_mut(),
                                 &self.chain_store,
                             )?;
                         }
+                        total_effective_fees = total_effective_fees.saturating_add(
+                            U256::from(result.gas_used).saturating_mul(U256::from(price)),
+                        );
+                        receipts.push(result.receipt);
                     }
                     Err(e) => {
                         return Err(NodeError::Startup(format!(

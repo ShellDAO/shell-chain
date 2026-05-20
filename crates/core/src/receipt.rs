@@ -119,6 +119,11 @@ impl Decodable for TransactionReceipt {
         let addr_bytes = alloy_rlp::Header::decode_bytes(buf, false)?;
         let contract_address = if addr_bytes.is_empty() {
             None
+        } else if addr_bytes.len() == 32 {
+            Some(
+                Address::try_from_slice(addr_bytes)
+                    .map_err(|_| alloy_rlp::Error::Custom("invalid contract address bytes"))?,
+            )
         } else if addr_bytes.len() == 20 {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(addr_bytes);
