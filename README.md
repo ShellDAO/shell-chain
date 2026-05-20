@@ -46,9 +46,14 @@ For production deployments with Docker, see the [Operator Guide](docs/TESTNET_OP
 
 Shell-Chain's long-term account model is **native AA**.
 Accounts are identified by `0x`-prefixed 64-character lowercase hex addresses —
-the full 32-byte BLAKE3 hash of `algo_id ‖ public_key`. There is no 20-byte
-Ethereum-compatible address space and no `[0:20]` truncation: the EVM, RPC,
-storage, and consensus layers all operate on the full 32-byte address.
+the full 32-byte BLAKE3 hash of `algo_id ‖ public_key`.
+
+At the **canonical layer** (RPC, storage, consensus, signing), addresses are always
+the full 32 bytes. At the **EVM execution boundary**, Shell-Chain maintains a
+20-byte mapping layer: `Address::to_alloy()` takes the last 20 bytes of the 32-byte
+canonical address for use with revm, and `Address::from_alloy()` zero-pads left
+back to 32 bytes. This boundary is internal — external callers (SDK, CLI, explorer)
+always see and submit the full 32-byte `0x`+64-hex form.
 
 Transaction validation follows three protocol-level paths:
 
