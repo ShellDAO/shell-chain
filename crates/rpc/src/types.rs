@@ -1,4 +1,4 @@
-//! JSON-RPC types with Ethereum-compatible hex numerics and `pq1...` addresses.
+//! JSON-RPC types with Ethereum-compatible hex numerics and `0x` addresses.
 
 use serde::{Deserialize, Serialize};
 use shell_primitives::{Address, ShellHash, U256};

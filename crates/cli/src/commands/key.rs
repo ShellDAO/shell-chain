@@ -68,8 +68,7 @@ pub fn key_inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let json = std::fs::read_to_string(&path)?;
     let encrypted: EncryptedKey = serde_json::from_str(&json)?;
 
-    // Derive canonical pq1 address from the stored public key (works for both
-    // old hex-format keystores and new pq1-format keystores).
+    // Derive canonical 0x address from the stored public key.
     let sig_type = signature_type_from_key_type(&encrypted.key_type)?;
     let pubkey_bytes = hex::decode(&encrypted.public_key)
         .map_err(|e| format!("invalid public_key in keystore: {e}"))?;
@@ -96,13 +95,13 @@ pub fn key_inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Migrate a keystore to the current v1 sk-only format with pq1 address.
+/// Migrate a keystore to the current v1 sk-only format with 0x address.
 ///
 /// Handles two migration scenarios:
 /// 1. Old SDK < 0.6.0 keystores where the ciphertext stored both sk and pk (sk‖pk).
-/// 2. Old keystores where `address` is stored as `"0x..."` hex instead of `pq1...`.
+/// 2. Old keystores where `address` is stored in a non-canonical format.
 ///
-/// The migrated keystore uses the canonical pq1 address format and sk-only ciphertext.
+/// The migrated keystore uses the canonical 0x address format and sk-only ciphertext.
 pub fn key_migrate(
     input: PathBuf,
     output: PathBuf,
@@ -117,8 +116,8 @@ pub fn key_migrate(
 
     info!("Decrypting keystore (algorithm: {key_type})...");
 
-    // Re-encrypt using the canonical v1 sk-only format + pq1 address (same password).
-    info!("Re-encrypting in v1 sk-only format with pq1 address...");
+    // Re-encrypt using the canonical v1 sk-only format + 0x address (same password).
+    info!("Re-encrypting in v1 sk-only format with 0x address...");
     let new_encrypted = match key_type.as_str() {
         "mldsa65" => {
             let signer = decrypt_mldsa(&encrypted, password.as_bytes())

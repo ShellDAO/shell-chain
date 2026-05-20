@@ -33,16 +33,16 @@ use shell_storage::{
 // ── Contract address ───────────────────────────────────────────────
 
 /// System contract address for ValidatorRegistry: 0x0000…0001.
-pub const VALIDATOR_REGISTRY_ADDR: [u8; 20] = {
-    let mut addr = [0u8; 20];
-    addr[19] = 1;
+pub const VALIDATOR_REGISTRY_ADDR: [u8; 32] = {
+    let mut addr = [0u8; 32];
+    addr[31] = 1;
     addr
 };
 
 /// System contract address for AccountManager: 0x0000…0002.
-pub const ACCOUNT_MANAGER_ADDR: [u8; 20] = {
-    let mut addr = [0u8; 20];
-    addr[19] = 2;
+pub const ACCOUNT_MANAGER_ADDR: [u8; 32] = {
+    let mut addr = [0u8; 32];
+    addr[31] = 2;
     addr
 };
 

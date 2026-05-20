@@ -31,7 +31,7 @@ const MAX_SUBSCRIPTIONS_PER_CONNECTION: u32 = 16;
 /// Auto-disconnect a subscriber after this many consecutive lag events (F-042).
 const MAX_CONSECUTIVE_LAGS: u32 = 3;
 
-/// Parse a user-facing address string (`pq1...` or legacy hex) into an `Address`.
+/// Parse a user-facing address string (`0x` + 64 lowercase hex) into an `Address`.
 fn parse_address_input(s: &str) -> Option<Address> {
     Address::parse(s).ok()
 }
@@ -1084,7 +1084,7 @@ mod tests {
             "topics": []
         });
         let filter = LogFilter::from_value(&json);
-        // hex address is silently ignored; only the pq1 address is accepted
+        // short EVM-style hex is silently ignored; only canonical 32-byte 0x addresses are accepted
         assert_eq!(filter.addresses.len(), 1);
     }
 

@@ -714,8 +714,7 @@ pub(crate) fn invalid_params_err(msg: impl std::fmt::Display) -> ErrorObjectOwne
     ErrorObjectOwned::owned(-32602, msg.to_string(), None::<()>)
 }
 
-/// Parse a user-facing address string. Only `pq1...` Bech32m format is accepted;
-/// legacy `0x` hex addresses are rejected with an error.
+/// Parse a user-facing address string. Only `0x` + 64 lowercase hex is accepted.
 pub(crate) fn parse_address(s: &str) -> Result<Address, ErrorObjectOwned> {
     Address::parse(s).map_err(|e| invalid_params_err(format!("invalid address: {e}")))
 }
@@ -3103,9 +3102,9 @@ mod tests {
     async fn encode_add_validator_returns_correct_hex() {
         let handler = setup();
         let target = Address::from([0xAB; 20]);
-        let bech32_addr = target.to_string();
+        let hex_addr = target.to_string();
 
-        let result = ShellApiServer::encode_add_validator(&handler, bech32_addr)
+        let result = ShellApiServer::encode_add_validator(&handler, hex_addr)
             .await
             .unwrap();
 
@@ -3121,9 +3120,9 @@ mod tests {
     async fn encode_remove_validator_returns_correct_hex() {
         let handler = setup();
         let target = Address::from([0xCD; 20]);
-        let bech32_addr = target.to_string();
+        let hex_addr = target.to_string();
 
-        let result = ShellApiServer::encode_remove_validator(&handler, bech32_addr)
+        let result = ShellApiServer::encode_remove_validator(&handler, hex_addr)
             .await
             .unwrap();
 
@@ -4402,7 +4401,7 @@ mod tests {
 
         assert_eq!(
             addr.to_string(),
-            "pq1q9dhyfqat4gyc370l49puq3vyujlhpdpnv25dxkc"
+            "0x07d843505276a03435c79f60d19121d443aae66f20ff4fd085a0abf019457697"
         );
 
         {

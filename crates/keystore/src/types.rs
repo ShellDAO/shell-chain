@@ -55,13 +55,13 @@ pub struct CipherParams {
 /// Encrypted private key in JSON-serializable format.
 ///
 /// Compatible with a PQ-adapted variant of the Web3 Secret Storage
-/// definition. The `address` field stores the Shell account as a `pq1...`
-/// bech32m string derived from `blake3(version || algo_id || pubkey)[0..20]`.
+/// definition. The `address` field stores the Shell account as a `0x`-prefixed
+/// hex string derived from `BLAKE3(algo_id || pubkey)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedKey {
     /// Format version (always 1).
     pub version: u32,
-    /// Shell-chain address derived from the public key (`pq1...` bech32m format).
+    /// Shell-chain address derived from the public key (`0x` + 64 lowercase hex).
     pub address: String,
     /// PQ algorithm type ("dilithium3" or "sphincs-sha2-256f").
     #[serde(default = "default_key_type")]
@@ -142,7 +142,7 @@ mod tests {
     fn encrypted_key_serialization_roundtrip() {
         let ek = EncryptedKey {
             version: 1,
-            address: "pq1qx46h2at4w46h2at4w46h2at4w46h2at4v6lzg9h".into(),
+            address: "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
             key_type: "dilithium3".into(),
             kdf: "argon2id".into(),
             kdf_params: KdfParams::default(),

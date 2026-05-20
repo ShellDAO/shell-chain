@@ -396,7 +396,7 @@ enum GenesisCommands {
         #[arg(long)]
         genesis: PathBuf,
 
-        /// Shell-chain address to add (hex or pq1… bech32).
+        /// Shell-chain address to add (`0x` + 64 lowercase hex).
         #[arg(long)]
         address: String,
 

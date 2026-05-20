@@ -433,8 +433,8 @@ mod tests {
 
     #[test]
     fn wpoa_genesis_writes_validator_weights_to_world_state() {
-        let v1 = Address::from([0x01; 20]);
-        let v2 = Address::from([0x02; 20]);
+        let v1 = Address::from([0x01; 32]);
+        let v2 = Address::from([0x02; 32]);
         let config = GenesisConfig {
             consensus: ConsensusConfig::WPoA {
                 authorities: vec![v1, v2],

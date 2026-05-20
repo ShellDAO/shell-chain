@@ -21,7 +21,7 @@ pub fn genesis_add_alloc(
     let mut doc: Value = serde_json::from_str(&raw)
         .map_err(|e| format!("invalid JSON in {}: {e}", genesis_path.display()))?;
 
-    let address = Address::parse(&address).map_err(|e| format!("invalid pq1 address: {e}"))?;
+    let address = Address::parse(&address).map_err(|e| format!("invalid address: {e}"))?;
     let addr_key = address.to_string();
 
     // Ensure `alloc` object exists.

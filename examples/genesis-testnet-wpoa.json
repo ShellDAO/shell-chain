@@ -8,9 +8,9 @@
   "consensus": {
     "engine": "wpoa",
     "authorities": [
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna",
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg7j66z6",
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv3ccudq"
+      "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "0x0000000000000000000000000000000000000000000000000000000000000002",
+      "0x0000000000000000000000000000000000000000000000000000000000000003"
     ],
     "weights": [2, 1, 1],
     "block_time_secs": 2,
@@ -18,23 +18,23 @@
     "epoch_length": 0
   },
   "alloc": {
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna": {
+    "0x0000000000000000000000000000000000000000000000000000000000000001": {
       "balance": "0x3635c9adc5dea00000",
       "nonce": 0
     },
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg7j66z6": {
+    "0x0000000000000000000000000000000000000000000000000000000000000002": {
       "balance": "0x3635c9adc5dea00000",
       "nonce": 0
     },
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv3ccudq": {
+    "0x0000000000000000000000000000000000000000000000000000000000000003": {
       "balance": "0x3635c9adc5dea00000",
       "nonce": 0
     },
-    "pq1q8eel4h9r2kc3ah5ee4t3qnj088llwfzvc2lgdcq": {
+    "0x0000000000000000000000000000000000000000000000000000000000000004": {
       "balance": "0x3635c9adc5dea00000",
       "nonce": 0
     },
-    "pq1q9cfj7tsc5vp9hp6qyx86qd4pcx30hreeqdqsp8a": {
+    "0x0000000000000000000000000000000000000000000000000000000000000005": {
       "balance": "0xde0b6b3a7640000",
       "nonce": 0
     }

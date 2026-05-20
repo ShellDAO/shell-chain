@@ -582,7 +582,7 @@ mod tests {
         Transaction {
             chain_id,
             nonce,
-            to: Some(Address::from([0x01; 20])),
+            to: Some(Address::from([0x01; 32])),
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
@@ -732,7 +732,7 @@ mod tests {
         let (mut ws, cs) = setup_stores();
 
         // Use a wrong from address
-        let wrong_from = Address::from([0xFF; 20]);
+        let wrong_from = Address::from([0xFF; 32]);
         fund_account(&mut ws, &wrong_from, U256::from(1_000_000));
 
         let tx = simple_transfer(test_chain_id(), 0);
@@ -858,7 +858,7 @@ mod tests {
         let tx = Transaction {
             chain_id: test_chain_id(),
             nonce: 0,
-            to: Some(Address::from([0x01; 20])),
+            to: Some(Address::from([0x01; 32])),
             value: U256::MAX, // near-max value
             data: Bytes::new(),
             gas_limit: u64::MAX,
@@ -974,7 +974,7 @@ mod tests {
 
     fn inner(value: u64, gas: u64) -> InnerCall {
         InnerCall {
-            to: Some(Address::from([0xAA; 20])),
+            to: Some(Address::from([0xAA; 32])),
             value: U256::from(value),
             data: ShellBytes::new(),
             gas_limit: gas,

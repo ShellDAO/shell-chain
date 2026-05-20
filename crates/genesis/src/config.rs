@@ -396,8 +396,8 @@ mod tests {
     use super::*;
 
     fn sample_genesis_json() -> String {
-        let authority = Address::from([0x01; 20]);
-        let funded = Address::from([0x02; 20]);
+        let authority = Address::from([0x01; 32]);
+        let funded = Address::from([0x02; 32]);
         serde_json::json!({
             "chain_id": 1337,
             "chain_name": "shell-testnet",
@@ -475,11 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn serialized_genesis_uses_bech32m_addresses() {
+    fn serialized_genesis_uses_hex_addresses() {
         let config = GenesisConfig::from_json(&sample_genesis_json()).unwrap();
         let json = config.to_json_pretty().unwrap();
-        assert!(json.contains(&Address::from([0x01; 20]).to_string()));
-        assert!(json.contains(&Address::from([0x02; 20]).to_string()));
+        assert!(json.contains(&Address::from([0x01; 32]).to_string()));
+        assert!(json.contains(&Address::from([0x02; 32]).to_string()));
     }
 
     #[test]

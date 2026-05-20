@@ -17,7 +17,7 @@ use crate::password::{resolve_password, PasswordArgs};
 pub enum TxCommand {
     /// Send a value transfer transaction.
     Send {
-        /// Recipient address (`pq1...` bech32m format).
+        /// Recipient address (`0x` + 64 lowercase hex).
         #[arg(long)]
         to: String,
 
@@ -71,7 +71,7 @@ pub enum TxCommand {
 
     /// Make a read-only call (eth_call).
     Call {
-        /// Contract address (`pq1...` bech32m format).
+        /// Contract address (`0x` + 64 lowercase hex).
         #[arg(long)]
         to: String,
 
@@ -315,7 +315,7 @@ fn load_keystore(
     Ok(signer)
 }
 
-/// Parse a user-facing address string. Only `pq1...` bech32m format is accepted.
+/// Parse a user-facing address string. Only `0x` + 64 hex is accepted.
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error>> {
     Address::parse(s).map_err(|e| format!("invalid address '{s}': {e}").into())
 }
@@ -510,16 +510,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_bech32m_address() {
-        let raw = Address::from([0x11; 20]);
+    fn parse_hex_address() {
+        let raw = Address::from([0x11; 32]);
         let addr = parse_address(&raw.to_string()).unwrap();
         assert_eq!(addr, raw);
     }
 
     #[test]
-    fn parse_address_rejects_hex() {
-        assert!(parse_address("0x0000000000000000000000000000000000000001").is_err());
-        assert!(parse_address("0000000000000000000000000000000000000001").is_err());
+    fn parse_address_accepts_only_prefixed_32_byte_hex() {
+        assert!(parse_address("0x0000000000000000000000000000000000000000000000000000000000000001").is_ok());
+        assert!(parse_address("0000000000000000000000000000000000000000000000000000000000000001").is_err());
     }
 
     #[test]

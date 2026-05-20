@@ -19,7 +19,7 @@ pub enum WalletCommand {
 
     /// Query the balance of an address.
     Balance {
-        /// Address to query (`pq1...`; legacy `0x...` also accepted).
+        /// Address to query (`0x` + 64 lowercase hex).
         address: String,
 
         /// JSON-RPC endpoint URL.
@@ -29,7 +29,7 @@ pub enum WalletCommand {
 
     /// Send a value transfer.
     Send {
-        /// Recipient address (`pq1...`; legacy `0x...` also accepted).
+        /// Recipient address (`0x` + 64 lowercase hex).
         #[arg(long)]
         to: String,
 
@@ -129,7 +129,7 @@ mod tests {
             &src,
             r#"{
   "version": 1,
-  "address": "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna",
+  "address": "0x0000000000000000000000000000000000000000000000000000000000000001",
   "key_type": "dilithium3",
   "public_key": "deadbeef",
   "ciphertext": "00",

@@ -463,7 +463,7 @@ async fn malformed_balance_probe(client: &Client, url: &str, req_id: u64) -> Res
     let req = RpcRequest {
         jsonrpc: "2.0",
         method: "eth_getBalance",
-        params: json!(["pq1definitelynotavalidaddress", "latest"]),
+        params: json!(["0xdefinitelynotavalidaddress", "latest"]),
         id: req_id,
     };
     let body = rpc_post(client, url, &req).await?;

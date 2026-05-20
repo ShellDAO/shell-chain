@@ -245,7 +245,7 @@ impl Worker {
         let pubkey = signer.public_key().to_vec();
         let address =
             Address::from_public_key(&pubkey, shell_crypto::SignatureType::Dilithium3.as_u8());
-        let pq_address = address.to_string(); // Display trait formats as pq1...
+        let pq_address = address.to_string(); // Display trait formats as 0x hex.
         Worker {
             id,
             signer,
