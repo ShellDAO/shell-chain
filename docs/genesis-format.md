@@ -60,7 +60,19 @@ before the first block is produced.
 }
 ```
 
-### `consensus` — wPoA (Weighted Proof of Authority)
+### `consensus` — PoA / wPoA (Proof of Authority)
+
+```json
+{
+  "engine": "poa",
+  "authorities": ["pq1...", "pq1...", "pq1..."],
+  "block_time_secs": 2,
+  "max_future_secs": 60,
+  "epoch_length": 0
+}
+```
+
+To enable the optional Weighted PoA extension:
 
 ```json
 {

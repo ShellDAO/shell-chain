@@ -15,7 +15,7 @@ Shell-chain is built from the ground up with post-quantum cryptographic primitiv
 5. [Address Derivation](#address-derivation)
 6. [Signature Sizes and Performance](#signature-sizes-and-performance)
 7. [Incompatibility with ECDSA and MetaMask](#incompatibility-with-ecdsa-and-metamask)
-8. [Future: SPHINCS+ and Hybrid Schemes](#future-sphincs-and-hybrid-schemes)
+8. [Additional Algorithms and Future Schemes](#additional-algorithms-and-future-schemes)
 
 ---
 
@@ -47,7 +47,7 @@ Shell-chain's default signature algorithm. Based on the hardness of lattice prob
 
 | Property | Value |
 |----------|-------|
-| **Standard** | NIST FIPS 204 (ML-DSA-65, draft) |
+| **Standard** | NIST Round 3 reference (pre-FIPS; shares security basis with ML-DSA-65) |
 | **Security Level** | NIST Level 3 (128-bit PQ) |
 | **Public Key Size** | 1,952 bytes |
 | **Secret Key Size** | 4,032 bytes |
@@ -275,7 +275,7 @@ The `eth_sign` and `eth_signTransaction` methods return error `-32601` because t
 
 ---
 
-## Future: SPHINCS+ and Hybrid Schemes
+## Additional Algorithms and Future Schemes
 
 ### SPHINCS+-SHA2-256f (Available Today)
 
@@ -326,7 +326,8 @@ This design enables seamless addition of new algorithms without protocol-breakin
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| **Signatures** | Dilithium3 (default) | Fast, compact (for PQ), NIST Level 3 |
+| **Signatures (default)** | Dilithium3 | Fast, compact (for PQ), NIST Level 3 |
+| **Signatures (FIPS 204)** | ML-DSA-65 | Optional FIPS-204 path via `--algorithm mldsa65` |
 | **Signatures (alt)** | SPHINCS+-SHA2-256f | Conservative, hash-based, NIST Level 5 |
 | **Hashing** | Keccak-256 | Ethereum compatibility |
 | **Internal hashing** | BLAKE3 | Performance |

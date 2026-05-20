@@ -71,15 +71,15 @@ All metrics are prefixed `shell_`.
 |--------|------|--------|-------------|
 | `shell_peer_count` | Gauge | — | Connected libp2p peers |
 
-### Consensus (wPoA)
+### Consensus (PoA / wPoA)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `shell_epoch_number` | Gauge | — | Current wPoA epoch |
+| `shell_epoch_number` | Gauge | — | Current epoch number |
 | `shell_validator_active_count` | Gauge | — | Active validators in current epoch |
-| `shell_validator_weight` | Gauge | `validator` | Proposer weight per validator address |
+| `shell_validator_weight` | Gauge | `validator` | Proposer weight per validator address (wPoA) |
 | `shell_consensus_slot_miss_total` | Counter | `validator` | Missed proposer slots per validator |
-| `shell_last_finalized_number` | Gauge | — | Latest block finalized by weighted wPoA quorum |
+| `shell_last_finalized_number` | Gauge | — | Latest finalized block number |
 | `shell_finality_lag_blocks` | Gauge | — | Difference between canonical head and latest finalized block |
 
 ### STARK prover (K4)
