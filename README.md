@@ -15,7 +15,7 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 - 🔐 **Post-Quantum Signatures** — Dilithium3 as default; ML-DSA-65 (FIPS 204) available as optional FIPS path; SPHINCS+ as conservative hash-based fallback
 - ⚙️ **EVM Compatible** — Cancun-spec EVM; run Solidity contracts with familiar tooling (Hardhat, ethers.js, MetaMask)
 - 🏗️ **Native Account Abstraction** — protocol-level smart accounts with built-in PQ validation, key rotation, and custom validator hooks
-- 🧩 **PQ Precompiles** — on-chain Dilithium/SPHINCS+ verification, Kyber decapsulation, STARK proof verification
+- 🧩 **PQ Precompile Suite** — 6 on-chain precompiles at `0x0001`–`0x0006`: ML-DSA-65 verify, SLH-DSA-SHA2-256f verify, ML-DSA-65 batch verify, BLAKE3-256, BLAKE3-512, PQAddr derive
 - ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with stake-weighted proposer selection, slashing, and finality tracking
 - ⚡ **STARK Sig-Aggregation** — Winterfell STARK proofs compress Dilithium3 signatures **7× per block**; 157 proofs/sec sustained throughput. v0.22.x introduces multi-layer (L1/L2/L3) recursive STARK compression for further on-chain data reduction.
 - 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
@@ -45,8 +45,8 @@ For production deployments with Docker, see the [Operator Guide](docs/TESTNET_OP
 ## Native Account Abstraction
 
 Shell-Chain's long-term account model is **native AA**.
-Externally, accounts are shown as `pq1...` Bech32m addresses; internally, they
-remain 20-byte EVM addresses for compatibility.
+Externally, accounts are identified by `0x`-prefixed 32-byte hex addresses (BLAKE3 derivation);
+internally, the EVM uses the last 20 bytes for compatibility.
 
 Transaction validation follows three protocol-level paths:
 
@@ -136,8 +136,8 @@ shell-chain/
 | **STARKs** | Hash-based proofs | Signature aggregation, storage compression | Deployed (optional, off by default in dev) |
 | **Kyber / ML-KEM** (P2P) | KEM | Validator transport (future) | **Not yet deployed** — classical libp2p Noise/XX is current |
 
-Addresses are derived as `blake3(version || algo_id || pq_public_key)[0..20]`
-and encoded externally as Bech32m `pq1...`.
+Addresses are derived as `BLAKE3(algo_id || pq_public_key)` — full 32 bytes,
+displayed as `0x` + 64 lowercase hex chars.
 
 For details, see [docs/PQ_CRYPTO_GUIDE.md](docs/PQ_CRYPTO_GUIDE.md).
 
@@ -147,7 +147,7 @@ For details, see [docs/PQ_CRYPTO_GUIDE.md](docs/PQ_CRYPTO_GUIDE.md).
 - [Operator Guide](docs/TESTNET_OPERATOR_GUIDE.md) — production deployment with Docker and monitoring
 - [API Reference](docs/JSON_RPC_API.md) — complete JSON-RPC API documentation
 - [PQ Crypto Guide](docs/PQ_CRYPTO_GUIDE.md) — post-quantum cryptography details
-- [Native Account Abstraction Guide](docs/ACCOUNT_ABSTRACTION_GUIDE.md) — `pq1...` addresses, validation layers, and AA rollout
+- [Native Account Abstraction Guide](docs/ACCOUNT_ABSTRACTION_GUIDE.md) — 32-byte PQ addresses, validation layers, and AA rollout
 - [Block Pruning & Compression](docs/BLOCK_PRUNING_AND_COMPRESSION.md) — storage profiles (archive/full/light), block body lifecycle, STARK compression
 - [STARK Aggregation](docs/stark-aggregation.md) — STARK aggregate proof architecture and multi-layer settlement
 - [Prover Guide](docs/PROVER_GUIDE.md) — running a dedicated prover node

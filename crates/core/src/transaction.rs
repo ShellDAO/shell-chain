@@ -316,12 +316,12 @@ impl Transaction {
 
     /// Compute the PQ signing hash using the spec payload and BLAKE3.
     pub fn signing_hash(&self, sig_type: u8) -> ShellHash {
-        let mut preimage = Vec::with_capacity(8 + 8 + 20 + 32 + self.data.len() + 8 + 1);
+        let mut preimage = Vec::with_capacity(8 + 8 + 32 + 32 + self.data.len() + 8 + 1);
         preimage.extend_from_slice(&self.chain_id.to_be_bytes());
         preimage.extend_from_slice(&self.nonce.to_be_bytes());
         match &self.to {
             Some(addr) => preimage.extend_from_slice(addr.0.as_slice()),
-            None => preimage.extend_from_slice(&[0u8; 20]),
+            None => preimage.extend_from_slice(&[0u8; 32]),
         }
         let value = self.value.to_be_bytes::<32>();
         preimage.extend_from_slice(&value);
@@ -1424,7 +1424,7 @@ impl SignedTransaction {
         let bundle = self.aa_bundle.as_ref()?;
         bundle.paymaster?;
         let batch_hash = self.batch_signing_hash()?;
-        let mut buf = Vec::with_capacity(1 + 20 + 32);
+        let mut buf = Vec::with_capacity(1 + 32 + 32);
         buf.push(PAYMASTER_SIGNING_HASH_DOMAIN);
         buf.extend_from_slice(self.from.0.as_slice());
         buf.extend_from_slice(batch_hash.0.as_slice());

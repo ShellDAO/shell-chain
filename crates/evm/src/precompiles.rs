@@ -43,10 +43,12 @@ const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
     PQ_ADDR_DERIVE_ADDR,
 ];
 
-pub const PQ_VERIFY_GAS: u64 = 10_000;
-pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 10_000;
-pub const BLAKE3_HASH_GAS: u64 = 500;
-pub const PQ_ADDR_DERIVE_GAS: u64 = 10_000;
+pub const PQ_MLDSA65_VERIFY_GAS: u64 = 46_000;
+pub const PQ_SLHDSA_VERIFY_GAS: u64 = 2_300_000;
+pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 12_000;
+pub const BLAKE3_BASE_GAS: u64 = 30;
+pub const BLAKE3_WORD_GAS: u64 = 6;
+pub const PQ_ADDR_DERIVE_GAS: u64 = 200;
 
 const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
@@ -200,7 +202,7 @@ fn charge_gas(result: &mut InterpreterResult, gas: u64) -> bool {
 
 fn run_mldsa65_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, PQ_VERIFY_GAS) {
+    if !charge_gas(&mut result, PQ_MLDSA65_VERIFY_GAS) {
         return result;
     }
     result.output = bool_output(verify_mldsa65(input));
@@ -209,7 +211,7 @@ fn run_mldsa65_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_slhdsa_sha2_256f_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, PQ_VERIFY_GAS) {
+    if !charge_gas(&mut result, PQ_SLHDSA_VERIFY_GAS) {
         return result;
     }
     result.output = bool_output(verify_slhdsa_sha2_256f(input));
@@ -229,7 +231,9 @@ fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_blake3_256(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, BLAKE3_HASH_GAS) {
+    let words = (input.len() as u64 + 31) / 32;
+    let gas = BLAKE3_BASE_GAS + BLAKE3_WORD_GAS * words;
+    if !charge_gas(&mut result, gas) {
         return result;
     }
     result.output = Bytes::copy_from_slice(blake3::hash(input).as_bytes());
@@ -238,7 +242,9 @@ fn run_blake3_256(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, BLAKE3_HASH_GAS) {
+    let words = (input.len() as u64 + 31) / 32;
+    let gas = BLAKE3_BASE_GAS + BLAKE3_WORD_GAS * words;
+    if !charge_gas(&mut result, gas) {
         return result;
     }
     let mut hasher = blake3::Hasher::new();
@@ -327,7 +333,9 @@ fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
 }
 
 fn bool_output(valid: bool) -> Bytes {
-    Bytes::copy_from_slice(&[u8::from(valid)])
+    let mut out = [0u8; 32];
+    out[31] = u8::from(valid);
+    Bytes::copy_from_slice(&out)
 }
 
 #[cfg(test)]
@@ -361,8 +369,10 @@ mod tests {
         input.extend_from_slice(&sig.data);
         input.extend_from_slice(message);
 
-        let output = run_mldsa65_verify(PQ_VERIFY_GAS, &input);
-        assert_eq!(output.output.as_ref(), &[1]);
+        let output = run_mldsa65_verify(PQ_MLDSA65_VERIFY_GAS, &input);
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(output.output.as_ref(), &expected);
     }
 
     #[test]
@@ -375,8 +385,10 @@ mod tests {
         input.extend_from_slice(&sig.data);
         input.extend_from_slice(message);
 
-        let output = run_slhdsa_sha2_256f_verify(PQ_VERIFY_GAS, &input);
-        assert_eq!(output.output.as_ref(), &[1]);
+        let output = run_slhdsa_sha2_256f_verify(PQ_SLHDSA_VERIFY_GAS, &input);
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(output.output.as_ref(), &expected);
     }
 
     #[test]

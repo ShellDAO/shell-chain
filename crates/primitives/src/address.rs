@@ -21,9 +21,8 @@ impl Address {
     }
 
     pub fn from_slice(slice: &[u8]) -> Self {
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(slice);
-        Self(bytes)
+        Self::try_from_slice(slice)
+            .expect("Address::from_slice: slice must be exactly 32 bytes")
     }
 
     pub fn try_from_slice(slice: &[u8]) -> Result<Self, PrimitivesError> {

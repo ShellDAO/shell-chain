@@ -1,6 +1,6 @@
 # Genesis File Format
 
-> Shell Chain — Genesis JSON specification (F-PQ1-ONLY)
+> Shell Chain — Genesis JSON specification
 
 ---
 
@@ -10,8 +10,8 @@ The genesis file defines the initial chain state: chain identity, consensus para
 pre-funded accounts (`alloc`), and boot node addresses. It is passed to `shell-node init`
 before the first block is produced.
 
-**Key requirement (F-PQ1-ONLY):** All addresses in the genesis file must use the canonical
-`pq1...` bech32m format. Legacy `0x` hex addresses are rejected by the parser.
+All addresses in the genesis file use the canonical `0x` + 64 lowercase hex chars (32 bytes)
+format — the BLAKE3 derivation `addr = BLAKE3(algo_id || pubkey)` rendered as hex.
 
 ---
 
@@ -26,7 +26,7 @@ before the first block is produced.
   "gas_limit": <u64>,
   "extra_data": "<string — arbitrary label, max 32 bytes>",
   "consensus": { ... },
-  "alloc": { "<pq1-address>": { "balance": "<hex-wei>", "nonce": <u64> }, ... },
+  "alloc": { "<0x-address>": { "balance": "<hex-wei>", "nonce": <u64> }, ... },
   "boot_nodes": [ "<multiaddr>", ... ]
 }
 ```
@@ -46,7 +46,7 @@ before the first block is produced.
 | `gas_limit` | `u64` | ✅ | Block gas limit for block 0. Recommend `30_000_000`. |
 | `extra_data` | `string` | ✅ | Arbitrary genesis label, stored in block 0 `extra_data`. |
 | `consensus` | object | ✅ | Consensus engine configuration (see below). |
-| `alloc` | object | ✅ | Initial account balances. Keys are `pq1...` addresses. |
+| `alloc` | object | ✅ | Initial account balances. Keys are `0x`-prefixed 32-byte hex addresses. |
 | `boot_nodes` | array | ✅ | P2P multiaddrs for bootstrap nodes. |
 
 ### `consensus` — PoA
@@ -54,30 +54,18 @@ before the first block is produced.
 ```json
 {
   "engine": "poa",
-  "authorities": ["pq1...", "pq1...", ...],
+  "authorities": ["0x<64hex>", "0x<64hex>", ...],
   "block_time_secs": 2,
   "max_future_secs": 60
 }
 ```
 
-### `consensus` — PoA / wPoA (Proof of Authority)
-
-```json
-{
-  "engine": "poa",
-  "authorities": ["pq1...", "pq1...", "pq1..."],
-  "block_time_secs": 2,
-  "max_future_secs": 60,
-  "epoch_length": 0
-}
-```
-
-To enable the optional Weighted PoA extension:
+### `consensus` — wPoA
 
 ```json
 {
   "engine": "wpoa",
-  "authorities": ["pq1...", "pq1...", "pq1..."],
+  "authorities": ["0x<64hex>", "0x<64hex>", "0x<64hex>"],
   "weights": [2, 1, 1],
   "block_time_secs": 2,
   "max_future_secs": 60,
@@ -88,7 +76,7 @@ To enable the optional Weighted PoA extension:
 | Field | Description |
 |-------|-------------|
 | `engine` | `"poa"` or `"wpoa"`. |
-| `authorities` | Array of `pq1...` validator addresses (must match keystore addresses). |
+| `authorities` | Array of `0x`-prefixed 32-byte hex validator addresses (must match keystore addresses). |
 | `weights` | (wPoA only) Integer vote weights, one per authority. Must sum ≥ 2/3 for quorum. |
 | `block_time_secs` | Target block time in seconds. |
 | `max_future_secs` | Maximum allowed clock skew for incoming blocks. |
@@ -98,7 +86,7 @@ To enable the optional Weighted PoA extension:
 
 ```json
 "alloc": {
-  "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna": {
+  "0x0000000000000000000000000000000000000000000000000000000000000001": {
     "balance": "0x3635c9adc5dea00000",
     "nonce": 0
   }
@@ -107,7 +95,7 @@ To enable the optional Weighted PoA extension:
 
 | Field | Description |
 |-------|-------------|
-| key | `pq1...` bech32m address (canonical format). **`0x` addresses are rejected.** |
+| key | `0x`-prefixed 32-byte hex address (canonical format). |
 | `balance` | Initial balance in wei, hex-encoded with `0x` prefix. |
 | `nonce` | Initial account nonce (almost always `0`). |
 
@@ -143,9 +131,9 @@ Standard libp2p multiaddrs with the `/p2p/<PeerId>` suffix:
   "consensus": {
     "engine": "wpoa",
     "authorities": [
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna",
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg7j66z6",
-      "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv3ccudq"
+      "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "0x3333333333333333333333333333333333333333333333333333333333333333"
     ],
     "weights": [2, 1, 1],
     "block_time_secs": 2,
@@ -153,15 +141,15 @@ Standard libp2p multiaddrs with the `/p2p/<PeerId>` suffix:
     "epoch_length": 0
   },
   "alloc": {
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna": {
+    "0x1111111111111111111111111111111111111111111111111111111111111111": {
       "balance": "0x3635c9adc5dea00000",
       "nonce": 0
     },
-    "pq1q8eel4h9r2kc3ah5ee4t3qnj088llwfzvc2lgdcq": {
+    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
       "balance": "0xde0b6b3a7640000",
       "nonce": 0
     },
-    "pq1q9cfj7tsc5vp9hp6qyx86qd4pcx30hreeqdqsp8a": {
+    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
       "balance": "0xde0b6b3a7640000",
       "nonce": 0
     }
@@ -189,7 +177,7 @@ cp examples/genesis-testnet-wpoa.json my-genesis.json
 # Add a faucet account
 shell-node genesis add-alloc \
     --genesis my-genesis.json \
-    --address pq1<faucet-address> \
+    --address 0x<32-byte-faucet-address> \
     --balance 1000000000000000000000000
 ```
 
@@ -216,9 +204,9 @@ shell-node init --genesis my-genesis.json --data-dir /var/lib/shell
 The node enforces these rules when loading a genesis file (F-082):
 
 1. File size ≤ 10 MB.
-2. All `alloc` addresses are valid `pq1...` bech32m addresses.
+2. All `alloc` addresses are valid `0x`-prefixed 32-byte hex addresses (64 hex chars after `0x`).
 3. `chain_id` is non-zero.
-4. `consensus.authorities` are non-empty and all valid `pq1...` addresses.
+4. `consensus.authorities` are non-empty and all valid `0x`-prefixed 32-byte hex addresses.
 5. `consensus.weights` (wPoA) has the same length as `authorities`.
 6. `timestamp` is reasonable (not zero, not far in the future).
 

@@ -27,7 +27,7 @@ pub use parallel::{
     ConflictMetric, ConflictReason, ExecutionWave, ParallelEvmConfig, ParallelExecutionPlan,
     ParallelScheduler, TxConflict, TxConflictGraph,
 };
-pub use precompiles::{BLAKE3_HASH_GAS, PQ_ADDR_DERIVE_GAS, PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_VERIFY_GAS, ShellPrecompiles};
+pub use precompiles::{BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDR_DERIVE_GAS, PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS, ShellPrecompiles};
 pub use rwset::{HeuristicRwSetExtractor, ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};
 pub use state_db::{ShellStateDb, StateDbError};
 pub use system_contracts::{
