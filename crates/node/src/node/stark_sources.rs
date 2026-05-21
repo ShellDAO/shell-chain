@@ -12,7 +12,7 @@
 //! * `msg_hash` – the 32-byte transaction hash.
 //! * `pk_hash`  – for [`PubkeyMode::Embedded`], the first ≤32 bytes of the
 //!   inline public key; for [`PubkeyMode::Reference`], the 20-
-//!   byte sender address zero-padded to 32 bytes.
+//!   byte sender address (32 bytes in v0.23.0+) zero-padded to 32 bytes.
 
 use shell_core::PubkeyMode;
 
@@ -36,8 +36,11 @@ pub(crate) fn tx_to_sig_batch_entry(tx: &SignedTransaction) -> SigBatchEntry {
         }
         PubkeyMode::Reference => {
             // Use sender address bytes as pk identifier for Reference-mode txs.
+            // Addresses are 32 bytes in v0.23.0 (BLAKE3, not 20-byte Ethereum).
             let mut h = [0u8; 32];
-            h[..20].copy_from_slice(tx.from.0.as_slice());
+            let addr = tx.from.0.as_slice();
+            let copy_len = addr.len().min(32);
+            h[..copy_len].copy_from_slice(&addr[..copy_len]);
             h
         }
     };
