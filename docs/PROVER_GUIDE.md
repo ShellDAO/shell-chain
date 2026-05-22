@@ -43,6 +43,21 @@ node_role = "prover"
 shell-node run --node-role prover --config config.toml
 ```
 
+### L2StarkMode
+
+The prover's contribution to proof availability is controlled by `L2StarkMode`:
+
+| Mode | CLI value | Behaviour |
+|------|-----------|-----------|
+| `Disabled` | `"disabled"` | No STARK proofs generated or forwarded |
+| `Scaffold` | `"scaffold"` | Proofs generated but not actively circulated; development/testing mode |
+| `Active` | `"active"` | Full proof pipeline: generate → store → broadcast `ProofAmendment` |
+
+```toml
+[prover]
+l2_stark_mode = "active"
+```
+
 ---
 
 ## How Proving Works
@@ -83,7 +98,7 @@ provers. Only registered provers can submit `ProofAmendment` messages.
 Provers register by submitting a governance transaction through
 `shell_proposeAddValidator` with the prover's address. The prover's address is
 derived from its PQ public key the same way as any account:
-`blake3(version || algo_id || pubkey)[0..20]`.
+`blake3(algo_id || pubkey)` rendered as `0x` + 64 lowercase hex characters.
 
 ### ProverRecord fields
 
@@ -227,6 +242,9 @@ On receipt, the network:
 4. Stores at `pa/<block_hash>`
 5. Deletes `w/<block_hash>` (after grace window)
 
+When `L2StarkMode=Active`, a proof challenge remains open for `T_c = 7200` blocks
+before the amendment lifecycle resolves to `RESOLVED` or `SLASHED`.
+
 ---
 
 ## Monitoring
@@ -263,6 +281,8 @@ ProofChallenge {
 ```
 
 Any node holding the raw proof can respond with a `ChallengeResponse` carrying
-the proof bytes, allowing the challenger to retry verification. Challenges are
+the proof bytes, allowing the challenger to retry verification. Challenge windows
+close after `T_c = 7200` blocks; at that point the amendment is resolved or the
+prover is slashed, depending on the verification outcome. Challenges are
 rate-limited per-peer to prevent DoS. A prover that accumulates failed
 challenges may be removed from `ProverRegistry`.

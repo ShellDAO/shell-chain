@@ -2,8 +2,8 @@
 
 Shell-Chain implements **account abstraction at the protocol layer**. Every user
 account is treated as a smart account from the start: the chain validates
-post-quantum signatures natively, keeps EVM-compatible 20-byte addresses
-internally, and exposes a Shell-specific `pq1...` address format externally.
+post-quantum signatures natively and uses canonical 32-byte BLAKE3-derived
+addresses rendered as `0x` + 64 lowercase hex characters.
 
 > **See also:** [Quickstart Guide](QUICKSTART.md) · [JSON-RPC API Reference](JSON_RPC_API.md) · [Post-Quantum Cryptography Guide](PQ_CRYPTO_GUIDE.md)
 
@@ -17,7 +17,7 @@ Instead, transaction validation is part of the base protocol:
 - **Default path:** built-in post-quantum signature validation
 - **Upgradeable path:** account-specific validation contract logic
 - **Stable account identity:** address stays the same across key rotation
-- **EVM compatibility:** contracts still see standard 20-byte addresses
+- **32-byte native addresses:** Shell-Chain uses 32-byte BLAKE3-derived addresses throughout; system contracts use the `from_alloy`/`to_alloy` shims for EVM call data compatibility
 
 In practice, this means the chain can support:
 
@@ -34,42 +34,38 @@ In practice, this means the chain can support:
 Shell-Chain derives account addresses from the signing algorithm and public key:
 
 ```text
-preimage = version(1 byte) || algo_id(1 byte) || pubkey(n bytes)
-address  = blake3(preimage)[0..20]
+address = blake3(algo_id || pubkey)   →   32-byte digest
 ```
 
-- `version = 0x01` for the first derivation scheme
-- `algo_id = SignatureType::as_u8()`
-- the final address is still **20 bytes**
+- `algo_id = SignatureType::as_u8()` (1 byte)
+- the address is the full **32 bytes** of the BLAKE3 output — no truncation
+- rendered as `0x` + 64 lowercase hex characters
 
-This keeps the EVM and storage layout compatible with 20-byte EVM address slots
-while avoiding Ethereum's `keccak256(pubkey)[12..]` address space.
+This gives a 256-bit address space bound to both the algorithm and key material,
+with no backward-compatibility bridge to any 20-byte model.
 
 ### 2.2 External address encoding
 
-Externally, Shell-Chain uses **Bech32m** with HRP `pq`:
+Shell-Chain uses `0x`-prefixed lowercase hex as the canonical address format:
 
 ```text
-pq1...
+0x<64 lowercase hex characters>
 ```
 
 Examples:
+- `0xd3b4f2a9c01e5f78a2b3...` (64 hex chars = 32 bytes)
 
-- canonical user-facing address: `pq1...`
-- internal debug form: `0x...` (20-byte hex)
+Unlike Ethereum's 20-byte `0x` addresses, Shell-Chain addresses are 32 bytes end-to-end.
 
-### 2.3 Why Shell-Chain does not use `0x...` as the canonical format
+### 2.3 Why Shell-Chain uses full 32-byte addresses
 
-The `pq1...` format exists to make the account space visibly distinct from
-Ethereum and other EVM chains:
+Shell-Chain addresses are 32 bytes end-to-end for three reasons:
 
-- it reduces accidental deposits to the wrong network
-- it binds the address to the PQ algorithm used at creation time
-- it leaves room for future derivation upgrades via `version`
+- the BLAKE3 output is 256 bits — truncating to 20 bytes would waste 12 bytes of collision resistance
+- PQ public keys encode algorithm identity via `algo_id`; the full-length digest preserves this binding
+- no `keccak256(pubkey)[12..]` truncation means no compatibility bridge to the Ethereum address space
 
-**Migration note:** some CLI / RPC input paths still accept legacy `0x...`
-addresses as a transitional compatibility shim, but canonical output, docs,
-genesis, and testnet operations use `pq1...`.
+The `0x`-prefix is kept for tooling familiarity. Addresses are 64 hex characters, not 40.
 
 ---
 
@@ -79,7 +75,7 @@ Shell-Chain uses a **three-layer validation flow**.
 
 | Layer | Trigger | Validation rule | Purpose |
 | --- | --- | --- | --- |
-| **Layer 1** | First transaction from an account with no state entry | Re-derive `tx.from` from `(version, algo_id, pubkey)` and verify signature | Account creation / first-use safety |
+| **Layer 1** | First transaction from an account with no state entry | Re-derive `tx.from` from `(algo_id, pubkey)` and verify signature | Account creation / first-use safety |
 | **Layer 2** | Existing account with `validation_code_hash = None` | Verify `pubkey_hash` and PQ signature | Normal operation with key rotation support |
 | **Layer 3** | Existing account with `validation_code_hash = Some(hash)` | Call account-specific validation logic in the EVM | Multisig / recovery / custom policies |
 
@@ -88,7 +84,7 @@ Shell-Chain uses a **three-layer validation flow**.
 When the account does not yet exist in world state:
 
 1. the node requires `sender_pubkey`
-2. it derives the expected address from `(version, algo_id, pubkey)`
+2. it derives the expected address from `(algo_id, pubkey)`
 3. it checks that the derived address matches `tx.from`
 4. it verifies the PQ signature
 
@@ -205,7 +201,7 @@ workspace regression and final rollout validation.
 | Bundler required | No | Yes |
 | Separate alt-mempool | No | Usually yes |
 | Default validator | Built into the chain | Wallet contract-defined |
-| Address format | `pq1...` externally, 20-byte internally | `0x...` |
+| Address format | `0x` + 64 hex (32-byte BLAKE3) | `0x` + 40 hex (20-byte keccak) |
 
 Shell-Chain's model is closer to a **native smart-account chain** than to an
 Ethereum add-on AA layer.
@@ -216,8 +212,8 @@ Ethereum add-on AA layer.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| PQ address derivation (`blake3(version || algo_id || pubkey)`) | ✅ Implemented | Canonical external format is `pq1...` |
-| RPC / CLI / genesis address migration | ✅ Implemented | User-facing outputs now use Bech32m |
+| PQ address derivation (`blake3(algo_id || pubkey)`) | ✅ Implemented | 32-byte BLAKE3 digest, `0x` + 64 hex |
+| RPC / CLI / genesis address format | ✅ Implemented | `0x` + 64 lowercase hex throughout |
 | AA validation dispatcher core | ✅ Implemented | Layer 1 / Layer 2 / Layer 3 routing exists |
 | Custom validator dry-run path | ✅ Implemented | Snapshot-based EVM validation with gas cap |
 | Mempool / production ingress integration | ✅ Implemented | Revalidation and block-production paths are wired |
@@ -230,7 +226,7 @@ Ethereum add-on AA layer.
 
 If you want to trace the implementation in code:
 
-- `crates/primitives/src/address.rs` — address derivation and `pq1...` encoding
+- `crates/primitives/src/address.rs` — address derivation (`BLAKE3(algo_id || pubkey)`, 32-byte output, `0x` hex encoding)
 - `crates/evm/src/aa_validation.rs` — native AA dispatcher and custom-validator path
 - `crates/evm/src/tx_validation.rs` — transaction validation entry points
 - `crates/mempool/src/pool.rs` — mempool-side validation integration
@@ -243,7 +239,7 @@ Shell-Chain's AA model combines:
 
 - **protocol-native smart-account validation**
 - **post-quantum key material**
-- **`pq1...` chain-specific addresses**
+- **32-byte `0x`-prefixed addresses** derived as `BLAKE3(algo_id || pubkey)`
 - **future-safe key rotation and validator upgrades**
 
 The goal is to make account abstraction the default account model, not an

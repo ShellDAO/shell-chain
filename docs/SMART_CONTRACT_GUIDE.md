@@ -8,7 +8,12 @@ Deploy and interact with smart contracts on Shell-Chain.
 
 ## Overview
 
-Shell-Chain is fully EVM-compatible (Cancun spec). Any contract written in Solidity or Vyper that compiles to EVM bytecode will work on Shell-Chain without modification. Standard tooling — Hardhat, Foundry, Remix — all work out of the box.
+Shell-Chain runs the **PQVM** (Post-Quantum Virtual Machine), which is based on the Cancun EVM with two differences from standard EVM:
+
+1. **`SELFDESTRUCT` and `CALLCODE` are removed** — these opcodes are unavailable in PQVM-1.
+2. **32-byte native addresses** — Shell-Chain addresses are 32-byte BLAKE3 digests (not 20-byte keccak truncations). The PQABI encoding uses a 32-byte full slot for addresses.
+
+For all other opcodes, arithmetic, memory, storage, logs, and control flow, Shell-Chain behaves like a standard Cancun EVM node. Standard tooling — Hardhat, Foundry, Remix — all work with the caveats above.
 
 ---
 
@@ -96,6 +101,34 @@ For the alpha testnet:
 ```bash
 forge create --rpc-url http://testnet.shell.xyz --chain-id 10 src/Counter.sol:Counter
 ```
+
+---
+
+## PQVM Native Opcodes
+
+Shell-Chain adds three post-quantum opcodes not present in the standard EVM:
+
+| Opcode | Hex | Gas | Description |
+|--------|-----|-----|-------------|
+| `PQVERIFY` | `0xB0` | 3000 | Verify a PQ signature on-chain |
+| `PQHASH` | `0xB1` | 200 | BLAKE3 hash of input data |
+| `PQADDR` | `0xB2` | 100 | Derive a 32-byte address from algo_id + pubkey |
+
+These opcodes are defined and gas-priced in the protocol; full interpreter
+dispatch wiring is in progress (see whitepaper §10 known limitations).
+
+### Precompile addresses (0x0001–0x0006)
+
+| Address | Function | Input wire format |
+|---------|----------|------------------|
+| `0x...0001` | ML-DSA-65 Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
+| `0x...0002` | SLH-DSA-SHA2-256f Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
+| `0x...0003` | BLAKE3 Hash | raw bytes → 32-byte digest |
+| `0x...0004` | Dilithium3 Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
+| `0x...0005` | PQ Address Derive | `[1-byte algo_id][pubkey]` → 32-byte address |
+| `0x...0006` | Reserved | — |
+
+Use the 32-byte precompile address `0x0000...000N` (31 zero bytes + 1 index byte).
 
 ---
 
@@ -312,12 +345,12 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 
 | Address | Function | Gas model |
 |---------|----------|-----------|
-| `0x0000000000000000000000000000000000000001` | ML-DSA-65 / Dilithium3 verify | flat `46,000` |
+| `0x0000000000000000000000000000000000000001` | ML-DSA-65 verify | flat `46,000` |
 | `0x0000000000000000000000000000000000000002` | SLH-DSA-SHA2-256f verify | flat `2,300,000` |
-| `0x0000000000000000000000000000000000000003` | ML-DSA-65 batch verify | `12,000 × signatures` |
-| `0x0000000000000000000000000000000000000004` | BLAKE3-256 | `30 + 6 × words` |
-| `0x0000000000000000000000000000000000000005` | BLAKE3-512 | `30 + 6 × words` |
-| `0x0000000000000000000000000000000000000006` | PQ address derive | flat `200` |
+| `0x0000000000000000000000000000000000000003` | BLAKE3 hash | `30 + 6 × words` |
+| `0x0000000000000000000000000000000000000004` | Dilithium3 verify | flat `46,000` |
+| `0x0000000000000000000000000000000000000005` | PQ address derive | flat `200` |
+| `0x0000000000000000000000000000000000000006` | Reserved | — |
 
 The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 
@@ -336,7 +369,7 @@ The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 pragma solidity ^0.8.24;
 
 library PQVerify {
-    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000001;
+    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000004;
 
     /// Verify a Dilithium3 signature. Returns true on valid.
     function verify(

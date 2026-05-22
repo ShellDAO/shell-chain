@@ -297,6 +297,22 @@ The live algorithm registry is process-global and is exposed through `shell_getA
 
 This lets the network phase algorithms in or out without changing the transaction container format.
 
+### Governance quorum rules
+
+A proposal requires $\lceil 2N/3 \rceil$ weighted validator votes. The votes
+must use **ML-DSA-65 or SLH-DSA-SHA2-256f** signatures — this dual-algorithm
+bootstrap safety ensures governance is not blocked if Dilithium3 is the algorithm
+being deprecated.
+
+Each proposal carries a unique identifier:
+```text
+proposal_id = BLAKE3(algo_id ‖ spec_bytes ‖ activation_height ‖ proposer_pk)
+```
+This prevents replay of old proposals at a later block height.
+
+The minimum activation delay is **Δ_min = 30 days** (~1,296,000 blocks at 2 s/block),
+giving the network time to upgrade software before the new algorithm goes live.
+
 ### SPHINCS+-SHA2-256f (Available Today)
 
 Shell-chain already supports **SPHINCS+-SHA2-256f-simple** as a secondary algorithm. SPHINCS+ is a **stateless hash-based** signature scheme, providing a fundamentally different security assumption from lattice-based Dilithium:
@@ -322,10 +338,6 @@ shell-node key generate --algorithm mldsa65 --output keystore.json
 ```
 
 Existing Dilithium3 keys remain fully valid for legacy compatibility. The `MultiVerifier` dispatches to the correct algorithm at runtime using the embedded `sig_type` tag.
-
-### Hybrid Schemes (Research)
-
-Future versions may support hybrid signature schemes that combine a classical algorithm (e.g., Ed25519) with a post-quantum algorithm (e.g., Dilithium3). This provides security even if one of the two algorithms is broken, offering a migration path for ecosystems transitioning from classical to post-quantum cryptography.
 
 ### Algorithm Agility
 

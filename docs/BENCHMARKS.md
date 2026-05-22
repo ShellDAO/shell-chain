@@ -9,7 +9,7 @@ All benchmarks run on the Criterion framework (`cargo bench -p bench`).
 
 ---
 
-## A3: STARK Signature Aggregation (v0.15.0 baseline)
+## A3: STARK Signature Aggregation (v0.23.x baseline)
 
 > **v0.22.x note:** v0.22.x ships multi-layer (L1/L2/L3) recursive STARK compression. For current per-layer compression numbers, see [`docs/BLOCK_PRUNING_AND_COMPRESSION.md`](BLOCK_PRUNING_AND_COMPRESSION.md).
 
@@ -31,6 +31,23 @@ All benchmarks run on the Criterion framework (`cargo bench -p bench`).
 | 20 | 18.4 KB | 105.4 KB | **5.7×** |
 
 > Peak compression (batch=5) is 7.1×; the sweet spot balances proof size vs verification cost.
+
+### Whitepaper reference proof sizes (Table 5)
+
+| Batch (tx) | STARK proof size | Re-verify speedup (L2StarkMode=Active) |
+|-----------|-----------------|----------------------------------------|
+| n = 25 | ~36 KB | — |
+| n = 50 | ~40 KB | — |
+| n = 100 | ~43 KB | 33× |
+| n ≈ 500 | ~87 KB | 79× |
+
+> Source: Shell-Chain white paper §9 (Winterfell FRI-based, 28 queries, blowup 8,
+> grinding 16 bits, ~100-bit soundness). Re-verify speedup measured vs. naive
+> per-signature verification on 12-core hardware.
+
+The per-block proof sizes above are larger than the batch-size benchmarks in the
+table above because the whitepaper measures a full Merkle-accumulator commitment
+circuit, not a raw signature batch.
 
 ### 6-Hour Soak Results
 

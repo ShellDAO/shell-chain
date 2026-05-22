@@ -10,8 +10,8 @@ The EVM executor intercepts calls to these addresses before running the EVM.
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| `ValidatorRegistry` | `0x0000000000000000000000000000000000000001` | Manages the active validator set |
-| `AccountManager` | `0x0000000000000000000000000000000000000002` | Per-account PQ key rotation and custom validation code |
+| `ValidatorRegistry` | `0x0000000000000000000000000000000000000000000000000000000000000001` | Manages the active validator set |
+| `AccountManager` | `0x0000000000000000000000000000000000000000000000000000000000000002` | Per-account PQ key rotation and custom validation code |
 
 ---
 
@@ -54,6 +54,10 @@ interface IValidatorRegistry {
 
 ### Calling from Solidity
 
+Shell-Chain system contracts live in the native 32-byte address space. When calling
+from Solidity tooling that still models `address` as 20 bytes, use the alloy/EVM shim:
+the last 20 bytes of the native 32-byte address are passed into the contract constant below.
+
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
@@ -64,8 +68,9 @@ interface IValidatorRegistry {
 }
 
 contract ValidatorCheck {
+    // Shell-Chain addresses are 32 bytes; use the last 20 bytes for the alloy/EVM shim
     IValidatorRegistry constant REGISTRY =
-        IValidatorRegistry(0x0000000000000000000000000000000000000001);
+        IValidatorRegistry(0x0000000000000000000000000000000001);
 
     function currentValidators() external view returns (address[] memory) {
         return REGISTRY.getValidators();
@@ -103,6 +108,22 @@ Writes are governed by weighted majority of the current active validator set:
 - `removeValidator` cannot remove the last remaining validator.
 - `setValidatorWeight` updates the in-memory and persisted validator weights used by wPoA proposer selection, finality, and slash-weight accounting.
 - `proposeAlgorithmActivation` / `deprecateAlgorithm` update the runtime algorithm registry; clients can read the live state via `shell_getAlgorithmRegistry`.
+
+### Algorithm Governance Protocol
+
+Algorithm registry changes require a $\lceil 2N/3 \rceil$ weighted validator quorum.
+The quorum must be met using **ML-DSA-65 or SLH-DSA-SHA2-256f** signatures only —
+this dual-algorithm bootstrap safety rule ensures the governance process itself is
+not bound to Dilithium3 even if Dilithium3 is later deprecated.
+
+Each proposal has a unique ID derived as:
+```text
+proposal_id = BLAKE3(algo_id ‖ spec_bytes ‖ activation_height ‖ proposer_pk)
+```
+
+The minimum delay between proposal and activation is **Δ_min = 30 days** (approximately
+1,296,000 blocks at 2 s/block). This prevents rapid algorithm switches that could
+destabilise the network.
 
 ---
 
@@ -166,7 +187,7 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
     "method":"shell_sendTransaction",
     "params":[{
       "from": "0xMYADDRESS",
-      "to":   "0x0000000000000000000000000000000000000002",
+      "to":   "0x0000000000000000000000000000000000000000000000000000000000000002",
       "data": "0x<rotateKey calldata>",
       "gas":  "0x186a0"
     }],
