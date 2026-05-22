@@ -8,8 +8,8 @@ pub struct BlockScore {
     /// Whether this block is on the finalized chain (1 = yes, 0 = no).
     /// Finalized chains always win.
     pub is_finalized: u8,
-    /// Number of attestations this block has received.
-    pub attestation_count: usize,
+    /// Total attesting weight this block has received.
+    pub attested_weight: u64,
     /// Block number (height). Higher = better.
     pub block_number: u64,
     /// Block hash used as deterministic tiebreaker (lower hash bytes = preferred).
@@ -26,7 +26,7 @@ impl Ord for BlockScore {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.is_finalized
             .cmp(&other.is_finalized)
-            .then(self.attestation_count.cmp(&other.attestation_count))
+            .then(self.attested_weight.cmp(&other.attested_weight))
             .then(self.block_number.cmp(&other.block_number))
             // Lower hash wins the deterministic final tiebreaker. Because higher
             // BlockScore is preferred, invert the comparison here.
@@ -38,7 +38,7 @@ impl Ord for BlockScore {
 ///
 /// Maintains a block tree and selects the canonical head based on:
 /// 1. Finalized chain always wins
-/// 2. More attestations = preferred
+/// 2. More attested weight = preferred
 /// 3. Higher block number = preferred
 /// 4. Lower block hash = deterministic tiebreaker
 pub struct ForkChoice {
@@ -57,7 +57,7 @@ impl ForkChoice {
     pub fn new(genesis_hash: ShellHash) -> Self {
         let score = BlockScore {
             is_finalized: 0,
-            attestation_count: 0,
+            attested_weight: 0,
             block_number: 0,
             block_hash: genesis_hash,
         };
@@ -81,12 +81,12 @@ impl ForkChoice {
         block_hash: ShellHash,
         parent_hash: ShellHash,
         block_number: u64,
-        attestation_count: usize,
+        attested_weight: u64,
         is_on_finalized_chain: bool,
     ) -> bool {
         let score = BlockScore {
             is_finalized: if is_on_finalized_chain { 1 } else { 0 },
-            attestation_count,
+            attested_weight,
             block_number,
             block_hash,
         };
@@ -103,10 +103,10 @@ impl ForkChoice {
         }
     }
 
-    /// Update attestation count for a block. Returns true if head changed.
-    pub fn update_attestations(&mut self, block_hash: &ShellHash, new_count: usize) -> bool {
+    /// Update attested weight for a block. Returns true if head changed.
+    pub fn update_attested_weight(&mut self, block_hash: &ShellHash, new_weight: u64) -> bool {
         if let Some(score) = self.scores.get_mut(block_hash) {
-            score.attestation_count = new_count;
+            score.attested_weight = new_weight;
             let updated_score = score.clone();
 
             if block_hash == &self.head {
@@ -295,30 +295,38 @@ mod tests {
     }
 
     #[test]
-    fn test_attestations_win_over_height() {
+    fn test_attested_weight_wins_over_height() {
         let mut fc = ForkChoice::new(hash(0));
         fc.add_block(hash(1), hash(0), 1, 0, false);
-        fc.add_block(hash(2), hash(1), 2, 0, false); // height 2, 0 attestations
-        fc.add_block(hash(3), hash(0), 1, 5, false); // height 1, 5 attestations
+        fc.add_block(hash(2), hash(1), 2, 0, false); // height 2, weight 0
+        fc.add_block(hash(3), hash(0), 1, 5, false); // height 1, weight 5
         assert_eq!(fc.head(), &hash(3));
+    }
+
+    #[test]
+    fn test_heavier_weight_beats_more_attesters() {
+        let mut fc = ForkChoice::new(hash(0));
+        fc.add_block(hash(1), hash(0), 1, 4, false);
+        fc.add_block(hash(2), hash(0), 1, 5, false);
+        assert_eq!(fc.head(), &hash(2));
     }
 
     #[test]
     fn test_finalized_always_wins() {
         let mut fc = ForkChoice::new(hash(0));
-        fc.add_block(hash(1), hash(0), 1, 10, false); // 10 attestations, not finalized
-        fc.add_block(hash(2), hash(0), 1, 1, true); // 1 attestation, finalized
+        fc.add_block(hash(1), hash(0), 1, 10, false); // weight 10, not finalized
+        fc.add_block(hash(2), hash(0), 1, 1, true); // weight 1, finalized
         assert_eq!(fc.head(), &hash(2));
     }
 
     #[test]
-    fn test_update_attestations_changes_head() {
+    fn test_update_attested_weight_changes_head() {
         let mut fc = ForkChoice::new(hash(0));
         fc.add_block(hash(1), hash(0), 1, 0, false);
         fc.add_block(hash(2), hash(0), 1, 0, false);
         // hash(1) < hash(2) as bytes, so hash(1) is head.
         assert_eq!(fc.head(), &hash(1));
-        let changed = fc.update_attestations(&hash(1), 5);
+        let changed = fc.update_attested_weight(&hash(1), 5);
         assert!(!changed);
         assert_eq!(fc.head(), &hash(1));
     }
@@ -392,13 +400,13 @@ mod tests {
     fn test_score_ordering() {
         let s1 = BlockScore {
             is_finalized: 0,
-            attestation_count: 10,
+            attested_weight: 10,
             block_number: 5,
             block_hash: hash(1),
         };
         let s2 = BlockScore {
             is_finalized: 1,
-            attestation_count: 0,
+            attested_weight: 0,
             block_number: 1,
             block_hash: hash(2),
         };
@@ -406,17 +414,17 @@ mod tests {
 
         let s3 = BlockScore {
             is_finalized: 0,
-            attestation_count: 5,
+            attested_weight: 5,
             block_number: 10,
             block_hash: hash(3),
         };
         let s4 = BlockScore {
             is_finalized: 0,
-            attestation_count: 3,
+            attested_weight: 3,
             block_number: 100,
             block_hash: hash(4),
         };
-        assert!(s3 > s4); // more attestations wins over height
+        assert!(s3 > s4); // more attested weight wins over height
     }
 
     #[test]
@@ -427,7 +435,7 @@ mod tests {
 
         // Manually change score
         if let Some(score) = fc.scores.get_mut(&hash(1)) {
-            score.attestation_count = 100;
+            score.attested_weight = 100;
         }
         fc.recalculate_head();
         assert_eq!(fc.head(), &hash(1));
@@ -568,10 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn update_attestations_unknown_block() {
+    fn update_attested_weight_unknown_block() {
         let mut fc = ForkChoice::new(hash(0));
         // Updating an unknown block should be a no-op
-        let changed = fc.update_attestations(&hash(99), 100);
+        let changed = fc.update_attested_weight(&hash(99), 100);
         assert!(!changed);
         assert_eq!(fc.head(), &hash(0));
     }

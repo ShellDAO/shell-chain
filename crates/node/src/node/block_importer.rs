@@ -576,6 +576,11 @@ impl<S: KvStore + 'static> Node<S> {
         prover.record_settled_sources(&stark_settlements);
         self.feed_l2_scheduler_from_settlements(&stark_settlements, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
+
+        // Track the last block proposed by each validator for offline-slash detection.
+        self.last_proposed_by
+            .lock()
+            .insert(block.header.proposer, block.number());
         for (address, pubkey) in new_pubkeys {
             block_store.store_pubkey(&address, &pubkey)?;
         }

@@ -11,6 +11,9 @@ use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
 use revm::context_interface::transaction::{AccessList, AccessListItem as RevmAccessListItem};
 use revm::handler::instructions::EthInstructions;
 use revm::handler::{ExecuteEvm, MainnetContext};
+use revm::interpreter::{
+    instructions::control, interpreter_types::InterpreterTypes, Host, Instruction,
+};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{TxKind, KECCAK_EMPTY};
 use revm::state::EvmState;
@@ -75,6 +78,27 @@ pub struct TxExecutionResult {
 pub struct ShellEvm<S: KvStore + 'static> {
     state_db: ShellStateDb<S>,
     chain_id: u64,
+}
+
+const OPCODE_CALLCODE: u8 = 0xF2;
+const OPCODE_SELFDESTRUCT: u8 = 0xFF;
+
+fn remove_legacy_opcodes<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
+where
+    WIRE: InterpreterTypes,
+    H: Host,
+{
+    // White-paper §4: CALLCODE (0xF2) and SELFDESTRUCT (0xFF) are hard-removed
+    // from the PQVM instruction table. Dispatch them through INVALID (0xFE)
+    // semantics so they halt execution as unsupported legacy opcodes.
+    instructions.insert_instruction(
+        OPCODE_CALLCODE,
+        Instruction::new(control::invalid::<WIRE, H>, 0),
+    );
+    instructions.insert_instruction(
+        OPCODE_SELFDESTRUCT,
+        Instruction::new(control::invalid::<WIRE, H>, 0),
+    );
 }
 
 impl<S: KvStore + 'static> ShellEvm<S> {
@@ -160,8 +184,8 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             .build_fill();
 
         // Build revm BlockEnv
-        // Use Cancun spec: enables EIP-1153 (transient storage), EIP-5656 (MCOPY),
-        // EIP-6780 (SELFDESTRUCT restriction). No actual blob txs on PoA chain.
+        // Use Cancun spec: enables EIP-1153 (transient storage) and EIP-5656
+        // (MCOPY). Legacy Ethereum opcodes removed by PQVM are overridden below.
         let mut block_env = BlockEnv {
             number: U256::from(header.number),
             beneficiary: header.proposer.into(),
@@ -177,9 +201,8 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         // EIP-4844: use header's excess blob gas for blob gas pricing.
         block_env.set_blob_excess_gas_and_price(header.excess_blob_gas, 3_338_477);
 
-        // Build revm context + EVM
-        // Use CANCUN spec — enables transient storage (EIP-1153), MCOPY (EIP-5656),
-        // and SELFDESTRUCT restriction (EIP-6780).
+        // Build revm context + EVM.
+        // Use CANCUN spec for transient storage (EIP-1153) and MCOPY (EIP-5656).
         let ctx: MainnetContext<&mut ShellStateDb<S>> =
             Context::new(&mut self.state_db, SpecId::CANCUN)
                 .modify_block_chained(|b| *b = block_env)
@@ -193,6 +216,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         // Wire PQVM native opcodes (0xB0–0xB2) into the instruction table.
         crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
+        remove_legacy_opcodes(&mut instructions);
         let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
         // Execute
@@ -418,11 +442,9 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                         cfg.disable_balance_check = true;
                     });
             let spec = SpecId::CANCUN;
-            let mut evm = Evm::new(
-                ctx,
-                EthInstructions::new_mainnet_with_spec(spec),
-                ShellPrecompiles::new(spec),
-            );
+            let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+            remove_legacy_opcodes(&mut instructions);
+            let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
             let exec_outcome = evm.transact(tx_env);
             drop(evm);
 
@@ -1712,16 +1734,17 @@ mod tests {
     // ════════════════════════════════════════════════════════════
 
     #[test]
-    fn selfdestruct_transfers_balance() {
+    fn selfdestruct_is_disabled() {
         let mut evm = setup_evm();
         let deployer = ShellAddress::from([0x42; 20]);
         let beneficiary = ShellAddress::from([0xBB; 20]);
         fund_account(&mut evm, &deployer, U256::from(100_000_000_000u64));
+        fund_account(&mut evm, &beneficiary, U256::ZERO);
 
         // Runtime: PUSH20 <beneficiary> SELFDESTRUCT
-        let mut runtime = vec![0x73]; // PUSH20
+        let mut runtime = vec![0x73];
         runtime.extend_from_slice(beneficiary.to_alloy().as_slice());
-        runtime.push(0xFF); // SELFDESTRUCT
+        runtime.push(0xFF);
 
         let init_code = make_init_code(&runtime);
         let deposit = U256::from(1_000_000_000u64);
@@ -1736,20 +1759,27 @@ mod tests {
             1,
             100_000,
         );
-        assert_eq!(result.receipt.status, 1, "selfdestruct tx failed");
+        assert_eq!(result.receipt.status, 0, "SELFDESTRUCT must be disabled");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, 100_000);
 
-        let ben_bal = evm
+        let beneficiary_balance = evm
             .state_db_mut()
             .world_state_mut()
             .get_balance(&beneficiary)
             .unwrap();
-        assert!(ben_bal >= deposit, "beneficiary should receive balance");
+        assert_eq!(beneficiary_balance, U256::ZERO);
+
+        let contract_balance = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_balance(&contract_addr)
+            .unwrap();
+        assert_eq!(contract_balance, deposit);
     }
 
     #[test]
-    fn selfdestruct_to_self_preserves_balance_cancun() {
-        // Cancun (EIP-6780): SELFDESTRUCT in a separate tx from creation
-        // only sends balance; when the beneficiary is self, balance is unchanged.
+    fn selfdestruct_to_self_is_disabled() {
         let mut evm = setup_evm();
         let deployer = ShellAddress::from([0x42; 20]);
         fund_account(&mut evm, &deployer, U256::from(100_000_000_000u64));
@@ -1769,27 +1799,25 @@ mod tests {
             1,
             100_000,
         );
-        assert_eq!(result.receipt.status, 1);
+        assert_eq!(result.receipt.status, 0, "SELFDESTRUCT must be disabled");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, 100_000);
 
         let balance = evm
             .state_db_mut()
             .world_state_mut()
             .get_balance(&contract_addr)
             .unwrap();
-        assert_eq!(
-            balance, deposit,
-            "Cancun: self-destruct to self in separate tx preserves balance"
-        );
+        assert_eq!(balance, deposit);
     }
 
     #[test]
-    fn selfdestruct_post_cancun_code_remains() {
-        // Cancun (EIP-6780): SELFDESTRUCT in a separate tx only
-        // transfers balance; code/storage remain.
+    fn selfdestruct_reverts_state_changes() {
         let mut evm = setup_evm();
         let deployer = ShellAddress::from([0x42; 20]);
         let beneficiary = ShellAddress::from([0xBB; 20]);
         fund_account(&mut evm, &deployer, U256::from(100_000_000_000u64));
+        fund_account(&mut evm, &beneficiary, U256::ZERO);
 
         // Runtime: SSTORE(0, 0x42) then SELFDESTRUCT to beneficiary
         let mut runtime = vec![
@@ -1800,10 +1828,9 @@ mod tests {
         runtime.push(0xFF);
 
         let init_code = make_init_code(&runtime);
-        let (_, contract_addr) =
-            deploy_contract(&mut evm, &deployer, init_code, U256::from(1_000_000u64), 0);
+        let deposit = U256::from(1_000_000u64);
+        let (_, contract_addr) = deploy_contract(&mut evm, &deployer, init_code, deposit, 0);
 
-        // Trigger SELFDESTRUCT in a separate transaction
         let result = call_contract(
             &mut evm,
             &deployer,
@@ -1813,18 +1840,38 @@ mod tests {
             1,
             200_000,
         );
-        assert_eq!(result.receipt.status, 1);
+        assert_eq!(result.receipt.status, 0, "SELFDESTRUCT must be disabled");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, 200_000);
 
-        // Cancun: code hash should still exist
+        let beneficiary_balance = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_balance(&beneficiary)
+            .unwrap();
+        assert_eq!(beneficiary_balance, U256::ZERO);
+
+        let slot = ShellHash::ZERO;
+        let stored = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_storage(&contract_addr, &slot)
+            .unwrap();
+        assert_eq!(stored, ShellHash::ZERO);
+
         let code_hash = evm
             .state_db_mut()
             .world_state_mut()
             .get_code_hash(&contract_addr)
             .unwrap();
-        assert!(
-            code_hash.is_some(),
-            "code should remain post-Cancun SELFDESTRUCT"
-        );
+        assert!(code_hash.is_some());
+
+        let contract_balance = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_balance(&contract_addr)
+            .unwrap();
+        assert_eq!(contract_balance, deposit);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -2480,58 +2527,53 @@ mod tests {
     }
 
     #[test]
-    fn test_selfdestruct_cancun_restriction() {
-        // EIP-6780: In Cancun, SELFDESTRUCT called outside the creation tx
-        // sends balance but does NOT delete the contract code.
+    fn callcode_is_disabled() {
         let mut evm = setup_evm();
         let deployer = ShellAddress::from([0x52; 20]);
-        let beneficiary = ShellAddress::from([0x53; 20]);
         fund_account(&mut evm, &deployer, U256::from(10_000_000_000u64));
-        fund_account(&mut evm, &beneficiary, U256::ZERO);
 
-        // Runtime: PUSH20 <beneficiary>, SELFDESTRUCT
-        let mut runtime = vec![0x73]; // PUSH20
-        runtime.extend_from_slice(beneficiary.to_alloy().as_slice());
-        runtime.push(0xFF); // SELFDESTRUCT
-
-        // Deploy contract with 1 ETH value
-        let deploy_value = U256::from(1_000_000_000u64);
-        let (_, addr) = deploy_contract(
+        // Callee: returns 0xFF in a 32-byte word.
+        let callee_rt = vec![0x60, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3];
+        let (_, callee_addr) = deploy_contract(
             &mut evm,
             &deployer,
-            make_init_code(&runtime),
-            deploy_value,
+            make_init_code(&callee_rt),
+            U256::ZERO,
             0,
         );
 
-        // Verify the contract has code and balance after deployment
-        let account_before = evm
-            .state_db()
-            .world_state()
-            .get_account(&addr)
-            .unwrap()
-            .unwrap();
-        assert!(
-            account_before.code_hash.is_some(),
-            "contract should have code"
+        // Caller: CALLCODE(gas, callee, 0, 0, 0, 0, 32) then return the buffer.
+        let mut caller_rt = vec![
+            0x60, 0x20, 0x60, 0x00, // retSize=32, retOffset=0
+            0x60, 0x00, 0x60, 0x00, // argsSize=0, argsOffset=0
+            0x60, 0x00, // value=0
+            0x73,
+        ];
+        caller_rt.extend_from_slice(callee_addr.to_alloy().as_slice());
+        caller_rt.extend_from_slice(&[
+            0x5A, 0xF2, 0x50, // GAS, CALLCODE, POP
+            0x60, 0x20, 0x60, 0x00, 0xF3, // RETURN 32 bytes
+        ]);
+        let (_, caller_addr) = deploy_contract(
+            &mut evm,
+            &deployer,
+            make_init_code(&caller_rt),
+            U256::ZERO,
+            1,
         );
-        assert_eq!(account_before.balance, deploy_value);
 
-        // Call SELFDESTRUCT from a separate transaction (not the creation tx)
-        let result = call_contract(&mut evm, &deployer, &addr, vec![], U256::ZERO, 1, 500_000);
-        assert_eq!(result.receipt.status, 1, "SELFDESTRUCT call should succeed");
-
-        // Cancun behavior: code should still exist (not deleted)
-        let account_after = evm
-            .state_db()
-            .world_state()
-            .get_account(&addr)
-            .unwrap()
-            .unwrap();
-        assert!(
-            account_after.code_hash.is_some(),
-            "Cancun: contract code must NOT be deleted by SELFDESTRUCT in separate tx"
+        let result = call_contract(
+            &mut evm,
+            &deployer,
+            &caller_addr,
+            vec![],
+            U256::ZERO,
+            2,
+            500_000,
         );
+        assert_eq!(result.receipt.status, 0, "CALLCODE must be disabled");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, 500_000);
     }
 
     // ════════════════════════════════════════════════════════════

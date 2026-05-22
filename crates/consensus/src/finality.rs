@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use shell_crypto::{BatchVerifier, CryptoError, PQSignature, SignatureType, VerifyItem};
+use shell_crypto::{
+    infer_signature_type_from_address, is_algorithm_allowed, BatchVerifier, CryptoError,
+    PQSignature, VerifyItem,
+};
 use shell_primitives::{Address, ShellHash};
 use std::collections::{HashMap, HashSet};
 
@@ -10,7 +13,7 @@ const MAX_PENDING_ATTESTATION_BLOCKS: usize = 512;
 
 /// An attestation is a validator's signed confirmation that they accept a block.
 /// Validators broadcast attestations after importing a valid block.
-/// When a BFT quorum (ceil(2N/3)) of validators attest to a block, it becomes finalized.
+/// When attesting weight exceeds 2/3 of total validator weight, the block becomes finalized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
     /// Hash of the attested block.
@@ -57,6 +60,8 @@ pub struct FinalityState {
     last_finalized_hash: ShellHash,
     /// Pending attestations per block hash: maps block_hash -> set of validator addresses.
     pending_attestations: HashMap<ShellHash, HashSet<Address>>,
+    /// Aggregate attesting weight per block hash.
+    pending_attested_weight: HashMap<ShellHash, u64>,
     /// Full attestation objects stored per block hash for verification.
     attestation_store: HashMap<ShellHash, Vec<Attestation>>,
 }
@@ -68,6 +73,7 @@ impl FinalityState {
             last_finalized_number: 0,
             last_finalized_hash: ShellHash::ZERO,
             pending_attestations: HashMap::new(),
+            pending_attested_weight: HashMap::new(),
             attestation_store: HashMap::new(),
         }
     }
@@ -78,14 +84,20 @@ impl FinalityState {
             last_finalized_number: number,
             last_finalized_hash: hash,
             pending_attestations: HashMap::new(),
+            pending_attested_weight: HashMap::new(),
             attestation_store: HashMap::new(),
         }
     }
 
-    /// Record an attestation. Returns true if this is a new (non-duplicate) attestation.
+    /// Record an attestation with the attester's canonical validator weight.
+    /// Returns true if this is a new (non-duplicate) attestation.
     /// Returns false for duplicates and when the pending attestation block-set is at capacity
     /// (to prevent memory exhaustion from attestation flood attacks).
-    pub fn record_attestation(&mut self, attestation: Attestation) -> bool {
+    pub fn record_attestation_weighted(
+        &mut self,
+        attestation: Attestation,
+        attester_weight: u64,
+    ) -> bool {
         // Reject attestations for unknown blocks when at capacity.
         if !self
             .pending_attestations
@@ -94,36 +106,41 @@ impl FinalityState {
         {
             return false;
         }
-        let validators = self
-            .pending_attestations
-            .entry(attestation.block_hash)
-            .or_default();
+        let block_hash = attestation.block_hash;
+        let validators = self.pending_attestations.entry(block_hash).or_default();
         let is_new = validators.insert(attestation.validator);
         if is_new {
+            let normalized_weight = attester_weight.max(1);
+            self.pending_attested_weight
+                .entry(block_hash)
+                .and_modify(|weight| *weight = weight.saturating_add(normalized_weight))
+                .or_insert(normalized_weight);
             self.attestation_store
-                .entry(attestation.block_hash)
+                .entry(block_hash)
                 .or_default()
                 .push(attestation);
         }
         is_new
     }
 
-    /// Check if a block has reached finality given the total validator count.
-    /// BFT quorum = ceil(2N/3) to tolerate up to f Byzantine validators.
-    pub fn check_finality(
+    /// Record an attestation using the default unit weight.
+    pub fn record_attestation(&mut self, attestation: Attestation) -> bool {
+        self.record_attestation_weighted(attestation, 1)
+    }
+
+    /// Check if a block has reached weighted finality.
+    /// White-paper quorum requires attesting weight to be strictly greater than 2/3.
+    pub fn check_finality_weighted(
         &mut self,
         block_hash: &ShellHash,
         block_number: u64,
-        total_validators: usize,
+        total_weight: u64,
     ) -> bool {
-        let quorum = Self::quorum_threshold(total_validators);
-        let count = self
-            .pending_attestations
-            .get(block_hash)
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let attested_weight = self.attested_weight(block_hash);
 
-        if count >= quorum && block_number > self.last_finalized_number {
+        if Self::has_weighted_quorum(attested_weight, total_weight)
+            && block_number > self.last_finalized_number
+        {
             self.last_finalized_number = block_number;
             self.last_finalized_hash = *block_hash;
             // Prune attestations for blocks at or below the newly finalized block
@@ -132,6 +149,14 @@ impl FinalityState {
         } else {
             false
         }
+    }
+
+    /// Return true when attesting weight is strictly greater than 2/3 of total weight.
+    pub fn has_weighted_quorum(attested_weight: u64, total_weight: u64) -> bool {
+        if total_weight == 0 {
+            return false;
+        }
+        (attested_weight as u128).saturating_mul(3) > (total_weight as u128).saturating_mul(2)
     }
 
     /// Calculate the quorum threshold for BFT consensus: ceil(2N/3).
@@ -157,7 +182,15 @@ impl FinalityState {
         &self.last_finalized_hash
     }
 
-    /// Number of attestations for a specific block.
+    /// Total attesting weight recorded for a specific block.
+    pub fn attested_weight(&self, block_hash: &ShellHash) -> u64 {
+        self.pending_attested_weight
+            .get(block_hash)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Number of distinct attestations for a specific block.
     pub fn attestation_count(&self, block_hash: &ShellHash) -> usize {
         self.pending_attestations
             .get(block_hash)
@@ -229,8 +262,18 @@ impl FinalityState {
 
         let sigs: Vec<PQSignature> = attestations
             .iter()
-            .map(|att| PQSignature::new(SignatureType::Dilithium3, att.signature.clone()))
-            .collect();
+            .map(|att| {
+                let pubkey = authorities
+                    .get(&att.validator)
+                    .ok_or(CryptoError::VerificationFailed)?;
+                let sig_type = infer_signature_type_from_address(pubkey, &att.validator)
+                    .ok_or(CryptoError::VerificationFailed)?;
+                if !is_algorithm_allowed(sig_type) {
+                    return Err(CryptoError::UnsupportedSignatureType(sig_type));
+                }
+                Ok(PQSignature::new(sig_type, att.signature.clone()))
+            })
+            .collect::<Result<_, _>>()?;
 
         let mut items = Vec::with_capacity(attestations.len());
         for (i, att) in attestations.iter().enumerate() {
@@ -282,6 +325,7 @@ impl FinalityState {
 
         for hash in hashes_to_remove {
             self.pending_attestations.remove(&hash);
+            self.pending_attested_weight.remove(&hash);
             self.attestation_store.remove(&hash);
         }
     }
@@ -307,6 +351,13 @@ mod tests {
         let mut bytes = [0u8; 20];
         bytes[0] = n;
         Address::from(bytes)
+    }
+
+    fn strict_quorum_weight(total_weight: u64) -> u64 {
+        if total_weight == 0 {
+            return 0;
+        }
+        total_weight.saturating_mul(2) / 3 + 1
     }
 
     #[test]
@@ -361,7 +412,7 @@ mod tests {
 
         // 1 of 3 validators
         state.record_attestation(Attestation::new(hash, 10, make_addr(1), vec![]));
-        assert!(!state.check_finality(&hash, 10, 3));
+        assert!(!state.check_finality_weighted(&hash, 10, 3));
         assert_eq!(state.last_finalized_number(), 0);
     }
 
@@ -370,11 +421,45 @@ mod tests {
         let mut state = FinalityState::new();
         let hash = make_hash(1);
 
-        // 2 of 3 validators → quorum = 2
+        // 3 of 3 validators is the minimum strict supermajority for uniform weights.
         state.record_attestation(Attestation::new(hash, 10, make_addr(1), vec![]));
         state.record_attestation(Attestation::new(hash, 10, make_addr(2), vec![]));
-        assert!(state.check_finality(&hash, 10, 3));
+        state.record_attestation(Attestation::new(hash, 10, make_addr(3), vec![]));
+        assert!(state.check_finality_weighted(&hash, 10, 3));
         assert_eq!(state.last_finalized_number(), 10);
+        assert_eq!(state.last_finalized_hash(), &hash);
+    }
+
+    #[test]
+    fn weighted_quorum_rejects_exact_two_thirds() {
+        let mut state = FinalityState::new();
+        let hash = make_hash(9);
+
+        state.record_attestation_weighted(Attestation::new(hash, 10, make_addr(1), vec![]), 2);
+        state.record_attestation_weighted(Attestation::new(hash, 10, make_addr(2), vec![]), 2);
+        assert_eq!(state.attested_weight(&hash), 4);
+        assert!(!state.check_finality_weighted(&hash, 10, 6));
+    }
+
+    #[test]
+    fn weighted_quorum_accepts_heavy_supermajority() {
+        let mut state = FinalityState::new();
+        let hash = make_hash(10);
+
+        state.record_attestation_weighted(Attestation::new(hash, 10, make_addr(1), vec![]), 4);
+        state.record_attestation_weighted(Attestation::new(hash, 10, make_addr(2), vec![]), 1);
+        assert_eq!(state.attestation_count(&hash), 2);
+        assert_eq!(state.attested_weight(&hash), 5);
+        assert!(state.check_finality_weighted(&hash, 10, 6));
+    }
+
+    #[test]
+    fn single_validator_weighted_finalizes() {
+        let mut state = FinalityState::new();
+        let hash = make_hash(11);
+
+        state.record_attestation_weighted(Attestation::new(hash, 1, make_addr(1), vec![]), 1);
+        assert!(state.check_finality_weighted(&hash, 1, 1));
         assert_eq!(state.last_finalized_hash(), &hash);
     }
 
@@ -383,10 +468,11 @@ mod tests {
         let mut state = FinalityState::with_finalized(20, make_hash(2));
         let hash = make_hash(1);
 
-        // Even with quorum, block 10 < finalized 20 → no update
+        // Even with weighted quorum, block 10 < finalized 20 → no update
         state.record_attestation(Attestation::new(hash, 10, make_addr(1), vec![]));
         state.record_attestation(Attestation::new(hash, 10, make_addr(2), vec![]));
-        assert!(!state.check_finality(&hash, 10, 3));
+        state.record_attestation(Attestation::new(hash, 10, make_addr(3), vec![]));
+        assert!(!state.check_finality_weighted(&hash, 10, 3));
         assert_eq!(state.last_finalized_number(), 20);
     }
 
@@ -440,10 +526,12 @@ mod tests {
 
         // Finalize at block 15 → prune block 5 attestations
         state.record_attestation(Attestation::new(hash2, 15, make_addr(2), vec![]));
-        assert!(state.check_finality(&hash2, 15, 3));
+        state.record_attestation(Attestation::new(hash2, 15, make_addr(3), vec![]));
+        assert!(state.check_finality_weighted(&hash2, 15, 3));
 
         assert_eq!(state.attestation_count(&hash1), 0); // pruned
-                                                        // hash2 also pruned since it's <= finalized (15)
+        assert_eq!(state.attested_weight(&hash1), 0);
+        // hash2 also pruned since it's <= finalized (15)
     }
 
     #[test]
@@ -455,10 +543,10 @@ mod tests {
         for i in 0..4 {
             state.record_attestation(Attestation::new(hash, 10, make_addr(i), vec![]));
         }
-        assert!(!state.check_finality(&hash, 10, 7)); // 4 < 5
+        assert!(!state.check_finality_weighted(&hash, 10, 7)); // 4 < 5
 
         state.record_attestation(Attestation::new(hash, 10, make_addr(4), vec![]));
-        assert!(state.check_finality(&hash, 10, 7)); // 5 >= 5
+        assert!(state.check_finality_weighted(&hash, 10, 7)); // 5 >= 5
     }
 
     #[test]
@@ -472,32 +560,29 @@ mod tests {
 
     #[test]
     fn quorum_exactly_at_threshold() {
-        // Verify quorum detection at exact threshold for various validator counts
-        for total in [3, 4, 5, 6, 7, 10, 13, 20] {
-            let quorum = FinalityState::quorum_threshold(total);
+        // Verify strict >2/3 quorum detection for various uniform validator sets.
+        for total in [3u64, 4, 5, 6, 7, 10, 13, 20] {
+            let quorum = strict_quorum_weight(total);
             let hash = make_hash(total as u8);
             let mut state = FinalityState::new();
 
-            // Add exactly quorum - 1 attestations → should NOT finalize
-            for i in 0..quorum - 1 {
+            // Add one weight less than quorum → should NOT finalize.
+            for i in 0..(quorum - 1) {
                 state.record_attestation(Attestation::new(hash, 100, make_addr(i as u8), vec![]));
             }
             assert!(
-                !state.check_finality(&hash, 100, total),
-                "N={total}: {0} attestations (quorum={quorum}) should NOT finalize",
+                !state.check_finality_weighted(&hash, 100, total),
+                "W={total}: weight {} should NOT finalize",
                 quorum - 1
             );
 
-            // Add one more → exactly at quorum → should finalize
-            state.record_attestation(Attestation::new(hash, 100, make_addr(quorum as u8), vec![]));
-            // Reset finalized state so block 100 > 0 finalized
             let mut state2 = FinalityState::new();
             for i in 0..quorum {
                 state2.record_attestation(Attestation::new(hash, 100, make_addr(i as u8), vec![]));
             }
             assert!(
-                state2.check_finality(&hash, 100, total),
-                "N={total}: {quorum} attestations should finalize"
+                state2.check_finality_weighted(&hash, 100, total),
+                "W={total}: weight {quorum} should finalize"
             );
         }
     }
@@ -511,7 +596,7 @@ mod tests {
         for i in 0..5 {
             state.record_attestation(Attestation::new(hash, 50, make_addr(i), vec![]));
         }
-        assert!(!state.check_finality(&hash, 50, 10));
+        assert!(!state.check_finality_weighted(&hash, 50, 10));
         assert_eq!(
             state.last_finalized_number(),
             0,
@@ -528,7 +613,7 @@ mod tests {
         for i in 0..3 {
             state.record_attestation(Attestation::new(hash10, 10, make_addr(i), vec![]));
         }
-        assert!(state.check_finality(&hash10, 10, 4)); // quorum = 3 for N=4
+        assert!(state.check_finality_weighted(&hash10, 10, 4)); // quorum = 3 for N=4
         assert_eq!(state.last_finalized_number(), 10);
 
         // Round 2: finalize block 20
@@ -536,7 +621,7 @@ mod tests {
         for i in 0..3 {
             state.record_attestation(Attestation::new(hash20, 20, make_addr(100 + i), vec![]));
         }
-        assert!(state.check_finality(&hash20, 20, 4));
+        assert!(state.check_finality_weighted(&hash20, 20, 4));
         assert_eq!(state.last_finalized_number(), 20);
         assert_eq!(state.last_finalized_hash(), &hash20);
 
@@ -545,7 +630,7 @@ mod tests {
         for i in 0..3 {
             state.record_attestation(Attestation::new(hash30, 30, make_addr(200 + i), vec![]));
         }
-        assert!(state.check_finality(&hash30, 30, 4));
+        assert!(state.check_finality_weighted(&hash30, 30, 4));
         assert_eq!(state.last_finalized_number(), 30);
     }
 
@@ -553,8 +638,8 @@ mod tests {
     fn large_validator_set_quorum() {
         let mut state = FinalityState::new();
         let hash = make_hash(1);
-        let total: usize = 100;
-        let quorum = FinalityState::quorum_threshold(total); // ceil(200/3) = 67
+        let total: u64 = 100;
+        let quorum = strict_quorum_weight(total);
 
         assert_eq!(quorum, 67);
 
@@ -562,11 +647,11 @@ mod tests {
         for i in 0..66u8 {
             state.record_attestation(Attestation::new(hash, 500, make_addr(i), vec![]));
         }
-        assert!(!state.check_finality(&hash, 500, total));
+        assert!(!state.check_finality_weighted(&hash, 500, total));
 
         // Add 1 more → exactly 67 → quorum
         state.record_attestation(Attestation::new(hash, 500, make_addr(66), vec![]));
-        assert!(state.check_finality(&hash, 500, total));
+        assert!(state.check_finality_weighted(&hash, 500, total));
         assert_eq!(state.last_finalized_number(), 500);
     }
 
@@ -579,7 +664,7 @@ mod tests {
         for i in 0..3 {
             state.record_attestation(Attestation::new(hash20, 20, make_addr(i), vec![]));
         }
-        assert!(state.check_finality(&hash20, 20, 4));
+        assert!(state.check_finality_weighted(&hash20, 20, 4));
         assert_eq!(state.last_finalized_number(), 20);
 
         // Try to finalize block 15 (lower) — should fail
@@ -587,7 +672,7 @@ mod tests {
         for i in 10..13 {
             state.record_attestation(Attestation::new(hash15, 15, make_addr(i), vec![]));
         }
-        assert!(!state.check_finality(&hash15, 15, 4));
+        assert!(!state.check_finality_weighted(&hash15, 15, 4));
         assert_eq!(
             state.last_finalized_number(),
             20,
@@ -599,7 +684,7 @@ mod tests {
         for i in 20..23 {
             state.record_attestation(Attestation::new(hash25, 25, make_addr(i), vec![]));
         }
-        assert!(state.check_finality(&hash25, 25, 4));
+        assert!(state.check_finality_weighted(&hash25, 25, 4));
         assert_eq!(state.last_finalized_number(), 25);
     }
 
@@ -615,11 +700,12 @@ mod tests {
         // Attestation at height 10
         state.record_attestation(Attestation::new(hash_high, 10, make_addr(2), vec![]));
         state.record_attestation(Attestation::new(hash_high, 10, make_addr(3), vec![]));
+        state.record_attestation(Attestation::new(hash_high, 10, make_addr(4), vec![]));
         // Attestation at height 20
-        state.record_attestation(Attestation::new(hash_future, 20, make_addr(4), vec![]));
+        state.record_attestation(Attestation::new(hash_future, 20, make_addr(5), vec![]));
 
         // Finalize at height 10 → prune heights <= 10
-        assert!(state.check_finality(&hash_high, 10, 3));
+        assert!(state.check_finality_weighted(&hash_high, 10, 3));
 
         // Height 5 should be pruned
         assert_eq!(state.attestation_count(&hash_low), 0);
@@ -679,17 +765,17 @@ mod tests {
         let hash_a = make_hash(1);
         let hash_b = make_hash(2);
 
-        // Different validators attest to different blocks at height 10
-        state.record_attestation(Attestation::new(hash_a, 10, make_addr(1), vec![]));
-        state.record_attestation(Attestation::new(hash_a, 10, make_addr(2), vec![]));
-        state.record_attestation(Attestation::new(hash_b, 10, make_addr(3), vec![]));
+        // Different validators attest to different blocks at height 10.
+        state.record_attestation_weighted(Attestation::new(hash_a, 10, make_addr(1), vec![]), 4);
+        state.record_attestation_weighted(Attestation::new(hash_a, 10, make_addr(2), vec![]), 1);
+        state.record_attestation_weighted(Attestation::new(hash_b, 10, make_addr(3), vec![]), 1);
 
-        // hash_a has 2 attestations, hash_b has 1
         assert_eq!(state.attestation_count(&hash_a), 2);
-        assert_eq!(state.attestation_count(&hash_b), 1);
+        assert_eq!(state.attested_weight(&hash_a), 5);
+        assert_eq!(state.attested_weight(&hash_b), 1);
 
-        // With 3 total validators, quorum = 2: hash_a should finalize
-        assert!(state.check_finality(&hash_a, 10, 3));
+        // Total validator weight is 6, so hash_a's weight 5 crosses the strict quorum.
+        assert!(state.check_finality_weighted(&hash_a, 10, 6));
         assert_eq!(state.last_finalized_hash(), &hash_a);
     }
 
@@ -700,17 +786,17 @@ mod tests {
 
         // 1 of 10 validators
         state.record_attestation(Attestation::new(hash, 10, make_addr(1), vec![]));
-        assert!(!state.check_finality(&hash, 10, 10)); // BFT quorum = 7
+        assert!(!state.check_finality_weighted(&hash, 10, 10)); // BFT quorum = 7
 
         // 6 of 10 validators
         for i in 2..=6 {
             state.record_attestation(Attestation::new(hash, 10, make_addr(i), vec![]));
         }
-        assert!(!state.check_finality(&hash, 10, 10)); // still only 6 < 7
+        assert!(!state.check_finality_weighted(&hash, 10, 10)); // still only 6 < 7
 
         // 7 of 10 validators → exactly quorum
         state.record_attestation(Attestation::new(hash, 10, make_addr(7), vec![]));
-        assert!(state.check_finality(&hash, 10, 10));
+        assert!(state.check_finality_weighted(&hash, 10, 10));
     }
 
     #[test]
@@ -742,6 +828,7 @@ mod tests {
         let mut state = FinalityState::new();
         assert!(state.record_attestation(attestation));
         assert_eq!(state.attestation_count(&block_hash), 1);
+        assert_eq!(state.attested_weight(&block_hash), 1);
 
         // Verify the stored attestation signature is valid.
         let stored = state.get_attestations(&block_hash).unwrap();

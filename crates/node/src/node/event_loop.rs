@@ -512,7 +512,36 @@ impl<S: KvStore + 'static> Node<S> {
                                     };
                                     match validators {
                                         Ok(v) if !v.is_empty() => {
-                                            self.consensus.write().set_authorities(v);
+                                            self.consensus.write().set_authorities(v.clone());
+
+                                            // §5.4 offline-slash enforcement: at each epoch
+                                            // boundary, detect validators that haven't proposed
+                                            // for `offline_window_blocks` and slash them.
+                                            let slash_config = SlashingConfig::default();
+                                            let last_by = self.last_proposed_by.lock().clone();
+                                            for addr in &v {
+                                                let last = last_by
+                                                    .get(addr)
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                if let Some(record) = detect_offline(
+                                                    addr,
+                                                    last,
+                                                    number,
+                                                    &slash_config,
+                                                ) {
+                                                    warn!(
+                                                        validator = %record.validator,
+                                                        last_block = last,
+                                                        current_block = number,
+                                                        "offline-slash: validator has not proposed \
+                                                         since block #{last}; slashing"
+                                                    );
+                                                    self.consensus
+                                                        .write()
+                                                        .slash_authority(&record.validator);
+                                                }
+                                            }
                                         }
                                         Ok(_) => {
                                             // Empty validator set in world state — keep current authorities.

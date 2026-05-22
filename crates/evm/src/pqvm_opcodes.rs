@@ -15,7 +15,9 @@
 //! ```
 //!
 //! `algo_id` values:
-//! - `0x01` — ML-DSA-65 (Dilithium3): `[4-byte pk_len][pk][4-byte msg_len][msg][sig]`
+//! - `0x01` — ML-DSA family: `[1-byte sig_type][4-byte pk_len][pk][4-byte msg_len][msg][sig]`
+//!            where `sig_type=0x01` selects ML-DSA-65 and `sig_type=0x00` keeps
+//!            legacy Dilithium3 compatibility on the same wire shape
 //! - `0x02` — SLH-DSA-SHA2-256f:      `[pk (64 B)][sig (49 856 B)][msg]`
 //!
 //! ## Gas costs
@@ -32,7 +34,7 @@ use revm::interpreter::{
     interpreter_types::{InterpreterTypes, MemoryTr, StackTr},
     Host, Instruction, InstructionContext, InstructionResult,
 };
-use shell_crypto::{DilithiumVerifier, PQSignature, SignatureType, SphincsVerifier, Verifier};
+use shell_crypto::{verify_signature, SignatureType};
 
 use crate::precompiles::{
     BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDR_DERIVE_GAS, PQ_MLDSA65_VERIFY_GAS,
@@ -294,9 +296,19 @@ where
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// ML-DSA-65 signature verification.
-/// Wire format: `[4-byte pk_len][pk][4-byte msg_len][msg][sig]`
+/// ML-DSA-family signature verification.
+/// Wire format: `[1-byte sig_type][4-byte pk_len][pk][4-byte msg_len][msg][sig]`
 fn verify_mldsa65(payload: &[u8]) -> bool {
+    let Some((&sig_type_id, payload)) = payload.split_first() else {
+        return false;
+    };
+    let Some(sig_type) = SignatureType::from_u8(sig_type_id) else {
+        return false;
+    };
+    if !matches!(sig_type, SignatureType::MlDsa65 | SignatureType::Dilithium3) {
+        return false;
+    }
+
     if payload.len() < 8 {
         return false;
     }
@@ -312,10 +324,7 @@ fn verify_mldsa65(payload: &[u8]) -> bool {
     }
     let message = &payload[4 + pk_len + 4..4 + pk_len + 4 + msg_len];
     let sig_bytes = &payload[4 + pk_len + 4 + msg_len..];
-    let signature = PQSignature::new(SignatureType::Dilithium3, sig_bytes.to_vec());
-    DilithiumVerifier
-        .verify(public_key, message, &signature)
-        .unwrap_or(false)
+    verify_signature(sig_type, public_key, message, sig_bytes).unwrap_or(false)
 }
 
 /// SLH-DSA-SHA2-256f signature verification.
@@ -329,10 +338,13 @@ fn verify_slhdsa(payload: &[u8]) -> bool {
     let public_key = &payload[..PK_LEN];
     let sig_bytes = &payload[PK_LEN..PK_LEN + SIG_LEN];
     let message = &payload[PK_LEN + SIG_LEN..];
-    let signature = PQSignature::new(SignatureType::SphincsSha2256f, sig_bytes.to_vec());
-    SphincsVerifier
-        .verify(public_key, message, &signature)
-        .unwrap_or(false)
+    verify_signature(
+        SignatureType::SphincsSha2256f,
+        public_key,
+        message,
+        sig_bytes,
+    )
+    .unwrap_or(false)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -388,14 +400,14 @@ mod tests {
     }
 
     #[test]
-    fn verify_mldsa65_helper_accepts_valid_sig() {
-        use shell_crypto::{DilithiumSigner, Signer};
+    fn verify_mldsa65_helper_accepts_legacy_dilithium_sig() {
+        use shell_crypto::{DilithiumSigner, SignatureType, Signer};
         let signer = DilithiumSigner::generate();
         let message = b"pqvm opcode verify test";
         let sig = signer.sign(message).unwrap();
         let pubkey = signer.public_key();
 
-        let mut payload = Vec::new();
+        let mut payload = vec![SignatureType::Dilithium3.as_u8()];
         payload.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
         payload.extend_from_slice(pubkey);
         payload.extend_from_slice(&(message.len() as u32).to_be_bytes());
@@ -407,7 +419,7 @@ mod tests {
 
     #[test]
     fn verify_mldsa65_helper_rejects_bad_sig() {
-        use shell_crypto::{DilithiumSigner, Signer};
+        use shell_crypto::{DilithiumSigner, SignatureType, Signer};
         let signer = DilithiumSigner::generate();
         let message = b"legitimate message";
         let sig = signer.sign(message).unwrap();
@@ -417,7 +429,7 @@ mod tests {
         let mut bad_sig = sig.data.clone();
         *bad_sig.last_mut().unwrap() ^= 0xFF;
 
-        let mut payload = Vec::new();
+        let mut payload = vec![SignatureType::Dilithium3.as_u8()];
         payload.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
         payload.extend_from_slice(pubkey);
         payload.extend_from_slice(&(message.len() as u32).to_be_bytes());

@@ -66,6 +66,9 @@ pub fn is_system_contract(address: &Address) -> bool {
 pub const ADD_VALIDATOR_SELECTOR: [u8; 4] = compute_selector(b"addValidator(address)");
 /// keccak256("removeValidator(address)")[..4]
 pub const REMOVE_VALIDATOR_SELECTOR: [u8; 4] = compute_selector(b"removeValidator(address)");
+/// keccak256("setValidatorWeight(address,uint64)")[..4]
+pub const SET_VALIDATOR_WEIGHT_SELECTOR: [u8; 4] =
+    compute_selector(b"setValidatorWeight(address,uint64)");
 /// keccak256("getValidators()")[..4]
 pub const GET_VALIDATORS_SELECTOR: [u8; 4] = compute_selector(b"getValidators()");
 /// keccak256("isValidator(address)")[..4]
@@ -204,7 +207,9 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
             execute_validator_registry(caller, input, world_state, Some(chain_store))?;
         let mut effects = SystemContractEffects::default();
         let selector = decode_selector(input)?;
-        if (selector == ADD_VALIDATOR_SELECTOR || selector == REMOVE_VALIDATOR_SELECTOR)
+        if (selector == ADD_VALIDATOR_SELECTOR
+            || selector == REMOVE_VALIDATOR_SELECTOR
+            || selector == SET_VALIDATOR_WEIGHT_SELECTOR)
             && output == encode_bool(true)
         {
             effects.validator_set_changed = true;
@@ -246,6 +251,12 @@ fn execute_validator_registry<S: KvStore + 'static>(
         s if s == REMOVE_VALIDATOR_SELECTOR => {
             let addr = decode_address(params)?;
             let applied = remove_validator(caller, &addr, world_state)?;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
+            Ok((encode_bool(applied), gas))
+        }
+        s if s == SET_VALIDATOR_WEIGHT_SELECTOR => {
+            let (addr, weight) = decode_address_u64(params)?;
+            let applied = set_validator_weight_op(caller, &addr, weight, world_state)?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
         }
@@ -441,10 +452,61 @@ fn remove_validator<S: KvStore + 'static>(
     Ok(true)
 }
 
+/// Governance-driven validator weight update (white paper §5.3 — F-039/F-040).
+///
+/// Requires a weighted quorum (> 2/3 of total voting weight) to take effect.
+/// Weight changes are logged but not stored back to the permanent validator list;
+/// they are applied immediately to `world_state` via `set_validator_weight`.
+fn set_validator_weight_op<S: KvStore + 'static>(
+    caller: &Address,
+    target: &Address,
+    new_weight: u64,
+    world_state: &mut WorldState<S>,
+) -> Result<bool, SystemContractError> {
+    let validators = world_state
+        .get_validators()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+
+    // Authorization: caller must be an existing validator.
+    if !validators.contains(caller) {
+        return Err(SystemContractError::Unauthorized);
+    }
+
+    // Target must be an existing validator; you cannot pre-assign weight.
+    if !validators.contains(target) {
+        return Err(SystemContractError::NotFound(*target));
+    }
+
+    // Reject zero-weight — would silently de-activate a validator.
+    if new_weight == 0 {
+        return Err(SystemContractError::AbiDecode(
+            "validator weight must be at least 1".into(),
+        ));
+    }
+
+    // Record vote; proceed only when weighted majority is reached.
+    if !record_validator_vote(
+        world_state,
+        ValidatorRegistryOp::SetWeight(new_weight),
+        target,
+        caller,
+        &validators,
+    )? {
+        return Ok(false);
+    }
+
+    world_state
+        .set_validator_weight(target, new_weight)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ValidatorRegistryOp {
     Add,
     Remove,
+    SetWeight(u64),
 }
 
 impl ValidatorRegistryOp {
@@ -452,6 +514,7 @@ impl ValidatorRegistryOp {
         match self {
             Self::Add => b"add",
             Self::Remove => b"remove",
+            Self::SetWeight(_) => b"set_weight",
         }
     }
 }
@@ -1168,6 +1231,41 @@ pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
     word.copy_from_slice(address.as_bytes());
     data.extend_from_slice(&word);
     data
+}
+
+/// Encode calldata for `setValidatorWeight(address,uint64)`.
+///
+/// ABI layout: selector (4) + address (32) + uint64 (32, big-endian right-aligned).
+pub fn encode_set_validator_weight_calldata(address: &Address, weight: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4usize.saturating_add(64));
+    data.extend_from_slice(&SET_VALIDATOR_WEIGHT_SELECTOR);
+    let mut addr_word = [0u8; 32];
+    addr_word.copy_from_slice(address.as_bytes());
+    data.extend_from_slice(&addr_word);
+    let mut weight_word = [0u8; 32];
+    weight_word[24..32].copy_from_slice(&weight.to_be_bytes());
+    data.extend_from_slice(&weight_word);
+    data
+}
+
+/// Decode `(address, uint64)` from ABI-encoded params (2 × 32-byte words).
+pub fn decode_address_u64(input: &[u8]) -> Result<(Address, u64), SystemContractError> {
+    if input.len() < 64 {
+        return Err(SystemContractError::AbiDecode(format!(
+            "expected 64 bytes for (address, uint64), got {}",
+            input.len()
+        )));
+    }
+    let raw32: [u8; 32] = input[0..32]
+        .try_into()
+        .map_err(|_| SystemContractError::AbiDecode("bad address word".into()))?;
+    let addr = Address::from(raw32);
+    let weight = u64::from_be_bytes(
+        input[56..64]
+            .try_into()
+            .map_err(|_| SystemContractError::AbiDecode("bad uint64 word".into()))?,
+    );
+    Ok((addr, weight))
 }
 
 /// Encode calldata for `setGuardians(address[],uint8,uint64)`.

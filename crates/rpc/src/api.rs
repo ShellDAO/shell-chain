@@ -411,6 +411,17 @@ pub trait ShellApi {
         address: String,
     ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Propose updating a validator's governance weight via system contract transaction.
+    /// Requires the node to be configured as a validator.
+    /// Takes effect when a weighted quorum (>2/3 of total weight) supports the change.
+    /// Returns the transaction hash on success.
+    #[method(name = "proposeSetValidatorWeight")]
+    async fn propose_set_validator_weight(
+        &self,
+        address: String,
+        weight: u64,
+    ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns whether an address is currently a validator.
     #[method(name = "getValidatorStatus")]
     async fn get_validator_status(

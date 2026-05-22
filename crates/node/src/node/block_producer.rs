@@ -400,6 +400,11 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Track the new state root for pruning decisions.
         self.record_finalized_state_root(block.number(), block.header.state_root);
+
+        // Update offline-slash tracker with this freshly proposed block.
+        self.last_proposed_by
+            .lock()
+            .insert(block.header.proposer, block.number());
         self.reload_authorities_if_boundary(block.number())?;
         if self.config.node_role.runs_prover() {
             let queued = self.enqueue_stark_frontier_backlog(8)?;

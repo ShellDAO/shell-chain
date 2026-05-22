@@ -3228,14 +3228,32 @@ mod tests {
         let handler = setup();
         let result = ShellApiServer::get_network_stats(&handler).await.unwrap();
 
+        // peerCount reflects the live AtomicUsize (0 in the default test setup).
         assert_eq!(result["peerCount"], 0);
         assert_eq!(result["protocolVersion"], "shell/1.0.0");
+        // listeningAddress falls back to the default multiaddr when unset.
         assert_eq!(result["listeningAddress"], "/ip4/0.0.0.0/tcp/30303");
         let protocols = result["protocols"].as_array().unwrap();
         assert_eq!(protocols.len(), 3);
         assert!(protocols.contains(&serde_json::json!("gossipsub")));
         assert!(protocols.contains(&serde_json::json!("kademlia")));
         assert!(protocols.contains(&serde_json::json!("mdns")));
+    }
+
+    #[tokio::test]
+    async fn get_network_stats_reflects_live_peer_count() {
+        use std::sync::atomic::Ordering;
+        let handler = setup();
+        handler.peer_count.store(7, Ordering::Relaxed);
+        let result = ShellApiServer::get_network_stats(&handler).await.unwrap();
+        assert_eq!(result["peerCount"], 7);
+    }
+
+    #[tokio::test]
+    async fn get_network_stats_reflects_configured_listen_addr() {
+        let handler = setup().with_admin_context("peer-id".into(), "/ip4/10.0.0.1/tcp/9000".into());
+        let result = ShellApiServer::get_network_stats(&handler).await.unwrap();
+        assert_eq!(result["listeningAddress"], "/ip4/10.0.0.1/tcp/9000");
     }
 
     // ── shell_getChainStats ────────────────────────────────────────

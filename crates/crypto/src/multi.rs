@@ -1,7 +1,8 @@
 use crate::{
-    CryptoError, DilithiumVerifier, MlDsaVerifier, PQSignature, SignatureType, SphincsVerifier,
-    Verifier,
+    is_algorithm_allowed, CryptoError, DilithiumVerifier, MlDsaVerifier, PQSignature,
+    SignatureType, SphincsVerifier, Verifier,
 };
+use shell_primitives::Address;
 
 /// Multi-algorithm verifier that dispatches to the correct backend
 /// based on the [`SignatureType`] embedded in each [`PQSignature`].
@@ -46,13 +47,50 @@ impl MultiVerifier {
     }
 }
 
+/// Verify a raw PQ signature by dispatching to the backend selected by `sig_type`.
+pub fn verify_signature(
+    sig_type: SignatureType,
+    pubkey: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, CryptoError> {
+    if !is_algorithm_allowed(sig_type) {
+        return Err(CryptoError::UnsupportedSignatureType(sig_type));
+    }
+
+    MultiVerifier.verify(
+        pubkey,
+        message,
+        &PQSignature::new(sig_type, signature.to_vec()),
+    )
+}
+
+/// Infer the signing algorithm bound to an address by re-deriving the address
+/// under each allowed algorithm and finding the matching one.
+pub fn infer_signature_type_from_address(
+    pubkey: &[u8],
+    address: &Address,
+) -> Option<SignatureType> {
+    [
+        SignatureType::MlDsa65,
+        SignatureType::Dilithium3,
+        SignatureType::SphincsSha2256f,
+    ]
+    .into_iter()
+    .find(|sig_type| {
+        is_algorithm_allowed(*sig_type)
+            && Address::from_public_key(pubkey, sig_type.as_u8()) == *address
+    })
+}
+
 #[cfg(feature = "batch")]
 impl crate::BatchVerifier for MultiVerifier {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DilithiumSigner, Signer, SphincsSigner};
+    use crate::{DilithiumSigner, MlDsaSigner, Signer, SphincsSigner};
+    use shell_primitives::Address;
 
     #[test]
     fn multi_verifies_dilithium() {
@@ -89,6 +127,31 @@ mod tests {
         // Verifying zeros with a zero pubkey should return Ok(false), not panic
         let result = mv.verify(&[0u8; 1952], b"test", &sig);
         assert!(result.is_ok()); // may be Ok(false) or Ok(true) but should not panic
+    }
+
+    #[test]
+    fn verify_signature_dispatches_mldsa65() {
+        let signer = MlDsaSigner::generate();
+        let sig = signer.sign(b"verify-signature").unwrap();
+
+        assert!(verify_signature(
+            SignatureType::MlDsa65,
+            signer.public_key(),
+            b"verify-signature",
+            &sig.data,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn infer_signature_type_from_address_detects_mldsa65() {
+        let signer = MlDsaSigner::generate();
+        let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+
+        assert_eq!(
+            infer_signature_type_from_address(signer.public_key(), &address),
+            Some(SignatureType::MlDsa65)
+        );
     }
 
     #[test]

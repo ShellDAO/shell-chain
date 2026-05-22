@@ -20,9 +20,9 @@ pub(crate) use tokio::sync::watch;
 pub(crate) use tracing::{debug, info, warn};
 
 pub(crate) use shell_consensus::{
-    detect_double_sign, Attestation, ConsensusEngine, EngineType, EquivocationProof, FinalityState,
-    ForkChoice, PeerScorer, PeerScoringConfig, ProofWindowManager, WPoaEvent, WPoaRound,
-    WindowConfig,
+    detect_double_sign, detect_offline, Attestation, ConsensusEngine, EngineType,
+    EquivocationProof, FinalityState, ForkChoice, PeerScorer, PeerScoringConfig,
+    ProofWindowManager, SlashingConfig, WPoaEvent, WPoaRound, WindowConfig,
 };
 pub(crate) use shell_core::{
     calculate_base_fee, effective_gas_price, Account, Block, BlockHeader, SignedTransaction,
@@ -141,6 +141,10 @@ pub struct Node<S: KvStore + 'static> {
     /// Recent tx gossip timestamps used to avoid rebroadcasting the same large
     /// PQ-signed transactions too frequently.
     tx_rebroadcast_seen: parking_lot::Mutex<HashMap<ShellHash, std::time::Instant>>,
+    /// Tracks the most recent block proposed by each known validator.
+    /// Updated on every block import/production; used for offline-slash detection
+    /// at epoch boundaries (white paper §5.4 — wPoA offline enforcement).
+    pub(crate) last_proposed_by: parking_lot::Mutex<HashMap<Address, u64>>,
     /// Drain frontier: the highest gap-at-block seen across all prover drain
     /// operations in this process lifetime.  Shared with ProverService so the
     /// seeding function can skip blocks that were already drained (and therefore
@@ -353,10 +357,10 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
         parent_hash: ShellHash,
         block_number: u64,
     ) -> bool {
-        let (attestation_count, is_finalized) = {
+        let (attested_weight, is_finalized) = {
             let finality = self.finality.read();
             (
-                finality.attestation_count(&block_hash),
+                finality.attested_weight(&block_hash),
                 finality.last_finalized_number() >= block_number,
             )
         };
@@ -364,7 +368,7 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
             block_hash,
             parent_hash,
             block_number,
-            attestation_count,
+            attested_weight,
             is_finalized,
         )
     }
@@ -653,6 +657,7 @@ impl<S: KvStore + 'static> Node<S> {
                 std::time::Duration::from_secs(300),
             )),
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
+            last_proposed_by: parking_lot::Mutex::new(HashMap::new()),
             stark_drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -1230,7 +1235,7 @@ mod tests {
     use crate::pruning::PruningConfig;
     use shell_consensus::{PoaConfig, PoaEngine, WPoaConfig, WPoaEngine};
     use shell_core::Transaction;
-    use shell_crypto::{DilithiumSigner, Signer};
+    use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer};
     use shell_mempool::MempoolConfig;
     use shell_primitives::U256;
     use shell_rpc::DevRpcControl;
@@ -1285,11 +1290,7 @@ mod tests {
         }
     }
 
-    fn setup_node() -> (Node<MemoryDb>, DilithiumSigner) {
-        let signer = DilithiumSigner::generate();
-        let pubkey = signer.public_key().to_vec();
-        let authority = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
-
+    fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
         let db = Arc::new(MemoryDb::new());
         let chain_store = Arc::new(ChainStore::new(db.clone()));
         let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
@@ -1302,7 +1303,14 @@ mod tests {
         }));
 
         let config = NodeConfig::dev(authority);
-        let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
+        Node::new(config, db, chain_store, world_state, tx_pool, consensus)
+    }
+
+    fn setup_node() -> (Node<MemoryDb>, DilithiumSigner) {
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let authority = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
+        let node = setup_node_with_authority(authority);
         (node, signer)
     }
 
@@ -1718,6 +1726,86 @@ mod tests {
                 .contains("requires block #2 to be compressed at L1"),
             "expected mixed-layer range rejection, got {err}"
         );
+    }
+
+    /// L2 source-binding validation must reject a source whose block-hash is
+    /// NOT in `settled_stark_sources`, even if the source amendment is stored.
+    #[test]
+    fn l2_source_binding_rejects_unsettled_l1_source() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+
+        // Build an L1 source amendment and store it — but do NOT register it in
+        // settled_stark_sources so it is un-settled.
+        let l1_src = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        let l1_src_json = serde_json::to_vec(&l1_src).unwrap();
+        node.amendment_store
+            .put_amendment(&l1_src.block_hash, &l1_src_json)
+            .unwrap();
+
+        // An L2 amendment that references the unsettled L1 source.
+        let l2 = dummy_ordered_amendment(2, vec![l1_src.block_hash, hashes[1]], 2);
+        let err = node.validate_stark_proof_source_binding(&l2).unwrap_err();
+        assert!(
+            err.to_string().contains("not yet settled"),
+            "expected not-yet-settled rejection, got: {err}"
+        );
+    }
+
+    /// L2 source-binding validation must accept a source that IS in
+    /// `settled_stark_sources` (happy path for the new canonical check).
+    #[test]
+    fn l2_source_binding_accepts_settled_l1_source() {
+        use shell_stark_prover::recursive_air::compute_aggregate_root;
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let hashes = produce_witnessed_blocks(&node, &signer, 1);
+
+        let l1_src = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        let l1_src_json = serde_json::to_vec(&l1_src).unwrap();
+        node.amendment_store
+            .put_amendment(&l1_src.block_hash, &l1_src_json)
+            .unwrap();
+        // Register the L1 source as settled.
+        node.settled_stark_sources
+            .lock()
+            .insert((1, l1_src.block_hash));
+
+        // Build an L2 amendment with correct n_sigs and aggregate root.
+        let root = u128::from_le_bytes(l1_src.proof.batch_root_bytes);
+        let agg_root = compute_aggregate_root(&[root]);
+        let l2 = ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: l1_src.block_hash,
+            block_number: 1,
+            start_block: Some(1),
+            proof: shell_stark_prover::proof::SigBatchProof {
+                version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
+                batch_root_bytes: agg_root.to_le_bytes(),
+                n_sigs: 1,
+                proof_bytes: vec![0x33; 128],
+            },
+            prover: Address::from([0x44; 32]),
+            prover_signature: Bytes::from(vec![0x55; 8]),
+            layer: 2,
+            source_hashes: vec![l1_src.block_hash],
+            original_size: Some(10_000),
+            compressed_size: Some(128),
+            settlement_tx_hash: None,
+        };
+        node.validate_stark_proof_source_binding(&l2)
+            .expect("settled L1 source should be accepted by L2 source-binding validation");
     }
 
     #[test]
@@ -4737,6 +4825,32 @@ mod tests {
         assert_eq!(tracker.len(), 1);
         assert_eq!(tracker.latest().unwrap().block_number, 1);
         assert_eq!(tracker.latest().unwrap().state_root, current_root);
+    }
+
+    #[test]
+    fn handle_attestation_routes_mldsa65_signatures() {
+        let signer = MlDsaSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let node = setup_node_with_authority(authority);
+        store_genesis(&node);
+        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+
+        let block = node.produce_block(&signer, 100).unwrap();
+        let block_hash = block.hash();
+        let block_number = block.header.number;
+        // handle_attestation checks block existence in chain_store first.
+        node.chain_store.put_block(&block).unwrap();
+        let attestation = node
+            .create_attestation(block_hash, block_number, &signer)
+            .unwrap();
+
+        let verifier = MultiVerifier;
+        assert!(node.handle_attestation(attestation, &verifier).is_ok());
+        // With a single unit-weight validator the attestation immediately
+        // satisfies weighted quorum (1 > 2/3*1), so the block is finalized
+        // and its attestation entry is pruned by prune_below(1).
+        // Verify finalization rather than raw attestation count.
+        assert_eq!(node.finality.read().last_finalized_hash(), &block_hash);
     }
 
     #[test]

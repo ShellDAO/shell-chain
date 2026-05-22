@@ -62,21 +62,35 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Verify the attestation signature.
         let msg = Attestation::signing_message(&block_hash, block_number);
-        let sig = shell_crypto::PQSignature::new(
-            shell_crypto::SignatureType::Dilithium3,
-            attestation.signature.clone(),
-        );
+        let sig_type = shell_crypto::infer_signature_type_from_address(pubkey, &validator)
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "unknown attestation signature algorithm for validator {validator:?}"
+                ))
+            })?;
+        if !shell_crypto::is_algorithm_allowed(sig_type) {
+            return Err(NodeError::Startup(format!(
+                "attestation signature algorithm {sig_type:?} not allowed"
+            )));
+        }
+        let sig = shell_crypto::PQSignature::new(sig_type, attestation.signature.clone());
         let valid = verifier
             .verify(pubkey, &msg, &sig)
-            .map_err(|_| NodeError::Startup("invalid attestation signature".into()))?;
+            .map_err(|e| NodeError::Startup(format!("invalid attestation signature: {e}")))?;
         if !valid {
             return Err(NodeError::Startup(
                 "attestation signature verification failed".into(),
             ));
         }
 
-        let total_validators = self.consensus.read().poa_config().authorities.len();
-        let (attestation_count, finalized) = {
+        let validator_weights = self.consensus.read().validator_weights();
+        let attester_weight = validator_weights.get(&validator).copied().ok_or_else(|| {
+            NodeError::Startup(format!(
+                "unknown active attestation validator: {validator:?}"
+            ))
+        })?;
+        let total_weight: u64 = validator_weights.values().copied().sum();
+        let (attested_weight, finalized) = {
             // Check for equivocation, record the attestation, and evaluate
             // finality under one finality write lock to avoid lock-order cycles
             // with fork_choice.
@@ -97,18 +111,19 @@ impl<S: KvStore + 'static> Node<S> {
             }
 
             // Record the attestation.
-            if !finality.record_attestation(attestation) {
+            if !finality.record_attestation_weighted(attestation, attester_weight) {
                 return Ok(()); // duplicate, already recorded
             }
-            let attestation_count = finality.attestation_count(&block_hash);
-            let finalized = finality.check_finality(&block_hash, block_number, total_validators);
-            (attestation_count, finalized)
+            let attested_weight = finality.attested_weight(&block_hash);
+            let finalized =
+                finality.check_finality_weighted(&block_hash, block_number, total_weight);
+            (attested_weight, finalized)
         };
 
         if self.fork_choice.read().contains(&block_hash) {
             self.fork_choice
                 .write()
-                .update_attestations(&block_hash, attestation_count);
+                .update_attested_weight(&block_hash, attested_weight);
         }
 
         if finalized {

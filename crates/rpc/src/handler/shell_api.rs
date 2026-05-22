@@ -125,6 +125,17 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
 
+    async fn propose_set_validator_weight(
+        &self,
+        address: String,
+        weight: u64,
+    ) -> Result<String, ErrorObjectOwned> {
+        let addr = parse_address(&address)?;
+        let calldata = shell_evm::encode_set_validator_weight_calldata(&addr, weight);
+        let hash = self.propose_validator_tx(calldata)?;
+        Ok(format!("0x{}", hex::encode(hash.0)))
+    }
+
     async fn get_validator_status(
         &self,
         address: Address,
@@ -191,10 +202,16 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     }
 
     async fn get_network_stats(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let peer_count = self.peer_count.load(Ordering::Relaxed);
+        let listen_addr = if self.admin_p2p_listen.is_empty() {
+            "/ip4/0.0.0.0/tcp/30303".to_string()
+        } else {
+            self.admin_p2p_listen.clone()
+        };
         Ok(serde_json::json!({
-            "peerCount": 0,
+            "peerCount": peer_count,
             "protocolVersion": "shell/1.0.0",
-            "listeningAddress": "/ip4/0.0.0.0/tcp/30303",
+            "listeningAddress": listen_addr,
             "protocols": ["gossipsub", "kademlia", "mdns"],
         }))
     }
