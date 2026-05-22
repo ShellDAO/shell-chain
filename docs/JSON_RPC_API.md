@@ -36,7 +36,7 @@ ws://127.0.0.1:8546
 
 All requests use POST with `Content-Type: application/json`.
 
-**Address note:** All RPC input and output addresses use bech32m `pq1...` format (since v0.21.0 / F-PQ1-ONLY). Legacy `0x` hex addresses are rejected on every input path.
+**Address note:** RPC input and output addresses use canonical 32-byte `0x` + 64 lowercase hex throughout the current codebase.
 
 ## CORS Configuration
 
@@ -124,7 +124,7 @@ wscat -c ws://127.0.0.1:8546
 **Example — logs with filter:**
 
 ```bash
-> {"jsonrpc":"2.0","id":2,"method":"eth_subscribe","params":["logs",{"address":"pq1...","topics":["0xddf2..."]}]}
+> {"jsonrpc":"2.0","id":2,"method":"eth_subscribe","params":["logs",{"address":"0x...","topics":["0xddf2..."]}]}
 < {"jsonrpc":"2.0","id":2,"result":"0x2"}
 ```
 
@@ -335,7 +335,7 @@ Returns the balance of an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical) |
+| 1 | `String` | Yes | Address (`0x...` canonical) |
 | 2 | `String` | No | Block tag (`"latest"`, `"earliest"`, `"pending"`, `"safe"`, `"finalized"`, or hex number) |
 
 **Returns:** `String` — Hex-encoded balance in wei.
@@ -343,7 +343,7 @@ Returns the balance of an address.
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["pq1YOUR_ADDRESS_HERE","latest"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xYOUR_ADDRESS_HERE","latest"],"id":1}'
 ```
 
 ```json
@@ -359,7 +359,7 @@ Returns the nonce (transaction count) for an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical) |
+| 1 | `String` | Yes | Address (`0x...` canonical) |
 | 2 | `String` | No | Block tag |
 
 **Returns:** `String` — Hex-encoded nonce.
@@ -367,7 +367,7 @@ Returns the nonce (transaction count) for an address.
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["pq1YOUR_ADDRESS_HERE","latest"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0xYOUR_ADDRESS_HERE","latest"],"id":1}'
 ```
 
 ```json
@@ -525,7 +525,7 @@ Executes a read-only call against the EVM (no state changes).
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"pq1CONTRACT_ADDRESS","data":"0x..."},"latest"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"0xCONTRACT_ADDRESS","data":"0x..."},"latest"],"id":1}'
 ```
 
 ---
@@ -544,7 +544,7 @@ Estimates gas for a transaction. Returns `gas_used × 1.2` with a minimum of 21,
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"to":"pq1RECIPIENT_ADDRESS","value":"0xde0b6b3a7640000"}],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"to":"0xRECIPIENT_ADDRESS","value":"0xde0b6b3a7640000"}],"id":1}'
 ```
 
 ```json
@@ -698,9 +698,9 @@ Returns error code `-32601`. The node does not hold private keys — sign transa
 
 Returns error code `-32601`. Same reason as `eth_sign`.
 
-### eth_getCompilers *(deprecated)*
+### eth_getCompilers
 
-Returns `[]`. This method is deprecated.
+Returns `[]`. This legacy Ethereum method is retained for compatibility.
 
 ---
 
@@ -808,14 +808,14 @@ Returns the post-quantum public key associated with an address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Address (`pq1...` canonical) |
+| 1 | `String` | Yes | Address (`0x...` canonical) |
 
 **Returns:** `String|null` — Hex-encoded PQ public key, or `null` if not found.
 
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_getPqPubkey","params":["pq1YOUR_ADDRESS_HERE"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"shell_getPqPubkey","params":["0xYOUR_ADDRESS_HERE"],"id":1}'
 ```
 
 ---
@@ -872,8 +872,8 @@ curl -s http://localhost:8545 \
   "jsonrpc": "2.0",
   "id": 1,
   "result": [
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna",
-    "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg7j66z6"
+    "0x0000000000000000000000000000000000000001",
+    "0x0000000000000000000000000000000000000002"
   ]
 }
 ```
@@ -892,7 +892,7 @@ Returns whether an address is a validator.
 **Returns:** Object:
 ```json
 {
-  "address": "pq1...",
+  "address": "0x...",
   "isValidator": true
 }
 ```
@@ -974,8 +974,8 @@ Returns governance configuration.
 ```json
 {
   "validatorCount": 3,
-  "validators": ["pq1...", "pq1...", "pq1..."],
-  "systemContractAddress": "pq1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqy0vusna",
+  "validators": ["0x...", "0x...", "0x..."],
+  "systemContractAddress": "0x0000000000000000000000000000000000000001",
   "proposalGasLimit": 100000
 }
 ```
@@ -1084,7 +1084,7 @@ local node has no certificate for the requested hash.
 {
   "blockHash": "0xabc...",
   "certificate": {
-    "pq1...": {
+    "0x...": {
       "sig_type": "Dilithium3",
       "data": [1, 2, 3]
     }
@@ -1109,7 +1109,7 @@ Returns the post-quantum signature details for validators who signed a specific 
   "blockNumber": "0x1a",
   "signers": [
     {
-      "address": "pq1...",
+      "address": "0x...",
       "pqPubkey": "0x...",
       "signatureValid": true
     }
@@ -1170,7 +1170,7 @@ Returns voting activity statistics for validators in recent blocks.
 {
   "validators": [
     {
-      "address": "pq1...",
+      "address": "0x...",
       "blocksProduced": 500,
       "lastBlockProduced": "0x1a",
       "uptime": 99.8
@@ -1193,8 +1193,8 @@ Returns pending governance proposals that have not yet been finalized.
   "proposals": [
     {
       "type": "addValidator",
-      "target": "pq1...",
-      "proposer": "pq1...",
+      "target": "0x...",
+      "proposer": "0x...",
       "proposedAt": "0x18",
       "status": "pending"
     }
@@ -1233,7 +1233,7 @@ older pages to avoid gaps or duplicates while new blocks arrive.
 
 | Name | Type | Description |
 |------|------|-------------|
-| `address` | string | `pq1...` address |
+| `address` | string | `0x...` address |
 | `fromBlock` | number \| null | Start block (inclusive, default 0) |
 | `toBlock` | number \| null | End block (inclusive, default latest) |
 | `page` | number \| null | Page index, 0-based (default 0) |
@@ -1243,7 +1243,7 @@ older pages to avoid gaps or duplicates while new blocks arrive.
 
 | Field | Type | Description |
 |------|------|-------------|
-| `address` | string | Queried `pq1...` address |
+| `address` | string | Queried `0x...` address |
 | `fromBlock` | string | Effective inclusive lower block bound, hex encoded |
 | `toBlock` | string | Effective inclusive upper block snapshot, hex encoded |
 | `page` | number | Page index, 0-based |
@@ -1253,7 +1253,7 @@ older pages to avoid gaps or duplicates while new blocks arrive.
 
 ```bash
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_getTransactionsByAddress","params":["pq1abc...",0,null,0,20],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"shell_getTransactionsByAddress","params":["0xabc...",0,null,0,20],"id":1}'
 ```
 
 ### shell_getBlockWitnesses
@@ -1290,14 +1290,14 @@ Directly sets the balance of an address. **Only available when `api_modules` inc
 
 | Name | Type | Description |
 |------|------|-------------|
-| `address` | string | Target `pq1...` address |
+| `address` | string | Target `0x...` address |
 | `balance` | string | New balance in wei as decimal string |
 
 **Response:** `true` on success.
 
 ```bash
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_setBalance","params":["pq1abc...","1000000000000000000"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"shell_setBalance","params":["0xabc...","1000000000000000000"],"id":1}'
 ```
 
 ---
@@ -1321,8 +1321,8 @@ Replays a transaction and returns an execution trace.
 {
   "frame": {
     "type": "CALL",
-    "from": "pq1...",
-    "to": "pq1...",
+    "from": "0x...",
+    "to": "0x...",
     "gas": 21000,
     "gasUsed": 21000,
     "input": "0x",
@@ -1423,6 +1423,31 @@ curl -s http://localhost:8545 \
   -d '{"jsonrpc":"2.0","method":"trace_transaction","params":["0xabc123..."],"id":1}'
 ```
 
+### shell_getAlgorithmRegistry
+
+Returns the live algorithm registry as an array of objects: `{ algo, status, description }`.
+
+**Parameters:** None
+
+**Returns:** `Array` — one entry per registered signature algorithm.
+
+```json
+[
+  {
+    "algo": "MlDsa65",
+    "description": "FIPS 204 ML-DSA-65 (NIST post-quantum standard; primary algorithm)",
+    "status": "active"
+  },
+  {
+    "algo": "Dilithium3",
+    "description": "CRYSTALS-Dilithium3 (Round-3 pre-FIPS; active for legacy compatibility)",
+    "status": "active"
+  }
+]
+```
+
+---
+
 ### shell_getProofAmendment
 
 Returns the STARK proof amendment for a block if one has been generated asynchronously. See [stark-aggregation.md](stark-aggregation.md) for the full response schema.
@@ -1456,7 +1481,7 @@ Returns the paymaster policy for a given paymaster address.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `String` | Yes | Paymaster address (`pq1...`) |
+| 1 | `String` | Yes | Paymaster address (`0x...`, 32 bytes) |
 
 **Returns:** `Object|null` — Policy object or `null` if no policy registered.
 
@@ -1485,7 +1510,7 @@ Returns current consensus engine state.
 ```json
 {
   "engine": "wpoa",
-  "currentProposer": "pq1...",
+  "currentProposer": "0x...",
   "epochNumber": 5,
   "validatorCount": 3,
   "finalizedHeight": "0x18"
@@ -1500,4 +1525,4 @@ For the canonical method list (currently 79 methods across `web3_`, `net_`, `eth
 
 ---
 
-*Last updated: 2025*
+*Last updated: 2026-05-22*

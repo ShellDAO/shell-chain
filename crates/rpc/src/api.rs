@@ -76,7 +76,7 @@ pub trait EthApi {
         tx: serde_json::Value,
     ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Returns a list of available compilers (deprecated, always empty).
+    /// Returns a list of available compilers (always empty).
     #[method(name = "getCompilers")]
     async fn get_compilers(&self) -> Result<Vec<String>, jsonrpsee::types::ErrorObjectOwned>;
 

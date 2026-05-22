@@ -1,10 +1,12 @@
 # Upgrade Guide
 
-## v0.15.0 → v0.22.2 (M14–M16: STARK hardening, ops maturity)
+## v0.15.0 → v0.23.0 (M14–M17: STARK hardening, R3 completion)
 
 ### Overview
 
-This covers all breaking and notable changes from v0.15.0 through v0.22.2.
+This covers all breaking and notable changes from v0.15.0 through v0.23.0.
+
+> **Current v0.23.0 note:** the live implementation uses canonical 32-byte `0x...` addresses again. Older `pq1...` guidance below is historical migration context only and does not describe the current R3 codebase.
 
 | Area | Change |
 |------|--------|
@@ -14,6 +16,9 @@ This covers all breaking and notable changes from v0.15.0 through v0.22.2.
 | RPC | `compressionLayer` and `pruningStatus` fields on block responses |
 | Metrics | `shell_stark_frontier_lag`, `shell_stark_settlements_accepted_total`, `shell_stark_settlements_rejected_total` |
 | CLI | `--algorithm mldsa65` (FIPS 204 ML-DSA-65) now available in `key generate` |
+| Consensus | wPoA view-change, `slash_weight_bps`, and 7,200-block STARK challenge timeout are now live |
+| Storage | `prune_state_trie()` can prune unreachable state snapshots for `StorageProfile::Light` |
+| Governance | ValidatorRegistry can propose/activate/deprecate algorithms and expose them via `shell_getAlgorithmRegistry` |
 
 ### STARK aggregation — `enable_stark_aggregation` default
 
@@ -44,7 +49,7 @@ still work as overrides but are no longer recommended as primary configuration.
 ### Docker image
 
 ```yaml
-image: ghcr.io/shelldao/shell-chain:0.22.2
+image: ghcr.io/shelldao/shell-chain:0.23.0
 ```
 
 ---

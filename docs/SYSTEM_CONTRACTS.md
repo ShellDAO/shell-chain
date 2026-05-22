@@ -30,6 +30,9 @@ interface IValidatorRegistry {
     // ── Write (validator-only) ──────────────────────────────────────────────
     function addValidator(address validator) external;
     function removeValidator(address validator) external;
+    function setValidatorWeight(address validator, uint64 weight) external;
+    function proposeAlgorithmActivation(uint8 algo) external;
+    function deprecateAlgorithm(uint8 algo) external;
 
     // ── Read (anyone) ───────────────────────────────────────────────────────
     function getValidators() external view returns (address[] memory);
@@ -39,12 +42,15 @@ interface IValidatorRegistry {
 
 ### Function selectors
 
-| Function | Selector (keccak256) | Access |
-|----------|---------------------|--------|
-| `addValidator(address)` | computed at compile time | validators only |
-| `removeValidator(address)` | computed at compile time | validators only |
-| `getValidators()` | computed at compile time | anyone |
-| `isValidator(address)` | computed at compile time | anyone |
+| Function | Selector | Access |
+|----------|----------|--------|
+| `addValidator(address)` | `0x4d238c8e` | validators only |
+| `removeValidator(address)` | `0x40a141ff` | validators only |
+| `setValidatorWeight(address,uint64)` | `0xa6d5d626` | validators only |
+| `proposeAlgorithmActivation(uint8)` | `0x487aee59` | validators only |
+| `deprecateAlgorithm(uint8)` | `0xa4b88278` | validators only |
+| `getValidators()` | `0xb7ab4db5` | anyone |
+| `isValidator(address)` | `0xfacd743b` | anyone |
 
 ### Calling from Solidity
 
@@ -95,6 +101,8 @@ Writes are governed by weighted majority of the current active validator set:
   in chain storage, so a newly legal validator can immediately verify/produce
   proposer seals;
 - `removeValidator` cannot remove the last remaining validator.
+- `setValidatorWeight` updates the in-memory and persisted validator weights used by wPoA proposer selection, finality, and slash-weight accounting.
+- `proposeAlgorithmActivation` / `deprecateAlgorithm` update the runtime algorithm registry; clients can read the live state via `shell_getAlgorithmRegistry`.
 
 ---
 
@@ -113,9 +121,15 @@ Allows accounts to:
 ```solidity
 interface IAccountManager {
     /// Rotate the caller's PQ public key.
-    /// pubkey: raw Dilithium3 or SPHINCS+ public key bytes
-    /// algo:   0 = Dilithium3, 1 = SPHINCS+-SHA2-256f
+    /// pubkey: raw Dilithium3, ML-DSA-65, or SPHINCS+ public key bytes
+    /// algo:   0 = Dilithium3, 1 = ML-DSA-65, 2 = SPHINCS+-SHA2-256f
     function rotateKey(bytes calldata pubkey, uint8 algo) external;
+
+    /// Configure guardian-based account recovery.
+    function setGuardians(address[] calldata guardians, uint8 thresholdPct, uint64 timelockSecs) external;
+    function submitRecovery(address target, bytes calldata signature, uint8 algo) external;
+    function executeRecovery(address target) external;
+    function cancelRecovery(address target) external;
 
     /// Set a custom validator contract for this account.
     /// validationCodeHash: keccak256 hash of the deployed validator bytecode.
@@ -129,11 +143,15 @@ interface IAccountManager {
 
 ### Function selectors
 
-| Function | Access |
-|----------|--------|
-| `rotateKey(bytes,uint8)` | self only (`msg.sender == tx.origin account`) |
-| `setValidationCode(bytes32)` | self only |
-| `clearValidationCode()` | self only |
+| Function | Selector | Access |
+|----------|----------|--------|
+| `rotateKey(bytes,uint8)` | `0xb746c079` | self only (`msg.sender == tx.origin account`) |
+| `setValidationCode(bytes32)` | `0x0e3cf096` | self only |
+| `clearValidationCode()` | `0xd1c4b175` | self only |
+| `setGuardians(address[],uint8,uint64)` | computed at compile time | self only |
+| `submitRecovery(address,bytes,uint8)` | computed at compile time | guardian only |
+| `executeRecovery(address)` | computed at compile time | anyone (after timelock) |
+| `cancelRecovery(address)` | computed at compile time | self only |
 
 ### Key rotation example
 
@@ -147,7 +165,7 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
     "jsonrpc":"2.0",
     "method":"shell_sendTransaction",
     "params":[{
-      "from": "pq1MYADDRESS",
+      "from": "0xMYADDRESS",
       "to":   "0x0000000000000000000000000000000000000002",
       "data": "0x<rotateKey calldata>",
       "gas":  "0x186a0"
@@ -156,7 +174,7 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
   }'
 ```
 
-After the transaction is included, future transactions from `pq1MYADDRESS` are
+After the transaction is included, future transactions from `0xMYADDRESS` are
 validated using the new key. The old key is invalidated immediately.
 
 ### Custom validation code

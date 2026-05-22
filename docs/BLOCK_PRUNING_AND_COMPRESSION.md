@@ -175,9 +175,7 @@ or lower-layer-gap artifacts cannot prune witnesses or claim rewards.
 
 Controlled by `state_pruning_experimental = false` (default off).
 
-When enabled, the node maintains a ref-count column family `refs/<node_hash>`
-(4-byte little-endian u32). `StateRootTracker` decrements counts for trie nodes
-no longer referenced by any retained root; nodes reaching zero are deleted.
+When enabled, `prune_state_trie()` walks canonical state roots below the light-profile retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
 
 **Not yet production-ready.** Enable only for testing.
 

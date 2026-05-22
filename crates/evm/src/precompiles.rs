@@ -45,8 +45,6 @@ pub const BLAKE3_BASE_GAS: u64 = 30;
 pub const BLAKE3_WORD_GAS: u64 = 6;
 pub const PQ_ADDR_DERIVE_GAS: u64 = 200;
 
-#[allow(dead_code)]
-const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
 const SPHINCS_SIGNATURE_BYTES: usize = 49_856;

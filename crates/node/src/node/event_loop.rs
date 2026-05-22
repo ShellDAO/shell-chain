@@ -1340,8 +1340,6 @@ impl<S: KvStore + 'static> Node<S> {
                                             block_number = equivocation.header_a.number,
                                             "I1: equivocation evidence verified (slashing deferred — epoch-boundary not implemented)"
                                         );
-                                        // TODO(shell-chain#31): apply slash_authority only at epoch boundary
-                                        // once ValidatorSet epoch transitions are in place.
                                     } else {
                                         warn!(%peer, "I1: received invalid equivocation evidence, ignoring");
                                     }

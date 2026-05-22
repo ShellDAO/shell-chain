@@ -153,7 +153,7 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 }
 
 /// Approximate size of a directory in bytes (best-effort).
-#[allow(dead_code)]
+#[cfg(feature = "rocksdb")]
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {

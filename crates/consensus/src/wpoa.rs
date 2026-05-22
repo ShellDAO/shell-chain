@@ -73,14 +73,12 @@ pub struct WPoaEngine {
     validator_set_config: ValidatorSetConfig,
     slash_weights: HashMap<Address, u64>,
     view_change_state: Mutex<ViewChangeState>,
-    #[allow(dead_code)]
-    verifier: Arc<dyn Verifier>,
     signer: Option<Arc<dyn Signer>>,
 }
 
 impl WPoaEngine {
     /// Construct a `WPoaEngine` from a `WPoaConfig`.
-    pub fn new(config: WPoaConfig, verifier: Arc<dyn Verifier>) -> Self {
+    pub fn new(config: WPoaConfig, _verifier: Arc<dyn Verifier>) -> Self {
         let mut poa = config.poa;
         let weights: Vec<u64> = poa
             .authorities
@@ -101,7 +99,6 @@ impl WPoaEngine {
             validator_set_config: config.validator_set_config,
             slash_weights: HashMap::new(),
             view_change_state: Mutex::new(ViewChangeState::new()),
-            verifier,
             signer: None,
         }
     }

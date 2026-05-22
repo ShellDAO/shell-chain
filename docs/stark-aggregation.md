@@ -151,7 +151,7 @@ The `ProofAmendmentStore` provides:
 
 When a proof amendment arrives for a block, the node can optionally delete the raw
 witness bundle if the storage profile is not `"archive"` and the
-`proof_replacement_grace` window has elapsed.
+`proof_replacement_grace` window has elapsed. Challenges for a proof stay `Open` for at most `T_c = 7200` blocks; a valid response marks them `Resolved`, while a timeout marks them `Slashed` and triggers prover slashing.
 
 ---
 
@@ -165,6 +165,17 @@ witness bundle if the storage profile is not `"archive"` and the
 | `shell_stark_frontier_lag` | Blocks between the chain tip and the highest continuously-settled STARK layer. Alert if > 100 (v0.22.x). |
 
 ---
+
+## Challenge lifecycle
+
+The challenge path is now an explicit lifecycle:
+
+```text
+OPEN --(valid ChallengeResponse)--> RESOLVED
+OPEN --(timeout at 7200 blocks)--> SLASHED
+```
+
+Nodes create an `Open` record when they emit `ProofChallenge`, resolve it when proof bytes validate, and slash the responsible prover if the record is still open after the timeout.
 
 ## Security Model
 

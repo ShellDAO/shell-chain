@@ -49,7 +49,7 @@ blocks in round-robin order. A block is valid if:
 
 1. The proposer is in the current `ValidatorSet`.
 2. The block header `authority` field matches the proposer's address.
-3. All transactions have valid Dilithium3 signatures (verified via `WitnessBundle`).
+3. All transactions have valid PQ signatures (ML-DSA-65 primary, Dilithium3 legacy-compatible, SPHINCS+ supported) verified via the witness pipeline.
 4. The block timestamp is within the allowed drift window.
 5. State root and witness root match the executed result.
 
@@ -94,6 +94,7 @@ cumulative weight rather than longest chain.
 | `slot_duration_ms` | 2000 | Slot length in milliseconds |
 | `min_validators` | 1 | Minimum validators to produce blocks |
 | `max_missed_slots` | 10 | Missed slots before offline detection |
+| `slash_weight_bps` | 1000 | Economic slash amount in basis points (10% per offence by default) |
 
 Enable wPoA:
 
@@ -101,6 +102,8 @@ Enable wPoA:
 [consensus]
 engine = "wpoa"
 ```
+
+If the expected proposer misses its slot, validators broadcast a signed `ViewChangeMessage`. Once the weighted quorum reaches `ceil(2/3 × total_active_weight)`, the engine advances `current_view` and rotates proposer selection across the ordered authority list for that height. The timeout is `max(block_time_ms, 10_000)` milliseconds.
 
 ---
 
@@ -236,6 +239,7 @@ SlashType::Offline
 | `offline_threshold` | 100 | Slots without a proposal before offline detection |
 | `slash_on_double_sign` | true | Slash immediately on equivocation |
 | `slash_on_offline` | false | Offline triggers suspension, not slash (configurable) |
+| `slash_weight_bps` | 1000 | Reduce effective validator weight by 10% per slash, capped at the validator's base weight |
 
 ### SlashRecord
 
@@ -249,8 +253,7 @@ SlashRecord {
 }
 ```
 
-Slash records are written to `ValidatorSet` and change the validator's status
-to `Slashed`. The validator is removed at the next epoch boundary.
+Slash records are written to `ValidatorSet`. Equivocation still marks the validator as slashed for epoch-boundary removal, while the economic penalty is applied immediately by reducing effective proposer/finality weight according to `slash_weight_bps`. Offline detection defaults to suspension-only until `slash_on_offline` is enabled.
 
 ---
 
@@ -277,6 +280,18 @@ DoS. `RateLimiterConfig` sets:
 - `window_seconds` — rolling window duration
 
 A challenger that exceeds the limit has its challenges silently dropped by peers.
+
+### Challenge lifecycle
+
+Challenges are tracked in-process with the following status machine:
+
+| Status | Meaning | Transition |
+|--------|---------|------------|
+| `Open` | challenge accepted and awaiting proof bytes | created when a node broadcasts `ProofChallenge` |
+| `Resolved` | a valid response was received before timeout | `ChallengeResponse` verifies successfully |
+| `Slashed` | the prover failed to answer within the timeout | automatic at `T_c = 7200` blocks |
+
+A timed-out challenge slashes the prover responsible for the amendment unless the prover could not be identified from the amendment/block context.
 
 ### Challenge flow
 

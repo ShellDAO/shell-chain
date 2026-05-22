@@ -2,7 +2,7 @@
 
 <!-- [![Build Status](https://img.shields.io/github/actions/workflow/status/LucienSong/shell-chain/ci.yml?branch=main)](https://github.com/LucienSong/shell-chain/actions) -->
 <!-- [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) -->
-<!-- [![Version](https://img.shields.io/badge/version-0.22.2-green.svg)](CHANGELOG.md) -->
+<!-- [![Version](https://img.shields.io/badge/version-0.23.0-green.svg)](CHANGELOG.md) -->
 
 The first EVM-compatible, post-quantum blockchain — quantum-safe **before Q-Day**, no migration needed.
 
@@ -12,16 +12,16 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 
 ### Key Features
 
-- 🔐 **Post-Quantum Signatures** — Dilithium3 as default; ML-DSA-65 (FIPS 204) available as optional FIPS path; SPHINCS+ as conservative hash-based fallback
+- 🔐 **Post-Quantum Signatures** — ML-DSA-65 (FIPS 204) is the primary governed algorithm; Dilithium3 remains deployed for legacy compatibility, with SPHINCS+ as a conservative fallback
 - ⚙️ **EVM Compatible** — Cancun-spec EVM; run Solidity contracts with familiar tooling (Hardhat, ethers.js, MetaMask)
 - 🏗️ **Native Account Abstraction** — protocol-level smart accounts with built-in PQ validation, key rotation, and custom validator hooks
 - 🧩 **PQ Precompile Suite** — 6 on-chain precompiles at `0x0001`–`0x0006`: ML-DSA-65 verify, SLH-DSA-SHA2-256f verify, ML-DSA-65 batch verify, BLAKE3-256, BLAKE3-512, PQAddr derive
-- ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with stake-weighted proposer selection, slashing, and finality tracking
-- ⚡ **STARK Sig-Aggregation** — Winterfell STARK proofs compress Dilithium3 signatures **7× per block**; 157 proofs/sec sustained throughput. v0.23.0 ships multi-layer (L1/L2/L3) recursive STARK compression for further on-chain data reduction.
+- ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with weighted proposer rotation, view-change fallback, offline/equivocation handling, economic slash weights, and finality tracking
+- ⚡ **STARK Sig-Aggregation** — Winterfell proofs compress PQ witness data, track challenges through `Open → Resolved/Slashed`, and in v0.23.0 ship multi-layer (L1/L2/L3) settlement plus trie-pruning integration for lighter storage profiles.
 - 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
 - 🛠️ **Developer Ecosystem** — TypeScript SDK (`shell-sdk`) with viem-based PQ signers and AA transaction builders
 - 🌐 **P2P Networking** — libp2p with GossipSub, Kademlia DHT, peer scoring, and message signature verification
-- 📡 **Full JSON-RPC** — Ethereum-compatible `eth_*`, `web3_*`, `net_*`, `debug_*`, plus Shell-specific APIs, secured by TLS, rate limiting, and API keys
+- 📡 **Full JSON-RPC** — Ethereum-compatible `eth_*`, `web3_*`, `net_*`, `debug_*`, plus Shell-specific APIs such as `shell_getFinalityInfo` and `shell_getAlgorithmRegistry`, secured by TLS, rate limiting, and API keys
 - 🐳 **Production Ready** — Docker Compose orchestration, Prometheus/Grafana monitoring, hot backups, and TOML configuration
 - 🛡️ **Security Hardened** — 50+ audit findings addressed, Criterion benchmarks, and continuous fuzzing
 

@@ -15,7 +15,7 @@ Shell-chain is built from the ground up with post-quantum cryptographic primitiv
 5. [Address Derivation](#address-derivation)
 6. [Signature Sizes and Performance](#signature-sizes-and-performance)
 7. [Incompatibility with ECDSA and MetaMask](#incompatibility-with-ecdsa-and-metamask)
-8. [Additional Algorithms and Future Schemes](#additional-algorithms-and-future-schemes)
+8. [Algorithm Registry Governance](#algorithm-registry-governance)
 
 ---
 
@@ -41,13 +41,26 @@ Shell-chain eliminates this risk by using **NIST-standardized lattice-based** an
 
 ## Algorithms Used
 
-### CRYSTALS-Dilithium3 (Primary Signature Algorithm)
+### ML-DSA-65 (Primary Runtime Algorithm)
 
-Shell-chain's default signature algorithm. Based on the hardness of lattice problems (Module-LWE and Module-SIS), Dilithium3 provides **NIST Level 3** security (128-bit post-quantum security, comparable to AES-192).
+`ML-DSA-65` is the primary algorithm in the live registry and the FIPS 204 path Shell-Chain targets for long-term production deployments. It shares the same NIST Level 3 security target as Dilithium3 while using the standardized ML-DSA parameterization.
 
 | Property | Value |
 |----------|-------|
-| **Standard** | NIST Round 3 reference (pre-FIPS; shares security basis with ML-DSA-65) |
+| **Standard** | FIPS 204 ML-DSA-65 |
+| **Security Level** | NIST Level 3 (128-bit PQ) |
+| **Public Key Size** | 1,952 bytes |
+| **Secret Key Size** | 4,032 bytes |
+| **Signature Size** | 3,309 bytes |
+| **Implementation** | `fips204` crate (`mldsa` module) |
+
+### CRYSTALS-Dilithium3 (Legacy Compatibility Path)
+
+Dilithium3 remains deployed for backwards compatibility and mixed-validator migrations. It uses the same security basis as ML-DSA-65, but the chain now documents it as the legacy Round-3 compatibility algorithm rather than the primary target.
+
+| Property | Value |
+|----------|-------|
+| **Standard** | NIST Round 3 reference (pre-FIPS) |
 | **Security Level** | NIST Level 3 (128-bit PQ) |
 | **Public Key Size** | 1,952 bytes |
 | **Secret Key Size** | 4,032 bytes |
@@ -66,7 +79,7 @@ Used for Shell account address derivation and other high-performance internal
 operations where Ethereum compatibility is not required.
 
 ```text
-address = blake3(version || algo_id || public_key)[0..20]
+address = blake3(algo_id || public_key)
 ```
 
 ### Argon2id (Key Derivation)
@@ -91,16 +104,16 @@ AEAD cipher used to encrypt private keys at rest. The 24-byte nonce is safe for 
 ### Command
 
 ```bash
-shell-node key generate --output keystore.json
+shell-node key generate --algorithm mldsa65 --output keystore.json
 ```
 
 ### What happens internally
 
-1. **CSPRNG key generation** — The `dilithium3::keypair()` function generates a random keypair using the system's cryptographically secure random number generator.
+1. **CSPRNG key generation** — The selected signer backend (ML-DSA-65 by default in this guide; Dilithium3 for legacy compatibility if requested explicitly) generates a random keypair using the system's cryptographically secure random number generator.
 
-2. **Address derivation** — The 20-byte address is computed as:
+2. **Address derivation** — The canonical 32-byte address is computed as:
    ```
-   address = blake3(version || algo_id || public_key)[0..20]
+   address = blake3(algo_id || public_key)
    ```
 
 3. **Password prompt** — You enter an encryption password.
@@ -113,7 +126,7 @@ shell-node key generate --output keystore.json
 
 ### Security properties
 
-- **Secret keys are zeroized** in memory after use via the `zeroize` crate. When a `DilithiumSigner` is dropped, its secret key bytes are overwritten with zeros.
+- **Secret keys are zeroized** in memory after use via the `zeroize` crate. When a signer is dropped, its secret key bytes are overwritten with zeros.
 - **The derived encryption key is zeroized** immediately after encrypting/decrypting.
 - **Each encryption uses a unique salt and nonce**, so encrypting the same key with the same password produces different ciphertext.
 
@@ -128,7 +141,7 @@ The keystore file is a JSON document inspired by the Ethereum Web3 Secret Storag
 ```json
 {
   "version": 1,
-  "address": "pq1...YOUR_PQ1_ADDRESS",
+  "address": "0xYOUR_32_BYTE_ADDRESS",
   "key_type": "dilithium3",
   "kdf": "argon2id",
   "kdf_params": {
@@ -151,8 +164,8 @@ The keystore file is a JSON document inspired by the Ethereum Web3 Secret Storag
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | `u32` | Format version (always `1`) |
-| `address` | `String` | Legacy hex address string stored for compatibility; CLI / RPC surfaces display canonical `pq1...` |
-| `key_type` | `String` | `"dilithium3"` or `"sphincs-sha2-256f"` |
+| `address` | `String` | Canonical 32-byte `0x` address derived from `blake3(algo_id || public_key)` |
+| `key_type` | `String` | `"dilithium3"`, `"mldsa65"`, or `"sphincs-sha2-256f"` |
 | `kdf` | `String` | Key derivation function (always `"argon2id"`) |
 | `kdf_params.m_cost` | `u32` | Memory cost in KiB (65,536 = 64 MiB) |
 | `kdf_params.t_cost` | `u32` | Time cost / iterations (3) |
@@ -167,37 +180,34 @@ The keystore file is a JSON document inspired by the Ethereum Web3 Secret Storag
 
 ```bash
 shell-node key inspect keystore.json
-# Output: Address: pq1...
+# Output: Address: 0x...
 ```
 
-This does **not** require the password. The keystore stores the address in
-plaintext for compatibility, while CLI output uses the canonical `pq1...` form.
+This does **not** require the password. The keystore stores the canonical 32-byte `0x...` address in plaintext so operators can inspect and verify it without decrypting the secret key.
 
 ---
 
 ## Address Derivation
 
-Shell-chain addresses remain **20 bytes internally**, but their canonical
-external form is `pq1...`.
+Shell-chain addresses are **32 bytes end-to-end** and are rendered canonically as `0x` + 64 lowercase hex characters.
 
 ```
-version || algo_id || public_key  ──→  blake3()  ──→  32-byte hash  ──→  take bytes [0..20]  ──→  20-byte address
-                                                                         └──── Bech32m encode ───→  pq1...
+algo_id || public_key  ──→  blake3()  ──→  32-byte address  ──→  `0x` + 64 lowercase hex chars
 ```
 
 ### Step by step
 
-1. Start with the derivation version, the signature algorithm ID, and the raw public key.
-2. Compute `blake3(version || algo_id || public_key)` → 32-byte hash.
-3. Take the first 20 bytes (bytes 0–19 inclusive).
-4. Encode that 20-byte value as Bech32m with HRP `pq` for user-facing display.
+1. Start with the signature algorithm ID and the raw public key.
+2. Compute `blake3(algo_id || public_key)` → 32-byte hash.
+3. Use the full 32-byte digest as the account address.
+4. Render it as canonical lowercase hex: `0x` + 64 characters.
 
 ### Important notes
 
 - The same public key always produces the same address (deterministic).
 - The same public key under different supported algorithms produces different addresses because `algo_id` is part of the preimage.
-- Different public keys produce different addresses (collision-resistant, 160-bit security).
-- Unlike Ethereum, the public key is a Dilithium3 key (1,952 bytes), not an ECDSA key (64 bytes). This means you **cannot** derive the public key from a signature as you can with ECDSA's `ecrecover`.
+- Different public keys produce different addresses (collision-resistant, 256-bit BLAKE3 output).
+- Unlike Ethereum, the public key is a PQ key (ML-DSA-65, Dilithium3, or SPHINCS+), not an ECDSA key (64 bytes). This means you **cannot** derive the public key from a signature as you can with ECDSA's `ecrecover`.
 - The public key must be registered on-chain with the first transaction. Query it via `shell_getPqPubkey`.
 
 ---
@@ -226,7 +236,7 @@ Dilithium3 signatures are ~52× larger than ECDSA, but this is a necessary trade
 | Sign + Verify | < 10 ms (debug < 50 ms) | ~60 ms |
 | 100 Sign+Verify ops | < 1 s | ~6 s |
 
-Dilithium3 is the default because it offers the best balance of security, signature size, and performance. SPHINCS+ is available as a conservative alternative with higher security but larger signatures.
+ML-DSA-65 is the primary governed path, while Dilithium3 remains available for compatibility where older tooling or validator sets still depend on it. SPHINCS+ is available as a conservative alternative with higher security but larger signatures.
 
 ### Batch verification
 
@@ -260,11 +270,11 @@ Shell-chain is **not compatible** with MetaMask, Ledger, or other wallets that u
 |-----------|------|
 | Generate a key | `shell-node key generate --output keystore.json` |
 | View address | `shell-node key inspect keystore.json` |
-| Send a transaction | `shell-node tx send --to pq1... --value ... --keystore keystore.json` |
+| Send a transaction | `shell-node tx send --to 0x... --value ... --keystore keystore.json` |
 | Deploy a contract | `shell-node tx deploy --code 0x... --keystore keystore.json` |
-| Call a contract | `shell-node tx call --to pq1... --data 0x...` |
-| Check balance | `shell-node account balance pq1ADDRESS` |
-| Check nonce | `shell-node account nonce pq1ADDRESS` |
+| Call a contract | `shell-node tx call --to 0x... --data 0x...` |
+| Check balance | `shell-node account balance 0xADDRESS` |
+| Check nonce | `shell-node account nonce 0xADDRESS` |
 | List keystores | `shell-node account list --datadir shell-data` |
 
 ### JSON-RPC compatibility
@@ -275,7 +285,17 @@ The `eth_sign` and `eth_signTransaction` methods return error `-32601` because t
 
 ---
 
-## Additional Algorithms and Future Schemes
+## Algorithm Registry Governance
+
+The live algorithm registry is process-global and is exposed through `shell_getAlgorithmRegistry`. Validators can transition an algorithm through the following lifecycle using system-contract governance:
+
+| Operation | Resulting status | Meaning |
+|-----------|------------------|---------|
+| `proposeAlgorithmActivation(uint8)` | `pending_activation` | announce an algorithm before it is accepted for new transactions |
+| activation commit | `active` | the algorithm is accepted for new signatures |
+| `deprecateAlgorithm(uint8)` | `deprecated` | keep registry visibility but reject new signatures |
+
+This lets the network phase algorithms in or out without changing the transaction container format.
 
 ### SPHINCS+-SHA2-256f (Available Today)
 
@@ -293,15 +313,15 @@ SPHINCS+ keystores use `"key_type": "sphincs-sha2-256f"` and are managed with th
 
 The `MultiVerifier` automatically detects the algorithm from the signature's embedded type tag, enabling mixed validator sets where some validators use Dilithium3 and others use SPHINCS+.
 
-### ML-DSA-65 (Available)
+### Generating ML-DSA-65 Keys
 
-**ML-DSA-65** (FIPS 204) is now supported alongside Dilithium3. Generate ML-DSA-65 keys with:
+Generate ML-DSA-65 keys with:
 
 ```bash
 shell-node key generate --algorithm mldsa65 --output keystore.json
 ```
 
-Existing Dilithium3 keys remain fully valid. The `MultiVerifier` dispatches to the correct algorithm at runtime using the embedded `sig_type` tag.
+Existing Dilithium3 keys remain fully valid for legacy compatibility. The `MultiVerifier` dispatches to the correct algorithm at runtime using the embedded `sig_type` tag.
 
 ### Hybrid Schemes (Research)
 
@@ -326,18 +346,18 @@ This design enables seamless addition of new algorithms without protocol-breakin
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| **Signatures (default)** | Dilithium3 | Fast, compact (for PQ), NIST Level 3 |
-| **Signatures (FIPS 204)** | ML-DSA-65 | Optional FIPS-204 path via `--algorithm mldsa65` |
+| **Signatures (primary)** | ML-DSA-65 | FIPS 204 path and primary governed algorithm |
+| **Signatures (legacy)** | Dilithium3 | Round-3 compatibility for existing deployments and migrations |
 | **Signatures (alt)** | SPHINCS+-SHA2-256f | Conservative, hash-based, NIST Level 5 |
 | **Hashing** | Keccak-256 | Ethereum compatibility |
 | **Internal hashing** | BLAKE3 | Performance |
 | **Keystore KDF** | Argon2id | Memory-hard, side-channel resistant |
 | **Keystore cipher** | XChaCha20-Poly1305 | AEAD, safe random nonces |
-| **Address format** | 20 bytes, `blake3(version \|\| algo_id \|\| pubkey)[0..20]` | PQ-bound, algo-agnostic |
+| **Address format** | 32 bytes, `blake3(algo_id \|\| pubkey)` | PQ-bound, algo-agnostic |
 | **Key zeroization** | `zeroize` crate | Secure memory erasure |
 
 Shell-chain is quantum-ready today. No migration will be needed when quantum computers arrive.
 
 ---
 
-*Last updated: 2026-05-20*
+*Last updated: 2026-05-22*

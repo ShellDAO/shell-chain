@@ -134,7 +134,7 @@ Signs a transaction with a local account (unsupported).
 get_compilers() → Vec<String>
 ```
 
-Returns a list of available compilers (deprecated, always empty).
+Returns a list of available compilers (always empty).
 
 ### eth_protocolVersion
 ```
@@ -713,6 +713,16 @@ after STARK proof arrives" (archive mode behavior).
 Returns an error when the node has not been configured with a profile
 (e.g. legacy startup paths). Stable consumers should treat such an
 error as `"profile: unknown"`.
+
+### shell_getAlgorithmRegistry
+```
+get_algorithm_registry() → serde_json::Value
+```
+
+Returns the live algorithm registry as an array of entries:
+- `algo` — algorithm name (`"MlDsa65"`, `"Dilithium3"`, `"SphincsSha2256f"`)
+- `status` — `"active"`, `"deprecated"`, or `"pending_activation"`
+- `description` — human-readable description
 
 ### shell_getProofAmendment
 ```

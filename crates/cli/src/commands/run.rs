@@ -27,7 +27,6 @@ use tracing::{error, info, warn};
 use crate::password::{resolve_password, PasswordArgs};
 
 /// Aggregated CLI arguments for the `run` subcommand.
-#[allow(dead_code)]
 pub struct RunArgs {
     pub datadir: PathBuf,
     pub rpc_addr: String,
@@ -766,6 +765,7 @@ async fn run_with_store<S: KvStore + 'static>(
         }
         #[cfg(not(feature = "libp2p"))]
         {
+            let _ = (&args.p2p_addr, &args.bootnodes, args.enable_mdns);
             return Err("libp2p support not compiled. Rebuild with: cargo build -p shell-cli --features libp2p".into());
         }
     } else {

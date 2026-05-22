@@ -778,17 +778,6 @@ pub(crate) fn parse_block_tag(s: &str) -> Result<BlockTag, ErrorObjectOwned> {
     }
 }
 
-/// Legacy helper used by callers that don't need pending semantics.
-/// `Finalized` is treated the same as `Latest` (resolves to head) because
-/// the caller has no access to the shared finalized-number state.
-#[allow(dead_code)]
-pub(crate) fn parse_block_number(s: &str) -> Result<Option<u64>, ErrorObjectOwned> {
-    match parse_block_tag(s)? {
-        BlockTag::Latest | BlockTag::Pending | BlockTag::Finalized => Ok(None),
-        BlockTag::Number(n) => Ok(Some(n)),
-    }
-}
-
 /// F-100: validate that a block tag is well-formed.
 /// Returns an error for malformed block parameters.
 pub(crate) fn validate_block_is_latest(s: &str) -> Result<(), ErrorObjectOwned> {

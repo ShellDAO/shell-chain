@@ -4,9 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-05-22 — Round 3 completion
+
 ### Added
 
-- **Algorithm registry governance runtime**: `AlgorithmRegistry` is now mutable at runtime, validator governance can propose/activate/deprecate signature algorithms via native system-contract calls, and RPC exposes the live registry through `shell_getAlgorithmRegistry`.
+- **Algorithm registry governance runtime**: `AlgorithmRegistry` is now mutable at runtime, validator governance can propose, activate, and deprecate signature algorithms via native system-contract calls, and RPC exposes the live registry through `shell_getAlgorithmRegistry`.
+- **wPoA view-change rotation**: signed `WPoaViewChange` messages now advance the proposer view after timeout using the same weighted quorum model as finality.
+- **STARK challenge lifecycle tracking**: proof challenges are recorded as `Open`, transition to `Resolved` on a valid response, and automatically become `Slashed` after the `T_c = 7200` block timeout.
+- **State-trie pruning path**: `prune_state_trie()` now prunes unreachable trie snapshots for `StorageProfile::Light`, complementing witness/body pruning.
+
+### Changed
+
+- **Economic slashing is weight-aware**: PoA and wPoA now apply `slash_weight_bps` reductions to a validator's effective weight, flooring at zero across repeated offences.
+
+### Fixed
+
+- **Bandwidth/liveness cleanup**: Round 3 network hardening reduces stale proof/challenge traffic and aligns docs with the current R3 implementation.
 
 ## [0.22.2] — 2026-05-12
 

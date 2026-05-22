@@ -58,7 +58,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     }
 
     async fn get_compilers(&self) -> Result<Vec<String>, ErrorObjectOwned> {
-        // Deprecated method; always returns an empty array.
+        // Legacy Ethereum method; always returns an empty array.
         Ok(vec![])
     }
 

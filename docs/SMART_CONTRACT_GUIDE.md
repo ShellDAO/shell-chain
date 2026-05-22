@@ -183,7 +183,7 @@ curl -s http://localhost:8545 \
     "jsonrpc":"2.0",
     "method":"eth_call",
     "params":[{
-      "to":"pq1YOUR_CONTRACT_ADDRESS",
+      "to":"0xYOUR_CONTRACT_ADDRESS",
       "data":"0x6d4ce63c"
     },"latest"],
     "id":1
@@ -192,10 +192,10 @@ curl -s http://localhost:8545 \
 
 Or with Hardhat:
 
-> **Compatibility note:** Shell-native EOA and contract addresses use bech32m `pq1...` format. Tooling that hardcodes 20-byte hex inputs (e.g., default Hardhat scripts) will fail at the Shell RPC boundary; use the shell-sdk pq1 helpers.
+> **Compatibility note:** Shell-native EOA and contract addresses use canonical 32-byte `0x...` format. Tooling that hardcodes 20-byte hex inputs (e.g., default Hardhat scripts) will fail at the Shell RPC boundary; use 32-byte hex addresses end-to-end.
 
 ```js
-const counter = await hre.ethers.getContractAt("Counter", "pq1...YOUR_CONTRACT_PQ1_ADDRESS");
+const counter = await hre.ethers.getContractAt("Counter", "0x...YOUR_CONTRACT_ADDRESS");
 const count = await counter.get();
 console.log("Current count:", count.toString());
 ```
@@ -219,7 +219,7 @@ curl -s http://localhost:8545 \
 Or with Hardhat:
 
 ```js
-const counter = await hre.ethers.getContractAt("Counter", "pq1...YOUR_CONTRACT_PQ1_ADDRESS");
+const counter = await hre.ethers.getContractAt("Counter", "0x...YOUR_CONTRACT_ADDRESS");
 const tx = await counter.increment();
 await tx.wait();
 console.log("Incremented! New count:", (await counter.get()).toString());
@@ -245,7 +245,7 @@ curl -s http://localhost:8545 \
     "jsonrpc":"2.0",
     "method":"shell_sendTransaction",
     "params":[{
-      "from": "pq1YOUR_ADDRESS",
+      "from": "0xYOUR_ADDRESS",
       "data": "0x608060405234801561001057600080fd5b50...",
       "gas": "0x100000",
       "maxFeePerGas": "0x5f7609",
@@ -306,13 +306,20 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 ### Signature behavior
 
 - **`ecrecover` (0x01) is disabled.** The precompile exists at address `0x01` but is a no-op — it returns empty bytes to force PQ migration. Contracts that call `ecrecover` will receive an empty result, not `address(0)`. Do not rely on it.
-- **Use the PQ precompile instead.** See [PQ_DILITHIUM_VERIFY precompile](#pq_dilithium_verify-precompile-0x0100) below.
+- **Use the PQ precompile suite instead.** The current runtime exposes six native precompiles at `0x0001`–`0x0006`.
 
-### PQ_DILITHIUM_VERIFY precompile (`0x0100`)
+### PQ precompile suite (`0x0001`–`0x0006`)
 
-Shell-Chain exposes a native Dilithium3 signature verification precompile at address `0x0000000000000000000000000000000000000100`.
+| Address | Function | Gas model |
+|---------|----------|-----------|
+| `0x0000000000000000000000000000000000000001` | ML-DSA-65 / Dilithium3 verify | flat `46,000` |
+| `0x0000000000000000000000000000000000000002` | SLH-DSA-SHA2-256f verify | flat `2,300,000` |
+| `0x0000000000000000000000000000000000000003` | ML-DSA-65 batch verify | `12,000 × signatures` |
+| `0x0000000000000000000000000000000000000004` | BLAKE3-256 | `30 + 6 × words` |
+| `0x0000000000000000000000000000000000000005` | BLAKE3-512 | `30 + 6 × words` |
+| `0x0000000000000000000000000000000000000006` | PQ address derive | flat `200` |
 
-**Gas cost:** 10,000 (flat, regardless of message length)
+The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 
 **Input format** (length-prefixed binary, no ABI encoding):
 ```
@@ -329,7 +336,7 @@ Shell-Chain exposes a native Dilithium3 signature verification precompile at add
 pragma solidity ^0.8.24;
 
 library PQVerify {
-    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000100;
+    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000001;
 
     /// Verify a Dilithium3 signature. Returns true on valid.
     function verify(
@@ -382,7 +389,7 @@ Shell-Chain uses the **EIP-1559** gas model:
         "jsonrpc":"2.0",
         "method":"eth_createAccessList",
         "params":[{
-         "to":"pq1YOUR_CONTRACT_ADDRESS",
+         "to":"0xYOUR_CONTRACT_ADDRESS",
          "data":"0x..."
         },"latest"],
         "id":1
