@@ -6189,6 +6189,7 @@ dependencies = [
  "hex",
  "lru",
  "parking_lot",
+ "rlp",
  "rocksdb",
  "serde",
  "serde_json",

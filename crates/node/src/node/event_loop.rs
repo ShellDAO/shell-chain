@@ -41,6 +41,82 @@ impl NodeTaskLifecycle {
 }
 
 impl<S: KvStore + 'static> Node<S> {
+    fn track_open_challenge(
+        &self,
+        challenge_id: ShellHash,
+        block_number: u64,
+        challenger: Address,
+    ) {
+        let prover = self
+            .amendment_store
+            .get_amendment(&challenge_id)
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                ProofAmendment::from_json(&bytes)
+                    .ok()
+                    .map(|amendment| amendment.prover)
+            })
+            .or_else(|| {
+                self.chain_store
+                    .get_block_by_hash(&challenge_id)
+                    .ok()
+                    .flatten()
+                    .map(|block| block.header.proposer)
+            })
+            .or_else(|| {
+                self.chain_store
+                    .get_block_by_number(block_number)
+                    .ok()
+                    .flatten()
+                    .map(|block| block.header.proposer)
+            })
+            .unwrap_or(Address::ZERO);
+        self.challenge_lifecycle
+            .lock()
+            .open_challenge(ChallengeRecord {
+                challenge_id,
+                prover,
+                challenger,
+                opened_at_block: self.head_number(),
+                status: ChallengeStatus::Open,
+            });
+    }
+
+    fn resolve_open_challenge(&self, challenge_id: &ShellHash) {
+        let _ = self
+            .challenge_lifecycle
+            .lock()
+            .resolve_challenge(challenge_id);
+    }
+
+    fn slash_timed_out_challenges(&self, block_number: u64) {
+        let slashed = self.challenge_lifecycle.lock().check_timeouts(block_number);
+        for record in slashed {
+            if record.prover == Address::ZERO {
+                warn!(
+                    challenge_id = %record.challenge_id,
+                    challenger = %record.challenger,
+                    opened_at_block = record.opened_at_block,
+                    current_block = block_number,
+                    timeout_blocks = CHALLENGE_TIMEOUT_BLOCKS,
+                    "challenge timed out but prover is unknown; skipping slash"
+                );
+                continue;
+            }
+            warn!(
+                challenge_id = %record.challenge_id,
+                prover = %record.prover,
+                challenger = %record.challenger,
+                opened_at_block = record.opened_at_block,
+                current_block = block_number,
+                timeout_blocks = CHALLENGE_TIMEOUT_BLOCKS,
+                "challenge timed out; slashing prover"
+            );
+            self.consensus.write().slash_authority(&record.prover);
+        }
+    }
+
     /// Run the async event loop.
     ///
     /// Drives block production, network event handling, and RPC serving:
@@ -556,6 +632,10 @@ impl<S: KvStore + 'static> Node<S> {
                                         }
                                     }
                                 }
+                                self.slash_timed_out_challenges(number);
+                                self.consensus
+                                    .write()
+                                    .note_block_progress(Self::wall_clock_millis());
                                 eprintln!(
                                     "⛏  Block #{number} produced ({tx_count} txs, {gas} gas)"
                                 );
@@ -621,46 +701,56 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                     }
 
-                    // W.5: Tick wPoA round state machine to detect proposal/vote timeouts.
-                    {
-                        let now = std::time::Instant::now();
-                        let events = if let Some(ref round) = *self.wpoa_round.lock() {
-                            round.tick(now)
-                        } else {
-                            vec![]
-                        };
-                        for event in events {
-                            match event {
-                                WPoaEvent::VoteTimeout { current_round }
-                                | WPoaEvent::ProposeTimeout { current_round } => {
-                                    warn!(
-                                        current_round,
-                                        "W.5: wPoA round timeout — initiating view change"
+                    // W.5: If the proposer fails to produce within the timeout,
+                    // broadcast a signed view-change vote for the current height.
+                    if self.consensus.read().engine_type() == EngineType::WPoA && can_produce_blocks {
+                        let now_ms = Self::wall_clock_millis();
+                        let timed_out = self
+                            .consensus
+                            .read()
+                            .check_view_change_timeout(now_ms, self.config.block_time_ms);
+                        if timed_out {
+                            let validator = self
+                                .config
+                                .proposer_address
+                                .expect("validated block producer has proposer address");
+                            let view = self.consensus.read().current_view();
+                            let block_number = self.head_number() + 1;
+                            let signing_message =
+                                ViewChangeMessage::signing_message(view, block_number);
+                            match signer.sign(&signing_message) {
+                                Ok(signature) => {
+                                    let msg = ViewChangeMessage::new(
+                                        view,
+                                        block_number,
+                                        validator,
+                                        signature.data,
                                     );
-                                    let new_view = current_round + 1;
-                                    if let Some(ref mut r) = *self.wpoa_round.lock() {
-                                        r.start_view_change(new_view);
-                                    }
-                                    if can_produce_blocks {
-                                        let voter = self
-                                            .config
-                                            .proposer_address
-                                            .expect("validated block producer has proposer address");
-                                        let block_number = self
-                                            .wpoa_round
-                                            .lock()
-                                            .as_ref()
-                                            .map(|r| r.block_number)
-                                            .unwrap_or_else(|| self.head_number() + 1);
-                                        let vc_msg = NetworkMessage::WPoaViewChange {
-                                            new_view,
-                                            block_number,
-                                            voter,
-                                        };
-                                        let _ = network.broadcast(vc_msg).await;
-                                    }
+                                    let total_weight: u64 = self
+                                        .consensus
+                                        .read()
+                                        .validator_weights()
+                                        .values()
+                                        .copied()
+                                        .sum();
+                                    let quorum = self
+                                        .consensus
+                                        .write()
+                                        .handle_view_change_message(msg.clone(), total_weight);
+                                    warn!(
+                                        view,
+                                        block_number,
+                                        timeout_ms = VIEW_CHANGE_TIMEOUT_MS,
+                                        quorum,
+                                        "W.5: proposer timeout — broadcasting view change"
+                                    );
+                                    let _ = network
+                                        .broadcast(NetworkMessage::WPoaViewChange(Box::new(msg)))
+                                        .await;
                                 }
-                                _ => {}
+                                Err(error) => {
+                                    warn!(%error, view, block_number, "W.5: failed to sign view change");
+                                }
                             }
                         }
                     }
@@ -680,6 +770,9 @@ impl<S: KvStore + 'static> Node<S> {
                                     // inside import_block doesn't starve other async tasks.
                                     match tokio::task::block_in_place(|| self.import_block(*block, &verifier)) {
                                         Ok(()) => {
+                                            self.consensus
+                                                .write()
+                                                .note_block_progress(Self::wall_clock_millis());
                                             let head_after_import = self.head_number();
                                             let canonical_advanced =
                                                 head_after_import > head_before_import
@@ -711,6 +804,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 self.finality.read().last_finalized_number(),
                                             );
                                             self.metrics.tx_pool_size.set(self.tx_pool.len() as i64);
+                                            self.slash_timed_out_challenges(imported_number);
 
                                             // Notify eth_subscribe listeners.
                                             let receipts = self
@@ -940,6 +1034,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                     self.finality.read().last_finalized_number(),
                                                 );
                                                 debug!(number = num, "synced block");
+                                                self.slash_timed_out_challenges(num);
                                                 if let Some(cert) = certs.get(&bhash) {
                                                     self.fast_finalize_with_certificate(
                                                         num, bhash, cert,
@@ -1255,6 +1350,11 @@ impl<S: KvStore + 'static> Node<S> {
                                 // If we hold the proof, respond with raw bytes.
                                 NetworkMessage::ProofChallenge(challenge) => {
                                     debug!(%peer, block = challenge.block_number, reason = %challenge.reason, "I2: received ProofChallenge");
+                                    self.track_open_challenge(
+                                        challenge.block_hash,
+                                        challenge.block_number,
+                                        challenge.challenger,
+                                    );
                                     if let Ok(Some(proof_bytes)) = self.amendment_store.get_amendment(&challenge.block_hash) {
                                         use shell_consensus::ChallengeResponse;
                                         if self.config.node_role.runs_prover() {
@@ -1279,6 +1379,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 if let Err(e) = self.amendment_store.put_amendment(&resp.block_hash, &resp.proof_bytes) {
                                                     warn!("I2: failed to store verified challenge response: {e}");
                                                 } else {
+                                                    self.resolve_open_challenge(&resp.block_hash);
                                                     info!(block = %resp.block_hash, "I2: challenge response verified and stored");
                                                 }
                                             } else {
@@ -1397,10 +1498,25 @@ impl<S: KvStore + 'static> Node<S> {
                                     // PS.2: after every vote, flush scored-below-threshold peers to ban list.
                                     self.flush_scorer_bans();
                                 }
-                                // W.5: Receive a wPoA view-change vote from a peer validator.
-                                NetworkMessage::WPoaViewChange { new_view, block_number, voter } => {
-                                    debug!(%peer, new_view, block = block_number, %voter, "W.5: received WPoaViewChange");
-                                    self.handle_wpoa_view_change(voter, new_view, block_number);
+                                // W.5: Receive a signed wPoA view-change vote from a peer validator.
+                                NetworkMessage::WPoaViewChange(view_change) => {
+                                    debug!(
+                                        %peer,
+                                        view = view_change.view,
+                                        block = view_change.block_number,
+                                        validator = %view_change.validator,
+                                        "W.5: received WPoaViewChange"
+                                    );
+                                    let verifier = MultiVerifier;
+                                    match self.handle_wpoa_view_change(*view_change, &verifier) {
+                                        Ok(quorum) if quorum => {
+                                            info!("W.5: view-change quorum reached; proposer rotated");
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            warn!(%error, %peer, "W.5: rejected view-change message");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2090,6 +2206,13 @@ impl<S: KvStore + 'static> Node<S> {
             // the frontier and re-seed correctly.
         }
         Ok(queued)
+    }
+
+    fn wall_clock_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     fn wall_clock_secs() -> u64 {

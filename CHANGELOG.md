@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Algorithm registry governance runtime**: `AlgorithmRegistry` is now mutable at runtime, validator governance can propose/activate/deprecate signature algorithms via native system-contract calls, and RPC exposes the live registry through `shell_getAlgorithmRegistry`.
+
 ## [0.22.2] — 2026-05-12
 
 ### Fixed

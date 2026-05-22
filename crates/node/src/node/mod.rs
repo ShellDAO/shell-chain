@@ -3,6 +3,7 @@
 mod block_importer;
 mod block_producer;
 mod chain_state_machine;
+mod challenge_lifecycle;
 mod dev_rpc;
 mod event_loop;
 mod invariants;
@@ -22,7 +23,8 @@ pub(crate) use tracing::{debug, info, warn};
 pub(crate) use shell_consensus::{
     detect_double_sign, detect_offline, Attestation, ConsensusEngine, EngineType,
     EquivocationProof, FinalityState, ForkChoice, PeerScorer, PeerScoringConfig,
-    ProofWindowManager, SlashingConfig, WPoaEvent, WPoaRound, WindowConfig,
+    ProofWindowManager, SlashingConfig, ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig,
+    VIEW_CHANGE_TIMEOUT_MS,
 };
 pub(crate) use shell_core::{
     calculate_base_fee, effective_gas_price, Account, Block, BlockHeader, SignedTransaction,
@@ -46,8 +48,11 @@ pub(crate) use crate::config::NodeConfig;
 pub(crate) use crate::error::NodeError;
 pub(crate) use crate::metrics::Metrics;
 pub(crate) use crate::prover_service::{ProverConfig, ProverService, ProverServiceHandle};
-pub(crate) use crate::pruning::{StateRootTracker, StorageProfile};
+pub(crate) use crate::pruning::{prune_state_trie, StateRootTracker, StorageProfile};
 pub(crate) use chain_state_machine::{BlockImportTransition, ChainStateMachine};
+pub(crate) use challenge_lifecycle::{
+    ChallengeLifecycle, ChallengeRecord, ChallengeStatus, CHALLENGE_TIMEOUT_BLOCKS,
+};
 pub(crate) use readiness::{ProductionReadiness, ProductionReadinessState};
 
 pub(crate) use shell_stark_prover::{
@@ -130,6 +135,8 @@ pub struct Node<S: KvStore + 'static> {
     /// I4: Proof window manager — tracks claim/squatting per block.
     /// Advances on each block import; drives prover reliability scoring in wPoA era.
     pub proof_window_manager: parking_lot::Mutex<ProofWindowManager>,
+    /// White paper §7 challenge state machine for proof disputes.
+    pub(crate) challenge_lifecycle: parking_lot::Mutex<ChallengeLifecycle>,
     /// W.5: Active wPoA round state machine for the current block height.
     /// `None` when running plain PoA or no block is in-flight.
     pub wpoa_round: parking_lot::Mutex<Option<shell_consensus::wpoa_state::WPoaRound>>,
@@ -650,6 +657,7 @@ impl<S: KvStore + 'static> Node<S> {
             proof_window_manager: parking_lot::Mutex::new(ProofWindowManager::new(
                 WindowConfig::default(),
             )),
+            challenge_lifecycle: parking_lot::Mutex::new(ChallengeLifecycle::new()),
             wpoa_round: parking_lot::Mutex::new(None),
             peer_scorer: parking_lot::Mutex::new(PeerScorer::new(PeerScoringConfig::default())),
             peer_ban_list: parking_lot::Mutex::new(shell_network::PeerBanList::new(
@@ -712,14 +720,13 @@ impl<S: KvStore + 'static> Node<S> {
         // Use the canonical classifier so banner + P2P capability stay consistent.
         let profile_name = StorageProfile::from_pruning_config(p).as_str();
 
-        let state_mode = if p.state_pruning_experimental {
-            if p.keep_recent == 0 {
-                "archive (experimental enabled but keep_recent=0)".to_string()
-            } else {
-                format!("keep-{} (experimental)", p.keep_recent)
-            }
-        } else if p.keep_recent == 0 {
+        let state_mode = if p.keep_recent == 0 {
             "archive".to_string()
+        } else if matches!(
+            StorageProfile::from_pruning_config(p),
+            StorageProfile::Light
+        ) {
+            format!("keep-{} (pruned)", p.keep_recent)
         } else {
             format!("keep-{}", p.keep_recent)
         };
@@ -1110,23 +1117,42 @@ impl<S: KvStore + 'static> Node<S> {
 
     /// Record a finalised state root, run state pruning, and evict old entries.
     fn record_finalized_state_root(&self, block_number: u64, state_root: ShellHash) {
-        let mut tracker = self.state_root_tracker.write();
-        if let Some(evicted) = tracker.record(block_number, state_root) {
-            tracing::debug!(
-                block = evicted.block_number,
-                root = %evicted.state_root,
-                "state root eligible for pruning"
-            );
-            // L3: when experimental trie pruning is enabled, evict trie nodes
-            // for the now-unreachable state root.  Until reference-counting is
-            // fully wired into the trie writer path, this only logs intent.
-            if self.config.pruning.state_pruning_experimental {
+        let profile = StorageProfile::from_pruning_config(&self.config.pruning);
+        let keep_recent = self.config.pruning.keep_recent;
+        let mut prune_keep_below = None;
+
+        {
+            let mut tracker = self.state_root_tracker.write();
+            if let Some(evicted) = tracker.record(block_number, state_root) {
                 tracing::debug!(
                     block = evicted.block_number,
                     root = %evicted.state_root,
-                    "L3 (experimental): trie node eviction eligible — \
-                     full ref-count walk deferred until trie writer is instrumented"
+                    "state root eligible for pruning"
                 );
+                if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
+                    prune_keep_below =
+                        Some(block_number.saturating_add(1).saturating_sub(keep_recent));
+                }
+            }
+        }
+
+        if let Some(keep_below_block) = prune_keep_below {
+            match prune_state_trie(Arc::clone(&self.store), keep_below_block, profile) {
+                Ok(result) => {
+                    if result.deleted_nodes > 0 {
+                        tracing::info!(
+                            keep_below_block,
+                            pruned_roots = result.pruned_roots,
+                            deleted_nodes = result.deleted_nodes,
+                            skipped_roots = result.skipped_roots,
+                            block = block_number,
+                            "state trie pruning deleted old snapshots"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, keep_below_block, "state trie pruning pass failed");
+                }
             }
         }
 
@@ -1213,6 +1239,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Periodic status log every 64 blocks.
         if block_number > 0 && block_number.is_multiple_of(64) {
+            let tracker = self.state_root_tracker.read();
             let oldest = tracker.oldest().map(|e| e.block_number).unwrap_or(0);
             tracing::info!(
                 tracked = tracker.len(),
@@ -5796,22 +5823,20 @@ mod tests {
         #[test]
         fn wpoa_network_message_wpoa_view_change_serde() {
             let voter = Address::from([0xef; 32]);
-            let msg = NetworkMessage::WPoaViewChange {
-                new_view: 3,
-                block_number: 10,
+            let msg = NetworkMessage::WPoaViewChange(Box::new(ViewChangeMessage::new(
+                3,
+                10,
                 voter,
-            };
+                vec![9, 9, 9],
+            )));
             let json = serde_json::to_string(&msg).expect("serialize failed");
             let decoded: NetworkMessage = serde_json::from_str(&json).expect("deserialize failed");
             match decoded {
-                NetworkMessage::WPoaViewChange {
-                    new_view: nv,
-                    block_number: bn,
-                    voter: v,
-                } => {
-                    assert_eq!(nv, 3);
-                    assert_eq!(bn, 10);
-                    assert_eq!(v, voter);
+                NetworkMessage::WPoaViewChange(view_change) => {
+                    assert_eq!(view_change.view, 3);
+                    assert_eq!(view_change.block_number, 10);
+                    assert_eq!(view_change.validator, voter);
+                    assert_eq!(view_change.signature, vec![9, 9, 9]);
                 }
                 _ => panic!("expected WPoaViewChange after deserialization"),
             }

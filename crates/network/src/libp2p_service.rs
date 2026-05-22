@@ -972,7 +972,7 @@ impl NetworkService for Libp2pNetwork {
             | NetworkMessage::ProofChallengeResponse(_) => TopicKind::Blocks,
             NetworkMessage::StorageCapability { .. }
             | NetworkMessage::WPoaVote { .. }
-            | NetworkMessage::WPoaViewChange { .. } => TopicKind::Attestation,
+            | NetworkMessage::WPoaViewChange(_) => TopicKind::Attestation,
         };
 
         let data =

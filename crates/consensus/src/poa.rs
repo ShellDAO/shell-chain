@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use shell_core::{Block, BlockHeader};
 use shell_crypto::{PQSignature, Signer, Verifier};
 use shell_primitives::{keccak256, Address};
@@ -20,9 +22,11 @@ pub struct PoaConfig {
     pub max_future_secs: u64,
     /// Number of blocks per epoch. 0 means no epochs (legacy behavior).
     pub epoch_length: u64,
-    /// Authorities that have been slashed for equivocation and are excluded from
-    /// block production. Slashed addresses are checked in `is_authority()`.
-    pub slashed: std::collections::HashSet<Address>,
+    /// Authorities that have been slashed for equivocation. The set records
+    /// offenses for observability; economic penalties are tracked in-engine.
+    pub slashed: HashSet<Address>,
+    /// Weight reduction applied per slash, in basis points.
+    pub slash_weight_bps: u64,
 }
 
 /// Default maximum future timestamp tolerance (60 seconds).
@@ -36,7 +40,8 @@ impl PoaConfig {
             block_time_secs,
             max_future_secs: DEFAULT_MAX_FUTURE_SECS,
             epoch_length: 0,
-            slashed: std::collections::HashSet::new(),
+            slashed: HashSet::new(),
+            slash_weight_bps: 1_000,
         }
     }
 
@@ -163,14 +168,10 @@ impl PoaConfig {
     }
 
     pub fn is_authority(&self, address: &Address) -> bool {
-        self.authorities.contains(address) && !self.slashed.contains(address)
+        self.authorities.contains(address)
     }
 
-    /// Mark an authority as slashed due to equivocation.
-    ///
-    /// Slashed authorities are excluded from `is_authority()` checks and
-    /// cannot propose new blocks. The slash is in-memory only; operators
-    /// must update the genesis/config to permanently remove the authority.
+    /// Record an in-memory slash for `offender`.
     pub fn slash_authority(&mut self, offender: &Address) {
         self.slashed.insert(*offender);
     }
@@ -192,11 +193,15 @@ impl PoaConfig {
 /// Each block must be sealed with the proposer's PQ signature.
 pub struct PoaEngine {
     config: PoaConfig,
+    slash_weights: HashMap<Address, u64>,
 }
 
 impl PoaEngine {
     pub fn new(config: PoaConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            slash_weights: HashMap::new(),
+        }
     }
 
     pub fn config(&self) -> &PoaConfig {
@@ -208,16 +213,44 @@ impl PoaEngine {
         &mut self.config
     }
 
+    fn base_weight_for(&self, authority: &Address) -> Option<u64> {
+        let idx = self
+            .config
+            .authorities
+            .iter()
+            .position(|candidate| candidate == authority)?;
+        Some(
+            self.config
+                .authority_weights
+                .get(idx)
+                .copied()
+                .unwrap_or(1)
+                .max(1),
+        )
+    }
+
+    fn effective_weight_for(&self, authority: &Address) -> Option<u64> {
+        self.base_weight_for(authority).map(|base_weight| {
+            let reduction = self.slash_weights.get(authority).copied().unwrap_or(0);
+            base_weight.saturating_sub(reduction)
+        })
+    }
+
     /// Slash an authority for equivocation.
-    ///
-    /// The slashed address is immediately excluded from `is_authority()` checks,
-    /// preventing it from proposing future blocks. Delegates to `PoaConfig::slash_authority`.
     pub fn slash_authority(&mut self, offender: &Address) {
         self.config.slash_authority(offender);
+
+        let current_weight = self.effective_weight_for(offender).unwrap_or(1);
+        let slash_amount =
+            ((current_weight as u128) * (self.config.slash_weight_bps as u128) / 10_000u128) as u64;
+        let base_weight = self.base_weight_for(offender).unwrap_or(1);
+        let cumulative = self.slash_weights.get(offender).copied().unwrap_or(0);
+        let updated = cumulative.saturating_add(slash_amount).min(base_weight);
+        self.slash_weights.insert(*offender, updated);
     }
 
     fn verify_proposer(&self, header: &BlockHeader) -> Result<(), ConsensusError> {
-        if !self.config.is_authority(&header.proposer) {
+        if self.effective_weight_for(&header.proposer).unwrap_or(0) == 0 {
             return Err(ConsensusError::UnknownProposer(header.proposer));
         }
 
@@ -364,15 +397,19 @@ impl ConsensusEngine for PoaEngine {
     }
 
     fn slash_authority(&mut self, offender: &Address) {
-        self.config.slash_authority(offender);
+        PoaEngine::slash_authority(self, offender);
     }
 
-    fn validator_weights(&self) -> std::collections::HashMap<Address, u64> {
+    fn validator_weights(&self) -> HashMap<Address, u64> {
         self.config
             .authorities
             .iter()
-            .filter(|a| !self.config.slashed.contains(a))
-            .map(|a| (*a, 1u64))
+            .map(|authority| {
+                (
+                    *authority,
+                    self.effective_weight_for(authority).unwrap_or_default(),
+                )
+            })
             .collect()
     }
 }
@@ -1172,5 +1209,59 @@ mod tests {
         let addrs = make_weighted_addrs(2);
         let config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![10, 5]);
         assert_eq!(config.authority_weights, vec![10, 5]);
+    }
+
+    #[test]
+    fn slash_reduces_weight_by_bps() {
+        let addrs = make_weighted_addrs(2);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![100, 50]);
+        config.slash_weight_bps = 1_000;
+        let mut engine = PoaEngine::new(config);
+
+        engine.slash_authority(&addrs[0]);
+
+        let weights = engine.validator_weights();
+        assert_eq!(weights.get(&addrs[0]), Some(&90));
+        assert_eq!(weights.get(&addrs[1]), Some(&50));
+    }
+
+    #[test]
+    fn multiple_slashes_are_cumulative() {
+        let addrs = make_weighted_addrs(1);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![100]);
+        config.slash_weight_bps = 1_000;
+        let mut engine = PoaEngine::new(config);
+
+        engine.slash_authority(&addrs[0]);
+        engine.slash_authority(&addrs[0]);
+
+        assert_eq!(engine.validator_weights().get(&addrs[0]), Some(&81));
+    }
+
+    #[test]
+    fn slash_weight_floors_at_zero() {
+        let addrs = make_weighted_addrs(1);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![10]);
+        config.slash_weight_bps = 10_000;
+        let mut engine = PoaEngine::new(config);
+
+        engine.slash_authority(&addrs[0]);
+        engine.slash_authority(&addrs[0]);
+
+        assert_eq!(engine.validator_weights().get(&addrs[0]), Some(&0));
+    }
+
+    #[test]
+    fn unslashed_validators_are_unaffected() {
+        let addrs = make_weighted_addrs(2);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![40, 60]);
+        config.slash_weight_bps = 2_500;
+        let mut engine = PoaEngine::new(config);
+
+        engine.slash_authority(&addrs[1]);
+
+        let weights = engine.validator_weights();
+        assert_eq!(weights.get(&addrs[0]), Some(&40));
+        assert_eq!(weights.get(&addrs[1]), Some(&45));
     }
 }

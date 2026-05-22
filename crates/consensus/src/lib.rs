@@ -9,6 +9,7 @@ pub mod prover_registry;
 pub mod rate_limiter;
 pub mod slashing;
 pub mod validator;
+pub mod view_change;
 pub mod window;
 pub mod wpoa;
 pub mod wpoa_state;
@@ -27,6 +28,7 @@ pub use slashing::{
     SlashingConfig,
 };
 pub use validator::{ValidatorInfo, ValidatorSet, ValidatorSetConfig, ValidatorStatus};
+pub use view_change::{ViewChangeMessage, ViewChangeState, VIEW_CHANGE_TIMEOUT_MS};
 pub use window::{ProofWindowManager, WindowConfig, WindowError, WindowState};
 pub use wpoa::{WPoaConfig, WPoaEngine};
 pub use wpoa_state::{WPoaEvent, WPoaRound};

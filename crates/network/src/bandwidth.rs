@@ -211,8 +211,10 @@ mod tests {
 
     #[test]
     fn outbound_limit_triggers() {
-        let tracker = BandwidthTracker::new(0, 200);
-        assert!(tracker.record_outbound(200));
+        // Use limit=1 so that a single token takes 1 second to refill — the test
+        // is then immune to sub-millisecond timing jitter on slow CI machines.
+        let tracker = BandwidthTracker::new(0, 1);
+        assert!(tracker.record_outbound(1));
         assert!(!tracker.record_outbound(1));
     }
 

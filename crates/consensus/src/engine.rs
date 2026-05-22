@@ -5,8 +5,7 @@ use shell_core::{Block, BlockHeader};
 use shell_crypto::{PQSignature, Signer, Verifier};
 use shell_primitives::Address;
 
-use crate::ConsensusError;
-use crate::PoaConfig;
+use crate::{ConsensusError, PoaConfig, ViewChangeMessage};
 
 /// Consensus engine type identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,13 +72,31 @@ pub trait ConsensusEngine: Send + Sync {
         verifier: &dyn Verifier,
     ) -> Result<(), ConsensusError>;
 
-    /// Slash a misbehaving authority, removing it from the active set.
+    /// Slash a misbehaving authority, reducing its effective economic weight.
     fn slash_authority(&mut self, offender: &Address);
 
     /// Return the active validator set with per-validator weights.
     ///
     /// Used by the wPoA state machine to initialize quorum tracking.
     fn validator_weights(&self) -> HashMap<Address, u64>;
+
+    /// Record a view-change vote and return true when quorum advances the view.
+    fn handle_view_change_message(&mut self, _msg: ViewChangeMessage, _total_weight: u64) -> bool {
+        false
+    }
+
+    /// Return the active view for the next in-flight block.
+    fn current_view(&self) -> u64 {
+        0
+    }
+
+    /// Return true when the proposer timeout has elapsed for the current height.
+    fn check_view_change_timeout(&self, _now_ms: u64, _block_time_ms: u64) -> bool {
+        false
+    }
+
+    /// Reset the view-change timeout window after a block is produced or imported.
+    fn note_block_progress(&mut self, _now_ms: u64) {}
 }
 
 #[cfg(test)]

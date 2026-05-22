@@ -877,17 +877,17 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         use shell_crypto::AlgorithmRegistry;
         let reg = AlgorithmRegistry::global();
         let entries: Vec<serde_json::Value> = reg
-            .entries()
+            .get_all_entries()
             .iter()
-            .map(|e| {
+            .map(|entry| {
                 serde_json::json!({
-                    "algo": format!("{:?}", e.algo),
-                    "status": e.status.to_string(),
-                    "description": e.description,
+                    "algo": format!("{:?}", entry.algo),
+                    "status": entry.status.to_string(),
+                    "description": entry.description,
                 })
             })
             .collect();
-        Ok(serde_json::json!({ "algorithms": entries }))
+        Ok(serde_json::Value::Array(entries))
     }
 }
 

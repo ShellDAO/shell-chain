@@ -463,8 +463,9 @@ impl<S: KvStore> ChainStore<S> {
     // when it is overwritten or explicitly evicted.  A node is eligible for
     // physical deletion once its count reaches 0.
     //
-    // This is the foundation of L3 state-trie pruning; actual trie-node
-    // eviction is gated behind `PruningConfig::state_pruning_experimental`.
+    // Reference counts remain available for future fine-grained GC work.
+    // Rolling/pruned profiles currently delete historical snapshot nodes via
+    // retained-root reachability checks in the node pruning pipeline.
 
     fn trie_refcount_key(node_hash: &ShellHash) -> Vec<u8> {
         [b"refs/".as_ref(), node_hash.as_bytes()].concat()

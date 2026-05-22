@@ -12,7 +12,8 @@
 //! For signature verification and block sealing, `WPoaEngine` delegates to
 //! the existing `PoaEngine` logic.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use shell_core::{Block, BlockHeader};
@@ -21,7 +22,9 @@ use shell_primitives::Address;
 
 use crate::poa::PoaEngine;
 use crate::validator::{ValidatorSet, ValidatorSetConfig};
-use crate::{ConsensusEngine, ConsensusError, EngineType, PoaConfig};
+use crate::{
+    ConsensusEngine, ConsensusError, EngineType, PoaConfig, ViewChangeMessage, ViewChangeState,
+};
 
 /// Configuration for the weighted PoA engine.
 #[derive(Debug, Clone)]
@@ -68,6 +71,8 @@ pub struct WPoaEngine {
     inner: PoaEngine,
     validator_set: ValidatorSet,
     validator_set_config: ValidatorSetConfig,
+    slash_weights: HashMap<Address, u64>,
+    view_change_state: Mutex<ViewChangeState>,
     #[allow(dead_code)]
     verifier: Arc<dyn Verifier>,
     signer: Option<Arc<dyn Signer>>,
@@ -94,6 +99,8 @@ impl WPoaEngine {
             inner: PoaEngine::new(poa),
             validator_set,
             validator_set_config: config.validator_set_config,
+            slash_weights: HashMap::new(),
+            view_change_state: Mutex::new(ViewChangeState::new()),
             verifier,
             signer: None,
         }
@@ -115,14 +122,121 @@ impl WPoaEngine {
         &mut self.validator_set
     }
 
-    /// Return the expected proposer for `block_number` using weighted round-robin.
-    ///
-    /// Falls back to the unweighted `PoaEngine` selection if the validator set
-    /// is empty (should not occur in a live network).
+    /// Return the expected proposer for `block_number` under the current view.
     pub fn proposer_for_block(&self, block_number: u64) -> Address {
+        let view = self.current_view();
+        self.proposer_for_block_in_view(block_number, view)
+    }
+
+    fn base_proposer_for_block(&self, block_number: u64) -> Address {
         self.validator_set
             .weighted_proposer(block_number)
             .unwrap_or_else(|| self.inner.config().proposer_for_block(block_number))
+    }
+
+    fn proposer_for_block_in_view(&self, block_number: u64, view: u64) -> Address {
+        if view == 0 {
+            return self.base_proposer_for_block(block_number);
+        }
+
+        let authorities = &self.inner.config().authorities;
+        if authorities.is_empty() {
+            return self.base_proposer_for_block(block_number);
+        }
+
+        let base = self.base_proposer_for_block(block_number);
+        let base_index = authorities
+            .iter()
+            .position(|candidate| *candidate == base)
+            .unwrap_or(0);
+        let rotated: Vec<Address> = authorities[base_index..]
+            .iter()
+            .chain(authorities[..base_index].iter())
+            .copied()
+            .collect();
+
+        ViewChangeState::select_proposer(view, &rotated)
+    }
+
+    pub fn handle_view_change_message(
+        &mut self,
+        msg: ViewChangeMessage,
+        total_weight: u64,
+    ) -> bool {
+        let validator_weights = self.validator_weights();
+        let mut state = self
+            .view_change_state
+            .lock()
+            .expect("view change state mutex poisoned");
+
+        if msg.view != state.current_view {
+            return false;
+        }
+
+        state.configure_quorum(validator_weights, total_weight);
+        if state.record_view_change(msg) {
+            state.advance_view();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_view_change_state(&mut self, now_ms: u64) {
+        self.view_change_state
+            .lock()
+            .expect("view change state mutex poisoned")
+            .reset_for_block(now_ms);
+    }
+
+    fn current_view(&self) -> u64 {
+        self.view_change_state
+            .lock()
+            .expect("view change state mutex poisoned")
+            .current_view
+    }
+
+    fn base_weight_for(&self, authority: &Address) -> Option<u64> {
+        self.validator_set
+            .get(authority)
+            .map(|validator| validator.weight)
+            .or_else(|| {
+                let idx = self
+                    .inner
+                    .config()
+                    .authorities
+                    .iter()
+                    .position(|candidate| candidate == authority)?;
+                Some(
+                    self.inner
+                        .config()
+                        .authority_weights
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1),
+                )
+            })
+    }
+
+    fn effective_weight_for(&self, authority: &Address) -> Option<u64> {
+        self.base_weight_for(authority).map(|base_weight| {
+            let reduction = self.slash_weights.get(authority).copied().unwrap_or(0);
+            base_weight.saturating_sub(reduction)
+        })
+    }
+
+    fn apply_slash(&mut self, offender: &Address) {
+        self.inner.config_mut().slash_authority(offender);
+
+        let current_weight = self.effective_weight_for(offender).unwrap_or(1);
+        let slash_amount = ((current_weight as u128)
+            * (self.inner.config().slash_weight_bps as u128)
+            / 10_000u128) as u64;
+        let base_weight = self.base_weight_for(offender).unwrap_or(1);
+        let cumulative = self.slash_weights.get(offender).copied().unwrap_or(0);
+        let updated = cumulative.saturating_add(slash_amount).min(base_weight);
+        self.slash_weights.insert(*offender, updated);
     }
 }
 
@@ -227,7 +341,7 @@ impl ConsensusEngine for WPoaEngine {
     }
 
     fn slash_authority(&mut self, offender: &Address) {
-        self.inner.config_mut().slash_authority(offender);
+        self.apply_slash(offender);
     }
 
     fn set_authorities(&mut self, authorities: Vec<Address>) {
@@ -256,12 +370,37 @@ impl ConsensusEngine for WPoaEngine {
         );
     }
 
-    fn validator_weights(&self) -> std::collections::HashMap<Address, u64> {
+    fn validator_weights(&self) -> HashMap<Address, u64> {
         self.validator_set
             .active_validators()
             .into_iter()
-            .map(|v| (v.address, v.weight))
+            .map(|validator| {
+                (
+                    validator.address,
+                    self.effective_weight_for(&validator.address)
+                        .unwrap_or_default(),
+                )
+            })
             .collect()
+    }
+
+    fn handle_view_change_message(&mut self, msg: ViewChangeMessage, total_weight: u64) -> bool {
+        WPoaEngine::handle_view_change_message(self, msg, total_weight)
+    }
+
+    fn current_view(&self) -> u64 {
+        WPoaEngine::current_view(self)
+    }
+
+    fn check_view_change_timeout(&self, now_ms: u64, block_time_ms: u64) -> bool {
+        self.view_change_state
+            .lock()
+            .expect("view change state mutex poisoned")
+            .check_timeout(now_ms, block_time_ms)
+    }
+
+    fn note_block_progress(&mut self, now_ms: u64) {
+        self.reset_view_change_state(now_ms);
     }
 }
 
@@ -271,7 +410,7 @@ impl ConsensusEngine for WPoaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poa::PoaConfig;
+    use crate::{poa::PoaConfig, VIEW_CHANGE_TIMEOUT_MS};
     use shell_crypto::{PQSignature, SignatureType};
 
     fn addr(n: u8) -> Address {
@@ -295,7 +434,16 @@ mod tests {
     }
 
     fn engine(authorities: Vec<Address>, weights: Vec<u64>) -> WPoaEngine {
-        let poa = PoaConfig::new(authorities, 2);
+        engine_with_slash_bps(authorities, weights, 1_000)
+    }
+
+    fn engine_with_slash_bps(
+        authorities: Vec<Address>,
+        weights: Vec<u64>,
+        slash_weight_bps: u64,
+    ) -> WPoaEngine {
+        let mut poa = PoaConfig::new(authorities, 2);
+        poa.slash_weight_bps = slash_weight_bps;
         let config = WPoaConfig::with_weights(poa, weights);
         WPoaEngine::new(config, Arc::new(MockVerifier))
     }
@@ -373,5 +521,71 @@ mod tests {
         assert_eq!(e.proposer_for_block(0), addr(1));
         assert_eq!(e.proposer_for_block(3), addr(1));
         assert_eq!(e.proposer_for_block(4), addr(3));
+    }
+
+    #[test]
+    fn slash_reduces_weight_by_bps() {
+        let mut e = engine_with_slash_bps(vec![addr(1), addr(2)], vec![100, 50], 1_000);
+
+        e.slash_authority(&addr(1));
+
+        let weights = e.validator_weights();
+        assert_eq!(weights.get(&addr(1)), Some(&90));
+        assert_eq!(weights.get(&addr(2)), Some(&50));
+    }
+
+    #[test]
+    fn multiple_slashes_are_cumulative() {
+        let mut e = engine_with_slash_bps(vec![addr(1)], vec![100], 1_000);
+
+        e.slash_authority(&addr(1));
+        e.slash_authority(&addr(1));
+
+        assert_eq!(e.validator_weights().get(&addr(1)), Some(&81));
+    }
+
+    #[test]
+    fn slash_weight_floors_at_zero() {
+        let mut e = engine_with_slash_bps(vec![addr(1)], vec![10], 10_000);
+
+        e.slash_authority(&addr(1));
+        e.slash_authority(&addr(1));
+
+        assert_eq!(e.validator_weights().get(&addr(1)), Some(&0));
+    }
+
+    #[test]
+    fn unslashed_validators_are_unaffected() {
+        let mut e = engine_with_slash_bps(vec![addr(1), addr(2)], vec![40, 60], 2_500);
+
+        e.slash_authority(&addr(2));
+
+        let weights = e.validator_weights();
+        assert_eq!(weights.get(&addr(1)), Some(&40));
+        assert_eq!(weights.get(&addr(2)), Some(&45));
+    }
+
+    #[test]
+    fn view_change_quorum_advances_view() {
+        let mut e = engine(vec![addr(1), addr(2), addr(3)], vec![1, 1, 1]);
+
+        assert!(!e.handle_view_change_message(ViewChangeMessage::new(0, 7, addr(1), vec![1]), 3,));
+        assert!(e.handle_view_change_message(ViewChangeMessage::new(0, 7, addr(2), vec![2]), 3,));
+        assert_eq!(e.current_view(), 1);
+        assert_eq!(e.proposer_for_block(0), addr(2));
+    }
+
+    #[test]
+    fn note_block_progress_resets_view_change_state() {
+        let mut e = engine(vec![addr(1), addr(2), addr(3)], vec![1, 1, 1]);
+
+        assert!(!e.handle_view_change_message(ViewChangeMessage::new(0, 9, addr(1), vec![1]), 3,));
+        assert!(e.handle_view_change_message(ViewChangeMessage::new(0, 9, addr(2), vec![2]), 3,));
+        assert_eq!(e.current_view(), 1);
+
+        e.note_block_progress(42);
+
+        assert_eq!(e.current_view(), 0);
+        assert!(!e.check_view_change_timeout(42 + VIEW_CHANGE_TIMEOUT_MS - 1, 1_000));
     }
 }

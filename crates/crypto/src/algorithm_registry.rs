@@ -4,18 +4,19 @@
 //! An on-chain algorithm registry controls accepted signing algorithms and supports
 //! future activation and deprecation through governance proposals.
 //!
-//! # Current implementation (skeleton)
-//! This module provides the *data model* and *validation interface* for the registry.
-//! It is initialised from the compile-time [`ALLOWED_ALGORITHMS`] allowlist so
-//! existing validation paths are unchanged while gaining an indirection layer that
-//! will accept runtime updates (governance, activation schedules) in a future round.
+//! # Current implementation
+//! This module provides the process-global registry used by signature validation,
+//! RPC exposure, and governance-triggered lifecycle transitions.
+//! It is initialised from the compile-time [`ALLOWED_ALGORITHMS`] allowlist and can
+//! then be updated at runtime as on-chain governance proposals reach quorum.
 //!
 //! Deferred items:
-//! - On-chain state storage and governance proposal lifecycle.
 //! - Activation scheduling / epoch-gated transitions.
 //! - Deprecation grace periods and migration tooling.
 //!
 //! [`ALLOWED_ALGORITHMS`]: crate::ALLOWED_ALGORITHMS
+
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +54,7 @@ impl std::fmt::Display for AlgorithmStatus {
 }
 
 /// A single algorithm entry in the registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlgorithmEntry {
     /// The algorithm identifier.
     pub algo: SignatureType,
@@ -65,11 +66,17 @@ pub struct AlgorithmEntry {
 
 /// The canonical algorithm registry for this node.
 ///
-/// Initialised from the compile-time allowlist; call [`AlgorithmRegistry::global`]
-/// to obtain a read-only view.  Future rounds will add a mutable runtime registry
-/// backed by on-chain governance state.
+/// Initialised from the compile-time allowlist and then updated at runtime by
+/// governance operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlgorithmRegistry {
     entries: Vec<AlgorithmEntry>,
+}
+
+impl Default for AlgorithmRegistry {
+    fn default() -> Self {
+        Self::from_allowlist()
+    }
 }
 
 impl AlgorithmRegistry {
@@ -89,32 +96,75 @@ impl AlgorithmRegistry {
         Self { entries }
     }
 
-    /// Return the process-global read-only registry (initialised from the
-    /// compile-time allowlist).
-    ///
-    /// This is a cheap operation — the registry is built once and reused.
-    pub fn global() -> &'static Self {
-        // SAFETY: no mutation, initialised once at first call.
-        static REGISTRY: std::sync::OnceLock<AlgorithmRegistry> = std::sync::OnceLock::new();
-        REGISTRY.get_or_init(Self::from_allowlist)
+    /// Return the process-global read-only registry.
+    pub fn global() -> RwLockReadGuard<'static, Self> {
+        global_registry()
+            .read()
+            .expect("algorithm registry lock poisoned")
+    }
+
+    /// Return the process-global mutable registry.
+    pub fn global_mut() -> RwLockWriteGuard<'static, Self> {
+        global_registry()
+            .write()
+            .expect("algorithm registry lock poisoned")
+    }
+
+    /// Mark an algorithm as pending activation.
+    pub fn propose_activation(&mut self, algo: SignatureType) {
+        self.upsert_status(algo, AlgorithmStatus::PendingActivation);
+    }
+
+    /// Mark an algorithm as active.
+    pub fn activate(&mut self, algo: SignatureType) {
+        self.upsert_status(algo, AlgorithmStatus::Active);
+    }
+
+    /// Mark an algorithm as deprecated.
+    pub fn deprecate(&mut self, algo: SignatureType) {
+        self.upsert_status(algo, AlgorithmStatus::Deprecated);
+    }
+
+    fn upsert_status(&mut self, algo: SignatureType, status: AlgorithmStatus) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.algo == algo) {
+            entry.status = status;
+            entry.description = algo.registry_description();
+            return;
+        }
+
+        self.entries.push(AlgorithmEntry {
+            algo,
+            status,
+            description: algo.registry_description(),
+        });
     }
 
     /// Returns `true` if the given algorithm is currently accepted for new
     /// transaction signatures.
     ///
-    /// This is the single validation indirection point.  Call this instead of
-    /// `ALLOWED_ALGORITHMS.contains()` so that future runtime updates to
-    /// registry status are respected automatically.
+    /// This is the single validation indirection point. Call this instead of
+    /// `ALLOWED_ALGORITHMS.contains()` so that runtime registry updates are
+    /// respected automatically.
     pub fn is_allowed(&self, algo: SignatureType) -> bool {
         self.entries
             .iter()
-            .any(|e| e.algo == algo && e.status.is_accepted())
+            .any(|entry| entry.algo == algo && entry.status.is_accepted())
     }
 
     /// Read-only view of all registered algorithms.
-    pub fn entries(&self) -> &[AlgorithmEntry] {
+    pub fn get_all_entries(&self) -> &[AlgorithmEntry] {
         &self.entries
     }
+
+    /// Backward-compatible alias for existing call sites.
+    pub fn entries(&self) -> &[AlgorithmEntry] {
+        self.get_all_entries()
+    }
+}
+
+fn global_registry() -> &'static RwLock<AlgorithmRegistry> {
+    static REGISTRY: OnceLock<RwLock<AlgorithmRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(AlgorithmRegistry::from_allowlist()))
 }
 
 /// Convenience function: check whether `algo` is allowed according to the
@@ -168,13 +218,13 @@ mod tests {
     #[test]
     fn registry_entries_count_matches_allowlist() {
         let reg = AlgorithmRegistry::global();
-        assert_eq!(reg.entries().len(), ALLOWED_ALGORITHMS.len());
+        assert_eq!(reg.get_all_entries().len(), ALLOWED_ALGORITHMS.len());
     }
 
     #[test]
     fn all_entries_are_active() {
         let reg = AlgorithmRegistry::global();
-        for entry in reg.entries() {
+        for entry in reg.get_all_entries() {
             assert_eq!(
                 entry.status,
                 AlgorithmStatus::Active,
@@ -198,6 +248,52 @@ mod tests {
             AlgorithmStatus::PendingActivation.to_string(),
             "pending_activation"
         );
+    }
+
+    #[test]
+    fn registry_lifecycle_transitions_update_status() {
+        let mut reg = AlgorithmRegistry::default();
+
+        reg.propose_activation(SignatureType::Dilithium3);
+        assert_eq!(
+            reg.get_all_entries()
+                .iter()
+                .find(|entry| entry.algo == SignatureType::Dilithium3)
+                .map(|entry| entry.status),
+            Some(AlgorithmStatus::PendingActivation)
+        );
+
+        reg.activate(SignatureType::Dilithium3);
+        assert_eq!(
+            reg.get_all_entries()
+                .iter()
+                .find(|entry| entry.algo == SignatureType::Dilithium3)
+                .map(|entry| entry.status),
+            Some(AlgorithmStatus::Active)
+        );
+
+        reg.deprecate(SignatureType::Dilithium3);
+        assert_eq!(
+            reg.get_all_entries()
+                .iter()
+                .find(|entry| entry.algo == SignatureType::Dilithium3)
+                .map(|entry| entry.status),
+            Some(AlgorithmStatus::Deprecated)
+        );
+    }
+
+    #[test]
+    fn non_active_statuses_are_not_allowed() {
+        let mut reg = AlgorithmRegistry::default();
+
+        reg.propose_activation(SignatureType::MlDsa65);
+        assert!(!reg.is_allowed(SignatureType::MlDsa65));
+
+        reg.activate(SignatureType::MlDsa65);
+        assert!(reg.is_allowed(SignatureType::MlDsa65));
+
+        reg.deprecate(SignatureType::MlDsa65);
+        assert!(!reg.is_allowed(SignatureType::MlDsa65));
     }
 
     #[test]

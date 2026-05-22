@@ -1,13 +1,15 @@
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use alloy_rlp::{Decodable, Encodable};
 use lru::LruCache;
 use parking_lot::Mutex;
+use rlp::{Prototype, Rlp};
 use shell_core::Account;
 use shell_primitives::{keccak256, Address, ShellHash, U256};
 
-use crate::{KvStore, MerkleTrie, StorageError};
+use crate::{KvStore, MerkleTrie, StorageError, WriteBatch};
 
 /// Approximate byte-size of one RLP-encoded [`Account`].
 const ACCOUNT_SIZE_BYTES: usize = 100;
@@ -430,6 +432,126 @@ impl<S: KvStore + 'static> WorldState<S> {
     pub fn state_root(&mut self) -> Result<ShellHash, StorageError> {
         let root = self.account_trie.root_hash()?;
         Ok(ShellHash::from(root))
+    }
+
+    /// Collect all hashed trie-node keys reachable from the given state root.
+    pub fn collect_snapshot_node_hashes(
+        store: &S,
+        root: ShellHash,
+    ) -> Result<HashSet<ShellHash>, StorageError> {
+        let mut visited = HashSet::new();
+        Self::collect_hashed_node(store, root, &mut visited)?;
+        Ok(visited)
+    }
+
+    /// Delete all hashed trie nodes reachable from the given state root except
+    /// those explicitly protected by `protected_nodes`.
+    pub fn delete_state_snapshot(
+        store: &S,
+        root: ShellHash,
+        protected_nodes: &HashSet<ShellHash>,
+    ) -> Result<u64, StorageError> {
+        let reachable = Self::collect_snapshot_node_hashes(store, root)?;
+        let deletable: Vec<ShellHash> = reachable
+            .into_iter()
+            .filter(|hash| !protected_nodes.contains(hash))
+            .collect();
+
+        if deletable.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = WriteBatch::new();
+        for hash in &deletable {
+            batch.delete(hash.as_bytes().to_vec());
+        }
+        store.write_batch(batch)?;
+        Ok(deletable.len() as u64)
+    }
+
+    fn collect_hashed_node(
+        store: &S,
+        node_hash: ShellHash,
+        visited: &mut HashSet<ShellHash>,
+    ) -> Result<(), StorageError> {
+        if visited.contains(&node_hash) {
+            return Ok(());
+        }
+        let Some(raw_node) = store.get(node_hash.as_bytes())? else {
+            return Ok(());
+        };
+        visited.insert(node_hash);
+        Self::collect_hashed_refs_in_raw(store, &raw_node, visited)
+    }
+
+    fn collect_hashed_refs_in_raw(
+        store: &S,
+        raw_node: &[u8],
+        visited: &mut HashSet<ShellHash>,
+    ) -> Result<(), StorageError> {
+        let rlp = Rlp::new(raw_node);
+        match rlp
+            .prototype()
+            .map_err(|e| StorageError::Trie(e.to_string()))?
+        {
+            Prototype::Data(0) => Ok(()),
+            Prototype::List(2) => {
+                let key = rlp
+                    .at(0)
+                    .and_then(|item| item.data())
+                    .map_err(|e| StorageError::Trie(e.to_string()))?;
+                if Self::compact_path_is_leaf(key) {
+                    return Ok(());
+                }
+                let child_raw = rlp
+                    .at(1)
+                    .map_err(|e| StorageError::Trie(e.to_string()))?
+                    .as_raw()
+                    .to_vec();
+                Self::collect_hashed_refs_from_item(store, &child_raw, visited)
+            }
+            Prototype::List(17) => {
+                for index in 0..16 {
+                    let child_raw = rlp
+                        .at(index)
+                        .map_err(|e| StorageError::Trie(e.to_string()))?
+                        .as_raw()
+                        .to_vec();
+                    Self::collect_hashed_refs_from_item(store, &child_raw, visited)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn collect_hashed_refs_from_item(
+        store: &S,
+        raw_item: &[u8],
+        visited: &mut HashSet<ShellHash>,
+    ) -> Result<(), StorageError> {
+        let rlp = Rlp::new(raw_item);
+        let prototype = rlp
+            .prototype()
+            .map_err(|e| StorageError::Trie(e.to_string()))?;
+        if rlp.is_data() && matches!(prototype, Prototype::Data(32)) {
+            let hash = ShellHash::try_from_slice(
+                rlp.data().map_err(|e| StorageError::Trie(e.to_string()))?,
+            )
+            .map_err(|e| StorageError::Trie(e.to_string()))?;
+            return Self::collect_hashed_node(store, hash, visited);
+        }
+        match prototype {
+            Prototype::Data(_) => Ok(()),
+            _ => Self::collect_hashed_refs_in_raw(store, raw_item, visited),
+        }
+    }
+
+    fn compact_path_is_leaf(compact: &[u8]) -> bool {
+        compact
+            .first()
+            .map(|byte| ((byte >> 4) & 0b10) != 0)
+            .unwrap_or(false)
     }
 
     /// Validate the world state by performing a health check (F-123).

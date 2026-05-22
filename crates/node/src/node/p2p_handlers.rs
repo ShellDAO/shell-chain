@@ -498,22 +498,53 @@ impl<S: KvStore + 'static> Node<S> {
         }
     }
 
-    /// W.5: Handle an incoming wPoA view-change vote from a peer.
-    ///
-    /// Records the vote and logs when quorum for the view change is reached.
-    pub fn handle_wpoa_view_change(&self, voter: Address, new_view: u64, block_number: u64) {
-        let mut guard = self.wpoa_round.lock();
-        if let Some(ref mut round) = *guard {
-            if round.block_number != block_number {
-                return;
-            }
-            let events = round.on_view_change_vote(voter, new_view);
-            for event in events {
-                if let WPoaEvent::ViewChangeReady { new_view } = event {
-                    tracing::info!(new_view, "W.5: view change ready — advancing round");
-                    round.round = new_view;
-                }
-            }
+    /// W.5: Handle an incoming signed wPoA view-change message from a peer.
+    pub fn handle_wpoa_view_change(
+        &self,
+        msg: ViewChangeMessage,
+        verifier: &dyn Verifier,
+    ) -> Result<bool, NodeError> {
+        let known = self.known_authorities.read();
+        let pubkey = known.get(&msg.validator).ok_or_else(|| {
+            NodeError::Startup(format!(
+                "unknown view-change validator: {:?}",
+                msg.validator
+            ))
+        })?;
+
+        let signing_message = ViewChangeMessage::signing_message(msg.view, msg.block_number);
+        let sig_type = shell_crypto::infer_signature_type_from_address(pubkey, &msg.validator)
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "unknown view-change signature algorithm for validator {}",
+                    msg.validator
+                ))
+            })?;
+        if !shell_crypto::is_algorithm_allowed(sig_type) {
+            return Err(NodeError::Startup(format!(
+                "view-change signature algorithm {sig_type:?} not allowed"
+            )));
         }
+        let sig = shell_crypto::PQSignature::new(sig_type, msg.signature.clone());
+        let valid = verifier
+            .verify(pubkey, &signing_message, &sig)
+            .map_err(|e| NodeError::Startup(format!("invalid view-change signature: {e}")))?;
+        if !valid {
+            return Err(NodeError::Startup(
+                "view-change signature verification failed".into(),
+            ));
+        }
+
+        let total_weight: u64 = self
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .sum();
+        Ok(self
+            .consensus
+            .write()
+            .handle_view_change_message(msg, total_weight))
     }
 }

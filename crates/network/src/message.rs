@@ -1,7 +1,9 @@
 //! Network message types for block and transaction propagation.
 
 use serde::{Deserialize, Serialize};
-use shell_consensus::{Attestation, ChallengeResponse, EquivocationProof, ProofChallenge};
+use shell_consensus::{
+    Attestation, ChallengeResponse, EquivocationProof, ProofChallenge, ViewChangeMessage,
+};
 use shell_core::{Block, SignedTransaction};
 use shell_crypto::PQSignature;
 use shell_primitives::ShellHash;
@@ -142,18 +144,8 @@ pub enum NetworkMessage {
         /// PQ signature over the block hash.
         signature: PQSignature,
     },
-    /// W.5: wPoA view-change vote when the current round times out.
-    ///
-    /// Broadcast by a validator to propose advancing to a new view number.
-    /// Quorum of view-change votes triggers a view transition.
-    WPoaViewChange {
-        /// The new view number being proposed.
-        new_view: u64,
-        /// Block number this view-change targets.
-        block_number: u64,
-        /// Address of the validator casting this view-change vote.
-        voter: shell_primitives::Address,
-    },
+    /// W.5: Signed wPoA view-change vote for a timed-out proposer view.
+    WPoaViewChange(Box<ViewChangeMessage>),
 }
 
 /// High-level topic classification for network message propagation.
@@ -178,7 +170,7 @@ impl NetworkMessage {
             Self::StorageCapability { .. }
             | Self::BodyRequest { .. }
             | Self::BodyResponse { .. } => Some(NetworkTopic::Blocks),
-            Self::WPoaVote { .. } | Self::WPoaViewChange { .. } => Some(NetworkTopic::Consensus),
+            Self::WPoaVote { .. } | Self::WPoaViewChange(_) => Some(NetworkTopic::Consensus),
             _ => None,
         }
     }
@@ -525,21 +517,19 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_wpoa_view_change() {
-        let msg = NetworkMessage::WPoaViewChange {
-            new_view: 3,
-            block_number: 42,
-            voter: Address::from_public_key(b"voter-key", 0),
-        };
+        let msg = NetworkMessage::WPoaViewChange(Box::new(ViewChangeMessage::new(
+            3,
+            42,
+            Address::from_public_key(b"voter-key", 0),
+            vec![1, 2, 3],
+        )));
         let json = serde_json::to_vec(&msg).unwrap();
         let decoded: NetworkMessage = serde_json::from_slice(&json).unwrap();
         match decoded {
-            NetworkMessage::WPoaViewChange {
-                new_view,
-                block_number,
-                ..
-            } => {
-                assert_eq!(new_view, 3);
-                assert_eq!(block_number, 42);
+            NetworkMessage::WPoaViewChange(view_change) => {
+                assert_eq!(view_change.view, 3);
+                assert_eq!(view_change.block_number, 42);
+                assert_eq!(view_change.signature, vec![1, 2, 3]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

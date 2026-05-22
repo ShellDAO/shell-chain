@@ -685,8 +685,8 @@ pub trait ShellApi {
     /// that are accepted, deprecated, or pending activation on this node.
     ///
     /// This is the RPC exposure of the white-paper §6 algorithm registry.
-    /// In the current skeleton implementation the registry mirrors the
-    /// compile-time allowlist; future rounds will add on-chain governance.
+    /// The returned array reflects the node's live in-memory view of on-chain
+    /// governance transitions.
     ///
     /// Response fields per entry:
     /// - `algo`        — algorithm name (`"MlDsa65"`, `"Dilithium3"`, `"SphincsSha2256f"`)

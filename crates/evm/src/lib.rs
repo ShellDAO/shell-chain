@@ -43,8 +43,8 @@ pub use system_contracts::{
     encode_set_validation_code_calldata, encode_set_validator_weight_calldata,
     execute_system_contract, execute_system_contract_call, is_system_contract, registry_address,
     system_contract_code_hash, SystemContractEffects, SystemContractError, SystemContractOutcome,
-    ACCOUNT_MANAGER_ADDR, SET_VALIDATOR_WEIGHT_SELECTOR, SYSTEM_CALL_BASE_GAS,
-    SYSTEM_CALL_OP_GAS, VALIDATOR_REGISTRY_ADDR,
+    ACCOUNT_MANAGER_ADDR, SET_VALIDATOR_WEIGHT_SELECTOR, SYSTEM_CALL_BASE_GAS, SYSTEM_CALL_OP_GAS,
+    VALIDATOR_REGISTRY_ADDR,
 };
 pub use tracer::{decode_revert_reason, CallFrame, TraceResult};
 pub use tx_validation::{
