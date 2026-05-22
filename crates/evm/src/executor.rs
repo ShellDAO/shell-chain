@@ -190,11 +190,10 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                 });
 
         let spec = SpecId::CANCUN;
-        let mut evm = Evm::new(
-            ctx,
-            EthInstructions::new_mainnet_with_spec(spec),
-            ShellPrecompiles::new(spec),
-        );
+        let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+        // Wire PQVM native opcodes (0xB0–0xB2) into the instruction table.
+        crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
+        let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
         // Execute
         let result_and_state = evm

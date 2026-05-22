@@ -23,9 +23,10 @@ This repository ships a public, self-contained agent SSoT (this file).
 Operators may also maintain a private `docs/agents/` subtree locally
 (gitignored, not distributed) containing CONSTITUTION, ARCHITECTURE,
 ADRs, learnings, and per-crate feature specs. If that subtree is
-present in your working copy, prefer it as the highest-authority source
-and read it in this order: `CONSTITUTION.md` → `ARCHITECTURE.md` →
-`learnings.md` → relevant `features/<crate>/spec.md` → relevant ADR.
+present in your working copy, treat the white paper as the target
+protocol authority and use the local docs as derived operational
+invariants: `CONSTITUTION.md` → `ARCHITECTURE.md` → `learnings.md` →
+relevant `features/<crate>/spec.md` → relevant ADR.
 
 If `docs/agents/` is not present, this file plus `CHANGELOG.md`,
 `docs/CONSENSUS_DETAILS.md`, `docs/stark-aggregation.md`,
@@ -75,10 +76,10 @@ For navigating `crates/node/` specifically, see
 
 ## Cardinal rules
 
-- **CONSTITUTION precedence**: if an operator-local
-  `docs/agents/CONSTITUTION.md` is present, it is the highest authority
-  on protocol/consensus/RPC/security invariants — flag drift, do not
-  silently reconcile.
+- **White paper precedence**: target protocol behavior is defined by the
+  Shell-Chain white paper. If an operator-local `docs/agents/CONSTITUTION.md`
+  is present, treat it as derived operational invariants — flag drift,
+  do not silently reconcile.
 - **All PQ signatures verified at mempool entry.**
 - **STARK proof settlements**: only via the `StarkReward` system
   transaction. `BlockHeader::extra_data` is permanently deprecated as a
@@ -88,8 +89,8 @@ For navigating `crates/node/` specifically, see
 - **Drain-frontier** is an `Arc<AtomicU64>` that is monotonic per process;
   the seeder must clamp `scan_start` to
   `max(contiguous_pending_end - 16, drain_frontier)`.
-- **`L2StarkMode::Active` is FORBIDDEN** until explicitly promoted by
-  the Constitution.
+- **`L2StarkMode::Active` is allowed only when the deployment explicitly
+  opts into the white-paper STARK target path and its operational gates.**
 
 ## Quality gates (local mirror of CI)
 

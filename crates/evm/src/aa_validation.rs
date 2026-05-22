@@ -8,7 +8,9 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use shell_core::{InnerCall, SessionAuth, SignedTransaction};
-use shell_crypto::{PQSignature, SignatureType, Verifier, ALLOWED_ALGORITHMS};
+use shell_crypto::{
+    is_algorithm_allowed, PQSignature, SignatureType, Verifier, ALLOWED_ALGORITHMS,
+};
 use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 
@@ -140,7 +142,7 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
         }
     }
 
-    if !ALLOWED_ALGORITHMS.contains(&signed_tx.signature.sig_type) {
+    if !is_algorithm_allowed(signed_tx.signature.sig_type) {
         return Err(AaValidationError::DisallowedAlgorithm(
             signed_tx.signature.sig_type,
         ));
@@ -512,7 +514,7 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
     let session_algo = SignatureType::from_u8(session_auth.session_algo).ok_or(
         AaValidationError::SessionKeyDisallowedAlgorithm(session_auth.session_algo),
     )?;
-    if !ALLOWED_ALGORITHMS.contains(&session_algo) {
+    if !is_algorithm_allowed(session_algo) {
         return Err(AaValidationError::SessionKeyDisallowedAlgorithm(
             session_auth.session_algo,
         ));

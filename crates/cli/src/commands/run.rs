@@ -587,10 +587,10 @@ async fn run_with_store<S: KvStore + 'static>(
             match args.consensus_engine.as_deref() {
                 Some("wpoa") => ConsensusEngineConfig::WPoa(build_wpoa()),
                 Some("poa") => ConsensusEngineConfig::Poa(build_poa()),
-                _ => match &genesis_config.consensus {
-                    ConsensusConfig::WPoA { .. } => ConsensusEngineConfig::WPoa(build_wpoa()),
-                    _ => ConsensusEngineConfig::Poa(build_poa()),
-                },
+                // WPoA is the standard shell-chain consensus; default to it
+                // regardless of genesis consensus field (explicit "poa" flag
+                // opt-in preserved above).
+                _ => ConsensusEngineConfig::WPoa(build_wpoa()),
             }
         },
         mempool: MempoolConfig {

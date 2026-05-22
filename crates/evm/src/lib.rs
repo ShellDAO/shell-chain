@@ -6,12 +6,14 @@
 //! - [`ShellStateDb`]: implements `revm::Database` over WorldState + ChainStore
 //! - [`ShellEvm`]: transaction executor (Shanghai spec)
 //! - [`ShellPrecompiles`]: PQ precompile provider (6-precompile suite at 0x0001-0x0006)
+//! - [`pqvm_opcodes`]: Native PQ opcodes (0xB0 PQVERIFY, 0xB1 PQHASH, 0xB2 PQADDR)
 //! - [`validate_tx`]: PQ signature verification + hybrid pubkey registration
 
 mod aa_validation;
 pub mod bloom;
 mod executor;
 mod parallel;
+pub mod pqvm_opcodes;
 mod precompiles;
 mod rwset;
 mod state_db;
@@ -27,6 +29,7 @@ pub use parallel::{
     ConflictMetric, ConflictReason, ExecutionWave, ParallelEvmConfig, ParallelExecutionPlan,
     ParallelScheduler, TxConflict, TxConflictGraph,
 };
+pub use pqvm_opcodes::{OPCODE_PQADDR, OPCODE_PQHASH, OPCODE_PQVERIFY};
 pub use precompiles::{
     ShellPrecompiles, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDR_DERIVE_GAS,
     PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,

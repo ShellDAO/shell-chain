@@ -473,4 +473,73 @@ mod tests {
         let decoded: RecursivePublicInputs = serde_json::from_str(&json).unwrap();
         assert_eq!(inputs, decoded);
     }
+
+    // ── Scaffold boundary guards ──────────────────────────────────────────────
+    // These tests ensure that the ScaffoldRecursiveProver CANNOT produce a
+    // success-shaped result.  The goal is to prevent a scenario where
+    // L2StarkMode::Active silently claims recursive settlements without a real
+    // recursive prover backing them.
+
+    #[test]
+    fn scaffold_prove_always_not_implemented() {
+        let prover = ScaffoldRecursiveProver;
+        let inputs = RecursivePublicInputs::from_l1_roots(&[1u128, 2, 3], 0);
+        let err = prover
+            .prove_aggregation(&inputs)
+            .expect_err("scaffold must never succeed");
+        assert!(
+            matches!(err, RecursiveProverError::NotImplemented),
+            "scaffold must return NotImplemented, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_verify_always_not_implemented() {
+        let prover = ScaffoldRecursiveProver;
+        let inputs = RecursivePublicInputs::from_l1_roots(&[1u128], 0);
+        // Fabricate a proof — the guard should reject regardless of content.
+        let fake_proof = RecursiveProof {
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            aggregate_root: 42,
+            start_block: 0,
+            end_block: 0,
+            n_l1_proofs: 1,
+        };
+        let err = prover
+            .verify_aggregation(&fake_proof, &inputs)
+            .expect_err("scaffold must never succeed at verification");
+        assert!(
+            matches!(err, RecursiveProverError::NotImplemented),
+            "scaffold verify must return NotImplemented, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_recursive_prover_returns_scaffold_by_default() {
+        // Without the `recursive` feature the returned prover must be the
+        // scaffold, which always returns NotImplemented.
+        let prover = get_recursive_prover();
+        let inputs = RecursivePublicInputs::from_l1_roots(&[100u128], 0);
+        let err = prover
+            .prove_aggregation(&inputs)
+            .expect_err("default prover must not produce a recursive proof");
+        assert!(
+            matches!(err, RecursiveProverError::NotImplemented),
+            "get_recursive_prover default must return NotImplemented, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_cannot_produce_recursive_proof() {
+        // Exhaustive check: scaffold never succeeds for any non-empty input set.
+        let prover = ScaffoldRecursiveProver;
+        for n in 1..=5 {
+            let roots: Vec<u128> = (0..n).map(|i| (i + 1) as u128 * 111).collect();
+            let inputs = RecursivePublicInputs::from_l1_roots(&roots, 100);
+            assert!(
+                prover.prove_aggregation(&inputs).is_err(),
+                "scaffold must fail for {n}-root input"
+            );
+        }
+    }
 }

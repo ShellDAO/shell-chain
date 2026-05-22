@@ -631,4 +631,79 @@ mod tests {
     fn proving_priority_variants() {
         assert_ne!(ProvingPriority::Sequential, ProvingPriority::LatestFirst);
     }
+
+    // ── STARK boundary guard tests ────────────────────────────────────────────
+    // Verify that L2StarkMode::Active cannot produce a recursive settlement
+    // when the real recursive prover is unavailable (scaffold only).
+
+    #[tokio::test]
+    async fn active_l2_mode_does_not_store_recursive_proof() {
+        // Build a service with L2StarkMode::Active and a real amendment store.
+        let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+        let db = Arc::new(MemoryDb::new());
+        let amendment_store = ProofAmendmentStore::new(db.clone());
+        let service = ProverService::new(
+            backlog.clone(),
+            amendment_store.clone(),
+            ProverConfig::default(),
+            Address::default(),
+        )
+        .with_l2_mode(crate::config::L2StarkMode::Active);
+
+        let task = shell_stark_prover::L2ProverTask {
+            job_id: ShellHash::from([0xAA; 32]),
+            l1_source_hashes: vec![ShellHash::from([0x01; 32]), ShellHash::from([0x02; 32])],
+            l1_batch_roots: vec![42u128, 84u128],
+            start_block: 10,
+            end_block: 11,
+            original_size: Some(1024),
+        };
+
+        service.process_l2_task(&task).await;
+
+        // The amendment store must remain empty — scaffold prover must not
+        // store any success-shaped recursive proof.
+        let stored = amendment_store
+            .get_amendment(&task.job_id)
+            .expect("store read must not fail");
+        assert!(
+            stored.is_none(),
+            "L2StarkMode::Active with scaffold prover must NOT store a recursive proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_l2_mode_does_not_store_recursive_proof() {
+        // L2StarkMode::Scaffold also must not produce recursive settlements —
+        // it provides observability only.
+        let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+        let db = Arc::new(MemoryDb::new());
+        let amendment_store = ProofAmendmentStore::new(db.clone());
+        let service = ProverService::new(
+            backlog,
+            amendment_store.clone(),
+            ProverConfig::default(),
+            Address::default(),
+        )
+        .with_l2_mode(crate::config::L2StarkMode::Scaffold);
+
+        let task = shell_stark_prover::L2ProverTask {
+            job_id: ShellHash::from([0xBB; 32]),
+            l1_source_hashes: vec![ShellHash::from([0x03; 32])],
+            l1_batch_roots: vec![99u128],
+            start_block: 5,
+            end_block: 5,
+            original_size: None,
+        };
+
+        service.process_l2_task(&task).await;
+
+        let stored = amendment_store
+            .get_amendment(&task.job_id)
+            .expect("store read must not fail");
+        assert!(
+            stored.is_none(),
+            "L2StarkMode::Scaffold must not store any recursive proof"
+        );
+    }
 }

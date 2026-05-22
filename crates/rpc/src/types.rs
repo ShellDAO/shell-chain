@@ -257,9 +257,10 @@ pub struct BatchInnerCallRequest {
 ///
 /// Active storage profile descriptor returned by `shell_getStorageProfile`.
 ///
-/// `profile` is one of `"archive" | "full" | "light"`. `body_retention`,
-/// `witness_retention`, `keep_recent`, `proof_replacement_grace` reflect the
-/// effective `PruningConfig` after applying any per-field overrides
+/// `profile` uses white-paper canonical names: `"archive"`, `"full"`, `"pruned"`.
+/// (`"pruned"` corresponds to the legacy `"light"` alias in CLI / config files.)
+/// `body_retention`, `witness_retention`, `keep_recent`, `proof_replacement_grace`
+/// reflect the effective `PruningConfig` after applying any per-field overrides
 /// (a value of `0` means "keep forever" except for `proof_replacement_grace`
 /// where `u64::MAX` means "never delete witness even after STARK proof").
 #[derive(Debug, Clone, Serialize)]

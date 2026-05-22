@@ -855,6 +855,23 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             })),
         }
     }
+
+    async fn get_algorithm_registry(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        use shell_crypto::AlgorithmRegistry;
+        let reg = AlgorithmRegistry::global();
+        let entries: Vec<serde_json::Value> = reg
+            .entries()
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "algo": format!("{:?}", e.algo),
+                    "status": e.status.to_string(),
+                    "description": e.description,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "algorithms": entries }))
+    }
 }
 
 fn resolve_witness_block<S: KvStore + 'static>(

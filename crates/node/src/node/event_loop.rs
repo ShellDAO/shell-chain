@@ -145,7 +145,9 @@ impl<S: KvStore + 'static> Node<S> {
             Some({
                 let p = &self.config.pruning;
                 shell_rpc::types::StorageProfileInfo {
-                    profile: StorageProfile::from_pruning_config(p).as_str().to_string(),
+                    profile: StorageProfile::from_pruning_config(p)
+                        .whitepaper_name()
+                        .to_string(),
                     body_retention: p.body_retention,
                     witness_retention: p.witness_retention,
                     keep_recent: p.keep_recent,

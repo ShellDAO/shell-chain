@@ -1,3 +1,4 @@
+mod algorithm_registry;
 #[cfg(feature = "batch")]
 mod batch;
 mod dilithium;
@@ -10,6 +11,9 @@ mod signer;
 mod sphincs;
 mod verifier;
 
+pub use algorithm_registry::{
+    is_algorithm_allowed, AlgorithmEntry, AlgorithmRegistry, AlgorithmStatus,
+};
 #[cfg(feature = "batch")]
 pub use batch::{BatchVerifier, PreVerified, VerifyItem};
 pub use dilithium::{DilithiumSigner, DilithiumVerifier};

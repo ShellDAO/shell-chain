@@ -17,11 +17,14 @@ use std::str::FromStr;
 /// CLI flag sets the active profile; individual flags (`--body-retention`, etc.) can
 /// still override individual fields after the profile defaults are applied.
 ///
-/// | Profile   | body_retention | witness_retention | proof_replacement_grace | keep_recent |
-/// |-----------|---------------|------------------|------------------------|-------------|
-/// | Archive   | 0 (forever)   | 0 (forever)      | u64::MAX (never)       | 0 (forever) |
-/// | Full      | 0 (forever)   | 128              | 0 (immediate)          | 0 (forever) |
-/// | Light     | 4 096         | 64               | 0 (immediate)          | 4 096       |
+/// White-paper canonical names are `Archive`, `Full`, and `Pruned (Rolling)`.
+/// `Light` is an accepted alias for `Pruned` (backwards compatible).
+///
+/// | Profile (WP name)       | body_retention | witness_retention | proof_replacement_grace | keep_recent |
+/// |-------------------------|---------------|------------------|------------------------|-------------|
+/// | Archive                 | 0 (forever)   | 0 (forever)      | u64::MAX (never)       | 0 (forever) |
+/// | Full                    | 0 (forever)   | 128              | 0 (immediate)          | 0 (forever) |
+/// | Pruned / Rolling / Light| 4 096         | 64               | 0 (immediate)          | 4 096       |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageProfile {
@@ -32,7 +35,9 @@ pub enum StorageProfile {
     /// by STARK proofs once the proof lands (disk-efficient).
     #[default]
     Full,
-    /// Lightweight rolling window: only the most recent ~2.3 h of data is retained.
+    /// Rolling/pruned window: only the most recent ~2.3 h of data is retained.
+    ///
+    /// White-paper names: `Pruned` or `Rolling`.  Accepted CLI alias: `light`.
     Light,
 }
 
@@ -43,6 +48,22 @@ impl StorageProfile {
             Self::Archive => "archive",
             Self::Full => "full",
             Self::Light => "light",
+        }
+    }
+
+    /// Returns the white-paper canonical name for this profile.
+    ///
+    /// Prefer this method when surfacing the profile externally (e.g. RPC response,
+    /// metrics labels) so clients receive the white-paper standard name.
+    ///
+    /// - `Archive` → `"archive"`
+    /// - `Full`    → `"full"`
+    /// - `Light`   → `"pruned"` (white-paper name for the rolling window profile)
+    pub fn whitepaper_name(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Full => "full",
+            Self::Light => "pruned",
         }
     }
 
@@ -107,9 +128,11 @@ impl FromStr for StorageProfile {
         match s.to_lowercase().as_str() {
             "archive" => Ok(Self::Archive),
             "full" => Ok(Self::Full),
-            "light" => Ok(Self::Light),
+            // White-paper names ("pruned", "rolling") and legacy alias ("light")
+            // all map to the same rolling-window profile.
+            "light" | "pruned" | "rolling" => Ok(Self::Light),
             other => Err(format!(
-                "unknown storage profile '{other}'; valid values: archive, full, light"
+                "unknown storage profile '{other}'; valid values: archive, full, pruned (aliases: rolling, light)"
             )),
         }
     }
@@ -381,5 +404,51 @@ mod tests {
         assert_eq!(cfg.witness_retention, 0);
         assert_eq!(cfg.keep_recent, 0);
         assert_eq!(cfg.proof_replacement_grace, u64::MAX);
+    }
+
+    // ── White-paper alias tests ───────────────────────────────────────────────
+
+    #[test]
+    fn storage_profile_pruned_alias_parses() {
+        assert_eq!(
+            StorageProfile::from_str("pruned").unwrap(),
+            StorageProfile::Light
+        );
+        assert_eq!(
+            StorageProfile::from_str("PRUNED").unwrap(),
+            StorageProfile::Light
+        );
+    }
+
+    #[test]
+    fn storage_profile_rolling_alias_parses() {
+        assert_eq!(
+            StorageProfile::from_str("rolling").unwrap(),
+            StorageProfile::Light
+        );
+        assert_eq!(
+            StorageProfile::from_str("Rolling").unwrap(),
+            StorageProfile::Light
+        );
+    }
+
+    #[test]
+    fn storage_profile_whitepaper_name_light_is_pruned() {
+        assert_eq!(StorageProfile::Light.whitepaper_name(), "pruned");
+    }
+
+    #[test]
+    fn storage_profile_whitepaper_names_archive_and_full_unchanged() {
+        assert_eq!(StorageProfile::Archive.whitepaper_name(), "archive");
+        assert_eq!(StorageProfile::Full.whitepaper_name(), "full");
+    }
+
+    #[test]
+    fn storage_profile_unknown_error_mentions_aliases() {
+        let err = StorageProfile::from_str("bad_profile").unwrap_err();
+        // Error message should guide users to both canonical and alias names.
+        assert!(err.contains("archive"), "error should mention archive");
+        assert!(err.contains("full"), "error should mention full");
+        assert!(err.contains("pruned"), "error should mention pruned");
     }
 }

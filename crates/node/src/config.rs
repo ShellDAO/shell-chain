@@ -87,11 +87,13 @@ impl Default for MetricsConfig {
 /// Which consensus engine the node should use.
 ///
 /// The config variant determines which engine is instantiated at startup.
+/// WPoA is the standard consensus (white-paper §4); PoA is an explicit opt-in
+/// for compatibility or single-validator local deployments.
 #[derive(Debug, Clone)]
 pub enum ConsensusEngineConfig {
-    /// Proof-of-Authority (default, Phase 1).
+    /// Proof-of-Authority (Phase 1, explicit opt-in for compatibility).
     Poa(PoaConfig),
-    /// Weighted Proof-of-Authority (Phase 1.5).
+    /// Weighted Proof-of-Authority — the standard shell-chain consensus protocol.
     WPoa(WPoaConfig),
 }
 
@@ -267,13 +269,14 @@ impl NodeConfig {
         } else {
             PruningConfig::default()
         };
+        // WPoA is the standard shell-chain consensus (white-paper §4).
+        // Single-validator dev/testnet setups use uniform weight=1, which
+        // is equivalent to plain PoA but routes through the WPoA engine.
+        let base_poa = PoaConfig::new(vec![authority], params.block_time_ms / 1_000);
         Self {
             chain_id: 1337,
             network_type,
-            consensus: ConsensusEngineConfig::Poa(PoaConfig::new(
-                vec![authority],
-                params.block_time_ms / 1_000,
-            )),
+            consensus: ConsensusEngineConfig::WPoa(WPoaConfig::from_poa(base_poa)),
             mempool: MempoolConfig {
                 chain_id: 1337,
                 ..MempoolConfig::default()
@@ -552,5 +555,49 @@ mod tests {
         assert_eq!(L2StarkMode::Disabled.to_string(), "disabled");
         assert_eq!(L2StarkMode::Scaffold.to_string(), "scaffold");
         assert_eq!(L2StarkMode::Active.to_string(), "active");
+    }
+
+    // ── WPoA default consensus tests ──────────────────────────
+
+    #[test]
+    fn default_consensus_is_wpoa() {
+        let cfg = NodeConfig::dev(Address::ZERO);
+        assert_eq!(cfg.consensus.engine_kind(), "wpoa");
+    }
+
+    #[test]
+    fn testnet_default_consensus_is_wpoa() {
+        let cfg = NodeConfig::for_network(Address::ZERO, NetworkType::Testnet);
+        assert_eq!(cfg.consensus.engine_kind(), "wpoa");
+    }
+
+    #[test]
+    fn mainnet_default_consensus_is_wpoa() {
+        let cfg = NodeConfig::for_network(Address::ZERO, NetworkType::Mainnet);
+        assert_eq!(cfg.consensus.engine_kind(), "wpoa");
+    }
+
+    #[test]
+    fn wpoa_default_preserves_authority() {
+        let addr = Address::from_slice(&[0xAB; 32]);
+        let cfg = NodeConfig::dev(addr);
+        // poa_config() works for both Poa and WPoa variants.
+        assert_eq!(cfg.consensus.poa_config().authorities[0], addr);
+    }
+
+    #[test]
+    fn heartbeat_default_is_600s() {
+        // White paper: heartbeat blocks keep the chain alive during idle periods.
+        // Default max_idle_interval is 600 000 ms (10 minutes).
+        let cfg = NodeConfig::dev(Address::ZERO);
+        assert_eq!(cfg.max_idle_interval_ms, 600_000);
+    }
+
+    #[test]
+    fn heartbeat_nonzero_means_idle_skip_enabled() {
+        // A non-zero max_idle_interval means idle-block-skip is active,
+        // i.e. heartbeat blocks are produced, not every tick.
+        let cfg = NodeConfig::dev(Address::ZERO);
+        assert!(cfg.max_idle_interval_ms > 0);
     }
 }

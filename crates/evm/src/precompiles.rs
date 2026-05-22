@@ -1,7 +1,6 @@
 //! Shell-chain custom precompiles.
 //!
-//! Overrides the standard Ethereum precompiles at `0x0001`–`0x0006` with the
-//! Shell PQ suite:
+//! Replaces the standard Ethereum precompile table with the Shell PQ suite:
 //! - `0x0001`: ML-DSA-65 verify (implemented with the existing Dilithium3-compatible verifier)
 //! - `0x0002`: SLH-DSA-SHA2-256f verify
 //! - `0x0003`: ML-DSA-65 batch verify
@@ -9,14 +8,14 @@
 //! - `0x0005`: BLAKE3-512 hash
 //! - `0x0006`: PQAddr derive (`BLAKE3(algo_id || public_key)`)
 //!
-//! This keeps `ecrecover` disabled by overriding `0x0001` with the Shell PQ verifier.
+//! This keeps all classical Ethereum precompiles disabled, including
+//! `ecrecover`, BN256, and BLAKE2f.
 
 use alloy_primitives::{address, Address, Bytes};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::ContextTr;
 use revm::handler::PrecompileProvider;
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
-use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::hardfork::SpecId;
 use shell_crypto::{DilithiumVerifier, PQSignature, SignatureType, SphincsVerifier, Verifier};
 use std::boxed::Box;
@@ -54,20 +53,16 @@ const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
 
 #[derive(Debug, Clone)]
 pub struct ShellPrecompiles {
-    inner: &'static Precompiles,
     spec: SpecId,
 }
 
 impl ShellPrecompiles {
     pub fn new(spec: SpecId) -> Self {
-        Self {
-            inner: Precompiles::new(PrecompileSpecId::from_spec_id(spec)),
-            spec,
-        }
+        Self { spec }
     }
 
     pub fn is_precompile(&self, address: &Address) -> bool {
-        is_pq_precompile(address) || self.inner.contains(address)
+        is_pq_precompile(address)
     }
 }
 
@@ -79,7 +74,6 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
         if spec == self.spec {
             return false;
         }
-        self.inner = Precompiles::new(PrecompileSpecId::from_spec_id(spec));
         self.spec = spec;
         true
     }
@@ -95,53 +89,15 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
             return Ok(Some(run_pq_precompile(target, inputs, context)));
         }
 
-        let Some(precompile) = self.inner.get(target) else {
-            return Ok(None);
-        };
-
-        let mut result = InterpreterResult {
-            result: InstructionResult::Return,
-            gas: Gas::new(inputs.gas_limit),
-            output: Bytes::new(),
-        };
-
-        let input_bytes = read_input(inputs, context);
-
-        match precompile.execute(&input_bytes, inputs.gas_limit) {
-            Ok(output) => {
-                result.gas.record_refund(output.gas_refunded);
-                let underflow = result.gas.record_cost(output.gas_used);
-                assert!(underflow, "Gas underflow is not possible");
-                result.result = if output.reverted {
-                    InstructionResult::Revert
-                } else {
-                    InstructionResult::Return
-                };
-                result.output = output.bytes;
-            }
-            Err(e) => {
-                result.result = if e.is_oog() {
-                    InstructionResult::PrecompileOOG
-                } else {
-                    InstructionResult::PrecompileError
-                };
-            }
-        }
-        Ok(Some(result))
+        Ok(None)
     }
 
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        let standard = self
-            .inner
-            .addresses()
-            .cloned()
-            .filter(|address| !is_pq_precompile(address))
-            .collect::<Vec<_>>();
-        Box::new(PQ_PRECOMPILE_ADDRS.into_iter().chain(standard))
+        Box::new(PQ_PRECOMPILE_ADDRS.into_iter())
     }
 
     fn contains(&self, address: &Address) -> bool {
-        is_pq_precompile(address) || self.inner.contains(address)
+        is_pq_precompile(address)
     }
 }
 
@@ -447,6 +403,18 @@ mod tests {
         let sp = ShellPrecompiles::new(SpecId::CANCUN);
         for address in PQ_PRECOMPILE_ADDRS {
             assert!(sp.is_precompile(&address));
+        }
+    }
+
+    #[test]
+    fn shell_precompiles_exclude_classic_ethereum_precompiles() {
+        let sp = ShellPrecompiles::new(SpecId::CANCUN);
+        for address in [
+            address!("0x0000000000000000000000000000000000000007"),
+            address!("0x0000000000000000000000000000000000000008"),
+            address!("0x0000000000000000000000000000000000000009"),
+        ] {
+            assert!(!sp.is_precompile(&address));
         }
     }
 }

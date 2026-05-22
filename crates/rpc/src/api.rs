@@ -669,4 +669,20 @@ pub trait ShellApi {
         &self,
         block_hash: String,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns the algorithm registry — the set of PQ signing algorithms
+    /// that are accepted, deprecated, or pending activation on this node.
+    ///
+    /// This is the RPC exposure of the white-paper §6 algorithm registry.
+    /// In the current skeleton implementation the registry mirrors the
+    /// compile-time allowlist; future rounds will add on-chain governance.
+    ///
+    /// Response fields per entry:
+    /// - `algo`        — algorithm name (`"MlDsa65"`, `"Dilithium3"`, `"SphincsSha2256f"`)
+    /// - `status`      — `"active"`, `"deprecated"`, or `"pending_activation"`
+    /// - `description` — human-readable description / NIST reference
+    #[method(name = "getAlgorithmRegistry")]
+    async fn get_algorithm_registry(
+        &self,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 }
