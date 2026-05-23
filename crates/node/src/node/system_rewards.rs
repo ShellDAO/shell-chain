@@ -365,6 +365,9 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Check 3: recursive proof verification.
+        // H-1: Both soft-pass paths (decode error, NotImplemented) are now hard
+        // errors by default. They are only permitted when compiled with the
+        // `stub-l2-verifier` feature, which MUST NOT be enabled in production.
         let pub_inputs = shell_stark_prover::RecursivePublicInputs {
             l1_roots,
             aggregate_root: expected_agg_root,
@@ -374,23 +377,31 @@ impl<S: KvStore + 'static> Node<S> {
             end_block: amendment.block_number,
         };
         let prover = shell_stark_prover::get_recursive_prover();
-        // Check 3: recursive proof verification (best-effort; requires
-        // feature = "recursive").  Until the real prover is wired in, the
-        // scaffold returns NotImplemented — treated as a soft pass so that
-        // testnet L2 settlements can proceed.  Source-binding checks (1 & 2)
-        // above are the canonical gate for now.
         if let Ok(rec_proof) = serde_json::from_slice::<shell_stark_prover::RecursiveProof>(
             &amendment.proof.proof_bytes,
         ) {
             match prover.verify_aggregation(&rec_proof, &pub_inputs) {
                 Ok(()) => {}
                 Err(shell_stark_prover::RecursiveProverError::NotImplemented) => {
-                    // Recursive verifier is not yet active; soft-pass.
-                    tracing::debug!(
-                        block_hash = %amendment.block_hash,
-                        "STARK L2 recursive proof verifier not yet active — \
-                         source-binding checks passed, soft-accepting"
-                    );
+                    // H-1: recursive verifier not implemented.
+                    #[cfg(feature = "stub-l2-verifier")]
+                    {
+                        tracing::debug!(
+                            block_hash = %amendment.block_hash,
+                            "STARK L2 recursive proof verifier not active (stub-l2-verifier) — \
+                             source-binding checks passed, soft-accepting"
+                        );
+                    }
+                    #[cfg(not(feature = "stub-l2-verifier"))]
+                    {
+                        self.metrics.stark_settlements_rejected.inc();
+                        return Err(NodeError::Startup(format!(
+                            "STARK L2 recursive proof verifier is not implemented \
+                             (block #{}). Enable feature `stub-l2-verifier` only in \
+                             non-production environments to bypass this check.",
+                            amendment.block_number
+                        )));
+                    }
                 }
                 Err(e) => {
                     self.metrics.stark_settlements_rejected.inc();
@@ -400,15 +411,26 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         } else {
-            // proof_bytes cannot be decoded as a RecursiveProof.
-            // The recursive verifier is scaffolded (returns NotImplemented), so
-            // source-binding checks 1 & 2 above are the canonical gate for now.
-            // Log a warning so this is visible when the real verifier is wired in.
-            tracing::warn!(
-                block_hash = %amendment.block_hash,
-                "STARK L2 proof_bytes are not a valid RecursiveProof — \
-                 soft-accepting because recursive verifier is not yet active"
-            );
+            // H-1: proof_bytes cannot be decoded as a RecursiveProof — hard error
+            // unless the stub-l2-verifier feature is enabled.
+            #[cfg(not(feature = "stub-l2-verifier"))]
+            {
+                self.metrics.stark_settlements_rejected.inc();
+                return Err(NodeError::Startup(format!(
+                    "STARK L2 proof_bytes for block #{} cannot be decoded as a \
+                     RecursiveProof. Enable feature `stub-l2-verifier` only in \
+                     non-production environments to bypass this check.",
+                    amendment.block_number
+                )));
+            }
+            #[cfg(feature = "stub-l2-verifier")]
+            {
+                tracing::warn!(
+                    block_hash = %amendment.block_hash,
+                    "STARK L2 proof_bytes are not a valid RecursiveProof — \
+                     soft-accepting because stub-l2-verifier feature is enabled"
+                );
+            }
         }
 
         Ok(())

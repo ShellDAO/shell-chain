@@ -31,3 +31,10 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+
+[features]
+# H-1: stub-l2-verifier allows L2 recursive proof verification to soft-pass.
+# This MUST NOT be enabled in production. It exists only for testnet / local
+# development environments where the real recursive prover is not yet wired in.
+# Default builds do NOT enable this feature.
+stub-l2-verifier = []

@@ -1,8 +1,18 @@
 [advisories]
 # Deny crates with known security advisories.
 ignore = [
-    # Pulled by libp2p 0.56 via hickory-proto 0.25.2. Upstream has not
-    # released a libp2p version that can consume hickory-proto >=0.26.1 yet.
+    # H-4 (audit finding 2026-05-24): hickory-proto 0.25.2 pulled transitively
+    # by libp2p 0.56.  A patched version (>=0.26.1) exists on crates.io but
+    # libp2p has not yet published a release that accepts it, so we cannot bump
+    # without forking libp2p or waiting for an upstream libp2p release.
+    #
+    # Mitigation: hickory-proto/hickory-resolver are used by libp2p ONLY for
+    # DNS-based peer bootstrap (mDNS + DNS/SD).  The failure mode is a
+    # bootstrap stall — DNS resolution returns an error and the node falls back
+    # to known static peers.  There is NO data-integrity or remote-code-execution
+    # exposure for shell-chain: DNS results are not persisted, not used in
+    # consensus, and not accessible from the contract execution layer.
+    # This acceptance will be removed once libp2p ships a compatible release.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
 ]

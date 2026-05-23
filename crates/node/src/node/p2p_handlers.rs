@@ -205,6 +205,80 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
+        // C-3: Verify the vote's PQ signature before dispatching into consensus.
+        // The signing pre-image is the raw block hash bytes (mirrors event_loop.rs).
+        // Mirrors the same pattern used in handle_wpoa_view_change.
+        {
+            let known = self.known_authorities.read();
+            let pubkey = match known.get(&voter) {
+                Some(pk) => pk.clone(),
+                None => {
+                    tracing::warn!(
+                        %voter,
+                        "C-3: WPoA vote from unknown validator — rejecting"
+                    );
+                    return;
+                }
+            };
+            drop(known); // release read lock before potential peer_scorer lock
+
+            let sig_type = match shell_crypto::infer_signature_type_from_address(&pubkey, &voter) {
+                Some(t) if shell_crypto::is_algorithm_allowed(t) => t,
+                Some(t) => {
+                    tracing::warn!(
+                        %voter,
+                        algorithm = ?t,
+                        "C-3: WPoA vote uses disallowed signature algorithm — rejecting"
+                    );
+                    let peer_id = shell_consensus::ScoringPeerId::from(format!("{voter:?}"));
+                    self.peer_scorer
+                        .lock()
+                        .record_event(&peer_id, shell_consensus::PeerEvent::InvalidProofPayload);
+                    return;
+                }
+                None => {
+                    tracing::warn!(
+                        %voter,
+                        "C-3: cannot infer signature algorithm for WPoA voter — rejecting"
+                    );
+                    let peer_id = shell_consensus::ScoringPeerId::from(format!("{voter:?}"));
+                    self.peer_scorer
+                        .lock()
+                        .record_event(&peer_id, shell_consensus::PeerEvent::InvalidProofPayload);
+                    return;
+                }
+            };
+
+            let typed_sig = shell_crypto::PQSignature::new(sig_type, sig.data.clone());
+            let verifier = MultiVerifier;
+            match verifier.verify(&pubkey, block_hash.as_bytes(), &typed_sig) {
+                Ok(true) => {} // valid — proceed to consensus
+                Ok(false) => {
+                    tracing::warn!(
+                        %voter,
+                        "C-3: WPoA vote signature verification failed (possible forgery) — dropping"
+                    );
+                    let peer_id = shell_consensus::ScoringPeerId::from(format!("{voter:?}"));
+                    self.peer_scorer
+                        .lock()
+                        .record_event(&peer_id, shell_consensus::PeerEvent::InvalidProofPayload);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %voter,
+                        error = %e,
+                        "C-3: WPoA vote signature verification error — dropping"
+                    );
+                    let peer_id = shell_consensus::ScoringPeerId::from(format!("{voter:?}"));
+                    self.peer_scorer
+                        .lock()
+                        .record_event(&peer_id, shell_consensus::PeerEvent::InvalidProofPayload);
+                    return;
+                }
+            }
+        }
+
         let mut guard = self.wpoa_round.lock();
         if let Some(ref mut round) = *guard {
             if round.block_number != block_number {

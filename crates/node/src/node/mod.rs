@@ -617,7 +617,7 @@ impl<S: KvStore + 'static> Node<S> {
         metrics.block_height.set(current_head as i64);
         metrics.update_finality(current_head, finality_state.last_finalized_number());
 
-        Self {
+        let node = Self {
             config,
             store,
             chain_store,
@@ -665,7 +665,17 @@ impl<S: KvStore + 'static> Node<S> {
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
             last_proposed_by: parking_lot::Mutex::new(HashMap::new()),
             stark_drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
+        };
+
+        // H-1: Emit a loud startup warning when stub-l2-verifier is compiled in.
+        // This must never appear in production logs.
+        #[cfg(feature = "stub-l2-verifier")]
+        tracing::warn!(
+            "⚠️  stub-l2-verifier feature enabled — L2 settlement proofs are NOT verified. \
+             DO NOT USE IN PRODUCTION."
+        );
+
+        node
     }
 
     fn block_store(&self) -> BlockStoreBoundary<'_, S> {
@@ -1784,7 +1794,10 @@ mod tests {
 
     /// L2 source-binding validation must accept a source that IS in
     /// `settled_stark_sources` (happy path for the new canonical check).
+    /// With stub-l2-verifier disabled (default), garbage proof_bytes yield an
+    /// error at Check 3; this test runs only with the stub enabled.
     #[test]
+    #[cfg(feature = "stub-l2-verifier")]
     fn l2_source_binding_accepts_settled_l1_source() {
         use shell_stark_prover::recursive_air::compute_aggregate_root;
         let (node, signer) = setup_node();
@@ -1830,6 +1843,58 @@ mod tests {
         };
         node.validate_stark_proof_source_binding(&l2)
             .expect("settled L1 source should be accepted by L2 source-binding validation");
+    }
+
+    /// H-1: Without stub-l2-verifier, garbage proof_bytes must be a hard error.
+    #[test]
+    #[cfg(not(feature = "stub-l2-verifier"))]
+    fn l2_source_binding_rejects_invalid_proof_bytes_without_stub() {
+        use shell_stark_prover::recursive_air::compute_aggregate_root;
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let hashes = produce_witnessed_blocks(&node, &signer, 1);
+
+        let l1_src = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        let l1_src_json = serde_json::to_vec(&l1_src).unwrap();
+        node.amendment_store
+            .put_amendment(&l1_src.block_hash, &l1_src_json)
+            .unwrap();
+        node.settled_stark_sources
+            .lock()
+            .insert((1, l1_src.block_hash));
+
+        let root = u128::from_le_bytes(l1_src.proof.batch_root_bytes);
+        let agg_root = compute_aggregate_root(&[root]);
+        let l2 = ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: l1_src.block_hash,
+            block_number: 1,
+            start_block: Some(1),
+            proof: shell_stark_prover::proof::SigBatchProof {
+                version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
+                batch_root_bytes: agg_root.to_le_bytes(),
+                n_sigs: 1,
+                // H-1: These garbage bytes cannot be decoded as a RecursiveProof.
+                proof_bytes: vec![0x33; 128],
+            },
+            prover: Address::from([0x44; 32]),
+            prover_signature: Bytes::from(vec![0x55; 8]),
+            layer: 2,
+            source_hashes: vec![l1_src.block_hash],
+            original_size: Some(10_000),
+            compressed_size: Some(128),
+            settlement_tx_hash: None,
+        };
+        let err = node.validate_stark_proof_source_binding(&l2);
+        assert!(
+            err.is_err(),
+            "H-1: garbage proof_bytes must be a hard error without stub-l2-verifier, got Ok"
+        );
     }
 
     #[test]
@@ -5705,10 +5770,14 @@ mod tests {
 
         #[test]
         fn wpoa_handle_vote_reaches_quorum() {
+            // C-3: All voters must have their pubkeys registered and use real
+            // signatures over block_hash.as_bytes() (the vote pre-image).
             let signer1 = DilithiumSigner::generate();
+            let signer2 = DilithiumSigner::generate();
+            let signer3 = DilithiumSigner::generate();
             let addr1 = Address::from_public_key(signer1.public_key(), signer1.sig_type().as_u8());
-            let addr2 = Address::from([0xaa; 32]);
-            let addr3 = Address::from([0xbb; 32]);
+            let addr2 = Address::from_public_key(signer2.public_key(), signer2.sig_type().as_u8());
+            let addr3 = Address::from_public_key(signer3.public_key(), signer3.sig_type().as_u8());
 
             let db = Arc::new(MemoryDb::new());
             let chain_store = Arc::new(ChainStore::new(db.clone()));
@@ -5726,6 +5795,10 @@ mod tests {
 
             let config = NodeConfig::dev(addr1);
             let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
+            // C-3: Register all validator public keys so sig verification can proceed.
+            node.register_authority_pubkey(addr1, signer1.public_key().to_vec());
+            node.register_authority_pubkey(addr2, signer2.public_key().to_vec());
+            node.register_authority_pubkey(addr3, signer3.public_key().to_vec());
             store_genesis_wpoa(&node);
 
             // Manually initialise the wPoA round (the event loop does this after
@@ -5739,16 +5812,9 @@ mod tests {
                 *node.wpoa_round.lock() = Some(round);
             }
 
-            // addr2 votes first — still below quorum
-            node.handle_wpoa_vote(
-                addr2,
-                block_hash,
-                block_number,
-                shell_crypto::PQSignature::new(
-                    shell_crypto::SignatureType::Dilithium3,
-                    vec![0u8; 32],
-                ),
-            );
+            // addr2 votes first with a valid signature — still below quorum.
+            let sig2 = signer2.sign(block_hash.as_bytes()).unwrap();
+            node.handle_wpoa_vote(addr2, block_hash, block_number, sig2);
             let phase1 = node
                 .wpoa_round
                 .lock()
@@ -5760,16 +5826,9 @@ mod tests {
                 "should still be Voting after 1 vote"
             );
 
-            // addr3 votes — quorum (2 of 3) reached
-            node.handle_wpoa_vote(
-                addr3,
-                block_hash,
-                block_number,
-                shell_crypto::PQSignature::new(
-                    shell_crypto::SignatureType::Dilithium3,
-                    vec![0u8; 32],
-                ),
-            );
+            // addr3 votes with a valid signature — quorum (2 of 3) reached.
+            let sig3 = signer3.sign(block_hash.as_bytes()).unwrap();
+            node.handle_wpoa_vote(addr3, block_hash, block_number, sig3);
             let phase2 = node
                 .wpoa_round
                 .lock()
@@ -5779,6 +5838,68 @@ mod tests {
                 phase2.as_deref(),
                 Some("Committed"),
                 "should be Committed after quorum is reached"
+            );
+        }
+
+        /// C-3: A vote with a garbage signature for a known validator must be
+        /// rejected — the round must NOT advance past Voting.
+        #[test]
+        fn wpoa_handle_vote_rejects_garbage_signature() {
+            let signer1 = DilithiumSigner::generate();
+            let signer2 = DilithiumSigner::generate();
+            let signer3 = DilithiumSigner::generate();
+            let addr1 = Address::from_public_key(signer1.public_key(), signer1.sig_type().as_u8());
+            let addr2 = Address::from_public_key(signer2.public_key(), signer2.sig_type().as_u8());
+            let addr3 = Address::from_public_key(signer3.public_key(), signer3.sig_type().as_u8());
+
+            let db = Arc::new(MemoryDb::new());
+            let chain_store = Arc::new(ChainStore::new(db.clone()));
+            let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+
+            let poa_cfg = PoaConfig::new(vec![addr1, addr2, addr3], 1);
+            let wpoa_cfg = WPoaConfig::from_poa(poa_cfg);
+            let engine = WPoaEngine::new(wpoa_cfg, Arc::new(MultiVerifier));
+            let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(engine));
+
+            let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+                chain_id: 1337,
+                ..MempoolConfig::default()
+            }));
+
+            let config = NodeConfig::dev(addr1);
+            let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
+            node.register_authority_pubkey(addr1, signer1.public_key().to_vec());
+            node.register_authority_pubkey(addr2, signer2.public_key().to_vec());
+            node.register_authority_pubkey(addr3, signer3.public_key().to_vec());
+            store_genesis_wpoa(&node);
+
+            let block_hash = hash(99);
+            let block_number = 1u64;
+            {
+                let weights = node.consensus.read().validator_weights();
+                let mut round = WPoaRound::new(block_number, 0, weights);
+                let _ = round.on_block_proposed(block_hash, addr1);
+                *node.wpoa_round.lock() = Some(round);
+            }
+
+            // Send votes with garbage signatures for addr2 and addr3.
+            // Neither should be accepted by the round (C-3 fix).
+            let garbage_sig = shell_crypto::PQSignature::new(
+                shell_crypto::SignatureType::Dilithium3,
+                vec![0xde, 0xad, 0xbe, 0xef],
+            );
+            node.handle_wpoa_vote(addr2, block_hash, block_number, garbage_sig.clone());
+            node.handle_wpoa_vote(addr3, block_hash, block_number, garbage_sig);
+
+            let phase = node
+                .wpoa_round
+                .lock()
+                .as_ref()
+                .map(|r| r.phase_name().to_string());
+            assert_eq!(
+                phase.as_deref(),
+                Some("Voting"),
+                "C-3: round must NOT advance when all votes have garbage signatures"
             );
         }
 
