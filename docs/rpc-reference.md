@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (32 methods)
+- **`shell_`** (34 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -474,6 +474,16 @@ Propose removing a validator via system contract transaction.
 Requires the node to be configured as a validator.
 Returns the transaction hash on success.
 
+### shell_proposeSetValidatorWeight
+```
+propose_set_validator_weight(address: String, weight: u64, ) → String
+```
+
+Propose updating a validator's governance weight via system contract transaction.
+Requires the node to be configured as a validator.
+Takes effect when a weighted quorum (>2/3 of total weight) supports the change.
+Returns the transaction hash on success.
+
 ### shell_getValidatorStatus
 ```
 get_validator_status(address: Address, ) → serde_json::Value
@@ -714,16 +724,6 @@ Returns an error when the node has not been configured with a profile
 (e.g. legacy startup paths). Stable consumers should treat such an
 error as `"profile: unknown"`.
 
-### shell_getAlgorithmRegistry
-```
-get_algorithm_registry() → serde_json::Value
-```
-
-Returns the live algorithm registry as an array of entries:
-- `algo` — algorithm name (`"MlDsa65"`, `"Dilithium3"`, `"SphincsSha2256f"`)
-- `status` — `"active"`, `"deprecated"`, or `"pending_activation"`
-- `description` — human-readable description
-
 ### shell_getProofAmendment
 ```
 get_proof_amendment(block_hash: String, ) → serde_json::Value
@@ -750,4 +750,21 @@ Pointer responses for non-final source blocks include `target_hash` and
 bytes and proof entry counts.
 
 Returns `null` when no proof amendment has been generated for the block.
+
+### shell_getAlgorithmRegistry
+```
+get_algorithm_registry() → serde_json::Value
+```
+
+Returns the algorithm registry — the set of PQ signing algorithms
+that are accepted, deprecated, or pending activation on this node.
+
+This is the RPC exposure of the white-paper §6 algorithm registry.
+The returned array reflects the node's live in-memory view of on-chain
+governance transitions.
+
+Response fields per entry:
+- `algo`        — algorithm name (`"MlDsa65"`, `"Dilithium3"`, `"SphincsSha2256f"`)
+- `status`      — `"active"`, `"deprecated"`, or `"pending_activation"`
+- `description` — human-readable description / NIST reference
 
