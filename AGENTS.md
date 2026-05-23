@@ -10,7 +10,7 @@ The post-quantum-native Layer 1 node implementation:
 
 - PQVM-native execution, currently through a revm-backed adapter for retained
   Cancun-style arithmetic, memory, storage, and control-flow semantics
-- PQ signatures: Dilithium3 (NIST FIPS 204 / ML-DSA-65 path), SPHINCS+
+- PQ signatures: ML-DSA-65 primary (FIPS 204), Dilithium3 legacy-compatible active path, SPHINCS+ fallback
 - wPoA consensus engine
 - STARK transaction-level settlement (system tx, no `extra_data`)
 - Account Abstraction natively in protocol (tx type `0x7E`)
@@ -54,7 +54,7 @@ Toolchain uses the `stable` channel via `rust-toolchain.toml` (+ rustfmt + clipp
 | Crate | Role |
 |---|---|
 | `primitives` | Core types (ShellHash, Address, U256) |
-| `crypto` | PQ signature stack (Dilithium3 / ML-DSA-65 / SPHINCS+) |
+| `crypto` | PQ signature stack (ML-DSA-65 primary / Dilithium3 legacy-compatible / SPHINCS+ fallback) |
 | `core` | Shared trait definitions, transaction model |
 | `storage` | KvStore, witness pruner, settled-source index |
 | `consensus` | wPoA engine, validator set, slashing |

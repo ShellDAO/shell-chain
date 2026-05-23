@@ -94,8 +94,8 @@ and the TypeScript SDK (`shell-sdk`).
 
 | `key_type` | Standard | Public Key | Secret Key | Notes |
 |------------|----------|------------|------------|-------|
-| `dilithium3` | Dilithium3 (NIST Round 3 reference) | 1952 B | 4000 B | **Current default** (`--algorithm dilithium3`) |
-| `mldsa65` | ML-DSA-65 (FIPS 204) | 1952 B | 4032 B | Optional FIPS-204 path; use with `--algorithm mldsa65` |
+| `mldsa65` | ML-DSA-65 (FIPS 204) | 1952 B | 4032 B | **Primary** (`--algorithm mldsa65`) |
+| `dilithium3` | Dilithium3 (NIST Round 3 reference) | 1952 B | 4000 B | Legacy-compatible active path; use with `--algorithm dilithium3` |
 
 Both algorithms use the same keystore format. The `key_type` field tells the runtime which
 decryption path to use.

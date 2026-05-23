@@ -93,7 +93,7 @@ For the full design and current implementation status, see
 | Crate | Description |
 |-------|-------------|
 | `shell-primitives` | Foundational types: Keccak-256, BLAKE3, H256, Address, U256, Bytes |
-| `shell-crypto` | Dilithium3 (default) & ML-DSA-65 (optional FIPS 204) & SPHINCS+ signing, multi-algorithm Signer/Verifier traits |
+| `shell-crypto` | ML-DSA-65 primary (FIPS 204) & Dilithium3 legacy-compatible active path & SPHINCS+ fallback signing, multi-algorithm Signer/Verifier traits |
 | `shell-core` | Block, Transaction (AA-native), Account, Receipt, EIP-1559 gas model |
 | `shell-storage` | RocksDB backend, Merkle Patricia Trie, RLP serialization, state pruning, storage profiles |
 | `shell-consensus` | PoA engine (default); optional wPoA extension: weight-based fork choice, BFT finality, slashing |
@@ -138,9 +138,9 @@ shell-chain/
 
 | Algorithm | Type | Use Case | Status |
 |-----------|------|----------|--------|
-| **Dilithium3** | Lattice-based | Transaction signing (default) | Deployed — NIST Level 3 |
-| **ML-DSA-65** (FIPS 204) | Lattice-based | Transaction signing (optional FIPS path) | Deployed — optional |
-| **SPHINCS+** (SLH-DSA) | Hash-based | High-security accounts (optional) | Deployed — NIST Level 5 |
+| **ML-DSA-65** (FIPS 204) | Lattice-based | Transaction signing (primary) | Deployed — NIST FIPS 204 |
+| **Dilithium3** | Lattice-based | Transaction signing (legacy-compatible active path) | Deployed — NIST Round 3 reference |
+| **SPHINCS+** (SLH-DSA) | Hash-based | High-security accounts (fallback) | Deployed — NIST Level 5 |
 | **STARKs** | Hash-based proofs | Signature aggregation, storage compression | Deployed (optional, off by default in dev) |
 | **Kyber / ML-KEM** (P2P) | KEM | Validator transport (future) | **Not yet deployed** — classical libp2p Noise/XX is current |
 

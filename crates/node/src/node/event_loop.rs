@@ -154,7 +154,7 @@ impl<S: KvStore + 'static> Node<S> {
             tokio::sync::mpsc::channel::<SignedTransaction>(4096);
 
         // Create a broadcast channel for block events (eth_subscribe).
-        // F-042: Use larger capacity to reduce subscriber lag.
+        // Capacity 256 provides ample buffering to reduce subscriber lag.
         let (block_event_tx, _) = tokio::sync::broadcast::channel::<BlockEvent>(256);
 
         // Start JSON-RPC server.
@@ -168,7 +168,7 @@ impl<S: KvStore + 'static> Node<S> {
             None
         };
         // Shared finalized block number for the RPC layer.
-        // F-107: recover persisted finalized_number from ChainStore on restart,
+        // Recover persisted finalized_number from ChainStore on restart,
         // falling back to finality state and then 0.
         let finality_num = self.finality.read().last_finalized_number();
         let persisted_num = self

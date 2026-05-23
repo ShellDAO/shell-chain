@@ -25,8 +25,7 @@ pub enum SignatureType {
     /// CRYSTALS-Dilithium3 (pre-FIPS, `pqcrypto-dilithium 0.5`).
     /// Based on the Round 3 submission, NOT the final FIPS 204 ML-DSA-65.
     Dilithium3,
-    /// FIPS 204 ML-DSA-65. Reserved for future migration when a compliant
-    /// Rust implementation is available and verified.
+    /// FIPS 204 ML-DSA-65. Primary signing algorithm.
     MlDsa65,
     /// SPHINCS+-SHA2-256f-simple (stateless hash-based, 256-bit PQ security).
     SphincsSha2256f,
