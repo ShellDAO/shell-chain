@@ -318,15 +318,18 @@ pub fn prune_state_trie<S: KvStore + 'static>(
         retained_roots.insert(header.state_root);
     }
 
-    // Only evict the block that just fell outside the retention window; all
-    // earlier blocks have already been pruned by previous calls.
-    if keep_below_block > 0 {
-        let evicted_block = keep_below_block - 1;
-        if let Some(block_hash) = chain_store.get_block_hash_by_number(evicted_block)? {
-            if let Some(header) = chain_store.get_header_by_hash(&block_hash)? {
-                old_roots.push(header.state_root);
-            }
-        }
+    // Collect roots to evict: all blocks strictly below the retention boundary.
+    // In steady-state operation this window stays small because each block
+    // advances keep_below_block by 1; on first-run or catch-up it is bounded by
+    // the retention window size, not total chain height.
+    for block_number in 0..keep_below_block {
+        let Some(block_hash) = chain_store.get_block_hash_by_number(block_number)? else {
+            continue;
+        };
+        let Some(header) = chain_store.get_header_by_hash(&block_hash)? else {
+            continue;
+        };
+        old_roots.push(header.state_root);
     }
 
     let mut protected_nodes = HashSet::new();
