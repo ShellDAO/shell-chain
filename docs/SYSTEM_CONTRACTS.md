@@ -2,7 +2,8 @@
 
 Shell-Chain ships two native system contracts. They live at well-known addresses
 and are executed as native Rust code — no Solidity bytecode, no compiler needed.
-The EVM executor intercepts calls to these addresses before running the EVM.
+The PQVM/revm execution adapter intercepts calls to these addresses before
+running bytecode.
 
 ---
 
@@ -236,7 +237,7 @@ System contract calls use a flat base gas charge:
 
 ## Implementation notes
 
-- System contracts are **intercepted by the EVM executor** before EVM bytecode
+- System contracts are **intercepted by the PQVM/revm execution adapter** before bytecode
   execution. There is no bytecode at these addresses — `eth_getCode` returns an
   empty result.
 - Both contracts produce standard EVM-style `logs` (topics + data) that appear

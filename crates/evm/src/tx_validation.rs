@@ -151,7 +151,7 @@ const ACCESS_LIST_ADDRESS_COST: u64 = 2400;
 /// EIP-2930: gas cost per storage key in the access list.
 const ACCESS_LIST_STORAGE_KEY_COST: u64 = 1900;
 
-/// Validate a signed transaction before EVM execution.
+/// Validate a signed transaction before PQVM/revm execution.
 ///
 /// This function performs the full pre-execution validation pipeline:
 ///

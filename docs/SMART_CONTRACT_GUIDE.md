@@ -8,12 +8,15 @@ Deploy and interact with smart contracts on Shell-Chain.
 
 ## Overview
 
-Shell-Chain runs the **PQVM** (Post-Quantum Virtual Machine), which is based on the Cancun EVM with two differences from standard EVM:
+Shell-Chain runs the **PQVM** (Post-Quantum Virtual Machine): an execution environment that retains Cancun-style arithmetic, memory, storage, logs, and control flow while replacing Ethereum's classical cryptographic surfaces.
+
+Key differences from standard Ethereum execution:
 
 1. **`SELFDESTRUCT` and `CALLCODE` are removed** — these opcodes are unavailable in PQVM-1.
 2. **32-byte native addresses** — Shell-Chain addresses are 32-byte BLAKE3 digests (not 20-byte keccak truncations). The PQABI encoding uses a 32-byte full slot for addresses.
+3. **PQ-native authentication** — transactions use PQ signatures and PQTx semantics, not ECDSA EOAs.
 
-For all other opcodes, arithmetic, memory, storage, logs, and control flow, Shell-Chain behaves like a standard Cancun EVM node. Standard tooling — Hardhat, Foundry, Remix — all work with the caveats above.
+For retained non-cryptographic opcodes, Shell-Chain keeps EVM-familiar behavior. Standard tooling such as Hardhat, Foundry, and Remix can be used with the caveats above and Shell-aware address/signing support.
 
 ---
 

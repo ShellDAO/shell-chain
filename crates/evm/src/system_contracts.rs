@@ -3,7 +3,7 @@
 //! - AccountManager at address 0x0000…0002
 //!
 //! Instead of deploying Solidity bytecode, this contract is intercepted by the
-//! EVM executor and executed as native Rust code. This avoids the need for a
+//! PQVM/revm execution adapter and executed as native Rust code. This avoids the need for a
 //! Solidity compiler and ensures deterministic, efficient validator management.
 //!
 //! # Supported Functions

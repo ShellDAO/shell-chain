@@ -17,7 +17,7 @@ Instead, transaction validation is part of the base protocol:
 - **Default path:** built-in post-quantum signature validation
 - **Upgradeable path:** account-specific validation contract logic
 - **Stable account identity:** address stays the same across key rotation
-- **32-byte native addresses:** Shell-Chain uses 32-byte BLAKE3-derived addresses throughout; system contracts use the `from_alloy`/`to_alloy` shims for EVM call data compatibility
+- **32-byte native addresses:** Shell-Chain uses 32-byte BLAKE3-derived addresses throughout; system contracts use the `from_alloy`/`to_alloy` shims only at the PQVM/revm execution boundary for retained ABI/tooling interoperability
 
 In practice, this means the chain can support:
 

@@ -8,7 +8,8 @@ this submodule.
 
 The post-quantum-native Layer 1 node implementation:
 
-- Cancun-EVM compatible (revm-based executor)
+- PQVM-native execution, currently through a revm-backed adapter for retained
+  Cancun-style arithmetic, memory, storage, and control-flow semantics
 - PQ signatures: Dilithium3 (NIST FIPS 204 / ML-DSA-65 path), SPHINCS+
 - wPoA consensus engine
 - STARK transaction-level settlement (system tx, no `extra_data`)
@@ -58,7 +59,7 @@ Toolchain uses the `stable` channel via `rust-toolchain.toml` (+ rustfmt + clipp
 | `storage` | KvStore, witness pruner, settled-source index |
 | `consensus` | wPoA engine, validator set, slashing |
 | `genesis` | Genesis block construction |
-| `evm` | revm wrapper, parallel scheduler |
+| `evm` | revm-backed PQVM execution adapter, parallel scheduler |
 | `mempool` | Transaction pool |
 | `network` | libp2p gossipsub |
 | `rpc` | JSON-RPC, TLS, three-RPC fanout |

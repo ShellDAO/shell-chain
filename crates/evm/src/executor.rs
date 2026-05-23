@@ -1,6 +1,6 @@
-//! EVM executor: executes transactions via revm and produces receipts.
+//! PQVM/revm execution adapter: executes transactions via revm and produces receipts.
 //!
-//! [`ShellEvm`] wraps the revm EVM with shell-chain's state bridge and
+//! [`ShellEvm`] wraps revm with shell-chain's state bridge and
 //! provides a high-level API for executing individual transactions and
 //! full blocks.
 
@@ -27,7 +27,7 @@ use crate::system_contracts::{
     self, execute_system_contract_call, SystemContractEffects, SYSTEM_CALL_BASE_GAS,
 };
 
-/// Errors returned during EVM execution.
+/// Errors returned during PQVM/revm execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
     #[error("evm: {0}")]
@@ -49,7 +49,7 @@ pub struct TxExecutionResult {
     pub receipt: TransactionReceipt,
     /// State changes produced by this transaction (for committing).
     pub state_changes: EvmState,
-    /// Maps 20-byte EVM address → full 32-byte PQ Shell address for accounts
+    /// Maps 20-byte revm bridge address → full 32-byte PQ Shell address for accounts
     /// whose upper 12 bytes are non-zero. Required by `commit_evm_state` to
     /// write state to the correct canonical key in world_state.
     pub pq_addr_map: std::collections::HashMap<EvmAddress, ShellAddress>,
@@ -61,16 +61,16 @@ pub struct TxExecutionResult {
     pub sender_nonce_after: u64,
     /// Gas actually used by this transaction.
     pub gas_used: u64,
-    /// Raw output bytes returned by the EVM (return data or revert reason).
+    /// Raw output bytes returned by execution (return data or revert reason).
     pub output: Vec<u8>,
     /// True if this was a system contract transaction whose state changes
-    /// were applied directly to the EVM's WorldState (not via EvmState).
+    /// were applied directly to WorldState (not via EvmState).
     pub is_system_tx: bool,
     /// Explicit state surfaces mutated by native system-contract execution.
     pub system_contract_effects: SystemContractEffects,
 }
 
-/// High-level EVM executor for shell-chain.
+/// High-level PQVM/revm execution adapter for shell-chain.
 ///
 /// Wraps revm and provides:
 /// - `execute_tx()`: execute a single validated transaction → receipt + state

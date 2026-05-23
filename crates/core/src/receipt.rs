@@ -22,7 +22,7 @@ pub struct TransactionReceipt {
     /// Contract address created, if any.
     pub contract_address: Option<Address>,
     /// Bloom filter for fast log filtering (2048-bit / 256 bytes).
-    /// Populated by EVM executor; empty until execution.
+    /// Populated by the PQVM/revm execution adapter; empty until execution.
     pub logs_bloom: Bytes,
     /// Event logs emitted during execution.
     pub logs: Vec<Log>,

@@ -15,7 +15,7 @@ pub struct BlockHeader {
     pub transactions_root: ShellHash,
     pub receipts_root: ShellHash,
     /// Bloom filter over all logs in this block (2048-bit / 256 bytes).
-    /// Populated by EVM executor; empty during construction.
+    /// Populated by the PQVM/revm execution adapter; empty during construction.
     pub logs_bloom: Bytes,
     pub number: u64,
     pub gas_limit: u64,
