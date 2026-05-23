@@ -122,6 +122,12 @@ impl ViewChangeState {
     }
 }
 
+impl Default for ViewChangeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn wall_clock_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

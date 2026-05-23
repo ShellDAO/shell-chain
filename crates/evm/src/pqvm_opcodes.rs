@@ -16,8 +16,8 @@
 //!
 //! `algo_id` values:
 //! - `0x01` — ML-DSA family: `[1-byte sig_type][4-byte pk_len][pk][4-byte msg_len][msg][sig]`
-//!            where `sig_type=0x01` selects ML-DSA-65 and `sig_type=0x00` keeps
-//!            legacy Dilithium3 compatibility on the same wire shape
+//!   where `sig_type=0x01` selects ML-DSA-65 and `sig_type=0x00` keeps
+//!   legacy Dilithium3 compatibility on the same wire shape
 //! - `0x02` — SLH-DSA-SHA2-256f:      `[pk (64 B)][sig (49 856 B)][msg]`
 //!
 //! ## Gas costs

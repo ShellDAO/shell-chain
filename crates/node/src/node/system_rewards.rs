@@ -400,12 +400,13 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         } else {
-            // Proof bytes are not decodable as a RecursiveProof — soft-pass
-            // until the encoding is finalised.
-            tracing::debug!(
-                block_hash = %amendment.block_hash,
-                "STARK L2 proof_bytes are not a RecursiveProof — soft-accepting"
-            );
+            // Proof bytes cannot be decoded as a RecursiveProof.
+            // Soft-accepting here would allow arbitrary proof_bytes to bypass
+            // L2 proof verification; hard-reject to prevent exploitation.
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(
+                "STARK L2 proof_bytes are not a valid RecursiveProof; cannot accept".into(),
+            ));
         }
 
         Ok(())

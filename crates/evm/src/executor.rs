@@ -443,6 +443,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                     });
             let spec = SpecId::CANCUN;
             let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+            crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
             remove_legacy_opcodes(&mut instructions);
             let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
             let exec_outcome = evm.transact(tx_env);

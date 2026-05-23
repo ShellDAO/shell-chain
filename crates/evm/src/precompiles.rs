@@ -243,6 +243,11 @@ fn verify_mldsa65(input: &[u8]) -> bool {
     }
     let message = &input[4 + pk_len + 4..4 + pk_len + 4 + msg_len];
     let sig_bytes = &input[4 + pk_len + 4 + msg_len..];
+    // Try ML-DSA-65 first (primary algorithm); fall back to Dilithium3 for
+    // legacy wire-compatible signatures on the same wire shape.
+    if verify_signature(SignatureType::MlDsa65, public_key, message, sig_bytes).unwrap_or(false) {
+        return true;
+    }
     verify_signature(SignatureType::Dilithium3, public_key, message, sig_bytes).unwrap_or(false)
 }
 

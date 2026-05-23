@@ -504,6 +504,23 @@ impl<S: KvStore + 'static> Node<S> {
         msg: ViewChangeMessage,
         verifier: &dyn Verifier,
     ) -> Result<bool, NodeError> {
+        // Reject view-change messages for heights other than the current
+        // timed-out height (head + 1) to prevent stale / replayed messages
+        // from incorrectly rotating proposer selection.
+        let expected_block = self
+            .chain_store
+            .get_head_block()
+            .ok()
+            .flatten()
+            .map(|b| b.number() + 1)
+            .unwrap_or(1);
+        if msg.block_number != expected_block {
+            return Err(NodeError::Startup(format!(
+                "view-change block_number {} does not match expected height {}",
+                msg.block_number, expected_block
+            )));
+        }
+
         let known = self.known_authorities.read();
         let pubkey = known.get(&msg.validator).ok_or_else(|| {
             NodeError::Startup(format!(

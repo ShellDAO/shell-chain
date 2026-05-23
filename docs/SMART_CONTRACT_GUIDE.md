@@ -113,9 +113,9 @@ Shell-Chain adds three post-quantum opcodes not present in the standard EVM:
 
 | Opcode | Hex | Gas | Description |
 |--------|-----|-----|-------------|
-| `PQVERIFY` | `0xB0` | 3000 | Verify a PQ signature on-chain |
-| `PQHASH` | `0xB1` | 200 | BLAKE3 hash of input data |
-| `PQADDR` | `0xB2` | 100 | Derive a 32-byte address from algo_id + pubkey |
+| `PQVERIFY` | `0xB0` | 46,000 (ML-DSA-65) | Verify a PQ signature on-chain |
+| `PQHASH` | `0xB1` | `30 + 6 × ⌈len/32⌉` | BLAKE3 hash of input data |
+| `PQADDR` | `0xB2` | 200 | Derive a 32-byte address from algo_id + pubkey |
 
 These opcodes are defined and gas-priced in the protocol; full interpreter
 dispatch wiring is in progress (see whitepaper §10 known limitations).
@@ -124,12 +124,12 @@ dispatch wiring is in progress (see whitepaper §10 known limitations).
 
 | Address | Function | Input wire format |
 |---------|----------|------------------|
-| `0x...0001` | ML-DSA-65 Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
-| `0x...0002` | SLH-DSA-SHA2-256f Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
-| `0x...0003` | BLAKE3 Hash | raw bytes → 32-byte digest |
-| `0x...0004` | Dilithium3 Verify | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
-| `0x...0005` | PQ Address Derive | `[1-byte algo_id][pubkey]` → 32-byte address |
-| `0x...0006` | Reserved | — |
+| `0x...0001` | ML-DSA-family Verify (ML-DSA-65 primary, Dilithium3 legacy) | `[4-byte pk_len][pk][4-byte msg_len][msg][sig]` |
+| `0x...0002` | SLH-DSA-SHA2-256f Verify | `[pk (64 B)][sig (49 856 B)][msg]` |
+| `0x...0003` | ML-DSA-65 Batch Verify | `[4-byte count][sig_0]...[sig_n]` |
+| `0x...0004` | BLAKE3-256 Hash | raw bytes → 32-byte digest |
+| `0x...0005` | BLAKE3-512 Hash | raw bytes → 64-byte digest |
+| `0x...0006` | PQ Address Derive | `[1-byte algo_id][pubkey]` → 32-byte address |
 
 Use the 32-byte precompile address `0x0000...000N` (31 zero bytes + 1 index byte).
 
@@ -348,12 +348,12 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 
 | Address | Function | Gas model |
 |---------|----------|-----------|
-| `0x0000000000000000000000000000000000000001` | ML-DSA-65 verify | flat `46,000` |
+| `0x0000000000000000000000000000000000000001` | ML-DSA-family verify (ML-DSA-65 primary, Dilithium3 legacy) | flat `46,000` |
 | `0x0000000000000000000000000000000000000002` | SLH-DSA-SHA2-256f verify | flat `2,300,000` |
-| `0x0000000000000000000000000000000000000003` | BLAKE3 hash | `30 + 6 × words` |
-| `0x0000000000000000000000000000000000000004` | Dilithium3 verify | flat `46,000` |
-| `0x0000000000000000000000000000000000000005` | PQ address derive | flat `200` |
-| `0x0000000000000000000000000000000000000006` | Reserved | — |
+| `0x0000000000000000000000000000000000000003` | ML-DSA-65 batch verify | `12,000 × sig_count` |
+| `0x0000000000000000000000000000000000000004` | BLAKE3-256 hash | `30 + 6 × ⌈len/32⌉` |
+| `0x0000000000000000000000000000000000000005` | BLAKE3-512 hash | `30 + 6 × ⌈len/32⌉` |
+| `0x0000000000000000000000000000000000000006` | PQ address derive | flat `200` |
 
 The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 

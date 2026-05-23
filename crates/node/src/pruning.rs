@@ -304,17 +304,28 @@ pub fn prune_state_trie<S: KvStore + 'static>(
 
     let mut old_roots = Vec::new();
     let mut retained_roots = HashSet::new();
-    for block_number in 0..=head.number() {
+
+    // Only walk the retention window for retained roots — avoids O(chain_height)
+    // per call which would become O(N²) over the chain's lifetime.
+    let window_start = keep_below_block.min(head.number());
+    for block_number in window_start..=head.number() {
         let Some(block_hash) = chain_store.get_block_hash_by_number(block_number)? else {
             continue;
         };
         let Some(header) = chain_store.get_header_by_hash(&block_hash)? else {
             continue;
         };
-        if block_number < keep_below_block {
-            old_roots.push(header.state_root);
-        } else {
-            retained_roots.insert(header.state_root);
+        retained_roots.insert(header.state_root);
+    }
+
+    // Only evict the block that just fell outside the retention window; all
+    // earlier blocks have already been pruned by previous calls.
+    if keep_below_block > 0 {
+        let evicted_block = keep_below_block - 1;
+        if let Some(block_hash) = chain_store.get_block_hash_by_number(evicted_block)? {
+            if let Some(header) = chain_store.get_header_by_hash(&block_hash)? {
+                old_roots.push(header.state_root);
+            }
         }
     }
 
