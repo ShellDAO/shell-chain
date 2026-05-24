@@ -249,6 +249,27 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             };
 
+            // Security: reject votes whose sender-controlled sig_type tag does
+            // not match the canonical algorithm inferred from the voter's address.
+            // Accepting a mismatched tag would allow an attacker to store a
+            // commit certificate whose algorithm label differs from the one used
+            // during verification (algorithm-tag confusion).
+            if sig.sig_type != sig_type {
+                tracing::warn!(
+                    voter = %voter,
+                    claimed = ?sig.sig_type,
+                    expected = ?sig_type,
+                    "vote sig_type mismatch: claimed={:?} expected={:?} — rejecting",
+                    sig.sig_type,
+                    sig_type,
+                );
+                let peer_id = shell_consensus::ScoringPeerId::from(format!("{voter:?}"));
+                self.peer_scorer
+                    .lock()
+                    .record_event(&peer_id, shell_consensus::PeerEvent::InvalidProofPayload);
+                return;
+            }
+
             let typed_sig = shell_crypto::PQSignature::new(sig_type, sig.data.clone());
             let verifier = MultiVerifier;
             match verifier.verify(&pubkey, block_hash.as_bytes(), &typed_sig) {

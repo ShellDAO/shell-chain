@@ -5903,6 +5903,74 @@ mod tests {
             );
         }
 
+        /// Security: A vote with a valid signature but a wrong `sig_type` tag
+        /// must be rejected — algorithm-tag confusion must not allow fake commit
+        /// certificates.
+        #[test]
+        fn wpoa_handle_vote_rejects_sig_type_mismatch() {
+            use shell_crypto::SignatureType;
+
+            // Use DilithiumSigner so the voter's address encodes Dilithium3.
+            let signer = DilithiumSigner::generate();
+            let addr = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+
+            // Need a second validator to bootstrap the round (proposer).
+            let proposer = DilithiumSigner::generate();
+            let proposer_addr =
+                Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+
+            let db = Arc::new(MemoryDb::new());
+            let chain_store = Arc::new(ChainStore::new(db.clone()));
+            let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+
+            let poa_cfg = PoaConfig::new(vec![proposer_addr, addr], 1);
+            let wpoa_cfg = WPoaConfig::from_poa(poa_cfg);
+            let engine = WPoaEngine::new(wpoa_cfg, Arc::new(MultiVerifier));
+            let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(engine));
+
+            let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+                chain_id: 1337,
+                ..MempoolConfig::default()
+            }));
+
+            let config = NodeConfig::dev(proposer_addr);
+            let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
+            node.register_authority_pubkey(proposer_addr, proposer.public_key().to_vec());
+            node.register_authority_pubkey(addr, signer.public_key().to_vec());
+            store_genesis_wpoa(&node);
+
+            let block_hash = hash(77);
+            let block_number = 1u64;
+            {
+                let weights = node.consensus.read().validator_weights();
+                let mut round = WPoaRound::new(block_number, 0, weights);
+                let _ = round.on_block_proposed(block_hash, proposer_addr);
+                *node.wpoa_round.lock() = Some(round);
+            }
+
+            // Build a valid Dilithium3 signature over block_hash, but lie about
+            // sig_type — claim it's MlDsa65 so the tag mismatches the inferred type.
+            let real_sig = signer.sign(block_hash.as_bytes()).unwrap();
+            let mismatched_sig = shell_crypto::PQSignature::new(
+                SignatureType::MlDsa65, // wrong tag — signer used Dilithium3
+                real_sig.data,
+            );
+
+            node.handle_wpoa_vote(addr, block_hash, block_number, mismatched_sig);
+
+            // The vote must have been rejected: round stays in Voting (no votes accepted).
+            let phase = node
+                .wpoa_round
+                .lock()
+                .as_ref()
+                .map(|r| r.phase_name().to_string());
+            assert_eq!(
+                phase.as_deref(),
+                Some("Voting"),
+                "algorithm-tag mismatch must cause vote rejection"
+            );
+        }
+
         // ── 6. Serde: NetworkMessage::WPoaVote roundtrip ──────────────────────
 
         #[test]
