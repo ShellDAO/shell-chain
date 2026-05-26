@@ -9,7 +9,7 @@
 
 use crate::aa_validation::{validate_aa_tx, AaValidationError};
 use shell_core::SignedTransaction;
-use shell_crypto::Verifier;
+use shell_crypto::{infer_signature_type_from_address, Verifier};
 use shell_primitives::{Address, U256};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 
@@ -230,9 +230,9 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     //
     // For AA bundles with a paymaster: verify the paymaster's PQ signature
     // over `paymaster_signing_hash`, then debit the gas-cost portion from
-    // the paymaster's balance. The sender still needs to afford its own
-    // value transfers (Σ inner.value), but `value` on the outer envelope
-    // is ignored for AA txs.
+    // the paymaster's balance. The sender still needs to afford the
+    // outer AA value budget, which caps the total ETH transferable by the
+    // inner calls.
     //
     // For all other paths: standard sender-pays balance check.
     let max_gas_cost = U256::from(tx.gas_limit).checked_mul(U256::from(tx.max_fee_per_gas));
@@ -254,20 +254,18 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
                     have: pm_balance,
                 });
             }
-            // Sender still needs to afford the inner value transfers.
-            let inner_value_sum = sum_inner_values(bundle);
+            // Sender still needs to afford the declared outer value budget.
             let balance = world_state.get_balance(&signed_tx.from)?;
-            if balance < inner_value_sum {
+            if balance < tx.value {
                 return Err(TxValidationError::InsufficientBalance {
-                    needed: inner_value_sum,
+                    needed: tx.value,
                     have: balance,
                 });
             }
             return Ok(pubkey);
         }
-        // Self-sponsored AA bundle: sender pays gas + Σ inner.value.
-        let inner_value_sum = sum_inner_values(bundle);
-        let needed = match max_gas_cost.and_then(|c| c.checked_add(inner_value_sum)) {
+        // Self-sponsored AA bundle: sender pays gas + outer value budget.
+        let needed = match max_gas_cost.and_then(|c| c.checked_add(tx.value)) {
             Some(n) => n,
             None => {
                 return Err(TxValidationError::InsufficientBalance {
@@ -372,13 +370,6 @@ pub fn validate_tx_for_import<S: KvStore + 'static, V: Verifier>(
     Ok(())
 }
 
-fn sum_inner_values(bundle: &shell_core::AaBundle) -> U256 {
-    bundle
-        .inner_calls
-        .iter()
-        .fold(U256::ZERO, |acc: U256, c| acc.saturating_add(c.value))
-}
-
 /// Verify the paymaster's PQ signature over `paymaster_signing_hash`.
 ///
 /// The paymaster MUST already have a registered PQ pubkey on-chain — there is
@@ -405,10 +396,14 @@ pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
     let hash = signed_tx
         .paymaster_signing_hash()
         .ok_or_else(|| TxValidationError::InvalidAaBundle("no paymaster_signing_hash".into()))?;
-    // Reuse sender's algorithm tag as paymaster's algorithm tag for v0.18.0
-    // (single-algorithm chain; multi-algo paymaster will land in v0.19.0+).
-    let pq_sig =
-        shell_crypto::PQSignature::new(signed_tx.signature.sig_type, sig_bytes.as_ref().to_vec());
+    let paymaster_sig_type =
+        infer_signature_type_from_address(&pubkey, paymaster).ok_or_else(|| {
+            TxValidationError::InvalidAaBundle(
+                "paymaster pubkey does not match the paymaster address under any allowed algorithm"
+                    .into(),
+            )
+        })?;
+    let pq_sig = shell_crypto::PQSignature::new(paymaster_sig_type, sig_bytes.as_ref().to_vec());
     let valid = verifier
         .verify(&pubkey, hash.as_bytes(), &pq_sig)
         .map_err(TxValidationError::Crypto)?;
@@ -454,6 +449,13 @@ pub fn validate_aa_bundle_structure(
         return Err(TxValidationError::InvalidAaBundle(format!(
             "inner_sum ({inner_sum}) + intrinsic_surcharge ({surcharge}) exceeds outer gas_limit ({})",
             tx.gas_limit
+        )));
+    }
+    let inner_value_sum = bundle.inner_value_sum();
+    if inner_value_sum > tx.value {
+        return Err(TxValidationError::InvalidAaBundle(format!(
+            "inner_value_sum ({inner_value_sum}) exceeds outer value ({})",
+            tx.value
         )));
     }
     Ok(combined as u64)
@@ -542,7 +544,10 @@ impl From<AaValidationError> for TxValidationError {
 mod tests {
     use super::*;
     use shell_core::Transaction;
-    use shell_crypto::{DilithiumSigner, DilithiumVerifier, PQSignature, SignatureType, Signer};
+    use shell_crypto::{
+        DilithiumSigner, DilithiumVerifier, MlDsaSigner, MultiVerifier, PQSignature, SignatureType,
+        Signer,
+    };
     use shell_primitives::{Bytes, ShellHash};
     use shell_storage::MemoryDb;
     use std::sync::Arc;
@@ -955,12 +960,12 @@ mod tests {
     use shell_core::{AaBundle, InnerCall, AA_BUNDLE_TX_TYPE, MAX_INNER_CALLS};
     use shell_primitives::Bytes as ShellBytes;
 
-    fn aa_outer_tx(chain_id: u64, nonce: u64, gas_limit: u64) -> Transaction {
+    fn aa_outer_tx(chain_id: u64, nonce: u64, gas_limit: u64, value: u64) -> Transaction {
         Transaction {
             chain_id,
             nonce,
             to: None,
-            value: U256::ZERO,
+            value: U256::from(value),
             data: Bytes::new(),
             gas_limit,
             max_fee_per_gas: 10,
@@ -1018,7 +1023,7 @@ mod tests {
     fn validate_tx_type_bundle_mismatch_rejects_aa_type_without_bundle() {
         let signer = make_signer();
         // tx_type = AA but no bundle on SignedTransaction
-        let mut tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let mut tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
         // Pass through normal sign_tx → no aa_bundle
         // But AA tx_type, so structural validator must reject.
         tx.tx_type = AA_BUNDLE_TX_TYPE;
@@ -1051,7 +1056,7 @@ mod tests {
     fn validate_aa_bundle_inner_gas_overflow() {
         let signer = make_signer();
         // outer gas = 100_000, but inner calls demand 200_000
-        let tx = aa_outer_tx(test_chain_id(), 0, 100_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 100_000, 0);
         let bundle = AaBundle {
             inner_calls: vec![inner(0, 100_000), inner(0, 100_000)],
             paymaster: None,
@@ -1068,9 +1073,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_aa_bundle_rejects_inner_value_overspend() {
+        let signer = make_signer();
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 2);
+        let bundle = AaBundle {
+            inner_calls: vec![inner(2, 50_000)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let mut signed = sign_aa(&signer, tx, bundle, true);
+        signed.tx.value = U256::from(1u64);
+        let err = validate_aa_bundle_structure(&signed).unwrap_err();
+        assert!(matches!(err, TxValidationError::InvalidAaBundle(_)));
+    }
+
+    #[test]
     fn validate_aa_bundle_too_many_inner_calls() {
         let signer = make_signer();
-        let tx = aa_outer_tx(test_chain_id(), 0, 10_000_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 10_000_000, 0);
         let calls: Vec<_> = (0..(MAX_INNER_CALLS + 1))
             .map(|_| inner(0, 21_000))
             .collect();
@@ -1097,7 +1118,7 @@ mod tests {
         // = 2_000_000 + 5 = 2_000_005. Fund well above.
         fund_account(&mut ws, &from, U256::from(10_000_000u64));
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 5);
         let bundle = AaBundle {
             inner_calls: vec![inner(2, 50_000), inner(3, 50_000)],
             paymaster: None,
@@ -1118,7 +1139,7 @@ mod tests {
         // Fund only enough for gas, NOT for inner value transfers.
         fund_account(&mut ws, &from, U256::from(2_000_000u64));
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 1_000_000_000);
         let bundle = AaBundle {
             inner_calls: vec![inner(1_000_000_000, 50_000)],
             paymaster: None,
@@ -1148,7 +1169,7 @@ mod tests {
         // Pre-register paymaster pubkey (sponsorship requires a registered key).
         cs.put_pubkey(&paymaster, pm_signer.public_key()).unwrap();
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 7);
         // Build bundle with placeholder paymaster sig first to compute hashes.
         let initial_bundle = AaBundle {
             inner_calls: vec![inner(7, 50_000)],
@@ -1185,6 +1206,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_aa_bundle_sponsored_happy_path_with_mixed_algorithms() {
+        let sender_signer = make_signer();
+        let pm_signer = MlDsaSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let sender = signer_address(&sender_signer);
+        let paymaster =
+            Address::from_public_key(pm_signer.public_key(), pm_signer.sig_type().as_u8());
+        fund_account(&mut ws, &sender, U256::from(1_000u64));
+        fund_account(&mut ws, &paymaster, U256::from(10_000_000u64));
+        cs.put_pubkey(&paymaster, pm_signer.public_key()).unwrap();
+
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 7);
+        let initial_bundle = AaBundle {
+            inner_calls: vec![inner(7, 50_000)],
+            paymaster: Some(paymaster),
+            paymaster_signature: Some(ShellBytes::from(vec![0u8; 1])),
+            ..Default::default()
+        };
+        let placeholder = SignedTransaction::with_aa_bundle(
+            sender,
+            tx.clone(),
+            PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]),
+            shell_core::PubkeyMode::Embedded(sender_signer.public_key().to_vec()),
+            initial_bundle.clone(),
+        )
+        .unwrap();
+        let pm_hash = placeholder.paymaster_signing_hash().unwrap();
+        let pm_sig = pm_signer.sign(pm_hash.as_bytes()).unwrap();
+
+        let final_bundle = AaBundle {
+            inner_calls: initial_bundle.inner_calls.clone(),
+            paymaster: Some(paymaster),
+            paymaster_signature: Some(ShellBytes::from(pm_sig.data.clone())),
+            ..Default::default()
+        };
+        let signed = sign_aa(&sender_signer, tx, final_bundle, true);
+        let verifier = MultiVerifier;
+        let res = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
+        assert!(
+            res.is_ok(),
+            "mixed-algorithm sponsored path should pass: {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
     fn validate_aa_bundle_sponsored_paymaster_pubkey_unregistered() {
         let sender_signer = make_signer();
         let pm_signer = make_signer();
@@ -1195,7 +1262,7 @@ mod tests {
         fund_account(&mut ws, &paymaster, U256::from(10_000_000u64));
         // Note: paymaster pubkey NOT registered.
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
         let bundle = AaBundle {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: Some(paymaster),
@@ -1222,7 +1289,7 @@ mod tests {
         fund_account(&mut ws, &paymaster, U256::from(10_000_000u64));
         cs.put_pubkey(&paymaster, pm_signer.public_key()).unwrap();
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
         // Sign over a *different* hash — wrong paymaster sig.
         let bogus_sig = pm_signer.sign(b"wrong message").unwrap();
         let bundle = AaBundle {
@@ -1252,7 +1319,7 @@ mod tests {
         fund_account(&mut ws, &paymaster, U256::from(100u64));
         cs.put_pubkey(&paymaster, pm_signer.public_key()).unwrap();
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
         let initial_bundle = AaBundle {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: Some(paymaster),
@@ -1294,7 +1361,7 @@ mod tests {
         let from = signer_address(&signer);
         fund_account(&mut ws, &from, U256::from(10_000_000u64));
 
-        let tx = aa_outer_tx(test_chain_id(), 0, 200_000);
+        let tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
         let bundle = AaBundle {
             inner_calls: vec![inner(0, 50_000)],
             paymaster: None,

@@ -341,6 +341,13 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         let payer = bundle.paymaster.unwrap_or(sender);
         let max_fee = U256::from(tx.max_fee_per_gas);
         let is_sponsored = payer != sender;
+        let declared_value = tx.value;
+        let inner_value_sum = bundle.inner_value_sum();
+        if inner_value_sum > declared_value {
+            return Err(ExecutorError::Evm(format!(
+                "aa bundle inner value sum ({inner_value_sum}) exceeds outer value ({declared_value})"
+            )));
+        }
 
         // Capture pre-bundle state root for atomic rollback on inner failure.
         let pre_root = self.state_db.world_state_mut().state_root()?;
@@ -896,7 +903,7 @@ pub fn commit_evm_state<S: KvStore + 'static>(
 mod tests {
     use super::*;
     use shell_core::{Account, SignedTransaction, Transaction};
-    use shell_crypto::{DilithiumSigner, PQSignature, SignatureType, Signer};
+    use shell_crypto::{PQSignature, SignatureType};
     use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::sync::Arc;
 
@@ -3403,7 +3410,7 @@ mod tests {
             chain_id: 1337,
             nonce: 0,
             to: None,
-            value: U256::ZERO,
+            value: U256::from(1u64),
             data: shell_primitives::Bytes::new(),
             gas_limit: 200_000,
             max_fee_per_gas: 10,
@@ -3455,11 +3462,14 @@ mod tests {
         paymaster: Option<ShellAddress>,
     ) -> SignedTransaction {
         use shell_core::{AaBundle, AA_BUNDLE_TX_TYPE};
+        let value = inner_calls
+            .iter()
+            .fold(U256::ZERO, |acc, call| acc.saturating_add(call.value));
         let tx = Transaction {
             chain_id: 1337,
             nonce,
             to: None,
-            value: U256::ZERO,
+            value,
             data: shell_primitives::Bytes::new(),
             gas_limit,
             max_fee_per_gas: max_fee,
@@ -3658,6 +3668,32 @@ mod tests {
         assert_eq!(get_balance(&mut evm, &paymaster), U256::ZERO);
         assert_eq!(get_nonce(&mut evm, &sender), 1);
         assert_eq!(res.gas_used, 0);
+    }
+
+    #[test]
+    fn execute_aa_bundle_rejects_inner_value_overspend() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let dst = ShellAddress::from([0xAA; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+
+        let inner_calls = vec![InnerCall {
+            to: Some(dst),
+            value: U256::from(2u64),
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let mut signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+        signed.tx.value = U256::from(1u64);
+
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0);
+        assert!(matches!(res, Err(ExecutorError::Evm(msg)) if msg.contains("exceeds outer value")));
+        assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);
+        assert_eq!(get_nonce(&mut evm, &sender), 0);
     }
 
     #[test]

@@ -838,6 +838,14 @@ impl AaBundle {
             .sum::<u128>()
     }
 
+    /// Sum of inner-call ETH values. Caller MUST verify this is ≤ outer
+    /// `Transaction.value`.
+    pub fn inner_value_sum(&self) -> U256 {
+        self.inner_calls
+            .iter()
+            .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value))
+    }
+
     /// Intrinsic gas surcharge added by the bundle on top of the standard
     /// 21_000 base: 4_000 per *additional* inner call beyond the first,
     /// plus 10_000 per PQ signature verify on the session key path (2 verifies).
@@ -1401,6 +1409,9 @@ impl SignedTransaction {
         aa_bundle.validate_structure()?;
         if aa_bundle.inner_gas_sum() > tx.gas_limit as u128 {
             return Err("with_aa_bundle: sum(inner.gas_limit) exceeds outer gas_limit");
+        }
+        if aa_bundle.inner_value_sum() > tx.value {
+            return Err("with_aa_bundle: sum(inner.value) exceeds outer value");
         }
         Ok(Self {
             from,
@@ -2845,6 +2856,23 @@ mod tests {
         let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
             .unwrap_err();
         assert!(err.contains("exceeds outer gas_limit"));
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rejects_inner_value_overspend() {
+        let mut tx = sample_aa_tx();
+        tx.value = U256::from(1u64);
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(2)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+            .unwrap_err();
+        assert!(err.contains("exceeds outer value"));
     }
 
     #[test]

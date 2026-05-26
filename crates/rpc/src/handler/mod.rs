@@ -4667,7 +4667,7 @@ mod tests {
             chain_id: 42,
             nonce: 0,
             to: None,
-            value: U256::ZERO,
+            value: U256::from(2u64),
             data: Bytes::new(),
             gas_limit: 200_000,
             max_fee_per_gas: 10,

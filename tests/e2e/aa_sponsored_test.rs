@@ -22,6 +22,9 @@ fn make_sponsored_tx(
     paymaster: Address,
     inner_calls: Vec<InnerCall>,
 ) -> SignedTransaction {
+    let value = inner_calls
+        .iter()
+        .fold(U256::ZERO, |acc, call| acc.saturating_add(call.value));
     let tx = Transaction {
         chain_id: TEST_CHAIN_ID,
         nonce,
@@ -29,7 +32,7 @@ fn make_sponsored_tx(
         max_priority_fee_per_gas: 100_000_000,
         gas_limit: 200_000,
         to: None,
-        value: U256::ZERO,
+        value,
         data: Bytes::default(),
         access_list: None,
         tx_type: AA_BUNDLE_TX_TYPE,

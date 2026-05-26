@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # hickory-proto NSEC3 closest-encloser proof validation has no fixed release yet.
+    "RUSTSEC-2026-0118",
+    # hickory-proto CPU exhaustion remains transitive through libp2p 0.56 and
+    # there is no compatible crates.io upgrade path in this workspace yet.
+    "RUSTSEC-2026-0119",
+]
