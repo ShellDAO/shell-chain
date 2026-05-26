@@ -19,7 +19,7 @@ use shell_storage::{ChainStore, KvStore, WitnessStore, WorldState};
 
 use crate::admin::AdminApiServer;
 use crate::api::{
-    DebugApiServer, EthApiServer, EvmApiServer, NetApiServer, ShellApiServer, TraceApiServer,
+    DebugApiServer, EthApiServer, LegacyEvmApiServer, NetApiServer, ShellApiServer, TraceApiServer,
     Web3ApiServer,
 };
 use crate::dev_control::DynDevRpcControl;
@@ -299,7 +299,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         module.merge(EthPubSubServer::into_rpc(handler.clone()))?;
     }
     if ns.iter().any(|n| n == "evm") {
-        module.merge(EvmApiServer::into_rpc(handler.clone()))?;
+        module.merge(LegacyEvmApiServer::into_rpc(handler.clone()))?;
     }
     if ns.iter().any(|n| n == "shell") {
         module.merge(ShellApiServer::into_rpc(handler.clone()))?;

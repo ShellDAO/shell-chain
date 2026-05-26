@@ -230,7 +230,7 @@ System contract calls use a flat base gas charge:
 | `setValidationCode` | `SYSTEM_CALL_BASE_GAS` + hash write |
 | `clearValidationCode` | `SYSTEM_CALL_BASE_GAS` + delete |
 
-`SYSTEM_CALL_BASE_GAS` is a constant defined in `shell-evm` — use
+`SYSTEM_CALL_BASE_GAS` is a constant defined in `shell-pqvm` — use
 `shell_estimateGovernanceGas` to get accurate estimates before submitting.
 
 ---

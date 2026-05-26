@@ -1,7 +1,7 @@
 //! Log filter for `eth_getLogs` — supports address, topic, and bloom-based filtering.
 
 use serde::Deserialize;
-use shell_evm::bloom::{bloom_contains, Bloom, BLOOM_SIZE};
+use shell_pqvm::bloom::{bloom_contains, Bloom, BLOOM_SIZE};
 use shell_primitives::{Address, ShellHash};
 
 /// Maximum number of blocks that can be queried in a single `eth_getLogs` call.
@@ -215,7 +215,7 @@ impl RawLogFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_evm::bloom::logs_bloom;
+    use shell_pqvm::bloom::logs_bloom;
     use shell_primitives::Bytes;
 
     fn make_log(addr: Address, topics: Vec<ShellHash>, data: &[u8]) -> shell_core::Log {

@@ -12,15 +12,15 @@ pub(crate) use shell_core::{
     Block, BlockHeader, SignedTransaction, SystemTransaction, Transaction, INITIAL_BASE_FEE,
 };
 pub(crate) use shell_crypto::{MultiVerifier, Signer};
-pub(crate) use shell_evm::bloom::BLOOM_SIZE;
-pub(crate) use shell_evm::{ShellEvm, ShellStateDb};
 pub(crate) use shell_mempool::TxPool;
+pub(crate) use shell_pqvm::bloom::BLOOM_SIZE;
+pub(crate) use shell_pqvm::{ShellPqvm, ShellStateDb};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_storage::{ChainStore, KvStore, WitnessStore, WorldState};
 
 pub(crate) use crate::admin::{AdminApiServer, NodeInfo, PeerInfo};
 pub(crate) use crate::api::{
-    DebugApiServer, EthApiServer, EvmApiServer, NetApiServer, ShellApiServer, TraceApiServer,
+    DebugApiServer, EthApiServer, LegacyEvmApiServer, NetApiServer, ShellApiServer, TraceApiServer,
     Web3ApiServer,
 };
 pub(crate) use crate::dev_control::DynDevRpcControl;
@@ -420,7 +420,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let tx = Transaction {
             chain_id: self.chain_id,
             nonce,
-            to: Some(shell_evm::registry_address()),
+            to: Some(shell_pqvm::registry_address()),
             value: U256::ZERO,
             data: Bytes::copy_from_slice(&calldata),
             gas_limit: 100_000,
@@ -459,7 +459,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let world_state = WorldState::at_root(store.clone(), &state_root).map_err(internal_err)?;
         let chain_store = ChainStore::new(store);
         let state_db = ShellStateDb::new(world_state, chain_store);
-        let mut evm = ShellEvm::new(state_db, self.chain_id);
+        let mut evm = ShellPqvm::new(state_db, self.chain_id);
 
         let from = req.from.unwrap_or(Address::ZERO);
         // Cap gas to prevent DoS via unbounded simulated execution.
@@ -549,7 +549,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
         let result = evm
             .execute_tx(&signed, &header, 0, 0)
-            .map_err(|e| internal_err(format!("EVM execution failed: {e}")))?;
+            .map_err(|e| internal_err(format!("PQVM execution failed: {e}")))?;
 
         Ok((result.output.clone(), result.gas_used))
     }
@@ -1302,22 +1302,28 @@ mod tests {
         let dev = Arc::new(MockDevControl::default());
         let handler = setup().with_dev_control(dev.clone());
 
-        let mined = EvmApiServer::mine(&handler, Some(2)).await.unwrap();
+        let mined = LegacyEvmApiServer::mine(&handler, Some(2)).await.unwrap();
         assert_eq!(mined["blocksMined"], "0x2");
         assert_eq!(dev.mined.load(Ordering::Relaxed), 2);
 
-        let next = EvmApiServer::set_next_block_timestamp(&handler, 1_700_000_123)
+        let next = LegacyEvmApiServer::set_next_block_timestamp(&handler, 1_700_000_123)
             .await
             .unwrap();
         assert_eq!(next, serde_json::json!("0x6553f17b"));
 
-        let increased = EvmApiServer::increase_time(&handler, 30).await.unwrap();
+        let increased = LegacyEvmApiServer::increase_time(&handler, 30)
+            .await
+            .unwrap();
         assert_eq!(increased, serde_json::json!("0x1e"));
 
-        let snapshot = EvmApiServer::snapshot(&handler).await.unwrap();
+        let snapshot = LegacyEvmApiServer::snapshot(&handler).await.unwrap();
         assert_eq!(snapshot, "0x1");
-        assert!(EvmApiServer::revert(&handler, "0x1".into()).await.unwrap());
-        assert!(!EvmApiServer::revert(&handler, "0x2".into()).await.unwrap());
+        assert!(LegacyEvmApiServer::revert(&handler, "0x1".into())
+            .await
+            .unwrap());
+        assert!(!LegacyEvmApiServer::revert(&handler, "0x2".into())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2235,7 +2241,7 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let addr = signer_address(&signer);
-        let gas_limit = shell_evm::compute_intrinsic_gas(&[], true, &None);
+        let gas_limit = shell_pqvm::compute_intrinsic_gas(&[], true, &None);
 
         // Fund the sender so balance check passes.
         {
@@ -2283,7 +2289,7 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let addr = signer_address(&signer);
-        let gas_limit = shell_evm::compute_intrinsic_gas(&[], true, &None);
+        let gas_limit = shell_pqvm::compute_intrinsic_gas(&[], true, &None);
 
         {
             let mut ws = handler.world_state.write();
@@ -2467,7 +2473,7 @@ mod tests {
         number: u64,
         logs_per_receipt: Vec<Vec<shell_core::Log>>,
     ) -> ShellHash {
-        let bloom = shell_evm::bloom::logs_bloom(
+        let bloom = shell_pqvm::bloom::logs_bloom(
             &logs_per_receipt
                 .iter()
                 .flatten()
@@ -2510,7 +2516,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, logs)| {
-                let receipt_bloom = shell_evm::bloom::logs_bloom(&logs);
+                let receipt_bloom = shell_pqvm::bloom::logs_bloom(&logs);
                 cumulative_gas += 21_000;
                 TransactionReceipt {
                     tx_hash: ShellHash::from_slice(&[i as u8 + 1; 32]),
@@ -2795,11 +2801,11 @@ mod tests {
 
         // Verify the transaction has the correct calldata.
         let target_addr = parse_address(&target).unwrap();
-        let expected_calldata = shell_evm::encode_add_validator_calldata(&target_addr);
+        let expected_calldata = shell_pqvm::encode_add_validator_calldata(&target_addr);
         let pending = handler.tx_pool.pending(100);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tx.data.as_ref(), expected_calldata.as_slice());
-        assert_eq!(pending[0].tx.to, Some(shell_evm::registry_address()));
+        assert_eq!(pending[0].tx.to, Some(shell_pqvm::registry_address()));
         assert_eq!(pending[0].tx.value, U256::ZERO);
         assert_eq!(pending[0].tx.chain_id, 42);
         assert_eq!(pending[0].tx.nonce, 0);
@@ -2820,7 +2826,7 @@ mod tests {
         assert_eq!(handler.tx_pool.len(), 1);
 
         let target_addr = parse_address(&target).unwrap();
-        let expected_calldata = shell_evm::encode_remove_validator_calldata(&target_addr);
+        let expected_calldata = shell_pqvm::encode_remove_validator_calldata(&target_addr);
         let pending = handler.tx_pool.pending(100);
         assert_eq!(pending[0].tx.data.as_ref(), expected_calldata.as_slice());
     }
@@ -3097,7 +3103,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = shell_evm::encode_add_validator_calldata(&target);
+        let expected = shell_pqvm::encode_add_validator_calldata(&target);
         assert_eq!(result, format!("0x{}", hex::encode(expected)));
         // Must start with the selector
         assert!(result.starts_with("0x"));
@@ -3115,7 +3121,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = shell_evm::encode_remove_validator_calldata(&target);
+        let expected = shell_pqvm::encode_remove_validator_calldata(&target);
         assert_eq!(result, format!("0x{}", hex::encode(expected)));
         assert_eq!(result.len(), 74);
     }
@@ -3125,7 +3131,7 @@ mod tests {
         let handler = setup();
         let result = ShellApiServer::get_governance_info(&handler).await.unwrap();
         let addr_str = result["systemContractAddress"].as_str().unwrap();
-        let expected = format!("{}", shell_evm::registry_address());
+        let expected = format!("{}", shell_pqvm::registry_address());
         assert_eq!(addr_str, expected);
     }
 
@@ -4253,7 +4259,7 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let addr = signer_address(&signer);
-        let gas_limit = shell_evm::compute_intrinsic_gas(&[], true, &None);
+        let gas_limit = shell_pqvm::compute_intrinsic_gas(&[], true, &None);
 
         // Fund the sender and register pubkey so mempool can verify.
         {
@@ -4301,7 +4307,7 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let addr = signer_address(&signer);
-        let gas_limit = shell_evm::compute_intrinsic_gas(&[], true, &None);
+        let gas_limit = shell_pqvm::compute_intrinsic_gas(&[], true, &None);
 
         {
             let mut ws = handler.world_state.write();
@@ -4347,7 +4353,7 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let addr = signer_address(&signer);
-        let gas_limit = shell_evm::compute_intrinsic_gas(&[], true, &None);
+        let gas_limit = shell_pqvm::compute_intrinsic_gas(&[], true, &None);
 
         {
             let mut ws = handler.world_state.write();

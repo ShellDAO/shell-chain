@@ -33,9 +33,9 @@ pub(crate) use shell_core::{
 pub(crate) use shell_crypto::{
     BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem,
 };
-pub(crate) use shell_evm::{commit_evm_state, validate_tx_for_import, ShellEvm, ShellStateDb};
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};
+pub(crate) use shell_pqvm::{commit_pqvm_state, validate_tx_for_import, ShellPqvm, ShellStateDb};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
@@ -833,7 +833,7 @@ impl<S: KvStore + 'static> Node<S> {
     fn sync_system_contract_state(
         &self,
         local_ws: &mut WorldState<S>,
-        effects: &shell_evm::SystemContractEffects,
+        effects: &shell_pqvm::SystemContractEffects,
     ) -> Result<(), NodeError> {
         let registry_account = if effects.validator_set_changed {
             let validators = local_ws.get_validators()?;
@@ -3123,9 +3123,9 @@ mod tests {
         let tx = Transaction {
             chain_id: 1337,
             nonce: 0,
-            to: Some(shell_evm::account_manager_address()),
+            to: Some(shell_pqvm::account_manager_address()),
             value: U256::ZERO,
-            data: shell_primitives::Bytes::from(shell_evm::encode_rotate_key_calldata(
+            data: shell_primitives::Bytes::from(shell_pqvm::encode_rotate_key_calldata(
                 &new_pubkey,
                 tx_signer.sig_type().as_u8(),
             )),
@@ -3172,7 +3172,7 @@ mod tests {
         assert_eq!(
             account.balance,
             initial_balance
-                - U256::from(shell_evm::SYSTEM_CALL_BASE_GAS + shell_evm::SYSTEM_CALL_OP_GAS)
+                - U256::from(shell_pqvm::SYSTEM_CALL_BASE_GAS + shell_pqvm::SYSTEM_CALL_OP_GAS)
                     * U256::from(shell_core::INITIAL_BASE_FEE)
         );
         assert_eq!(
@@ -3462,9 +3462,9 @@ mod tests {
         let add_tx = Transaction {
             chain_id: 1337,
             nonce: 0,
-            to: Some(shell_evm::registry_address()),
+            to: Some(shell_pqvm::registry_address()),
             value: U256::ZERO,
-            data: Bytes::copy_from_slice(&shell_evm::encode_add_validator_calldata(&target)),
+            data: Bytes::copy_from_slice(&shell_pqvm::encode_add_validator_calldata(&target)),
             gas_limit: 100_000,
             max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
             max_priority_fee_per_gas: 0,

@@ -1,12 +1,12 @@
-//! Benchmarks for the parallel-EVM scheduling and rwset layer.
+//! Benchmarks for the parallel-PQVM scheduling and rwset layer.
 //!
 //! These benchmarks exercise the conflict-graph and wave-planning paths using
-//! mock transactions — no real EVM execution is required.
+//! mock transactions — no real PQVM execution is required.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{PQSignature, SignatureType};
-use shell_evm::{HeuristicRwSetExtractor, ParallelEvmConfig, ParallelScheduler};
+use shell_pqvm::{HeuristicRwSetExtractor, ParallelPqvmConfig, ParallelScheduler};
 use shell_primitives::{Address, Bytes, U256};
 
 fn make_tx(nonce: u64, to: Address) -> SignedTransaction {
@@ -33,7 +33,7 @@ fn make_tx(nonce: u64, to: Address) -> SignedTransaction {
 }
 
 fn scheduler() -> ParallelScheduler {
-    ParallelScheduler::new(ParallelEvmConfig {
+    ParallelScheduler::new(ParallelPqvmConfig {
         enabled: true,
         max_workers: 4,
         fallback_on_incomplete: true,

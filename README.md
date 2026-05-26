@@ -49,7 +49,7 @@ Accounts are identified by `0x`-prefixed 64-character lowercase hex addresses �
 the full 32-byte BLAKE3 hash of `algo_id ‖ public_key`.
 
 At the **canonical layer** (RPC, storage, consensus, signing), addresses are always
-the full 32 bytes. At the **EVM execution boundary**, Shell-Chain maintains a
+the full 32 bytes. At the **revm adapter boundary**, Shell-Chain maintains a
 20-byte mapping layer: `Address::to_alloy()` takes the last 20 bytes of the 32-byte
 canonical address for use with revm, and `Address::from_alloy()` zero-pads left
 back to 32 bytes. This boundary is internal — external callers (SDK, CLI, explorer)
@@ -79,7 +79,7 @@ For the full design and current implementation status, see
 │                    shell-core               │
 │       (Block, Transaction, Account)         │
 ├──────────┬──────────────┼───────────────────┤
-│ shell-evm│ shell-crypto │  shell-storage    │
+│ shell-pqvm│ shell-crypto │  shell-storage    │
 │(PQVM/revm│  (PQ Crypto) │   (RocksDB)      │
 │ adapter) │              │                  │
 ├──────────┴──────────────┴───────────────────┤
@@ -97,7 +97,7 @@ For the full design and current implementation status, see
 | `shell-core` | Block, Transaction (AA-native), Account, Receipt, EIP-1559 gas model |
 | `shell-storage` | RocksDB backend, Merkle Patricia Trie, RLP serialization, state pruning, storage profiles |
 | `shell-consensus` | PoA engine (default); optional wPoA extension: weight-based fork choice, BFT finality, slashing |
-| `shell-evm` | PQVM execution adapter over revm for retained Cancun-style semantics, PQ precompiles, EIP-2930/4844 fields, system contracts |
+| `shell-pqvm` | PQVM execution adapter over revm for retained Cancun-style semantics, PQ precompiles, EIP-2930/4844 fields, system contracts |
 | `shell-mempool` | Transaction pool with PQ validation, fee-priority ordering, Replace-by-Fee |
 | `shell-network` | libp2p P2P: GossipSub, Kademlia DHT, NAT traversal, peer scoring, tx gossip |
 | `shell-rpc` | JSON-RPC (HTTP + WebSocket), CORS, rate limiting, filters, subscriptions, debug/trace APIs |
@@ -117,7 +117,7 @@ shell-chain/
 │   ├── consensus/       # Weighted PoA consensus engine and slashing
 │   ├── core/            # Block, Transaction, Account
 │   ├── crypto/          # Post-quantum cryptography
-│   ├── evm/             # PQVM/revm execution adapter and precompiles
+│   ├── pqvm/             # PQVM/revm execution adapter and precompiles
 │   ├── genesis/         # Genesis configuration
 │   ├── keystore/        # Encrypted key storage
 │   ├── mempool/         # Transaction pool

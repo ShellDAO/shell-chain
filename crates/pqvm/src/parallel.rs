@@ -1,8 +1,8 @@
-//! Parallel EVM PoC scheduling primitives.
+//! Parallel PQVM PoC scheduling primitives.
 //!
 //! This module intentionally stays additive: it builds conflict graphs and
 //! execution waves from transaction read/write sets without changing the
-//! production executor path. Callers can opt in via [`ParallelEvmConfig`]
+//! production executor path. Callers can opt in via [`ParallelPqvmConfig`]
 //! and either inspect the plan or execute wave-local work with rayon.
 
 use rayon::prelude::*;
@@ -10,9 +10,9 @@ use shell_core::SignedTransaction;
 
 use crate::rwset::{ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};
 
-/// Feature flag and scheduler knobs for the parallel-EVM PoC.
+/// Feature flag and scheduler knobs for the parallel-PQVM PoC.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParallelEvmConfig {
+pub struct ParallelPqvmConfig {
     /// Enables conflict-graph scheduling.
     pub enabled: bool,
     /// Maximum worker threads used for parallelizable waves.
@@ -21,7 +21,7 @@ pub struct ParallelEvmConfig {
     pub fallback_on_incomplete: bool,
 }
 
-impl Default for ParallelEvmConfig {
+impl Default for ParallelPqvmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -102,18 +102,18 @@ pub struct ParallelExecutionPlan {
     pub fallback_serial: bool,
 }
 
-/// Conflict-aware scheduler for the parallel-EVM PoC.
+/// Conflict-aware scheduler for the parallel-PQVM PoC.
 #[derive(Debug, Clone)]
 pub struct ParallelScheduler {
-    config: ParallelEvmConfig,
+    config: ParallelPqvmConfig,
 }
 
 impl ParallelScheduler {
-    pub fn new(config: ParallelEvmConfig) -> Self {
+    pub fn new(config: ParallelPqvmConfig) -> Self {
         Self { config }
     }
 
-    pub fn config(&self) -> &ParallelEvmConfig {
+    pub fn config(&self) -> &ParallelPqvmConfig {
         &self.config
     }
 
@@ -460,9 +460,9 @@ mod parallel_validation {
             txs.iter().map(|tx| extractor.extract(tx)).collect();
 
         // Parallel: build graph, which extracts rwsets internally.
-        let scheduler_parallel = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler_parallel = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let graph = scheduler_parallel.build_graph(&txs, &extractor);
 
@@ -524,7 +524,7 @@ mod parallel_validation {
         assert!(graph.rwsets.is_empty(), "rwsets should be empty");
         assert!(graph.conflicts.is_empty(), "conflicts should be empty");
 
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig::default());
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig::default());
         let plan = scheduler.plan_from_graph(&graph);
         assert!(
             plan.waves.is_empty(),
@@ -610,9 +610,9 @@ mod tests {
             signed_tx(shared, 1, Vec::new()),
             signed_tx(shared, 2, Vec::new()),
         ];
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let graph = scheduler.build_graph(&txs, &HeuristicRwSetExtractor);
 
@@ -628,9 +628,9 @@ mod tests {
             signed_tx(Address::from([0x31; 20]), 1, Vec::new()),
             signed_tx(Address::from([0x32; 20]), 2, Vec::new()),
         ];
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let (_, plan) = scheduler.plan(&txs, &HeuristicRwSetExtractor);
 
@@ -662,10 +662,10 @@ mod tests {
             PQSignature::new(SignatureType::Dilithium3, vec![0x77; 32]),
         )];
 
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
             fallback_on_incomplete: true,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let (_, plan) = scheduler.plan(&txs, &HeuristicRwSetExtractor);
 
@@ -680,10 +680,10 @@ mod tests {
             signed_tx(Address::from([0x51; 20]), 1, Vec::new()),
             signed_tx(Address::from([0x52; 20]), 2, Vec::new()),
         ];
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
             max_workers: 2,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let (_, plan) = scheduler.plan(&txs, &HeuristicRwSetExtractor);
         let outputs = scheduler
@@ -703,10 +703,10 @@ mod tests {
             signed_tx(shared, 4, Vec::new()),
             signed_tx(Address::from([0x33; 20]), 5, Vec::new()),
         ];
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
             max_workers: 4,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let (_, plan) = scheduler.plan(&txs, &HeuristicRwSetExtractor);
         let outputs = scheduler
@@ -746,9 +746,9 @@ mod tests {
             signed_tx(shared, 1, Vec::new()),
             signed_tx(shared, 2, Vec::new()),
         ];
-        let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
             enabled: true,
-            ..ParallelEvmConfig::default()
+            ..ParallelPqvmConfig::default()
         });
         let (graph, _, metric) =
             scheduler.plan_with_metrics(&txs_conflict, &HeuristicRwSetExtractor);

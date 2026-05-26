@@ -432,7 +432,7 @@ New Prometheus metrics added in v0.13.0:
 | `shell_key_rotation_total` | Counter | PQ key rotations |
 | `shell_validator_weight{address}` | Gauge | Current validator weight |
 | `shell_consensus_slot_miss` | Counter | Empty slots (missed proposer) |
-| `shell_evm_gas_used_total` | Counter | Cumulative gas used |
+| `shell_pqvm_gas_used_total` | Counter | Cumulative gas used |
 | `shell_snapshot_size_bytes` | Gauge | Latest backup snapshot size |
 
 Update your Grafana dashboards by importing the updated JSON from `docker/grafana/`.

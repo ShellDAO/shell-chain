@@ -10,8 +10,8 @@ pub enum NodeError {
     #[error("consensus error: {0}")]
     Consensus(#[from] shell_consensus::ConsensusError),
 
-    #[error("evm error: {0}")]
-    Evm(#[from] shell_evm::ExecutorError),
+    #[error("pqvm error: {0}")]
+    Pqvm(#[from] shell_pqvm::ExecutorError),
 
     #[error("network error: {0}")]
     Network(#[from] shell_network::NetworkError),

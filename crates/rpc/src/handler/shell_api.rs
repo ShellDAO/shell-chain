@@ -101,26 +101,26 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
     async fn encode_add_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
-        let calldata = shell_evm::encode_add_validator_calldata(&addr);
+        let calldata = shell_pqvm::encode_add_validator_calldata(&addr);
         Ok(format!("0x{}", hex::encode(calldata)))
     }
 
     async fn encode_remove_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
-        let calldata = shell_evm::encode_remove_validator_calldata(&addr);
+        let calldata = shell_pqvm::encode_remove_validator_calldata(&addr);
         Ok(format!("0x{}", hex::encode(calldata)))
     }
 
     async fn propose_add_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
-        let calldata = shell_evm::encode_add_validator_calldata(&addr);
+        let calldata = shell_pqvm::encode_add_validator_calldata(&addr);
         let hash = self.propose_validator_tx(calldata)?;
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
 
     async fn propose_remove_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
-        let calldata = shell_evm::encode_remove_validator_calldata(&addr);
+        let calldata = shell_pqvm::encode_remove_validator_calldata(&addr);
         let hash = self.propose_validator_tx(calldata)?;
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
@@ -131,7 +131,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         weight: u64,
     ) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
-        let calldata = shell_evm::encode_set_validator_weight_calldata(&addr, weight);
+        let calldata = shell_pqvm::encode_set_validator_weight_calldata(&addr, weight);
         let hash = self.propose_validator_tx(calldata)?;
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
@@ -155,7 +155,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(serde_json::json!({
             "validatorCount": validators.len(),
             "validators": validators,
-            "systemContractAddress": shell_evm::registry_address(),
+            "systemContractAddress": shell_pqvm::registry_address(),
             "proposalGasLimit": 100_000,
         }))
     }
@@ -163,9 +163,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     async fn estimate_governance_gas(&self, operation: String) -> Result<String, ErrorObjectOwned> {
         let gas = match operation.as_str() {
             "addValidator" | "removeValidator" => {
-                shell_evm::SYSTEM_CALL_BASE_GAS + shell_evm::SYSTEM_CALL_OP_GAS
+                shell_pqvm::SYSTEM_CALL_BASE_GAS + shell_pqvm::SYSTEM_CALL_OP_GAS
             }
-            "getValidators" | "isValidator" => shell_evm::SYSTEM_CALL_BASE_GAS,
+            "getValidators" | "isValidator" => shell_pqvm::SYSTEM_CALL_BASE_GAS,
             _ => {
                 return Err(invalid_params(format!(
                     "unknown governance operation: {operation}"

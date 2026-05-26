@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 shell-crypto = { path = "../../crates/crypto", default-features = false, features = [] }
 shell-core = { path = "../../crates/core" }
-shell-evm = { path = "../../crates/evm" }
+shell-pqvm = { path = "../../crates/pqvm" }
 shell-primitives = { path = "../../crates/primitives" }
 
 tokio = { version = "1", features = ["full"] }

@@ -62,10 +62,10 @@ pub struct RunArgs {
     pub mempool_price_bump: Option<u64>,
     /// Account LRU cache size for the world-state trie, in MiB (default: 64).
     pub state_cache_size_mb: Option<usize>,
-    /// Enable the parallel-EVM conflict-graph scheduler.
-    pub parallel_evm: bool,
-    /// Number of worker threads for the parallel-EVM scheduler (default: logical CPUs).
-    pub parallel_evm_workers: Option<usize>,
+    /// Enable the parallel-PQVM conflict-graph scheduler.
+    pub parallel_pqvm: bool,
+    /// Number of worker threads for the parallel-PQVM scheduler (default: logical CPUs).
+    pub parallel_pqvm_workers: Option<usize>,
     /// Override witness bundle retention from the storage profile.
     /// `0` = keep forever. Omit to use the storage profile default.
     pub witness_retention: Option<u64>,
@@ -658,14 +658,14 @@ async fn run_with_store<S: KvStore + 'static>(
         },
         max_idle_interval_ms: args.max_idle_interval * 1000,
         state_cache_size_mb: args.state_cache_size_mb.unwrap_or(64),
-        parallel_evm: shell_node::config::ParallelEvmConfig {
-            enabled: args.parallel_evm,
-            max_workers: args.parallel_evm_workers.unwrap_or_else(|| {
+        parallel_pqvm: shell_node::config::ParallelPqvmConfig {
+            enabled: args.parallel_pqvm,
+            max_workers: args.parallel_pqvm_workers.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(usize::from)
                     .unwrap_or(1)
             }),
-            ..shell_node::config::ParallelEvmConfig::default()
+            ..shell_node::config::ParallelPqvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
         l2_stark_mode: args
@@ -840,14 +840,14 @@ mod tests {
     use super::*;
     use shell_core::BlockHeader;
     use shell_genesis::initialize_genesis;
-    use shell_node::config::ParallelEvmConfig;
+    use shell_node::config::ParallelPqvmConfig;
     use shell_primitives::{Bytes, U256};
     use shell_storage::{MemoryDb, DEFAULT_BODY_RETENTION, DEFAULT_WITNESS_RETENTION};
     use std::collections::HashMap;
 
-    /// Verify that `--parallel-evm --parallel-evm-workers 4` produces the correct config.
+    /// Verify that `--parallel-pqvm --parallel-pqvm-workers 4` produces the correct config.
     #[test]
-    fn parallel_evm_args_produce_correct_config() {
+    fn parallel_pqvm_args_produce_correct_config() {
         let args = RunArgs {
             datadir: std::path::PathBuf::from("shell-data"),
             rpc_addr: "127.0.0.1:8545".into(),
@@ -875,8 +875,8 @@ mod tests {
             mempool_max_size: None,
             mempool_price_bump: None,
             state_cache_size_mb: None,
-            parallel_evm: true,
-            parallel_evm_workers: Some(4),
+            parallel_pqvm: true,
+            parallel_pqvm_workers: Some(4),
             witness_retention: Some(DEFAULT_WITNESS_RETENTION),
             body_retention: Some(DEFAULT_BODY_RETENTION),
             storage_profile: "full".into(),
@@ -892,16 +892,16 @@ mod tests {
             },
         };
 
-        let expected = ParallelEvmConfig {
-            enabled: args.parallel_evm,
-            max_workers: args.parallel_evm_workers.unwrap(),
-            ..ParallelEvmConfig::default()
+        let expected = ParallelPqvmConfig {
+            enabled: args.parallel_pqvm,
+            max_workers: args.parallel_pqvm_workers.unwrap(),
+            ..ParallelPqvmConfig::default()
         };
 
-        assert!(expected.enabled, "--parallel-evm must set enabled = true");
+        assert!(expected.enabled, "--parallel-pqvm must set enabled = true");
         assert_eq!(
             expected.max_workers, 4,
-            "--parallel-evm-workers 4 must set max_workers = 4"
+            "--parallel-pqvm-workers 4 must set max_workers = 4"
         );
     }
 

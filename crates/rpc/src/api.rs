@@ -284,8 +284,11 @@ pub trait TraceApi {
 }
 
 /// Hardhat/Foundry-compatible dev RPCs.
+///
+/// The `evm` namespace name is retained as an Ethereum tooling compatibility
+/// surface; it is not the Shell-Chain execution model name.
 #[rpc(server, namespace = "evm")]
-pub trait EvmApi {
+pub trait LegacyEvmApi {
     /// Mine one or more blocks immediately.
     #[method(name = "mine")]
     async fn mine(

@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use shell_core::SignedTransaction;
 use shell_crypto::Verifier;
-use shell_evm::{
+use shell_pqvm::{
     compute_intrinsic_gas, validate_aa_bundle_structure, validate_aa_tx, AaValidationError,
     AaValidationOutcome, TxValidationError,
 };

@@ -34,7 +34,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Create an isolated EVM instance at the current state root.
         let (state_db, current_root) = block_store.isolated_state_db()?;
-        let mut evm = ShellEvm::new(state_db, self.config.chain_id);
+        let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
 
         let now = self.current_block_timestamp(head.header.timestamp);
 
@@ -127,8 +127,8 @@ impl<S: KvStore + 'static> Node<S> {
                             &result.system_contract_effects,
                         )?;
                     } else {
-                        // Normal EVM tx: commit EvmState changeset.
-                        commit_evm_state(
+                        // Normal PQVM tx: commit the revm state changeset.
+                        commit_pqvm_state(
                             &result,
                             evm.state_db_mut().world_state_mut(),
                             &self.chain_store,
@@ -137,7 +137,7 @@ impl<S: KvStore + 'static> Node<S> {
                         // Commit to the node's persistent WorldState.
                         {
                             let mut ws = self.world_state.write();
-                            commit_evm_state(&result, &mut ws, &self.chain_store)?;
+                            commit_pqvm_state(&result, &mut ws, &self.chain_store)?;
                         }
                     }
                     total_effective_fees = total_effective_fees.saturating_add(
@@ -273,17 +273,17 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Compute block-level logs bloom by OR-ing all receipt blooms.
         {
-            let receipt_blooms: Vec<shell_evm::bloom::Bloom> = receipts
+            let receipt_blooms: Vec<shell_pqvm::bloom::Bloom> = receipts
                 .iter()
                 .map(|r| {
-                    let mut bloom = [0u8; shell_evm::bloom::BLOOM_SIZE];
+                    let mut bloom = [0u8; shell_pqvm::bloom::BLOOM_SIZE];
                     let bytes = r.logs_bloom.as_ref();
-                    let len = bytes.len().min(shell_evm::bloom::BLOOM_SIZE);
+                    let len = bytes.len().min(shell_pqvm::bloom::BLOOM_SIZE);
                     bloom[..len].copy_from_slice(&bytes[..len]);
                     bloom
                 })
                 .collect();
-            let block_bloom = shell_evm::bloom::bloom_union(&receipt_blooms);
+            let block_bloom = shell_pqvm::bloom::bloom_union(&receipt_blooms);
             header.logs_bloom = Bytes::from(block_bloom.to_vec());
         }
 

@@ -4,7 +4,7 @@ use alloy_primitives::U256;
 use common::{apply_tx, fund_account, setup, sign_tx, CHAIN_ID};
 use shell_core::Transaction;
 use shell_crypto::{DilithiumSigner, MultiVerifier, Signer, SphincsSigner};
-use shell_evm::{
+use shell_pqvm::{
     account_manager_address, encode_rotate_key_calldata, validate_tx, TxValidationError,
 };
 use shell_primitives::{blake3_hash, Address as ShellAddress, Bytes as ShellBytes};

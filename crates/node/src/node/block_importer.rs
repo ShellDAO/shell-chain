@@ -347,7 +347,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
 
             let (state_db, _) = block_store.isolated_state_db()?;
-            let mut evm = ShellEvm::new(state_db, self.config.chain_id);
+            let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
 
             // Non-signature validation (chain-id, gas, sender binding).
             // Uses PreVerified to skip redundant individual
@@ -426,7 +426,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 &result.system_contract_effects,
                             )?;
                         } else {
-                            commit_evm_state(
+                            commit_pqvm_state(
                                 &result,
                                 evm.state_db_mut().world_state_mut(),
                                 &self.chain_store,

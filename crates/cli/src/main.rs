@@ -192,13 +192,13 @@ enum Commands {
         #[arg(long)]
         state_cache_size_mb: Option<usize>,
 
-        /// Enable the parallel-EVM conflict-graph scheduler.
-        #[arg(long)]
-        parallel_evm: bool,
+        /// Enable the parallel-PQVM conflict-graph scheduler.
+        #[arg(long, alias = "parallel-evm")]
+        parallel_pqvm: bool,
 
-        /// Worker threads for the parallel-EVM scheduler (default: logical CPUs).
-        #[arg(long)]
-        parallel_evm_workers: Option<usize>,
+        /// Worker threads for the parallel-PQVM scheduler (default: logical CPUs).
+        #[arg(long, alias = "parallel-evm-workers")]
+        parallel_pqvm_workers: Option<usize>,
 
         /// High-level storage classification for this node.
         ///
@@ -487,8 +487,8 @@ async fn main() {
             mempool_max_size,
             mempool_price_bump,
             state_cache_size_mb,
-            parallel_evm,
-            parallel_evm_workers,
+            parallel_pqvm,
+            parallel_pqvm_workers,
             storage_profile,
             witness_retention,
             body_retention,
@@ -609,10 +609,10 @@ async fn main() {
                 .or(file_config.metrics.listen_addr)
                 .unwrap_or_else(|| "127.0.0.1:9090".to_string());
 
-            let effective_parallel_evm =
-                parallel_evm || file_config.parallel_evm.enabled.unwrap_or(false);
-            let effective_parallel_evm_workers =
-                parallel_evm_workers.or(file_config.parallel_evm.worker_threads);
+            let effective_parallel_pqvm =
+                parallel_pqvm || file_config.parallel_pqvm.enabled.unwrap_or(false);
+            let effective_parallel_pqvm_workers =
+                parallel_pqvm_workers.or(file_config.parallel_pqvm.worker_threads);
 
             commands::run(commands::run::RunArgs {
                 datadir,
@@ -642,8 +642,8 @@ async fn main() {
                 mempool_max_size,
                 mempool_price_bump,
                 state_cache_size_mb,
-                parallel_evm: effective_parallel_evm,
-                parallel_evm_workers: effective_parallel_evm_workers,
+                parallel_pqvm: effective_parallel_pqvm,
+                parallel_pqvm_workers: effective_parallel_pqvm_workers,
                 storage_profile,
                 witness_retention,
                 body_retention,

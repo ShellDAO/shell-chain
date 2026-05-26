@@ -77,8 +77,8 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--mempool-max-size <N>` | `4096` | Maximum pending transactions in mempool |
 | `--mempool-price-bump <PCT>` | `10` | Minimum gas-price bump % to replace a pending tx |
 | `--state-cache-size-mb <MB>` | `64` | Account LRU cache size for world-state trie |
-| `--parallel-evm` | `false` | Enable parallel-EVM conflict-graph scheduler |
-| `--parallel-evm-workers <N>` | logical CPUs | Worker threads for parallel-EVM |
+| `--parallel-pqvm` | `false` | Enable parallel-PQVM conflict-graph scheduler (`--parallel-evm` remains a deprecated alias) |
+| `--parallel-pqvm-workers <N>` | logical CPUs | Worker threads for parallel-PQVM (`--parallel-evm-workers` remains a deprecated alias) |
 | `--storage-profile <PROFILE>` | `full` | Storage classification: `archive`, `full`, or `light` |
 | `--witness-retention <N>` | profile default | Override witness bundle retention (0 = keep forever) |
 | `--body-retention <N>` | profile default | Override TX body retention (0 = keep forever) |

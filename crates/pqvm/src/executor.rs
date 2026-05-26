@@ -1,6 +1,6 @@
 //! PQVM/revm execution adapter: executes transactions via revm and produces receipts.
 //!
-//! [`ShellEvm`] wraps revm with shell-chain's state bridge and
+//! [`ShellPqvm`] wraps revm with shell-chain's state bridge and
 //! provides a high-level API for executing individual transactions and
 //! full blocks.
 
@@ -30,8 +30,8 @@ use crate::system_contracts::{
 /// Errors returned during PQVM/revm execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
-    #[error("evm: {0}")]
-    Evm(String),
+    #[error("pqvm/revm: {0}")]
+    Revm(String),
 
     #[error("state db: {0}")]
     StateDb(#[from] StateDbError),
@@ -50,11 +50,11 @@ pub struct TxExecutionResult {
     /// State changes produced by this transaction (for committing).
     pub state_changes: EvmState,
     /// Maps 20-byte revm bridge address → full 32-byte PQ Shell address for accounts
-    /// whose upper 12 bytes are non-zero. Required by `commit_evm_state` to
+    /// whose upper 12 bytes are non-zero. Required by `commit_pqvm_state` to
     /// write state to the correct canonical key in world_state.
     pub pq_addr_map: std::collections::HashMap<EvmAddress, ShellAddress>,
     /// The sender's nonce after this transaction (= tx.nonce + 1). Used by
-    /// `commit_evm_state` to ensure the nonce is always advanced correctly even
+    /// `commit_pqvm_state` to ensure the nonce is always advanced correctly even
     /// when revm's `disable_nonce_check = true` suppresses the normal increment.
     pub sender_shell_addr: ShellAddress,
     /// Expected nonce of `sender_shell_addr` after tx (= tx.nonce + 1).
@@ -75,7 +75,7 @@ pub struct TxExecutionResult {
 /// Wraps revm and provides:
 /// - `execute_tx()`: execute a single validated transaction → receipt + state
 /// - Block-level gas tracking for cumulative_gas_used
-pub struct ShellEvm<S: KvStore + 'static> {
+pub struct ShellPqvm<S: KvStore + 'static> {
     state_db: ShellStateDb<S>,
     chain_id: u64,
 }
@@ -101,7 +101,7 @@ where
     );
 }
 
-impl<S: KvStore + 'static> ShellEvm<S> {
+impl<S: KvStore + 'static> ShellPqvm<S> {
     pub fn new(state_db: ShellStateDb<S>, chain_id: u64) -> Self {
         Self { state_db, chain_id }
     }
@@ -153,7 +153,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
             }
         }
 
-        // ── Normal EVM execution path ──────────────────────────
+        // ── Normal PQVM/revm execution path ──────────────────────────
         let tx = &signed_tx.tx;
         let sender_shell_addr = signed_tx.from;
         let sender_nonce_after = tx.nonce.saturating_add(1);
@@ -222,12 +222,12 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         // Execute
         let result_and_state = evm
             .transact(tx_env)
-            .map_err(|e| ExecutorError::Evm(format!("{e:?}")))?;
+            .map_err(|e| ExecutorError::Revm(format!("{e:?}")))?;
 
         let exec_result = result_and_state.result;
         let state = result_and_state.state;
 
-        // Capture PQ address hints for commit_evm_state so it writes to the
+        // Capture PQ address hints for commit_pqvm_state so it writes to the
         // canonical Shell address rather than the zero-padded EVM address.
         let pq_addr_map = self.state_db.pq_hints.clone();
 
@@ -335,7 +335,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
     ) -> Result<TxExecutionResult, ExecutorError> {
         let bundle = signed_tx
             .aa_bundle()
-            .ok_or_else(|| ExecutorError::Evm("execute_aa_bundle called on non-AA tx".into()))?;
+            .ok_or_else(|| ExecutorError::Revm("execute_aa_bundle called on non-AA tx".into()))?;
         let tx = &signed_tx.tx;
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
@@ -344,7 +344,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
         let declared_value = tx.value;
         let inner_value_sum = bundle.inner_value_sum();
         if inner_value_sum > declared_value {
-            return Err(ExecutorError::Evm(format!(
+            return Err(ExecutorError::Revm(format!(
                 "aa bundle inner value sum ({inner_value_sum}) exceeds outer value ({declared_value})"
             )));
         }
@@ -484,7 +484,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                     successful_values_sum = successful_values_sum.saturating_add(inner.value);
                     let cs_arc = std::sync::Arc::clone(self.state_db.chain_store().store());
                     let cs_view = ChainStore::new(cs_arc);
-                    // Build a minimal result for commit_evm_state; no PQ addresses in AA
+                    // Build a minimal result for commit_pqvm_state; no PQ addresses in AA
                     // inner calls (they use EVM-canonical addresses), no nonce advance here
                     // as outer tx handles it.
                     let inner_result = TxExecutionResult {
@@ -498,7 +498,7 @@ impl<S: KvStore + 'static> ShellEvm<S> {
                         is_system_tx: false,
                         system_contract_effects: SystemContractEffects::default(),
                     };
-                    commit_evm_state(&inner_result, self.state_db.world_state_mut(), &cs_view)?;
+                    commit_pqvm_state(&inner_result, self.state_db.world_state_mut(), &cs_view)?;
                 }
                 ExecutionResult::Revert { output, .. } => {
                     atomic_failure = true;
@@ -823,14 +823,14 @@ fn empty_receipt() -> TransactionReceipt {
 /// Iterates the revm `EvmState` (address → account) and for each touched
 /// account, updates balance, nonce, contract code, and storage slots.
 ///
-/// Call this after `ShellEvm::execute_tx()` to persist the computed state
+/// Call this after `ShellPqvm::execute_tx()` to persist the computed state
 /// diff. For multi-transaction blocks, call after **each** transaction so
 /// subsequent transactions see prior state updates.
 ///
 /// Uses `result.pq_addr_map` to write PQ-derived accounts to the correct
 /// 32-byte canonical key, and `result.sender_nonce_after` to ensure the
 /// sender's nonce advances even when revm's `disable_nonce_check = true`.
-pub fn commit_evm_state<S: KvStore + 'static>(
+pub fn commit_pqvm_state<S: KvStore + 'static>(
     result: &TxExecutionResult,
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
@@ -907,11 +907,11 @@ mod tests {
     use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::sync::Arc;
 
-    fn setup_evm() -> ShellEvm<MemoryDb> {
+    fn setup_evm() -> ShellPqvm<MemoryDb> {
         let ws = WorldState::new(Arc::new(MemoryDb::new()));
         let cs = ChainStore::new(Arc::new(MemoryDb::new()));
         let state_db = ShellStateDb::new(ws, cs);
-        ShellEvm::new(state_db, 1337)
+        ShellPqvm::new(state_db, 1337)
     }
 
     fn sample_header() -> BlockHeader {
@@ -937,7 +937,7 @@ mod tests {
         }
     }
 
-    fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
+    fn fund_account(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
         let account = Account {
             pq_pubkey_hash: ShellHash::ZERO,
             nonce: 0,
@@ -1452,7 +1452,7 @@ mod tests {
 
     // ── Helpers for advanced EVM tests ────────────────────────
 
-    fn commit_state(evm: &mut ShellEvm<MemoryDb>, state: &EvmState) {
+    fn commit_state(evm: &mut ShellPqvm<MemoryDb>, state: &EvmState) {
         let (ws, cs) = evm.state_db_mut().world_state_and_chain_store();
         let fake_result = TxExecutionResult {
             receipt: empty_receipt(),
@@ -1465,11 +1465,11 @@ mod tests {
             is_system_tx: false,
             system_contract_effects: SystemContractEffects::default(),
         };
-        commit_evm_state(&fake_result, ws, cs).unwrap();
+        commit_pqvm_state(&fake_result, ws, cs).unwrap();
     }
 
     fn deploy_contract(
-        evm: &mut ShellEvm<MemoryDb>,
+        evm: &mut ShellPqvm<MemoryDb>,
         from: &ShellAddress,
         init_code: Vec<u8>,
         value: U256,
@@ -1499,7 +1499,7 @@ mod tests {
     }
 
     fn call_contract(
-        evm: &mut ShellEvm<MemoryDb>,
+        evm: &mut ShellPqvm<MemoryDb>,
         from: &ShellAddress,
         to: &ShellAddress,
         calldata: Vec<u8>,
@@ -3490,7 +3490,7 @@ mod tests {
             .unwrap()
     }
 
-    fn get_balance(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress) -> U256 {
+    fn get_balance(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress) -> U256 {
         evm.state_db_mut()
             .world_state_mut()
             .get_account(addr)
@@ -3499,7 +3499,7 @@ mod tests {
             .unwrap_or(U256::ZERO)
     }
 
-    fn get_nonce(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress) -> u64 {
+    fn get_nonce(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress) -> u64 {
         evm.state_db_mut()
             .world_state_mut()
             .get_account(addr)
@@ -3691,7 +3691,9 @@ mod tests {
 
         let header = sample_header();
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0);
-        assert!(matches!(res, Err(ExecutorError::Evm(msg)) if msg.contains("exceeds outer value")));
+        assert!(
+            matches!(res, Err(ExecutorError::Revm(msg)) if msg.contains("exceeds outer value"))
+        );
         assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);
         assert_eq!(get_nonce(&mut evm, &sender), 0);
     }

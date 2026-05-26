@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use shell_primitives::{Address, Bytes, U256};
 
-/// A single call frame in an EVM execution trace.
+/// A single call frame in an PQVM/revm execution trace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallFrame {

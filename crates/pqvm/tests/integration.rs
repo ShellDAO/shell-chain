@@ -1,12 +1,12 @@
 //! End-to-end EVM integration tests.
 //!
-//! These tests exercise the full pipeline: tx validation → EVM execution → receipt,
+//! These tests exercise the full pipeline: tx validation → PQVM execution → receipt,
 //! using real Dilithium3 signatures and the Shell PQ precompile suite (0x0001–0x0006).
 
 use alloy_primitives::U256;
 use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
 use shell_crypto::{DilithiumSigner, DilithiumVerifier, PQSignature, SignatureType, Signer};
-use shell_evm::{validate_tx, ShellEvm, ShellStateDb, TxValidationError};
+use shell_pqvm::{validate_tx, ShellPqvm, ShellStateDb, TxValidationError};
 use shell_primitives::{Address as ShellAddress, Bytes as ShellBytes, ShellHash};
 use shell_storage::{ChainStore, MemoryDb, WorldState};
 use std::sync::Arc;
@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 const CHAIN_ID: u64 = 1337;
 
-fn setup() -> (ShellEvm<MemoryDb>, ChainStore<MemoryDb>) {
+fn setup() -> (ShellPqvm<MemoryDb>, ChainStore<MemoryDb>) {
     let ws = WorldState::new(Arc::new(MemoryDb::new()));
     let cs_db = Arc::new(MemoryDb::new());
     let cs_for_evm = ChainStore::new(cs_db.clone());
     let cs_for_test = ChainStore::new(cs_db);
     let state_db = ShellStateDb::new(ws, cs_for_evm);
-    let evm = ShellEvm::new(state_db, CHAIN_ID);
+    let evm = ShellPqvm::new(state_db, CHAIN_ID);
     (evm, cs_for_test)
 }
 
@@ -48,7 +48,7 @@ fn sample_header(number: u64) -> BlockHeader {
     }
 }
 
-fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
+fn fund_account(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
     let account = Account {
         pq_pubkey_hash: ShellHash::ZERO,
         nonce: 0,
@@ -261,9 +261,9 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
     let r1 = evm.execute_tx(&signed1, &header, 0, 0).unwrap();
     assert_eq!(r1.receipt.status, 1);
 
-    // Commit the nonce change from execution using commit_evm_state so PQ
+    // Commit the nonce change from execution using commit_pqvm_state so PQ
     // addresses are correctly resolved via the pq_addr_map.
-    shell_evm::commit_evm_state(&r1, evm.state_db_mut().world_state_mut(), &cs)
+    shell_pqvm::commit_pqvm_state(&r1, evm.state_db_mut().world_state_mut(), &cs)
         .expect("commit r1 failed");
 
     // Second tx: NO pubkey attached — should read from registry
@@ -306,7 +306,7 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
 fn e2e_precompile_addresses() {
     use alloy_primitives::address;
     use revm::primitives::hardfork::SpecId;
-    use shell_evm::ShellPrecompiles;
+    use shell_pqvm::ShellPrecompiles;
 
     let sp = ShellPrecompiles::new(SpecId::CANCUN);
 

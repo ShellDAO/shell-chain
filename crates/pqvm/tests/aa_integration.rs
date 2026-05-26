@@ -4,7 +4,7 @@ use alloy_primitives::U256;
 use common::{apply_tx, deploy_runtime_contract, fund_account, setup, sign_tx, CHAIN_ID};
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{DilithiumSigner, MultiVerifier, PQSignature, SignatureType, Signer};
-use shell_evm::{
+use shell_pqvm::{
     account_manager_address, encode_clear_validation_code_calldata,
     encode_set_validation_code_calldata, validate_tx, TxValidationError,
 };

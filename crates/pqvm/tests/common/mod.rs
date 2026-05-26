@@ -1,20 +1,20 @@
 use alloy_primitives::U256;
 use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
 use shell_crypto::{Signer, Verifier};
-use shell_evm::{commit_evm_state, validate_tx, ShellEvm, ShellStateDb, TxExecutionResult};
+use shell_pqvm::{commit_pqvm_state, validate_tx, ShellPqvm, ShellStateDb, TxExecutionResult};
 use shell_primitives::{Address as ShellAddress, Bytes as ShellBytes, ShellHash};
 use shell_storage::{ChainStore, MemoryDb, WorldState};
 use std::sync::Arc;
 
 pub const CHAIN_ID: u64 = 1337;
 
-pub fn setup() -> (ShellEvm<MemoryDb>, ChainStore<MemoryDb>) {
+pub fn setup() -> (ShellPqvm<MemoryDb>, ChainStore<MemoryDb>) {
     let world_state = WorldState::new(Arc::new(MemoryDb::new()));
     let chain_store_db = Arc::new(MemoryDb::new());
     let chain_store_for_evm = ChainStore::new(chain_store_db.clone());
     let chain_store_for_tests = ChainStore::new(chain_store_db);
     let state_db = ShellStateDb::new(world_state, chain_store_for_evm);
-    let evm = ShellEvm::new(state_db, CHAIN_ID);
+    let evm = ShellPqvm::new(state_db, CHAIN_ID);
     (evm, chain_store_for_tests)
 }
 
@@ -41,7 +41,7 @@ pub fn sample_header(number: u64) -> BlockHeader {
     }
 }
 
-pub fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
+pub fn fund_account(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress, balance: U256) {
     let account = Account {
         pq_pubkey_hash: ShellHash::ZERO,
         nonce: 0,
@@ -72,7 +72,7 @@ pub fn sign_tx<S: Signer>(
 }
 
 pub fn apply_tx<V: Verifier>(
-    evm: &mut ShellEvm<MemoryDb>,
+    evm: &mut ShellPqvm<MemoryDb>,
     chain_store: &ChainStore<MemoryDb>,
     verifier: &V,
     signed_tx: &SignedTransaction,
@@ -99,8 +99,8 @@ pub fn apply_tx<V: Verifier>(
         .expect("execute_tx failed");
 
     if !result.is_system_tx {
-        commit_evm_state(&result, evm.state_db_mut().world_state_mut(), chain_store)
-            .expect("commit_evm_state failed");
+        commit_pqvm_state(&result, evm.state_db_mut().world_state_mut(), chain_store)
+            .expect("commit_pqvm_state failed");
     }
 
     result
@@ -109,7 +109,7 @@ pub fn apply_tx<V: Verifier>(
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_runtime_contract<S: Signer, V: Verifier>(
-    evm: &mut ShellEvm<MemoryDb>,
+    evm: &mut ShellPqvm<MemoryDb>,
     chain_store: &ChainStore<MemoryDb>,
     verifier: &V,
     signer: &S,

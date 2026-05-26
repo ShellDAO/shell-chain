@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{DilithiumSigner, Signer};
-use shell_evm::{account_manager_address, encode_rotate_key_calldata};
+use shell_pqvm::{account_manager_address, encode_rotate_key_calldata};
 use shell_primitives::{Address, Bytes, U256};
 use shell_tx_generator::load_dev_authority;
 

@@ -1,5 +1,5 @@
 [package]
-name = "shell-evm"
+name = "shell-pqvm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

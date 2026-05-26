@@ -1,19 +1,19 @@
-//! Benchmarks for shell-evm: transfer, contract creation.
+//! Benchmarks for shell-pqvm: transfer, contract creation.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 
 use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
 use shell_crypto::{PQSignature, SignatureType};
-use shell_evm::{ShellEvm, ShellStateDb};
+use shell_pqvm::{ShellPqvm, ShellStateDb};
 use shell_primitives::{Address, Bytes, ShellHash, U256};
 use shell_storage::{ChainStore, MemoryDb, WorldState};
 
-fn setup_evm() -> ShellEvm<MemoryDb> {
+fn setup_evm() -> ShellPqvm<MemoryDb> {
     let ws = WorldState::new(Arc::new(MemoryDb::new()));
     let cs = ChainStore::new(Arc::new(MemoryDb::new()));
     let state_db = ShellStateDb::new(ws, cs);
-    ShellEvm::new(state_db, 1337)
+    ShellPqvm::new(state_db, 1337)
 }
 
 fn sample_header() -> BlockHeader {
@@ -39,7 +39,7 @@ fn sample_header() -> BlockHeader {
     }
 }
 
-fn fund_account(evm: &mut ShellEvm<MemoryDb>, addr: &Address, balance: U256) {
+fn fund_account(evm: &mut ShellPqvm<MemoryDb>, addr: &Address, balance: U256) {
     let account = Account {
         pq_pubkey_hash: ShellHash::ZERO,
         nonce: 0,
@@ -101,7 +101,7 @@ fn minimal_init_code() -> Vec<u8> {
 // ── Simple transfer ──────────────────────────────────────────
 
 fn bench_simple_transfer(c: &mut Criterion) {
-    c.bench_function("evm/simple_transfer", |b| {
+    c.bench_function("pqvm/simple_transfer", |b| {
         let mut evm = setup_evm();
         let sender = Address::from([0x01; 20]);
         let receiver = Address::from([0x02; 20]);
@@ -121,7 +121,7 @@ fn bench_simple_transfer(c: &mut Criterion) {
 // ── Contract creation ────────────────────────────────────────
 
 fn bench_contract_creation(c: &mut Criterion) {
-    c.bench_function("evm/contract_creation", |b| {
+    c.bench_function("pqvm/contract_creation", |b| {
         let mut evm = setup_evm();
         let deployer = Address::from([0x42; 20]);
         fund_account(&mut evm, &deployer, U256::from(1_000_000_000_000u64));

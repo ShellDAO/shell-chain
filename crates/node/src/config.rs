@@ -3,10 +3,10 @@
 use std::net::SocketAddr;
 
 use shell_consensus::{PoaConfig, WPoaConfig};
-pub use shell_evm::ParallelEvmConfig;
 use shell_genesis::NetworkType;
 use shell_mempool::MempoolConfig;
 use shell_network::NetworkConfig;
+pub use shell_pqvm::ParallelPqvmConfig;
 use shell_primitives::Address;
 use shell_rpc::RpcConfig;
 
@@ -228,8 +228,8 @@ pub struct NodeConfig {
     /// Account cache size in MiB for the world state LRU trie cache.
     /// Default: 64 MiB.  Higher values reduce state trie decode overhead.
     pub state_cache_size_mb: usize,
-    /// Parallel-EVM PoC configuration. Disabled by default until promoted.
-    pub parallel_evm: ParallelEvmConfig,
+    /// Parallel-PQVM PoC configuration. Disabled by default until promoted.
+    pub parallel_pqvm: ParallelPqvmConfig,
     /// Enable STARK aggregate proof generation during block production.
     /// When true, `produce_block` calls `prove_sig_batch()` over all transaction
     /// entries and stores the result in `BlockHeader::sig_aggregate_proof`.
@@ -294,7 +294,7 @@ impl NodeConfig {
             metrics: MetricsConfig::default(),
             max_idle_interval_ms: 600_000,
             state_cache_size_mb: 64,
-            parallel_evm: ParallelEvmConfig::default(),
+            parallel_pqvm: ParallelPqvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),

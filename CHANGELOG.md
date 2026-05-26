@@ -331,12 +331,12 @@ All notable changes to this project will be documented in this file.
   `expiry_block`, `root_signature`, and `session_signature`. RLP encodes as a
   5-field list. Breaking change vs v0.18.x wire format. See `docs/AA_PHASE2_SPEC.md`.
 
-- **AA Phase 2 contract paymaster** (`crates/evm`): `validatePaymasterOp` ABI call
+- **AA Phase 2 contract paymaster** (`crates/pqvm`): `validatePaymasterOp` ABI call
   dispatched when `paymaster_context` is present. Call runs in a world-state
   snapshot (mutations discarded). Gas cap 50k. Bool return decoded from 32-byte
   ABI word.
 
-- **AA Phase 2 session keys** (`crates/evm`): Session-key-signed AA bundles now
+- **AA Phase 2 session keys** (`crates/pqvm`): Session-key-signed AA bundles now
   validated via two-step PQ verification: (1) root key authorizes the session key
   via `session_auth_hash`; (2) session key signs the tx via `sender_signing_hash`.
   Constraint checks: expiry block, value cap (Σ inner call values), optional target
@@ -344,7 +344,7 @@ All notable changes to this project will be documented in this file.
   `SessionTargetMismatch`, `SessionRootSignatureInvalid`, `SessionKeySignatureInvalid`,
   `SessionKeyDisallowedAlgorithm`.
 
-- **AA Phase 2 guardian recovery** (`crates/evm`, `crates/storage`): `AccountManager`
+- **AA Phase 2 guardian recovery** (`crates/pqvm`, `crates/storage`): `AccountManager`
   system contract gains 4 new entry points: `setGuardians(address[],uint8,uint64)`,
   `submitRecovery(address,bytes,uint8)`, `executeRecovery(address)`,
   `cancelRecovery(address)`. `GuardianConfig` and `RecoveryProposal` persisted in
@@ -355,7 +355,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Double PQ signature verification** (`crates/evm`): `validate_tx()` and
+- **Double PQ signature verification** (`crates/pqvm`): `validate_tx()` and
   `validate_tx_for_import()` both previously called `verify_paymaster_signature()`
   after already invoking `validate_aa_tx()` which performs the same check internally.
   The redundant second call is now removed; PQ (Dilithium) sig verification is
@@ -591,16 +591,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **Parallel EVM executor** (`crates/evm`): `ConflictMetric` type with `ReadWrite`, `WriteWrite`, and `Incomplete` variants for tracking inter-transaction state conflicts.
+- **Parallel PQVM executor** (`crates/pqvm`): `ConflictMetric` type with `ReadWrite`, `WriteWrite`, and `Incomplete` variants for tracking inter-transaction state conflicts.
 - `plan_with_metrics()`: transaction dependency graph builder that returns a `Vec<ConflictMetric>` alongside the execution plan.
-- CLI flag `--parallel-evm` (default: **OFF**) to opt-in to the parallel execution path.
-- CLI flag `--parallel-evm-workers <N>` to control the Rayon worker-pool size (default: number of logical CPUs).
-- `config/node.example.toml` updated with a `[parallel_evm]` section documenting both flags.
-- State validation tests: 11 unit tests in `crates/evm`, 3 benchmarks in `crates/bench` (`parallel_evm_throughput`, `conflict_detection_overhead`, `sequential_baseline`).
+- CLI flag `--parallel-pqvm` (default: **OFF**) to opt-in to the parallel execution path.
+- CLI flag `--parallel-pqvm-workers <N>` to control the Rayon worker-pool size (default: number of logical CPUs).
+- `config/node.example.toml` updated with a `[parallel_pqvm]` section documenting both flags.
+- State validation tests: 11 unit tests in `crates/pqvm`, 3 benchmarks in `crates/bench` (`parallel_pqvm_throughput`, `conflict_detection_overhead`, `sequential_baseline`).
 
 ### Changed
 
-- `parallel-evm` feature is gated behind the CLI flag and disabled on production nodes until further notice.
+- `parallel-pqvm` feature is gated behind the CLI flag and disabled on production nodes until further notice.
 
 ### Previous release: [0.13.0]
 
@@ -629,7 +629,7 @@ All notable changes to this project will be documented in this file.
 
 **Batch 4 — Operations & Observability**
 - Structured JSON logging with `--log-format json|text` and sensitive-field filtering
-- Extended Prometheus metrics: `shell_aa_tx_total`, `shell_key_rotation_total`, `shell_validator_weight`, `shell_consensus_slot_miss`, `shell_evm_gas_used_total`, `shell_snapshot_size_bytes`
+- Extended Prometheus metrics: `shell_aa_tx_total`, `shell_key_rotation_total`, `shell_validator_weight`, `shell_consensus_slot_miss`, `shell_pqvm_gas_used_total`, `shell_snapshot_size_bytes`
 - Admin RPC namespace (`admin_nodeInfo`, `admin_peers`, `admin_addPeer`, `admin_removePeer`, `admin_datadir`); requires `--admin-api` flag (loopback-only by default)
 - Hot backup / restore CLI: `shell-node backup create|restore|schedule`
 
@@ -696,11 +696,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Upgrade from Shanghai to Cancun EVM specification
-- EIP-2930 access list support in transactions, EVM execution, and RPC
+- EIP-2930 access list support in transactions, PQVM execution, and RPC
 - EIP-4844 basic blob transaction type and gas pricing
 - `debug_traceTransaction` and trace API for transaction debugging
 - Missing standard Ethereum JSON-RPC methods (full eth_* coverage)
-- Comprehensive EVM compatibility verification tests
+- Comprehensive Ethereum tooling compatibility verification tests
 - State pruning with configurable retention policy
 - Batch parallel signature verification with Rayon
 - RLP serialization replacing JSON in chain store for performance
@@ -783,7 +783,7 @@ All notable changes to this project will be documented in this file.
 - PoA consensus engine with pluggable trait
 - Genesis block initialization from config
 - Code storage and PQ public key registry in ChainStore
-- EVM executor with revm integration
+- PQVM executor with revm integration
 - PQ precompiles — disabled `ecrecover`, added Dilithium3 verify
 - Transaction validation pipeline with hybrid pubkey registration
 - JSON-RPC server with `eth_*` and `shell_*` endpoints

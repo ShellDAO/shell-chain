@@ -7,7 +7,7 @@ members = [
     "crates/storage",
     "crates/consensus",
     "crates/genesis",
-    "crates/evm",
+    "crates/pqvm",
     "crates/mempool",
     "crates/rpc",
     "crates/network",
@@ -63,7 +63,7 @@ async-trait = "0.1"
 # --- storage (trie) ---
 eth_trie = "0.4"
 
-# --- evm ---
+# --- pqvm ---
 revm = { version = "36", default-features = false, features = ["std", "optional_no_base_fee", "optional_balance_check"] }
 
 # --- rpc ---

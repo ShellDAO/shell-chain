@@ -34,10 +34,10 @@ Layer 1: Protocol-level signature check (Dilithium3 or SPHINCS+)
               ↓
 Layer 2: Account-specific validation contract (if set via AccountManager)
               ↓
-Layer 3: EVM execution
+Layer 3: PQVM execution
 ```
 
-The critical difference: validation happens **before** the EVM sees the
+The critical difference: validation happens **before** the PQVM sees the
 transaction. No bundler. No `UserOperation` mempool. No `EntryPoint` contract
 to re-enter. The chain itself is the bundler.
 

@@ -36,9 +36,10 @@
 # level = "info"    # trace | debug | info | warn | error
 # format = "text"   # text | compact | json
 
-# ── Parallel-EVM scheduler ────────────────────────────────────────────────────
+# ── Parallel-PQVM scheduler ────────────────────────────────────────────────────
 # Enables conflict-graph-based parallel transaction scheduling.
-# Equivalent CLI flags: --parallel-evm  --parallel-evm-workers <N>
-[parallel_evm]
+# Preferred CLI flags: --parallel-pqvm  --parallel-pqvm-workers <N>
+# Deprecated aliases still accepted: --parallel-evm  --parallel-evm-workers <N>
+[parallel_pqvm]
 # enabled = false
 # worker_threads = 4

@@ -21,7 +21,7 @@ shell-core.workspace = true
 shell-storage.workspace = true
 shell-consensus = { path = "../consensus" }
 shell-genesis = { path = "../genesis" }
-shell-evm = { path = "../evm" }
+shell-pqvm = { path = "../pqvm" }
 shell-mempool = { path = "../mempool" }
 shell-rpc = { path = "../rpc" }
 shell-network = { path = "../network" }

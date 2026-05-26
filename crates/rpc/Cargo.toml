@@ -12,7 +12,7 @@ shell-core.workspace = true
 shell-storage.workspace = true
 shell-stark-prover = { path = "../stark-prover" }
 shell-mempool = { path = "../mempool" }
-shell-evm = { path = "../evm" }
+shell-pqvm = { path = "../pqvm" }
 shell-consensus = { path = "../consensus" }
 jsonrpsee.workspace = true
 tokio.workspace = true

@@ -1,10 +1,10 @@
-//! Shell-chain EVM integration layer.
+//! Shell-chain PQVM execution layer.
 //!
 //! This crate bridges the shell-chain storage layer (WorldState + ChainStore)
 //! with revm, providing:
 //!
 //! - [`ShellStateDb`]: implements `revm::Database` over WorldState + ChainStore
-//! - [`ShellEvm`]: transaction executor (Shanghai spec)
+//! - [`ShellPqvm`]: transaction executor backed by retained Cancun-style semantics
 //! - [`ShellPrecompiles`]: PQ precompile provider (6-precompile suite at 0x0001-0x0006)
 //! - [`pqvm_opcodes`]: Native PQ opcodes (0xB0 PQVERIFY, 0xB1 PQHASH, 0xB2 PQADDR)
 //! - [`validate_tx`]: PQ signature verification + hybrid pubkey registration
@@ -24,9 +24,9 @@ mod tx_validation;
 pub use aa_validation::{
     validate_aa_tx, AaValidationError, AaValidationOutcome, VALIDATION_GAS_CAP,
 };
-pub use executor::{commit_evm_state, ExecutorError, ShellEvm, TxExecutionResult};
+pub use executor::{commit_pqvm_state, ExecutorError, ShellPqvm, TxExecutionResult};
 pub use parallel::{
-    ConflictMetric, ConflictReason, ExecutionWave, ParallelEvmConfig, ParallelExecutionPlan,
+    ConflictMetric, ConflictReason, ExecutionWave, ParallelExecutionPlan, ParallelPqvmConfig,
     ParallelScheduler, TxConflict, TxConflictGraph,
 };
 pub use pqvm_opcodes::{OPCODE_PQADDR, OPCODE_PQHASH, OPCODE_PQVERIFY};

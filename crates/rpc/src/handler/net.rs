@@ -52,7 +52,7 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         let to_addr = tx.tx.to.unwrap_or(Address::ZERO);
         let call_type = if tx.tx.to.is_none() { "CREATE" } else { "CALL" };
 
-        let mut frame = shell_evm::CallFrame::new(
+        let mut frame = shell_pqvm::CallFrame::new(
             call_type,
             tx.sender(),
             to_addr,
@@ -77,7 +77,7 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
             }
         }
 
-        let trace = shell_evm::TraceResult {
+        let trace = shell_pqvm::TraceResult {
             frame,
             failed: !receipt.succeeded(),
         };
@@ -109,7 +109,7 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
             let to_addr = tx.tx.to.unwrap_or(Address::ZERO);
             let call_type = if tx.tx.to.is_none() { "CREATE" } else { "CALL" };
 
-            let mut frame = shell_evm::CallFrame::new(
+            let mut frame = shell_pqvm::CallFrame::new(
                 call_type,
                 tx.sender(),
                 to_addr,
@@ -135,7 +135,7 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
             }
 
             let failed = receipt.map(|r| !r.succeeded()).unwrap_or(true);
-            let trace = shell_evm::TraceResult { frame, failed };
+            let trace = shell_pqvm::TraceResult { frame, failed };
             traces.push(trace);
         }
 

@@ -83,7 +83,7 @@ pub trait ReadWriteSetExtractor {
     fn extract(&self, tx: &SignedTransaction) -> TxReadWriteSet;
 }
 
-/// Heuristic extractor used by the M11 parallel-EVM PoC.
+/// Heuristic extractor used by the M11 parallel-PQVM PoC.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeuristicRwSetExtractor;
 

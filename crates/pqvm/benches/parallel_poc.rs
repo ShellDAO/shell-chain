@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{PQSignature, SignatureType};
-use shell_evm::{HeuristicRwSetExtractor, ParallelEvmConfig, ParallelScheduler};
+use shell_pqvm::{HeuristicRwSetExtractor, ParallelPqvmConfig, ParallelScheduler};
 use shell_primitives::{Address, Bytes, U256};
 
 fn bench_parallel_poc(c: &mut Criterion) {
-    let scheduler = ParallelScheduler::new(ParallelEvmConfig {
+    let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
         enabled: true,
         max_workers: 4,
         fallback_on_incomplete: true,

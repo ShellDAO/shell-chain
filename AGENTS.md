@@ -59,7 +59,7 @@ Toolchain uses the `stable` channel via `rust-toolchain.toml` (+ rustfmt + clipp
 | `storage` | KvStore, witness pruner, settled-source index |
 | `consensus` | wPoA engine, validator set, slashing |
 | `genesis` | Genesis block construction |
-| `evm` | revm-backed PQVM execution adapter, parallel scheduler |
+| `pqvm` | revm-backed PQVM execution adapter, parallel scheduler |
 | `mempool` | Transaction pool |
 | `network` | libp2p gossipsub |
 | `rpc` | JSON-RPC, TLS, three-RPC fanout |

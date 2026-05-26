@@ -15,7 +15,8 @@ pub struct ShellConfig {
     pub consensus: ConsensusSection,
     pub metrics: MetricsSection,
     pub logging: LoggingSection,
-    pub parallel_evm: ParallelEvmSection,
+    #[serde(alias = "parallel_evm")]
+    pub parallel_pqvm: ParallelPqvmSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -72,10 +73,10 @@ pub struct LoggingSection {
     pub format: Option<String>,
 }
 
-/// Parallel-EVM scheduling configuration.
+/// Parallel-PQVM scheduling configuration.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct ParallelEvmSection {
+pub struct ParallelPqvmSection {
     /// Enable conflict-graph scheduling.
     pub enabled: Option<bool>,
     /// Maximum worker threads for parallelizable waves.

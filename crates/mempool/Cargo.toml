@@ -9,7 +9,7 @@ repository.workspace = true
 shell-primitives.workspace = true
 shell-crypto.workspace = true
 shell-core.workspace = true
-shell-evm = { path = "../evm" }
+shell-pqvm = { path = "../pqvm" }
 shell-storage = { path = "../storage" }
 thiserror.workspace = true
 parking_lot = { workspace = true }

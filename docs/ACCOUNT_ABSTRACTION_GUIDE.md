@@ -157,8 +157,8 @@ Current node logic accepts the common "magic valid" encodings:
 
 This call path is implemented in:
 
-- `crates/evm/src/aa_validation.rs`
-- `crates/evm/src/tx_validation.rs`
+- `crates/pqvm/src/aa_validation.rs`
+- `crates/pqvm/src/tx_validation.rs`
 - `contracts/DefaultPQValidator.sol`
 
 ---
@@ -227,8 +227,8 @@ Ethereum add-on AA layer.
 If you want to trace the implementation in code:
 
 - `crates/primitives/src/address.rs` — address derivation (`BLAKE3(algo_id || pubkey)`, 32-byte output, `0x` hex encoding)
-- `crates/evm/src/aa_validation.rs` — native AA dispatcher and custom-validator path
-- `crates/evm/src/tx_validation.rs` — transaction validation entry points
+- `crates/pqvm/src/aa_validation.rs` — native AA dispatcher and custom-validator path
+- `crates/pqvm/src/tx_validation.rs` — transaction validation entry points
 - `crates/mempool/src/pool.rs` — mempool-side validation integration
 
 ---

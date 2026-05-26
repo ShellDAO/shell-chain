@@ -5861,12 +5861,12 @@ dependencies = [
  "shell-consensus",
  "shell-core",
  "shell-crypto",
- "shell-evm",
  "shell-genesis",
  "shell-keystore",
  "shell-mempool",
  "shell-network",
  "shell-node",
+ "shell-pqvm",
  "shell-primitives",
  "shell-rpc",
  "shell-storage",
@@ -5943,27 +5943,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shell-evm"
-version = "0.23.0"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "blake3",
- "criterion",
- "hex",
- "rayon",
- "revm",
- "serde",
- "serde_json",
- "sha3",
- "shell-core",
- "shell-crypto",
- "shell-primitives",
- "shell-storage",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "shell-genesis"
 version = "0.23.0"
 dependencies = [
@@ -6024,7 +6003,7 @@ dependencies = [
  "serde_json",
  "shell-core",
  "shell-crypto",
- "shell-evm",
+ "shell-pqvm",
  "shell-primitives",
  "shell-storage",
  "thiserror 2.0.18",
@@ -6083,10 +6062,10 @@ dependencies = [
  "shell-consensus",
  "shell-core",
  "shell-crypto",
- "shell-evm",
  "shell-genesis",
  "shell-mempool",
  "shell-network",
+ "shell-pqvm",
  "shell-primitives",
  "shell-rpc",
  "shell-stark-prover",
@@ -6094,6 +6073,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "shell-pqvm"
+version = "0.23.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "blake3",
+ "criterion",
+ "hex",
+ "rayon",
+ "revm",
+ "serde",
+ "serde_json",
+ "sha3",
+ "shell-core",
+ "shell-crypto",
+ "shell-primitives",
+ "shell-storage",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6130,8 +6130,8 @@ dependencies = [
  "shell-consensus",
  "shell-core",
  "shell-crypto",
- "shell-evm",
  "shell-mempool",
+ "shell-pqvm",
  "shell-primitives",
  "shell-stark-prover",
  "shell-storage",
