@@ -20,7 +20,7 @@ pub const MAX_SIGNATURE_BYTES: usize = 51_200;
 pub const MAX_ML_DSA_65_SIG_BYTES: usize = 4_096;
 
 /// Identifies which PQ signature algorithm was used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum SignatureType {
     /// CRYSTALS-Dilithium3 (pre-FIPS, `pqcrypto-dilithium 0.5`).
     /// Based on the Round 3 submission, NOT the final FIPS 204 ML-DSA-65.
@@ -29,6 +29,25 @@ pub enum SignatureType {
     MlDsa65,
     /// SPHINCS+-SHA2-256f-simple (stateless hash-based, 256-bit PQ security).
     SphincsSha2256f,
+}
+
+impl<'de> Deserialize<'de> for SignatureType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "Dilithium3" => Ok(SignatureType::Dilithium3),
+            // Accept both the SDK canonical name and the Rust variant name.
+            "ML-DSA-65" | "MlDsa65" => Ok(SignatureType::MlDsa65),
+            "SphincsSha2256f" => Ok(SignatureType::SphincsSha2256f),
+            other => Err(DeError::unknown_variant(
+                other,
+                &["Dilithium3", "ML-DSA-65", "MlDsa65", "SphincsSha2256f"],
+            )),
+        }
+    }
 }
 
 impl SignatureType {
@@ -238,6 +257,17 @@ mod tests {
         let json = serde_json::to_string(&valid).unwrap();
         let decoded: PQSignature = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, valid);
+    }
+
+    #[test]
+    fn signature_type_deserializes_sdk_canonical_name() {
+        // SDK sends "ML-DSA-65" as the sig_type string; ensure both aliases work.
+        let t: SignatureType = serde_json::from_str(r#""ML-DSA-65""#).unwrap();
+        assert_eq!(t, SignatureType::MlDsa65);
+        let t2: SignatureType = serde_json::from_str(r#""MlDsa65""#).unwrap();
+        assert_eq!(t2, SignatureType::MlDsa65);
+        let t3: SignatureType = serde_json::from_str(r#""Dilithium3""#).unwrap();
+        assert_eq!(t3, SignatureType::Dilithium3);
     }
 
     // ── F-170: Algorithm allowlist ──────────────────────────────
