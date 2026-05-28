@@ -163,6 +163,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             None => TxKind::Create,
         };
 
+        // Register the recipient's full 32-byte address so commit_pqvm_state
+        // stores the balance update under the correct 32-byte key rather than
+        // the zero-padded form of the truncated 20-byte EVM address.
+        if let Some(to) = &tx.to {
+            self.state_db.register_pq_address(*to);
+        }
+
         let tx_env = TxEnv::builder()
             .caller(signed_tx.from.into())
             .gas_limit(tx.gas_limit)
@@ -3747,5 +3754,90 @@ mod tests {
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
         assert_eq!(res.receipt.status, 1);
         assert_eq!(get_nonce(&mut evm, &sender), 8);
+    }
+
+    /// Regression test: native transfer to a fresh 32-byte PQ address must store
+    /// the balance under the correct full 32-byte key, not a zero-padded form.
+    ///
+    /// Before the fix, `commit_pqvm_state` would fall back to
+    /// `ShellAddress::from_alloy(20-byte truncated to)` = zero-pad the upper 12 bytes,
+    /// silently losing funds stored under the wrong key.
+    #[test]
+    fn transfer_to_fresh_pq_address_stores_balance_at_correct_key() {
+        let mut evm = setup_evm();
+
+        // Sender is a legacy 20-byte address (zero-padded, round-trips cleanly).
+        let sender = ShellAddress::from([0x42u8; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000_000u64));
+
+        // Recipient is a genuine 32-byte PQ address with non-zero upper 12 bytes.
+        // Its upper 12 bytes are 0xAA, so from_alloy(to_alloy(addr)) != addr.
+        let mut pq_bytes = [0u8; 32];
+        pq_bytes[0..12].copy_from_slice(&[0xAAu8; 12]);
+        pq_bytes[12..32].copy_from_slice(&[0x0Bu8; 20]);
+        let pq_recipient = ShellAddress::from(pq_bytes);
+
+        // Sanity check: the address round-trip through 20-byte is indeed lossy.
+        let evm_form: alloy_primitives::Address = pq_recipient.into();
+        let zero_padded = ShellAddress::from(evm_form);
+        assert_ne!(
+            zero_padded, pq_recipient,
+            "test setup: pq_recipient must have non-zero upper bytes"
+        );
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(pq_recipient),
+            value: U256::from(1_000u64),
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xAA; 100]);
+        let signed = SignedTransaction::new(sender, tx, sig);
+
+        let header = sample_header();
+        let result = evm.execute_tx(&signed, &header, 0, 0);
+        assert!(result.is_ok(), "execute_tx failed: {:?}", result.err());
+        let tx_result = result.unwrap();
+        assert_eq!(tx_result.receipt.status, 1);
+
+        // Commit state to WorldState — execute_tx returns changes but does not
+        // persist them; the caller must drive commit_pqvm_state.
+        commit_pqvm_state(&tx_result, evm.state_db_mut()).expect("commit_pqvm_state failed");
+
+        // The balance must be stored at the CORRECT full 32-byte address.
+        let correct_balance = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_account(&pq_recipient)
+            .unwrap()
+            .map(|a| a.balance)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(
+            correct_balance,
+            U256::from(1_000u64),
+            "balance must be at the full PQ address"
+        );
+
+        // The zero-padded address must NOT hold the balance.
+        let wrong_balance = evm
+            .state_db_mut()
+            .world_state_mut()
+            .get_account(&zero_padded)
+            .unwrap()
+            .map(|a| a.balance)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(
+            wrong_balance,
+            U256::ZERO,
+            "balance must NOT be stored at the zero-padded fallback address"
+        );
     }
 }
