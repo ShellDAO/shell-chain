@@ -2000,8 +2000,6 @@ mod tests {
         assert_eq!(tx.hash(), expected);
     }
 
-    // ── EIP-4844 blob transaction tests ────────────────────────
-
     #[test]
     fn blob_tx_valid() {
         let tx = Transaction {

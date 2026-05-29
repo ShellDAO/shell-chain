@@ -10,7 +10,7 @@ name = "shell-node"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["rocksdb"]
 rocksdb = ["shell-storage/rocksdb"]
 libp2p = ["shell-network/libp2p"]
 

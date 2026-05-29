@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use shell_crypto::DilithiumSigner;
 use shell_crypto::Signer;
@@ -85,7 +86,10 @@ pub fn init(
                 chain_id,
                 chain_name: format!("shell-chain-{}", network_type.as_str()),
                 network_type,
-                timestamp: 1_700_000_000,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
                 gas_limit: 30_000_000,
                 extra_data: String::new(),
                 consensus: ConsensusConfig::PoA {
