@@ -288,30 +288,6 @@ fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
     .unwrap_or(false)
 }
 
-/// Legacy Dilithium3-only item verifier, kept for wire-format reference.
-/// No longer called from the batch path after H-3 unification; batch now
-/// delegates to `verify_mldsa65` (ML-DSA-65 primary + Dilithium3 fallback).
-/// TODO: remove once Dilithium3 legacy wires are fully retired (audit L-2).
-#[allow(dead_code)]
-fn verify_legacy_mldsa65_item(input: &[u8]) -> bool {
-    if input.len() < 8 {
-        return false;
-    }
-    let pk_len = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
-    if input.len() < 4 + pk_len + 4 {
-        return false;
-    }
-    let public_key = &input[4..4 + pk_len];
-    let msg_len =
-        u32::from_be_bytes(input[4 + pk_len..4 + pk_len + 4].try_into().unwrap()) as usize;
-    if input.len() < 4 + pk_len + 4 + msg_len {
-        return false;
-    }
-    let message = &input[4 + pk_len + 4..4 + pk_len + 4 + msg_len];
-    let sig_bytes = &input[4 + pk_len + 4 + msg_len..];
-    verify_signature(SignatureType::Dilithium3, public_key, message, sig_bytes).unwrap_or(false)
-}
-
 fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
     // Batch wire format:
     // [4-byte count][item_0][item_1]...
@@ -350,12 +326,8 @@ fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
         if item_end > input.len() {
             return (count, false);
         }
-        // H-3: Use the same ML-DSA-65-first dispatch as the single-verify path
-        // (verify_mldsa65) so batch and single verification are consistent.
-        // Legacy Dilithium3-only dispatch (verify_legacy_mldsa65_item) is kept
-        // below for reference but no longer used here.
-        // TODO: once Dilithium3 legacy wires are retired, remove the fallback
-        // entirely (audit finding L-2).
+        // H-3: ML-DSA-65-first dispatch (ML-DSA-65 primary + Dilithium3 fallback)
+        // matches the single-verify path so batch and single verification are consistent.
         let item = &input[item_start..item_end];
         valid &= verify_mldsa65(item);
         cursor = item_end;
