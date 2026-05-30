@@ -451,7 +451,8 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
             }
-            let producer_reward = total_effective_fees / U256::from(2u8);
+            // Block producer receives 100% of effective gas fees.
+            let producer_reward = total_effective_fees;
             if producer_reward > U256::ZERO {
                 evm.state_db_mut()
                     .world_state_mut()

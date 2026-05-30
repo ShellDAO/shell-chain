@@ -3751,7 +3751,8 @@ mod tests {
                 1,
                 2,
                 proposer,
-                U256::from(21_000u64).saturating_mul(U256::from(shell_core::INITIAL_BASE_FEE)),
+                // Two 21 000-gas txs → 42 000 total gas; producer receives 100% of fees.
+                U256::from(42_000u64).saturating_mul(U256::from(shell_core::INITIAL_BASE_FEE)),
                 genesis_hash,
             )],
             proposer_seal: None,

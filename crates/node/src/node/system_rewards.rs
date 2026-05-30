@@ -66,7 +66,6 @@ impl<S: KvStore + 'static> Node<S> {
             mint /= U256::from(2u8);
         }
 
-        let mut gas_share = U256::ZERO;
         let source_count;
         if amendment.layer == 1 {
             // For L1 proofs, base mint counts only covered source blocks that have
@@ -74,7 +73,6 @@ impl<S: KvStore + 'static> Node<S> {
             // for continuity but must not inflate the reward — they contribute no
             // witness entries and earn no base mint multiplier.
             let mut non_empty_count = 0usize;
-            let mut total_effective_fees = U256::ZERO;
             for source_hash in &covered_hashes {
                 let Some(source_block) = self.chain_store.get_block_by_hash(source_hash)? else {
                     return Err(NodeError::Startup(format!(
@@ -84,22 +82,7 @@ impl<S: KvStore + 'static> Node<S> {
                 if !source_block.transactions.is_empty() {
                     non_empty_count += 1;
                 }
-                let receipts = self
-                    .chain_store
-                    .get_receipts(source_hash)?
-                    .unwrap_or_default();
-                for (idx, tx) in source_block.transactions.iter().enumerate() {
-                    let gas_used = receipts.get(idx).map(|r| r.gas_used).unwrap_or(0);
-                    let price = effective_gas_price(
-                        tx.tx.max_fee_per_gas,
-                        tx.tx.max_priority_fee_per_gas,
-                        source_block.header.base_fee_per_gas,
-                    );
-                    total_effective_fees = total_effective_fees
-                        .saturating_add(U256::from(gas_used).saturating_mul(U256::from(price)));
-                }
             }
-            gas_share = total_effective_fees / U256::from(2u8);
             // At least 1 so a qualifying proof (n_sigs >= MIN_L1_STARK_TXS) always
             // earns some base mint even if all tx blocks are covered by a single block.
             source_count = non_empty_count.max(1);
@@ -110,7 +93,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         mint = mint.saturating_mul(U256::from(source_count));
-        Ok(mint.saturating_add(gas_share))
+        Ok(mint)
     }
 
     pub(crate) fn build_stark_reward_tx(
