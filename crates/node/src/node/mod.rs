@@ -2710,8 +2710,7 @@ mod tests {
 
         // Produce one fee-paying block with a real transaction.
         let tx_signer = DilithiumSigner::generate();
-        let sender =
-            Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
         let receiver = Address::from([0xBBu8; 32]);
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
 
