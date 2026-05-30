@@ -66,8 +66,7 @@ impl<S: KvStore + 'static> Node<S> {
             mint /= U256::from(2u8);
         }
 
-        let source_count;
-        if amendment.layer == 1 {
+        let source_count = if amendment.layer == 1 {
             // For L1 proofs, base mint counts only covered source blocks that have
             // user transactions.  0tx canonical blocks are included in source_hashes
             // for continuity but must not inflate the reward — they contribute no
@@ -85,12 +84,12 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // At least 1 so a qualifying proof (n_sigs >= MIN_L1_STARK_TXS) always
             // earns some base mint even if all tx blocks are covered by a single block.
-            source_count = non_empty_count.max(1);
+            non_empty_count.max(1)
         } else {
             // For L2+ proofs, source_hashes are lower-layer proof artifacts, not
             // raw block hashes.  Count all covered sources for the base mint.
-            source_count = covered_hashes.len().max(1);
-        }
+            covered_hashes.len().max(1)
+        };
 
         mint = mint.saturating_mul(U256::from(source_count));
         Ok(mint)
