@@ -88,7 +88,7 @@ pub fn init(
                 network_type,
                 timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .map_err(|e| format!("system clock is before UNIX epoch: {e}"))?
                     .as_secs(),
                 gas_limit: 30_000_000,
                 extra_data: String::new(),

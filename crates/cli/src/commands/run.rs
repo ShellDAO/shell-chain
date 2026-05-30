@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use shell_consensus::{PoaConfig, WPoaConfig};
@@ -480,7 +481,10 @@ async fn run_with_store<S: KvStore + 'static>(
             chain_id: args.chain_id,
             chain_name: format!("shell-chain-{}", args.network),
             network_type,
-            timestamp: 1_700_000_000,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("system clock is before UNIX epoch: {e}"))?
+                .as_secs(),
             gas_limit: 30_000_000,
             extra_data: String::new(),
             consensus: ConsensusConfig::PoA {

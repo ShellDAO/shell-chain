@@ -559,8 +559,21 @@ async fn main() {
 
             // Storage backend: explicit CLI > config file > network-profile default.
             // dev → memory (ephemeral); testnet/mainnet → rocksdb (persistent).
+            // If the binary was compiled without the rocksdb feature, fall back to
+            // memory and warn so operators notice and rebuild with the feature enabled.
             let network_default_db = match effective_network.as_str() {
-                "testnet" | "mainnet" => "rocksdb",
+                "testnet" | "mainnet" => {
+                    if cfg!(feature = "rocksdb") {
+                        "rocksdb"
+                    } else {
+                        tracing::warn!(
+                            "rocksdb feature not compiled in; falling back to memory for \
+                             {effective_network} — DATA WILL NOT PERSIST across restarts. \
+                             Rebuild with --features shell-cli/rocksdb."
+                        );
+                        "memory"
+                    }
+                }
                 _ => "memory",
             };
             let effective_db = db
