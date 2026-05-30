@@ -60,13 +60,14 @@ normal block when executable transactions are available. While idle, validators
 skip empty slots and produce only a 600-second heartbeat block. Heartbeat blocks
 carry no user transactions, consume zero gas, and do not pay rewards.
 
-For normal transaction blocks, transaction fees are split by consensus rule:
+For normal transaction blocks, the reward rules are:
 
-- the block producer receives 50% of effective gas fees as a deterministic
+- the block producer receives **100% of effective gas fees** as a deterministic
   `blockGasReward` system transaction;
-- L1 STARK settlement receives the remaining 50% of covered source-block gas
-  fees, plus mint reward `100 SHELL / 2^L`;
-- L2+ recursive STARK settlements receive only the layer-discounted mint reward.
+- L1 STARK settlement receives a **mint-only** reward of `100 SHELL / 2^1 × source_count`
+  (where `source_count` counts covered source blocks that contain user transactions);
+- L2+ recursive STARK settlements receive only the layer-discounted mint reward
+  `100 SHELL / 2^L × source_count`; no gas-fee share at any STARK layer.
 
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.

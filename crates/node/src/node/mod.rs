@@ -2700,6 +2700,77 @@ mod tests {
     }
 
     /// Empty (0-tx) canonical blocks must NOT appear in `settled_stark_sources`
+    /// `stark_reward_value` for a L1 proof covering a fee-paying source block must
+    /// return the mint-only amount — no gas-fee share.  This is a regression guard
+    /// against re-introducing the old 50% gas split into the STARK reward path.
+    #[test]
+    fn stark_reward_value_is_mint_only_for_fee_paying_source_block() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+
+        // Produce one fee-paying block with a real transaction.
+        let tx_signer = DilithiumSigner::generate();
+        let sender =
+            Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0xBBu8; 32]);
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+
+        let tx = shell_core::Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed = shell_core::SignedTransaction::with_pubkey(
+            sender,
+            tx,
+            sig,
+            tx_signer.public_key().to_vec(),
+        );
+
+        let verifier = MultiVerifier;
+        {
+            let mut ws = node.world_state.write();
+            node.tx_pool
+                .insert(signed, &mut ws, node.chain_store.as_ref(), &verifier)
+                .unwrap();
+        }
+
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let block = node.produce_block(&signer, 10).unwrap();
+        let block_hash = block.hash();
+        assert!(!block.transactions.is_empty(), "block must contain the tx");
+        put_dummy_witness(&node, &block_hash);
+
+        // Build a minimal L1 STARK amendment referencing genesis + tx block.
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, block_hash], block.number());
+
+        let reward = node.stark_reward_value(block.number(), &amendment).unwrap();
+
+        // Expected: mint = BASE / 2^1 × source_count.
+        // source_count = 1 (only the tx block is non-empty; genesis is 0-tx).
+        const BASE: u128 = 100_000_000_000_000_000_000;
+        let expected = U256::from(BASE / 2);
+        assert_eq!(
+            reward, expected,
+            "STARK L1 reward must be mint-only (no gas-fee share); got {reward}, expected {expected}"
+        );
+    }
+
     /// before a StarkReward is accepted, but MUST appear after the settlement
     /// block is produced.  This ensures the seeding loop never skips empty
     /// frontier blocks prematurely.
