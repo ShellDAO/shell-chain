@@ -1,12 +1,11 @@
 //! PQVM native opcodes — Shell-Chain EVM extension.
 //!
-//! Adds three PQ-native opcodes to the revm instruction table:
+//! Adds two PQ-native opcodes to the revm instruction table:
 //!
 //! | Opcode | Name       | Stack in (deepest→top)                                           | Stack out    | Description                          |
 //! |--------|------------|------------------------------------------------------------------|--------------|--------------------------------------|
 //! | 0xB0   | `PQVERIFY` | `algo_id, msg_ptr, msg_len, pk_len, pk_ptr, sig_len, sig_ptr`   | `[valid]`    | Verify a PQ signature from memory    |
 //! | 0xB1   | `PQHASH`   | `data_ptr, data_len, out_ptr`                                    | (side effect)| BLAKE3-256 hash written to memory    |
-//! | 0xB2   | `PQADDR`   | `algo_id, pk_ptr, pk_len`                                        | `[addr]`     | Derive PQ address: BLAKE3(aid‖pubkey)|
 //!
 //! ## PQVERIFY algo_id values (WP §1073)
 //!
@@ -20,7 +19,6 @@
 //! |----------|----------------------------------------------------------|
 //! | PQVERIFY | 46 000 (ML-DSA-65 / Dilithium3) / 2 300 000 (SLH-DSA)  |
 //! | PQHASH   | 30 + 6 × ⌈len/32⌉                                       |
-//! | PQADDR   | 200                                                      |
 
 use alloy_primitives::{B256, U256};
 use revm::handler::instructions::EthInstructions;
@@ -31,7 +29,7 @@ use revm::interpreter::{
 use shell_crypto::{verify_signature, SignatureType};
 
 use crate::precompiles::{
-    BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDR_DERIVE_GAS, PQ_MLDSA65_VERIFY_GAS,
+    BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_MLDSA65_VERIFY_GAS,
     PQ_SLHDSA_VERIFY_GAS,
 };
 
@@ -41,14 +39,12 @@ use crate::precompiles::{
 pub const OPCODE_PQVERIFY: u8 = 0xB0;
 /// `PQHASH` — opcode 0xB1.  BLAKE3-256 hash of a memory region.
 pub const OPCODE_PQHASH: u8 = 0xB1;
-/// `PQADDR` — opcode 0xB2.  Derive PQ address BLAKE3(algo_id ‖ pubkey).
-pub const OPCODE_PQADDR: u8 = 0xB2;
 
 // ── algo_id constants (WP §1073) ─────────────────────────────────────────────
 
 /// Dilithium3 legacy compatibility algo_id for PQVERIFY.
 const ALGO_DILITHIUM3: u8 = 0x00;
-/// ML-DSA-65 algo_id for PQVERIFY and PQADDR.
+/// ML-DSA-65 algo_id for PQVERIFY.
 const ALGO_MLDSA65: u8 = 0x01;
 /// SLH-DSA-SHA2-256f algo_id for PQVERIFY.
 const ALGO_SLHDSA_SHA2_256F: u8 = 0x02;
@@ -314,82 +310,12 @@ pub fn pq_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     context.interpreter.memory.set(out_ptr, &hash_bytes);
 }
 
-// ── PQADDR (0xB2) ────────────────────────────────────────────────────────────
-
-/// `PQADDR` instruction: derive PQ address `BLAKE3(algo_id ‖ pubkey)` (WP §1065-1091).
-///
-/// Stack (deepest → top): `algo_id (U256), pk_ptr (U256), pk_len (U256)` → `address (B256 as U256)`
-///
-/// Gas: `200`.
-pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    let Some(pk_len_u256) = context.interpreter.stack.pop() else {
-        context.interpreter.halt_underflow();
-        return;
-    };
-    let Some(pk_ptr_u256) = context.interpreter.stack.pop() else {
-        context.interpreter.halt_underflow();
-        return;
-    };
-    let Some(algo_id) = context.interpreter.stack.pop() else {
-        context.interpreter.halt_underflow();
-        return;
-    };
-
-    if !context.interpreter.gas.record_cost(PQ_ADDR_DERIVE_GAS) {
-        context.interpreter.halt_oog();
-        return;
-    }
-
-    let algo_byte = algo_id.as_limbs()[0] as u8; // least-significant byte of the U256
-
-    let pk_len = match u256_to_usize(context.interpreter, pk_len_u256) {
-        Some(v) => v,
-        None => return,
-    };
-
-    let hash_bytes: [u8; 32] = if pk_len == 0 {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[algo_byte]);
-        *hasher.finalize().as_bytes()
-    } else {
-        let pk_ptr = match u256_to_usize(context.interpreter, pk_ptr_u256) {
-            Some(v) => v,
-            None => return,
-        };
-        let gas_params = context.host.gas_params().clone();
-        if !context
-            .interpreter
-            .resize_memory(&gas_params, pk_ptr, pk_len)
-        {
-            return;
-        }
-        let pubkey = context
-            .interpreter
-            .memory
-            .slice_len(pk_ptr, pk_len)
-            .as_ref()
-            .to_vec();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[algo_byte]);
-        hasher.update(&pubkey);
-        *hasher.finalize().as_bytes()
-    };
-
-    if !context
-        .interpreter
-        .stack
-        .push(B256::from(hash_bytes).into())
-    {
-        context.interpreter.halt_overflow();
-    }
-}
-
 // ── installer ─────────────────────────────────────────────────────────────────
 
-/// Install the three PQVM native opcodes into `instructions`.
+/// Install the two PQVM native opcodes into `instructions`.
 ///
 /// Call this after `EthInstructions::new_mainnet_with_spec` and before
-/// building the `Evm` instance so that `PQVERIFY`, `PQHASH`, and `PQADDR`
+/// building the `Evm` instance so that `PQVERIFY` and `PQHASH`
 /// are dispatched natively instead of triggering `UNDEFINED`.
 pub fn install_pqvm_opcodes<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
 where
@@ -398,7 +324,6 @@ where
 {
     instructions.insert_instruction(OPCODE_PQVERIFY, Instruction::new(pq_verify::<WIRE, H>, 0));
     instructions.insert_instruction(OPCODE_PQHASH, Instruction::new(pq_hash::<WIRE, H>, 0));
-    instructions.insert_instruction(OPCODE_PQADDR, Instruction::new(pq_addr::<WIRE, H>, 0));
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -427,27 +352,6 @@ mod tests {
         let repeated: [u8; 32] = *blake3::hash(input).as_bytes();
         assert_eq!(expected, repeated);
     }
-
-    #[test]
-    fn pqaddr_derivation_matches_precompile_logic() {
-        let pubkey = b"test-public-key-bytes";
-        let algo_id = 0x01u8;
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[algo_id]);
-        hasher.update(pubkey);
-        let addr: [u8; 32] = *hasher.finalize().as_bytes();
-
-        // Should match direct precompile-like computation.
-        let mut hasher2 = blake3::Hasher::new();
-        hasher2.update(&[algo_id]);
-        hasher2.update(pubkey);
-        let addr2: [u8; 32] = *hasher2.finalize().as_bytes();
-
-        assert_eq!(addr, addr2);
-    }
-
-    // ── PQVERIFY logic tests ──────────────────────────────────────────────────
 
     #[test]
     fn pqverify_verify_signature_accepts_dilithium3_sig() {
@@ -483,6 +387,5 @@ mod tests {
     fn pqverify_opcode_constants() {
         assert_eq!(OPCODE_PQVERIFY, 0xB0);
         assert_eq!(OPCODE_PQHASH, 0xB1);
-        assert_eq!(OPCODE_PQADDR, 0xB2);
     }
 }

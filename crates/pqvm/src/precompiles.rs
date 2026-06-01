@@ -6,7 +6,6 @@
 //! - `0x0003`: ML-DSA-65 batch verify
 //! - `0x0004`: BLAKE3-256 hash
 //! - `0x0005`: BLAKE3-512 hash
-//! - `0x0006`: PQAddr derive (`BLAKE3(algo_id || public_key)`)
 //!
 //! This keeps all classical Ethereum precompiles disabled, including
 //! `ecrecover`, BN256, and BLAKE2f.
@@ -27,15 +26,13 @@ pub const PQ_MLDSA65_BATCH_VERIFY_ADDR: Address =
     address!("0x0000000000000000000000000000000000000003");
 pub const PQ_BLAKE3_256_ADDR: Address = address!("0x0000000000000000000000000000000000000004");
 pub const PQ_BLAKE3_512_ADDR: Address = address!("0x0000000000000000000000000000000000000005");
-pub const PQ_ADDR_DERIVE_ADDR: Address = address!("0x0000000000000000000000000000000000000006");
 
-const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
+const PQ_PRECOMPILE_ADDRS: [Address; 5] = [
     PQ_MLDSA65_VERIFY_ADDR,
     PQ_SLHDSA_SHA2_256F_VERIFY_ADDR,
     PQ_MLDSA65_BATCH_VERIFY_ADDR,
     PQ_BLAKE3_256_ADDR,
     PQ_BLAKE3_512_ADDR,
-    PQ_ADDR_DERIVE_ADDR,
 ];
 
 pub const PQ_MLDSA65_VERIFY_GAS: u64 = 46_000;
@@ -45,7 +42,6 @@ pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 12_000;
 pub const MAX_BATCH_SIGNATURES: u32 = 256;
 pub const BLAKE3_BASE_GAS: u64 = 30;
 pub const BLAKE3_WORD_GAS: u64 = 6;
-pub const PQ_ADDR_DERIVE_GAS: u64 = 200;
 
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
@@ -117,7 +113,6 @@ fn run_pq_precompile<CTX: ContextTr>(
         PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, &input),
         PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, &input),
         PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, &input),
-        PQ_ADDR_DERIVE_ADDR => run_pq_addr_derive(inputs.gas_limit, &input),
         _ => InterpreterResult {
             result: InstructionResult::PrecompileError,
             gas: Gas::new(inputs.gas_limit),
@@ -222,23 +217,6 @@ fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut output = [0u8; 64];
     hasher.finalize_xof().fill(&mut output);
     result.output = Bytes::copy_from_slice(&output);
-    result
-}
-
-fn run_pq_addr_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
-    let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, PQ_ADDR_DERIVE_GAS) {
-        return result;
-    }
-    let Some((&algo_id, public_key)) = input.split_first() else {
-        result.output = Bytes::copy_from_slice(&[0u8; 32]);
-        return result;
-    };
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&[algo_id]);
-    hasher.update(public_key);
-    result.output = Bytes::copy_from_slice(hasher.finalize().as_bytes());
     result
 }
 
@@ -369,10 +347,6 @@ mod tests {
             PQ_BLAKE3_512_ADDR,
             address!("0x0000000000000000000000000000000000000005")
         );
-        assert_eq!(
-            PQ_ADDR_DERIVE_ADDR,
-            address!("0x0000000000000000000000000000000000000006")
-        );
     }
 
     #[test]
@@ -417,14 +391,6 @@ mod tests {
         let mut expected = [0u8; 32];
         expected[31] = 1;
         assert_eq!(output.output.as_ref(), &expected);
-    }
-
-    #[test]
-    fn pq_addr_derive_precompile_outputs_32_bytes() {
-        let mut input = vec![0x01];
-        input.extend_from_slice(b"public-key");
-        let output = run_pq_addr_derive(PQ_ADDR_DERIVE_GAS, &input);
-        assert_eq!(output.output.len(), 32);
     }
 
     #[test]

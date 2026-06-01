@@ -31,9 +31,9 @@ pub use parallel::{
     ConflictMetric, ConflictReason, ExecutionWave, ParallelExecutionPlan, ParallelPqvmConfig,
     ParallelScheduler, TxConflict, TxConflictGraph,
 };
-pub use pqvm_opcodes::{OPCODE_PQADDR, OPCODE_PQHASH, OPCODE_PQVERIFY};
+pub use pqvm_opcodes::{OPCODE_PQHASH, OPCODE_PQVERIFY};
 pub use precompiles::{
-    ShellPrecompiles, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDR_DERIVE_GAS,
+    ShellPrecompiles, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS,
     PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
 };
 pub use rwset::{HeuristicRwSetExtractor, ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};

@@ -1,7 +1,7 @@
 //! End-to-end EVM integration tests.
 //!
 //! These tests exercise the full pipeline: tx validation → PQVM execution → receipt,
-//! using real Dilithium3 signatures and the Shell PQ precompile suite (0x0001–0x0006).
+//! using real Dilithium3 signatures and the Shell PQ precompile suite (0x0001–0x0005).
 
 use alloy_primitives::U256;
 use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
@@ -321,13 +321,6 @@ fn e2e_precompile_addresses() {
     assert!(
         sp.is_precompile(&slhdsa_addr),
         "SLH-DSA verify precompile should be registered"
-    );
-
-    // PQAddr derive at 0x0006
-    let pqaddr_addr = address!("0x0000000000000000000000000000000000000006");
-    assert!(
-        sp.is_precompile(&pqaddr_addr),
-        "PQAddr derive precompile should be registered"
     );
 
     // Non-precompile address (old PQ addr 0x0100 no longer registered)
