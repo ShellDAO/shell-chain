@@ -20,7 +20,7 @@
 //! | PQVERIFY | 46 000 (ML-DSA-65 / Dilithium3) / 2 300 000 (SLH-DSA)  |
 //! | PQHASH   | 30 + 6 × ⌈len/32⌉                                       |
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::U256;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::{
     interpreter_types::{InterpreterTypes, MemoryTr, StackTr},
@@ -29,8 +29,7 @@ use revm::interpreter::{
 use shell_crypto::{verify_signature, SignatureType};
 
 use crate::precompiles::{
-    BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_MLDSA65_VERIFY_GAS,
-    PQ_SLHDSA_VERIFY_GAS,
+    BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
 };
 
 // ── opcode numbers ────────────────────────────────────────────────────────────
