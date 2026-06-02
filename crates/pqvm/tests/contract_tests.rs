@@ -30,53 +30,53 @@ fn counter_runtime() -> Vec<u8> {
     // Dispatcher: extract 4-byte selector from calldata
     let mut code = vec![
         0x60, 0x00, // PUSH1 0
-        0x35,       // CALLDATALOAD  → stack: [calldata[0:32]]
+        0x35, // CALLDATALOAD  → stack: [calldata[0:32]]
         0x60, 0xE0, // PUSH1 224
-        0x1C,       // SHR           → stack: [selector]
+        0x1C, // SHR           → stack: [selector]
         // Check increment()
-        0x80,       // DUP1
-        0x63,       // PUSH4 ...
+        0x80, // DUP1
+        0x63, // PUSH4 ...
     ];
     code.extend_from_slice(incr_sel); // bytes 0x08..0x0B
     code.extend_from_slice(&[
-        0x14,       // EQ
+        0x14, // EQ
         0x60, 0x1F, // PUSH1 0x1F
-        0x57,       // JUMPI
+        0x57, // JUMPI
         // Check get()
-        0x80,       // DUP1
-        0x63,       // PUSH4 ...
+        0x80, // DUP1
+        0x63, // PUSH4 ...
     ]);
     code.extend_from_slice(get_sel); // bytes 0x12..0x15
     code.extend_from_slice(&[
-        0x14,       // EQ
+        0x14, // EQ
         0x60, 0x2F, // PUSH1 0x2F
-        0x57,       // JUMPI
+        0x57, // JUMPI
         // Default: revert
         0x60, 0x00, // PUSH1 0
         0x60, 0x00, // PUSH1 0
-        0xFD,       // REVERT
+        0xFD, // REVERT
         // ── increment() at offset 0x1F ──
-        0x5B,       // JUMPDEST
-        0x50,       // POP
+        0x5B, // JUMPDEST
+        0x50, // POP
         0x60, 0x00, // PUSH1 0        (slot)
-        0x54,       // SLOAD          → [value]
+        0x54, // SLOAD          → [value]
         0x60, 0x01, // PUSH1 1
-        0x01,       // ADD            → [value+1]
+        0x01, // ADD            → [value+1]
         0x60, 0x00, // PUSH1 0        (slot)
-        0x55,       // SSTORE
+        0x55, // SSTORE
         0x60, 0x00, // PUSH1 0
         0x60, 0x00, // PUSH1 0
-        0xF3,       // RETURN (empty)
+        0xF3, // RETURN (empty)
         // ── get() at offset 0x2F ──
-        0x5B,       // JUMPDEST
-        0x50,       // POP
+        0x5B, // JUMPDEST
+        0x50, // POP
         0x60, 0x00, // PUSH1 0        (slot)
-        0x54,       // SLOAD          → [value]
+        0x54, // SLOAD          → [value]
         0x60, 0x00, // PUSH1 0
-        0x52,       // MSTORE         → mem[0:32] = value
+        0x52, // MSTORE         → mem[0:32] = value
         0x60, 0x20, // PUSH1 32
         0x60, 0x00, // PUSH1 0
-        0xF3,       // RETURN mem[0:32]
+        0xF3, // RETURN mem[0:32]
     ]);
 
     // Verify the JUMPDEST offsets are correct at compile time in tests.
@@ -101,23 +101,31 @@ fn counter_runtime() -> Vec<u8> {
 fn precompile_relay_runtime(precompile_addr_byte: u8) -> Vec<u8> {
     vec![
         // Copy calldata to memory[0..]
-        0x36,       // CALLDATASIZE
-        0x60, 0x00, // PUSH1 0  (destOffset)
-        0x60, 0x00, // PUSH1 0  (dataOffset)
-        0x37,       // CALLDATACOPY
+        0x36, // CALLDATASIZE
+        0x60,
+        0x00, // PUSH1 0  (destOffset)
+        0x60,
+        0x00, // PUSH1 0  (dataOffset)
+        0x37, // CALLDATACOPY
         // STATICCALL(gas, addr, inOff=0, inLen=calldatasize, outOff=0, outLen=32)
-        0x60, 0x20, // PUSH1 32   retLen
-        0x60, 0x00, // PUSH1 0    retOff
-        0x36,       // CALLDATASIZE  argsLen
-        0x60, 0x00, // PUSH1 0    argsOff
-        0x60, precompile_addr_byte, // PUSH1 addr
-        0x5A,       // GAS
-        0xFA,       // STATICCALL  → [success]
-        0x50,       // POP
+        0x60,
+        0x20, // PUSH1 32   retLen
+        0x60,
+        0x00, // PUSH1 0    retOff
+        0x36, // CALLDATASIZE  argsLen
+        0x60,
+        0x00, // PUSH1 0    argsOff
+        0x60,
+        precompile_addr_byte, // PUSH1 addr
+        0x5A,                 // GAS
+        0xFA,                 // STATICCALL  → [success]
+        0x50,                 // POP
         // Return mem[0:32]
-        0x60, 0x20, // PUSH1 32
-        0x60, 0x00, // PUSH1 0
-        0xF3,       // RETURN
+        0x60,
+        0x20, // PUSH1 32
+        0x60,
+        0x00, // PUSH1 0
+        0xF3, // RETURN
     ]
 }
 
@@ -136,48 +144,43 @@ fn contract_a_runtime() -> Vec<u8> {
 
     let mut code = vec![
         0x60, 0x00, // PUSH1 0
-        0x35,       // CALLDATALOAD
+        0x35, // CALLDATALOAD
         0x60, 0xE0, // PUSH1 224
-        0x1C,       // SHR  → selector
-        0x80,       // DUP1
-        0x63,       // PUSH4 set_sel
+        0x1C, // SHR  → selector
+        0x80, // DUP1
+        0x63, // PUSH4 set_sel
     ];
     code.extend_from_slice(set_sel);
     code.extend_from_slice(&[
-        0x14,       // EQ
-        0x60, 0x1F, // PUSH1 0x1F  (set handler; 3+3+2+4+1+2+1+5 = 21 = 0x15... wait: two dispatch)
-        0x57,       // JUMPI
-        0x80,       // DUP1
-        0x63,       // PUSH4 get_sel
+        0x14, // EQ
+        0x60,
+        0x1F, // PUSH1 0x1F  (set handler; 3+3+2+4+1+2+1+5 = 21 = 0x15... wait: two dispatch)
+        0x57, // JUMPI
+        0x80, // DUP1
+        0x63, // PUSH4 get_sel
     ]);
     code.extend_from_slice(get_sel);
     code.extend_from_slice(&[
-        0x14,       // EQ
+        0x14, // EQ
         0x60, 0x2C, // PUSH1 0x2C  (get handler; 0x1F + 13 = 0x2C)
-        0x57,       // JUMPI
+        0x57, // JUMPI
         0x60, 0x00, // PUSH1 0  (revert)
-        0x60, 0x00,
-        0xFD,       // REVERT
+        0x60, 0x00, 0xFD, // REVERT
         // ── set(uint256) at 0x1F ──
-        0x5B,       // JUMPDEST
-        0x50,       // POP       (selector)
+        0x5B, // JUMPDEST
+        0x50, // POP       (selector)
         0x60, 0x04, // PUSH1 4   (skip selector in calldata)
-        0x35,       // CALLDATALOAD  → [value]
+        0x35, // CALLDATALOAD  → [value]
         0x60, 0x00, // PUSH1 0   (slot)
-        0x55,       // SSTORE
-        0x60, 0x00,
-        0x60, 0x00,
-        0xF3,       // RETURN empty
+        0x55, // SSTORE
+        0x60, 0x00, 0x60, 0x00, 0xF3, // RETURN empty
         // ── get() at 0x2C ──
-        0x5B,       // JUMPDEST
-        0x50,       // POP
+        0x5B, // JUMPDEST
+        0x50, // POP
         0x60, 0x00, // PUSH1 0
-        0x54,       // SLOAD
-        0x60, 0x00,
-        0x52,       // MSTORE
-        0x60, 0x20,
-        0x60, 0x00,
-        0xF3,       // RETURN mem[0:32]
+        0x54, // SLOAD
+        0x60, 0x00, 0x52, // MSTORE
+        0x60, 0x20, 0x60, 0x00, 0xF3, // RETURN mem[0:32]
     ]);
 
     debug_assert_eq!(code[0x1F], 0x5B, "set() JUMPDEST must be at offset 0x1F");
@@ -205,22 +208,22 @@ fn contract_b_runtime() -> Vec<u8> {
     code.extend_from_slice(set_sel);
     code.extend_from_slice(&[
         0x60, 0xE0, // PUSH1 224
-        0x1B,       // SHL     → sel << 224
+        0x1B, // SHL     → sel << 224
         0x60, 0x00, // PUSH1 0
-        0x52,       // MSTORE  → mem[0:32]: selector at bytes 0-3
+        0x52, // MSTORE  → mem[0:32]: selector at bytes 0-3
     ]);
 
     // Step 2: Write uint256(42) to mem[4:36]
     code.extend_from_slice(&[
         0x60, 0x2A, // PUSH1 42
         0x60, 0x04, // PUSH1 4
-        0x52,       // MSTORE  → mem[4:36]: 42 right-aligned; overlapping zeroes overwrite [4:32]
+        0x52, // MSTORE  → mem[4:36]: 42 right-aligned; overlapping zeroes overwrite [4:32]
     ]);
 
     // Step 3: Load Contract A address from calldata[0:32]
     code.extend_from_slice(&[
         0x60, 0x00, // PUSH1 0
-        0x35,       // CALLDATALOAD  → stack: [addrA]
+        0x35, // CALLDATALOAD  → stack: [addrA]
     ]);
 
     // Step 4: CALL(gas, addr, value, argsOff, argsLen, retOff, retLen)  — 7 args
@@ -232,18 +235,18 @@ fn contract_b_runtime() -> Vec<u8> {
         0x60, 0x00, // PUSH1 0   argsOff  → [0, 36, 0, 0, addrA]
         0x60, 0x00, // PUSH1 0   value    → [0, 0, 36, 0, 0, addrA]
         // Stack (top→bottom): [value=0, argsOff=0, argsLen=36, retOff=0, retLen=0, addrA]
-        0x85,       // DUP6  → [addrA, value=0, argsOff=0, argsLen=36, retOff=0, retLen=0, addrA]
-        0x5A,       // GAS   → [gas, addrA, value=0, argsOff=0, argsLen=36, retOff=0, retLen=0, addrA]
-        0xF1,       // CALL  pops 7, pushes success
-        0x50,       // POP   (success)
-        0x50,       // POP   (remaining addrA)
+        0x85, // DUP6  → [addrA, value=0, argsOff=0, argsLen=36, retOff=0, retLen=0, addrA]
+        0x5A, // GAS   → [gas, addrA, value=0, argsOff=0, argsLen=36, retOff=0, retLen=0, addrA]
+        0xF1, // CALL  pops 7, pushes success
+        0x50, // POP   (success)
+        0x50, // POP   (remaining addrA)
     ]);
 
     // Step 5: Return empty
     code.extend_from_slice(&[
         0x60, 0x00, // PUSH1 0
         0x60, 0x00, // PUSH1 0
-        0xF3,       // RETURN
+        0xF3, // RETURN
     ]);
 
     code
@@ -266,34 +269,32 @@ fn revert_contract_runtime() -> Vec<u8> {
     //     REVERT(0, 4)
 
     let mut code = vec![
-        0x60, 0x00, 0x35,       // PUSH1 0; CALLDATALOAD
-        0x60, 0xE0, 0x1C,       // PUSH1 224; SHR  → selector
-        0x80, 0x63,             // DUP1; PUSH4 ...
+        0x60, 0x00, 0x35, // PUSH1 0; CALLDATALOAD
+        0x60, 0xE0, 0x1C, // PUSH1 224; SHR  → selector
+        0x80, 0x63, // DUP1; PUSH4 ...
     ];
     code.extend_from_slice(revert_sel);
     code.extend_from_slice(&[
-        0x14,       // EQ
+        0x14, // EQ
         0x60, 0x15, // PUSH1 0x15  (handler offset: 3+3+2+4+1+2+1+5 = 21 = 0x15)
-        0x57,       // JUMPI
+        0x57, // JUMPI
         // Default fallback: REVERT empty
-        0x60, 0x00,
-        0x60, 0x00,
-        0xFD,       // REVERT
+        0x60, 0x00, 0x60, 0x00, 0xFD, // REVERT
         // ── alwaysReverts() at 0x15 ──
-        0x5B,       // JUMPDEST
-        0x50,       // POP
+        0x5B, // JUMPDEST
+        0x50, // POP
         // Write err_sel to mem[0]
-        0x63,       // PUSH4 err_sel
+        0x63, // PUSH4 err_sel
     ]);
     code.extend_from_slice(err_sel);
     code.extend_from_slice(&[
         0x60, 0xE0, // PUSH1 224
-        0x1B,       // SHL          → err_sel << 224
+        0x1B, // SHL          → err_sel << 224
         0x60, 0x00, // PUSH1 0
-        0x52,       // MSTORE       → mem[0:32] contains err_sel at bytes 0-3
+        0x52, // MSTORE       → mem[0:32] contains err_sel at bytes 0-3
         0x60, 0x04, // PUSH1 4      (revert data size)
         0x60, 0x00, // PUSH1 0      (offset)
-        0xFD,       // REVERT
+        0xFD, // REVERT
     ]);
 
     debug_assert_eq!(
@@ -315,7 +316,7 @@ fn log_emitter_runtime() -> Vec<u8> {
     // topic0 = keccak256("Transfer(address,address,uint256)")
     let topic0 = keccak256(b"Transfer(address,address,uint256)");
     let from_addr = [0xAA_u8; 32]; // address padded to 32 bytes
-    let to_addr = [0xBB_u8; 32];   // address padded to 32 bytes
+    let to_addr = [0xBB_u8; 32]; // address padded to 32 bytes
 
     // Memory layout: mem[0x00..0x20] = uint256(100)
     // LOG3 pops (top→bottom): offset, size, topic0, topic1, topic2
@@ -344,11 +345,9 @@ fn log_emitter_runtime() -> Vec<u8> {
     code.extend_from_slice(&[
         0x60, 0x20, // PUSH1 32  (size)
         0x60, 0x00, // PUSH1 0   (offset — top of stack, popped first by LOG3)
-        0xA3,       // LOG3
+        0xA3, // LOG3
         // Return empty
-        0x60, 0x00,
-        0x60, 0x00,
-        0xF3,       // RETURN
+        0x60, 0x00, 0x60, 0x00, 0xF3, // RETURN
     ]);
 
     code
@@ -388,7 +387,11 @@ fn t1_counter_deploy_increment_get() {
     let result2 = call_contract(&mut evm, from, 2, contract, get_sel[..4].to_vec(), 3);
     assert_eq!(result2.receipt.status, 1, "get() should succeed");
     let value = abi_decode_u256(&result2.output);
-    assert_eq!(value, U256::from(1u64), "counter should be 1 after one increment");
+    assert_eq!(
+        value,
+        U256::from(1u64),
+        "counter should be 1 after one increment"
+    );
 }
 
 /// T2: Deploy a relay contract that calls the BLAKE3-256 precompile (0x0004) and returns
@@ -466,7 +469,11 @@ fn t4_event_log_emission() {
     );
     // Log data should encode amount = 100
     let logged_amount = abi_decode_u256(log.data.as_ref());
-    assert_eq!(logged_amount, U256::from(100u64), "logged amount should be 100");
+    assert_eq!(
+        logged_amount,
+        U256::from(100u64),
+        "logged amount should be 100"
+    );
 }
 
 /// T5: Deploy a contract with a function that always reverts with a custom error selector.
@@ -493,16 +500,12 @@ fn t5_revert_propagation() {
     );
 
     let revert_fn_sel = keccak256(b"alwaysReverts()");
-    let result = call_contract(
-        &mut evm,
-        from,
-        1,
-        contract,
-        revert_fn_sel[..4].to_vec(),
-        2,
-    );
+    let result = call_contract(&mut evm, from, 1, contract, revert_fn_sel[..4].to_vec(), 2);
 
-    assert_eq!(result.receipt.status, 0, "reverted call should have status 0");
+    assert_eq!(
+        result.receipt.status, 0,
+        "reverted call should have status 0"
+    );
 
     let expected_err_sel = &keccak256(b"CustomError()")[..4];
     assert!(
@@ -565,7 +568,11 @@ fn t6_contract_to_contract_call() {
     let get_result = call_contract(&mut evm, from, 3, contract_a, get_sel[..4].to_vec(), 4);
     assert_eq!(get_result.receipt.status, 1, "get() on A should succeed");
     let stored = abi_decode_u256(&get_result.output);
-    assert_eq!(stored, U256::from(42u64), "A's storage should be 42 after B called set(42)");
+    assert_eq!(
+        stored,
+        U256::from(42u64),
+        "A's storage should be 42 after B called set(42)"
+    );
 }
 
 /// T7: ML-DSA verify precompile (0x0001) invoked from a deployed contract.
@@ -606,7 +613,10 @@ fn t7_mldsa_verify_precompile_from_contract() {
 
     // Valid signature → output[31] == 1
     let result = call_contract(&mut evm, from, 1, contract, wire.clone(), 2);
-    assert_eq!(result.receipt.status, 1, "ML-DSA verify call should succeed");
+    assert_eq!(
+        result.receipt.status, 1,
+        "ML-DSA verify call should succeed"
+    );
     assert_eq!(
         result.output[31], 1,
         "valid ML-DSA signature should return 1"
@@ -618,7 +628,10 @@ fn t7_mldsa_verify_precompile_from_contract() {
     tampered[last] ^= 0xFF;
 
     let result2 = call_contract(&mut evm, from, 2, contract, tampered, 3);
-    assert_eq!(result2.receipt.status, 1, "tampered sig call should not revert (precompile returns 0)");
+    assert_eq!(
+        result2.receipt.status, 1,
+        "tampered sig call should not revert (precompile returns 0)"
+    );
     assert_eq!(
         result2.output[31], 0,
         "tampered ML-DSA signature should return 0"
