@@ -233,9 +233,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let gas_used = exec_result.gas().spent();
         let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
 
-        let (status, logs, contract_address, output_bytes) = match &exec_result {
+        let (status, logs, contract_address, output_bytes) = match exec_result {
             ExecutionResult::Success { logs, output, .. } => {
-                let contract_addr = match output {
+                let contract_addr = match &output {
                     revm::context::result::Output::Create(_, Some(addr)) => {
                         Some(ShellAddress::from(*addr))
                     }
@@ -245,7 +245,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     revm::context::result::Output::Call(bytes) => bytes.to_vec(),
                     revm::context::result::Output::Create(bytes, _) => bytes.to_vec(),
                 };
-                (1u8, logs.clone(), contract_addr, data)
+                (1u8, logs, contract_addr, data)
             }
             ExecutionResult::Revert { output, .. } => (0u8, vec![], None, output.to_vec()),
             ExecutionResult::Halt { .. } => (0u8, vec![], None, vec![]),

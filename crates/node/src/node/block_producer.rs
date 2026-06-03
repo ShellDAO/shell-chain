@@ -72,17 +72,18 @@ impl<S: KvStore + 'static> Node<S> {
         let mut cumulative_gas: u64 = 0;
         let mut total_effective_fees = U256::ZERO;
 
+        // F-302: Create the ChainStore wrapper once and reuse it for all per-tx
+        // re-validations. ChainStore is a thin Arc-clone wrapper, so creating it
+        // inside the loop was an unnecessary per-iteration allocation.
+        let import_cs = ChainStore::new(self.store.clone());
+
         for (idx, tx) in candidates.iter().enumerate() {
             // EIP-1559: skip transactions that cannot afford the base fee.
             if tx.tx.max_fee_per_gas < base_fee {
                 continue;
             }
-
-            // F-302: Re-validate mempool txs before execution. Security checks
-            // may have changed since the tx was originally admitted (e.g. new
-            // algorithm restrictions, pubkey conflicts). Uses the import-path
-            // validator which skips nonce/balance (EVM handles those).
-            let import_cs = ChainStore::new(self.store.clone());
+            // F-302: Re-validate before execution (algorithm restrictions may have
+            // changed since admission). Uses import-path validator (skips nonce/balance).
             let pre_verifier = PreVerified;
             if let Err(e) = validate_tx_for_import(
                 tx,
@@ -224,9 +225,12 @@ impl<S: KvStore + 'static> Node<S> {
             {
                 continue;
             }
-            let mut candidate_settlements = settled_stark_proofs.clone();
-            candidate_settlements.push(amendment.clone());
-            if let Err(e) = self.validate_stark_settlement_sequence(&candidate_settlements) {
+            // Optimistic push: validate with the new amendment included, then pop
+            // on failure. This avoids the O(n²) settled_stark_proofs.clone() that
+            // the previous candidate_settlements pattern caused.
+            settled_stark_proofs.push(amendment.clone());
+            if let Err(e) = self.validate_stark_settlement_sequence(&settled_stark_proofs) {
+                settled_stark_proofs.pop();
                 warn!(
                     block = next_number,
                     source = %amendment.block_hash,
@@ -239,8 +243,12 @@ impl<S: KvStore + 'static> Node<S> {
             let tx_index = included_txs.len().saturating_add(system_txs.len()) as u32;
             let reward_tx = match self.build_stark_reward_tx(next_number, tx_index, &amendment) {
                 Ok(tx) if tx.value > U256::ZERO => tx,
-                Ok(_) => continue,
+                Ok(_) => {
+                    settled_stark_proofs.pop();
+                    continue;
+                }
                 Err(e) => {
+                    settled_stark_proofs.pop();
                     warn!(
                         block = next_number,
                         source = %amendment.block_hash,
@@ -266,8 +274,8 @@ impl<S: KvStore + 'static> Node<S> {
             });
             let reward_hash = reward_tx.hash();
             system_txs.push(reward_tx);
-            settled_stark_artifacts.push((amendment.clone(), reward_hash));
-            settled_stark_proofs.push(amendment);
+            settled_stark_artifacts.push((amendment, reward_hash));
+            // settled_stark_proofs already holds the amendment (optimistic push above).
         }
         header.extra_data = Bytes::default();
 
@@ -308,8 +316,8 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut block = Block {
             header,
-            transactions: included_txs.clone(),
-            system_transactions: system_txs.clone(),
+            transactions: included_txs,
+            system_transactions: system_txs,
             proposer_seal: None,
         };
 
@@ -320,7 +328,7 @@ impl<S: KvStore + 'static> Node<S> {
         // a commitment-only header will skip full STARK verification until a
         // ProofAmendment arrives.
         let stark_entries: Option<Vec<SigBatchEntry>> = if self.stark_aggregation {
-            Some(stark_sources::entries_from_txs(&included_txs))
+            Some(stark_sources::entries_from_txs(&block.transactions))
         } else {
             None
         };
@@ -409,7 +417,7 @@ impl<S: KvStore + 'static> Node<S> {
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.
-        let tx_hashes: Vec<ShellHash> = included_txs.iter().map(|tx| tx.hash()).collect();
+        let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();
         let pruned = mem_pool.remove_committed_hashes(&tx_hashes);
         if pruned > 0 {
             debug!(
@@ -421,7 +429,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Update canonical aggregate counters for shell_* stats RPCs.
         block_store.update_chain_totals(
             block.number(),
-            included_txs.len() as u64,
+            block.transactions.len() as u64,
             block.header.gas_used,
         )?;
 
