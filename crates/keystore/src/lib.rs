@@ -25,6 +25,7 @@ mod crypto;
 mod types;
 
 pub use crypto::{
-    decrypt, decrypt_any, decrypt_mldsa, decrypt_sphincs, encrypt, encrypt_mldsa, encrypt_sphincs,
+    decrypt, decrypt_any, decrypt_hd_seed, decrypt_mldsa, decrypt_sphincs, encrypt, encrypt_hd_seed,
+    encrypt_mldsa, encrypt_sphincs,
 };
 pub use types::{CipherParams, EncryptedKey, KdfParams, KeystoreError};

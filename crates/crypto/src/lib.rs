@@ -3,6 +3,7 @@ mod algorithm_registry;
 mod batch;
 mod dilithium;
 mod error;
+pub mod hd;
 mod keypair;
 mod mldsa;
 mod multi;

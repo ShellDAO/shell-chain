@@ -22,4 +22,7 @@ pub enum CryptoError {
 
     #[error("batch verification failed: {failed}/{total} signatures invalid")]
     BatchVerificationFailed { total: usize, failed: usize },
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }

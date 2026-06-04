@@ -15,6 +15,10 @@ pqcrypto-dilithium = { workspace = true }
 pqcrypto-sphincsplus = { workspace = true }
 pqcrypto-traits = { workspace = true }
 fips204 = { workspace = true }
+fips205 = { workspace = true }
+bip39 = { workspace = true }
+blake3 = { workspace = true }
+rand_core = { workspace = true }
 zeroize = { workspace = true }
 alloy-rlp = { workspace = true }
 serde = { workspace = true }

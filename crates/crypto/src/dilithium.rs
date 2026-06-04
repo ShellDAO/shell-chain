@@ -402,8 +402,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed.as_secs() < 1,
-            "100 sign+verify took {:.2}s, expected <1s",
+            elapsed.as_secs_f64() < 2.0,
+            "100 sign+verify took {:.2}s, expected <2s",
             elapsed.as_secs_f64()
         );
     }

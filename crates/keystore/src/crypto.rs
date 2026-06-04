@@ -272,6 +272,85 @@ pub fn decrypt_sphincs(
     Ok(signer)
 }
 
+/// Encrypt a 64-byte HD seed (Shell PQ-HD v1) with a password.
+///
+/// Stores `key_type = "hd-seed"` so [`decrypt_hd_seed`] can identify the payload.
+/// The `address` field holds the default ML-DSA-65 account-0 address;
+/// `public_key` is left empty because the seed is the root secret.
+pub fn encrypt_hd_seed(
+    seed: &[u8; 64],
+    default_address: &str,
+    password: &[u8],
+) -> Result<EncryptedKey, KeystoreError> {
+    let mut salt = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    rand::rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut nonce);
+
+    let kdf_params = KdfParams { m_cost: 65536, t_cost: 3, p_cost: 4, salt: hex::encode(salt) };
+
+    let mut derived_key = derive_key(password, &salt, &kdf_params)?;
+    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let ciphertext = cipher
+        .encrypt((&nonce).into(), seed.as_ref())
+        .map_err(|e| KeystoreError::Encryption(e.to_string()))?;
+    derived_key.zeroize();
+
+    Ok(EncryptedKey {
+        version: 1,
+        address: default_address.to_string(),
+        key_type: "hd-seed".into(),
+        kdf: "argon2id".into(),
+        kdf_params,
+        cipher: "xchacha20-poly1305".into(),
+        cipher_params: CipherParams { nonce: hex::encode(nonce) },
+        ciphertext: hex::encode(&ciphertext),
+        public_key: String::new(), // seed is root; no single public key
+    })
+}
+
+/// Decrypt an HD seed keystore, returning the 64-byte BIP-39 seed.
+///
+/// Only accepts keystores with `key_type = "hd-seed"`.
+pub fn decrypt_hd_seed(
+    encrypted: &EncryptedKey,
+    password: &[u8],
+) -> Result<[u8; 64], KeystoreError> {
+    if encrypted.key_type != "hd-seed" {
+        return Err(KeystoreError::InvalidKey(format!(
+            "expected key_type 'hd-seed', got '{}'",
+            encrypted.key_type
+        )));
+    }
+    let salt = hex::decode(&encrypted.kdf_params.salt)
+        .map_err(|e| KeystoreError::InvalidKey(format!("bad salt hex: {e}")))?;
+    let nonce_bytes = hex::decode(&encrypted.cipher_params.nonce)
+        .map_err(|e| KeystoreError::InvalidKey(format!("bad nonce hex: {e}")))?;
+    let ciphertext = hex::decode(&encrypted.ciphertext)
+        .map_err(|e| KeystoreError::InvalidKey(format!("bad ciphertext hex: {e}")))?;
+
+    if nonce_bytes.len() != 24 {
+        return Err(KeystoreError::InvalidKey(format!(
+            "nonce must be 24 bytes, got {}",
+            nonce_bytes.len()
+        )));
+    }
+
+    let mut derived_key = derive_key(password, &salt, &encrypted.kdf_params)?;
+    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let nonce: [u8; 24] =
+        nonce_bytes.try_into().map_err(|_| KeystoreError::Decryption)?;
+    let plaintext = cipher
+        .decrypt((&nonce).into(), ciphertext.as_ref())
+        .map_err(|_| KeystoreError::Decryption)?;
+    derived_key.zeroize();
+
+    let seed: [u8; 64] = plaintext
+        .try_into()
+        .map_err(|_| KeystoreError::InvalidKey("decrypted payload is not 64 bytes".into()))?;
+    Ok(seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

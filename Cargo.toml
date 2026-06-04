@@ -50,6 +50,9 @@ pqcrypto-dilithium = "0.5"
 pqcrypto-sphincsplus = "0.7"
 pqcrypto-traits = "0.3"
 fips204 = "0.4.6"
+fips205 = "0.4"
+bip39 = { version = "2", features = ["rand"] }
+rand_core = "0.6"
 zeroize = { version = "1", features = ["derive"] }
 
 # --- keystore ---

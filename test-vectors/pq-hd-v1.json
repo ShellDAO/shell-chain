@@ -1,0 +1,137 @@
+{
+  "_comment": "Shell PQ-HD v1 canonical test vectors — DO NOT EDIT, regenerate with gen_pq_hd_vectors.mjs",
+  "_version": "pq-hd-v1",
+  "_lib_versions": {
+    "noble_post_quantum": "^0.6.0",
+    "scure_bip39": "transitive (exact from lock)",
+    "noble_hashes_blake3": "^1.8.0"
+  },
+  "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+  "mnemonic_normalized": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+  "passphrase": "",
+  "seed_512": "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840",
+  "master": {
+    "secret": "32b13206c9c29e6fc174c4ff32897c072bfdf89fcace59cb3469b929f256768a",
+    "chain_code": "8ce0f9c5ab2683396a504d8959e52a4e888362dd7a766a9931ee671917bc78d9"
+  },
+  "path_constants": {
+    "purpose": 9000,
+    "coin_type": 8888,
+    "algo_mldsa65": 1,
+    "algo_slhdsa": 2,
+    "hardened_offset": "0x80000000"
+  },
+  "ml_dsa_65": {
+    "path": "m/9000'/8888'/1'/0'/0'/0'",
+    "path_components_raw": [
+      9000,
+      8888,
+      1,
+      0,
+      0,
+      0
+    ],
+    "intermediate_nodes": [
+      {
+        "raw_index": 9000,
+        "encoded_index": "0x80002328",
+        "secret": "d18f764955ec00680459b9f5a94ebc56f68dc9c6f5e028f68d345d464afe7c05",
+        "chain_code": "01a31b3e0e10bed0eb0a617b3df5a19dda25cf26ac758842295bc3f2129b1232"
+      },
+      {
+        "raw_index": 8888,
+        "encoded_index": "0x800022b8",
+        "secret": "81c4c33a82cf46f117fc29fcb7fe4a0fcafc9f8f280e61de5de62c4893c8fbc7",
+        "chain_code": "8985ed149ef46ce4016bb24e5bbce946415af36f0eb429b4854dc90af5f2fe2f"
+      },
+      {
+        "raw_index": 1,
+        "encoded_index": "0x80000001",
+        "secret": "d81fac59fc1b4842b11d124a1441d34cce239935c4edc623dd969d81ae6170b0",
+        "chain_code": "e41a0211ee0d3f9ec895444b3c7e0f1a535f2fcd12ebce436eebe09a549ba20c"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "8673d945f8dff73c2d758e01f3dbf16818eca309b08c7483b1637dbc3efd73ba",
+        "chain_code": "f01238a6f27d2d15500b53114e297ccc0ffcf3f77cd097da1880efcadb946a9a"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "b3c764ea3b1a095a7446a77104c64c43dcdc714bc62a2e7e57a8cc03764c37ee",
+        "chain_code": "c2a152114a64f3c81c41a0e4e542bb44335cbd15d76810ce5223c62a3d418a6a"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "457a45358d458a18dc53635adfc627433b616c490d431cc3bfd2189f03e08c20",
+        "chain_code": "2e6bf1edbaa08f320730539945d002b1fb50628bf2ffc1ecb40d4271ddae20c1"
+      }
+    ],
+    "leaf_secret": "457a45358d458a18dc53635adfc627433b616c490d431cc3bfd2189f03e08c20",
+    "leaf_chain_code": "2e6bf1edbaa08f320730539945d002b1fb50628bf2ffc1ecb40d4271ddae20c1",
+    "ml_seed32": "49a17fd5aed88853cf9e44ae75316978d4916f3276afcbb00f86c9735e03d74c",
+    "algo_id": "0x01",
+    "public_key_length": 1952,
+    "public_key_hex": "8fa820175d407a0da9fa1933fed44d79ffc71a3a14b9645e46bfff1bef1d35fdc84bc738aff37a5dcf3a93203ddbc70f22aff6ad7fb588abbcddb0b7433ade5ca8d752cae92474b47d7c2b510ae091704e40e5a57a3d3d5b0f4e53a74263bda231ed3ef56191dab2bfb61cae5c606263d04af7a293848757abc2f792a26e63d807c7b970d5789670943c070e7cca082ce9ad009e137a0a8fc8fb0ee04093ae9be16b14a28e6765fec6645ef4a0f14aa2a4087e8d4d3d5784d5d907e50efb7c11c3cc8b897d77d303c176dbba5b6ff7d78053d0e27d0bbb66b4b9d54c3f0566ea2086949eeca9c7f9e26ad9f5ebe1781ce77da3b459931d04290547d7d1a103b5f2928b32820248514d7f76b6f7b5db70eb04a741b0fe10c30385497b020294c70466a8904500ea44515323d6a137f198907b323789ced2fb02a269a9f23ffd7dbe990e09cacdd2b8d0ae7dcc8b4ebd2462f1807372cd47a3355897eddaf11317b2c285a5cb8fc6829357a7d97af1ba05cc494e25b3097023be86ae7bd368c7311fbcd8a9e7e5fe373bf3b74246f21c23d76cf94acdea55a8f30dcb9adb1a52793ca9aa1376e9100e954828d78656dedc6f5cbad60755a3b6fa8d1efca11a6e195982f97a26ab813968187f7fb1ad5713bc490e784f7a424cf24a42fa7c8cfa2a97ed64efe88648ed79c85fac712acaccb98dcc488f11ca79697b4c9fa6d126b7dbc2d5fcc17f2dbfeb85e1d52c700a004030a63eedc3ccc5675c9180de57dc428090b085598562391ef172496c3d2749bfa1b63cb150ed2f6ca22d6a83f2cc4493aacaadef7f2287124bab8459fad79a21132899506d91474f690ff77697b314ea2dcf725b7a6d7d8876135def0920325c7a586fc46145179411a24a085060a9f7ee34aa222f46eb5312544ecff6f1c37356542e3da56e58083202f51ed36ee81a17d2fa5e1e1fba5eab3414a009276c1e24e03f15c720cc74378e44d2b1499a41df7f0216eb68eee40d2643123a087776dfddf3e9d4721086402ac21a7475456e1ba4d0e527b187303e1e59d563faf956acd5e24a33776c277081b6e8530cf739f03015a95eff8797c439a242fedfb34e91d7f0bce001353d12d0370ede34b96eee6c7a24c6929d2d1c64f57eca4a996a2f079e27faf7e7234babe6e52db342b2eae75ead09fa6a897a3810307b2d5055a2f8f0adab533625f201fc66fa6fb0b6bcd2d39fecf30c46de2c6e8a8d9d91190ecce756f6c08fc01f7aa6cf6c3a3eb04ccac16634c3fab999fc3b2d64c25f2280327e38abab7d45fe5306fa6540b9cfc3855bf38901201cd8dbb33836dd82da5efa38f6be4550777314ad360cb5f2642505eff0ba60d405d2431591fcad2cd9d8f46fbcbfa66ba3f55161e374f9477e5d6f6078bca8b0ea75247904673278cd3dbb7caad2eb219c732720796f406ae098b91be347e3d12db3bf94354a7b27e1c64501a539511d036d7cd958b7c2999950cd9ffa85999c9055e1aa016eab20e588e23c75e61485e02903512fd0c653b6c7b4fe5744b88f2f8a7320a0e6fecd2865ce3ecfd99f5f00e22adfad5ecf749369a4fd23ee7c63384fb76ace4471903593729d13e8b392747beb804184e0af7efa662b1a62e70eaeb37c24a1423bf56090bec4408ebf7f99733e048a1fb35c442b6a147864f58edeab780c399659d33612b7e32c928823347f4f117ee9f6a3f7fc67e2ac8fc76846d4a752ac5319c34cd75c26c792e33073d8148f943955a80dd6f583d24c49227aace74c92ef6313391c33c840ac12be8ac58dc6c638d87c06faad109ab2cc7a7a1dd763d61fb2df782b6b49a57f18f1be4cb51ccd4b8d423c92990a8880f25edc21043574d237da1e17c5ecae375c140930bc2c871bca720dcf8133ca0f0711441080773ad031a95f31a3e96ff97d7c92408c06541e2ebbc1c8eec17da76a865d039e5273275f04c0fa6096f99826a2abe8dba4d6849656d7a7ac18f53f6486b3592c78e532fc7555457126bbf93eebe25a868e5acedba44a89258479de16059a4ebac4f4dd9194e90574696a3939750b9d509176beb560b9ebf0bc2eb760d33a1fb64452fa9373c8457347b46c9d2d665a8a242544e099f1932fde332ad8cc5aeccbd5ed9cd71c60e6000d97b46050b7c99dae91a0390e30346e3f8138efd35b1a1deb2222a082f7d22aa58ada852ea01238d08b148593c73c0ab537a986d5d66494a503a2ef0e776e3caeefad211ecb84efc6d8dd412c3b26d33759e018722c6f062a01220dead7428c53819932628988b96cadd1bb380aa11db2c1db547f9675c827b520c16057db44917492c248feafd5e5a9372ade47fc9d4c67a6435df8e88e64facebab043db643f0a57044279973d9c9d9bd8f24136a3fbba01d1fa6e5d79aa357a663ba40c5643fc8378bf1aef50c12f6ffac9ee06a8863224f19d0546f9f5cec0781ade428eb6bcba327392bd5c7a070c0208c3bcd7a7ee056dc4cdbb73562f678efe27714ea1dd8f11a316c17f3b989db677f9bbc37ec0a2ff00777d869b2ab8643cf42226650e7ea730c60e41bc1f86d02586db52326f704c711cde1ccec55db49848c12490caf0e2d1a7d17d2e978b539af5963c2169a0e98b44c25dbe9a90353786e00916fb4de5462db44404c88d0e8686dcc430135296b29ce2b15557247bcc2b10ecbd638cbb511f812f828ed74094998d6cb84e3582e6e466fed700459043dfdd56353f5d0ba32db63846ddfa0d63",
+    "address": "0xe5a4d49d958ce2b125d4b3142d5cccbe632eefe3b387996fb02f5845136dcb82"
+  },
+  "slh_dsa_sha2_256f": {
+    "path": "m/9000'/8888'/2'/0'/0'/0'",
+    "path_components_raw": [
+      9000,
+      8888,
+      2,
+      0,
+      0,
+      0
+    ],
+    "intermediate_nodes": [
+      {
+        "raw_index": 9000,
+        "encoded_index": "0x80002328",
+        "secret": "d18f764955ec00680459b9f5a94ebc56f68dc9c6f5e028f68d345d464afe7c05",
+        "chain_code": "01a31b3e0e10bed0eb0a617b3df5a19dda25cf26ac758842295bc3f2129b1232"
+      },
+      {
+        "raw_index": 8888,
+        "encoded_index": "0x800022b8",
+        "secret": "81c4c33a82cf46f117fc29fcb7fe4a0fcafc9f8f280e61de5de62c4893c8fbc7",
+        "chain_code": "8985ed149ef46ce4016bb24e5bbce946415af36f0eb429b4854dc90af5f2fe2f"
+      },
+      {
+        "raw_index": 2,
+        "encoded_index": "0x80000002",
+        "secret": "aa27954dcb740cd0dac170ff32c8cd28dc48b4dd1bb226960cec6b42c3cc3fc1",
+        "chain_code": "5176932b6b3a1daa44a5bb65337922d69a858a2779aa64b94e6111e2db1bca59"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "b33f446e27be9929856de59222fa875b4bfc15c903b5a38fc3979c472426ff15",
+        "chain_code": "6e357c0d77e74afe260db30524fd663010268a2d971da35d326841b9cabdaf07"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "fed0e22a36093b973db14669acd01efdda26d3091d8e0c1bf35d990011992bd7",
+        "chain_code": "e54744f9e29305ca64435c5218c0b2dc487e7434c23547263b53f6a1fa4aac83"
+      },
+      {
+        "raw_index": 0,
+        "encoded_index": "0x80000000",
+        "secret": "f74a5ec5d06f9a715b14930ab48ce509c7004d845873a07144dc05c9d8cdfd7c",
+        "chain_code": "1b386fcb257aeee654ab3e497d312b8b4d927fdc8da86e3fa444ffe6d508f73c"
+      }
+    ],
+    "leaf_secret": "f74a5ec5d06f9a715b14930ab48ce509c7004d845873a07144dc05c9d8cdfd7c",
+    "leaf_chain_code": "1b386fcb257aeee654ab3e497d312b8b4d927fdc8da86e3fa444ffe6d508f73c",
+    "slh_seed96_layout": "SK.seed(32) || SK.prf(32) || PK.seed(32)",
+    "slh_seed96": "3f6566832d9f7ddce18fc4b06a28561baddea43ec02183f2640d84c642bda9d8e73fab5c4ddcb3e45de40bca39815bac2c140be7eb87bdc34a37bc94a0b925369651e6bd08eb5e8e5c513d1e977c25e36cb206bf72435ebcbab054955aa95145",
+    "algo_id": "0x02",
+    "public_key_length": 64,
+    "public_key_hex": "9651e6bd08eb5e8e5c513d1e977c25e36cb206bf72435ebcbab054955aa9514548273bf4ae037eb25afe09a6be6a6b7b2d8595a7c67765ec72f2b2918735e0ff",
+    "address": "0x1f1e2763d412db82737e0873dfb37f7d083cfa2a494e415f32da8bde00497c83"
+  }
+}

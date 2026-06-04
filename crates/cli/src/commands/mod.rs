@@ -7,6 +7,7 @@ mod genesis;
 mod import_state;
 mod init;
 mod key;
+pub mod pqhd;
 mod removedb;
 pub mod run;
 pub mod tx;
