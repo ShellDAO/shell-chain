@@ -1,4 +1,4 @@
-//! `shell-node pqhd` — Shell PQ-HD v1 wallet commands.
+//! `shell-chain pq-hd` — Shell PQ-HD v1 wallet commands.
 //!
 //! Subcommands:
 //! - `generate`  — generate a new mnemonic, derive account 0, save encrypted HD keystore.

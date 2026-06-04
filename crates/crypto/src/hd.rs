@@ -166,9 +166,8 @@ pub fn generate_mnemonic() -> bip39::Mnemonic {
 
 /// Derive the 512-bit seed from a BIP-39 mnemonic using PBKDF2-HMAC-SHA512.
 ///
-/// Normalization: applies NFKD and lowercases words before PBKDF2.
-/// This matches the TypeScript implementation for all standard BIP-39 mnemonics
-/// (English wordlist words are already lowercase ASCII).
+/// Normalization: applies BIP-39 normalization (NFKD) before PBKDF2. This
+/// matches the TypeScript implementation for standard BIP-39 mnemonics.
 ///
 /// Returns a 64-byte seed.
 pub fn mnemonic_to_seed(mnemonic: &str, passphrase: &str) -> [u8; 64] {
