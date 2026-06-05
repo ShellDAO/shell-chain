@@ -8,8 +8,7 @@
 | v0.23.x | ✅ Security fixes |
 | < v0.23.0 | ❌ End of life |
 
-Only the latest release and the current `main` branch receive security fixes.
-Users running older versions should upgrade before reporting issues against them.
+**v0.23.x is the current supported release line.** `main` receives active development and security fixes; v0.23.x receives security-only backports. Users on versions older than v0.23.0 should upgrade before reporting issues against them.
 
 ## Scope
 
@@ -48,11 +47,11 @@ The following are **out of scope**:
 We will acknowledge receipt within **72 hours** and aim to provide an initial
 assessment within **7 days**.
 
-### Alternative — encrypted email
+### Alternative — email
 
-If you prefer email, contact the maintainers at the address listed in
-[`Cargo.toml`](./Cargo.toml) under `[package].authors`, or reach the ShellDAO
-security team via the contact on [shell.org](https://shell.org).
+Reach the ShellDAO security team via the contact on [shell.org](https://shell.org).
+If you need an encrypted channel, open a GitHub Private Security Advisory first
+and request a PGP key in the advisory thread — maintainers will provide one.
 
 Please include:
 - A concise description of the vulnerability
@@ -109,13 +108,13 @@ in the security advisory and in `CHANGELOG.md`.
 
 ## Security Hardening Notes
 
-For operators running validator nodes, consult the deployment runbook and
-ensure:
+For operators running validator nodes, consult the
+[Testnet Operator Guide](./docs/TESTNET_OPERATOR_GUIDE.md) and ensure:
 
 - Keystores are stored with filesystem permissions `600`, owned by the node
   process user only
-- The RPC ports (`8545`, `8547`, `8549`) are not exposed to the public internet
-  without authentication/TLS
+- The RPC/WS ports (`8545` HTTP JSON-RPC, `8546` WebSocket, `8548`/`8549` for
+  rpc-node) are not exposed to the public internet without authentication/TLS
 - The `pqhd` CLI reads mnemonics from stdin (no shell history exposure); never
   pass mnemonics as command-line arguments
 - Backups of `*.keystore.json` files must be encrypted at rest
