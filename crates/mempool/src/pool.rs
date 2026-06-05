@@ -279,8 +279,8 @@ impl TxPool {
         let stale_hashes: Vec<ShellHash> = inner
             .by_hash
             .iter()
-            .filter_map(|(hash, entry)| {
-                match world_state.get_nonce(&entry.tx.from) {
+            .filter_map(
+                |(hash, entry)| match world_state.get_nonce(&entry.tx.from) {
                     Ok(canonical_nonce) => (entry.tx.tx.nonce < canonical_nonce).then_some(*hash),
                     Err(e) => {
                         warn!(
@@ -291,8 +291,8 @@ impl TxPool {
                         );
                         None
                     }
-                }
-            })
+                },
+            )
             .collect();
         let pruned = stale_hashes.len();
         for hash in stale_hashes {

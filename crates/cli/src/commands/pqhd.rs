@@ -36,10 +36,19 @@ pub enum PqHdCommand {
 
 pub fn execute(cmd: PqHdCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        PqHdCommand::Generate { output, algo, password_args } => generate(output, algo, password_args),
-        PqHdCommand::Derive { keystore, account, change, index, algo, password_args } => {
-            derive(keystore, algo, account, change, index, password_args)
-        }
+        PqHdCommand::Generate {
+            output,
+            algo,
+            password_args,
+        } => generate(output, algo, password_args),
+        PqHdCommand::Derive {
+            keystore,
+            account,
+            change,
+            index,
+            algo,
+            password_args,
+        } => derive(keystore, algo, account, change, index, password_args),
         PqHdCommand::Address { count, algo } => print_addresses(count, algo),
     }
 }
@@ -111,10 +120,7 @@ fn derive(
 
 /// Print addresses for a mnemonic without storing anything.
 /// Reads mnemonic from stdin (never from CLI args to avoid shell history exposure).
-fn print_addresses(
-    count: u32,
-    algo_str: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_addresses(count: u32, algo_str: String) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     let algo = parse_algo(&algo_str)?;

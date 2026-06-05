@@ -103,7 +103,10 @@ struct SeedReader {
 
 impl SeedReader {
     fn new(seed: &[u8]) -> Self {
-        Self { buf: seed.to_vec(), pos: 0 }
+        Self {
+            buf: seed.to_vec(),
+            pos: 0,
+        }
     }
 }
 
@@ -233,10 +236,7 @@ pub fn derive_at_path(master: &HdNode, path_components: &[u32]) -> Result<HdNode
 /// Derive an ML-DSA-65 account at the given leaf node.
 ///
 /// Returns an [`HdAccount`] with `public_key` of length `MLDSA65_PK_LENGTH` (1952 bytes).
-pub fn derive_mldsa65_account(
-    leaf_node: &HdNode,
-    path: String,
-) -> Result<HdAccount, CryptoError> {
+pub fn derive_mldsa65_account(leaf_node: &HdNode, path: String) -> Result<HdAccount, CryptoError> {
     let key = key_mldsa_leaf();
     let ml_seed_xof = blake3_keyed_xof(&key, &leaf_node.secret, 32);
     let mut ml_seed = [0u8; 32];
@@ -268,10 +268,7 @@ pub fn derive_mldsa65_account(
 ///
 /// The 96-byte seed layout is: `SK.seed(32) || SK.prf(32) || PK.seed(32)`.
 /// Returns an [`HdAccount`] with `public_key` of length `SLHDSA_PK_LENGTH` (64 bytes).
-pub fn derive_slhdsa_account(
-    leaf_node: &HdNode,
-    path: String,
-) -> Result<HdAccount, CryptoError> {
+pub fn derive_slhdsa_account(leaf_node: &HdNode, path: String) -> Result<HdAccount, CryptoError> {
     let key = key_slh_leaf();
     // slh_seed96 layout: SK.seed(32) || SK.prf(32) || PK.seed(32)
     let slh_seed96 = blake3_keyed_xof(&key, &leaf_node.secret, 96);
@@ -325,7 +322,14 @@ pub fn derive_account(
         HdAlgo::MlDsa65 => ALGO_MLDSA65,
         HdAlgo::SlhDsaSha2256f => ALGO_SLH_DSA,
     };
-    let components = [HD_PURPOSE, HD_COIN_TYPE, algo_val, account_index, change_index, address_index];
+    let components = [
+        HD_PURPOSE,
+        HD_COIN_TYPE,
+        algo_val,
+        account_index,
+        change_index,
+        address_index,
+    ];
     let path = format_path(&components);
 
     let master = master_node_from_seed(seed512);
@@ -352,9 +356,9 @@ pub fn format_path(components: &[u32]) -> String {
 /// # Errors
 /// Returns an error if any component is not hardened or the path is malformed.
 pub fn parse_path(path: &str) -> Result<Vec<u32>, CryptoError> {
-    let path = path.strip_prefix("m/").ok_or_else(|| {
-        CryptoError::InvalidInput(format!("path must start with \"m/\": {path}"))
-    })?;
+    let path = path
+        .strip_prefix("m/")
+        .ok_or_else(|| CryptoError::InvalidInput(format!("path must start with \"m/\": {path}")))?;
     path.split('/')
         .map(|part| {
             let raw = part.strip_suffix('\'').ok_or_else(|| {
@@ -527,13 +531,21 @@ mod tests {
         let leaf = derive_at_path(&master, &components).unwrap();
         let account = derive_mldsa65_account(&leaf, path).unwrap();
 
-        assert_eq!(account.public_key.len(), MLDSA65_PK_LENGTH, "ML-DSA-65 pk length");
+        assert_eq!(
+            account.public_key.len(),
+            MLDSA65_PK_LENGTH,
+            "ML-DSA-65 pk length"
+        );
         assert_eq!(
             bytes_to_hex(&account.public_key),
             mlv["public_key_hex"].as_str().unwrap(),
             "ML-DSA-65 pk mismatch"
         );
-        assert_eq!(account.address, mlv["address"].as_str().unwrap(), "ML-DSA-65 address mismatch");
+        assert_eq!(
+            account.address,
+            mlv["address"].as_str().unwrap(),
+            "ML-DSA-65 address mismatch"
+        );
         assert_eq!(account.algo_id, 1);
     }
 
@@ -558,13 +570,21 @@ mod tests {
         let leaf = derive_at_path(&master, &components).unwrap();
         let account = derive_slhdsa_account(&leaf, path).unwrap();
 
-        assert_eq!(account.public_key.len(), SLHDSA_PK_LENGTH, "SLH-DSA pk length");
+        assert_eq!(
+            account.public_key.len(),
+            SLHDSA_PK_LENGTH,
+            "SLH-DSA pk length"
+        );
         assert_eq!(
             bytes_to_hex(&account.public_key),
             slhv["public_key_hex"].as_str().unwrap(),
             "SLH-DSA pk mismatch"
         );
-        assert_eq!(account.address, slhv["address"].as_str().unwrap(), "SLH-DSA address mismatch");
+        assert_eq!(
+            account.address,
+            slhv["address"].as_str().unwrap(),
+            "SLH-DSA address mismatch"
+        );
         assert_eq!(account.algo_id, 2);
     }
 
@@ -588,15 +608,24 @@ mod tests {
         let seed: [u8; 64] = hex_to_bytes(seed_hex).try_into().unwrap();
 
         let account = derive_account(&seed, HdAlgo::SlhDsaSha2256f, 0, 0, 0).unwrap();
-        assert_eq!(account.path, v["slh_dsa_sha2_256f"]["path"].as_str().unwrap());
-        assert_eq!(account.address, v["slh_dsa_sha2_256f"]["address"].as_str().unwrap());
+        assert_eq!(
+            account.path,
+            v["slh_dsa_sha2_256f"]["path"].as_str().unwrap()
+        );
+        assert_eq!(
+            account.address,
+            v["slh_dsa_sha2_256f"]["address"].as_str().unwrap()
+        );
     }
 
     // ── Path utilities ────────────────────────────────────────────────────────
 
     #[test]
     fn format_path_produces_hardened_string() {
-        assert_eq!(format_path(&[9000, 8888, 1, 0, 0, 0]), "m/9000'/8888'/1'/0'/0'/0'");
+        assert_eq!(
+            format_path(&[9000, 8888, 1, 0, 0, 0]),
+            "m/9000'/8888'/1'/0'/0'/0'"
+        );
     }
 
     #[test]

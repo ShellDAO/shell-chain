@@ -287,7 +287,12 @@ pub fn encrypt_hd_seed(
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
 
-    let kdf_params = KdfParams { m_cost: 65536, t_cost: 3, p_cost: 4, salt: hex::encode(salt) };
+    let kdf_params = KdfParams {
+        m_cost: 65536,
+        t_cost: 3,
+        p_cost: 4,
+        salt: hex::encode(salt),
+    };
 
     let mut derived_key = derive_key(password, &salt, &kdf_params)?;
     let cipher = XChaCha20Poly1305::new((&derived_key).into());
@@ -303,7 +308,9 @@ pub fn encrypt_hd_seed(
         kdf: "argon2id".into(),
         kdf_params,
         cipher: "xchacha20-poly1305".into(),
-        cipher_params: CipherParams { nonce: hex::encode(nonce) },
+        cipher_params: CipherParams {
+            nonce: hex::encode(nonce),
+        },
         ciphertext: hex::encode(&ciphertext),
         public_key: String::new(), // seed is root; no single public key
     })
@@ -338,8 +345,9 @@ pub fn decrypt_hd_seed(
 
     let mut derived_key = derive_key(password, &salt, &encrypted.kdf_params)?;
     let cipher = XChaCha20Poly1305::new((&derived_key).into());
-    let nonce: [u8; 24] =
-        nonce_bytes.try_into().map_err(|_| KeystoreError::Decryption)?;
+    let nonce: [u8; 24] = nonce_bytes
+        .try_into()
+        .map_err(|_| KeystoreError::Decryption)?;
     let mut plaintext = cipher
         .decrypt((&nonce).into(), ciphertext.as_ref())
         .map_err(|_| KeystoreError::Decryption)?;

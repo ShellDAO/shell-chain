@@ -774,21 +774,22 @@ async fn main() {
                     password_args,
                 })
             }
-            PqHdCommands::Derive { keystore, account, change, index, algo } => {
-                commands::pqhd::execute(commands::pqhd::PqHdCommand::Derive {
-                    keystore,
-                    account,
-                    change,
-                    index,
-                    algo,
-                    password_args,
-                })
-            }
+            PqHdCommands::Derive {
+                keystore,
+                account,
+                change,
+                index,
+                algo,
+            } => commands::pqhd::execute(commands::pqhd::PqHdCommand::Derive {
+                keystore,
+                account,
+                change,
+                index,
+                algo,
+                password_args,
+            }),
             PqHdCommands::Address { count, algo } => {
-                commands::pqhd::execute(commands::pqhd::PqHdCommand::Address {
-                    count,
-                    algo,
-                })
+                commands::pqhd::execute(commands::pqhd::PqHdCommand::Address { count, algo })
             }
         },
         Commands::Backup { command } => match command {
