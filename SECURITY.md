@@ -22,7 +22,7 @@ The following components are **in scope**:
 - `crates/rpc` — JSON-RPC handler, TLS, three-RPC fanout
 - `crates/mempool` — transaction pool, AA validation
 - `crates/stark-prover` — STARK settlement
-- `crates/cli` — `shell-chain` binary, `pqhd` key management commands
+- `crates/cli` — `shell-chain` binary, `pq-hd` key management commands
 - Protocol-level vulnerabilities (consensus safety/liveness, double-spend, AA bypass)
 - Denial-of-service attacks that can halt block production on the public testnet
 
@@ -44,14 +44,14 @@ The following are **out of scope**:
 2. Fill in the advisory form (affected versions, component, reproduction steps, impact)
 3. Submit — this creates a private draft visible only to maintainers
 
-### Alternative — encrypted email
-
-If you prefer email, contact the maintainers at the address listed in
-[`Cargo.toml`](./Cargo.toml) under `[package].authors`, or reach the ShellDAO
-security team via the contact on [shell.org](https://shell.org).
-
 We will acknowledge receipt within **72 hours** and aim to provide an initial
 assessment within **7 days**.
+
+### Alternative — encrypted email
+
+Reach the ShellDAO security team via the contact on [shell.org](https://shell.org).
+If you need an encrypted channel, open a GitHub Private Security Advisory first
+and request a PGP key in the advisory thread — maintainers will provide one.
 
 Please include:
 - A concise description of the vulnerability
@@ -115,6 +115,6 @@ For operators running validator nodes, consult the
   process user only
 - The RPC/WS ports (`8545` HTTP JSON-RPC, `8546` WebSocket, `8548`/`8549` for
   rpc-node) are not exposed to the public internet without authentication/TLS
-- The `pqhd` CLI reads mnemonics from stdin (no shell history exposure); never
+- The `pq-hd` CLI reads mnemonics from stdin (no shell history exposure); never
   pass mnemonics as command-line arguments
 - Backups of `*.keystore.json` files must be encrypted at rest
