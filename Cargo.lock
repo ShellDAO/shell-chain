@@ -6111,6 +6111,7 @@ dependencies = [
  "shell-primitives",
  "shell-storage",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

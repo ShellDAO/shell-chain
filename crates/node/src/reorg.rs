@@ -101,6 +101,26 @@ impl ReorgEngine {
         // Full EVM re-execution is not performed here; instead we trust the
         // stored state roots which were validated at block import time.
         // The world state is set to the tip block's state root.
+
+        // Safety: verify that new_chain forms a contiguous descendant chain
+        // before mutating any canonical pointers. This prevents a malformed
+        // call from leaving canonical state partially written.
+        {
+            let mut expected_parent = ancestor_hash;
+            for hash in new_chain {
+                let block = chain_store.get_block_by_hash(hash)?.ok_or_else(|| {
+                    NodeError::Startup(format!("new chain block not found: {:?}", hash))
+                })?;
+                if block.header.parent_hash != expected_parent {
+                    return Err(NodeError::Startup(format!(
+                        "new_chain continuity broken at {:?}: expected parent {:?}, got {:?}",
+                        hash, expected_parent, block.header.parent_hash
+                    )));
+                }
+                expected_parent = *hash;
+            }
+        }
+
         let mut applied = 0;
         let mut new_head = ancestor_hash;
         let mut tip_state_root = ancestor_block.header.state_root;
