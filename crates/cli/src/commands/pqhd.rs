@@ -120,7 +120,10 @@ fn derive(
 
 /// Print addresses for a mnemonic without storing anything.
 /// Reads mnemonic from stdin (never from CLI args to avoid shell history exposure).
-fn print_addresses(count: u32, algo_str: String) -> Result<(), Box<dyn std::error::Error>> {
+fn print_addresses(
+    count: u32,
+    algo_str: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     let algo = parse_algo(&algo_str)?;
