@@ -461,15 +461,8 @@ enum PqHdCommands {
     },
 
     /// Print addresses for a mnemonic without storing anything (dry run).
+    /// The mnemonic is read from stdin (never passed as a CLI argument).
     Address {
-        /// BIP-39 mnemonic phrase (24 words).
-        #[arg(long)]
-        mnemonic: String,
-
-        /// Optional BIP-39 passphrase (empty string if omitted).
-        #[arg(long, default_value = "")]
-        passphrase: String,
-
         /// Number of accounts to derive (account indices 0..count-1).
         #[arg(long, default_value = "5")]
         count: u32,
@@ -791,10 +784,8 @@ async fn main() {
                     password_args,
                 })
             }
-            PqHdCommands::Address { mnemonic, passphrase, count, algo } => {
+            PqHdCommands::Address { count, algo } => {
                 commands::pqhd::execute(commands::pqhd::PqHdCommand::Address {
-                    mnemonic,
-                    passphrase,
                     count,
                     algo,
                 })

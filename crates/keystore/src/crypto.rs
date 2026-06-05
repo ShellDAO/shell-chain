@@ -340,13 +340,14 @@ pub fn decrypt_hd_seed(
     let cipher = XChaCha20Poly1305::new((&derived_key).into());
     let nonce: [u8; 24] =
         nonce_bytes.try_into().map_err(|_| KeystoreError::Decryption)?;
-    let plaintext = cipher
+    let mut plaintext = cipher
         .decrypt((&nonce).into(), ciphertext.as_ref())
         .map_err(|_| KeystoreError::Decryption)?;
     derived_key.zeroize();
 
-    let seed: [u8; 64] = plaintext
-        .try_into()
+    let seed_result: Result<[u8; 64], _> = plaintext.as_slice().try_into();
+    plaintext.zeroize();
+    let seed = seed_result
         .map_err(|_| KeystoreError::InvalidKey("decrypted payload is not 64 bytes".into()))?;
     Ok(seed)
 }

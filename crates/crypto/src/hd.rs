@@ -27,6 +27,7 @@ use fips204::traits::{KeyGen as Fips204KeyGen, SerDes as Fips204SerDes};
 use fips205::slh_dsa_sha2_256f;
 use fips205::traits::SerDes as Fips205SerDes;
 use rand_core::{CryptoRng, RngCore};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::CryptoError;
 
@@ -76,6 +77,7 @@ pub struct HdNode {
 }
 
 /// A fully-derived account at a leaf path.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HdAccount {
     /// BIP-44-like path string, e.g. `"m/9000'/8888'/1'/0'/0'/0'"`.
     pub path: String,
@@ -93,6 +95,7 @@ pub struct HdAccount {
 
 /// A simple sequential RNG that reads bytes from a fixed buffer.
 /// Used to pass a deterministic seed to fips205's `try_keygen_with_rng`.
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct SeedReader {
     buf: Vec<u8>,
     pos: usize,
@@ -134,13 +137,14 @@ impl CryptoRng for SeedReader {}
 // ── BLAKE3-keyed XOF helper ────────────────────────────────────────────────────
 
 /// Compute `BLAKE3_keyed(key32, data, xof_len)` → `output[0..xof_len]`.
-fn blake3_keyed_xof(key: &[u8; 32], data: &[u8], xof_len: usize) -> Vec<u8> {
+/// Returns a `Zeroizing` wrapper so the secret material is wiped on drop.
+fn blake3_keyed_xof(key: &[u8; 32], data: &[u8], xof_len: usize) -> Zeroizing<Vec<u8>> {
     let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(data);
     let mut reader = hasher.finalize_xof();
     let mut output = vec![0u8; xof_len];
     reader.fill(&mut output);
-    output
+    Zeroizing::new(output)
 }
 
 // ── Mnemonic helpers ─────────────────────────────────────────────────────────
@@ -199,7 +203,8 @@ pub fn derive_child_node(parent: &HdNode, raw_index: u32) -> Result<HdNode, Cryp
     let encoded_index = HARDENED_OFFSET | raw_index; // 0x80000000 | n, NORMATIVE
 
     // data = CTX_CHILD || 0x00 || parent_secret(32) || ser32BE(encoded_index)
-    let mut data = Vec::with_capacity(CTX_CHILD.len() + 1 + 32 + 4);
+    // Zeroizing ensures the parent_secret copy is wiped after the hash.
+    let mut data = Zeroizing::new(Vec::with_capacity(CTX_CHILD.len() + 1 + 32 + 4));
     data.extend_from_slice(CTX_CHILD);
     data.push(0x00);
     data.extend_from_slice(&parent.secret);
@@ -233,8 +238,10 @@ pub fn derive_mldsa65_account(
     path: String,
 ) -> Result<HdAccount, CryptoError> {
     let key = key_mldsa_leaf();
-    let ml_seed_vec = blake3_keyed_xof(&key, &leaf_node.secret, 32);
-    let ml_seed: [u8; 32] = ml_seed_vec.try_into().expect("ml_seed32 must be 32 bytes");
+    let ml_seed_xof = blake3_keyed_xof(&key, &leaf_node.secret, 32);
+    let mut ml_seed = [0u8; 32];
+    ml_seed.copy_from_slice(&ml_seed_xof);
+    // ml_seed_xof is dropped and zeroized here
 
     let (pk, sk) = ml_dsa_65::KG::keygen_from_seed(&ml_seed);
     let pk_bytes = pk.into_bytes();

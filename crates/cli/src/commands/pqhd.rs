@@ -29,8 +29,6 @@ pub enum PqHdCommand {
         password_args: PasswordArgs,
     },
     Address {
-        mnemonic: String,
-        passphrase: String,
         count: u32,
         algo: String,
     },
@@ -42,9 +40,7 @@ pub fn execute(cmd: PqHdCommand) -> Result<(), Box<dyn std::error::Error>> {
         PqHdCommand::Derive { keystore, account, change, index, algo, password_args } => {
             derive(keystore, algo, account, change, index, password_args)
         }
-        PqHdCommand::Address { mnemonic, passphrase, count, algo } => {
-            print_addresses(mnemonic, passphrase, count, algo)
-        }
+        PqHdCommand::Address { count, algo } => print_addresses(count, algo),
     }
 }
 
@@ -114,13 +110,23 @@ fn derive(
 }
 
 /// Print addresses for a mnemonic without storing anything.
+/// Reads mnemonic from stdin (never from CLI args to avoid shell history exposure).
 fn print_addresses(
-    mnemonic: String,
-    passphrase: String,
     count: u32,
     algo_str: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
     let algo = parse_algo(&algo_str)?;
+
+    eprint!("Enter recovery phrase (24 words): ");
+    std::io::stderr().flush()?;
+    let mnemonic = rpassword::read_password()?;
+
+    eprint!("BIP-39 passphrase (leave empty for none): ");
+    std::io::stderr().flush()?;
+    let passphrase = rpassword::read_password()?;
+
     let seed = mnemonic_to_seed(&mnemonic, &passphrase);
 
     println!("Algorithm : {algo_str}");
