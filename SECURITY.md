@@ -44,14 +44,14 @@ The following are **out of scope**:
 2. Fill in the advisory form (affected versions, component, reproduction steps, impact)
 3. Submit — this creates a private draft visible only to maintainers
 
-### Alternative — encrypted email
-
-If you prefer email, contact the maintainers at the address listed in
-[`Cargo.toml`](./Cargo.toml) under `[package].authors`, or reach the ShellDAO
-security team via the contact on [shell.org](https://shell.org).
-
 We will acknowledge receipt within **72 hours** and aim to provide an initial
 assessment within **7 days**.
+
+### Alternative — encrypted email
+
+Reach the ShellDAO security team via the contact on [shell.org](https://shell.org).
+If you need an encrypted channel, open a GitHub Private Security Advisory first
+and request a PGP key in the advisory thread — maintainers will provide one.
 
 Please include:
 - A concise description of the vulnerability
