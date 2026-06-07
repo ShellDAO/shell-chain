@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.2] — 2026-06-07 — Consensus liveness hardening
+
+### Fixed
+
+- **Slashed-validator slot deadlock in PoA proposer selection**: proposer slot
+  selection now uses slash-adjusted effective validator weights. Validators
+  fully slashed to effective weight `0` are excluded from slot assignment, so
+  remaining active validators can continue producing valid blocks.
+
 ## [0.23.0] — 2026-05-22 — Round 3 completion
 
 ### Added
