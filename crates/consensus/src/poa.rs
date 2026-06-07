@@ -236,6 +236,66 @@ impl PoaEngine {
         })
     }
 
+    /// Determine the expected proposer for `block_number` after applying current
+    /// slash state. Authorities with effective weight `0` are excluded.
+    fn expected_proposer_for_block(&self, block_number: u64) -> Address {
+        if self.config.authorities.is_empty() {
+            return Address::default();
+        }
+
+        let active: Vec<(Address, u64)> = self
+            .config
+            .authorities
+            .iter()
+            .filter_map(|authority| {
+                let weight = self.effective_weight_for(authority).unwrap_or(0);
+                (weight > 0).then_some((*authority, weight))
+            })
+            .collect();
+
+        if active.is_empty() {
+            return Address::default();
+        }
+
+        if self.config.authority_weights.is_empty() {
+            let idx = if self.config.epoch_length > 0 {
+                (block_number
+                    .checked_rem(self.config.epoch_length)
+                    .unwrap_or(0) as usize)
+                    .checked_rem(active.len())
+                    .unwrap_or(0)
+            } else {
+                (block_number as usize)
+                    .checked_rem(active.len())
+                    .unwrap_or(0)
+            };
+            return active[idx].0;
+        }
+
+        let total_weight: u64 = active
+            .iter()
+            .map(|(_, w)| *w)
+            .try_fold(0u64, |acc, w| acc.checked_add(w))
+            .unwrap_or(u64::MAX);
+        let seed_bytes = keccak256(&block_number.to_le_bytes());
+        let seed_u64 =
+            u64::from_le_bytes(seed_bytes.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
+        let ticket = seed_u64 % total_weight;
+
+        let mut cumulative = 0u64;
+        for (authority, weight) in &active {
+            cumulative = cumulative.saturating_add(*weight);
+            if ticket < cumulative {
+                return *authority;
+            }
+        }
+
+        active
+            .last()
+            .map(|(authority, _)| *authority)
+            .unwrap_or_default()
+    }
+
     /// Slash an authority for equivocation.
     pub fn slash_authority(&mut self, offender: &Address) {
         self.config.slash_authority(offender);
@@ -254,7 +314,7 @@ impl PoaEngine {
             return Err(ConsensusError::UnknownProposer(header.proposer));
         }
 
-        let expected = self.config.proposer_for_block(header.number);
+        let expected = self.expected_proposer_for_block(header.number);
         if header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
                 expected,
@@ -333,7 +393,7 @@ impl ConsensusEngine for PoaEngine {
         // Sealing requires a Signer which is injected externally.
         // The caller is responsible for signing — this validates the block is
         // sealable by checking the proposer slot.
-        let expected = self.config.proposer_for_block(block.header.number);
+        let expected = self.expected_proposer_for_block(block.header.number);
         if block.header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
                 expected,
@@ -344,7 +404,7 @@ impl ConsensusEngine for PoaEngine {
     }
 
     fn is_proposer(&self, slot: u64, address: &Address) -> bool {
-        self.config.proposer_for_block(slot) == *address
+        self.expected_proposer_for_block(slot) == *address
     }
 
     fn engine_type(&self) -> EngineType {
@@ -364,7 +424,7 @@ impl ConsensusEngine for PoaEngine {
         block: &mut Block,
         signer: &dyn shell_crypto::Signer,
     ) -> Result<(), ConsensusError> {
-        let expected = self.config.proposer_for_block(block.header.number);
+        let expected = self.expected_proposer_for_block(block.header.number);
         if block.header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
                 expected,
@@ -436,7 +496,7 @@ impl PoaEngine {
 
     /// Sign a block header with the proposer's key.
     pub fn sign_block(&self, block: &mut Block, signer: &dyn Signer) -> Result<(), ConsensusError> {
-        let expected = self.config.proposer_for_block(block.header.number);
+        let expected = self.expected_proposer_for_block(block.header.number);
         if block.header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
                 expected,
@@ -1249,6 +1309,38 @@ mod tests {
         engine.slash_authority(&addrs[0]);
 
         assert_eq!(engine.validator_weights().get(&addrs[0]), Some(&0));
+    }
+
+    #[test]
+    fn slashed_zero_weight_authority_is_excluded_from_slot_selection() {
+        let addrs = make_weighted_addrs(2);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![10, 10]);
+        config.slash_weight_bps = 10_000;
+        let mut engine = PoaEngine::new(config);
+
+        engine.slash_authority(&addrs[0]);
+        assert_eq!(engine.validator_weights().get(&addrs[0]), Some(&0));
+        assert_eq!(engine.validator_weights().get(&addrs[1]), Some(&10));
+
+        for block in 0u64..32 {
+            assert_eq!(
+                engine.expected_proposer_for_block(block),
+                addrs[1],
+                "slashed validator selected at block {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_header_accepts_remaining_active_validator_after_full_slash() {
+        let addrs = make_weighted_addrs(2);
+        let mut config = PoaConfig::new(addrs.clone(), 2).with_weights(vec![10, 10]);
+        config.slash_weight_bps = 10_000;
+        let mut engine = PoaEngine::new(config);
+        engine.slash_authority(&addrs[0]);
+
+        let header = sample_header(0, addrs[1], 1000);
+        assert!(engine.verify_header(&header).is_ok());
     }
 
     #[test]
