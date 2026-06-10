@@ -80,6 +80,9 @@ pub enum AaValidationError {
     #[error("contract paymaster validation failed: {0}")]
     PaymasterValidationFailed(String),
 
+    #[error("contract paymaster validation exceeded gas budget (50k limit)")]
+    PaymasterGasExceeded,
+
     #[error("session key expired at block {expiry_block} (current {current_block})")]
     SessionKeyExpired {
         expiry_block: u64,
@@ -651,9 +654,17 @@ fn call_paymaster_validate<S: KvStore + 'static>(
                 hex::encode(output)
             )))
         }
-        ExecutionResult::Halt { reason, .. } => Err(AaValidationError::PaymasterValidationFailed(
-            format!("halted: {reason:?}"),
-        )),
+        ExecutionResult::Halt { reason, .. } => {
+            // Check if halt reason is OutOfGas (paymaster exceeded 50k gas limit)
+            let reason_str = format!("{reason:?}");
+            if reason_str.contains("OutOfGas") {
+                Err(AaValidationError::PaymasterGasExceeded)
+            } else {
+                Err(AaValidationError::PaymasterValidationFailed(format!(
+                    "halted: {reason:?}",
+                )))
+            }
+        }
     }
 }
 

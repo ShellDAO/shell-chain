@@ -80,6 +80,9 @@ pub enum TxValidationError {
     #[error("contract paymaster validation failed: {0}")]
     PaymasterValidationFailed(String),
 
+    #[error("contract paymaster validation exceeded gas budget (50k limit)")]
+    PaymasterGasExceeded,
+
     #[error("session key expired at block {expiry_block} (current {current_block})")]
     SessionKeyExpired {
         expiry_block: u64,
@@ -130,6 +133,7 @@ impl TxValidationError {
             Self::PaymasterInsufficientBalance { .. } => "paymaster_insufficient_balance",
             Self::PaymasterRejected => "paymaster_rejected",
             Self::PaymasterValidationFailed(_) => "paymaster_validation_failed",
+            Self::PaymasterGasExceeded => "paymaster_gas_exceeded",
             Self::SessionKeyExpired { .. } => "session_key_expired",
             Self::SessionValueCapExceeded => "session_value_cap_exceeded",
             Self::SessionTargetMismatch => "session_target_mismatch",
@@ -512,6 +516,7 @@ impl From<AaValidationError> for TxValidationError {
             AaValidationError::PaymasterValidationFailed(msg) => {
                 Self::PaymasterValidationFailed(msg)
             }
+            AaValidationError::PaymasterGasExceeded => Self::PaymasterGasExceeded,
             AaValidationError::SessionKeyExpired {
                 expiry_block,
                 current_block,
