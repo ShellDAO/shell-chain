@@ -105,6 +105,7 @@ pub fn decode_revert_reason(output: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shell_primitives::INTRINSIC_GAS_TX;
 
     #[test]
     fn test_call_frame_new() {
@@ -112,11 +113,11 @@ mod tests {
             "CALL",
             Address::default(),
             Address::default(),
-            21000,
+            INTRINSIC_GAS_TX,
             Bytes::default(),
         );
         assert_eq!(frame.call_type, "CALL");
-        assert_eq!(frame.gas, 21000);
+        assert_eq!(frame.gas, INTRINSIC_GAS_TX);
         assert!(frame.calls.is_empty());
     }
 
@@ -126,7 +127,7 @@ mod tests {
             "CALL",
             Address::default(),
             Address::default(),
-            21000,
+            INTRINSIC_GAS_TX,
             Bytes::default(),
         )
         .with_value(U256::from(100));
@@ -139,7 +140,7 @@ mod tests {
             "CALL",
             Address::default(),
             Address::default(),
-            21000,
+            INTRINSIC_GAS_TX,
             Bytes::default(),
         );
         let result = TraceResult {
@@ -206,7 +207,7 @@ mod tests {
             "CALL",
             Address::default(),
             Address::default(),
-            21000,
+            INTRINSIC_GAS_TX,
             Bytes::default(),
         );
         let json = serde_json::to_string(&frame).unwrap();
