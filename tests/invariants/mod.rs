@@ -5,6 +5,7 @@
 
 mod t1_pq_native;
 mod t2_aa_first_class;
+mod t3_pqvm_execution;
 mod t5_atomic_default;
 mod t6_snake_case_wire;
 mod t7_domain_separation;
@@ -15,6 +16,7 @@ mod i_constants;
 pub use self::{
     t1_pq_native::verify_no_ecrecover,
     t2_aa_first_class::verify_aa_atomicity,
+    t3_pqvm_execution::verify_pqvm_sole_executor,
     t5_atomic_default::verify_bundle_revert_atomicity,
     t6_snake_case_wire::verify_rpc_snake_case,
     t7_domain_separation::verify_domain_bytes_unique,
