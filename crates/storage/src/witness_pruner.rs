@@ -15,7 +15,10 @@ use tracing::debug;
 use crate::{ChainStore, KvStore, StorageError, WitnessStore};
 
 /// Default number of recent blocks whose witness bundles are always retained.
-pub const DEFAULT_WITNESS_RETENTION: u64 = 128;
+/// Set to 256 for testnet to provide STARK prover with additional headroom.
+/// At 2s block times: 256 blocks ≈ 8.5 minutes retention window.
+/// Tuning: Mainnet should use 512 (≈17 minutes); testnet uses 256 for faster development cycles.
+pub const DEFAULT_WITNESS_RETENTION: u64 = 256;
 
 /// Result of a single witness prune pass.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
