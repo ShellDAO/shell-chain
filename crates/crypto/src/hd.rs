@@ -59,6 +59,13 @@ pub const ALGO_MLDSA65: u32 = 1;
 /// Algorithm path level for SLH-DSA-SHA2-256f (raw, applied as hardened).
 pub const ALGO_SLH_DSA: u32 = 2;
 
+/// AA Phase 2 session-key subtree: account level index (raw, applied as hardened).
+/// Path: `m/1'/1'/k'` — fixed first two components.
+pub const HD_SESSION_ACCOUNT: u32 = 1;
+/// AA Phase 2 session-key subtree: subtree level index (raw, applied as hardened).
+/// Path: `m/1'/1'/k'` — fixed second component marking the session subtree.
+pub const HD_SESSION_SUBTREE: u32 = 1;
+
 /// Expected ML-DSA-65 public key length in bytes (FIPS 204, NORMATIVE).
 pub const MLDSA65_PK_LENGTH: usize = 1952;
 /// Expected SLH-DSA-SHA2-256f public key length in bytes (FIPS 205, NORMATIVE).
@@ -329,6 +336,52 @@ pub fn derive_account(
         change_index,
         address_index,
     ];
+    let path = format_path(&components);
+
+    let master = master_node_from_seed(seed512);
+    let leaf = derive_at_path(&master, &components)?;
+
+    match algo {
+        HdAlgo::MlDsa65 => derive_mldsa65_account(&leaf, path),
+        HdAlgo::SlhDsaSha2256f => derive_slhdsa_account(&leaf, path),
+    }
+}
+
+/// Derive an AA Phase 2 session key from a 64-byte seed.
+///
+/// Path: `m/1'/1'/k'` (all hardened), where k = `session_index`.
+///
+/// Session keys are time-bounded delegated signing keys used in AA bundles.
+/// They are intentionally separated from the primary account key tree
+/// (`m/9000'/8888'/...`) to prevent namespace collisions between session
+/// and wallet keys.
+///
+/// # Key Space
+/// - `m/1'/1'/0'` — first session key (k=0)
+/// - `m/1'/1'/1'` — second session key (k=1)
+/// - `m/1'/1'/k'` — up to 2^31 session keys per seed
+///
+/// # Guarantees
+/// - Deterministic: same (seed512, algo, k) always yields the same key pair
+/// - Isolated: session keys cannot be confused with primary account keys
+/// - Cross-algorithm safe: specifying `algo` prevents collisions across key types
+/// - Memory-safe: `HdNode` secret material is zeroized on drop
+///
+/// # Usage
+/// ```no_run
+/// use shell_crypto::hd::{derive_session_key, mnemonic_to_seed, HdAlgo};
+///
+/// let seed = mnemonic_to_seed("word1 word2 ...", "");
+/// let session_0 = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+/// let session_1 = derive_session_key(&seed, HdAlgo::MlDsa65, 1).unwrap();
+/// assert_ne!(session_0.public_key, session_1.public_key);
+/// ```
+pub fn derive_session_key(
+    seed512: &[u8; 64],
+    algo: HdAlgo,
+    session_index: u32,
+) -> Result<HdAccount, CryptoError> {
+    let components = [HD_SESSION_ACCOUNT, HD_SESSION_SUBTREE, session_index];
     let path = format_path(&components);
 
     let master = master_node_from_seed(seed512);
@@ -656,5 +709,86 @@ mod tests {
         assert_eq!(HD_COIN_TYPE, 8888);
         assert_eq!(ALGO_MLDSA65, 1);
         assert_eq!(ALGO_SLH_DSA, 2);
+    }
+
+    // ── Session key derivation (AA Phase 2) ──────────────────────────────────
+
+    #[test]
+    fn session_key_path_is_correct() {
+        let seed = [0u8; 64];
+        let session = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        assert_eq!(session.path, "m/1'/1'/0'", "session key 0 path");
+
+        let session1 = derive_session_key(&seed, HdAlgo::MlDsa65, 1).unwrap();
+        assert_eq!(session1.path, "m/1'/1'/1'", "session key 1 path");
+
+        let session100 = derive_session_key(&seed, HdAlgo::MlDsa65, 100).unwrap();
+        assert_eq!(session100.path, "m/1'/1'/100'", "session key 100 path");
+    }
+
+    #[test]
+    fn session_keys_are_deterministic() {
+        // Same (seed, algo, index) always produces the same key pair.
+        let seed = [0xABu8; 64];
+        let s0a = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        let s0b = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        assert_eq!(s0a.public_key, s0b.public_key, "same index must be deterministic");
+        assert_eq!(s0a.address, s0b.address, "same index address must be deterministic");
+    }
+
+    #[test]
+    fn session_keys_differ_by_index() {
+        // Different indices produce different keys.
+        let seed = [0xCDu8; 64];
+        let s0 = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        let s1 = derive_session_key(&seed, HdAlgo::MlDsa65, 1).unwrap();
+        let s2 = derive_session_key(&seed, HdAlgo::MlDsa65, 2).unwrap();
+        assert_ne!(s0.public_key, s1.public_key, "index 0 != index 1");
+        assert_ne!(s0.public_key, s2.public_key, "index 0 != index 2");
+        assert_ne!(s1.public_key, s2.public_key, "index 1 != index 2");
+        assert_ne!(s0.address, s1.address, "addresses must differ by index");
+    }
+
+    #[test]
+    fn session_key_differs_from_account_key() {
+        // Session tree (m/1'/1'/k') must not collide with account tree (m/9000'/8888'/...).
+        let seed = [0xEFu8; 64];
+        let session = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        let account = derive_account(&seed, HdAlgo::MlDsa65, 0, 0, 0).unwrap();
+        assert_ne!(
+            session.public_key, account.public_key,
+            "session key must not collide with account key"
+        );
+        assert_ne!(
+            session.address, account.address,
+            "session address must not collide with account address"
+        );
+    }
+
+    #[test]
+    fn session_key_slhdsa_works() {
+        // SLH-DSA session keys follow the same path scheme.
+        let seed = [0x12u8; 64];
+        let s0 = derive_session_key(&seed, HdAlgo::SlhDsaSha2256f, 0).unwrap();
+        let s1 = derive_session_key(&seed, HdAlgo::SlhDsaSha2256f, 1).unwrap();
+        assert_eq!(s0.path, "m/1'/1'/0'");
+        assert_eq!(s0.algo_id, 2, "SLH-DSA algo_id");
+        assert_eq!(s0.public_key.len(), SLHDSA_PK_LENGTH);
+        assert_ne!(s0.public_key, s1.public_key, "different SLH-DSA session keys");
+    }
+
+    #[test]
+    fn session_key_mldsa_slhdsa_differ_same_index() {
+        // Same index but different algo must produce different keys (cross-algorithm safety).
+        let seed = [0x34u8; 64];
+        let ml = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
+        let slh = derive_session_key(&seed, HdAlgo::SlhDsaSha2256f, 0).unwrap();
+        assert_ne!(ml.address, slh.address, "ML-DSA and SLH-DSA addresses must differ");
+    }
+
+    #[test]
+    fn session_key_constants_are_correct() {
+        assert_eq!(HD_SESSION_ACCOUNT, 1);
+        assert_eq!(HD_SESSION_SUBTREE, 1);
     }
 }
