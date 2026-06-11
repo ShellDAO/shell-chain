@@ -215,3 +215,80 @@ pub fn mine_block(
 
     hash
 }
+
+/// Returns a reference to the [`RpcHandler`] inside the [`TestEnv`].
+pub fn make_rpc(env: &TestEnv) -> &RpcHandler<MemoryDb> {
+    &env.handler
+}
+
+// ---------------------------------------------------------------------------
+// pqvm-e2e stubs — compiled only when `pqvm-e2e` feature is enabled.
+//
+// These helpers require a full PQVM executor with deployed contract bytecode
+// and are intentionally left as stubs so that normal CI still compiles the
+// test file while making the missing infrastructure explicit.
+// ---------------------------------------------------------------------------
+
+/// Compiled bytecode of a named paymaster test contract.
+/// Populated only when actual bytecode fixtures are provided (pqvm-e2e infra).
+#[cfg(feature = "pqvm-e2e")]
+pub struct ContractBytecode {
+    pub bytecode: Bytes,
+}
+
+/// Looks up pre-compiled bytecode for `name` (e.g. "SimplePaymaster").
+/// Replace with real artifact loading when pqvm-e2e infra is in place.
+#[cfg(feature = "pqvm-e2e")]
+pub fn compile_contract(_name: &str) -> ContractBytecode {
+    unimplemented!(
+        "compile_contract requires PQVM executor + Solidity fixtures; \
+         see workspace/projects/shell-chain/contracts/ and AA-PHASE-2-GUIDE.md"
+    )
+}
+
+/// Builds a deploy transaction from the given bytecode.
+#[cfg(feature = "pqvm-e2e")]
+pub fn make_deploy_tx(sender: &FundedAccount, bytecode: &ContractBytecode) -> SignedTransaction {
+    use shell_core::AA_BUNDLE_TX_TYPE;
+    let tx = Transaction {
+        chain_id: TEST_CHAIN_ID,
+        nonce: 0,
+        max_fee_per_gas: 1_000_000_000,
+        max_priority_fee_per_gas: 100_000_000,
+        gas_limit: 500_000,
+        to: None,
+        value: U256::ZERO,
+        data: bytecode.bytecode.clone(),
+        access_list: None,
+        tx_type: AA_BUNDLE_TX_TYPE,
+        max_fee_per_blob_gas: None,
+        blob_versioned_hashes: None,
+    };
+    sign_tx(&sender.signer, sender.address, tx)
+}
+
+/// Submits a transaction, executes it through the PQVM, and mines a block.
+/// Requires an RPC handler backed by a live PQVM executor.
+#[cfg(feature = "pqvm-e2e")]
+pub async fn execute_and_mine(
+    _env: &TestEnv,
+    _rpc: &RpcHandler<MemoryDb>,
+    _tx: SignedTransaction,
+) -> Result<ShellHash, String> {
+    unimplemented!(
+        "execute_and_mine requires a PQVM executor wired into the RPC handler; \
+         pending Phase 3 integration"
+    )
+}
+
+/// Computes the CREATE-address for a contract deployed by `sender` at `nonce`.
+#[cfg(feature = "pqvm-e2e")]
+pub fn compute_contract_addr(sender: &Address, nonce: u64) -> Address {
+    // Deterministic CREATE address: blake3(sender || nonce_be) truncated to 32 bytes.
+    use shell_primitives::blake3_hash;
+    let mut preimage = Vec::with_capacity(32 + 8);
+    preimage.extend_from_slice(sender.0.as_slice());
+    preimage.extend_from_slice(&nonce.to_be_bytes());
+    let hash = blake3_hash(&preimage);
+    Address(hash.0.into())
+}

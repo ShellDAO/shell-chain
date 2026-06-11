@@ -1,5 +1,6 @@
 use alloy_primitives::Bytes as AlBytes;
 use revm::context::result::ExecutionResult;
+use revm::context_interface::result::HaltReason;
 use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
 use revm::database_interface::Database;
 use revm::handler::instructions::EthInstructions;
@@ -655,9 +656,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
             )))
         }
         ExecutionResult::Halt { reason, .. } => {
-            // Check if halt reason is OutOfGas (paymaster exceeded 50k gas limit)
-            let reason_str = format!("{reason:?}");
-            if reason_str.contains("OutOfGas") {
+            if matches!(reason, HaltReason::OutOfGas(_)) {
                 Err(AaValidationError::PaymasterGasExceeded)
             } else {
                 Err(AaValidationError::PaymasterValidationFailed(format!(

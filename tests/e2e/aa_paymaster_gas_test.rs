@@ -5,6 +5,11 @@
 //! 1. Paymasters using ≤50k gas are accepted
 //! 2. Paymasters exceeding 50k gas are rejected with PaymasterGasExceeded
 //! 3. Gas metering is precise and enforced consistently
+//!
+//! **Requires the `pqvm-e2e` feature**:
+//! ```sh
+//! cargo test -p shell-e2e-tests --features pqvm-e2e --test aa_paymaster_gas_test
+//! ```
 
 use shell_e2e::*;
 use shell_core::{AaBundle, InnerCall, SignedTransaction, Transaction, AA_BUNDLE_TX_TYPE};
@@ -80,7 +85,7 @@ async fn paymaster_gas_metering_within_limit_success() {
     store_block(&env, &genesis);
 
     let rpc = make_rpc(&env);
-    let acc = make_funded_account(&env, TEST_CHAIN_ID);
+    let acc = make_funded_account(&env);
 
     // Create a simple contract that returns true with minimal gas usage
     // (e.g., a contract that just returns 0x01 without any logic)
@@ -110,7 +115,7 @@ async fn paymaster_gas_metering_exceeds_limit_rejected() {
     store_block(&env, &genesis);
 
     let rpc = make_rpc(&env);
-    let acc = make_funded_account(&env, TEST_CHAIN_ID);
+    let acc = make_funded_account(&env);
 
     // Deploy a contract that intentionally loops to exceed 50k gas
     let loop_contract = compile_contract("LoopingPaymaster");
@@ -150,7 +155,7 @@ async fn paymaster_gas_metering_at_limit_boundary_success() {
     store_block(&env, &genesis);
 
     let rpc = make_rpc(&env);
-    let acc = make_funded_account(&env, TEST_CHAIN_ID);
+    let acc = make_funded_account(&env);
 
     // Deploy a contract that uses approximately 50k gas (expensive operation)
     let boundary_contract = compile_contract("BoundaryPaymaster");
@@ -181,7 +186,7 @@ async fn paymaster_gas_metering_with_session_key_combined() {
     store_block(&env, &genesis);
 
     let rpc = make_rpc(&env);
-    let acc = make_funded_account(&env, TEST_CHAIN_ID);
+    let acc = make_funded_account(&env);
 
     // Deploy paymaster contract
     let paymaster_contract = compile_contract("SimplePaymaster");

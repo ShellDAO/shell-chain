@@ -37,6 +37,17 @@ path = "aa_batch_test.rs"
 name = "aa_sponsored_test"
 path = "aa_sponsored_test.rs"
 
+# aa_paymaster_gas_test requires a full PQVM executor + contract bytecode fixtures.
+# Compile and run only with: cargo test -p shell-e2e-tests --features pqvm-e2e --test aa_paymaster_gas_test
+[[test]]
+name = "aa_paymaster_gas_test"
+path = "aa_paymaster_gas_test.rs"
+required-features = ["pqvm-e2e"]
+
+[features]
+# Gate tests that require a full PQVM executor and deployed contract bytecode.
+pqvm-e2e = []
+
 [dependencies]
 shell-primitives = { path = "../../crates/primitives" }
 shell-crypto = { path = "../../crates/crypto" }
