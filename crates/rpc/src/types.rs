@@ -253,6 +253,23 @@ pub struct BatchInnerCallRequest {
     pub gas_limit: Option<String>,
 }
 
+/// Request body for `shell_estimatePaymasterGas` (AA Phase 2).
+///
+/// Estimates gas for a contract paymaster `validatePaymasterOp` staticcall.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaymasterGasEstimateRequest {
+    /// Paymaster contract address to query.
+    pub paymaster: Address,
+    /// Bundle sender address.
+    pub sender: Address,
+    /// Inner calls as raw hex bytes (forwarded to `validatePaymasterOp`).
+    pub inner_calls_data: Option<String>,
+    /// Max fee per gas (hex wei). Used to compute `max_gas_cost`.
+    pub max_fee_per_gas: Option<String>,
+    /// Opaque context bytes forwarded to `validatePaymasterOp`.
+    pub paymaster_context: Option<String>,
+}
+
 /// Active storage profile descriptor returned by `shell_getStorageProfile`.
 ///
 /// Active storage profile descriptor returned by `shell_getStorageProfile`.

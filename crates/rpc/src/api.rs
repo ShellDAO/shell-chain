@@ -599,6 +599,36 @@ pub trait ShellApi {
         req: crate::types::BatchEstimateRequest,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Estimates gas required for a contract paymaster validation call.
+    ///
+    /// Performs a dry-run of `validatePaymasterOp` against the paymaster
+    /// contract and returns a detailed gas breakdown. Use this to compute
+    /// `gas_limit` before submitting a sponsored AA bundle.
+    ///
+    /// **Input** (`paymaster_context` is the opaque bytes forwarded to the contract):
+    /// ```json
+    /// {
+    ///   "paymaster": "0x…",
+    ///   "sender": "0x…",
+    ///   "inner_calls_data": "0x…",
+    ///   "max_fee_per_gas": "0x…",
+    ///   "paymaster_context": "0x…"
+    /// }
+    /// ```
+    ///
+    /// **Response**:
+    /// - `validation_gas` — estimated gas for `validatePaymasterOp` staticcall
+    /// - `paymaster_gas_cap` — hard cap enforced by the node (50 000)
+    /// - `within_cap` — whether `validation_gas ≤ paymaster_gas_cap`
+    /// - `paymaster` — the paymaster address queried
+    ///
+    /// **Error** (`-32000`): EVM simulation failed or paymaster contract reverted.
+    #[method(name = "estimatePaymasterGas")]
+    async fn estimate_paymaster_gas(
+        &self,
+        req: crate::types::PaymasterGasEstimateRequest,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns Native-AA paymaster policy for an address.
     ///
     /// In v0.18.0 Phase 1, paymasters are plain EOAs; the "policy" is

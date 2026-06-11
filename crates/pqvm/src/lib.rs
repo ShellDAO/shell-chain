@@ -22,7 +22,8 @@ pub mod tracer;
 mod tx_validation;
 
 pub use aa_validation::{
-    validate_aa_tx, AaValidationError, AaValidationOutcome, VALIDATION_GAS_CAP,
+    validate_aa_tx, AaValidationError, AaValidationOutcome, PAYMASTER_VALIDATE_GAS_CAP,
+    VALIDATION_GAS_CAP,
 };
 pub use executor::{
     commit_pqvm_state, commit_pqvm_state_raw, ExecutorError, ShellPqvm, TxExecutionResult,

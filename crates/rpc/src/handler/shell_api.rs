@@ -721,6 +721,49 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         }))
     }
 
+    async fn estimate_paymaster_gas(
+        &self,
+        req: crate::types::PaymasterGasEstimateRequest,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        use shell_pqvm::PAYMASTER_VALIDATE_GAS_CAP;
+
+        // Parse optional fields, applying defaults.
+        let inner_calls_data = match req.inner_calls_data.as_deref() {
+            Some(hex) if !hex.is_empty() && hex != "0x" => hex::decode(hex.trim_start_matches("0x"))
+                .map_err(|_| invalid_params("estimatePaymasterGas: invalid inner_calls_data hex"))?,
+            _ => vec![],
+        };
+        let max_fee_per_gas: u64 = match req.max_fee_per_gas.as_deref() {
+            Some(hex) => parse_hex_u64(hex)?,
+            None => 1_000_000_000, // 1 gwei default
+        };
+        let paymaster_context = match req.paymaster_context.as_deref() {
+            Some(hex) if !hex.is_empty() && hex != "0x" => hex::decode(hex.trim_start_matches("0x"))
+                .map_err(|_| invalid_params("estimatePaymasterGas: invalid paymaster_context hex"))?,
+            _ => vec![],
+        };
+
+        // Build a minimal dummy SignedTransaction to feed the paymaster validator.
+        // We cannot run a real staticcall without a full EVM environment, so we
+        // return a static estimate indicating the cap and whether the contract
+        // is deployable. Full simulation requires live storage access.
+        let _ = (inner_calls_data, max_fee_per_gas, paymaster_context); // used in full impl
+
+        // Static response: indicates the 50k gas cap enforced by CONSTITUTION §2.2.
+        // Full EVM simulation (querying the contract) requires a world-state snapshot
+        // and is implemented as a v0.26.0 milestone.
+        Ok(serde_json::json!({
+            "paymaster": req.paymaster,
+            "sender": req.sender,
+            "validation_gas": serde_json::Value::Null,
+            "paymaster_gas_cap": hex_u64(PAYMASTER_VALIDATE_GAS_CAP),
+            "within_cap": serde_json::Value::Null,
+            "note": "Full EVM simulation for validatePaymasterOp is a v0.26.0 milestone. \
+                     Current response reports the protocol gas cap only. \
+                     Use shell_estimateBatch for bundle gas estimation.",
+        }))
+    }
+
     async fn get_paymaster_policy(
         &self,
         address: Address,
