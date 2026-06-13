@@ -622,6 +622,7 @@ async fn run_with_store<S: KvStore + 'static>(
             tls_key_path: args.rpc_tls_key.clone(),
             ..RpcConfig::default()
         },
+        rpc_enabled: true,
         network: NetworkConfig::default(),
         proposer_address: proposer_address_for_role(node_role, authority),
         block_time_ms: args.block_time,

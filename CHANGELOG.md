@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.3] — 2026-06-13 — CI parity hardening
+
+### Fixed
+
+- **Event-loop unit tests under socket-restricted sandboxes**: `Node::run` now
+  supports disabling JSON-RPC startup through `NodeConfig::rpc_enabled` while
+  preserving RPC startup by default for normal node operation. Event-loop tests
+  that do not exercise RPC disable it explicitly, removing sandbox-only
+  `Operation not permitted` bind failures from `make ci`.
+
 ## [0.24.2] — 2026-06-07 — Consensus liveness hardening
 
 ### Fixed

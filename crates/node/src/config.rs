@@ -202,6 +202,11 @@ pub struct NodeConfig {
     pub mempool: MempoolConfig,
     /// JSON-RPC server configuration.
     pub rpc: RpcConfig,
+    /// Whether [`Node::run`](crate::node::Node::run) starts the JSON-RPC server.
+    ///
+    /// Defaults to true for normal node operation. Tests and embedded runtimes
+    /// that drive the event loop without opening sockets can disable it.
+    pub rpc_enabled: bool,
     /// P2P network configuration.
     pub network: NetworkConfig,
     /// This node's authority address (if it is a block producer).
@@ -286,6 +291,7 @@ impl NodeConfig {
                 ws_addr: None,
                 ..RpcConfig::default()
             },
+            rpc_enabled: true,
             network: NetworkConfig::default(),
             proposer_address: Some(authority),
             block_time_ms: params.block_time_ms,

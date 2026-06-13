@@ -182,10 +182,12 @@ impl<S: KvStore + 'static> Node<S> {
         // Get the peer count handle from the network for RPC.
         let peer_count_handle = network.peer_count_handle();
 
-        self.config
-            .rpc
-            .validate_dev_rpc_exposure()
-            .map_err(NodeError::Startup)?;
+        if self.config.rpc_enabled {
+            self.config
+                .rpc
+                .validate_dev_rpc_exposure()
+                .map_err(NodeError::Startup)?;
+        }
 
         let invariant_snapshot = self.check_core_invariants()?;
         info!(
@@ -198,47 +200,53 @@ impl<S: KvStore + 'static> Node<S> {
             "core chain invariants satisfied"
         );
 
-        let rpc_handle = start_rpc_server(
-            self.config.rpc.clone(),
-            self.chain_store.clone(),
-            self.world_state.clone(),
-            self.tx_pool.clone(),
-            self.config.chain_id,
-            Some(tx_broadcast_tx),
-            block_event_tx.clone(),
-            proposer_signer,
-            self.config.proposer_address,
-            finalized_number.clone(),
-            self.finality.clone(),
-            peer_count_handle,
-            if self.config.rpc.has_api_namespace("evm") {
-                Some(self.clone() as Arc<dyn DevRpcControl>)
-            } else {
-                None
-            },
-            None, // admin_p2p_context: wire peer_id + p2p_listen when P2P layer is integrated
-            Some(Arc::clone(&self.witness_store)), // B5: witness store wired
-            Some({
-                let p = &self.config.pruning;
-                shell_rpc::types::StorageProfileInfo {
-                    profile: StorageProfile::from_pruning_config(p)
-                        .whitepaper_name()
-                        .to_string(),
-                    body_retention: p.body_retention,
-                    witness_retention: p.witness_retention,
-                    keep_recent: p.keep_recent,
-                    proof_replacement_grace: p.proof_replacement_grace,
-                    state_pruning_experimental: p.state_pruning_experimental,
-                }
-            }),
-            Some(Arc::clone(&self.consensus)
-                as Arc<
-                    parking_lot::RwLock<dyn shell_consensus::ConsensusEngine>,
-                >), // W.6: wire consensus engine for shell_consensusInfo
-            Some(Arc::new(self.amendment_store.clone())), // STK.4: wire proof amendment store
-        )
-        .await
-        .map_err(|e| NodeError::Startup(format!("RPC: {e}")))?;
+        let rpc_handle = if self.config.rpc_enabled {
+            Some(
+                start_rpc_server(
+                    self.config.rpc.clone(),
+                    self.chain_store.clone(),
+                    self.world_state.clone(),
+                    self.tx_pool.clone(),
+                    self.config.chain_id,
+                    Some(tx_broadcast_tx),
+                    block_event_tx.clone(),
+                    proposer_signer,
+                    self.config.proposer_address,
+                    finalized_number.clone(),
+                    self.finality.clone(),
+                    peer_count_handle,
+                    if self.config.rpc.has_api_namespace("evm") {
+                        Some(self.clone() as Arc<dyn DevRpcControl>)
+                    } else {
+                        None
+                    },
+                    None, // admin_p2p_context: wire peer_id + p2p_listen when P2P layer is integrated
+                    Some(Arc::clone(&self.witness_store)), // B5: witness store wired
+                    Some({
+                        let p = &self.config.pruning;
+                        shell_rpc::types::StorageProfileInfo {
+                            profile: StorageProfile::from_pruning_config(p)
+                                .whitepaper_name()
+                                .to_string(),
+                            body_retention: p.body_retention,
+                            witness_retention: p.witness_retention,
+                            keep_recent: p.keep_recent,
+                            proof_replacement_grace: p.proof_replacement_grace,
+                            state_pruning_experimental: p.state_pruning_experimental,
+                        }
+                    }),
+                    Some(Arc::clone(&self.consensus)
+                        as Arc<
+                            parking_lot::RwLock<dyn shell_consensus::ConsensusEngine>,
+                        >), // W.6: wire consensus engine for shell_consensusInfo
+                    Some(Arc::new(self.amendment_store.clone())), // STK.4: wire proof amendment store
+                )
+                .await
+                .map_err(|e| NodeError::Startup(format!("RPC: {e}")))?,
+            )
+        } else {
+            None
+        };
 
         // Register own authority pubkey for seal verification.
         if let Some(addr) = self.config.proposer_address {
@@ -1772,11 +1780,13 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Graceful shutdown: stop RPC servers first.
-        rpc_handle.http_handle.stop().ok();
-        if let Some(ws) = rpc_handle.ws_handle {
-            ws.stop().ok();
+        if let Some(rpc_handle) = rpc_handle {
+            rpc_handle.http_handle.stop().ok();
+            if let Some(ws) = rpc_handle.ws_handle {
+                ws.stop().ok();
+            }
+            eprintln!("✓ RPC server stopped");
         }
-        eprintln!("✓ RPC server stopped");
 
         task_lifecycle.shutdown().await;
 

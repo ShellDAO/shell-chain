@@ -4145,6 +4145,8 @@ mod tests {
         // Override block_time to 1s so the test completes quickly
         // regardless of the Dev network profile default (30s).
         node.config.block_time_ms = 1_000;
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
         // Disable idle-skip so the loop produces blocks even with an empty
         // mempool (this test only verifies block production, not idle behavior).
         node.config.max_idle_interval_ms = 0;
@@ -4185,6 +4187,7 @@ mod tests {
         let (mut node, signer) = setup_node();
         node.config.node_role = crate::config::NodeRole::ValidatorProver;
         node.config.metrics.enabled = false;
+        node.config.rpc_enabled = false;
         node.config.rpc.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
         node.config.rpc.ws_addr = None;
         store_consistent_genesis(&node);
