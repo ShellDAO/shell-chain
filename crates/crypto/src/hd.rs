@@ -732,8 +732,14 @@ mod tests {
         let seed = [0xABu8; 64];
         let s0a = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
         let s0b = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
-        assert_eq!(s0a.public_key, s0b.public_key, "same index must be deterministic");
-        assert_eq!(s0a.address, s0b.address, "same index address must be deterministic");
+        assert_eq!(
+            s0a.public_key, s0b.public_key,
+            "same index must be deterministic"
+        );
+        assert_eq!(
+            s0a.address, s0b.address,
+            "same index address must be deterministic"
+        );
     }
 
     #[test]
@@ -774,7 +780,10 @@ mod tests {
         assert_eq!(s0.path, "m/1'/1'/0'");
         assert_eq!(s0.algo_id, 2, "SLH-DSA algo_id");
         assert_eq!(s0.public_key.len(), SLHDSA_PK_LENGTH);
-        assert_ne!(s0.public_key, s1.public_key, "different SLH-DSA session keys");
+        assert_ne!(
+            s0.public_key, s1.public_key,
+            "different SLH-DSA session keys"
+        );
     }
 
     #[test]
@@ -783,7 +792,10 @@ mod tests {
         let seed = [0x34u8; 64];
         let ml = derive_session_key(&seed, HdAlgo::MlDsa65, 0).unwrap();
         let slh = derive_session_key(&seed, HdAlgo::SlhDsaSha2256f, 0).unwrap();
-        assert_ne!(ml.address, slh.address, "ML-DSA and SLH-DSA addresses must differ");
+        assert_ne!(
+            ml.address, slh.address,
+            "ML-DSA and SLH-DSA addresses must differ"
+        );
     }
 
     #[test]

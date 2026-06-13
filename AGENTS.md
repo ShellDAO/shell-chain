@@ -16,7 +16,7 @@ The post-quantum-native Layer 1 node implementation:
 - Account Abstraction natively in protocol (tx type `0x7E`)
 - RocksDB storage with three-segment witness pruner
 
-Currently at **v0.23.0**.
+Currently at **v0.24.2**.
 
 ## Read order before editing
 

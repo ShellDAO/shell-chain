@@ -11,8 +11,8 @@ use crate::aa_validation::{validate_aa_tx, AaValidationError};
 use shell_core::SignedTransaction;
 use shell_crypto::{infer_signature_type_from_address, Verifier};
 use shell_primitives::{
-    Address, U256, INTRINSIC_GAS_TX, GAS_CONTRACT_CREATION, GAS_PER_ZERO_BYTE,
-    GAS_PER_NONZERO_BYTE, ACCESS_LIST_ADDRESS_COST, ACCESS_LIST_STORAGE_KEY_COST,
+    Address, ACCESS_LIST_ADDRESS_COST, ACCESS_LIST_STORAGE_KEY_COST, GAS_CONTRACT_CREATION,
+    GAS_PER_NONZERO_BYTE, GAS_PER_ZERO_BYTE, INTRINSIC_GAS_TX, U256,
 };
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 

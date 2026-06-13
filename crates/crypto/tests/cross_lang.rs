@@ -73,6 +73,7 @@ fn cross_lang_keygen_seed_produces_identical_keys() {
     );
     assert_eq!(pk_bytes.len(), fixture.key_sizes.public_key_len);
     assert_eq!(sk_bytes.len(), fixture.key_sizes.secret_key_len);
+    assert_eq!(fixture.key_sizes.signature_len, 3309);
 }
 
 // ─── Signature production ─────────────────────────────────────────────────────

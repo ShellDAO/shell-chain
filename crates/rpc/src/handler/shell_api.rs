@@ -729,8 +729,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
         // Parse optional fields, applying defaults.
         let inner_calls_data = match req.inner_calls_data.as_deref() {
-            Some(hex) if !hex.is_empty() && hex != "0x" => hex::decode(hex.trim_start_matches("0x"))
-                .map_err(|_| invalid_params("estimatePaymasterGas: invalid inner_calls_data hex"))?,
+            Some(hex) if !hex.is_empty() && hex != "0x" => {
+                hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
+                    invalid_params("estimatePaymasterGas: invalid inner_calls_data hex")
+                })?
+            }
             _ => vec![],
         };
         let max_fee_per_gas: u64 = match req.max_fee_per_gas.as_deref() {
@@ -738,8 +741,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             None => 1_000_000_000, // 1 gwei default
         };
         let paymaster_context = match req.paymaster_context.as_deref() {
-            Some(hex) if !hex.is_empty() && hex != "0x" => hex::decode(hex.trim_start_matches("0x"))
-                .map_err(|_| invalid_params("estimatePaymasterGas: invalid paymaster_context hex"))?,
+            Some(hex) if !hex.is_empty() && hex != "0x" => {
+                hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
+                    invalid_params("estimatePaymasterGas: invalid paymaster_context hex")
+                })?
+            }
             _ => vec![],
         };
 

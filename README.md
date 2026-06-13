@@ -2,7 +2,7 @@
 
 <!-- [![Build Status](https://img.shields.io/github/actions/workflow/status/LucienSong/shell-chain/ci.yml?branch=main)](https://github.com/LucienSong/shell-chain/actions) -->
 <!-- [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) -->
-<!-- [![Version](https://img.shields.io/badge/version-0.23.0-green.svg)](CHANGELOG.md) -->
+<!-- [![Version](https://img.shields.io/badge/version-0.24.2-green.svg)](CHANGELOG.md) -->
 
 The first PQVM-native, post-quantum blockchain — quantum-safe **before Q-Day**, no migration needed.
 
@@ -17,7 +17,7 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 - 🏗️ **Native Account Abstraction** — protocol-level smart accounts with built-in PQ validation, key rotation, and custom validator hooks
 - 🧩 **PQ Precompile Suite** — 6 on-chain precompiles at `0x0001`–`0x0006`: ML-DSA-65 verify, SLH-DSA-SHA2-256f verify, ML-DSA-65 batch verify, BLAKE3-256, BLAKE3-512, PQAddr derive
 - ⚖️ **wPoA Consensus** — Weighted Proof-of-Authority with weighted proposer rotation, view-change fallback, offline/equivocation handling, economic slash weights, and finality tracking
-- ⚡ **STARK Sig-Aggregation** — Winterfell proofs compress PQ witness data, track challenges through `Open → Resolved/Slashed`, and in v0.23.0 ship multi-layer (L1/L2/L3) settlement plus trie-pruning integration for lighter storage profiles.
+- ⚡ **STARK Sig-Aggregation** — Winterfell proofs compress PQ witness data, track challenges through `Open → Resolved/Slashed`, and in v0.24.x ship multi-layer (L1/L2/L3) settlement, trie-pruning integration, and consensus liveness hardening for lighter storage profiles.
 - 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
 - 🛠️ **Developer Ecosystem** — TypeScript SDK (`shell-sdk`) with viem-based PQ signers and AA transaction builders
 - 🌐 **P2P Networking** — libp2p with GossipSub, Kademlia DHT, peer scoring, and message signature verification

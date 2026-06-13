@@ -11,9 +11,9 @@
 //! cargo test -p shell-e2e-tests --features pqvm-e2e --test aa_paymaster_gas_test
 //! ```
 
-use shell_e2e::*;
 use shell_core::{AaBundle, InnerCall, SignedTransaction, Transaction, AA_BUNDLE_TX_TYPE};
 use shell_crypto::Signer;
+use shell_e2e::*;
 use shell_primitives::{Address, Bytes, U256};
 use shell_rpc::api::ShellApiServer;
 

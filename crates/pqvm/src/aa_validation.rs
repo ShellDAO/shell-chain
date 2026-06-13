@@ -1,7 +1,7 @@
 use alloy_primitives::Bytes as AlBytes;
 use revm::context::result::ExecutionResult;
-use revm::context_interface::result::HaltReason;
 use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
+use revm::context_interface::result::HaltReason;
 use revm::database_interface::Database;
 use revm::handler::instructions::EthInstructions;
 use revm::handler::{ExecuteEvm, MainnetContext};
