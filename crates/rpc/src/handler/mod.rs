@@ -4638,6 +4638,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn estimate_paymaster_gas_reports_versioned_cap_only_status() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 20]);
+        let sender = Address::from([0xBB; 20]);
+
+        let res = ShellApiServer::estimate_paymaster_gas(
+            &handler,
+            PaymasterGasEstimateRequest {
+                paymaster,
+                sender,
+                inner_calls_data: Some("0x".into()),
+                max_fee_per_gas: Some("0x3b9aca00".into()),
+                paymaster_context: Some("0x01".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res["paymaster"], serde_json::to_value(paymaster).unwrap());
+        assert_eq!(res["sender"], serde_json::to_value(sender).unwrap());
+        assert_eq!(res["validation_gas"], serde_json::Value::Null);
+        assert_eq!(res["within_cap"], serde_json::Value::Null);
+        assert_eq!(res["paymaster_gas_cap"], "0xc350");
+        assert_eq!(res["simulation_status"], "cap_only");
+        assert_eq!(res["simulation_version"], 1u64);
+        assert_eq!(res["capability"], "paymaster_cap_only");
+    }
+
+    #[tokio::test]
     async fn is_sponsored_returns_not_found_for_unknown_hash() {
         let handler = setup();
         let res = ShellApiServer::is_sponsored(&handler, ShellHash::from_slice(&[0u8; 32]))

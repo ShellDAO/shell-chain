@@ -599,11 +599,13 @@ pub trait ShellApi {
         req: crate::types::BatchEstimateRequest,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Estimates gas required for a contract paymaster validation call.
+    /// Reports paymaster validation gas capability for contract paymasters.
     ///
-    /// Performs a dry-run of `validatePaymasterOp` against the paymaster
-    /// contract and returns a detailed gas breakdown. Use this to compute
-    /// `gas_limit` before submitting a sponsored AA bundle.
+    /// Current node builds return a versioned cap-only response for the
+    /// protocol `validatePaymasterOp` gas limit. They do not perform a full EVM
+    /// staticcall dry-run from this RPC path yet. Clients must inspect
+    /// `simulation_status` and only enable contract-paymaster UX when it is
+    /// upgraded from `"cap_only"`.
     ///
     /// **Input** (`paymaster_context` is the opaque bytes forwarded to the contract):
     /// ```json
@@ -617,12 +619,15 @@ pub trait ShellApi {
     /// ```
     ///
     /// **Response**:
-    /// - `validation_gas` — estimated gas for `validatePaymasterOp` staticcall
+    /// - `validation_gas` — `null` while `simulation_status` is `"cap_only"`
     /// - `paymaster_gas_cap` — hard cap enforced by the node (50 000)
-    /// - `within_cap` — whether `validation_gas ≤ paymaster_gas_cap`
+    /// - `within_cap` — `null` while no staticcall simulation has run
     /// - `paymaster` — the paymaster address queried
+    /// - `simulation_status` — currently `"cap_only"`
+    /// - `simulation_version` — response contract version
+    /// - `capability` — current node capability string
     ///
-    /// **Error** (`-32000`): EVM simulation failed or paymaster contract reverted.
+    /// **Future error** (`-32000`): EVM simulation failed or paymaster contract reverted.
     #[method(name = "estimatePaymasterGas")]
     async fn estimate_paymaster_gas(
         &self,

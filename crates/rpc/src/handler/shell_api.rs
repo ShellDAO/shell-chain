@@ -749,24 +749,23 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             _ => vec![],
         };
 
-        // Build a minimal dummy SignedTransaction to feed the paymaster validator.
-        // We cannot run a real staticcall without a full EVM environment, so we
-        // return a static estimate indicating the cap and whether the contract
-        // is deployable. Full simulation requires live storage access.
+        // Current RPC handlers do not yet expose the full EVM staticcall
+        // executor needed to run validatePaymasterOp from this read-only path.
+        // Return an explicit cap-only response so clients can gate sponsored
+        // flows without mistaking this for a successful contract simulation.
         let _ = (inner_calls_data, max_fee_per_gas, paymaster_context); // used in full impl
 
-        // Static response: indicates the 50k gas cap enforced by CONSTITUTION §2.2.
-        // Full EVM simulation (querying the contract) requires a world-state snapshot
-        // and is implemented as a v0.26.0 milestone.
         Ok(serde_json::json!({
             "paymaster": req.paymaster,
             "sender": req.sender,
             "validation_gas": serde_json::Value::Null,
             "paymaster_gas_cap": hex_u64(PAYMASTER_VALIDATE_GAS_CAP),
             "within_cap": serde_json::Value::Null,
-            "note": "Full EVM simulation for validatePaymasterOp is a v0.26.0 milestone. \
-                     Current response reports the protocol gas cap only. \
-                     Use shell_estimateBatch for bundle gas estimation.",
+            "simulation_status": "cap_only",
+            "simulation_version": 1u64,
+            "capability": "paymaster_cap_only",
+            "reason": "validatePaymasterOp staticcall simulation is not exposed by this RPC handler yet",
+            "note": "Current response reports the protocol gas cap only. Use shell_estimateBatch for bundle gas estimation and gate contract-paymaster UX on simulation_status.",
         }))
     }
 

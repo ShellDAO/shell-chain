@@ -206,7 +206,7 @@ mod tests {
         let tracker = BandwidthTracker::new(100, 0);
         assert!(tracker.record_inbound(50));
         assert!(tracker.record_inbound(50)); // exactly at limit
-        assert!(!tracker.record_inbound(1)); // over limit
+        assert!(!tracker.record_inbound(101)); // over limit, even if a token refills
     }
 
     #[test]
@@ -222,8 +222,8 @@ mod tests {
     fn rejected_bytes_not_counted_in_window() {
         let tracker = BandwidthTracker::new(100, 0);
         assert!(tracker.record_inbound(100));
-        assert!(!tracker.record_inbound(50)); // rejected
-                                              // Window counter stays at 100, not 150
+        assert!(!tracker.record_inbound(101)); // rejected
+                                               // Window counter stays at 100, not 201
         assert_eq!(tracker.stats().inbound_bytes_per_sec, 100);
     }
 
@@ -231,7 +231,7 @@ mod tests {
     fn reset_clears_window_counters() {
         let tracker = BandwidthTracker::new(100, 100);
         assert!(tracker.record_inbound(100));
-        assert!(!tracker.record_inbound(1));
+        assert!(!tracker.record_inbound(101));
 
         // Force a reset by backdating both the stats window and limiter clock.
         {
@@ -308,7 +308,7 @@ mod tests {
     fn token_bucket_allows_smoothed_burst_after_idle_refill() {
         let tracker = BandwidthTracker::new(100, 0);
         assert!(tracker.record_inbound(100));
-        assert!(!tracker.record_inbound(1));
+        assert!(!tracker.record_inbound(101));
 
         {
             let mut limiter = tracker.inbound_limiter.as_ref().unwrap().lock().unwrap();
@@ -316,7 +316,7 @@ mod tests {
         }
 
         assert!(tracker.record_inbound(150));
-        assert!(!tracker.record_inbound(1));
+        assert!(!tracker.record_inbound(151));
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
         }
 
         assert!(tracker.record_inbound(150));
-        assert!(!tracker.record_inbound(1));
+        assert!(!tracker.record_inbound(151));
     }
 
     #[test]

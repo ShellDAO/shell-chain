@@ -255,7 +255,11 @@ pub struct BatchInnerCallRequest {
 
 /// Request body for `shell_estimatePaymasterGas` (AA Phase 2).
 ///
-/// Estimates gas for a contract paymaster `validatePaymasterOp` staticcall.
+/// Reports the protocol gas cap for contract-paymaster validation.
+///
+/// Current node builds return a versioned `cap_only` response instead of a
+/// real `validatePaymasterOp` staticcall simulation. Clients must inspect the
+/// response `simulation_status` before enabling contract-paymaster UX.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaymasterGasEstimateRequest {
     /// Paymaster contract address to query.
