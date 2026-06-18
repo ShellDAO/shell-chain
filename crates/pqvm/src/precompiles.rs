@@ -6,6 +6,7 @@
 //! - `0x0003`: ML-DSA-65 batch verify
 //! - `0x0004`: BLAKE3-256 hash
 //! - `0x0005`: BLAKE3-512 hash
+//! - `0x0006`: PQ address derive
 //!
 //! This keeps all classical Ethereum precompiles disabled, including
 //! `ecrecover`, BN256, and BLAKE2f.
@@ -17,6 +18,7 @@ use revm::handler::PrecompileProvider;
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
 use revm::primitives::hardfork::SpecId;
 use shell_crypto::{verify_signature, SignatureType};
+use shell_primitives::Address as ShellAddress;
 use std::boxed::Box;
 
 pub const PQ_MLDSA65_VERIFY_ADDR: Address = address!("0x0000000000000000000000000000000000000001");
@@ -26,13 +28,15 @@ pub const PQ_MLDSA65_BATCH_VERIFY_ADDR: Address =
     address!("0x0000000000000000000000000000000000000003");
 pub const PQ_BLAKE3_256_ADDR: Address = address!("0x0000000000000000000000000000000000000004");
 pub const PQ_BLAKE3_512_ADDR: Address = address!("0x0000000000000000000000000000000000000005");
+pub const PQ_ADDRESS_DERIVE_ADDR: Address = address!("0x0000000000000000000000000000000000000006");
 
-const PQ_PRECOMPILE_ADDRS: [Address; 5] = [
+const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
     PQ_MLDSA65_VERIFY_ADDR,
     PQ_SLHDSA_SHA2_256F_VERIFY_ADDR,
     PQ_MLDSA65_BATCH_VERIFY_ADDR,
     PQ_BLAKE3_256_ADDR,
     PQ_BLAKE3_512_ADDR,
+    PQ_ADDRESS_DERIVE_ADDR,
 ];
 
 pub const PQ_MLDSA65_VERIFY_GAS: u64 = 46_000;
@@ -42,6 +46,7 @@ pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 12_000;
 pub const MAX_BATCH_SIGNATURES: u32 = 256;
 pub const BLAKE3_BASE_GAS: u64 = 30;
 pub const BLAKE3_WORD_GAS: u64 = 6;
+pub const PQ_ADDRESS_DERIVE_GAS: u64 = 200;
 
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
@@ -113,6 +118,7 @@ fn run_pq_precompile<CTX: ContextTr>(
         PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, &input),
         PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, &input),
         PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, &input),
+        PQ_ADDRESS_DERIVE_ADDR => run_pq_address_derive(inputs.gas_limit, &input),
         _ => InterpreterResult {
             result: InstructionResult::PrecompileError,
             gas: Gas::new(inputs.gas_limit),
@@ -218,6 +224,30 @@ fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     hasher.finalize_xof().fill(&mut output);
     result.output = Bytes::copy_from_slice(&output);
     result
+}
+
+fn run_pq_address_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    let mut result = base_result(gas_limit);
+    if !charge_gas(&mut result, PQ_ADDRESS_DERIVE_GAS) {
+        return result;
+    }
+
+    let Some((&algo_id, pubkey)) = input.split_first() else {
+        result.result = InstructionResult::PrecompileError;
+        return result;
+    };
+    let Some(address) = derive_pq_address(algo_id, pubkey) else {
+        result.result = InstructionResult::PrecompileError;
+        return result;
+    };
+
+    result.output = Bytes::copy_from_slice(&address);
+    result
+}
+
+pub(crate) fn derive_pq_address(algo_id: u8, pubkey: &[u8]) -> Option<[u8; 32]> {
+    SignatureType::from_u8(algo_id)?;
+    Some(*ShellAddress::from_public_key(pubkey, algo_id).as_bytes())
 }
 
 fn verify_mldsa65(input: &[u8]) -> bool {
@@ -347,12 +377,41 @@ mod tests {
             PQ_BLAKE3_512_ADDR,
             address!("0x0000000000000000000000000000000000000005")
         );
+        assert_eq!(
+            PQ_ADDRESS_DERIVE_ADDR,
+            address!("0x0000000000000000000000000000000000000006")
+        );
     }
 
     #[test]
     fn blake3_256_precompile_hashes_input() {
         let output = run_blake3_256(1_000, b"abc");
         assert_eq!(output.output.as_ref(), blake3::hash(b"abc").as_bytes());
+    }
+
+    #[test]
+    fn pq_address_derive_precompile_derives_shell_address() {
+        let pubkey = [0x11, 0x22, 0x33, 0x44];
+        let mut input = vec![SignatureType::MlDsa65.as_u8()];
+        input.extend_from_slice(&pubkey);
+
+        let output = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS, &input);
+        let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
+        assert_eq!(output.result, InstructionResult::Return);
+        assert_eq!(output.output.as_ref(), expected.as_bytes());
+    }
+
+    #[test]
+    fn pq_address_derive_precompile_rejects_unknown_algorithm() {
+        let result = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS, &[0xFF, 0x11]);
+        assert_eq!(result.result, InstructionResult::PrecompileError);
+        assert!(result.output.is_empty());
+    }
+
+    #[test]
+    fn pq_address_derive_precompile_charges_gas_before_parsing() {
+        let result = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS - 1, &[0x01, 0x11]);
+        assert_eq!(result.result, InstructionResult::PrecompileOOG);
     }
 
     #[test]

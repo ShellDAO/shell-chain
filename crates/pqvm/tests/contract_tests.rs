@@ -8,7 +8,7 @@ mod common;
 
 use alloy_primitives::{keccak256, U256};
 use common::{abi_decode_u256, call_contract, deploy_runtime_contract, fund_account, setup};
-use shell_crypto::{DilithiumSigner, Signer};
+use shell_crypto::{DilithiumSigner, SignatureType, Signer};
 use shell_primitives::Address as ShellAddress;
 
 // ── Bytecode builders ─────────────────────────────────────────────────────────
@@ -636,4 +636,70 @@ fn t7_mldsa_verify_precompile_from_contract() {
         result2.output[31], 0,
         "tampered ML-DSA signature should return 0"
     );
+}
+
+/// T8: PQADDR native opcode (0xB2) derives a 32-byte Shell address in-contract.
+#[test]
+fn t8_pqaddr_native_opcode_derives_address() {
+    let (mut evm, chain_store) = setup();
+    let verifier = shell_crypto::DilithiumVerifier;
+
+    let signer = DilithiumSigner::generate();
+    let from = ShellAddress::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+
+    fund_account(&mut evm, &from, U256::from(100_000_000_000u64));
+
+    let pubkey = [0x11, 0x22, 0x33, 0x44];
+    let runtime = vec![
+        0x60,
+        pubkey[0],
+        0x60,
+        0x00,
+        0x53, // memory[0] = pubkey[0]
+        0x60,
+        pubkey[1],
+        0x60,
+        0x01,
+        0x53, // memory[1] = pubkey[1]
+        0x60,
+        pubkey[2],
+        0x60,
+        0x02,
+        0x53, // memory[2] = pubkey[2]
+        0x60,
+        pubkey[3],
+        0x60,
+        0x03,
+        0x53, // memory[3] = pubkey[3]
+        0x60,
+        SignatureType::MlDsa65.as_u8(), // algo_id
+        0x60,
+        0x00, // pk_ptr
+        0x60,
+        pubkey.len() as u8, // pk_len
+        0x60,
+        0x20, // out_ptr
+        0xB2, // PQADDR
+        0x60,
+        0x20, // return length
+        0x60,
+        0x20, // return offset
+        0xF3, // RETURN
+    ];
+
+    let (contract, _) = deploy_runtime_contract(
+        &mut evm,
+        &chain_store,
+        &verifier,
+        &signer,
+        from,
+        0,
+        1,
+        &runtime,
+    );
+
+    let result = call_contract(&mut evm, from, 1, contract, vec![], 2);
+    let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
+    assert_eq!(result.receipt.status, 1, "PQADDR call should succeed");
+    assert_eq!(result.output, expected.as_bytes());
 }

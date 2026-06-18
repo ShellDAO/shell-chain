@@ -1,13 +1,14 @@
 //! PQVM native opcodes — Shell-Chain EVM extension.
 //!
-//! Adds two PQ-native opcodes to the revm instruction table:
+//! Adds three PQ-native opcodes to the revm instruction table:
 //!
 //! | Opcode | Name       | Stack in (deepest→top)                                           | Stack out    | Description                          |
 //! |--------|------------|------------------------------------------------------------------|--------------|--------------------------------------|
 //! | 0xB0   | `PQVERIFY` | `algo_id, msg_ptr, msg_len, pk_len, pk_ptr, sig_len, sig_ptr`   | `[valid]`    | Verify a PQ signature from memory    |
 //! | 0xB1   | `PQHASH`   | `data_ptr, data_len, out_ptr`                                    | (side effect)| BLAKE3-256 hash written to memory    |
+//! | 0xB2   | `PQADDR`   | `algo_id, pk_ptr, pk_len, out_ptr`                               | (side effect)| PQ address written to memory         |
 //!
-//! ## PQVERIFY algo_id values (WP §1073)
+//! ## algo_id values (WP §1073)
 //!
 //! - `0x00` — Dilithium3 (legacy compatibility)
 //! - `0x01` — ML-DSA-65
@@ -19,6 +20,7 @@
 //! |----------|----------------------------------------------------------|
 //! | PQVERIFY | 46 000 (ML-DSA-65 / Dilithium3) / 2 300 000 (SLH-DSA)  |
 //! | PQHASH   | 30 + 6 × ⌈len/32⌉                                       |
+//! | PQADDR   | 200                                                      |
 
 use alloy_primitives::U256;
 use revm::handler::instructions::EthInstructions;
@@ -29,7 +31,8 @@ use revm::interpreter::{
 use shell_crypto::{verify_signature, SignatureType};
 
 use crate::precompiles::{
-    BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
+    derive_pq_address, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDRESS_DERIVE_GAS,
+    PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
 };
 
 // ── opcode numbers ────────────────────────────────────────────────────────────
@@ -38,6 +41,8 @@ use crate::precompiles::{
 pub const OPCODE_PQVERIFY: u8 = 0xB0;
 /// `PQHASH` — opcode 0xB1.  BLAKE3-256 hash of a memory region.
 pub const OPCODE_PQHASH: u8 = 0xB1;
+/// `PQADDR` — opcode 0xB2. Derive a 32-byte Shell address from algo_id + pubkey.
+pub const OPCODE_PQADDR: u8 = 0xB2;
 
 // ── algo_id constants (WP §1073) ─────────────────────────────────────────────
 
@@ -309,12 +314,86 @@ pub fn pq_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     context.interpreter.memory.set(out_ptr, &hash_bytes);
 }
 
+// ── PQADDR (0xB2) ────────────────────────────────────────────────────────────
+
+/// `PQADDR` instruction: derive a 32-byte Shell address from a PQ public key.
+///
+/// Stack (deepest → top): `algo_id, pk_ptr, pk_len, out_ptr` → (side effect)
+///
+/// Reads `pk_len` bytes from `pk_ptr`, computes `BLAKE3(algo_id || pubkey)`,
+/// and writes the 32-byte address to `out_ptr`. Unknown `algo_id` values write
+/// the zero address after charging gas so contracts can branch on the result.
+///
+/// Gas: `200`.
+pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    let Some(out_ptr_u256) = context.interpreter.stack.pop() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let Some(pk_len_u256) = context.interpreter.stack.pop() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let Some(pk_ptr_u256) = context.interpreter.stack.pop() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let Some(algo_id_u256) = context.interpreter.stack.pop() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+
+    if !context.interpreter.gas.record_cost(PQ_ADDRESS_DERIVE_GAS) {
+        context.interpreter.halt_oog();
+        return;
+    }
+
+    let algo_id = algo_id_u256.as_limbs()[0] as u8;
+    let pk_len = match u256_to_usize(context.interpreter, pk_len_u256) {
+        Some(v) => v,
+        None => return,
+    };
+    let pk_ptr = match u256_to_usize(context.interpreter, pk_ptr_u256) {
+        Some(v) => v,
+        None => return,
+    };
+    let out_ptr = match u256_to_usize(context.interpreter, out_ptr_u256) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let gas_params = context.host.gas_params().clone();
+    if pk_len > 0
+        && !context
+            .interpreter
+            .resize_memory(&gas_params, pk_ptr, pk_len)
+    {
+        return;
+    }
+    if !context.interpreter.resize_memory(&gas_params, out_ptr, 32) {
+        return;
+    }
+
+    let pubkey: Vec<u8> = if pk_len > 0 {
+        context
+            .interpreter
+            .memory
+            .slice_len(pk_ptr, pk_len)
+            .as_ref()
+            .to_vec()
+    } else {
+        vec![]
+    };
+    let address = derive_pq_address(algo_id, &pubkey).unwrap_or([0u8; 32]);
+    context.interpreter.memory.set(out_ptr, &address);
+}
+
 // ── installer ─────────────────────────────────────────────────────────────────
 
-/// Install the two PQVM native opcodes into `instructions`.
+/// Install the PQVM native opcodes into `instructions`.
 ///
 /// Call this after `EthInstructions::new_mainnet_with_spec` and before
-/// building the `Evm` instance so that `PQVERIFY` and `PQHASH`
+/// building the `Evm` instance so that `PQVERIFY`, `PQHASH`, and `PQADDR`
 /// are dispatched natively instead of triggering `UNDEFINED`.
 pub fn install_pqvm_opcodes<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
 where
@@ -323,6 +402,7 @@ where
 {
     instructions.insert_instruction(OPCODE_PQVERIFY, Instruction::new(pq_verify::<WIRE, H>, 0));
     instructions.insert_instruction(OPCODE_PQHASH, Instruction::new(pq_hash::<WIRE, H>, 0));
+    instructions.insert_instruction(OPCODE_PQADDR, Instruction::new(pq_addr::<WIRE, H>, 0));
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -386,5 +466,18 @@ mod tests {
     fn pqverify_opcode_constants() {
         assert_eq!(OPCODE_PQVERIFY, 0xB0);
         assert_eq!(OPCODE_PQHASH, 0xB1);
+        assert_eq!(OPCODE_PQADDR, 0xB2);
+    }
+
+    #[test]
+    fn pqaddr_helper_matches_shell_address_derivation() {
+        let pubkey = [0x11, 0x22, 0x33, 0x44];
+        let expected =
+            shell_primitives::Address::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
+        assert_eq!(
+            derive_pq_address(SignatureType::MlDsa65.as_u8(), &pubkey),
+            Some(*expected.as_bytes())
+        );
+        assert_eq!(derive_pq_address(0xFF, &pubkey), None);
     }
 }

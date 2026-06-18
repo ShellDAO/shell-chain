@@ -117,8 +117,10 @@ Shell-Chain adds three post-quantum opcodes not present in the standard EVM:
 | `PQHASH` | `0xB1` | `30 + 6 × ⌈len/32⌉` | BLAKE3 hash of input data |
 | `PQADDR` | `0xB2` | 200 | Derive a 32-byte address from algo_id + pubkey |
 
-These opcodes are defined and gas-priced in the protocol; full interpreter
-dispatch wiring is in progress (see whitepaper §10 known limitations).
+The runtime installs all three opcodes in the PQVM interpreter. `PQADDR`
+uses stack input `algo_id, pk_ptr, pk_len, out_ptr`, reads the public key from
+memory, and writes `BLAKE3(algo_id || pubkey)` as a 32-byte Shell address.
+Unknown `algo_id` values write the zero address.
 
 ### Precompile addresses (0x0001–0x0006)
 
