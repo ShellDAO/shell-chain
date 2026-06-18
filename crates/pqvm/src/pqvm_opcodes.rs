@@ -71,6 +71,15 @@ fn u256_to_usize<WIRE: InterpreterTypes>(
     Some(limbs[0] as usize)
 }
 
+/// Convert a stack value to an 8-bit algorithm id without truncating.
+fn u256_to_algo_id(v: U256) -> Option<u8> {
+    let limbs = v.as_limbs();
+    if (limbs[0] <= u8::MAX as u64) & (limbs[1] == 0) & (limbs[2] == 0) & (limbs[3] == 0) {
+        return Some(limbs[0] as u8);
+    }
+    None
+}
+
 // ── PQVERIFY (0xB0) ──────────────────────────────────────────────────────────
 
 /// `PQVERIFY` instruction: verify a PQ signature from memory (WP §1058-1079).
@@ -114,7 +123,17 @@ pub fn pq_verify<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
-    let algo_byte = algo_id_u256.as_limbs()[0] as u8;
+    let Some(algo_byte) = u256_to_algo_id(algo_id_u256) else {
+        // Unknown algorithm — charge minimum and push false.
+        if !context.interpreter.gas.record_cost(PQ_MLDSA65_VERIFY_GAS) {
+            context.interpreter.halt_oog();
+            return;
+        }
+        if !context.interpreter.stack.push(U256::ZERO) {
+            context.interpreter.halt_overflow();
+        }
+        return;
+    };
 
     let gas_cost = match algo_byte {
         ALGO_MLDSA65 | ALGO_DILITHIUM3 => PQ_MLDSA65_VERIFY_GAS,
@@ -348,7 +367,7 @@ pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
         return;
     }
 
-    let algo_id = algo_id_u256.as_limbs()[0] as u8;
+    let algo_id = u256_to_algo_id(algo_id_u256);
     let pk_len = match u256_to_usize(context.interpreter, pk_len_u256) {
         Some(v) => v,
         None => return,
@@ -374,17 +393,17 @@ pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
         return;
     }
 
-    let pubkey: Vec<u8> = if pk_len > 0 {
-        context
-            .interpreter
-            .memory
-            .slice_len(pk_ptr, pk_len)
-            .as_ref()
-            .to_vec()
+    let address = if let Some(algo_id) = algo_id {
+        if pk_len > 0 {
+            let pubkey = context.interpreter.memory.slice_len(pk_ptr, pk_len);
+            derive_pq_address(algo_id, pubkey.as_ref())
+        } else {
+            derive_pq_address(algo_id, &[])
+        }
     } else {
-        vec![]
-    };
-    let address = derive_pq_address(algo_id, &pubkey).unwrap_or([0u8; 32]);
+        None
+    }
+    .unwrap_or([0u8; 32]);
     context.interpreter.memory.set(out_ptr, &address);
 }
 
@@ -479,5 +498,12 @@ mod tests {
             Some(*expected.as_bytes())
         );
         assert_eq!(derive_pq_address(0xFF, &pubkey), None);
+    }
+
+    #[test]
+    fn algo_id_parser_rejects_values_that_would_truncate() {
+        assert_eq!(u256_to_algo_id(U256::from(0x01u8)), Some(0x01));
+        assert_eq!(u256_to_algo_id(U256::from(0x0101u16)), None);
+        assert_eq!(u256_to_algo_id(U256::from(u64::MAX)), None);
     }
 }
