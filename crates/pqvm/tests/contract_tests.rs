@@ -687,8 +687,11 @@ fn t8_pqaddr_native_opcode_derives_address() {
         0xF3, // RETURN
     ];
 
-    let deploy_nonce = 0;
-    let call_nonce = deploy_nonce + 1;
+    let deploy_nonce = evm
+        .state_db()
+        .world_state()
+        .get_nonce(&from)
+        .expect("funded sender nonce should be readable");
 
     let (contract, _) = deploy_runtime_contract(
         &mut evm,
@@ -701,6 +704,11 @@ fn t8_pqaddr_native_opcode_derives_address() {
         &runtime,
     );
 
+    let call_nonce = evm
+        .state_db()
+        .world_state()
+        .get_nonce(&from)
+        .expect("sender nonce should advance after deployment");
     let result = call_contract(&mut evm, from, call_nonce, contract, vec![], 2);
     let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
     assert_eq!(result.receipt.status, 1, "PQADDR call should succeed");
