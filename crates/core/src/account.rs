@@ -29,7 +29,7 @@ impl Account {
     pub fn new_user_account(pq_pubkey_hash: ShellHash, balance: U256) -> Self {
         Self {
             pq_pubkey_hash,
-            nonce: 0,
+            nonce: u64::default(),
             balance,
             validation_code_hash: None,
             code_hash: None,
