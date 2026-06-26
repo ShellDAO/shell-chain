@@ -687,18 +687,21 @@ fn t8_pqaddr_native_opcode_derives_address() {
         0xF3, // RETURN
     ];
 
+    let deploy_nonce = 0;
+    let call_nonce = deploy_nonce + 1;
+
     let (contract, _) = deploy_runtime_contract(
         &mut evm,
         &chain_store,
         &verifier,
         &signer,
         from,
-        0,
+        deploy_nonce,
         1,
         &runtime,
     );
 
-    let result = call_contract(&mut evm, from, 1, contract, vec![], 2);
+    let result = call_contract(&mut evm, from, call_nonce, contract, vec![], 2);
     let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
     assert_eq!(result.receipt.status, 1, "PQADDR call should succeed");
     assert_eq!(result.output, expected.as_bytes());
