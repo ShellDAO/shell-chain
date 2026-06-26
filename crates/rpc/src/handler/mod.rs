@@ -2381,6 +2381,15 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn send_raw_transaction_rejects_oversized_payload_before_decode() {
+        let handler = setup();
+        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE + 1));
+        let result = EthApiServer::send_raw_transaction(&handler, oversized).await;
+        let err = result.unwrap_err();
+        assert!(err.message().contains("maximum size"));
+    }
+
     // ── New RPC methods ──────────────────────────────────────────
 
     #[tokio::test]

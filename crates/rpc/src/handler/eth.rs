@@ -583,6 +583,12 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn send_raw_transaction(&self, data: String) -> Result<ShellHash, ErrorObjectOwned> {
         // Decode hex payload: "0x" + hex-encoded transaction bytes.
         let raw = data.strip_prefix("0x").unwrap_or(&data);
+        if raw.len() > shell_mempool::MAX_TX_SIZE.saturating_mul(2) {
+            return Err(invalid_params_err(format!(
+                "raw transaction exceeds maximum size of {} bytes",
+                shell_mempool::MAX_TX_SIZE
+            )));
+        }
         let bytes =
             hex::decode(raw).map_err(|e| invalid_params_err(format!("invalid hex: {e}")))?;
 

@@ -36,8 +36,7 @@ pub(crate) use shell_crypto::{
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_pqvm::{
-    commit_pqvm_state, commit_pqvm_state_raw, process_pending_activations, validate_tx_for_import,
-    ShellPqvm, ShellStateDb,
+    commit_pqvm_state, process_pending_activations, validate_tx_for_import, ShellPqvm, ShellStateDb,
 };
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
@@ -1456,6 +1455,69 @@ mod tests {
         };
         let mut ws = node.world_state.write();
         ws.set_account(addr, &account).unwrap();
+    }
+
+    fn counter_runtime() -> Vec<u8> {
+        let incr_sel = shell_primitives::keccak256(b"increment()");
+        let get_sel = shell_primitives::keccak256(b"get()");
+        let mut code = vec![0x60, 0x00, 0x35, 0x60, 0xE0, 0x1C, 0x80, 0x63];
+        code.extend_from_slice(&incr_sel.as_bytes()[..4]);
+        code.extend_from_slice(&[0x14, 0x60, 0x1F, 0x57, 0x80, 0x63]);
+        code.extend_from_slice(&get_sel.as_bytes()[..4]);
+        code.extend_from_slice(&[
+            0x14, 0x60, 0x2F, 0x57, 0x60, 0x00, 0x60, 0x00, 0xFD, 0x5B, 0x50, 0x60, 0x00, 0x54,
+            0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xF3, 0x5B, 0x50, 0x60,
+            0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3,
+        ]);
+        debug_assert_eq!(code[0x1F], 0x5B);
+        debug_assert_eq!(code[0x2F], 0x5B);
+        code
+    }
+
+    fn make_init_code(runtime: &[u8]) -> Vec<u8> {
+        assert!(runtime.len() <= u8::MAX as usize, "runtime too large");
+        let runtime_len = runtime.len() as u8;
+        let prefix_len = 12u8;
+        let mut init = vec![
+            0x60,
+            runtime_len,
+            0x60,
+            prefix_len,
+            0x60,
+            0x00,
+            0x39,
+            0x60,
+            runtime_len,
+            0x60,
+            0x00,
+            0xF3,
+        ];
+        init.extend_from_slice(runtime);
+        init
+    }
+
+    fn submit_signed_tx<S: KvStore + 'static>(
+        node: &Node<S>,
+        tx_signer: &impl Signer,
+        sender: Address,
+        tx: Transaction,
+    ) -> ShellHash {
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed =
+            SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
+        let hash = signed.hash();
+        let verifier = MultiVerifier;
+        let mut world_state = node.world_state.write();
+        node.tx_pool
+            .insert(
+                signed,
+                &mut world_state,
+                node.chain_store.as_ref(),
+                &verifier,
+            )
+            .unwrap();
+        hash
     }
 
     fn current_state_root<S: KvStore + 'static>(node: &Node<S>) -> ShellHash {
@@ -3035,6 +3097,76 @@ mod tests {
             block.header.state_root,
             ShellHash::default(),
             "state root should reflect committed state"
+        );
+    }
+
+    #[test]
+    fn produce_block_commits_repeated_contract_storage_updates() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(10_000_000_000_000_000_000u64));
+
+        let deploy_tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::from(make_init_code(&counter_runtime())),
+            gas_limit: 5_000_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&node, &tx_signer, sender, deploy_tx);
+        let deploy_block = node.produce_block(&signer, 100).unwrap();
+        assert_eq!(deploy_block.transactions.len(), 1);
+        let deploy_receipts = node
+            .chain_store
+            .get_receipts(&deploy_block.hash())
+            .unwrap()
+            .expect("deploy receipts should be stored");
+        let contract = deploy_receipts[0]
+            .contract_address
+            .expect("contract deploy should produce address");
+
+        let increment_selector = shell_primitives::keccak256(b"increment()");
+        for nonce in 1..=2 {
+            let call_tx = Transaction {
+                chain_id: 1337,
+                nonce,
+                to: Some(contract),
+                value: U256::ZERO,
+                data: Bytes::from(increment_selector.as_bytes()[..4].to_vec()),
+                gas_limit: 1_000_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let tx_hash = submit_signed_tx(&node, &tx_signer, sender, call_tx);
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert_eq!(
+                block.transactions.len(),
+                1,
+                "call nonce {nonce} should be included"
+            );
+            assert_eq!(block.transactions[0].hash(), tx_hash);
+        }
+
+        let ws = node.world_state.read();
+        let slot_value = ws.get_storage(&contract, &ShellHash::ZERO).unwrap();
+        assert_eq!(
+            U256::from_be_bytes(*slot_value.as_bytes()),
+            U256::from(2u64),
+            "counter storage slot 0 should survive repeated block commits"
         );
     }
 

@@ -100,6 +100,7 @@ impl<S: KvStore + 'static> Node<S> {
                 continue;
             }
 
+            let pre_tx_root = evm.state_db_mut().world_state_mut().state_root()?;
             let is_aa = tx.is_aa_bundle();
             let exec_result = if is_aa {
                 evm.execute_aa_bundle(tx, &header, idx as u32, cumulative_gas)
@@ -108,7 +109,6 @@ impl<S: KvStore + 'static> Node<S> {
             };
             match exec_result {
                 Ok(result) => {
-                    cumulative_gas += result.gas_used;
                     let price = effective_gas_price(
                         tx.tx.max_fee_per_gas,
                         tx.tx.max_priority_fee_per_gas,
@@ -129,25 +129,74 @@ impl<S: KvStore + 'static> Node<S> {
                         )?;
                     } else {
                         // Normal PQVM tx: commit the revm state changeset.
-                        // Snapshot the address registry before the first commit clears it,
-                        // so the persistent WorldState can resolve PQ addresses too.
-                        let registry = evm.state_db().address_registry_snapshot();
-                        commit_pqvm_state(&result, evm.state_db_mut())?;
-
-                        // Commit to the node's persistent WorldState.
-                        {
-                            let mut ws = self.world_state.write();
-                            commit_pqvm_state_raw(&result, &mut *ws, &self.chain_store, &registry)?;
+                        if let Err(e) = commit_pqvm_state(&result, evm.state_db_mut()) {
+                            if let Err(rollback_err) = evm
+                                .state_db_mut()
+                                .world_state_mut()
+                                .rollback_to_root(&pre_tx_root)
+                            {
+                                warn!(
+                                    tx_hash = %tx.hash(),
+                                    error = %rollback_err,
+                                    target_root = %pre_tx_root,
+                                    "produce_block: failed to roll back isolated state after tx commit error"
+                                );
+                            }
+                            warn!(
+                                tx_hash = %tx.hash(),
+                                from = %tx.from,
+                                to = ?tx.tx.to,
+                                nonce = tx.tx.nonce,
+                                error = %e,
+                                "produce_block: skipping tx after state commit error"
+                            );
+                            if is_unrecoverable_executor_error(&e) {
+                                let removed = self.tx_pool.remove(&tx.hash());
+                                warn!(
+                                    tx_hash = %tx.hash(),
+                                    removed,
+                                    "produce_block: removed tx with unrecoverable state error from mempool"
+                                );
+                            }
+                            continue;
                         }
                     }
+                    cumulative_gas += result.gas_used;
                     total_effective_fees = total_effective_fees.saturating_add(
                         U256::from(result.gas_used).saturating_mul(U256::from(price)),
                     );
                     receipts.push(result.receipt);
                     included_txs.push(tx.clone());
                 }
-                Err(_) => {
-                    // Skip failed transactions.
+                Err(e) => {
+                    if let Err(rollback_err) = evm
+                        .state_db_mut()
+                        .world_state_mut()
+                        .rollback_to_root(&pre_tx_root)
+                    {
+                        warn!(
+                            tx_hash = %tx.hash(),
+                            error = %rollback_err,
+                            target_root = %pre_tx_root,
+                            "produce_block: failed to roll back isolated state after tx execution error"
+                        );
+                    }
+                    warn!(
+                        tx_hash = %tx.hash(),
+                        from = %tx.from,
+                        to = ?tx.tx.to,
+                        nonce = tx.tx.nonce,
+                        error = %e,
+                        "produce_block: skipping tx after execution error"
+                    );
+                    if is_unrecoverable_executor_error(&e) {
+                        let removed = self.tx_pool.remove(&tx.hash());
+                        warn!(
+                            tx_hash = %tx.hash(),
+                            removed,
+                            "produce_block: removed tx with unrecoverable state error from mempool"
+                        );
+                    }
                     continue;
                 }
             }
@@ -159,13 +208,19 @@ impl<S: KvStore + 'static> Node<S> {
 
         header.gas_used = cumulative_gas;
 
+        // The EVM executes against an isolated WorldState opened at the parent
+        // root. Normal transaction commits must not be applied a second time to
+        // the live WorldState: both handles share the same trie KV store, and a
+        // second write from the old storage root can race with nodes removed by
+        // the first persistent trie update. Re-open the live state at the
+        // isolated post-transaction root once instead.
+        let post_tx_root = evm.state_db_mut().world_state_mut().state_root()?;
+        block_store.rollback_world_state(&post_tx_root)?;
+
         let mut system_txs = Vec::new();
         // Block producer receives 100% of effective gas fees.
         let producer_reward = total_effective_fees;
         if !included_txs.is_empty() && producer_reward > U256::ZERO {
-            evm.state_db_mut()
-                .world_state_mut()
-                .add_balance(&proposer_addr, producer_reward)?;
             block_store.add_balance(&proposer_addr, producer_reward)?;
             let tx_index = included_txs.len() as u32;
             let reward_tx = SystemTransaction::block_gas_reward(
@@ -257,9 +312,6 @@ impl<S: KvStore + 'static> Node<S> {
                     continue;
                 }
             };
-            evm.state_db_mut()
-                .world_state_mut()
-                .add_balance(&reward_tx.to, reward_tx.value)?;
             block_store.add_balance(&reward_tx.to, reward_tx.value)?;
             receipts.push(TransactionReceipt {
                 tx_hash: reward_tx.hash(),
@@ -457,4 +509,14 @@ impl<S: KvStore + 'static> Node<S> {
 
         Ok(block)
     }
+}
+
+fn is_unrecoverable_executor_error(error: &shell_pqvm::ExecutorError) -> bool {
+    matches!(
+        error,
+        shell_pqvm::ExecutorError::Storage(shell_storage::StorageError::Trie(_))
+            | shell_pqvm::ExecutorError::StateDb(shell_pqvm::StateDbError::Storage(
+                shell_storage::StorageError::Trie(_),
+            ))
+    )
 }

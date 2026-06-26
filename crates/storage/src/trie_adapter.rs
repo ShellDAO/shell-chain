@@ -28,6 +28,14 @@ impl<S: KvStore> eth_trie::DB for KvStoreTrieDb<S> {
     }
 
     fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
+        // eth_trie stores trie nodes by their 32-byte content hash. Deleting
+        // those physical nodes during a normal trie update is unsafe because
+        // older state roots can still reference them for rollback, snapshots,
+        // or parallel WorldState handles. Historical pruning uses explicit
+        // batch deletes and bypasses this adapter.
+        if key.len() == 32 {
+            return Ok(());
+        }
         self.inner.delete(key)
     }
 
@@ -73,6 +81,15 @@ mod tests {
         adapter.insert(b"key", b"value".to_vec()).unwrap();
         adapter.remove(b"key").unwrap();
         assert_eq!(adapter.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn remove_preserves_content_addressed_trie_nodes() {
+        let adapter = make_adapter();
+        let key = [0x11u8; 32];
+        adapter.insert(&key, b"node".to_vec()).unwrap();
+        adapter.remove(&key).unwrap();
+        assert_eq!(adapter.get(&key).unwrap(), Some(b"node".to_vec()));
     }
 
     #[test]
