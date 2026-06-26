@@ -144,6 +144,176 @@ pub struct RpcTransactionSummary {
     pub compressed_size: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RpcListDirection {
+    Asc,
+    Desc,
+}
+
+impl Default for RpcListDirection {
+    fn default() -> Self {
+        Self::Desc
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RpcV2TxDetail {
+    None,
+    Hashes,
+    Summary,
+    Full,
+}
+
+impl Default for RpcV2TxDetail {
+    fn default() -> Self {
+        Self::Summary
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcBlocksRangeOptions {
+    #[serde(default)]
+    pub direction: RpcListDirection,
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub tx_detail: RpcV2TxDetail,
+    pub tx_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAddressSummaryOptions {
+    pub recent_limit: Option<u64>,
+    pub include_total: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAddressTransactionsV2Options {
+    pub from_block: Option<u64>,
+    pub to_block: Option<u64>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub direction: RpcListDirection,
+    #[serde(default)]
+    pub detail: RpcV2TxDetail,
+    pub include_total: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionSummaryOptions {
+    pub include_receipt: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcValidatorSnapshotOptions {
+    pub proposer_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcCapabilities {
+    pub rpc_version: String,
+    pub methods: Vec<String>,
+    pub max_page_size: u64,
+    pub max_blocks_range: u64,
+    pub max_tx_summary_per_block: u64,
+    pub supports_cursor_pagination: bool,
+    pub supports_address_history_index: bool,
+    pub witness_store: bool,
+    pub storage_profile: Option<StorageProfileInfo>,
+    pub fallback_methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcBlocksRange {
+    pub start: String,
+    pub direction: RpcListDirection,
+    pub limit: u64,
+    pub blocks: Vec<RpcBlock>,
+    pub next_start: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAddressTransactionsV2Page {
+    pub address: Address,
+    pub from_block: String,
+    pub to_block: String,
+    pub limit: u64,
+    pub direction: RpcListDirection,
+    pub total: Option<u64>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub items: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAddressSummary {
+    pub address: Address,
+    pub balance: String,
+    pub nonce: String,
+    pub exists: bool,
+    pub has_code: bool,
+    pub code_hash: Option<ShellHash>,
+    pub pq_pubkey_registered: bool,
+    pub total_transactions: Option<u64>,
+    pub recent_transactions: RpcAddressTransactionsV2Page,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionSummaryResult {
+    pub transaction: Option<serde_json::Value>,
+    pub receipt: Option<RpcReceipt>,
+    pub status: Option<String>,
+    pub gas_used: Option<String>,
+    pub log_count: Option<u64>,
+    pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcChainSnapshot {
+    pub chain_id: String,
+    pub head: Option<RpcBlock>,
+    pub finalized: Option<RpcBlock>,
+    pub finality_lag: u64,
+    pub pending_transactions: String,
+    pub peer_count: u64,
+    pub is_mining: bool,
+    pub uptime: u64,
+    pub base_fee: String,
+    pub gas_price: String,
+    pub total_transactions: u64,
+    pub gas_used_total: String,
+    pub avg_block_time: f64,
+    pub consensus: serde_json::Value,
+    pub validators: serde_json::Value,
+    pub storage_profile: Option<StorageProfileInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcValidatorSnapshot {
+    pub validators: serde_json::Value,
+    pub current_proposer: serde_json::Value,
+    pub block_number: u64,
+    pub epoch: serde_json::Value,
+    pub epoch_length: serde_json::Value,
+    pub epoch_progress: serde_json::Value,
+    pub proposer_window: u64,
+    pub proposer_stats: Vec<serde_json::Value>,
+}
+
 /// EIP-2930 access list item for RPC responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

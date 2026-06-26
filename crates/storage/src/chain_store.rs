@@ -127,6 +127,9 @@ mod prefix {
     pub const PUBKEY_BY_ADDR: &[u8] = b"pk/";
     /// Address → tx_hash index: key = "a/" + address(20) + block_number(8) + tx_index(4)
     pub const ADDR_TX_INDEX: &[u8] = b"a/";
+    /// Address → tx_hash newest-first index:
+    /// key = "ar/" + address(20) + inverted_block_number(8) + tx_index(4)
+    pub const ADDR_TX_INDEX_REV: &[u8] = b"ar/";
     /// Guardian config: key = "gc/" + address(20) → JSON-encoded GuardianConfig
     pub const GUARDIAN_CONFIG: &[u8] = b"gc/";
     /// Active recovery proposal: key = "rp/" + address(20) → JSON-encoded RecoveryProposal
@@ -144,6 +147,14 @@ mod prefix {
 /// hash, store transaction receipts, and maintain a transaction → block index.
 pub struct ChainStore<S: KvStore> {
     store: Arc<S>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTxIndexEntry {
+    pub block_number: u64,
+    pub tx_index: u32,
+    pub tx_hash: ShellHash,
+    pub cursor: String,
 }
 
 /// Local availability class for a block hash.
@@ -269,12 +280,84 @@ impl<S: KvStore> ChainStore<S> {
         key
     }
 
+    /// Key for newest-first address history. Ascending key order yields higher
+    /// block numbers first because the block number is bitwise inverted.
+    fn addr_tx_rev_key(address: &Address, block_number: u64, tx_index: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(3 + 20 + 8 + 4);
+        key.extend_from_slice(prefix::ADDR_TX_INDEX_REV);
+        key.extend_from_slice(address.as_ref());
+        key.extend_from_slice(&(!block_number).to_be_bytes());
+        key.extend_from_slice(&tx_index.to_be_bytes());
+        key
+    }
+
     /// Prefix for scanning all txs of a given address.
     fn addr_tx_prefix(address: &Address) -> Vec<u8> {
         let mut key = Vec::with_capacity(2 + 20);
         key.extend_from_slice(prefix::ADDR_TX_INDEX);
         key.extend_from_slice(address.as_ref());
         key
+    }
+
+    fn addr_tx_rev_prefix(address: &Address) -> Vec<u8> {
+        let mut key = Vec::with_capacity(3 + 20);
+        key.extend_from_slice(prefix::ADDR_TX_INDEX_REV);
+        key.extend_from_slice(address.as_ref());
+        key
+    }
+
+    fn addr_tx_rev_cursor_key(address: &Address, cursor: &str) -> Result<Vec<u8>, StorageError> {
+        let raw = cursor.strip_prefix("0x").unwrap_or(cursor);
+        let bytes = hex::decode(raw).map_err(|e| StorageError::Codec(e.to_string()))?;
+        if bytes.len() != 12 {
+            return Err(StorageError::Codec(
+                "address tx cursor must encode 12 bytes".into(),
+            ));
+        }
+        let mut key = Self::addr_tx_rev_prefix(address);
+        key.extend_from_slice(&bytes);
+        Ok(key)
+    }
+
+    fn addr_tx_cursor_key(address: &Address, cursor: &str) -> Result<Vec<u8>, StorageError> {
+        let raw = cursor.strip_prefix("0x").unwrap_or(cursor);
+        let bytes = hex::decode(raw).map_err(|e| StorageError::Codec(e.to_string()))?;
+        if bytes.len() != 12 {
+            return Err(StorageError::Codec(
+                "address tx cursor must encode 12 bytes".into(),
+            ));
+        }
+        let mut key = Self::addr_tx_prefix(address);
+        key.extend_from_slice(&bytes);
+        Ok(key)
+    }
+
+    fn addr_tx_cursor_from_key(prefix_len: usize, key: &[u8]) -> Result<String, StorageError> {
+        if key.len() < prefix_len.saturating_add(12) {
+            return Err(StorageError::Codec("invalid addr index key".into()));
+        }
+        Ok(format!(
+            "0x{}",
+            hex::encode(&key[prefix_len..prefix_len + 12])
+        ))
+    }
+
+    fn addr_tx_rev_cursor_from_key(prefix_len: usize, key: &[u8]) -> Result<String, StorageError> {
+        if key.len() < prefix_len.saturating_add(12) {
+            return Err(StorageError::Codec("invalid reverse addr index key".into()));
+        }
+        Ok(format!(
+            "0x{}",
+            hex::encode(&key[prefix_len..prefix_len + 12])
+        ))
+    }
+
+    fn block_number_from_addr_rev_index_key(
+        prefix_len: usize,
+        key: &[u8],
+    ) -> Result<u64, StorageError> {
+        let inverted = Self::block_number_from_addr_index_key(prefix_len, key)?;
+        Ok(!inverted)
     }
 
     fn code_key(code_hash: &ShellHash) -> Vec<u8> {
@@ -355,23 +438,33 @@ impl<S: KvStore> ChainStore<S> {
                 index_value.extend_from_slice(&(i as u32).to_be_bytes());
                 batch.put(Self::tx_index_key(&tx_hash), index_value);
 
-                // Address index: sender
                 let idx = i as u32;
-                batch.put(
-                    Self::addr_tx_key(&tx.sender(), block_number, idx),
-                    tx_hash.as_bytes().to_vec(),
-                );
-                // Address index: recipient (if not contract creation)
+                Self::append_addr_tx_index(batch, &tx.sender(), block_number, idx, &tx_hash);
                 if let Some(to) = tx.tx.to {
                     if to != tx.sender() {
-                        batch.put(
-                            Self::addr_tx_key(&to, block_number, idx),
-                            tx_hash.as_bytes().to_vec(),
-                        );
+                        Self::append_addr_tx_index(batch, &to, block_number, idx, &tx_hash);
                     }
                 }
             }
         }
+    }
+
+    fn append_addr_tx_index(
+        batch: &mut WriteBatch,
+        address: &Address,
+        block_number: u64,
+        tx_index: u32,
+        tx_hash: &ShellHash,
+    ) {
+        let value = tx_hash.as_bytes().to_vec();
+        batch.put(
+            Self::addr_tx_key(address, block_number, tx_index),
+            value.clone(),
+        );
+        batch.put(
+            Self::addr_tx_rev_key(address, block_number, tx_index),
+            value,
+        );
     }
 
     fn put_block_parts(&self, block: &Block, index_transactions: bool) -> Result<(), StorageError> {
@@ -643,10 +736,7 @@ impl<S: KvStore> ChainStore<S> {
             let mut index_value = block_hash.as_bytes().to_vec();
             index_value.extend_from_slice(&tx.tx_index.to_be_bytes());
             batch.put(Self::tx_index_key(&tx_hash), index_value);
-            batch.put(
-                Self::addr_tx_key(&tx.to, block_number, tx.tx_index),
-                tx_hash.as_bytes().to_vec(),
-            );
+            Self::append_addr_tx_index(batch, &tx.to, block_number, tx.tx_index, &tx_hash);
         }
 
         Ok(())
@@ -887,6 +977,88 @@ impl<S: KvStore> ChainStore<S> {
             .sum();
 
         Ok(total)
+    }
+
+    /// Return address transaction index entries using bounded cursor scanning.
+    ///
+    /// `descending = true` returns newest-first using the reverse index. The
+    /// returned `bool` indicates whether more entries are available after the
+    /// returned page.
+    pub fn get_txs_by_address_cursor(
+        &self,
+        address: &Address,
+        from_block: u64,
+        to_block: u64,
+        cursor: Option<&str>,
+        limit: usize,
+        descending: bool,
+    ) -> Result<(Vec<AddressTxIndexEntry>, bool), StorageError> {
+        if limit == 0 {
+            return Ok((Vec::new(), false));
+        }
+
+        let prefix = if descending {
+            Self::addr_tx_rev_prefix(address)
+        } else {
+            Self::addr_tx_prefix(address)
+        };
+        let after_key = match cursor {
+            Some(cursor) if descending => Some(Self::addr_tx_rev_cursor_key(address, cursor)?),
+            Some(cursor) => Some(Self::addr_tx_cursor_key(address, cursor)?),
+            None => None,
+        };
+
+        let mut entries = Vec::new();
+        let mut next_after = after_key;
+        let mut has_more = false;
+        while entries.len() <= limit {
+            let remaining = limit.saturating_sub(entries.len()).saturating_add(1);
+            let page = self.store.scan_prefix_after(
+                &prefix,
+                next_after.as_deref(),
+                remaining.max(1).saturating_mul(2),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for (key, value) in page {
+                next_after = Some(key.clone());
+                if value.len() != 32 {
+                    continue;
+                }
+                let block_number = if descending {
+                    Self::block_number_from_addr_rev_index_key(prefix.len(), &key)?
+                } else {
+                    Self::block_number_from_addr_index_key(prefix.len(), &key)?
+                };
+                if block_number < from_block || block_number > to_block {
+                    continue;
+                }
+                let (_, tx_index) = Self::addr_index_key_parts(prefix.len(), &key)?;
+                let tx_hash = ShellHash::try_from_slice(&value)
+                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                let cursor = if descending {
+                    Self::addr_tx_rev_cursor_from_key(prefix.len(), &key)?
+                } else {
+                    Self::addr_tx_cursor_from_key(prefix.len(), &key)?
+                };
+                if entries.len() >= limit {
+                    has_more = true;
+                    break;
+                }
+                entries.push(AddressTxIndexEntry {
+                    block_number,
+                    tx_index,
+                    tx_hash,
+                    cursor,
+                });
+            }
+            if has_more || entries.len() >= limit {
+                break;
+            }
+        }
+
+        Ok((entries, has_more))
     }
 
     // ── Chain config ───────────────────────────────────────────
@@ -2364,6 +2536,40 @@ mod tests {
 
         assert_eq!(cs.count_txs_by_address(&address, 0, u64::MAX).unwrap(), 3);
         assert_eq!(cs.count_txs_by_address(&address, 2, 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn get_txs_by_address_cursor_returns_newest_first_with_cursor() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let address = Address::from([0xAA; 20]);
+
+        for number in 1..=3 {
+            let block = make_block_with_txs(number);
+            put_canonical(&cs, &block);
+        }
+
+        let (first_page, has_more) = cs
+            .get_txs_by_address_cursor(&address, 0, u64::MAX, None, 2, true)
+            .unwrap();
+        assert!(has_more);
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].block_number, 3);
+        assert_eq!(first_page[1].block_number, 2);
+
+        let (second_page, has_more) = cs
+            .get_txs_by_address_cursor(
+                &address,
+                0,
+                u64::MAX,
+                first_page.last().map(|entry| entry.cursor.as_str()),
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].block_number, 1);
     }
 
     // ── Snapshot round-trip tests ──────────────────────────────────────

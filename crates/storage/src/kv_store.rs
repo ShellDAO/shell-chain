@@ -66,6 +66,31 @@ pub trait KvStore: Send + Sync {
     #[allow(clippy::type_complexity)]
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
 
+    /// Scan keys with `prefix` after an optional exclusive key, stopping once
+    /// `limit` entries have been collected. Results are sorted by ascending key.
+    #[allow(clippy::type_complexity)]
+    fn scan_prefix_after(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (key, value) in self.scan_prefix(prefix)? {
+            if after.is_some_and(|after_key| key.as_slice() <= after_key) {
+                continue;
+            }
+            out.push((key, value));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Scan all keys in the store, returning (key, value) pairs in ascending key order.
     #[allow(clippy::type_complexity)]
     fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {

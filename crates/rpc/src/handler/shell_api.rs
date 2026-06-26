@@ -1,5 +1,286 @@
 use super::*;
 
+impl<S: KvStore + 'static> RpcHandler<S> {
+    fn resolve_block_number_for_v2(&self, value: &str) -> Result<u64, ErrorObjectOwned> {
+        match parse_block_tag(value)? {
+            BlockTag::Latest | BlockTag::Pending => Ok(self
+                .chain_store
+                .get_head_block()
+                .map_err(internal_err)?
+                .map(|b| b.number())
+                .unwrap_or(0)),
+            BlockTag::Finalized => Ok(*self.finalized_number.read()),
+            BlockTag::Number(n) => Ok(n),
+        }
+    }
+
+    fn light_block(
+        &self,
+        block: &Block,
+        detail: BlockTxDetail,
+        tx_limit: Option<usize>,
+    ) -> RpcBlock {
+        let mut rpc = block_to_rpc_with_detail(block, detail);
+        self.fill_stark_metadata(&block.hash(), &mut rpc);
+        self.attach_system_txs(block, &mut rpc, detail);
+        if let Some(limit) = tx_limit {
+            if let serde_json::Value::Array(ref mut txs) = rpc.transactions {
+                txs.truncate(limit);
+            }
+        }
+        rpc
+    }
+
+    fn avg_block_time(&self, head_number: u64) -> Result<f64, ErrorObjectOwned> {
+        if head_number == 0 {
+            return Ok(0.0);
+        }
+        let window = std::cmp::min(head_number, 10);
+        if window == 0 {
+            return Ok(0.0);
+        }
+        let recent = self
+            .chain_store
+            .get_block_by_number(head_number)
+            .map_err(internal_err)?;
+        let older = self
+            .chain_store
+            .get_block_by_number(head_number - window)
+            .map_err(internal_err)?;
+        Ok(match (recent, older) {
+            (Some(recent), Some(older)) => {
+                recent
+                    .header
+                    .timestamp
+                    .saturating_sub(older.header.timestamp) as f64
+                    / window as f64
+            }
+            _ => 0.0,
+        })
+    }
+
+    fn address_transactions_v2(
+        &self,
+        address: Address,
+        options: RpcAddressTransactionsV2Options,
+    ) -> Result<RpcAddressTransactionsV2Page, ErrorObjectOwned> {
+        let to_block = options.to_block.unwrap_or_else(|| {
+            self.chain_store
+                .get_head_block()
+                .ok()
+                .flatten()
+                .map(|b| b.number())
+                .unwrap_or(0)
+        });
+        let from_block = options.from_block.unwrap_or(0);
+        let limit = options.limit.unwrap_or(20).clamp(0, 100);
+        let descending = matches!(options.direction, RpcListDirection::Desc);
+        let (entries, has_more) = self
+            .chain_store
+            .get_txs_by_address_cursor(
+                &address,
+                from_block,
+                to_block,
+                options.cursor.as_deref(),
+                limit as usize,
+                descending,
+            )
+            .map_err(internal_err)?;
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let Some((block_hash, tx_index)) = self
+                .chain_store
+                .get_tx_location(&entry.tx_hash)
+                .map_err(internal_err)?
+            else {
+                continue;
+            };
+            let Some(block) = self
+                .chain_store
+                .get_block_by_hash(&block_hash)
+                .map_err(internal_err)?
+            else {
+                continue;
+            };
+            if let Some(mut value) = self.tx_value_for_location(
+                &entry.tx_hash,
+                &block,
+                block_hash,
+                tx_index,
+                options.detail,
+            )? {
+                if let serde_json::Value::Object(ref mut object) = value {
+                    object.insert(
+                        "timestamp".into(),
+                        serde_json::json!(hex_u64(block.header.timestamp)),
+                    );
+                    if let Some(receipt) = self
+                        .chain_store
+                        .get_receipt_by_tx_hash(&entry.tx_hash)
+                        .map_err(internal_err)?
+                    {
+                        object.insert(
+                            "status".into(),
+                            serde_json::json!(hex_u64(receipt.status as u64)),
+                        );
+                        object.insert(
+                            "gasUsed".into(),
+                            serde_json::json!(hex_u64(receipt.gas_used)),
+                        );
+                        object.insert("logCount".into(), serde_json::json!(receipt.logs.len()));
+                    }
+                    object.insert("cursor".into(), serde_json::json!(entry.cursor));
+                }
+                items.push(value);
+            }
+        }
+        let total = if options.include_total.unwrap_or(false) {
+            Some(
+                self.chain_store
+                    .count_txs_by_address(&address, from_block, to_block)
+                    .map_err(internal_err)?,
+            )
+        } else {
+            None
+        };
+        Ok(RpcAddressTransactionsV2Page {
+            address,
+            from_block: hex_u64(from_block),
+            to_block: hex_u64(to_block),
+            limit,
+            direction: options.direction,
+            total,
+            next_cursor: entries.last().map(|entry| entry.cursor.clone()),
+            has_more,
+            items,
+        })
+    }
+
+    fn tx_value_for_location(
+        &self,
+        hash: &ShellHash,
+        block: &Block,
+        block_hash: ShellHash,
+        tx_index: u32,
+        detail: RpcV2TxDetail,
+    ) -> Result<Option<serde_json::Value>, ErrorObjectOwned> {
+        if matches!(detail, RpcV2TxDetail::Hashes) {
+            return Ok(Some(serde_json::json!(hash)));
+        }
+        if let Some(tx) = block.transactions.get(tx_index as usize) {
+            let value = match detail {
+                RpcV2TxDetail::Full => serde_json::to_value(tx_to_rpc(
+                    tx,
+                    Some(block_hash),
+                    Some(block.number()),
+                    Some(tx_index),
+                    Some(block.header.base_fee_per_gas),
+                )),
+                RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
+                    serde_json::to_value(tx_to_rpc_summary(
+                        tx,
+                        Some(block_hash),
+                        Some(block.number()),
+                        Some(tx_index),
+                    ))
+                }
+            }
+            .map_err(|e| internal_err(format!("serialize tx: {e}")))?;
+            return Ok(Some(value));
+        }
+        let system_tx = self
+            .chain_store
+            .get_system_transaction_by_hash(hash)
+            .map_err(internal_err)?;
+        let Some(system_tx) = system_tx else {
+            return Ok(None);
+        };
+        let value = match detail {
+            RpcV2TxDetail::Full => {
+                serde_json::to_value(system_tx_to_rpc(&system_tx, Some(block_hash)))
+            }
+            RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
+                serde_json::to_value(system_tx_to_rpc_summary(&system_tx, Some(block_hash)))
+            }
+        }
+        .map_err(|e| internal_err(format!("serialize system tx: {e}")))?;
+        Ok(Some(value))
+    }
+
+    fn receipt_for_location(
+        &self,
+        hash: &ShellHash,
+        block: &Block,
+        block_hash: ShellHash,
+        tx_index: u32,
+    ) -> Result<Option<RpcReceipt>, shell_storage::StorageError> {
+        let Some(receipt) = self.chain_store.get_receipt_by_tx_hash(hash)? else {
+            return Ok(None);
+        };
+        let (from, to, effective_gas_price, tx_type, shell_type, reward_kind) =
+            if let Some(tx) = block.transactions.get(tx_index as usize) {
+                let shell_type = if tx.is_aa_bundle() {
+                    "aaBatch"
+                } else if tx.tx.to.is_none() {
+                    "contractCreate"
+                } else if !tx.tx.data.is_empty() {
+                    "contractCall"
+                } else {
+                    "transfer"
+                };
+                (
+                    tx.sender(),
+                    tx.tx.to,
+                    shell_core::effective_gas_price(
+                        tx.tx.max_fee_per_gas,
+                        tx.tx.max_priority_fee_per_gas,
+                        block.header.base_fee_per_gas,
+                    ),
+                    tx.tx.tx_type,
+                    Some(shell_type.into()),
+                    None,
+                )
+            } else if let Some(system_tx) = self.chain_store.get_system_transaction_by_hash(hash)? {
+                (
+                    system_tx.from,
+                    Some(system_tx.to),
+                    0,
+                    0x80u8,
+                    Some(system_tx.kind.as_str().into()),
+                    Some(system_tx.kind.as_str().into()),
+                )
+            } else {
+                (Address::ZERO, None, 0, 2u8, None, None)
+            };
+        Ok(Some(RpcReceipt {
+            transaction_hash: receipt.tx_hash,
+            block_hash,
+            block_number: hex_u64(receipt.block_number),
+            transaction_index: hex_u64(tx_index as u64),
+            from,
+            to,
+            status: hex_u64(receipt.status as u64),
+            gas_used: hex_u64(receipt.gas_used),
+            cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
+            effective_gas_price: hex_u64(effective_gas_price),
+            contract_address: receipt.contract_address,
+            logs: receipt
+                .logs
+                .into_iter()
+                .map(|log| RpcLog {
+                    address: log.address,
+                    topics: log.topics,
+                    data: hex_bytes(log.data.as_ref()),
+                })
+                .collect(),
+            logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
+            tx_type: format!("{:#x}", tx_type),
+            shell_type,
+            reward_kind,
+        }))
+    }
+}
+
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     async fn get_pq_pubkey(&self, address: Address) -> Result<Option<String>, ErrorObjectOwned> {
@@ -70,6 +351,307 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             self.attach_system_txs(b, &mut rpc, detail);
             rpc
         }))
+    }
+
+    async fn rpc_capabilities(&self) -> Result<RpcCapabilities, ErrorObjectOwned> {
+        Ok(RpcCapabilities {
+            rpc_version: "shell-rpc-v2".into(),
+            methods: vec![
+                "shell_rpcCapabilities".into(),
+                "shell_getChainSnapshot".into(),
+                "shell_getBlocksRange".into(),
+                "shell_getAddressSummary".into(),
+                "shell_getTransactionsByAddressV2".into(),
+                "shell_getTransactionSummary".into(),
+                "shell_getValidatorSnapshot".into(),
+            ],
+            max_page_size: 100,
+            max_blocks_range: 100,
+            max_tx_summary_per_block: 100,
+            supports_cursor_pagination: true,
+            supports_address_history_index: true,
+            witness_store: self.witness_store.is_some(),
+            storage_profile: self.storage_profile.clone(),
+            fallback_methods: vec![
+                "shell_getBlockByNumber".into(),
+                "shell_getTransactionsByAddress".into(),
+                "shell_getChainStats".into(),
+                "shell_getNodeInfo".into(),
+            ],
+        })
+    }
+
+    async fn get_chain_snapshot(
+        &self,
+        _options: Option<serde_json::Value>,
+    ) -> Result<RpcChainSnapshot, ErrorObjectOwned> {
+        let head = self.chain_store.get_head_block().map_err(internal_err)?;
+        let head_number = head.as_ref().map(|b| b.number()).unwrap_or(0);
+        let finalized_number = *self.finalized_number.read();
+        let finalized = self
+            .chain_store
+            .get_block_by_number(finalized_number)
+            .map_err(internal_err)?;
+        let base_fee = match &head {
+            Some(h) if h.header.base_fee_per_gas > 0 => h.header.base_fee_per_gas,
+            _ => INITIAL_BASE_FEE,
+        };
+        let (total_transactions, gas_used_total) = if head.is_some() {
+            self.chain_store
+                .get_chain_totals(head_number)
+                .map_err(internal_err)?
+        } else {
+            (0, U256::ZERO)
+        };
+
+        let avg_block_time = self.avg_block_time(head_number)?;
+        let consensus = ShellApiServer::consensus_info(self).await?;
+        let validators = consensus
+            .get("validators")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+
+        Ok(RpcChainSnapshot {
+            chain_id: hex_u64(self.chain_id),
+            head: head
+                .as_ref()
+                .map(|b| self.light_block(b, BlockTxDetail::Summary, Some(100))),
+            finalized: finalized
+                .as_ref()
+                .map(|b| self.light_block(b, BlockTxDetail::Summary, Some(100))),
+            finality_lag: head_number.saturating_sub(finalized_number),
+            pending_transactions: hex_u64(self.tx_pool.len() as u64),
+            peer_count: self.peer_count.load(Ordering::Relaxed) as u64,
+            is_mining: self.proposer_signer.is_some(),
+            uptime: self.start_time.elapsed().as_secs(),
+            base_fee: hex_u64(base_fee),
+            gas_price: hex_u64(base_fee),
+            total_transactions,
+            gas_used_total: hex_u256(gas_used_total),
+            avg_block_time,
+            consensus,
+            validators,
+            storage_profile: self.storage_profile.clone(),
+        })
+    }
+
+    async fn get_blocks_range(
+        &self,
+        start: String,
+        options: Option<RpcBlocksRangeOptions>,
+    ) -> Result<RpcBlocksRange, ErrorObjectOwned> {
+        let options = options.unwrap_or_default();
+        let limit = options.limit.unwrap_or(20).clamp(1, 100);
+        let tx_limit = options.tx_limit.map(|n| n.min(100) as usize);
+        let detail = match options.tx_detail {
+            RpcV2TxDetail::None | RpcV2TxDetail::Hashes => BlockTxDetail::Hashes,
+            RpcV2TxDetail::Summary => BlockTxDetail::Summary,
+            RpcV2TxDetail::Full => BlockTxDetail::Full,
+        };
+        let mut current = self.resolve_block_number_for_v2(&start)?;
+        let mut blocks = Vec::new();
+        for _ in 0..limit {
+            let Some(block) = self
+                .chain_store
+                .get_block_by_number(current)
+                .map_err(internal_err)?
+            else {
+                break;
+            };
+            let mut rpc = self.light_block(&block, detail, tx_limit);
+            if matches!(options.tx_detail, RpcV2TxDetail::None) {
+                rpc.transactions = serde_json::json!([]);
+            }
+            blocks.push(rpc);
+            match options.direction {
+                RpcListDirection::Desc if current == 0 => break,
+                RpcListDirection::Desc => current = current.saturating_sub(1),
+                RpcListDirection::Asc => current = current.saturating_add(1),
+            }
+        }
+        let next_start = if blocks.len() as u64 == limit {
+            Some(hex_u64(current))
+        } else {
+            None
+        };
+        Ok(RpcBlocksRange {
+            start,
+            direction: options.direction,
+            limit,
+            blocks,
+            next_start,
+        })
+    }
+
+    async fn get_address_summary(
+        &self,
+        address: Address,
+        options: Option<RpcAddressSummaryOptions>,
+    ) -> Result<RpcAddressSummary, ErrorObjectOwned> {
+        let options = options.unwrap_or_default();
+        let recent_limit = options.recent_limit.unwrap_or(10).clamp(0, 100);
+        let tx_options = RpcAddressTransactionsV2Options {
+            limit: Some(recent_limit),
+            include_total: options.include_total,
+            ..RpcAddressTransactionsV2Options::default()
+        };
+        let recent_transactions = self.address_transactions_v2(address, tx_options)?;
+        let ws = self.world_state.read();
+        let balance = ws.get_balance(&address).map_err(internal_err)?;
+        let nonce = ws.get_nonce(&address).map_err(internal_err)?;
+        let exists = ws.exists(&address).map_err(internal_err)?;
+        let code_hash = ws.get_code_hash(&address).map_err(internal_err)?;
+        drop(ws);
+        let pq_pubkey_registered = self
+            .chain_store
+            .get_pubkey(&address)
+            .map_err(internal_err)?
+            .is_some();
+        Ok(RpcAddressSummary {
+            address,
+            balance: hex_u256(balance),
+            nonce: hex_u64(nonce),
+            exists,
+            has_code: code_hash.is_some(),
+            code_hash,
+            pq_pubkey_registered,
+            total_transactions: recent_transactions.total,
+            recent_transactions,
+        })
+    }
+
+    async fn get_transactions_by_address_v2(
+        &self,
+        address: Address,
+        options: Option<RpcAddressTransactionsV2Options>,
+    ) -> Result<RpcAddressTransactionsV2Page, ErrorObjectOwned> {
+        self.address_transactions_v2(address, options.unwrap_or_default())
+    }
+
+    async fn get_transaction_summary(
+        &self,
+        hash: ShellHash,
+        options: Option<RpcTransactionSummaryOptions>,
+    ) -> Result<RpcTransactionSummaryResult, ErrorObjectOwned> {
+        let include_receipt = options.unwrap_or_default().include_receipt.unwrap_or(false);
+        let Some((block_hash, tx_index)) = self
+            .chain_store
+            .get_tx_location(&hash)
+            .map_err(internal_err)?
+        else {
+            return Ok(RpcTransactionSummaryResult {
+                transaction: None,
+                receipt: None,
+                status: None,
+                gas_used: None,
+                log_count: None,
+                timestamp: None,
+            });
+        };
+        let block = self
+            .chain_store
+            .get_block_by_hash(&block_hash)
+            .map_err(internal_err)?;
+        let Some(block) = block else {
+            return Ok(RpcTransactionSummaryResult {
+                transaction: None,
+                receipt: None,
+                status: None,
+                gas_used: None,
+                log_count: None,
+                timestamp: None,
+            });
+        };
+        let transaction = self
+            .tx_value_for_location(&hash, &block, block_hash, tx_index, RpcV2TxDetail::Summary)?
+            .map(|mut value| {
+                if let serde_json::Value::Object(ref mut object) = value {
+                    object.insert(
+                        "timestamp".into(),
+                        serde_json::json!(hex_u64(block.header.timestamp)),
+                    );
+                }
+                value
+            });
+        let receipt = self
+            .receipt_for_location(&hash, &block, block_hash, tx_index)
+            .map_err(internal_err)?;
+        let status = receipt.as_ref().map(|r| r.status.clone());
+        let gas_used = receipt.as_ref().map(|r| r.gas_used.clone());
+        let log_count = receipt.as_ref().map(|r| r.logs.len() as u64);
+        Ok(RpcTransactionSummaryResult {
+            transaction,
+            receipt: if include_receipt { receipt } else { None },
+            status,
+            gas_used,
+            log_count,
+            timestamp: Some(hex_u64(block.header.timestamp)),
+        })
+    }
+
+    async fn get_validator_snapshot(
+        &self,
+        options: Option<RpcValidatorSnapshotOptions>,
+    ) -> Result<RpcValidatorSnapshot, ErrorObjectOwned> {
+        let proposer_window = options
+            .unwrap_or_default()
+            .proposer_window
+            .unwrap_or(200)
+            .min(1000);
+        let consensus = ShellApiServer::consensus_info(self).await?;
+        let head_number = consensus
+            .get("block_number")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let from = head_number.saturating_sub(proposer_window.saturating_sub(1));
+        let mut counts = std::collections::BTreeMap::<String, (u64, u64)>::new();
+        for number in from..=head_number {
+            if let Some(block) = self
+                .chain_store
+                .get_block_by_number(number)
+                .map_err(internal_err)?
+            {
+                let key = block.header.proposer.to_string();
+                let entry = counts.entry(key).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.max(number);
+            }
+        }
+        let proposer_stats = counts
+            .into_iter()
+            .map(|(address, (blocks, last_seen_block))| {
+                serde_json::json!({
+                    "address": address,
+                    "blocksProposed": blocks,
+                    "lastSeenBlock": last_seen_block,
+                })
+            })
+            .collect();
+        Ok(RpcValidatorSnapshot {
+            validators: consensus
+                .get("validators")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            current_proposer: consensus
+                .get("current_proposer")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            block_number: head_number,
+            epoch: consensus
+                .get("epoch")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            epoch_length: consensus
+                .get("epoch_length")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            epoch_progress: consensus
+                .get("epoch_progress")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            proposer_window,
+            proposer_stats,
+        })
     }
 
     async fn send_transaction(&self, tx: SignedTransaction) -> Result<ShellHash, ErrorObjectOwned> {

@@ -1334,6 +1334,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_capabilities_exposes_v2_methods() {
+        let handler = setup();
+        let result = ShellApiServer::rpc_capabilities(&handler).await.unwrap();
+        assert!(result.supports_cursor_pagination);
+        assert!(result
+            .methods
+            .contains(&"shell_getTransactionsByAddressV2".to_string()));
+        assert_eq!(result.max_page_size, 100);
+    }
+
+    #[tokio::test]
+    async fn chain_snapshot_empty_chain_is_compact() {
+        let handler = setup();
+        let result = ShellApiServer::get_chain_snapshot(&handler, None)
+            .await
+            .unwrap();
+        assert_eq!(result.chain_id, "0x2a");
+        assert!(result.head.is_none());
+        assert_eq!(result.pending_transactions, "0x0");
+        assert_eq!(result.finality_lag, 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_summary_not_found_is_null_shaped() {
+        let handler = setup();
+        let result =
+            ShellApiServer::get_transaction_summary(&handler, ShellHash::from([0x77; 32]), None)
+                .await
+                .unwrap();
+        assert!(result.transaction.is_none());
+        assert!(result.receipt.is_none());
+        assert!(result.status.is_none());
+    }
+
+    #[tokio::test]
     async fn get_transactions_by_address_total_counts_all_matches() {
         let handler = setup();
         let sender = DilithiumSigner::generate();
@@ -1469,6 +1504,25 @@ mod tests {
         assert_eq!(result["total"], 2);
         assert_eq!(result["transactions"].as_array().unwrap().len(), 1);
         assert_eq!(result["transactions"][0]["blockNumber"], "0x2");
+
+        let v2 = ShellApiServer::get_transactions_by_address_v2(
+            &handler,
+            from,
+            Some(RpcAddressTransactionsV2Options {
+                from_block: Some(0),
+                to_block: Some(2),
+                limit: Some(1),
+                include_total: Some(true),
+                ..RpcAddressTransactionsV2Options::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2.total, Some(2));
+        assert!(v2.has_more);
+        assert_eq!(v2.items.len(), 1);
+        assert_eq!(v2.items[0]["blockNumber"], "0x2");
+        assert!(v2.items[0].get("input").is_none());
     }
 
     #[tokio::test]

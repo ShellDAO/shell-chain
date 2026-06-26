@@ -357,6 +357,58 @@ pub trait ShellApi {
         tx_detail: Option<String>,
     ) -> Result<Option<RpcBlock>, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns Shell RPC extension capabilities and server limits.
+    #[method(name = "rpcCapabilities")]
+    async fn rpc_capabilities(
+        &self,
+    ) -> Result<crate::types::RpcCapabilities, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns a compact chain/node/consensus snapshot for dashboards.
+    #[method(name = "getChainSnapshot")]
+    async fn get_chain_snapshot(
+        &self,
+        options: Option<serde_json::Value>,
+    ) -> Result<crate::types::RpcChainSnapshot, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns a range of compact block responses in one call.
+    #[method(name = "getBlocksRange")]
+    async fn get_blocks_range(
+        &self,
+        start: String,
+        options: Option<crate::types::RpcBlocksRangeOptions>,
+    ) -> Result<crate::types::RpcBlocksRange, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns account state plus a small cursor-paginated transaction page.
+    #[method(name = "getAddressSummary")]
+    async fn get_address_summary(
+        &self,
+        address: Address,
+        options: Option<crate::types::RpcAddressSummaryOptions>,
+    ) -> Result<crate::types::RpcAddressSummary, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns cursor-paginated transaction history for an address.
+    #[method(name = "getTransactionsByAddressV2")]
+    async fn get_transactions_by_address_v2(
+        &self,
+        address: Address,
+        options: Option<crate::types::RpcAddressTransactionsV2Options>,
+    ) -> Result<crate::types::RpcAddressTransactionsV2Page, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns a compact transaction view with optional receipt.
+    #[method(name = "getTransactionSummary")]
+    async fn get_transaction_summary(
+        &self,
+        hash: ShellHash,
+        options: Option<crate::types::RpcTransactionSummaryOptions>,
+    ) -> Result<crate::types::RpcTransactionSummaryResult, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns validator set, proposer and optional recent proposer stats.
+    #[method(name = "getValidatorSnapshot")]
+    async fn get_validator_snapshot(
+        &self,
+        options: Option<crate::types::RpcValidatorSnapshotOptions>,
+    ) -> Result<crate::types::RpcValidatorSnapshot, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Submit a signed transaction as structured JSON (developer-friendly).
     #[method(name = "sendTransaction")]
     async fn send_transaction(

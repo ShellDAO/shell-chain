@@ -394,6 +394,41 @@ impl KvStore for RocksDbStore {
         Ok(results)
     }
 
+    fn scan_prefix_after(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange(prefix));
+        let start = after.unwrap_or(prefix);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            opts,
+            rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            if after.is_some_and(|after_key| k.as_ref() <= after_key) {
+                continue;
+            }
+            results.push((k.to_vec(), v.to_vec()));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let cf = self.cf();
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
