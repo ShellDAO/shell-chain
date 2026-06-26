@@ -144,32 +144,22 @@ pub struct RpcTransactionSummary {
     pub compressed_size: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RpcListDirection {
     Asc,
+    #[default]
     Desc,
 }
 
-impl Default for RpcListDirection {
-    fn default() -> Self {
-        Self::Desc
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RpcV2TxDetail {
     None,
     Hashes,
+    #[default]
     Summary,
     Full,
-}
-
-impl Default for RpcV2TxDetail {
-    fn default() -> Self {
-        Self::Summary
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
