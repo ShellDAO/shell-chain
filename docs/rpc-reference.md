@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (35 methods)
+- **`shell_`** (42 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -413,6 +413,55 @@ shell_get_block_by_hash(hash: ShellHash, tx_detail: Option<String>, ) → Option
 Returns a block by hash with Shell transaction detail modes.
 
 See `shell_getBlockByNumber` for supported `tx_detail` values.
+
+### shell_rpcCapabilities
+```
+rpc_capabilities() → crate::types::RpcCapabilities
+```
+
+Returns Shell RPC extension capabilities and server limits.
+
+### shell_getChainSnapshot
+```
+get_chain_snapshot(options: Option<serde_json::Value>, ) → crate::types::RpcChainSnapshot
+```
+
+Returns a compact chain/node/consensus snapshot for dashboards.
+
+### shell_getBlocksRange
+```
+get_blocks_range(start: String, options: Option<crate::types::RpcBlocksRangeOptions>, ) → crate::types::RpcBlocksRange
+```
+
+Returns a range of compact block responses in one call.
+
+### shell_getAddressSummary
+```
+get_address_summary(address: Address, options: Option<crate::types::RpcAddressSummaryOptions>, ) → crate::types::RpcAddressSummary
+```
+
+Returns account state plus a small cursor-paginated transaction page.
+
+### shell_getTransactionsByAddressV2
+```
+get_transactions_by_address_v2(address: Address, options: Option<crate::types::RpcAddressTransactionsV2Options>, ) → crate::types::RpcAddressTransactionsV2Page
+```
+
+Returns cursor-paginated transaction history for an address.
+
+### shell_getTransactionSummary
+```
+get_transaction_summary(hash: ShellHash, options: Option<crate::types::RpcTransactionSummaryOptions>, ) → crate::types::RpcTransactionSummaryResult
+```
+
+Returns a compact transaction view with optional receipt.
+
+### shell_getValidatorSnapshot
+```
+get_validator_snapshot(options: Option<crate::types::RpcValidatorSnapshotOptions>, ) → crate::types::RpcValidatorSnapshot
+```
+
+Returns validator set, proposer and optional recent proposer stats.
 
 ### shell_sendTransaction
 ```
