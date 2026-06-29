@@ -97,11 +97,6 @@ impl TxPool {
     ) -> Result<ShellHash, MempoolError> {
         // --- Stateless checks (before acquiring lock) ---
         let validation = self.validate_stateless(&tx, world_state, chain_store, verifier)?;
-        if validation.should_register_pubkey {
-            chain_store
-                .put_pubkey(&tx.from, &validation.pubkey)
-                .map_err(MempoolError::Storage)?;
-        }
 
         // --- Balance floor check (F-020) ---
         let sender = tx.sender();
@@ -230,6 +225,12 @@ impl TxPool {
                     capacity: self.config.max_pool_size,
                 });
             }
+        }
+
+        if validation.should_register_pubkey {
+            chain_store
+                .put_pubkey(&tx.from, &validation.pubkey)
+                .map_err(MempoolError::Storage)?;
         }
 
         // --- Insert ---
@@ -928,6 +929,24 @@ mod tests {
         let sig1 = signer.sign(tx1.hash().as_bytes()).unwrap();
         let follow_up = SignedTransaction::new(from, tx1, sig1);
         insert_rich(&pool, follow_up, &verifier, &mut ws, &cs).unwrap();
+    }
+
+    #[test]
+    fn rejected_embedded_pubkey_tx_does_not_register_pubkey() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let first_account_nonce = u64::default();
+        let priority_fee = make_config().min_gas_price + 99;
+        let tx = make_signed_tx_with_signer(&signer, &pubkey, first_account_nonce, priority_fee);
+        let sender = tx.sender();
+
+        let err = insert_broke(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+        assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
+        assert_eq!(cs.get_pubkey(&sender).unwrap(), None);
+        assert_ne!(cs.get_pubkey(&sender).unwrap(), Some(pubkey));
     }
 
     #[test]

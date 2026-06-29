@@ -28,7 +28,7 @@ pub(crate) use shell_consensus::{
 };
 pub(crate) use shell_core::{
     calculate_base_fee, effective_gas_price, Account, Block, BlockHeader, SignedTransaction,
-    SystemTransaction, SystemTxKind, TransactionReceipt,
+    StrippedBlock, SystemTransaction, SystemTxKind, TransactionReceipt,
 };
 pub(crate) use shell_crypto::{
     AlgorithmRegistry, BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem,
@@ -194,7 +194,6 @@ struct BlockStoreBoundary<'a, S: KvStore + 'static> {
     store: &'a Arc<S>,
     chain_store: &'a Arc<ChainStore<S>>,
     world_state: &'a Arc<RwLock<WorldState<S>>>,
-    witness_store: &'a Arc<WitnessStore<S>>,
     pending_grace_deletes: &'a parking_lot::Mutex<HashMap<ShellHash, u64>>,
 }
 
@@ -268,20 +267,9 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
             .unwrap_or(0)
     }
 
-    fn stored_pubkey(&self, address: &Address) -> Result<Option<Vec<u8>>, NodeError> {
-        Ok(self.chain_store.get_pubkey(address)?)
-    }
-
     fn store_pubkey(&self, address: &Address, pubkey: &[u8]) -> Result<(), NodeError> {
         self.chain_store.put_pubkey(address, pubkey)?;
         Ok(())
-    }
-
-    fn witness_bundle(
-        &self,
-        block_hash: &ShellHash,
-    ) -> Result<Option<shell_core::WitnessBundle>, NodeError> {
-        Ok(self.witness_store.get_bundle(block_hash)?)
     }
 
     fn update_chain_totals(
@@ -343,11 +331,6 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
         self.finality.read().last_finalized_number()
     }
 
-    fn verify_header(&self, header: &BlockHeader) -> Result<(), NodeError> {
-        self.consensus.read().verify_header(header)?;
-        Ok(())
-    }
-
     fn sign_block(&self, block: &mut Block, signer: &dyn Signer) -> Result<(), NodeError> {
         self.consensus.read().sign_block(block, signer)?;
         Ok(())
@@ -355,10 +338,6 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
 
     fn register_authority_pubkey(&self, address: Address, pubkey: Vec<u8>) {
         self.known_authorities.write().insert(address, pubkey);
-    }
-
-    fn known_authority_pubkey(&self, address: &Address) -> Option<Vec<u8>> {
-        self.known_authorities.read().get(address).cloned()
     }
 
     fn register_fork_choice_block(
@@ -686,7 +665,6 @@ impl<S: KvStore + 'static> Node<S> {
             store: &self.store,
             chain_store: &self.chain_store,
             world_state: &self.world_state,
-            witness_store: &self.witness_store,
             pending_grace_deletes: &self.pending_grace_deletes,
         }
     }
@@ -3401,11 +3379,13 @@ mod tests {
 
     #[test]
     fn import_block() {
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let state_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
 
-        let block = Block {
+        let mut block = Block {
             header: BlockHeader {
                 parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
                 state_root,
@@ -3417,7 +3397,7 @@ mod tests {
                 gas_used: 0,
                 timestamp: 1_700_000_001,
                 extra_data: Bytes::default(),
-                proposer: node.config.proposer_address.unwrap(),
+                proposer,
                 sig_aggregate_proof: None,
                 base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
                 withdrawals_root: ShellHash::ZERO,
@@ -3430,6 +3410,10 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
 
         let verifier = MultiVerifier;
         node.import_block(block, &verifier).unwrap();
@@ -3869,9 +3853,10 @@ mod tests {
     /// block import must fail immediately.
     #[test]
     fn block_import_reference_before_embedded_fails() {
-        let (node, _) = setup_node();
+        let (node, proposer_signer) = setup_node();
         store_genesis(&node);
         let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
@@ -3924,13 +3909,13 @@ mod tests {
         let signed1 =
             SignedTransaction::with_pubkey(sender, tx1, sig1, tx_signer.public_key().to_vec());
 
-        // Build a minimally valid block (proposer_seal=None is allowed in M1b)
+        // Build a signed block whose tx ordering must be rejected by import validation.
         let genesis_hash = node
             .chain_store
             .get_head_hash()
             .unwrap()
             .expect("genesis head");
-        let bad_block = shell_core::Block {
+        let mut bad_block = shell_core::Block {
             header: shell_core::BlockHeader {
                 parent_hash: genesis_hash,
                 state_root: ShellHash::default(),
@@ -3963,6 +3948,11 @@ mod tests {
             )],
             proposer_seal: None,
         };
+        bad_block.proposer_seal = Some(
+            proposer_signer
+                .sign(bad_block.header.hash().as_bytes())
+                .expect("sign bad block"),
+        );
 
         let verifier = MultiVerifier;
         let result = node.import_block(bad_block, &verifier);
@@ -4206,8 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn import_block_without_seal_allowed_m1b() {
-        // In M1b, blocks without a seal are allowed with a warning.
+    fn import_block_without_seal_rejected() {
         let (node, _signer) = setup_node();
         store_genesis(&node);
         let state_root = current_state_root(&node);
@@ -4239,10 +4228,104 @@ mod tests {
         };
 
         let verifier = MultiVerifier;
-        // Should succeed despite missing seal (M1b tolerance).
-        node.import_block(block, &verifier).unwrap();
-        let head = node.chain_store.get_head_block().unwrap().unwrap();
-        assert_eq!(head.number(), 1);
+        let err = node.import_block(block, &verifier).unwrap_err();
+        assert!(
+            err.to_string().contains("missing proposer seal"),
+            "expected missing seal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn import_block_rejects_timestamp_before_block_time() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        let parent = node.chain_store.get_head_block().unwrap().unwrap();
+        let state_root = current_state_root(&node);
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: parent.number() + 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: parent.header.timestamp,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        block.proposer_seal = Some(
+            signer
+                .sign(block.header.hash().as_bytes())
+                .expect("sign block"),
+        );
+
+        let err = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(err.to_string().contains("timestamp"));
+    }
+
+    #[test]
+    fn import_block_rejects_future_timestamp() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        let parent = node.chain_store.get_head_block().unwrap().unwrap();
+        let state_root = current_state_root(&node);
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(10_000);
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: parent.number() + 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: future,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        block.proposer_seal = Some(
+            signer
+                .sign(block.header.hash().as_bytes())
+                .expect("sign block"),
+        );
+
+        let err = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(err.to_string().contains("timestamp"));
     }
 
     #[test]
@@ -4609,10 +4692,11 @@ mod tests {
 
     #[test]
     fn import_multiple_sequential_blocks() {
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let verifier = MultiVerifier;
         let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
         let state_root = current_state_root(&node);
 
         let mut parent_hash = node.chain_store.get_head_hash().unwrap().unwrap();
@@ -4623,7 +4707,7 @@ mod tests {
         for i in 1..=5u64 {
             let base_fee =
                 shell_core::calculate_base_fee(parent_gas_used, parent_gas_limit, parent_base_fee);
-            let block = Block {
+            let mut block = Block {
                 header: BlockHeader {
                     parent_hash,
                     state_root,
@@ -4648,6 +4732,10 @@ mod tests {
                 system_transactions: vec![],
                 proposer_seal: None,
             };
+            node.consensus
+                .read()
+                .sign_block(&mut block, &signer)
+                .unwrap();
             parent_hash = block.hash();
             parent_gas_used = block.header.gas_used;
             parent_gas_limit = block.header.gas_limit;
@@ -4712,15 +4800,16 @@ mod tests {
 
     #[test]
     fn import_fork_block_at_same_height_is_stored_as_side_fork() {
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let verifier = MultiVerifier;
         let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
         let state_root = current_state_root(&node);
 
         // Import block 1 normally.
         let parent_hash = node.chain_store.get_head_hash().unwrap().unwrap();
-        let block1 = Block {
+        let mut block1 = Block {
             header: BlockHeader {
                 parent_hash,
                 state_root,
@@ -4745,6 +4834,10 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
+        node.consensus
+            .read()
+            .sign_block(&mut block1, &signer)
+            .unwrap();
         let block1_hash = block1.hash();
         node.import_block(block1, &verifier).unwrap();
         assert_eq!(
@@ -4753,7 +4846,7 @@ mod tests {
         );
 
         // Try to import a competing block at the same height with different content.
-        let fork_block = Block {
+        let mut fork_block = Block {
             header: BlockHeader {
                 parent_hash,
                 state_root,
@@ -4778,6 +4871,10 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
+        node.consensus
+            .read()
+            .sign_block(&mut fork_block, &signer)
+            .unwrap();
         let fork_hash = fork_block.hash();
 
         // Should succeed, keep canonical head unchanged, and retain the side fork
@@ -4812,16 +4909,17 @@ mod tests {
     }
 
     #[test]
-    fn import_next_height_wrong_parent_is_stored_as_side_fork() {
-        let (node, _signer) = setup_node();
+    fn import_next_height_unknown_parent_is_rejected() {
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let verifier = MultiVerifier;
         let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
         let state_root = current_state_root(&node);
         let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
         let wrong_parent = ShellHash::from([0x42; 32]);
 
-        let fork_block = Block {
+        let mut fork_block = Block {
             header: BlockHeader {
                 parent_hash: wrong_parent,
                 state_root,
@@ -4846,20 +4944,23 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
-        let fork_hash = fork_block.hash();
+        node.consensus
+            .read()
+            .sign_block(&mut fork_block, &signer)
+            .unwrap();
 
-        node.import_block(fork_block, &verifier).unwrap();
+        let err = node.import_block(fork_block, &verifier).unwrap_err();
+        assert!(
+            matches!(err, NodeError::Startup(ref message) if message.contains("parent block")),
+            "expected unknown parent rejection, got {err:?}"
+        );
 
         assert_eq!(
             node.chain_store.get_head_hash().unwrap().unwrap(),
             genesis_hash,
             "disconnected next-height block must not become canonical head"
         );
-        assert_eq!(
-            node.chain_store.get_side_fork_hashes(1).unwrap(),
-            vec![fork_hash]
-        );
-        assert!(node.fork_choice.read().contains(&fork_hash));
+        assert!(node.chain_store.get_side_fork_hashes(1).unwrap().is_empty());
     }
 
     #[test]
@@ -4906,14 +5007,15 @@ mod tests {
 
     #[test]
     fn import_duplicate_block_is_idempotent() {
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let verifier = MultiVerifier;
         let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
         let state_root = current_state_root(&node);
 
         let parent_hash = node.chain_store.get_head_hash().unwrap().unwrap();
-        let block = Block {
+        let mut block = Block {
             header: BlockHeader {
                 parent_hash,
                 state_root,
@@ -4938,6 +5040,10 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
 
         // First import should succeed.
         node.import_block(block.clone(), &verifier).unwrap();
@@ -5099,11 +5205,13 @@ mod tests {
 
     #[test]
     fn import_block_tracks_state_root() {
-        let (node, _signer) = setup_node_with_pruning(10);
+        let (node, signer) = setup_node_with_pruning(10);
         store_genesis(&node);
         let current_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
 
-        let block = Block {
+        let mut block = Block {
             header: BlockHeader {
                 parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
                 state_root: current_root,
@@ -5128,6 +5236,11 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         };
+        block.proposer_seal = Some(
+            signer
+                .sign(block.header.hash().as_bytes())
+                .expect("sign block"),
+        );
 
         let verifier = MultiVerifier;
         node.import_block(block, &verifier).unwrap();
@@ -5216,9 +5329,13 @@ mod tests {
     // ── B5: witness_root validation tests ────────────────────────────────────
 
     /// Build a height-1 block with an optional witness_root set.
-    fn make_block_at_1(node: &Node<MemoryDb>, witness_root: Option<ShellHash>) -> Block {
+    fn make_block_at_1(
+        node: &Node<MemoryDb>,
+        signer: &dyn Signer,
+        witness_root: Option<ShellHash>,
+    ) -> Block {
         let current_root = current_state_root(node);
-        Block {
+        let mut block = Block {
             header: BlockHeader {
                 parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
                 state_root: current_root,
@@ -5242,61 +5359,53 @@ mod tests {
             transactions: vec![],
             system_transactions: vec![],
             proposer_seal: None,
-        }
+        };
+        block.proposer_seal = Some(
+            signer
+                .sign(block.header.hash().as_bytes())
+                .expect("sign block"),
+        );
+        block
     }
 
     #[test]
     fn import_block_no_witness_root_succeeds() {
         // Block with no witness_root: validation is skipped.
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
-        let block = make_block_at_1(&node, None);
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
+        let block = make_block_at_1(&node, &signer, None);
         let verifier = MultiVerifier;
         assert!(node.import_block(block, &verifier).is_ok());
     }
 
     #[test]
-    fn import_block_witness_root_no_bundle_still_imports() {
-        // witness_root is set but no bundle in store → logged, import allowed.
-        let (node, _signer) = setup_node();
+    fn import_block_witness_root_mismatch_without_stored_bundle_rejected() {
+        let (node, signer) = setup_node();
         store_genesis(&node);
-        let fake_root = ShellHash::from([0xab; 32]);
-        let block = make_block_at_1(&node, Some(fake_root));
-        let verifier = MultiVerifier;
-        assert!(
-            node.import_block(block, &verifier).is_ok(),
-            "should accept block when bundle not yet delivered"
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
         );
+        let fake_root = ShellHash::from([0xab; 32]);
+        let block = make_block_at_1(&node, &signer, Some(fake_root));
+        let verifier = MultiVerifier;
+        let err = node.import_block(block, &verifier).unwrap_err();
+        assert!(err.to_string().contains("witness_root mismatch"));
     }
 
     #[test]
     fn import_block_witness_root_matches_bundle_succeeds() {
-        use shell_core::{TxWitness, WitnessBundle};
-        use shell_crypto::PQSignature;
-        use shell_crypto::SignatureType;
-
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
-
-        // Build a minimal bundle and compute its root.
-        let sig = PQSignature {
-            sig_type: SignatureType::Dilithium3,
-            data: vec![0xAA; 16],
-        };
-        let witness = TxWitness {
-            signature: sig,
-            pubkey: None,
-        };
-        let bundle = WitnessBundle {
-            witnesses: vec![witness],
-        };
-        let root = bundle.compute_root();
-
-        // Store the bundle before the block hash exists — we need the future hash.
-        // Build block first, then store bundle, then import.
-        let block = make_block_at_1(&node, Some(root));
-        let block_hash = block.hash();
-        node.witness_store.put_bundle(&block_hash, &bundle).unwrap();
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
+        let block = make_block_at_1(&node, &signer, Some(ShellHash::default()));
 
         let verifier = MultiVerifier;
         assert!(node.import_block(block, &verifier).is_ok());
@@ -5308,11 +5417,15 @@ mod tests {
         use shell_crypto::PQSignature;
         use shell_crypto::SignatureType;
 
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
 
         let wrong_root = ShellHash::from([0xFF; 32]);
-        let block = make_block_at_1(&node, Some(wrong_root));
+        let block = make_block_at_1(&node, &signer, Some(wrong_root));
         let block_hash = block.hash();
 
         // Store a bundle whose root does NOT match wrong_root.

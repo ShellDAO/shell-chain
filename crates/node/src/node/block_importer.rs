@@ -1,6 +1,115 @@
 use super::*;
 
 impl<S: KvStore + 'static> Node<S> {
+    fn wall_clock_secs_for_import() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn parent_for_import(&self, block: &Block) -> Result<Block, NodeError> {
+        if block.number() == 0 {
+            return Err(NodeError::Startup(
+                "network import of genesis block is not supported".into(),
+            ));
+        }
+        self.chain_store
+            .get_block_by_hash(&block.header.parent_hash)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "parent block {} not found for imported block {}",
+                    block.header.parent_hash,
+                    block.number()
+                ))
+            })
+    }
+
+    fn verify_import_consensus(&self, block: &Block, parent: &Block) -> Result<(), NodeError> {
+        let seal = block.proposer_seal.as_ref().ok_or_else(|| {
+            NodeError::Startup(format!("block {} missing proposer seal", block.number()))
+        })?;
+
+        {
+            let consensus = self.consensus.read();
+            consensus.verify_header(&block.header)?;
+            let cfg = consensus.poa_config();
+            let max_allowed =
+                Self::wall_clock_secs_for_import().saturating_add(cfg.max_future_secs);
+            if block.header.timestamp > max_allowed {
+                return Err(NodeError::Startup(format!(
+                    "block {} timestamp {} exceeds current time + max_future {}",
+                    block.number(),
+                    block.header.timestamp,
+                    cfg.max_future_secs
+                )));
+            }
+            if block.header.timestamp < parent.header.timestamp.saturating_add(cfg.block_time_secs)
+            {
+                return Err(NodeError::Startup(format!(
+                    "block {} timestamp {} < parent {} + block_time {}",
+                    block.number(),
+                    block.header.timestamp,
+                    parent.header.timestamp,
+                    cfg.block_time_secs
+                )));
+            }
+            if block.header.number != parent.header.number.saturating_add(1) {
+                return Err(NodeError::Startup(format!(
+                    "block number {} != parent {} + 1",
+                    block.header.number, parent.header.number
+                )));
+            }
+            if block.header.parent_hash != parent.hash() {
+                return Err(NodeError::Startup(
+                    "parent_hash does not match parent block".into(),
+                ));
+            }
+        }
+
+        let proposer = &block.header.proposer;
+        let pubkey = self
+            .known_authorities
+            .read()
+            .get(proposer)
+            .cloned()
+            .or_else(|| self.chain_store.get_pubkey(proposer).ok().flatten())
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "block {} seal verification failed: proposer {} pubkey unknown",
+                    block.number(),
+                    proposer
+                ))
+            })?;
+
+        let verifier = MultiVerifier;
+        self.consensus
+            .read()
+            .verify_seal(&block.header, seal, &pubkey, &verifier)?;
+        self.known_authorities
+            .write()
+            .entry(*proposer)
+            .or_insert(pubkey);
+        Ok(())
+    }
+
+    fn verify_incoming_witness_root(&self, block: &Block) -> Result<(), NodeError> {
+        let Some(expected_root) = block.header.witness_root else {
+            return Ok(());
+        };
+        let (_, bundle) = StrippedBlock::split(block);
+        let computed = bundle.compute_root();
+        if computed != expected_root {
+            return Err(NodeError::Startup(format!(
+                "block {} witness_root mismatch: header={:?}, computed={:?}",
+                block.number(),
+                expected_root,
+                computed
+            )));
+        }
+        Ok(())
+    }
+
     /// Import and validate a block received from the network.
     ///
     /// Re-executes all transactions through the EVM on an isolated state
@@ -36,7 +145,8 @@ impl<S: KvStore + 'static> Node<S> {
         // Fork detection: same height, different hash. Keep the side block so
         // fork-choice/reorg can inspect it later instead of dropping evidence.
         if transition == BlockImportTransition::SameHeightFork {
-            consensus.verify_header(&block.header)?;
+            let parent = self.parent_for_import(&block)?;
+            self.verify_import_consensus(&block, &parent)?;
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
@@ -66,7 +176,8 @@ impl<S: KvStore + 'static> Node<S> {
         // Keep it as a fork candidate instead of corrupting the canonical
         // number->hash mapping with a disconnected block.
         if transition == BlockImportTransition::NextHeightFork {
-            consensus.verify_header(&block.header)?;
+            let parent = self.parent_for_import(&block)?;
+            self.verify_import_consensus(&block, &parent)?;
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
@@ -116,8 +227,10 @@ impl<S: KvStore + 'static> Node<S> {
             return Err(NodeError::GapDetected { incoming, expected });
         }
 
-        // Verify consensus rules.
-        consensus.verify_header(&block.header)?;
+        // Verify consensus rules, including parent linkage, timestamp bounds,
+        // and proposer seal.
+        let parent = self.parent_for_import(&block)?;
+        self.verify_import_consensus(&block, &parent)?;
 
         // Verify EIP-1559 base fee is correct.
         let expected_base_fee = calculate_base_fee(
@@ -130,39 +243,6 @@ impl<S: KvStore + 'static> Node<S> {
                 "invalid base_fee_per_gas: expected {expected_base_fee}, got {}",
                 block.header.base_fee_per_gas,
             )));
-        }
-
-        // Verify proposer seal (PQ signature).
-        match &block.proposer_seal {
-            Some(seal) => {
-                let proposer = &block.header.proposer;
-                if let Some(pubkey) = consensus.known_authority_pubkey(proposer) {
-                    let verifier = MultiVerifier;
-                    self.consensus
-                        .read()
-                        .verify_seal(&block.header, seal, &pubkey, &verifier)?;
-                } else if let Some(pubkey) = block_store.stored_pubkey(proposer)? {
-                    let verifier = MultiVerifier;
-                    self.consensus
-                        .read()
-                        .verify_seal(&block.header, seal, &pubkey, &verifier)?;
-                    consensus.register_authority_pubkey(*proposer, pubkey);
-                } else {
-                    // F-308: Reject blocks from unknown proposers.
-                    return Err(NodeError::Startup(format!(
-                        "block {} seal verification failed: proposer {} pubkey unknown",
-                        block.number(),
-                        proposer
-                    )));
-                }
-            }
-            None => {
-                warn!(
-                    block = block.number(),
-                    proposer = %block.header.proposer,
-                    "imported block has no proposer seal (M1b: allowed, will be strict in M2)"
-                );
-            }
         }
 
         // C3: If the block carries a STARK aggregate proof, verify it.
@@ -555,40 +635,10 @@ impl<S: KvStore + 'static> Node<S> {
             )));
         }
 
-        // B5: Validate witness_root when present.
-        // If the header declares a witness_root, the stored bundle must hash to it.
-        if let Some(expected_root) = block.header.witness_root {
-            let block_hash_for_witness = block.hash();
-            match block_store.witness_bundle(&block_hash_for_witness) {
-                Ok(Some(bundle)) => {
-                    let computed = bundle.compute_root();
-                    if computed != expected_root {
-                        return Err(NodeError::Startup(format!(
-                            "block {} witness_root mismatch: header={:?}, computed={:?}",
-                            block.number(),
-                            expected_root,
-                            computed
-                        )));
-                    }
-                }
-                Ok(None) => {
-                    // Witness bundle not yet available (e.g. not yet delivered by network).
-                    // Log and allow import — full validation requires witness propagation
-                    // (Phase B network layer). Reject only if bundle is present but wrong.
-                    debug!(
-                        block = block.number(),
-                        witness_root = ?expected_root,
-                        "witness bundle not in store; skipping witness_root check for now"
-                    );
-                }
-                Err(e) => {
-                    return Err(NodeError::Startup(format!(
-                        "block {} witness store lookup failed: {e}",
-                        block.number()
-                    )));
-                }
-            }
-        }
+        // B5: Validate witness_root directly from the incoming block before it is
+        // committed. Relying on a pre-existing stored bundle lets first import
+        // skip the check.
+        self.verify_incoming_witness_root(&block)?;
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;

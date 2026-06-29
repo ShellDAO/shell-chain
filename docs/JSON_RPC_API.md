@@ -328,6 +328,20 @@ curl -s http://localhost:8545 \
 
 ---
 
+## State Query Block Tags
+
+State-reading methods currently execute against the live world state only:
+`eth_getBalance`, `eth_getTransactionCount`, `eth_call`, `eth_createAccessList`,
+`eth_getCode`, and `eth_getStorageAt` accept only `"latest"` or `"pending"` as
+their optional block tag. Historical state queries using `"earliest"`, `"safe"`,
+`"finalized"`, or a numeric block return `-32602` until historical state access is
+implemented.
+
+Block, receipt, log, and fee-history methods keep their documented historical
+block support.
+
+---
+
 ### eth_getBalance
 
 Returns the balance of an address.
@@ -336,7 +350,7 @@ Returns the balance of an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address (`0x...` canonical) |
-| 2 | `String` | No | Block tag (`"latest"`, `"earliest"`, `"pending"`, `"safe"`, `"finalized"`, or hex number) |
+| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** `String` — Hex-encoded balance in wei.
 
@@ -360,7 +374,7 @@ Returns the nonce (transaction count) for an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address (`0x...` canonical) |
-| 2 | `String` | No | Block tag |
+| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** `String` — Hex-encoded nonce.
 
@@ -518,7 +532,7 @@ Executes a read-only call against the EVM (no state changes).
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `Object` | Yes | Call request: `{from?, to, data?, value?, gas?}` |
-| 2 | `String` | No | Block tag |
+| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** `String` — Hex-encoded return data.
 
@@ -561,7 +575,7 @@ Creates an EIP-2930 access list for a transaction.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `Object` | Yes | Call request |
-| 2 | `String` | No | Block tag |
+| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** Object with `accessList` and `gasUsed`.
 
@@ -575,7 +589,7 @@ Returns the bytecode at an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address |
-| 2 | `String` | No | Block tag |
+| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** `String` — Hex-encoded bytecode, or `"0x"` for accounts without
 runtime code.
@@ -591,7 +605,7 @@ Returns a storage slot value.
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address |
 | 2 | `String` | Yes | Storage position (hex-encoded, 32-byte key) |
-| 3 | `String` | No | Block tag |
+| 3 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
 
 **Returns:** `String` — Zero-padded 32-byte hex value.
 

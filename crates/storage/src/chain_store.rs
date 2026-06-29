@@ -1065,15 +1065,47 @@ impl<S: KvStore> ChainStore<S> {
         } else {
             Self::addr_tx_prefix(address)
         };
+        if from_block > to_block {
+            return Ok((Vec::new(), false));
+        }
         let after_key = match cursor {
-            Some(cursor) if descending => Some(Self::addr_tx_rev_cursor_key(address, cursor)?),
-            Some(cursor) => Some(Self::addr_tx_cursor_key(address, cursor)?),
+            Some(cursor) if descending => {
+                let key = Self::addr_tx_rev_cursor_key(address, cursor)?;
+                let block_number = Self::block_number_from_addr_rev_index_key(prefix.len(), &key)?;
+                if block_number < from_block || block_number > to_block {
+                    return Err(StorageError::Codec(
+                        "address tx cursor is outside requested block range".into(),
+                    ));
+                }
+                Some(key)
+            }
+            Some(cursor) => {
+                let key = Self::addr_tx_cursor_key(address, cursor)?;
+                let block_number = Self::block_number_from_addr_index_key(prefix.len(), &key)?;
+                if block_number < from_block || block_number > to_block {
+                    return Err(StorageError::Codec(
+                        "address tx cursor is outside requested block range".into(),
+                    ));
+                }
+                Some(key)
+            }
+            None if descending && to_block < u64::MAX => Some(Self::addr_tx_rev_key(
+                address,
+                to_block.saturating_add(1),
+                u32::MAX,
+            )),
+            None if !descending && from_block > 0 => Some(Self::addr_tx_key(
+                address,
+                from_block.saturating_sub(1),
+                u32::MAX,
+            )),
             None => None,
         };
 
         let mut entries = Vec::new();
         let mut next_after = after_key;
         let mut has_more = false;
+        let mut exhausted_range = false;
         while entries.len() <= limit {
             let remaining = limit.saturating_sub(entries.len()).saturating_add(1);
             let page = self.store.scan_prefix_after(
@@ -1094,6 +1126,16 @@ impl<S: KvStore> ChainStore<S> {
                 } else {
                     Self::block_number_from_addr_index_key(prefix.len(), &key)?
                 };
+                if descending && block_number < from_block {
+                    has_more = false;
+                    exhausted_range = true;
+                    break;
+                }
+                if !descending && block_number > to_block {
+                    has_more = false;
+                    exhausted_range = true;
+                    break;
+                }
                 if block_number < from_block || block_number > to_block {
                     continue;
                 }
@@ -1117,6 +1159,9 @@ impl<S: KvStore> ChainStore<S> {
                 });
             }
             if has_more || entries.len() >= limit {
+                break;
+            }
+            if exhausted_range {
                 break;
             }
         }
@@ -2641,6 +2686,36 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].block_number, 3);
         assert_eq!(filtered[1].block_number, 2);
+    }
+
+    #[test]
+    fn get_txs_by_address_cursor_rejects_cursor_outside_range() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let address = Address::from([0xAA; 20]);
+
+        for number in 1..=4 {
+            let block = make_block_with_txs(number);
+            put_canonical(&cs, &block);
+        }
+
+        let (page, _) = cs
+            .get_txs_by_address_cursor(&address, 0, u64::MAX, None, 2, true)
+            .unwrap();
+        assert_eq!(page[0].block_number, 4);
+        assert_eq!(page[1].block_number, 3);
+
+        let err = cs
+            .get_txs_by_address_cursor(
+                &address,
+                1,
+                2,
+                page.last().map(|entry| entry.cursor.as_str()),
+                2,
+                true,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("outside requested block range"));
     }
 
     #[test]

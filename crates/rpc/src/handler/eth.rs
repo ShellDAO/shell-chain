@@ -481,9 +481,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         address: Address,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
-        // F-100: validate block parameter — reject malformed block tags.
         if let Some(ref tag) = block {
-            validate_block_is_latest(tag)?;
+            validate_state_block_is_latest(tag)?;
         }
         let ws = self.world_state.read();
         let balance = ws.get_balance(&address).map_err(internal_err)?;
@@ -496,7 +495,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
         if let Some(ref tag) = block {
-            validate_block_is_latest(tag)?;
+            validate_state_block_is_latest(tag)?;
         }
         let ws = self.world_state.read();
         let nonce = ws.get_nonce(&address).map_err(internal_err)?;
@@ -615,8 +614,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn call(
         &self,
         tx: crate::types::CallRequest,
-        _block: Option<String>,
+        block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
+        if let Some(ref tag) = block {
+            validate_state_block_is_latest(tag)?;
+        }
         let (output, _gas_used) = self.execute_call(&tx)?;
         Ok(hex_bytes(&output))
     }
@@ -634,8 +636,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn create_access_list(
         &self,
         tx: crate::types::CallRequest,
-        _block: Option<String>,
+        block: Option<String>,
     ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        if let Some(ref tag) = block {
+            validate_state_block_is_latest(tag)?;
+        }
         let (_output, gas_used) = self.execute_call(&tx)?;
         // Simplified implementation: return the provided access list (or empty)
         // and the estimated gas.
@@ -662,7 +667,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
         if let Some(ref tag) = block {
-            validate_block_is_latest(tag)?;
+            validate_state_block_is_latest(tag)?;
         }
         let ws = self.world_state.read();
         let code_hash = ws.get_code_hash(&address).map_err(internal_err)?;
@@ -685,7 +690,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
         if let Some(ref tag) = block {
-            validate_block_is_latest(tag)?;
+            validate_state_block_is_latest(tag)?;
         }
         let key_u256 = parse_hex_u256(&position)?;
         let key = ShellHash::from(alloy_primitives::B256::from(key_u256));
@@ -897,7 +902,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             }
 
             let mut hashes = Vec::new();
-            for block_num in from..=latest {
+            let actual_to = latest.min(from + MAX_BLOCK_RANGE - 1);
+            for block_num in from..=actual_to {
                 if let Some(block) = self
                     .chain_store
                     .get_block_by_number(block_num)
@@ -907,7 +913,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 }
             }
 
-            self.filter_registry.update_last_poll(&id, latest);
+            self.filter_registry.update_last_poll(&id, actual_to);
             Ok(serde_json::to_value(&hashes).unwrap_or(serde_json::json!([])))
         }
     }

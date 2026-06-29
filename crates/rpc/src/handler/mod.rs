@@ -722,14 +722,16 @@ pub(crate) fn parse_address(s: &str) -> Result<Address, ErrorObjectOwned> {
 /// Parse a 32-byte hex string into `ShellHash`.
 pub(crate) fn parse_hex_hash(s: &str) -> Result<ShellHash, ErrorObjectOwned> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(hex_str).map_err(|e| internal_err(format!("invalid hash hex: {e}")))?;
-    ShellHash::try_from_slice(&bytes).map_err(|e| internal_err(format!("invalid hash length: {e}")))
+    let bytes =
+        hex::decode(hex_str).map_err(|e| invalid_params_err(format!("invalid hash hex: {e}")))?;
+    ShellHash::try_from_slice(&bytes)
+        .map_err(|e| invalid_params_err(format!("invalid hash length: {e}")))
 }
 
 /// Parse a hex string "0x..." into u64.
 pub(crate) fn parse_hex_u64(s: &str) -> Result<u64, ErrorObjectOwned> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).map_err(|_| internal_err(format!("invalid hex u64: 0x{s}")))
+    u64::from_str_radix(s, 16).map_err(|_| invalid_params_err(format!("invalid hex u64: 0x{s}")))
 }
 
 /// Parse a hex string "0x..." into U256.
@@ -737,7 +739,7 @@ pub(crate) fn parse_hex_u256(s: &str) -> Result<U256, ErrorObjectOwned> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     // F-066: reject oversized input to prevent silent truncation.
     if s.len() > 64 {
-        return Err(internal_err(format!(
+        return Err(invalid_params_err(format!(
             "hex string too long for U256: {} chars (max 64)",
             s.len()
         )));
@@ -747,7 +749,7 @@ pub(crate) fn parse_hex_u256(s: &str) -> Result<U256, ErrorObjectOwned> {
     } else {
         s.to_string()
     })
-    .map_err(|_| internal_err(format!("invalid hex U256: 0x{s}")))?;
+    .map_err(|_| invalid_params_err(format!("invalid hex U256: 0x{s}")))?;
     Ok(U256::from_be_slice(&bytes))
 }
 
@@ -773,22 +775,27 @@ pub(crate) fn parse_block_tag(s: &str) -> Result<BlockTag, ErrorObjectOwned> {
         "earliest" => Ok(BlockTag::Number(0)),
         hex if hex.starts_with("0x") => u64::from_str_radix(&hex[2..], 16)
             .map(BlockTag::Number)
-            .map_err(|_| internal_err(format!("invalid block number: {hex}"))),
-        _ => Err(internal_err(format!("invalid block number: {s}"))),
+            .map_err(|_| invalid_params_err(format!("invalid block number: {hex}"))),
+        _ => Err(invalid_params_err(format!("invalid block number: {s}"))),
     }
 }
 
-/// F-100: validate that a block tag is well-formed.
-/// Returns an error for malformed block parameters.
-pub(crate) fn validate_block_is_latest(s: &str) -> Result<(), ErrorObjectOwned> {
+/// Current state backend only exposes the live world state. Reject historical
+/// state tags instead of returning latest-state data for a historical request.
+pub(crate) fn validate_state_block_is_latest(s: &str) -> Result<(), ErrorObjectOwned> {
     match s {
-        "latest" | "pending" | "safe" | "finalized" | "earliest" => Ok(()),
+        "latest" | "pending" => Ok(()),
+        "safe" | "finalized" | "earliest" => Err(invalid_params_err(
+            "historical state queries are not supported; use latest or pending",
+        )),
         hex if hex.starts_with("0x") => {
             let _ = u64::from_str_radix(&hex[2..], 16)
-                .map_err(|_| internal_err(format!("invalid block number: {hex}")))?;
-            Ok(())
+                .map_err(|_| invalid_params_err(format!("invalid block number: {hex}")))?;
+            Err(invalid_params_err(
+                "historical state queries are not supported; use latest or pending",
+            ))
         }
-        _ => Err(internal_err(format!("invalid block tag: {s}"))),
+        _ => Err(invalid_params_err(format!("invalid block tag: {s}"))),
     }
 }
 
@@ -1725,6 +1732,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "0x0");
+    }
+
+    #[tokio::test]
+    async fn get_balance_rejects_historical_state_block() {
+        let handler = setup();
+        let addr = test_address(b"test-address-key");
+        let err = EthApiServer::get_balance(&handler, addr, Some("0x0".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("historical state queries"));
     }
 
     #[tokio::test]
@@ -3971,6 +3989,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changes, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn block_filter_changes_are_range_capped() {
+        let handler = setup();
+
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+        handler.chain_store.set_head(&genesis_hash).unwrap();
+
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+        let mut parent_hash = genesis_hash;
+        for number in 1..=(MAX_BLOCK_RANGE + 1) {
+            let block = Block {
+                header: BlockHeader {
+                    parent_hash,
+                    number,
+                    ..make_genesis_block().header
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let hash = block.hash();
+            handler.chain_store.put_block(&block).unwrap();
+            handler.chain_store.set_canonical(number, &hash).unwrap();
+            handler.chain_store.set_head(&hash).unwrap();
+            parent_hash = hash;
+        }
+
+        let first = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.as_array().unwrap().len(), MAX_BLOCK_RANGE as usize);
+
+        let second = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        assert_eq!(second.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
