@@ -29,7 +29,7 @@ All notable changes to this project will be documented in this file.
 - Lightweight address-history storage index with cursor pagination support,
   avoiding full-chain scan-and-sort behavior for high-traffic address queries.
 - PQVM native address opcode support for Shell smart contract execution.
-- Testnet resource guardrails and systemd operator examples for safer SG3-style
+- Testnet resource guardrails and systemd operator examples for safer
   deployments.
 
 ### Changed
@@ -96,7 +96,7 @@ All notable changes to this project will be documented in this file.
   advanced past the gap. A shared `Arc<AtomicU64>` is now updated to
   `gap_at_block` after every `drain_front()` call; the seeder clamps
   `scan_start` to `max(contiguous_pending_end − 16, drain_frontier)`, breaking
-  the loop permanently. Verified on testnet-sg3: `frontier_lag` dropped from
+  the loop permanently. Verified on testnet: `frontier_lag` dropped from
   4 807 to **1** within five minutes of deployment.
 - **Reseed anchored at contiguous settled frontier** (Fix B): `scan_start` is
   now derived from `contiguous_pending_end` — the highest block reachable
