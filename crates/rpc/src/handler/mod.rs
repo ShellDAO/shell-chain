@@ -1553,6 +1553,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_transactions_by_address_rejects_deep_legacy_offset() {
+        let handler = setup();
+        let address = test_address(b"legacy-deep-offset");
+
+        let err = ShellApiServer::get_transactions_by_address(
+            &handler,
+            address,
+            Some(0),
+            Some(10),
+            Some(101),
+            Some(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("legacy address transaction pagination offset"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_transactions_by_address_v2_rejects_wide_exact_total() {
+        let handler = setup();
+        let address = test_address(b"v2-wide-total");
+
+        let err = ShellApiServer::get_transactions_by_address_v2(
+            &handler,
+            address,
+            Some(RpcAddressTransactionsV2Options {
+                from_block: Some(0),
+                to_block: Some(10_001),
+                include_total: Some(true),
+                ..RpcAddressTransactionsV2Options::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.message().contains("exact address transaction totals"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn blocks_range_clamps_limits_and_supports_direction() {
         let handler = setup();
         let genesis = make_genesis_block();

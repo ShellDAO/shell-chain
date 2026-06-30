@@ -21,10 +21,9 @@ pub(crate) use tokio::sync::watch;
 pub(crate) use tracing::{debug, info, warn};
 
 pub(crate) use shell_consensus::{
-    detect_double_sign, detect_offline, Attestation, ConsensusEngine, EngineType,
-    EquivocationProof, FinalityState, ForkChoice, PeerScorer, PeerScoringConfig,
-    ProofWindowManager, SlashingConfig, ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig,
-    VIEW_CHANGE_TIMEOUT_MS,
+    detect_offline, Attestation, ConsensusEngine, EngineType, EquivocationProof, FinalityState,
+    ForkChoice, PeerScorer, PeerScoringConfig, ProofWindowManager, SlashingConfig,
+    ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig, VIEW_CHANGE_TIMEOUT_MS,
 };
 pub(crate) use shell_core::{
     calculate_base_fee, effective_gas_price, Account, Block, BlockHeader, SignedTransaction,
@@ -1640,6 +1639,7 @@ mod tests {
         let block_hash = *source_hashes
             .last()
             .expect("ordered amendment needs at least one source");
+        let empty_root = shell_stark_prover::compute_batch_root(&[]);
         ProofAmendment {
             version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
             block_hash,
@@ -1649,20 +1649,16 @@ mod tests {
                 .and_then(|end_plus_one| end_plus_one.checked_sub(source_hashes.len() as u64)),
             proof: shell_stark_prover::proof::SigBatchProof {
                 version: shell_stark_prover::proof::SIG_BATCH_PROOF_VERSION,
-                batch_root_bytes: [0x22; 32],
-                n_sigs: if layer == 1 {
-                    MIN_L1_STARK_TXS
-                } else {
-                    source_hashes.len()
-                },
-                proof_bytes: vec![0x33; 128],
+                batch_root_bytes: empty_root,
+                n_sigs: 0,
+                proof_bytes: Vec::new(),
             },
             prover: Address::from([0x44; 32]),
             prover_signature: Bytes::from(vec![0x55; 8]),
             layer,
             source_hashes,
-            original_size: Some(10_000),
-            compressed_size: Some(128),
+            original_size: Some(0),
+            compressed_size: Some(0),
             settlement_tx_hash: None,
         }
     }
@@ -2114,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn stark_settlement_prefers_widest_same_start_range() {
+    fn stark_settlement_sort_prefers_widest_same_start_range() {
         let (node, signer) = setup_node();
         store_genesis(&node);
         let genesis_hash = node
@@ -2124,9 +2120,49 @@ mod tests {
             .expect("genesis hash");
         let hashes = produce_witnessed_blocks(&node, &signer, 3);
 
-        let short = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
-        let wide =
+        let mut short = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        short.proof.n_sigs = MIN_L1_STARK_TXS;
+        short.proof.batch_root_bytes = [0x22; 32];
+        short.proof.proof_bytes = vec![0x33; 128];
+        short.original_size = Some(10_000);
+        short.compressed_size = Some(128);
+        let mut wide =
             dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1], hashes[2]], 3);
+        wide.proof.n_sigs = MIN_L1_STARK_TXS;
+        wide.proof.batch_root_bytes = [0x22; 32];
+        wide.proof.proof_bytes = vec![0x33; 128];
+        wide.original_size = Some(10_000);
+        wide.compressed_size = Some(128);
+
+        let mut settlements = vec![short, wide];
+        block_producer::sort_stark_settlements_for_inclusion(&mut settlements);
+
+        assert_eq!(
+            settlements[0].block_hash, hashes[2],
+            "same-start settlement sorting should prefer the widest range"
+        );
+        assert_eq!(
+            settlements[1].block_hash, hashes[0],
+            "shorter overlapping same-start settlement should sort after widest"
+        );
+    }
+
+    #[test]
+    fn stark_settlement_skips_invalid_same_start_proofs() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 3);
+
+        let mut short = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        short.proof.proof_bytes = vec![0x33; 128];
+        let mut wide =
+            dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1], hashes[2]], 3);
+        wide.proof.proof_bytes = vec![0x33; 128];
 
         node.pending_stark_settlements.lock().extend([short, wide]);
         let settlement_block = node.produce_block(&signer, 100).unwrap();
@@ -2137,12 +2173,12 @@ mod tests {
                 .iter()
                 .filter(|tx| tx.kind == SystemTxKind::StarkReward)
                 .count(),
-            1,
-            "overlapping same-start proofs should produce only one reward settlement"
+            0,
+            "invalid proof-source bindings must not produce reward settlements"
         );
         assert!(
-            node.settled_stark_sources.lock().contains(&(1, hashes[2])),
-            "the widest same-start proof should be settled first"
+            !node.settled_stark_sources.lock().contains(&(1, hashes[2])),
+            "invalid widest proof must not be marked settled"
         );
     }
 
@@ -2218,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn block_producer_settles_l1_and_l2_in_same_block() {
+    fn block_producer_settles_valid_l1_and_skips_invalid_l2_same_block() {
         let (node, signer) = setup_node();
         store_genesis(&node);
         let hashes = produce_witnessed_blocks(&node, &signer, 1);
@@ -2247,9 +2283,12 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(settlements.len(), 2);
+        assert_eq!(
+            settlements.len(),
+            1,
+            "producer should settle the valid L1 amendment and skip invalid L2 proof bytes"
+        );
         assert_eq!(settlements[0].layer, 1);
-        assert_eq!(settlements[1].layer, 2);
     }
 
     #[test]
@@ -2704,8 +2743,8 @@ mod tests {
         // Two more 0-tx blocks so the range is [genesis(0tx), B1(0tx), B2(0tx)].
         let hashes = produce_witnessed_blocks(&node, &signer, 2);
 
-        // `dummy_ordered_amendment` sets n_sigs = MIN_L1_STARK_TXS which
-        // satisfies the layer-1 threshold; source_hashes are contiguous canonical.
+        // `dummy_ordered_amendment` represents a valid empty range; source_hashes
+        // are contiguous canonical.
         let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
 
         node.validate_stark_amendment_ordering(&amendment)
@@ -3963,8 +4002,76 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string().to_lowercase();
         assert!(
-            err_msg.contains("state root mismatch"),
-            "expected state-root backstop rejection, got: {err_msg}"
+            err_msg.contains("reference pubkey mode") || err_msg.contains("no registered"),
+            "expected unresolved Reference pubkey rejection, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn import_block_rejects_empty_signature_user_tx() {
+        let (leader, proposer_signer) = setup_node();
+        store_genesis(&leader);
+        let proposer = leader.config.proposer_address.unwrap();
+        leader.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        fund_account(&leader, &sender, U256::from(100_000_000_000_000u64));
+        let tx = make_embedded_tx(&tx_signer, sender, tx_signer.public_key().to_vec(), 0, 1);
+        let verifier = MultiVerifier;
+        {
+            let mut ws = leader.world_state.write();
+            leader
+                .tx_pool
+                .insert(tx, &mut ws, leader.chain_store.as_ref(), &verifier)
+                .unwrap();
+        }
+
+        let mut block = leader.produce_block(&proposer_signer, 100).unwrap();
+        block
+            .transactions
+            .first_mut()
+            .expect("block should include tx")
+            .signature
+            .data
+            .clear();
+
+        let follower_db = Arc::new(MemoryDb::new());
+        let follower_cs = Arc::new(ChainStore::new(follower_db.clone()));
+        let follower_ws = Arc::new(RwLock::new(WorldState::new(follower_db.clone())));
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![proposer], 1),
+        )));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+            chain_id: 1337,
+            ..MempoolConfig::default()
+        }));
+        let follower = Node::new(
+            NodeConfig::dev(proposer),
+            follower_db,
+            follower_cs,
+            follower_ws,
+            tx_pool,
+            consensus,
+        );
+        store_genesis(&follower);
+        fund_account(&follower, &sender, U256::from(100_000_000_000_000u64));
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let err = follower.import_block(block, &verifier).unwrap_err();
+        assert!(
+            err.to_string().contains("empty signature"),
+            "expected empty signature rejection, got: {err}"
+        );
+        assert_eq!(
+            follower
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .number(),
+            0,
+            "failed import must not advance head"
         );
     }
 

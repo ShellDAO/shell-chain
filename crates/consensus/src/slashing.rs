@@ -13,7 +13,8 @@
 //! Receiving nodes independently verify the proof and apply slashing.
 
 use serde::{Deserialize, Serialize};
-use shell_core::BlockHeader;
+use shell_core::{Block, BlockHeader};
+use shell_crypto::{PQSignature, Verifier};
 use shell_primitives::{Address, ShellHash};
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,12 @@ pub struct EquivocationProof {
     pub hash_a: ShellHash,
     /// Hash of `header_b`.
     pub hash_b: ShellHash,
+    /// Proposer seal over `hash_a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_a: Option<PQSignature>,
+    /// Proposer seal over `hash_b`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_b: Option<PQSignature>,
 }
 
 impl EquivocationProof {
@@ -55,10 +62,41 @@ impl EquivocationProof {
                 header_b: header_b.clone(),
                 hash_a,
                 hash_b,
+                seal_a: None,
+                seal_b: None,
             })
         } else {
             None
         }
+    }
+
+    /// Construct signed evidence from two complete blocks.
+    ///
+    /// Returns `None` unless both blocks carry proposer seals and their headers
+    /// are valid double-sign evidence.
+    pub fn from_blocks(block_a: &Block, block_b: &Block) -> Option<Self> {
+        let seal_a = block_a.proposer_seal.clone()?;
+        let seal_b = block_b.proposer_seal.clone()?;
+        let header_a = block_a.header.clone();
+        let header_b = block_b.header.clone();
+        let hash_a = header_a.hash();
+        let hash_b = header_b.hash();
+        if header_a.number != header_b.number
+            || header_a.proposer != header_b.proposer
+            || hash_a == hash_b
+        {
+            return None;
+        }
+
+        Some(Self {
+            offender: header_a.proposer,
+            header_a: Box::new(header_a),
+            header_b: Box::new(header_b),
+            hash_a,
+            hash_b,
+            seal_a: Some(seal_a),
+            seal_b: Some(seal_b),
+        })
     }
 
     /// Verify the equivocation proof is internally consistent:
@@ -75,6 +113,29 @@ impl EquivocationProof {
         let computed_a = self.header_a.hash();
         let computed_b = self.header_b.hash();
         computed_a == self.hash_a && computed_b == self.hash_b && self.hash_a != self.hash_b
+    }
+
+    /// Verify internal consistency and both proposer seals against the
+    /// offender's registered public key.
+    pub fn verify_signed(&self, pubkey: &[u8], verifier: &dyn Verifier) -> bool {
+        if !self.verify() {
+            return false;
+        }
+        let (Some(seal_a), Some(seal_b)) = (&self.seal_a, &self.seal_b) else {
+            return false;
+        };
+        if seal_a.is_empty() || seal_b.is_empty() {
+            return false;
+        }
+        let Ok(valid_a) = verifier.verify(pubkey, self.hash_a.as_bytes(), seal_a) else {
+            return false;
+        };
+        if !valid_a {
+            return false;
+        }
+        verifier
+            .verify(pubkey, self.hash_b.as_bytes(), seal_b)
+            .unwrap_or(false)
     }
 }
 
@@ -229,7 +290,8 @@ pub fn detect_offline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_core::BlockHeader;
+    use shell_core::{Block, BlockHeader};
+    use shell_crypto::{MlDsaSigner, MultiVerifier, Signer};
     use shell_primitives::{Address, Bytes, ShellHash};
 
     fn addr(n: u8) -> Address {
@@ -256,6 +318,19 @@ mod tests {
             blob_gas_used: 0,
             excess_blob_gas: 0,
             witness_root: None,
+        }
+    }
+
+    fn signed_block(number: u64, proposer: Address, nonce: u64, signer: &dyn Signer) -> Block {
+        let header = header(number, proposer, nonce);
+        let seal = signer
+            .sign(header.hash().as_bytes())
+            .expect("test signer should seal header");
+        Block {
+            header,
+            transactions: Vec::new(),
+            system_transactions: Vec::new(),
+            proposer_seal: Some(seal),
         }
     }
 
@@ -335,6 +410,10 @@ mod tests {
         assert_eq!(eq.header_a.number, 10);
         assert_eq!(eq.header_b.number, 10);
         assert_ne!(eq.hash_a, eq.hash_b);
+        assert!(
+            eq.seal_a.is_none() && eq.seal_b.is_none(),
+            "slash-record conversion is header-only legacy evidence"
+        );
     }
 
     #[test]
@@ -344,6 +423,66 @@ mod tests {
         let record = detect_double_sign(&h1, &h2).unwrap();
         let eq = EquivocationProof::from_slash_record(&record).unwrap();
         assert!(eq.verify(), "valid equivocation should verify");
+    }
+
+    #[test]
+    fn equivocation_proof_from_blocks_verify_signed_valid() {
+        let signer = MlDsaSigner::generate();
+        let b1 = signed_block(10, addr(1), 0, &signer);
+        let b2 = signed_block(10, addr(1), 99, &signer);
+        let eq = EquivocationProof::from_blocks(&b1, &b2).expect("signed double-sign proof");
+        assert!(eq.verify(), "headers should be internally consistent");
+        assert!(
+            eq.verify_signed(signer.public_key(), &MultiVerifier),
+            "both proposer seals should verify"
+        );
+    }
+
+    #[test]
+    fn equivocation_proof_from_blocks_requires_both_seals() {
+        let signer = MlDsaSigner::generate();
+        let b1 = signed_block(10, addr(1), 0, &signer);
+        let mut b2 = signed_block(10, addr(1), 99, &signer);
+        b2.proposer_seal = None;
+        assert!(
+            EquivocationProof::from_blocks(&b1, &b2).is_none(),
+            "broadcastable evidence must include both proposer seals"
+        );
+    }
+
+    #[test]
+    fn equivocation_proof_verify_signed_rejects_missing_legacy_seals() {
+        let signer = MlDsaSigner::generate();
+        let h1 = header(10, addr(1), 0);
+        let h2 = header(10, addr(1), 99);
+        let record = detect_double_sign(&h1, &h2).unwrap();
+        let eq = EquivocationProof::from_slash_record(&record).unwrap();
+        assert!(
+            eq.verify(),
+            "legacy header-only proof is internally consistent"
+        );
+        assert!(
+            !eq.verify_signed(signer.public_key(), &MultiVerifier),
+            "legacy header-only proof must not be accepted for slashing"
+        );
+    }
+
+    #[test]
+    fn equivocation_proof_verify_signed_rejects_tampered_seal() {
+        let signer = MlDsaSigner::generate();
+        let b1 = signed_block(10, addr(1), 0, &signer);
+        let b2 = signed_block(10, addr(1), 99, &signer);
+        let mut eq = EquivocationProof::from_blocks(&b1, &b2).expect("signed proof");
+        eq.seal_b
+            .as_mut()
+            .expect("seal_b")
+            .data
+            .first_mut()
+            .map(|byte| *byte ^= 0x01);
+        assert!(
+            !eq.verify_signed(signer.public_key(), &MultiVerifier),
+            "tampered seal should fail signed verification"
+        );
     }
 
     #[test]

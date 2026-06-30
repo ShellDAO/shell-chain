@@ -18,12 +18,13 @@ use tower::{Layer, Service};
 
 /// Shared state for one fixed-window rate-limit bucket.
 ///
-/// Buckets are keyed by bearer token when present. Public/no-auth requests use
-/// a separate `public` bucket. This keeps anonymous traffic from exhausting an
-/// authenticated caller's quota without trusting forwarded IP headers.
+/// Buckets are keyed by coarse authentication context. The rate limiter must
+/// never retain raw bearer tokens: authentication is handled separately by
+/// [`ApiKeyLayer`], and untrusted token text is attacker-controlled input.
 struct RateLimiterState {
     max_per_sec: u32,
     window_start: Instant,
+    last_seen: Instant,
     count: u32,
 }
 
@@ -32,6 +33,7 @@ impl RateLimiterState {
         Self {
             max_per_sec,
             window_start: Instant::now(),
+            last_seen: Instant::now(),
             count: 0,
         }
     }
@@ -39,6 +41,7 @@ impl RateLimiterState {
     /// Returns `true` if the request is allowed (within the current window).
     fn check_and_record(&mut self) -> bool {
         let now = Instant::now();
+        self.last_seen = now;
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;
             self.count = 0;
@@ -50,6 +53,9 @@ impl RateLimiterState {
         true
     }
 }
+
+const MAX_RATE_LIMIT_BUCKETS: usize = 16;
+const RATE_LIMIT_BUCKET_TTL: Duration = Duration::from_secs(60);
 
 /// Tower layer that enforces a global request rate limit (req/sec).
 /// Clone-compatible: all clones share the same `Arc<Mutex<RateLimiterState>>`.
@@ -71,6 +77,11 @@ impl RateLimitLayer {
     /// `u32::MAX` (effectively disabled) so the layer type stays uniform.
     pub fn from_config(max_per_sec: Option<u32>) -> Self {
         Self::new(max_per_sec.unwrap_or(u32::MAX))
+    }
+
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.buckets.lock().len()
     }
 }
 
@@ -116,6 +127,7 @@ where
         let bucket_key = rate_limit_bucket_key(&req);
         let allowed = {
             let mut buckets = self.buckets.lock();
+            prune_rate_limit_buckets(&mut buckets);
             buckets
                 .entry(bucket_key)
                 .or_insert_with(|| RateLimiterState::new(self.max_per_sec))
@@ -133,13 +145,39 @@ where
 }
 
 fn rate_limit_bucket_key<B>(req: &Request<B>) -> String {
-    req.headers()
+    if req
+        .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .filter(|token| !token.is_empty())
-        .map(|token| format!("bearer:{token}"))
-        .unwrap_or_else(|| "public".to_string())
+        .is_some()
+    {
+        "authenticated".to_string()
+    } else {
+        "public".to_string()
+    }
+}
+
+fn prune_rate_limit_buckets(buckets: &mut HashMap<String, RateLimiterState>) {
+    if buckets.len() < MAX_RATE_LIMIT_BUCKETS {
+        return;
+    }
+    let now = Instant::now();
+    buckets.retain(|_, state| now.duration_since(state.last_seen) < RATE_LIMIT_BUCKET_TTL);
+    if buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        let mut keys_by_age: Vec<(String, Instant)> = buckets
+            .iter()
+            .map(|(key, state)| (key.clone(), state.last_seen))
+            .collect();
+        keys_by_age.sort_by_key(|(_, last_seen)| *last_seen);
+        for (key, _) in keys_by_age
+            .into_iter()
+            .take(buckets.len().saturating_sub(MAX_RATE_LIMIT_BUCKETS - 1))
+        {
+            buckets.remove(&key);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_separates_bearer_token_buckets() {
+    async fn rate_limit_coalesces_bearer_token_buckets() {
         let layer = RateLimitLayer::new(1);
         let mut svc = layer.layer(OkService);
         let req_a1 = Request::builder()
@@ -302,7 +340,35 @@ mod tests {
         let second_same_token = svc.ready().await.unwrap().call(req_a2).await.unwrap();
         assert_eq!(second_same_token.status(), StatusCode::TOO_MANY_REQUESTS);
         let other_token = svc.ready().await.unwrap().call(req_b).await.unwrap();
-        assert_eq!(other_token.status(), StatusCode::OK);
+        assert_eq!(other_token.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(layer.bucket_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_unique_bearer_headers_do_not_grow_bucket_map() {
+        let layer = RateLimitLayer::new(10_000);
+        let mut svc = layer.layer(OkService);
+
+        for i in 0..128 {
+            let req = Request::builder()
+                .header(http::header::AUTHORIZATION, format!("Bearer token-{i}"))
+                .body(())
+                .unwrap();
+            let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        assert_eq!(layer.bucket_count(), 1);
+
+        let public = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+        assert_eq!(layer.bucket_count(), 2);
     }
 
     #[tokio::test]

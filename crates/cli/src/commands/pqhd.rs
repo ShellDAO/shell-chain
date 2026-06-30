@@ -13,6 +13,7 @@ use shell_crypto::hd::{
 use shell_keystore::{decrypt_hd_seed, encrypt_hd_seed, EncryptedKey};
 
 use crate::password::{resolve_new_password, resolve_password, PasswordArgs};
+use crate::secure_file::write_sensitive_file_new;
 
 pub enum PqHdCommand {
     Generate {
@@ -77,7 +78,7 @@ fn generate(
 
     let encrypted = encrypt_hd_seed(&seed, &account.address, password.as_bytes())?;
     let json = serde_json::to_string_pretty(&encrypted)?;
-    std::fs::write(&output, &json)?;
+    write_sensitive_file_new(&output, &json)?;
 
     eprintln!("✓ HD keystore written to {}", output.display());
     eprintln!();

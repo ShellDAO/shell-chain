@@ -1,5 +1,24 @@
 use super::*;
 
+const MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE: u64 = 10_000;
+const MAX_LEGACY_ADDRESS_TX_OFFSET: u64 = 10_000;
+
+fn ensure_exact_address_total_allowed(
+    from_block: u64,
+    to_block: u64,
+) -> Result<(), ErrorObjectOwned> {
+    if from_block > to_block {
+        return Ok(());
+    }
+    let range = to_block.saturating_sub(from_block).saturating_add(1);
+    if range > MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE {
+        return Err(invalid_params_err(format!(
+            "exact address transaction totals are limited to {MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE} blocks; use cursor pagination with includeTotal=false for wider ranges"
+        )));
+    }
+    Ok(())
+}
+
 impl<S: KvStore + 'static> RpcHandler<S> {
     fn resolve_block_number_for_v2(&self, value: &str) -> Result<u64, ErrorObjectOwned> {
         match parse_block_tag(value)? {
@@ -135,6 +154,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             }
         }
         let total = if options.include_total.unwrap_or(false) {
+            ensure_exact_address_total_allowed(from_block, to_block)?;
             Some(
                 self.chain_store
                     .count_txs_by_address(&address, from_block, to_block)
@@ -1021,6 +1041,12 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let offset = page
             .checked_mul(limit)
             .ok_or_else(|| invalid_params_err("page * limit overflow"))?;
+        if offset > MAX_LEGACY_ADDRESS_TX_OFFSET {
+            return Err(invalid_params_err(format!(
+                "legacy address transaction pagination offset is limited to {MAX_LEGACY_ADDRESS_TX_OFFSET}; use shell_getTransactionsByAddressV2 cursor pagination"
+            )));
+        }
+        ensure_exact_address_total_allowed(from, to)?;
         let total = self
             .chain_store
             .count_txs_by_address(&address, from, to)

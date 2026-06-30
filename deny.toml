@@ -1,23 +1,27 @@
 [advisories]
 # Deny crates with known security advisories.
 ignore = [
-    # H-4 (audit finding 2026-05-24): hickory-proto 0.25.2 pulled transitively
-    # by libp2p 0.56.  A patched version (>=0.26.1) exists on crates.io but
-    # libp2p has not yet published a release that accepts it, so we cannot bump
-    # without forking libp2p or waiting for an upstream libp2p release.
-    #
-    # Mitigation: hickory-proto/hickory-resolver are used by libp2p ONLY for
-    # DNS-based peer bootstrap (mDNS + DNS/SD).  The failure mode is a
-    # bootstrap stall — DNS resolution returns an error and the node falls back
-    # to known static peers.  There is NO data-integrity or remote-code-execution
-    # exposure for shell-chain: DNS results are not persisted, not used in
-    # consensus, and not accessible from the contract execution layer.
-    # This acceptance will be removed once libp2p ships a compatible release.
-    "RUSTSEC-2026-0118",
-    "RUSTSEC-2026-0119",
+    # Transitive through alloy/libp2p networking dependencies. No active
+    # vulnerability is reported; keep visible until upstreams remove `paste`.
+    "RUSTSEC-2024-0436",
+    # Legacy pre-FIPS Dilithium support is retained for historical key and
+    # signature verification compatibility. New signing paths should prefer
+    # ML-DSA (`fips204`) while this compatibility path is migrated out.
+    "RUSTSEC-2024-0380",
+    # SPHINCS+ support is still exposed as a configured PQ signature option.
+    # Keep this explicit until a maintained SLH-DSA implementation replaces it.
+    "RUSTSEC-2026-0160",
+    # Shared pqcrypto support crates pulled by the retained legacy PQ backends.
+    "RUSTSEC-2026-0162",
+    "RUSTSEC-2026-0163",
+    # Direct TLS PEM parsing dependency in shell-rpc. No active vulnerability is
+    # reported; track upstream replacement before removing the exception.
+    "RUSTSEC-2025-0134",
 ]
-# Unmaintained crates: "none" skips the check (use "workspace" or "all" to enable).
-unmaintained = "none"
+# Check the full dependency tree for unmaintained advisories. Each current
+# exception above is explicit and should be removed when upstream migrations
+# are available.
+unmaintained = "all"
 
 [licenses]
 # Allow only standard permissive/copyleft licenses suitable for open-source use.

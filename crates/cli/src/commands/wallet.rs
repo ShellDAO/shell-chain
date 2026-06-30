@@ -7,6 +7,7 @@ use shell_keystore::EncryptedKey;
 
 use super::{account, key, tx};
 use crate::password::PasswordArgs;
+use crate::secure_file::write_sensitive_file_new;
 
 #[derive(Subcommand)]
 pub enum WalletCommand {
@@ -109,7 +110,7 @@ fn cmd_export(keystore: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::err
     let raw = std::fs::read_to_string(&keystore)?;
     let encrypted: EncryptedKey = serde_json::from_str(&raw)?;
     let normalized = serde_json::to_string_pretty(&encrypted)?;
-    std::fs::write(&output, normalized)?;
+    write_sensitive_file_new(&output, normalized)?;
     eprintln!("✓ Wallet keystore exported to {}", output.display());
     Ok(())
 }

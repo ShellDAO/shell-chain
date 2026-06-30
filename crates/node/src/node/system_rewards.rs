@@ -53,7 +53,10 @@ impl<S: KvStore + 'static> Node<S> {
                 "STARK reward claim does not satisfy strict compression threshold".into(),
             ));
         }
-        if amendment.layer == 1 && amendment.proof.n_sigs < MIN_L1_STARK_TXS {
+        if amendment.layer == 1
+            && amendment.proof.n_sigs != 0
+            && amendment.proof.n_sigs < MIN_L1_STARK_TXS
+        {
             return Err(NodeError::Startup(format!(
                 "STARK L1 reward claim covers {} tx entries; minimum is {MIN_L1_STARK_TXS}",
                 amendment.proof.n_sigs
@@ -256,7 +259,22 @@ impl<S: KvStore + 'static> Node<S> {
             )));
         }
 
-        // Check 3: full Winterfell STARK verification.
+        // Check 3: full Winterfell STARK verification. Empty source ranges have
+        // no signature batch to prove; the canonical entry count and empty root
+        // checks above are the complete binding for that case.
+        if all_entries.is_empty() {
+            if !amendment.proof.proof_bytes.is_empty() {
+                self.metrics.stark_settlements_rejected.inc();
+                return Err(NodeError::Startup(format!(
+                    "empty STARK source range for block #{} must not carry proof bytes",
+                    amendment.block_number
+                )));
+            }
+            return Ok(());
+        }
+
+        // Check 4: non-empty ranges must carry and verify a full Winterfell
+        // proof for the reconstructed public inputs.
         verify_sig_batch(&amendment.proof).map_err(|e| {
             self.metrics.stark_settlements_rejected.inc();
             NodeError::Startup(format!(
@@ -661,7 +679,10 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        if amendment.layer == 1 && amendment.proof.n_sigs < MIN_L1_STARK_TXS {
+        if amendment.layer == 1
+            && amendment.proof.n_sigs != 0
+            && amendment.proof.n_sigs < MIN_L1_STARK_TXS
+        {
             return Err(NodeError::Startup(format!(
                 "STARK L1 amendment covers {} tx entries; minimum is {MIN_L1_STARK_TXS}",
                 amendment.proof.n_sigs

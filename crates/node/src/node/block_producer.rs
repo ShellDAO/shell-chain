@@ -1,5 +1,21 @@
 use super::*;
 
+pub(crate) fn sort_stark_settlements_for_inclusion(settlements: &mut [ProofAmendment]) {
+    settlements.sort_by(|a, b| {
+        let a_start = a.range_start_block().unwrap_or(a.block_number);
+        let b_start = b.range_start_block().unwrap_or(b.block_number);
+        a.layer
+            .cmp(&b.layer)
+            .then_with(|| a_start.cmp(&b_start))
+            // If multiple proofs cover the same frontier start, settle the
+            // widest range first so short overlapping proofs cannot starve
+            // historical catch-up.
+            .then_with(|| b.block_number.cmp(&a.block_number))
+            .then_with(|| a.block_hash.as_bytes().cmp(b.block_hash.as_bytes()))
+            .then_with(|| a.prover.0.as_slice().cmp(b.prover.0.as_slice()))
+    });
+}
+
 impl<S: KvStore + 'static> Node<S> {
     /// Produce a block from pending mempool transactions.
     ///
@@ -247,19 +263,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let mut drained_stark_settlements = prover.take_pending_stark_settlements();
-        drained_stark_settlements.sort_by(|a, b| {
-            let a_start = a.range_start_block().unwrap_or(a.block_number);
-            let b_start = b.range_start_block().unwrap_or(b.block_number);
-            a.layer
-                .cmp(&b.layer)
-                .then_with(|| a_start.cmp(&b_start))
-                // If multiple proofs cover the same frontier start, settle the
-                // widest range first so short overlapping proofs cannot starve
-                // historical catch-up.
-                .then_with(|| b.block_number.cmp(&a.block_number))
-                .then_with(|| a.block_hash.as_bytes().cmp(b.block_hash.as_bytes()))
-                .then_with(|| a.prover.0.as_slice().cmp(b.prover.0.as_slice()))
-        });
+        sort_stark_settlements_for_inclusion(&mut drained_stark_settlements);
         let mut settled_stark_proofs = Vec::new();
         let mut settled_stark_artifacts = Vec::new();
         let mut seen_stark_sources = HashSet::new();
@@ -292,6 +296,16 @@ impl<S: KvStore + 'static> Node<S> {
                     source = %amendment.block_hash,
                     layer = amendment.layer,
                     "skipping out-of-order STARK reward settlement: {e}"
+                );
+                continue;
+            }
+            if let Err(e) = self.validate_stark_proof_source_binding(&amendment) {
+                settled_stark_proofs.pop();
+                warn!(
+                    block = next_number,
+                    source = %amendment.block_hash,
+                    layer = amendment.layer,
+                    "skipping STARK reward settlement with invalid proof-source binding: {e}"
                 );
                 continue;
             }

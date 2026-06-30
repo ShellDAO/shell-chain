@@ -24,6 +24,7 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 mod config;
 mod password;
+mod secure_file;
 
 use config::ShellConfig;
 use password::PasswordArgs;

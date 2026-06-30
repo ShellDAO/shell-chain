@@ -11,6 +11,7 @@ use shell_primitives::Address;
 use tracing::info;
 
 use crate::password::{resolve_new_password, resolve_password, PasswordArgs};
+use crate::secure_file::write_sensitive_file_new;
 
 /// Generate a new keypair and encrypt it to a keystore file.
 ///
@@ -49,7 +50,7 @@ pub fn key_generate(
     };
 
     let json = serde_json::to_string_pretty(&encrypted)?;
-    std::fs::write(&output, &json)?;
+    write_sensitive_file_new(&output, &json)?;
 
     eprintln!("✓ Keystore written to {}", output.display());
     eprintln!("  Address:   {address}");
@@ -138,7 +139,7 @@ pub fn key_migrate(
     };
 
     let new_json = serde_json::to_string_pretty(&new_encrypted)?;
-    std::fs::write(&output, &new_json)?;
+    write_sensitive_file_new(&output, &new_json)?;
 
     let address = Address::parse(&new_encrypted.address)
         .map_err(|e| format!("invalid address in re-encrypted keystore: {e}"))?;

@@ -68,19 +68,13 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let proposer = &block.header.proposer;
-        let pubkey = self
-            .known_authorities
-            .read()
-            .get(proposer)
-            .cloned()
-            .or_else(|| self.chain_store.get_pubkey(proposer).ok().flatten())
-            .ok_or_else(|| {
-                NodeError::Startup(format!(
-                    "block {} seal verification failed: proposer {} pubkey unknown",
-                    block.number(),
-                    proposer
-                ))
-            })?;
+        let pubkey = self.authority_pubkey(proposer).ok_or_else(|| {
+            NodeError::Startup(format!(
+                "block {} seal verification failed: proposer {} pubkey unknown",
+                block.number(),
+                proposer
+            ))
+        })?;
 
         let verifier = MultiVerifier;
         self.consensus
@@ -91,6 +85,43 @@ impl<S: KvStore + 'static> Node<S> {
             .entry(*proposer)
             .or_insert(pubkey);
         Ok(())
+    }
+
+    fn authority_pubkey(&self, authority: &Address) -> Option<Vec<u8>> {
+        self.known_authorities
+            .read()
+            .get(authority)
+            .cloned()
+            .or_else(|| self.chain_store.get_pubkey(authority).ok().flatten())
+    }
+
+    fn queue_signed_equivocation_if_valid(&self, existing: &Block, candidate: &Block) {
+        let Some(equivocation) = EquivocationProof::from_blocks(existing, candidate) else {
+            return;
+        };
+        let Some(pubkey) = self.authority_pubkey(&equivocation.offender) else {
+            warn!(
+                offender = %equivocation.offender,
+                block_number = equivocation.header_a.number,
+                "I1: double-sign candidate ignored because offender pubkey is unknown"
+            );
+            return;
+        };
+        let verifier = MultiVerifier;
+        if !equivocation.verify_signed(&pubkey, &verifier) {
+            warn!(
+                offender = %equivocation.offender,
+                block_number = equivocation.header_a.number,
+                "I1: double-sign candidate ignored because proposer seals do not verify"
+            );
+            return;
+        }
+        warn!(
+            offender = %equivocation.offender,
+            block_number = equivocation.header_a.number,
+            "I1: signed double-sign detected, queuing equivocation broadcast"
+        );
+        self.equivocation_queue.lock().push(equivocation);
     }
 
     fn verify_incoming_witness_root(&self, block: &Block) -> Result<(), NodeError> {
@@ -147,6 +178,9 @@ impl<S: KvStore + 'static> Node<S> {
         if transition == BlockImportTransition::SameHeightFork {
             let parent = self.parent_for_import(&block)?;
             self.verify_import_consensus(&block, &parent)?;
+            if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
+                self.queue_signed_equivocation_if_valid(&existing, &block);
+            }
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
@@ -199,20 +233,7 @@ impl<S: KvStore + 'static> Node<S> {
         if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
             if existing.hash() != block.hash() && existing.header.proposer == block.header.proposer
             {
-                let slash_record = detect_double_sign(&existing.header, &block.header);
-                if let Some(record) = slash_record {
-                    if let Some(equivocation) = EquivocationProof::from_slash_record(&record) {
-                        if equivocation.verify() {
-                            warn!(
-                                offender = %equivocation.offender,
-                                block_number = incoming,
-                                "I1: double-sign detected, queuing equivocation broadcast"
-                            );
-                            // Store in equivocation queue for broadcast in the event loop.
-                            self.equivocation_queue.lock().push(equivocation);
-                        }
-                    }
-                }
+                self.queue_signed_equivocation_if_valid(&existing, &block);
             }
         }
 
@@ -339,13 +360,9 @@ impl<S: KvStore + 'static> Node<S> {
             })
             .collect::<Result<Vec<_>, NodeError>>()?;
         self.validate_stark_settlement_sequence(&stark_settlements)?;
-        // Note: `validate_stark_proof_source_binding` (full STARK cryptographic
-        // verification) is intentionally skipped here.  During block import we
-        // trust that the settlement was validated at gossip time before the PoA
-        // proposer included it.  Re-verifying the full STARK proof on every
-        // import would be prohibitively expensive for chain sync and is
-        // redundant for a PoA chain.  The lightweight ordering and sequence
-        // checks above are still enforced.
+        for amendment in &stark_settlements {
+            self.validate_stark_proof_source_binding(amendment)?;
+        }
 
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
@@ -360,6 +377,13 @@ impl<S: KvStore + 'static> Node<S> {
             let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();
             let mut resolved_pks: Vec<Vec<u8>> = Vec::with_capacity(block.transactions.len());
             for tx in &block.transactions {
+                if tx.signature.data.is_empty() {
+                    return Err(NodeError::Startup(format!(
+                        "block {} tx {} has empty signature",
+                        block.number(),
+                        tx.hash()
+                    )));
+                }
                 let pk = match &tx.pubkey_mode {
                     shell_core::PubkeyMode::Embedded(pk) => {
                         block_pubkeys.entry(tx.from).or_insert_with(|| pk.clone());
@@ -388,53 +412,43 @@ impl<S: KvStore + 'static> Node<S> {
                         })? {
                             pk
                         } else {
-                            // Pubkey not yet registered for this Reference-mode tx.
-                            // This occurs when syncing historical blocks produced by an
-                            // older node where the sender's first tx was Reference-mode
-                            // (pre-F181 enforcement).  Skip sig verification for this tx;
-                            // correctness is guaranteed by the state-root check below.
-                            warn!(
-                                block = block.number(),
-                                from = %tx.from,
-                                "Reference-mode tx with unresolvable pubkey; \
-                                 skipping sig verification (state-root will validate)"
-                            );
-                            Vec::new() // sentinel: empty pk → skip in batch verify
+                            return Err(NodeError::Startup(format!(
+                                "block {} tx {} uses Reference pubkey mode but sender {} has no registered or earlier embedded pubkey",
+                                block.number(),
+                                tx.hash(),
+                                tx.from
+                            )));
                         }
                     }
                 };
                 resolved_pks.push(pk);
             }
-            // Only include txs whose pubkey was resolved in the batch verify.
-            // Txs with an empty sentinel pk (unresolvable Reference-mode from
-            // historical blocks) are skipped here; the state-root check is the
-            // security backstop for those.
             let verify_items: Vec<VerifyItem> = block
                 .transactions
                 .iter()
                 .enumerate()
-                .filter_map(|(i, tx)| {
-                    if resolved_pks[i].is_empty() || tx.signature.data.is_empty() {
-                        None
-                    } else {
-                        Some(VerifyItem {
-                            pubkey: &resolved_pks[i],
-                            message: tx_hashes[i].as_bytes(),
-                            signature: &tx.signature,
-                        })
-                    }
+                .map(|(i, tx)| VerifyItem {
+                    pubkey: &resolved_pks[i],
+                    message: tx_hashes[i].as_bytes(),
+                    signature: &tx.signature,
                 })
                 .collect();
-            if !verify_items.is_empty() {
-                batch_verifier
-                    .verify_batch_all(&verify_items)
-                    .map_err(|e| {
-                        NodeError::Startup(format!(
-                            "block {} batch sig verification failed: {e}",
-                            block.number()
-                        ))
-                    })?;
+            if verify_items.len() != block.transactions.len() {
+                return Err(NodeError::Startup(format!(
+                    "block {} signature verification coverage mismatch: {} verify items for {} transactions",
+                    block.number(),
+                    verify_items.len(),
+                    block.transactions.len()
+                )));
             }
+            batch_verifier
+                .verify_batch_all(&verify_items)
+                .map_err(|e| {
+                    NodeError::Startup(format!(
+                        "block {} batch sig verification failed: {e}",
+                        block.number()
+                    ))
+                })?;
 
             let (state_db, _) = block_store.isolated_state_db()?;
             let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
@@ -455,25 +469,7 @@ impl<S: KvStore + 'static> Node<S> {
             let pre_verified = PreVerified;
             let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
             let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
-            for (idx, tx) in block.transactions.iter().enumerate() {
-                // Skip full validation for txs whose pubkey could not be
-                // resolved (unresolvable Reference-mode from historical blocks).
-                // Correctness is guaranteed by the state-root check below.
-                if resolved_pks[idx].is_empty() || tx.signature.data.is_empty() {
-                    let world_state = evm.state_db_mut().world_state_mut();
-                    let expected_nonce = match validation_nonces.get(&tx.from) {
-                        Some(next_nonce) => *next_nonce,
-                        None => world_state.get_nonce(&tx.from)?,
-                    };
-                    let next_nonce = if tx.tx.nonce >= expected_nonce {
-                        tx.tx.nonce.saturating_add(1)
-                    } else {
-                        expected_nonce
-                    };
-                    validation_nonces.insert(tx.from, next_nonce);
-                    continue;
-                }
-
+            for tx in &block.transactions {
                 let mut tx_for_validation = tx.clone();
                 if tx_for_validation.pubkey_mode.is_reference() {
                     if let Some(pk) = validation_pubkeys.get(&tx.from) {

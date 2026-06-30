@@ -1344,21 +1344,44 @@ impl<S: KvStore + 'static> Node<S> {
                                 NetworkMessage::ProofAck { block_hash, holder } => {
                                     debug!(%peer, ?holder, "received ProofAck for block {}", block_hash);
                                 }
-                                // I1: Received equivocation evidence from a peer.
-                                // Independently verify and log; slashing is deferred until
-                                // the proposer-schedule epoch-boundary design is complete,
-                                // to prevent mid-chain validator-set corruption causing
-                                // cascading false-equivocation (wPoA stability fix).
+                                // I1: Received signed equivocation evidence from a peer.
+                                // Slashing requires both conflicting proposer seals to verify
+                                // against the offender's registered public key.
                                 NetworkMessage::EquivocationEvidence(equivocation) => {
-                                    if equivocation.verify() {
+                                    let offender_pubkey = self
+                                        .known_authorities
+                                        .read()
+                                        .get(&equivocation.offender)
+                                        .cloned()
+                                        .or_else(|| {
+                                            self.chain_store
+                                                .get_pubkey(&equivocation.offender)
+                                                .ok()
+                                                .flatten()
+                                        });
+                                    let Some(pubkey) = offender_pubkey else {
                                         warn!(
+                                            %peer,
                                             offender = %equivocation.offender,
-                                            block_number = equivocation.header_a.number,
-                                            "I1: equivocation evidence verified (slashing deferred — epoch-boundary not implemented)"
+                                            "I1: received equivocation evidence for unknown offender pubkey, ignoring"
                                         );
-                                    } else {
-                                        warn!(%peer, "I1: received invalid equivocation evidence, ignoring");
+                                        continue;
+                                    };
+                                    let verifier = MultiVerifier;
+                                    if !equivocation.verify_signed(&pubkey, &verifier) {
+                                        warn!(
+                                            %peer,
+                                            offender = %equivocation.offender,
+                                            "I1: received invalid signed equivocation evidence, ignoring"
+                                        );
+                                        continue;
                                     }
+                                    warn!(
+                                        offender = %equivocation.offender,
+                                        block_number = equivocation.header_a.number,
+                                        "I1: signed equivocation evidence verified, applying slash"
+                                    );
+                                    self.consensus.write().slash_authority(&equivocation.offender);
                                 }
                                 // I2: Received a proof challenge from a peer.
                                 // If we hold the proof, respond with raw bytes.
