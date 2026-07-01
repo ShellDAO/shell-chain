@@ -48,6 +48,8 @@ cleanup() {
   [[ -n "$NODE1_PID" ]] && kill "$NODE1_PID" 2>/dev/null || true
   [[ -n "$NODE2_PID" ]] && kill "$NODE2_PID" 2>/dev/null || true
   wait 2>/dev/null || true
+  rm -f "$PW" "$KEY1" "$KEY2"
+  find "$TESTDIR" -name 'libp2p.key' -delete 2>/dev/null || true
   info "Artifacts saved to: $TESTDIR"
   if [[ $FAILURES -gt 0 ]]; then
     echo -e "${RED}FAILED ($FAILURES failures)${NC}"
@@ -83,6 +85,44 @@ get_finalized_number() {
 get_head_hash() {
   rpc "$1" eth_getBlockByNumber '["latest",false]' \
     | python3 -c 'import json,sys; r=json.load(sys.stdin).get("result") or {}; print(r.get("hash",""))' 2>/dev/null || echo ""
+}
+
+write_rpc_snapshot() {
+  local port=$1
+  local label=$2
+  local out="$TESTDIR/rpc-snapshot-$label.json"
+  python3 - "$port" "$label" "$out" <<'PY'
+import json
+import sys
+import urllib.request
+
+port, label, out = sys.argv[1], sys.argv[2], sys.argv[3]
+url = f"http://127.0.0.1:{port}"
+
+def rpc(method, params=None):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.load(resp)
+
+snapshot = {"label": label, "rpc": url}
+for key, method in [
+    ("chainId", "eth_chainId"),
+    ("blockNumber", "eth_blockNumber"),
+    ("peerCount", "net_peerCount"),
+    ("finality", "shell_getFinalityInfo"),
+]:
+    try:
+        snapshot[key] = rpc(method)
+    except Exception as exc:
+        snapshot[key] = {"error": str(exc)}
+
+with open(out, "w") as fh:
+    json.dump(snapshot, fh, indent=2, sort_keys=True)
+PY
 }
 
 wait_rpc() {
@@ -329,6 +369,9 @@ HEAD1=$(get_block_number "$NODE1_RPC")
 HEAD2=$(get_block_number "$NODE2_RPC")
 HASH1=$(get_head_hash "$NODE1_RPC")
 HASH2=$(get_head_hash "$NODE2_RPC")
+write_rpc_snapshot "$NODE1_RPC" node1
+write_rpc_snapshot "$NODE2_RPC" node2
+pass "RPC snapshots written"
 
 {
   echo "=== Local Restart Recovery Report ==="
@@ -338,5 +381,6 @@ HASH2=$(get_head_hash "$NODE2_RPC")
   echo "Finalized after stop:  $STOP_FINALIZED"
   echo "Finalized final:       node1=$FINAL1 node2=$FINAL2"
   echo "Head final:            node1=$HEAD1/$HASH1 node2=$HEAD2/$HASH2"
+  echo "RPC snapshots:         rpc-snapshot-node1.json rpc-snapshot-node2.json"
 } > "$REPORT"
 echo "Report: $REPORT"

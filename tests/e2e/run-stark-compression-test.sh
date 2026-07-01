@@ -65,6 +65,10 @@ NODE2_DATA="$TESTDIR/node2"
 NODE3_DATA="$TESTDIR/node3"
 SHARED_DIR="$TESTDIR/shared"
 mkdir -p "$NODE1_DATA" "$NODE2_DATA" "$NODE3_DATA" "$SHARED_DIR"
+NODE1_KEYSTORE="$TESTDIR/node1-validator.json"
+PASSWORD_FILE="$TESTDIR/password.txt"
+printf 'dev-password\n' > "$PASSWORD_FILE"
+chmod 600 "$PASSWORD_FILE"
 
 # Log files
 LOG1="$TESTDIR/node1.log"
@@ -81,6 +85,9 @@ cleanup() {
   [[ -n "$NODE2_PID" ]] && kill "$NODE2_PID" 2>/dev/null || true
   [[ -n "$NODE3_PID" ]] && kill "$NODE3_PID" 2>/dev/null || true
   wait 2>/dev/null || true
+  rm -f "$PASSWORD_FILE" "$NODE1_KEYSTORE" "$TESTDIR"/tx-*.err
+  find "$TESTDIR" -name 'dev-authority.json' -delete 2>/dev/null || true
+  find "$TESTDIR" -name 'libp2p.key' -delete 2>/dev/null || true
   info "Logs saved to: $TESTDIR"
   if [[ $FAILURES -gt 0 ]]; then
     echo -e "${RED}FAILED ($FAILURES failures)${NC}"
@@ -113,6 +120,44 @@ rpc() { # rpc PORT METHOD [PARAMS]
     -d "{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params,\"id\":1}" 2>/dev/null
 }
 
+write_rpc_snapshot() {
+  local port=$1
+  local label=$2
+  local out="$TESTDIR/rpc-snapshot-$label.json"
+  python3 - "$port" "$label" "$out" <<'PY'
+import json
+import sys
+import urllib.request
+
+port, label, out = sys.argv[1], sys.argv[2], sys.argv[3]
+url = f"http://127.0.0.1:{port}"
+
+def rpc(method, params=None):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.load(resp)
+
+snapshot = {"label": label, "rpc": url}
+for key, method in [
+    ("chainId", "eth_chainId"),
+    ("blockNumber", "eth_blockNumber"),
+    ("peerCount", "net_peerCount"),
+    ("finality", "shell_getFinalityInfo"),
+]:
+    try:
+        snapshot[key] = rpc(method)
+    except Exception as exc:
+        snapshot[key] = {"error": str(exc)}
+
+with open(out, "w") as fh:
+    json.dump(snapshot, fh, indent=2, sort_keys=True)
+PY
+}
+
 wait_rpc() { # wait_rpc PORT LABEL
   local port=$1 label=$2
   for i in $(seq 1 60); do
@@ -127,9 +172,16 @@ wait_rpc() { # wait_rpc PORT LABEL
 }
 
 # ── Start node1 (producer, STARK enabled) ────────────────────────────────────
+header "Generating node1 validator key"
+"$NODE_BIN" --password-file "$PASSWORD_FILE" key generate --output "$NODE1_KEYSTORE" \
+  > "$TESTDIR/keygen.log" 2>&1
+pass "node1 validator keystore generated"
+
 header "Starting node1 (block producer + STARK aggregation)"
 "$NODE_BIN" run \
   --datadir "$NODE1_DATA" \
+  --keystore "$NODE1_KEYSTORE" \
+  --password-file "$PASSWORD_FILE" \
   --rpc-addr "127.0.0.1:$NODE1_RPC" \
   --rpc-api "eth,net,web3,shell" \
   --metrics-addr "127.0.0.1:$NODE1_METRICS" \
@@ -254,24 +306,33 @@ pass "Balance: $DEV_BALANCE wei"
 # ── Submit transactions ────────────────────────────────────────────────────────
 header "Submitting $TOTAL_TXS transactions ($NUM_BATCHES × $TXS_PER_BATCH)"
 
-RECIPIENT="0x000000000000000000000000000000000000dead"
+RECIPIENT="0x000000000000000000000000000000000000000000000000000000000000dead"
 TX_HASHES=()
 TX_ERRORS=()
 NONCE=0
 
 send_tx() {
-  local nonce_hex
-  nonce_hex=$(printf "0x%x" "$1")
-  rpc "$NODE1_RPC" eth_sendTransaction \
-    "[{\"from\":\"$DEV_ACCOUNT\",\"to\":\"$RECIPIENT\",\"value\":\"0x1\",\"nonce\":\"$nonce_hex\",\"gas\":\"0x5208\",\"gasPrice\":\"0x1\"}]" \
-    | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('result','ERROR:'+str(r.get('error',{}))))" 2>/dev/null
+  "$NODE_BIN" --password-file "$PASSWORD_FILE" tx send \
+    --keystore "$NODE1_KEYSTORE" \
+    --rpc-url "http://127.0.0.1:$NODE1_RPC" \
+    --chain-id "$CHAIN_ID" \
+    --nonce "$1" \
+    --gas-limit 21000 \
+    --to "$RECIPIENT" \
+    --value 1 \
+    2>"$TESTDIR/tx-$1.err" \
+    | tail -n1
 }
 
 if [[ "$TOTAL_TXS" -gt 0 ]]; then
   for batch in $(seq 1 "$NUM_BATCHES"); do
     info "Batch $batch/$NUM_BATCHES..."
     for _ in $(seq 1 "$TXS_PER_BATCH"); do
-      hash=$(send_tx "$NONCE")
+      if hash=$(send_tx "$NONCE"); then
+        :
+      else
+        hash="ERROR:$(tr '\n' ' ' < "$TESTDIR/tx-$NONCE.err" 2>/dev/null || true)"
+      fi
       if [[ "$hash" == 0x* ]]; then
         TX_HASHES+=("$hash")
       else
@@ -431,9 +492,10 @@ print("  embedded Dilithium3 public keys → 6.6× block size reduction for sig 
 print()
 if proofs_ok > 0:
     print(f"  ✓ {proofs_ok} proof(s) generated during this testnet run.")
+elif total_txs > 0:
+    print("  ℹ  No proofs generated; summary below verifies the explicit below-threshold wait state.")
 else:
-    print("  ℹ  No proofs generated yet (async backlog may still be processing).")
-    print("     Check Prometheus metrics after a longer run or increase --wait-blocks.")
+    print("  ℹ  No proofs generated; empty sparse run has no proof workload.")
 PYEOF
 
 # ── Node sync check ───────────────────────────────────────────────────────────
@@ -456,6 +518,79 @@ else
   fail "Nodes not in sync (node1=$BN1/$HASH1, node2=$BN2/$HASH2, node3=$BN3/$HASH3)"
 fi
 
+write_rpc_snapshot "$NODE1_RPC" node1
+write_rpc_snapshot "$NODE2_RPC" node2
+write_rpc_snapshot "$NODE3_RPC" node3
+pass "RPC snapshots written"
+
+RECEIPT_PARITY="not-run"
+if [[ "$SENT" -gt 0 ]]; then
+  if python3 - "$NODE1_RPC" "$NODE2_RPC" "$NODE3_RPC" "$TESTDIR/receipt-parity.json" "${TX_HASHES[@]}" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+ports = sys.argv[1:4]
+out = sys.argv[4]
+hashes = sys.argv[5:]
+
+def rpc(port, method, params):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}",
+        data=json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.load(resp)
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+    return data.get("result")
+
+rows = []
+ok = True
+for tx_hash in hashes:
+    receipts = []
+    for port in ports:
+        receipt = None
+        for _ in range(20):
+            receipt = rpc(port, "eth_getTransactionReceipt", [tx_hash])
+            if receipt:
+                break
+            time.sleep(0.5)
+        reduced = None
+        if receipt:
+            reduced = {
+                "transactionHash": receipt.get("transactionHash"),
+                "status": receipt.get("status"),
+                "blockHash": receipt.get("blockHash"),
+                "blockNumber": receipt.get("blockNumber"),
+                "transactionIndex": receipt.get("transactionIndex"),
+            }
+        receipts.append({"port": port, "receipt": reduced})
+    first = receipts[0]["receipt"]
+    parity = first is not None and all(item["receipt"] == first for item in receipts[1:])
+    ok = ok and parity
+    rows.append({"transactionHash": tx_hash, "parity": parity, "receipts": receipts})
+
+with open(out, "w") as fh:
+    json.dump({"ok": ok, "transactions": rows}, fh, indent=2, sort_keys=True)
+
+sys.exit(0 if ok else 1)
+PY
+  then
+    RECEIPT_PARITY="pass"
+    pass "Transaction receipt parity passed"
+  else
+    RECEIPT_PARITY="fail"
+    fail "Transaction receipt parity failed"
+    exit 1
+  fi
+else
+  RECEIPT_PARITY="no-transactions"
+  pass "Receipt parity skipped; no transactions submitted"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 header "Summary"
 echo "  Transactions sent:       $SENT"
@@ -466,11 +601,18 @@ echo "  ProofAmendments:         $AMENDMENTS"
 echo "  Test data directory:     $TESTDIR"
 echo
 if [[ "$PROOFS_OK" -gt 0 ]]; then
+  PROOF_STATE="proof-generated"
   pass "STARK block compression active: $PROOFS_OK proof(s) generated"
 elif [[ "$SENT" -eq 0 ]]; then
+  PROOF_STATE="empty-chain-no-proof-expected"
   pass "Sparse liveness run completed without proof failures; no proof expected without transactions"
+elif grep -q 'awaiting more canonical non-empty blocks' "$LOG1"; then
+  PROOF_STATE="awaiting-more-entries"
+  pass "STARK prover reported explicit below-threshold wait state for sparse transaction load"
 else
-  info "STARK proofs still pending (async) — check $LOG1 for ProverService output"
+  PROOF_STATE="ambiguous-pending"
+  fail "STARK proofs pending without explicit ProverService wait reason"
+  exit 1
 fi
 
 # Save report
@@ -479,8 +621,11 @@ fi
   echo "Date: $(date -u)"
   echo "Transactions: $SENT"
   echo "Final block:  $FINAL_BN"
+  echo "State:        $PROOF_STATE"
   echo "Proofs:       $PROOFS_OK"
   echo "Failures:     $PROOFS_FAIL"
   echo "Amendments:   $AMENDMENTS"
+  echo "Head parity:  node1=$BN1/$HASH1 node2=$BN2/$HASH2 node3=$BN3/$HASH3"
+  echo "Receipts:     $RECEIPT_PARITY"
 } > "$REPORT"
 echo "Report: $REPORT"
