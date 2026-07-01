@@ -6,6 +6,7 @@
 #   restart-recovery      Local two-validator restart/redial/finality smoke.
 #   chaos-docker          Docker crash, partition, leader restart, rapid restart.
 #   validator-prover      Local STARK/prover path smoke test.
+#   local-p0-p2           Local no-Docker P0-P2 suite.
 #   single-validator-testnet
 #                         Alias for sync.
 #   two-validator-devnet  Alias for restart-recovery until a dedicated
@@ -33,6 +34,7 @@ Profiles:
   restart-recovery      Run local two-validator restart/redial/finality checks.
   chaos-docker          Run Docker crash/partition/restart recovery checks.
   validator-prover      Run local STARK/prover smoke checks.
+  local-p0-p2           Run local restart, prover no-tx, prover tx, and guard checks.
   single-validator-testnet
                         Alias for sync.
   two-validator-devnet  Alias for restart-recovery.
@@ -47,6 +49,8 @@ Environment:
   NODE_BIN=...          Binary for validator-prover profile.
   TXS_PER_BATCH=...     Override STARK test transaction count.
   NUM_BATCHES=...       Override STARK test batch count.
+  LOCAL_P0_P2_TXS=...    Transactions per batch for local-p0-p2 tx leg (default: 2).
+  LOCAL_P0_P2_BATCHES=... Batches for local-p0-p2 tx leg (default: 2).
 USAGE
 }
 
@@ -73,6 +77,19 @@ run_profile() {
       ;;
     validator-prover)
       "$SCRIPT_DIR/run-stark-compression-test.sh" "$@"
+      ;;
+    local-p0-p2)
+      run_profile restart-recovery
+      TXS_PER_BATCH=0 NUM_BATCHES=1 WAIT_BLOCKS="${LOCAL_P0_P2_WAIT_BLOCKS:-3}" \
+        BLOCK_TIME="${LOCAL_P0_P2_BLOCK_TIME:-1000}" \
+        run_profile validator-prover --txs 0 --batches 1 --block-time "${LOCAL_P0_P2_BLOCK_TIME:-1000}"
+      TXS_PER_BATCH="${LOCAL_P0_P2_TXS:-2}" NUM_BATCHES="${LOCAL_P0_P2_BATCHES:-2}" \
+        WAIT_BLOCKS="${LOCAL_P0_P2_WAIT_BLOCKS:-4}" BLOCK_TIME="${LOCAL_P0_P2_BLOCK_TIME:-1000}" \
+        run_profile validator-prover \
+          --txs "${LOCAL_P0_P2_TXS:-2}" \
+          --batches "${LOCAL_P0_P2_BATCHES:-2}" \
+          --block-time "${LOCAL_P0_P2_BLOCK_TIME:-1000}"
+      run_profile non-authority-validator-negative
       ;;
     single-validator-testnet)
       run_profile sync "$@"
@@ -124,7 +141,7 @@ case "$PROFILE" in
     run_profile validator-prover "$@"
     run_profile non-authority-validator-negative "$@"
     ;;
-  sync|restart-recovery|chaos-docker|validator-prover|single-validator-testnet|two-validator-devnet|two-validator-testnet-profile|non-authority-validator-negative)
+  sync|restart-recovery|chaos-docker|validator-prover|local-p0-p2|single-validator-testnet|two-validator-devnet|two-validator-testnet-profile|non-authority-validator-negative)
     run_profile "$PROFILE" "$@"
     ;;
   *)
