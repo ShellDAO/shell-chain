@@ -769,46 +769,11 @@ impl<S: KvStore + 'static> Node<S> {
     /// Used to populate the `oldest_body_block` field of `StorageCapability`.
     /// Returns 0 if block 0 is available (or no blocks exist yet).
     fn oldest_available_body_block(&self) -> u64 {
-        let head_number = self
-            .chain_store
-            .get_head_block()
+        self.chain_store
+            .oldest_canonical_body_number()
             .ok()
             .flatten()
-            .map(|b| b.header.number)
-            .unwrap_or(0);
-
-        // Binary search for the first block that still has a body.
-        // Fall back to sequential scan if the range is small.
-        if head_number < 1024 {
-            for n in 0..=head_number {
-                if let Ok(Some(h)) = self.chain_store.get_block_hash_by_number(n) {
-                    if self.chain_store.has_body(&h).unwrap_or(false) {
-                        return n;
-                    }
-                }
-            }
-            return head_number;
-        }
-
-        // Binary search: find smallest n where has_body is true.
-        let mut lo = 0u64;
-        let mut hi = head_number;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let has = self
-                .chain_store
-                .get_block_hash_by_number(mid)
-                .ok()
-                .flatten()
-                .and_then(|h| self.chain_store.has_body(&h).ok())
-                .unwrap_or(false);
-            if has {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        lo
+            .unwrap_or(0)
     }
 
     fn sync_system_contract_state(

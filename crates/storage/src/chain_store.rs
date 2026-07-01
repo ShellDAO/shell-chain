@@ -584,6 +584,36 @@ impl<S: KvStore> ChainStore<S> {
         Ok(self.store.get(&Self::body_key(hash))?.is_some())
     }
 
+    /// Return the lowest canonical block number whose stripped body is present.
+    ///
+    /// Body storage can be non-contiguous during historical backfill or after
+    /// interrupted pruning. This scans actual body keys instead of assuming the
+    /// availability range is monotonic by block number.
+    pub fn oldest_canonical_body_number(&self) -> Result<Option<u64>, StorageError> {
+        if let Some(genesis_hash) = self.get_block_hash_by_number(0)? {
+            if self.has_body(&genesis_hash)? {
+                return Ok(Some(0));
+            }
+        }
+
+        let mut oldest = None;
+        for (key, _) in self.store.scan_prefix(prefix::BODY_BY_HASH)? {
+            let raw_hash = key
+                .strip_prefix(prefix::BODY_BY_HASH)
+                .ok_or_else(|| StorageError::Codec("invalid body key prefix".into()))?;
+            let hash = ShellHash::try_from_slice(raw_hash)
+                .map_err(|e| StorageError::Codec(e.to_string()))?;
+            let Some(header) = self.get_header_by_hash(&hash)? else {
+                continue;
+            };
+            if self.get_block_hash_by_number(header.number)? == Some(hash) {
+                oldest = Some(oldest.map_or(header.number, |n: u64| n.min(header.number)));
+            }
+        }
+
+        Ok(oldest)
+    }
+
     /// Classify which block components are available locally for a hash.
     pub fn block_availability(&self, hash: &ShellHash) -> Result<BlockAvailability, StorageError> {
         let has_header = self.store.get(&Self::header_key(hash))?.is_some();
@@ -2235,6 +2265,48 @@ mod tests {
             cs.block_availability(&hash).unwrap(),
             BlockAvailability::HeaderOnly
         );
+    }
+
+    #[test]
+    fn oldest_canonical_body_number_handles_non_contiguous_bodies() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let mut hashes = Vec::new();
+        for number in 0..=5 {
+            let block = empty_block(number);
+            hashes.push(block.hash());
+            put_canonical(&cs, &block);
+        }
+
+        cs.delete_body(&hashes[3]).unwrap();
+
+        assert_eq!(cs.oldest_canonical_body_number().unwrap(), Some(0));
+
+        for hash in hashes.iter().take(3) {
+            cs.delete_body(hash).unwrap();
+        }
+
+        assert_eq!(cs.oldest_canonical_body_number().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn oldest_canonical_body_number_ignores_side_fork_bodies() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+
+        let genesis = empty_block(0);
+        let genesis_hash = genesis.hash();
+        put_canonical(&cs, &genesis);
+        cs.delete_body(&genesis_hash).unwrap();
+
+        let canonical = empty_block(5);
+        put_canonical(&cs, &canonical);
+
+        let mut side_fork = empty_block(1);
+        side_fork.header.extra_data = Bytes::from_static(b"side-fork");
+        cs.put_side_fork_block(&side_fork).unwrap();
+
+        assert_eq!(cs.oldest_canonical_body_number().unwrap(), Some(5));
     }
 
     #[test]
