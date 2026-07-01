@@ -722,6 +722,13 @@ impl<S: KvStore + 'static> Node<S> {
                                 .config
                                 .proposer_address
                                 .expect("validated block producer has proposer address");
+                            if self.local_validator_weight().is_none() {
+                                debug!(
+                                    %validator,
+                                    "W.5: proposer timeout observed but local validator is not in the active validator set; skipping view change"
+                                );
+                                continue;
+                            }
                             let view = self.consensus.read().current_view();
                             let block_number = self.head_number() + 1;
                             let chain_id = self.config.chain_id;

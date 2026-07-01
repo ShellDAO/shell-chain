@@ -102,7 +102,8 @@ impl Default for NetworkConfig {
 ///
 /// Checks:
 /// - Parses as a valid [`libp2p::Multiaddr`]
-/// - Contains an IP transport layer (`/ip4/` or `/ip6/`)
+/// - Contains an address layer (`/ip4/`, `/ip6/`, `/dns/`, `/dns4/`,
+///   `/dns6/`, or `/dnsaddr/`)
 /// - Contains a TCP or UDP transport layer (`/tcp/` or `/udp/`)
 /// - Contains a `/p2p/<peer_id>` component with a valid PeerId
 #[cfg(feature = "libp2p")]
@@ -114,15 +115,18 @@ pub fn validate_bootnode_multiaddr(addr: &str) -> bool {
         Err(_) => return false,
     };
 
-    let mut has_ip = false;
+    let mut has_address = false;
     let mut has_transport = false;
     let mut has_peer_id = false;
 
     for proto in ma.iter() {
         match proto {
-            libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_) => {
-                has_ip = true;
-            }
+            libp2p::multiaddr::Protocol::Ip4(_)
+            | libp2p::multiaddr::Protocol::Ip6(_)
+            | libp2p::multiaddr::Protocol::Dns(_)
+            | libp2p::multiaddr::Protocol::Dns4(_)
+            | libp2p::multiaddr::Protocol::Dns6(_)
+            | libp2p::multiaddr::Protocol::Dnsaddr(_) => has_address = true,
             libp2p::multiaddr::Protocol::Tcp(_) | libp2p::multiaddr::Protocol::Udp(_) => {
                 has_transport = true;
             }
@@ -133,7 +137,7 @@ pub fn validate_bootnode_multiaddr(addr: &str) -> bool {
         }
     }
 
-    has_ip && has_transport && has_peer_id
+    has_address && has_transport && has_peer_id
 }
 
 #[cfg(test)]
@@ -158,6 +162,13 @@ mod tests {
     fn valid_ipv4_udp_multiaddr() {
         let addr =
             "/ip4/10.0.0.1/udp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        assert!(validate_bootnode_multiaddr(addr));
+    }
+
+    #[test]
+    fn valid_dns4_tcp_multiaddr() {
+        let addr =
+            "/dns4/bootnode.shell.org/tcp/30303/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
         assert!(validate_bootnode_multiaddr(addr));
     }
 

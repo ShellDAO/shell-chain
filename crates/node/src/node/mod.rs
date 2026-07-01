@@ -882,6 +882,16 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or(0)
     }
 
+    fn local_validator_weight(&self) -> Option<u64> {
+        let proposer = self.config.proposer_address?;
+        self.consensus
+            .read()
+            .validator_weights()
+            .get(&proposer)
+            .copied()
+            .filter(|weight| *weight > 0)
+    }
+
     fn preferred_fork_ahead(&self) -> Option<(ShellHash, u64, u64)> {
         let canonical_head = self.chain_store.get_head_block().ok().flatten()?;
         let canonical_number = canonical_head.number();
@@ -5180,6 +5190,32 @@ mod tests {
 
         node.produce_block(&signer, 100).unwrap();
         assert_eq!(node.head_number(), 1);
+    }
+
+    #[test]
+    fn local_validator_weight_returns_active_weight() {
+        let (node, _signer) = setup_node();
+        assert_eq!(node.local_validator_weight(), Some(1));
+    }
+
+    #[test]
+    fn local_validator_weight_ignores_non_authority_proposer() {
+        let local = Address::from([0x11; 32]);
+        let active = Address::from([0x22; 32]);
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> =
+            Arc::new(RwLock::new(PoaEngine::new(PoaConfig::new(vec![active], 1))));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+            chain_id: 1337,
+            ..MempoolConfig::default()
+        }));
+        let config = NodeConfig::dev(local);
+
+        let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
+
+        assert_eq!(node.local_validator_weight(), None);
     }
 
     // ── State consistency tests ────────────────────────────────────────

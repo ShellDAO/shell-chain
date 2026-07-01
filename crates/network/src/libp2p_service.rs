@@ -638,19 +638,8 @@ async fn swarm_loop(
                 }
             }
             _ = bootnode_redial_interval.tick(), if !loop_config.boot_nodes.is_empty() => {
-                let connected = swarm.connected_peers().count();
-                if connected == 0 {
-                    for addr in &loop_config.boot_nodes {
-                        seed_and_dial_boot_node(&mut swarm, addr, "redial");
-                    }
-                } else {
-                    for addr in &loop_config.boot_nodes {
-                        if let Some(peer_id) = extract_peer_id(addr) {
-                            if !swarm.is_connected(&peer_id) {
-                                seed_and_dial_boot_node(&mut swarm, addr, "redial");
-                            }
-                        }
-                    }
+                for addr in &loop_config.boot_nodes {
+                    seed_and_dial_boot_node(&mut swarm, addr, "redial");
                 }
             }
             _ = score_log_interval.tick() => {
