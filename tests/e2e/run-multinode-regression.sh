@@ -3,7 +3,8 @@
 #
 # Profiles:
 #   sync                  Docker 3-node sync/RPC/health checks.
-#   restart-recovery      Docker crash, partition, leader restart, rapid restart.
+#   restart-recovery      Local two-validator restart/redial/finality smoke.
+#   chaos-docker          Docker crash, partition, leader restart, rapid restart.
 #   validator-prover      Local STARK/prover path smoke test.
 #   single-validator-testnet
 #                         Alias for sync.
@@ -13,7 +14,7 @@
 #                         Alias for validator-prover.
 #   non-authority-validator-negative
 #                         Runs script-level deployment guard checks.
-#   all                   sync + restart-recovery + validator-prover.
+#   all                   sync + restart-recovery + validator-prover + guard checks.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,7 +30,8 @@ Usage: ./tests/e2e/run-multinode-regression.sh [profile]
 
 Profiles:
   sync                  Run Docker 3-node sync/RPC/health checks.
-  restart-recovery      Run Docker crash/partition/restart recovery checks.
+  restart-recovery      Run local two-validator restart/redial/finality checks.
+  chaos-docker          Run Docker crash/partition/restart recovery checks.
   validator-prover      Run local STARK/prover smoke checks.
   single-validator-testnet
                         Alias for sync.
@@ -60,6 +62,9 @@ run_profile() {
       fi
       ;;
     restart-recovery)
+      "$SCRIPT_DIR/run-local-restart-recovery.sh" "$@"
+      ;;
+    chaos-docker)
       if [[ "${REUSE:-false}" == "true" ]]; then
         "$SCRIPT_DIR/run-chaos-test.sh" --reuse
       else
@@ -79,10 +84,26 @@ run_profile() {
       run_profile validator-prover "$@"
       ;;
     non-authority-validator-negative)
-      SHELL_NODE_ROLE=validator \
+      local out="/tmp/shell-node-start-negative.out"
+      local err="/tmp/shell-node-start-negative.err"
+      rm -f "$out" "$err"
+      if SHELL_NODE_ROLE=validator \
         SHELL_KEYSTORE=/tmp/shell-chain-missing-validator.json \
         SHELL_PASSWORD_FILE=/tmp/shell-chain-missing-validator.pw \
-        "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh" >/tmp/shell-node-start-negative.out 2>/tmp/shell-node-start-negative.err
+        "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh" >"$out" 2>"$err"; then
+        echo "non-authority validator guard unexpectedly allowed startup" >&2
+        return 1
+      fi
+      if ! grep -q 'SHELL_KEYSTORE is not readable' "$err"; then
+        echo "non-authority validator guard failed for an unexpected reason" >&2
+        cat "$err" >&2
+        return 1
+      fi
+      if ! grep -q 'configured validator authority mismatch: expected .* got ' "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh"; then
+        echo "systemd validator authority mismatch log lost expected/derived comparison" >&2
+        return 1
+      fi
+      echo "non-authority-validator-negative passed"
       ;;
     *)
       echo "unknown multinode regression profile: $profile" >&2
@@ -101,19 +122,10 @@ case "$PROFILE" in
     run_profile sync
     run_profile restart-recovery
     run_profile validator-prover "$@"
-    if run_profile non-authority-validator-negative "$@"; then
-      echo "non-authority-validator-negative unexpectedly succeeded" >&2
-      exit 1
-    fi
+    run_profile non-authority-validator-negative "$@"
     ;;
-  sync|restart-recovery|validator-prover|single-validator-testnet|two-validator-devnet|two-validator-testnet-profile)
+  sync|restart-recovery|chaos-docker|validator-prover|single-validator-testnet|two-validator-devnet|two-validator-testnet-profile|non-authority-validator-negative)
     run_profile "$PROFILE" "$@"
-    ;;
-  non-authority-validator-negative)
-    if run_profile "$PROFILE" "$@"; then
-      echo "non-authority-validator-negative unexpectedly succeeded" >&2
-      exit 1
-    fi
     ;;
   *)
     echo "unknown multinode regression profile: $PROFILE" >&2
