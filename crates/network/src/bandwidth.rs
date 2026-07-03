@@ -5,7 +5,7 @@
 //! methods return `false` so the caller can log warnings or shed load.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Snapshot of current bandwidth usage.
@@ -84,9 +84,9 @@ pub struct BandwidthTracker {
     total_outbound: Arc<AtomicU64>,
     max_inbound: u64,
     max_outbound: u64,
-    inbound_limiter: Option<std::sync::Mutex<TokenBucket>>,
-    outbound_limiter: Option<std::sync::Mutex<TokenBucket>>,
-    last_reset: std::sync::Mutex<Instant>,
+    inbound_limiter: Option<Mutex<TokenBucket>>,
+    outbound_limiter: Option<Mutex<TokenBucket>>,
+    last_reset: Mutex<Instant>,
 }
 
 impl BandwidthTracker {
@@ -101,76 +101,83 @@ impl BandwidthTracker {
             total_outbound: Arc::new(AtomicU64::new(0)),
             max_inbound: max_in,
             max_outbound: max_out,
-            inbound_limiter: (max_in != 0).then(|| std::sync::Mutex::new(TokenBucket::new(max_in))),
-            outbound_limiter: (max_out != 0)
-                .then(|| std::sync::Mutex::new(TokenBucket::new(max_out))),
-            last_reset: std::sync::Mutex::new(Instant::now()),
+            inbound_limiter: (max_in != 0).then(|| Mutex::new(TokenBucket::new(max_in))),
+            outbound_limiter: (max_out != 0).then(|| Mutex::new(TokenBucket::new(max_out))),
+            last_reset: Mutex::new(Instant::now()),
         }
+    }
+
+    fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn saturating_add_counter(counter: &AtomicU64, bytes: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_add(bytes))
+        });
+    }
+
+    fn record_limited(
+        bytes: u64,
+        total_counter: &AtomicU64,
+        window_counter: &AtomicU64,
+        max_bytes: u64,
+        limiter: &Option<Mutex<TokenBucket>>,
+    ) -> bool {
+        Self::saturating_add_counter(total_counter, bytes);
+        if max_bytes == 0 {
+            window_counter.fetch_add(bytes, Ordering::Relaxed);
+            return true;
+        }
+
+        let Some(limiter) = limiter else {
+            window_counter.fetch_add(bytes, Ordering::Relaxed);
+            return true;
+        };
+        let allowed = Self::lock_unpoisoned(limiter).allow(bytes, Instant::now());
+        if allowed {
+            window_counter.fetch_add(bytes, Ordering::Relaxed);
+        }
+        allowed
     }
 
     /// Record `bytes` of inbound traffic. Returns `false` if the configured
     /// per-second inbound limit would be exceeded (bytes NOT counted when over limit).
     pub fn record_inbound(&self, bytes: u64) -> bool {
-        // Saturating add for total counter to prevent wrap-around (F-058).
-        let _ = self
-            .total_inbound
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(bytes))
-            });
-        if self.max_inbound == 0 {
-            self.inbound_bytes.fetch_add(bytes, Ordering::Relaxed);
-            return true;
-        }
-
-        let allowed = self
-            .inbound_limiter
-            .as_ref()
-            .expect("inbound limiter missing")
-            .lock()
-            .expect("lock poisoned")
-            .allow(bytes, Instant::now());
-        if allowed {
-            self.inbound_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-        allowed
+        Self::record_limited(
+            bytes,
+            &self.total_inbound,
+            &self.inbound_bytes,
+            self.max_inbound,
+            &self.inbound_limiter,
+        )
     }
 
     /// Record `bytes` of outbound traffic. Returns `false` if the configured
     /// per-second outbound limit would be exceeded (bytes NOT counted when over limit).
     pub fn record_outbound(&self, bytes: u64) -> bool {
-        let _ = self
-            .total_outbound
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(bytes))
-            });
-        if self.max_outbound == 0 {
-            self.outbound_bytes.fetch_add(bytes, Ordering::Relaxed);
-            return true;
-        }
-
-        let allowed = self
-            .outbound_limiter
-            .as_ref()
-            .expect("outbound limiter missing")
-            .lock()
-            .expect("lock poisoned")
-            .allow(bytes, Instant::now());
-        if allowed {
-            self.outbound_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-        allowed
+        Self::record_limited(
+            bytes,
+            &self.total_outbound,
+            &self.outbound_bytes,
+            self.max_outbound,
+            &self.outbound_limiter,
+        )
     }
 
     /// Reset per-second counters if at least one second has elapsed.
     pub fn reset_if_needed(&self) {
-        let mut last = self.last_reset.lock().expect("lock poisoned");
+        let mut last = Self::lock_unpoisoned(&self.last_reset);
         if last.elapsed() >= Duration::from_secs(1) {
             let now = Instant::now();
             if let Some(limiter) = &self.inbound_limiter {
-                limiter.lock().expect("lock poisoned").refill(now);
+                Self::lock_unpoisoned(limiter).refill(now);
             }
             if let Some(limiter) = &self.outbound_limiter {
-                limiter.lock().expect("lock poisoned").refill(now);
+                Self::lock_unpoisoned(limiter).refill(now);
             }
 
             self.inbound_bytes.store(0, Ordering::SeqCst);
@@ -328,6 +335,32 @@ mod tests {
 
         assert!(tracker.record_inbound(150));
         assert!(!tracker.record_inbound(151));
+    }
+
+    #[test]
+    fn poisoned_limiter_lock_does_not_panic() {
+        let tracker = Arc::new(BandwidthTracker::new(10, 0));
+        let poisoned = Arc::clone(&tracker);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.inbound_limiter.as_ref().unwrap().lock().unwrap();
+            panic!("poison inbound limiter for test");
+        })
+        .join();
+
+        assert!(std::panic::catch_unwind(|| tracker.record_inbound(1)).is_ok());
+    }
+
+    #[test]
+    fn poisoned_reset_lock_does_not_panic() {
+        let tracker = Arc::new(BandwidthTracker::new(10, 10));
+        let poisoned = Arc::clone(&tracker);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.last_reset.lock().unwrap();
+            panic!("poison reset lock for test");
+        })
+        .join();
+
+        assert!(std::panic::catch_unwind(|| tracker.reset_if_needed()).is_ok());
     }
 
     #[test]
