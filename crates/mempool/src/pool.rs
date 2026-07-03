@@ -160,6 +160,7 @@ impl TxPool {
         let sender_q = inner.by_sender.get(&sender);
         let existing_hash = sender_q.and_then(|q| q.get(&nonce).copied());
         let expected_next_nonce = next_expected_nonce(sender_q, chain_nonce);
+        let mut evict_hash = None;
 
         if nonce < chain_nonce {
             return Err(MempoolError::NonceTooLow {
@@ -185,8 +186,7 @@ impl TxPool {
                     required,
                 });
             }
-            // Evict old tx at this nonce
-            Self::remove_entry(&mut inner, &existing_hash);
+            evict_hash = Some(existing_hash);
         } else if nonce > expected_next_nonce {
             return Err(MempoolError::NonceGap {
                 expected: expected_next_nonce,
@@ -201,7 +201,7 @@ impl TxPool {
 
         // Per-sender limit (checked after possible RBF eviction)
         let sender_count = inner.by_sender.get(&sender).map_or(0, |q| q.len());
-        if sender_count >= self.config.max_per_sender {
+        if existing_hash.is_none() && sender_count >= self.config.max_per_sender {
             return Err(MempoolError::SenderQueueFull {
                 sender,
                 count: sender_count,
@@ -209,7 +209,7 @@ impl TxPool {
         }
 
         // Pool full — evict lowest priority tx
-        if inner.by_hash.len() >= self.config.max_pool_size {
+        if existing_hash.is_none() && inner.by_hash.len() >= self.config.max_pool_size {
             if let Some((&evict_key, _)) = inner.by_priority.last_key_value() {
                 let incoming_neg = -(priority_fee as i128);
                 if incoming_neg >= evict_key.neg_priority_fee {
@@ -217,9 +217,11 @@ impl TxPool {
                         capacity: self.config.max_pool_size,
                     });
                 }
-                if let Some(evict_hash) = inner.by_priority.remove(&evict_key) {
-                    Self::remove_entry(&mut inner, &evict_hash);
-                }
+                evict_hash = Some(*inner.by_priority.get(&evict_key).ok_or(
+                    MempoolError::PoolFull {
+                        capacity: self.config.max_pool_size,
+                    },
+                )?);
             } else {
                 return Err(MempoolError::PoolFull {
                     capacity: self.config.max_pool_size,
@@ -231,6 +233,10 @@ impl TxPool {
             chain_store
                 .put_pubkey(&tx.from, &validation.pubkey)
                 .map_err(MempoolError::Storage)?;
+        }
+
+        if let Some(evict_hash) = evict_hash {
+            Self::remove_entry(&mut inner, &evict_hash);
         }
 
         // --- Insert ---
@@ -560,8 +566,55 @@ mod tests {
     use shell_core::Transaction;
     use shell_crypto::{DilithiumSigner, DilithiumVerifier, Signer};
     use shell_primitives::Bytes;
-    use shell_storage::{ChainStore, MemoryDb, WorldState};
+    use shell_storage::{ChainStore, KvStore, MemoryDb, StorageError, WorldState, WriteBatch};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FailingPubkeyStore {
+        inner: MemoryDb,
+        fail_pubkey_put: AtomicBool,
+    }
+
+    impl FailingPubkeyStore {
+        fn new(fail_pubkey_put: bool) -> Self {
+            Self {
+                inner: MemoryDb::new(),
+                fail_pubkey_put: AtomicBool::new(fail_pubkey_put),
+            }
+        }
+    }
+
+    impl KvStore for FailingPubkeyStore {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            if self.fail_pubkey_put.load(Ordering::SeqCst) && key.starts_with(b"pk/") {
+                return Err(StorageError::Database(
+                    "injected pubkey write failure".into(),
+                ));
+            }
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn test_address(seed: &[u8]) -> Address {
         Address::from_public_key(seed, 0)
@@ -635,34 +688,45 @@ mod tests {
         (ws, cs)
     }
 
-    fn insert_with_balance(
+    fn setup_failing_store_ctx(
+        fail_pubkey_put: bool,
+    ) -> (
+        WorldState<FailingPubkeyStore>,
+        ChainStore<FailingPubkeyStore>,
+    ) {
+        let ws = WorldState::new(Arc::new(FailingPubkeyStore::new(false)));
+        let cs = ChainStore::new(Arc::new(FailingPubkeyStore::new(fail_pubkey_put)));
+        (ws, cs)
+    }
+
+    fn insert_with_balance<S: KvStore + 'static>(
         pool: &TxPool,
         tx: SignedTransaction,
         verifier: &DilithiumVerifier,
-        ws: &mut WorldState<MemoryDb>,
-        cs: &ChainStore<MemoryDb>,
+        ws: &mut WorldState<S>,
+        cs: &ChainStore<S>,
         balance: U256,
     ) -> Result<ShellHash, MempoolError> {
         ws.set_balance(&tx.sender(), balance).unwrap();
         pool.insert(tx, ws, cs, verifier)
     }
 
-    fn insert_rich(
+    fn insert_rich<S: KvStore + 'static>(
         pool: &TxPool,
         tx: SignedTransaction,
         verifier: &DilithiumVerifier,
-        ws: &mut WorldState<MemoryDb>,
-        cs: &ChainStore<MemoryDb>,
+        ws: &mut WorldState<S>,
+        cs: &ChainStore<S>,
     ) -> Result<ShellHash, MempoolError> {
         insert_with_balance(pool, tx, verifier, ws, cs, U256::from(1_000_000_000_000u64))
     }
 
-    fn insert_broke(
+    fn insert_broke<S: KvStore + 'static>(
         pool: &TxPool,
         tx: SignedTransaction,
         verifier: &DilithiumVerifier,
-        ws: &mut WorldState<MemoryDb>,
-        cs: &ChainStore<MemoryDb>,
+        ws: &mut WorldState<S>,
+        cs: &ChainStore<S>,
     ) -> Result<ShellHash, MempoolError> {
         insert_with_balance(pool, tx, verifier, ws, cs, U256::ZERO)
     }
@@ -1137,6 +1201,32 @@ mod tests {
     }
 
     #[test]
+    fn pool_full_pubkey_storage_failure_keeps_evicted_candidate() {
+        let config = MempoolConfig {
+            max_pool_size: 1,
+            ..make_config()
+        };
+        let pool = TxPool::new(config);
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs_ok) = setup_failing_store_ctx(false);
+        let first_nonce = u64::default();
+
+        let (tx_low, _) = make_signed_tx(first_nonce, 10);
+        let low_hash = tx_low.hash();
+        insert_rich(&pool, tx_low, &verifier, &mut ws, &cs_ok).unwrap();
+
+        let (_, cs_fail) = setup_failing_store_ctx(true);
+        let (tx_high, _) = make_signed_tx(first_nonce, 100);
+        let high_hash = tx_high.hash();
+        let err = insert_rich(&pool, tx_high, &verifier, &mut ws, &cs_fail).unwrap_err();
+
+        assert!(matches!(err, MempoolError::Storage(_)));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&low_hash));
+        assert!(!pool.contains(&high_hash));
+    }
+
+    #[test]
     fn pool_full_rejects_low_priority() {
         let config = MempoolConfig {
             max_pool_size: 2,
@@ -1254,6 +1344,30 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(!pool.contains(&old_hash));
         assert!(pool.contains(&new_hash));
+    }
+
+    #[test]
+    fn rbf_pubkey_storage_failure_keeps_old_transaction() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs_ok) = setup_failing_store_ctx(false);
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let first_nonce = u64::default();
+        let tx_old = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 100);
+        let old_hash = tx_old.hash();
+        insert_rich(&pool, tx_old, &verifier, &mut ws, &cs_ok).unwrap();
+
+        let (_, cs_fail) = setup_failing_store_ctx(true);
+        let tx_new = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 111);
+        let new_hash = tx_new.hash();
+        let err = insert_rich(&pool, tx_new, &verifier, &mut ws, &cs_fail).unwrap_err();
+
+        assert!(matches!(err, MempoolError::Storage(_)));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&old_hash));
+        assert!(!pool.contains(&new_hash));
     }
 
     #[test]
