@@ -4686,6 +4686,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_block_skips_oversized_candidates_and_keeps_later_fit_txs() {
+        let handler = setup();
+        let mut block = make_genesis_block();
+        block.header.gas_limit = 42_000;
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let oversized_signer = DilithiumSigner::generate();
+        let oversized_addr = signer_address(&oversized_signer);
+        let fit_signer = DilithiumSigner::generate();
+        let fit_addr = signer_address(&fit_signer);
+        {
+            let mut ws = handler.world_state.write();
+            ws.add_balance(&oversized_addr, U256::from(100_000_000_000_000u64))
+                .unwrap();
+            ws.add_balance(&fit_addr, U256::from(100_000_000_000_000u64))
+                .unwrap();
+        }
+        handler
+            .chain_store
+            .put_pubkey(&oversized_addr, oversized_signer.public_key())
+            .unwrap();
+        handler
+            .chain_store
+            .put_pubkey(&fit_addr, fit_signer.public_key())
+            .unwrap();
+
+        let oversized_tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            max_priority_fee_per_gas: 100_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            gas_limit: 42_001,
+            to: Some(test_address(b"pending-oversized-to")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let oversized_sig = oversized_signer
+            .sign(oversized_tx.hash().0.as_slice())
+            .unwrap();
+        let oversized = SignedTransaction::new(oversized_addr, oversized_tx, oversized_sig);
+
+        let fit_tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            max_priority_fee_per_gas: 100_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            gas_limit: 21_000,
+            to: Some(test_address(b"pending-fit-to")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let fit_sig = fit_signer.sign(fit_tx.hash().0.as_slice()).unwrap();
+        let fit = SignedTransaction::new(fit_addr, fit_tx, fit_sig);
+        let fit_hash = fit.hash();
+
+        {
+            let mut ws = handler.world_state.write();
+            handler
+                .tx_pool
+                .insert(
+                    oversized,
+                    &mut ws,
+                    handler.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            handler
+                .tx_pool
+                .insert(fit, &mut ws, handler.chain_store.as_ref(), &MultiVerifier)
+                .unwrap();
+        }
+
+        let rpc = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rpc.transactions, serde_json::json!([fit_hash]));
+    }
+
+    #[tokio::test]
     async fn pending_block_number_saturates_at_max_head() {
         let handler = setup();
         let mut block = make_genesis_block();

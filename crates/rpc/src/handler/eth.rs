@@ -149,9 +149,13 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 let mut cumulative_gas: u64 = 0;
                 let pending_txs: Vec<_> = all_pending
                     .into_iter()
-                    .take_while(|tx| {
+                    .filter(|tx| {
+                        let remaining = gas_limit.saturating_sub(cumulative_gas);
+                        if tx.tx.gas_limit > remaining {
+                            return false;
+                        }
                         cumulative_gas = cumulative_gas.saturating_add(tx.tx.gas_limit);
-                        cumulative_gas <= gas_limit
+                        true
                     })
                     .collect();
                 let now = std::time::SystemTime::now()
