@@ -731,9 +731,11 @@ pub trait ShellApi {
 
     /// Returns the active storage profile and the effective pruning parameters.
     ///
-    /// Profile is one of `"archive" | "full" | "light"`. The numeric fields
-    /// reflect the resolved `PruningConfig` (after applying any per-field
-    /// overrides such as `--body-retention` / `--witness-retention`).
+    /// Profile is one of `"archive" | "full" | "pruned"`. The `"pruned"`
+    /// value corresponds to the rolling-window profile accepted as `"light"`
+    /// by CLI/config inputs. The numeric fields reflect the resolved
+    /// `PruningConfig` (after applying any per-field overrides such as
+    /// `--body-retention` / `--witness-retention`).
     /// A value of `0` means "keep forever" for retention/keep_recent;
     /// `proof_replacement_grace = u64::MAX` means "never delete witness even
     /// after STARK proof arrives" (archive mode behavior).

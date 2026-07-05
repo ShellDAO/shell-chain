@@ -436,8 +436,6 @@ pub struct PaymasterGasEstimateRequest {
 
 /// Active storage profile descriptor returned by `shell_getStorageProfile`.
 ///
-/// Active storage profile descriptor returned by `shell_getStorageProfile`.
-///
 /// `profile` uses white-paper canonical names: `"archive"`, `"full"`, `"pruned"`.
 /// (`"pruned"` corresponds to the legacy `"light"` alias in CLI / config files.)
 /// `body_retention`, `witness_retention`, `keep_recent`, `proof_replacement_grace`

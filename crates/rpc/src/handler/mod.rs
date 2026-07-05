@@ -6208,21 +6208,21 @@ mod tests {
     // ── shell_getStorageProfile ────────────────────────────────────
 
     #[tokio::test]
-    async fn get_storage_profile_returns_attached_descriptor() {
+    async fn get_storage_profile_returns_pruned_descriptor() {
         let handler = setup().with_storage_profile(crate::types::StorageProfileInfo {
-            profile: "full".into(),
-            body_retention: 0,
-            witness_retention: 128,
-            keep_recent: 0,
-            proof_replacement_grace: 0,
+            profile: "pruned".into(),
+            body_retention: 4096,
+            witness_retention: 64,
+            keep_recent: 4096,
+            proof_replacement_grace: 128,
             state_pruning_experimental: false,
         });
         let res = ShellApiServer::get_storage_profile(&handler).await.unwrap();
-        assert_eq!(res["profile"], "full");
-        assert_eq!(res["body_retention"], 0u64);
-        assert_eq!(res["witness_retention"], 128u64);
-        assert_eq!(res["keep_recent"], 0u64);
-        assert_eq!(res["proof_replacement_grace"], 0u64);
+        assert_eq!(res["profile"], "pruned");
+        assert_eq!(res["body_retention"], 4096u64);
+        assert_eq!(res["witness_retention"], 64u64);
+        assert_eq!(res["keep_recent"], 4096u64);
+        assert_eq!(res["proof_replacement_grace"], 128u64);
         assert_eq!(res["state_pruning_experimental"], false);
     }
 
