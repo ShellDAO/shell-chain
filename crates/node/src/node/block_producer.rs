@@ -94,6 +94,19 @@ impl<S: KvStore + 'static> Node<S> {
         let import_cs = ChainStore::new(self.store.clone());
 
         for (idx, tx) in candidates.iter().enumerate() {
+            if cumulative_gas >= header.gas_limit {
+                break;
+            }
+            if !tx_fits_remaining_block_gas(tx, cumulative_gas, header.gas_limit) {
+                debug!(
+                    tx_hash = %tx.tx.hash(),
+                    gas_limit = tx.tx.gas_limit,
+                    cumulative_gas,
+                    block_gas_limit = header.gas_limit,
+                    "produce_block: skipping tx that exceeds remaining block gas"
+                );
+                continue;
+            }
             // EIP-1559: skip transactions that cannot afford the base fee.
             if tx.tx.max_fee_per_gas < base_fee {
                 continue;
@@ -216,10 +229,6 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                     continue;
                 }
-            }
-
-            if cumulative_gas >= header.gas_limit {
-                break;
             }
         }
 

@@ -510,6 +510,15 @@ impl<S: KvStore + 'static> Node<S> {
             let mut total_effective_fees = U256::ZERO;
 
             for (idx, tx) in block.transactions.iter().enumerate() {
+                if !tx_fits_remaining_block_gas(tx, cumulative_gas, block.header.gas_limit) {
+                    return Err(NodeError::Startup(format!(
+                        "block {} tx {} gas_limit {} exceeds remaining block gas {}",
+                        block.number(),
+                        idx,
+                        tx.tx.gas_limit,
+                        block.header.gas_limit.saturating_sub(cumulative_gas)
+                    )));
+                }
                 let exec_result = if tx.is_aa_bundle() {
                     evm.execute_aa_bundle(tx, &block.header, idx as u32, cumulative_gas)
                 } else {
@@ -546,6 +555,14 @@ impl<S: KvStore + 'static> Node<S> {
                         )));
                     }
                 }
+            }
+            if cumulative_gas != block.header.gas_used {
+                return Err(NodeError::Startup(format!(
+                    "block {} gas_used mismatch: expected {}, got {}",
+                    block.number(),
+                    block.header.gas_used,
+                    cumulative_gas
+                )));
             }
             // Block producer receives 100% of effective gas fees.
             let producer_reward = total_effective_fees;
@@ -619,6 +636,13 @@ impl<S: KvStore + 'static> Node<S> {
             }
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
+            if block.header.gas_used != 0 {
+                return Err(NodeError::Startup(format!(
+                    "block {} gas_used mismatch: expected {}, got 0",
+                    block.number(),
+                    block.header.gas_used
+                )));
+            }
             if !block.system_transactions.is_empty() {
                 return Err(NodeError::Startup(format!(
                     "block {} carries unexpected system transactions",

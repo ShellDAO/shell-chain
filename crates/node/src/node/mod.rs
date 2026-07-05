@@ -64,6 +64,14 @@ pub(crate) use shell_stark_prover::{
     ProofTask, SettledL1Input, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
 };
 
+fn tx_fits_remaining_block_gas(
+    tx: &SignedTransaction,
+    cumulative_gas: u64,
+    block_gas_limit: u64,
+) -> bool {
+    tx.tx.gas_limit <= block_gas_limit.saturating_sub(cumulative_gas)
+}
+
 /// A running shell-chain node.
 ///
 /// Orchestrates storage, consensus, EVM, mempool, network, and RPC
@@ -1348,6 +1356,10 @@ mod tests {
     }
 
     fn store_genesis<S: KvStore + 'static>(node: &Node<S>) {
+        store_genesis_with_gas_limit(node, 30_000_000);
+    }
+
+    fn store_genesis_with_gas_limit<S: KvStore + 'static>(node: &Node<S>, gas_limit: u64) {
         let genesis = Block {
             header: BlockHeader {
                 parent_hash: ShellHash::default(),
@@ -1356,7 +1368,7 @@ mod tests {
                 receipts_root: ShellHash::default(),
                 logs_bloom: Bytes::default(),
                 number: 0,
-                gas_limit: 30_000_000,
+                gas_limit,
                 gas_used: 0,
                 timestamp: 1_700_000_000,
                 extra_data: Bytes::default(),
@@ -3109,6 +3121,44 @@ mod tests {
     }
 
     #[test]
+    fn produce_block_skips_tx_that_exceeds_remaining_block_gas() {
+        let (node, signer) = setup_node();
+        store_genesis_with_gas_limit(&node, 21_000);
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xDD);
+            a
+        });
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000u64),
+            data: Bytes::new(),
+            gas_limit: 21_001,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&node, &tx_signer, sender, tx);
+
+        let block = node.produce_block(&signer, 100).unwrap();
+        assert!(
+            block.transactions.is_empty(),
+            "oversized tx should not be included"
+        );
+        assert_eq!(block.header.gas_used, 0);
+    }
+
+    #[test]
     fn produce_block_commits_repeated_contract_storage_updates() {
         let (node, signer) = setup_node();
         store_genesis(&node);
@@ -3449,6 +3499,51 @@ mod tests {
     }
 
     #[test]
+    fn import_block_rejects_empty_header_gas_used_mismatch() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let state_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 1,
+                timestamp: 1_700_000_001,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
+
+        let err = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            err.to_string().contains("gas_used mismatch"),
+            "expected empty block gas_used rejection, got {err}"
+        );
+    }
+
+    #[test]
     fn import_block_with_valid_seal() {
         let (node, signer) = setup_node();
         store_consistent_genesis(&node);
@@ -3484,6 +3579,112 @@ mod tests {
 
         let head = node2.chain_store.get_head_block().unwrap().unwrap();
         assert_eq!(head.number(), 1);
+    }
+
+    #[test]
+    fn import_block_rejects_tx_that_exceeds_remaining_block_gas() {
+        let (leader, proposer_signer) = setup_node();
+        store_genesis(&leader);
+        let proposer = leader.config.proposer_address.unwrap();
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xDE);
+            a
+        });
+        let initial_balance = U256::from(100_000_000_000_000u64);
+        fund_account(&leader, &sender, initial_balance);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&leader, &tx_signer, sender, tx);
+        let mut block = leader.produce_block(&proposer_signer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        block.header.gas_limit = 20_999;
+        block.proposer_seal = None;
+        leader
+            .consensus
+            .read()
+            .sign_block(&mut block, &proposer_signer)
+            .unwrap();
+
+        let follower = setup_node_with_authority(proposer);
+        store_genesis(&follower);
+        fund_account(&follower, &sender, initial_balance);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let err = follower.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds remaining block gas"),
+            "expected block gas rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn import_block_rejects_header_gas_used_mismatch() {
+        let (leader, proposer_signer) = setup_node();
+        store_genesis(&leader);
+        let proposer = leader.config.proposer_address.unwrap();
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xDF);
+            a
+        });
+        let initial_balance = U256::from(100_000_000_000_000u64);
+        fund_account(&leader, &sender, initial_balance);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&leader, &tx_signer, sender, tx);
+        let mut block = leader.produce_block(&proposer_signer, 100).unwrap();
+        assert_eq!(block.header.gas_used, 21_000);
+        block.header.gas_used = 0;
+        block.proposer_seal = None;
+        leader
+            .consensus
+            .read()
+            .sign_block(&mut block, &proposer_signer)
+            .unwrap();
+
+        let follower = setup_node_with_authority(proposer);
+        store_genesis(&follower);
+        fund_account(&follower, &sender, initial_balance);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let err = follower.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            err.to_string().contains("gas_used mismatch"),
+            "expected header gas_used rejection, got {err}"
+        );
     }
 
     #[test]
