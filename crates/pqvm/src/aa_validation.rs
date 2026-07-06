@@ -504,6 +504,10 @@ fn abi_word(value: u64) -> [u8; 32] {
     word
 }
 
+fn abi_word_u256(value: U256) -> [u8; 32] {
+    value.to_be_bytes::<32>()
+}
+
 fn padded_len(len: usize) -> usize {
     len.next_multiple_of(32)
 }
@@ -641,10 +645,9 @@ fn call_paymaster_validate<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<(), AaValidationError> {
-    let max_gas_cost = signed_tx
-        .tx
-        .gas_limit
-        .saturating_mul(signed_tx.tx.max_fee_per_gas);
+    let max_gas_cost = U256::from(signed_tx.tx.gas_limit)
+        .checked_mul(U256::from(signed_tx.tx.max_fee_per_gas))
+        .unwrap_or(U256::MAX);
 
     let calldata = encode_validate_paymaster_op_calldata(
         &signed_tx.from,
@@ -766,7 +769,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
 fn encode_validate_paymaster_op_calldata(
     sender: &Address,
     call_data: &[u8],
-    max_gas_cost: u64,
+    max_gas_cost: U256,
     context: &[u8],
 ) -> Vec<u8> {
     let call_data_offset: usize = 128; // 4 static args × 32 bytes
@@ -793,14 +796,15 @@ fn encode_validate_paymaster_op_calldata(
     );
 
     // sender: address left-padded to 32 bytes
+    let sender_evm = sender.to_alloy();
     out.extend_from_slice(&[0u8; 12]);
-    out.extend_from_slice(sender.0.as_slice());
+    out.extend_from_slice(sender_evm.as_slice());
 
     // callData offset
     out.extend_from_slice(&abi_word(call_data_offset as u64));
 
     // maxGasCost
-    out.extend_from_slice(&abi_word(max_gas_cost));
+    out.extend_from_slice(&abi_word_u256(max_gas_cost));
 
     // context offset
     out.extend_from_slice(&abi_word(context_offset as u64));
@@ -959,6 +963,10 @@ mod tests {
         u64::from_be_bytes(word[24..32].try_into().unwrap())
     }
 
+    fn read_abi_u256(word: &[u8]) -> U256 {
+        U256::from_be_bytes::<32>(word.try_into().unwrap())
+    }
+
     fn fixture_account_sequence(addr: &Address) -> u64 {
         addr.as_bytes()
             .iter()
@@ -1010,6 +1018,29 @@ mod tests {
         assert_eq!(read_abi_u64(&calldata[356..388]), 480);
         assert_eq!(read_abi_u64(&calldata[388..420]), 64);
         assert_eq!(&calldata[420..484], signed.signature.data.as_slice());
+    }
+
+    #[test]
+    fn paymaster_validation_calldata_encodes_uint256_max_gas_cost() {
+        let sender = Address::from([0x22; 20]);
+        let call_data = [0xAA, 0xBB, 0xCC];
+        let context = [0xDD, 0xEE];
+        let max_gas_cost = U256::from(u64::MAX) + U256::from(42u64);
+
+        let calldata =
+            encode_validate_paymaster_op_calldata(&sender, &call_data, max_gas_cost, &context);
+        let selector = keccak256(VALIDATE_PAYMASTER_OP_SIGNATURE);
+
+        assert_eq!(&calldata[0..4], &selector.as_bytes()[..4]);
+        assert_eq!(&calldata[4..16], &[0u8; 12]);
+        assert_eq!(&calldata[16..36], sender.to_alloy().as_slice());
+        assert_eq!(read_abi_u64(&calldata[36..68]), 128);
+        assert_eq!(read_abi_u256(&calldata[68..100]), max_gas_cost);
+        assert_eq!(read_abi_u64(&calldata[100..132]), 192);
+        assert_eq!(read_abi_u64(&calldata[132..164]), call_data.len() as u64);
+        assert_eq!(&calldata[164..167], call_data.as_slice());
+        assert_eq!(read_abi_u64(&calldata[196..228]), context.len() as u64);
+        assert_eq!(&calldata[228..230], context.as_slice());
     }
 
     #[test]
