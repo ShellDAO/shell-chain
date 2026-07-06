@@ -1370,6 +1370,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let inner_calls_data = parse_optional_hex_bytes(
             req.inner_calls_data.as_deref(),
             "estimatePaymasterGas: inner_calls_data",
+            MAX_OPTIONAL_RPC_BYTE_FIELD_LEN,
         )?;
         let max_fee_per_gas: u64 = match req.max_fee_per_gas.as_deref() {
             Some(hex) => parse_hex_u64(hex)?,
@@ -1378,6 +1379,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let paymaster_context = parse_optional_hex_bytes(
             req.paymaster_context.as_deref(),
             "estimatePaymasterGas: paymaster_context",
+            shell_core::MAX_PAYMASTER_CONTEXT,
         )?;
 
         // Current RPC handlers do not yet expose the full EVM staticcall
@@ -1570,7 +1572,11 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
     }
 }
 
-fn parse_optional_hex_bytes(value: Option<&str>, field: &str) -> Result<Vec<u8>, ErrorObjectOwned> {
+fn parse_optional_hex_bytes(
+    value: Option<&str>,
+    field: &str,
+    max_len: usize,
+) -> Result<Vec<u8>, ErrorObjectOwned> {
     let Some(value) = value else {
         return Ok(vec![]);
     };
@@ -1580,9 +1586,9 @@ fn parse_optional_hex_bytes(value: Option<&str>, field: &str) -> Result<Vec<u8>,
     let Some(hex) = value.strip_prefix("0x") else {
         return Err(invalid_params(format!("{field} must be 0x-prefixed")));
     };
-    if hex.len() > MAX_OPTIONAL_RPC_BYTE_FIELD_LEN.saturating_mul(2) {
+    if hex.len() > max_len.saturating_mul(2) {
         return Err(invalid_params(format!(
-            "{field} exceeds maximum size of {MAX_OPTIONAL_RPC_BYTE_FIELD_LEN} bytes"
+            "{field} exceeds maximum size of {max_len} bytes"
         )));
     }
     hex::decode(hex).map_err(|e| invalid_params(format!("{field} invalid hex: {e}")))

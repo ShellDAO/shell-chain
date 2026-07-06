@@ -6363,6 +6363,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn estimate_paymaster_gas_rejects_context_above_protocol_cap() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 20]);
+        let sender = Address::from([0xBB; 20]);
+        let oversized_context = format!("0x{}", "aa".repeat(shell_core::MAX_PAYMASTER_CONTEXT + 1));
+
+        let err = ShellApiServer::estimate_paymaster_gas(
+            &handler,
+            PaymasterGasEstimateRequest {
+                paymaster,
+                sender,
+                inner_calls_data: None,
+                max_fee_per_gas: Some("0x1".into()),
+                paymaster_context: Some(oversized_context),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains(&format!(
+            "paymaster_context exceeds maximum size of {} bytes",
+            shell_core::MAX_PAYMASTER_CONTEXT
+        )));
+    }
+
+    #[tokio::test]
     async fn is_sponsored_returns_not_found_for_unknown_hash() {
         let handler = setup();
         let res = ShellApiServer::is_sponsored(&handler, ShellHash::from_slice(&[0u8; 32]))
