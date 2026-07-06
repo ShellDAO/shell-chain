@@ -1,7 +1,7 @@
 # Shell-Node CLI Automation Guide
 
 > Covers non-interactive password handling, CI/CD integration, and scripting patterns for
-> `shell-node` v0.25.0+.
+> `shell-node` v0.25.2+.
 
 ---
 
@@ -109,7 +109,7 @@ echo "$KEYSTORE_PASSWORD" | \
 # docker-compose.yml
 services:
   validator:
-    image: shell-chain:0.25.0
+    image: shell-chain:0.25.2
     command:
       - shell-node
       - --password-file=/run/secrets/ks-password

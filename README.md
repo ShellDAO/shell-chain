@@ -2,7 +2,7 @@
 
 <!-- [![Build Status](https://img.shields.io/github/actions/workflow/status/ShellDAO/shell-chain/ci.yml?branch=main)](https://github.com/ShellDAO/shell-chain/actions) -->
 <!-- [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) -->
-<!-- [![Version](https://img.shields.io/badge/version-0.25.0-green.svg)](CHANGELOG.md) -->
+<!-- [![Version](https://img.shields.io/badge/version-0.25.2-green.svg)](CHANGELOG.md) -->
 
 The first PQVM-native, post-quantum blockchain — quantum-safe **before Q-Day**, no migration needed.
 
