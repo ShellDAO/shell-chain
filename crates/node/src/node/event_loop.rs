@@ -6,6 +6,10 @@ fn block_response_import_allowed(block_count: usize, commit_certificate_count: u
     block_count <= MAX_BLOCK_SYNC_RESPONSE_BLOCKS && commit_certificate_count <= block_count
 }
 
+fn body_response_import_allowed(block_count: usize) -> bool {
+    block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
+}
+
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
@@ -378,7 +382,7 @@ impl<S: KvStore + 'static> Node<S> {
                     let _ = network
                         .broadcast(NetworkMessage::BodyRequest {
                             start_number: 0,
-                            count: 128,
+                            count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                         })
                         .await;
                     info!(
@@ -1462,7 +1466,9 @@ impl<S: KvStore + 'static> Node<S> {
                                 // L4: Peer requests block bodies for historical back-fill.
                                 NetworkMessage::BodyRequest { start_number, count } => {
                                     debug!(%peer, start_number, count, "L4: received BodyRequest");
-                                    let end = start_number.saturating_add(count.min(128));
+                                    let end = start_number.saturating_add(
+                                        count.min(crate::historical_sync::BODY_BACKFILL_BATCH_SIZE),
+                                    );
                                     let mut blocks = Vec::new();
                                     for n in start_number..end {
                                         if let Ok(Some(block)) = self.chain_store.get_block_by_number(n) {
@@ -1490,6 +1496,15 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                                 // L4: Receive block bodies from a peer as historical back-fill.
                                 NetworkMessage::BodyResponse { blocks } => {
+                                    if !body_response_import_allowed(blocks.len()) {
+                                        warn!(
+                                            %peer,
+                                            count = blocks.len(),
+                                            max_blocks = crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                            "L4: dropping oversized BodyResponse"
+                                        );
+                                        continue;
+                                    }
                                     debug!(%peer, count = blocks.len(), "L4: received BodyResponse");
                                     let head_number = self.chain_store
                                         .get_head_block()
@@ -1545,7 +1560,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             // More blocks needed — request next batch.
                                             let _ = network.broadcast(NetworkMessage::BodyRequest {
                                                 start_number: next,
-                                                count: 128,
+                                                count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                                             }).await;
                                         } else {
                                             info!("L4: historical body back-fill complete");
@@ -2309,7 +2324,8 @@ fn body_backfill_next_start(
     if let Some(stored) = last_stored {
         return stored.checked_add(1);
     }
-    batch_start.and_then(|start| start.checked_add(128))
+    batch_start
+        .and_then(|start| start.checked_add(crate::historical_sync::BODY_BACKFILL_BATCH_SIZE))
 }
 
 #[cfg(test)]
@@ -2356,6 +2372,16 @@ mod cadence_tests {
         );
         assert_eq!(body_backfill_next_start(None, Some(10), Some(1)), Some(11));
         assert_eq!(body_backfill_next_start(None, None, Some(10)), Some(138));
+    }
+
+    #[test]
+    fn body_response_import_rejects_oversized_responses() {
+        assert!(body_response_import_allowed(
+            crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
+        ));
+        assert!(!body_response_import_allowed(
+            crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize + 1
+        ));
     }
 
     #[test]

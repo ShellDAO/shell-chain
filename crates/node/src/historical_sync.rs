@@ -94,7 +94,7 @@ impl PeerCapabilityTracker {
 }
 
 /// How many blocks to request in a single `BodyRequest`.
-const BATCH_SIZE: u64 = 128;
+pub(crate) const BODY_BACKFILL_BATCH_SIZE: u64 = 128;
 
 /// Result of a single back-fill scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +164,7 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
                     peer,
                     NetworkMessage::BodyRequest {
                         start_number: start,
-                        count: BATCH_SIZE,
+                        count: BODY_BACKFILL_BATCH_SIZE,
                     },
                 );
                 SyncStatus::Started { gaps_found }
@@ -199,7 +199,7 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
                         peer,
                         NetworkMessage::BodyRequest {
                             start_number: next_start,
-                            count: BATCH_SIZE,
+                            count: BODY_BACKFILL_BATCH_SIZE,
                         },
                     );
                     return;
