@@ -688,7 +688,12 @@ fn next_expected_nonce(sender_q: Option<&BTreeMap<u64, ShellHash>>, chain_nonce:
 fn replacement_fee_required(old_fee: u64, bump_pct: u64) -> u64 {
     let numerator = u128::from(old_fee).saturating_mul(u128::from(100u64.saturating_add(bump_pct)));
     let rounded = numerator.saturating_add(99) / 100;
-    rounded.min(u128::from(u64::MAX)) as u64
+    let percentage_required = rounded.min(u128::from(u64::MAX)) as u64;
+    if bump_pct == 0 {
+        percentage_required
+    } else {
+        percentage_required.max(old_fee.saturating_add(1))
+    }
 }
 
 #[cfg(test)]
@@ -1941,7 +1946,47 @@ mod tests {
     }
 
     #[test]
+    fn rbf_zero_fee_replacement_requires_positive_bump() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let first_nonce = u64::default();
+        let tx_old = make_signed_value_tx_with_signer(&signer, &pubkey, first_nonce, 0, U256::ZERO);
+        let old_hash = tx_old.hash();
+        insert_rich(&pool, tx_old, &verifier, &mut ws, &cs).unwrap();
+
+        let zero_fee_replacement =
+            make_signed_value_tx_with_signer(&signer, &pubkey, first_nonce, 0, U256::from(1u64));
+        let zero_fee_hash = zero_fee_replacement.hash();
+        let err = insert_rich(&pool, zero_fee_replacement, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::ReplacementFeeTooLow {
+                got: 0,
+                required: 1
+            }
+        ));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&old_hash));
+        assert!(!pool.contains(&zero_fee_hash));
+
+        let bumped_replacement =
+            make_signed_value_tx_with_signer(&signer, &pubkey, first_nonce, 1, U256::from(1u64));
+        let bumped_hash = bumped_replacement.hash();
+        insert_rich(&pool, bumped_replacement, &verifier, &mut ws, &cs).unwrap();
+
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.contains(&old_hash));
+        assert!(pool.contains(&bumped_hash));
+    }
+
+    #[test]
     fn rbf_fee_bump_rounds_up_for_small_fees() {
+        assert_eq!(replacement_fee_required(0, 10), 1);
         assert_eq!(replacement_fee_required(1, 10), 2);
         assert_eq!(replacement_fee_required(10, 10), 11);
         assert_eq!(replacement_fee_required(101, 10), 112);
