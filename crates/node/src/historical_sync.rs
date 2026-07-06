@@ -43,10 +43,10 @@ pub struct PeerCapability {
 impl PeerCapability {
     /// Returns a numeric "richness" score (higher = preferred for sync).
     fn richness(&self) -> u8 {
-        match self.profile.as_str() {
+        match self.profile.to_ascii_lowercase().as_str() {
             "archive" => 3,
             "full" => 2,
-            "light" => 1,
+            "light" | "pruned" | "rolling" => 1,
             _ => 0,
         }
     }
@@ -177,22 +177,49 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
     /// Stores each returned block's body and, if the range is not yet complete,
     /// issues the next `BodyRequest` batch.
     pub fn handle_response(&self, peer: PeerId, blocks: Vec<shell_core::Block>, head_number: u64) {
+        let batch_start = blocks.first().map(|block| block.header.number);
+        let mut first_gap: Option<u64> = None;
         let mut last_stored: Option<u64> = None;
+        let mut expected_next = batch_start;
         for block in &blocks {
             let n = block.header.number;
+            if let Some(expected) = expected_next {
+                if n > expected {
+                    first_gap.get_or_insert(expected);
+                }
+                if n >= expected {
+                    expected_next = n.checked_add(1);
+                }
+            }
+
+            let expected_hash = self.chain_store.get_block_hash_by_number(n).ok().flatten();
+            let actual_hash = block.hash();
+            if expected_hash.as_ref() != Some(&actual_hash) {
+                warn!(
+                    block = n,
+                    "historical sync: BodyResponse hash mismatch, skipping body"
+                );
+                first_gap.get_or_insert(n);
+                continue;
+            }
+            if self.chain_store.has_body(&actual_hash).unwrap_or(false) {
+                last_stored = Some(n);
+                continue;
+            }
             if let Err(e) = self.chain_store.put_body_only(block) {
                 warn!(block = n, error = %e, "historical sync: failed to store body");
+                first_gap.get_or_insert(n);
             } else {
                 last_stored = Some(n);
             }
         }
 
-        if let Some(next_start) = last_stored.and_then(|last| last.checked_add(1)) {
-            if next_start <= head_number {
-                // Check if there are still missing bodies ahead.
-                if self
-                    .first_missing_body_in_range(next_start, head_number)
-                    .is_some()
+        let scan_start = first_gap
+            .or_else(|| last_stored.and_then(|last| last.checked_add(1)))
+            .or_else(|| batch_start.and_then(|start| start.checked_add(BODY_BACKFILL_BATCH_SIZE)));
+        if let Some(scan_start) = scan_start {
+            if scan_start <= head_number {
+                if let Some(next_start) = self.first_missing_body_in_range(scan_start, head_number)
                 {
                     info!(next_start, "historical sync: requesting next batch");
                     (self.send_fn)(
@@ -308,11 +335,50 @@ mod tests {
     }
 
     #[test]
+    fn tracker_treats_pruned_aliases_as_light_profile() {
+        let pruned = PeerCapability {
+            profile: "pruned".into(),
+            oldest_body_block: 0,
+        };
+        let rolling = PeerCapability {
+            profile: "Rolling".into(),
+            oldest_body_block: 0,
+        };
+        let light = PeerCapability {
+            profile: "light".into(),
+            oldest_body_block: 0,
+        };
+
+        assert_eq!(pruned.richness(), light.richness());
+        assert_eq!(rolling.richness(), light.richness());
+    }
+
+    #[test]
     fn tracker_remove_peer() {
         let tracker = PeerCapabilityTracker::new();
         tracker.record(PeerId("a".into()), "full".into(), 0);
         tracker.remove(&PeerId("a".into()));
         assert!(tracker.best_peer_for_block(0).is_none());
+    }
+
+    fn numbered_block(number: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                number,
+                ..BlockHeader::default()
+            },
+            transactions: Vec::new(),
+            system_transactions: Vec::new(),
+            proposer_seal: None,
+        }
+    }
+
+    fn store_canonical_block(chain_store: &ChainStore<MemoryDb>, number: u64) -> Block {
+        let block = numbered_block(number);
+        let hash = block.hash();
+        chain_store.put_block(&block).unwrap();
+        chain_store.set_canonical(number, &hash).unwrap();
+        block
     }
 
     #[test]
@@ -338,5 +404,38 @@ mod tests {
         sync.handle_response(PeerId("peer".into()), vec![block], u64::MAX);
 
         assert!(sent.lock().is_empty());
+    }
+
+    #[test]
+    fn handle_response_re_requests_first_omitted_body() {
+        let chain_store = Arc::new(ChainStore::new(Arc::new(MemoryDb::new())));
+        let block0 = store_canonical_block(&chain_store, 0);
+        let block1 = store_canonical_block(&chain_store, 1);
+        let block2 = store_canonical_block(&chain_store, 2);
+        chain_store.delete_body(&block1.hash()).unwrap();
+        chain_store.delete_body(&block2.hash()).unwrap();
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_messages = Arc::clone(&sent);
+        let sync = HistoricalBodySync {
+            chain_store,
+            peers: PeerCapabilityTracker::new(),
+            send_fn: Arc::new(move |_peer, msg| sent_messages.lock().push(msg)),
+        };
+
+        sync.handle_response(PeerId("peer".into()), vec![block0, block2], 2);
+
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1);
+        match &sent[0] {
+            NetworkMessage::BodyRequest {
+                start_number,
+                count,
+            } => {
+                assert_eq!(*start_number, 1);
+                assert_eq!(*count, BODY_BACKFILL_BATCH_SIZE);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }
