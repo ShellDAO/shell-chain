@@ -1586,8 +1586,22 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
-        let tx0 = make_signed_value_tx_with_signer(&signer, &pubkey, 0, 50, U256::from(1_000u64));
-        let tx1 = make_signed_value_tx_with_signer(&signer, &pubkey, 1, 50, U256::from(1_000u64));
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.saturating_add(1);
+        let tx0 = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            first_nonce,
+            50,
+            U256::from(1_000u64),
+        );
+        let tx1 = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            second_nonce,
+            50,
+            U256::from(1_000u64),
+        );
         let h0 = tx0.hash();
         let h1 = tx1.hash();
         let one_tx_budget = U256::from(21_000u64 * 60)
@@ -1638,11 +1652,22 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
-        let tx_old =
-            make_signed_value_tx_with_signer(&signer, &pubkey, 0, 100, U256::from(1_000u64));
+        let replacement_nonce = u64::default();
+        let tx_old = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            replacement_nonce,
+            100,
+            U256::from(1_000u64),
+        );
         let old_hash = tx_old.hash();
-        let tx_new =
-            make_signed_value_tx_with_signer(&signer, &pubkey, 0, 111, U256::from(1_500u64));
+        let tx_new = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            replacement_nonce,
+            111,
+            U256::from(1_500u64),
+        );
         let new_hash = tx_new.hash();
         let new_tx_budget = U256::from(21_000u64 * 121)
             .checked_add(U256::from(1_500u64))
