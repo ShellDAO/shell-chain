@@ -1519,8 +1519,14 @@ impl<S: KvStore + 'static> Node<S> {
                                     // Track first gap (mismatch or storage failure) so we
                                     // re-request from that point and don't silently skip blocks.
                                     let mut first_gap: Option<u64> = None;
+                                    let mut expected_next = batch_start;
                                     for block in &blocks {
                                         let n = block.header.number;
+                                        track_body_response_sequence(
+                                            &mut expected_next,
+                                            &mut first_gap,
+                                            n,
+                                        );
                                         // Validate block hash matches canonical chain before storing.
                                         let expected_hash = self.chain_store
                                             .get_block_hash_by_number(n)
@@ -2328,6 +2334,21 @@ fn body_backfill_next_start(
         .and_then(|start| start.checked_add(crate::historical_sync::BODY_BACKFILL_BATCH_SIZE))
 }
 
+fn track_body_response_sequence(
+    expected_next: &mut Option<u64>,
+    first_gap: &mut Option<u64>,
+    block_number: u64,
+) {
+    if let Some(expected) = *expected_next {
+        if block_number > expected {
+            first_gap.get_or_insert(expected);
+        }
+        if block_number >= expected {
+            *expected_next = block_number.checked_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod cadence_tests {
     use super::*;
@@ -2372,6 +2393,30 @@ mod cadence_tests {
         );
         assert_eq!(body_backfill_next_start(None, Some(10), Some(1)), Some(11));
         assert_eq!(body_backfill_next_start(None, None, Some(10)), Some(138));
+    }
+
+    #[test]
+    fn body_response_sequence_tracks_first_omitted_block() {
+        let mut expected_next = Some(10);
+        let mut first_gap = None;
+
+        track_body_response_sequence(&mut expected_next, &mut first_gap, 10);
+        track_body_response_sequence(&mut expected_next, &mut first_gap, 12);
+        track_body_response_sequence(&mut expected_next, &mut first_gap, 13);
+
+        assert_eq!(first_gap, Some(11));
+        assert_eq!(expected_next, Some(14));
+    }
+
+    #[test]
+    fn body_response_sequence_does_not_wrap_after_max_block() {
+        let mut expected_next = Some(u64::MAX);
+        let mut first_gap = None;
+
+        track_body_response_sequence(&mut expected_next, &mut first_gap, u64::MAX);
+
+        assert_eq!(first_gap, None);
+        assert_eq!(expected_next, None);
     }
 
     #[test]
