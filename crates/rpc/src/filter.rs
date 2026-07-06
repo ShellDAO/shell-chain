@@ -143,14 +143,19 @@ where
 }
 
 impl RawLogFilter {
-    fn into_topics(raw_topics: Option<Vec<Option<TopicEntry>>>) -> [Option<Vec<ShellHash>>; 4] {
+    fn into_topics(
+        raw_topics: Option<Vec<Option<TopicEntry>>>,
+    ) -> Result<[Option<Vec<ShellHash>>; 4], String> {
         let mut topics: [Option<Vec<ShellHash>>; 4] = Default::default();
         if let Some(raw_topics) = raw_topics {
-            for (i, entry) in raw_topics.into_iter().enumerate().take(4) {
+            if raw_topics.len() > 4 {
+                return Err("topics must contain at most 4 entries".to_string());
+            }
+            for (i, entry) in raw_topics.into_iter().enumerate() {
                 topics[i] = entry.map(|e| e.into_vec());
             }
         }
-        topics
+        Ok(topics)
     }
 
     /// Convert to a resolved `LogFilter`, resolving block tags to numbers.
@@ -161,7 +166,7 @@ impl RawLogFilter {
             address,
             topics: raw_topics,
         } = self;
-        let topics = Self::into_topics(raw_topics);
+        let topics = Self::into_topics(raw_topics)?;
 
         let resolve = |field: &str, tag: &str| -> Result<u64, String> {
             match tag {
@@ -219,19 +224,19 @@ impl RawLogFilter {
     /// Used by `eth_getFilterChanges`, which computes the block range from the
     /// filter cursor and latest head, so re-resolving `fromBlock` / `toBlock`
     /// on every poll is unnecessary.
-    pub fn into_match_filter(self) -> LogFilter {
+    pub fn into_match_filter(self) -> Result<LogFilter, String> {
         let RawLogFilter {
             address,
             topics: raw_topics,
             ..
         } = self;
-        let topics = Self::into_topics(raw_topics);
-        LogFilter {
+        let topics = Self::into_topics(raw_topics)?;
+        Ok(LogFilter {
             from_block: None,
             to_block: None,
             address,
             topics,
-        }
+        })
     }
 }
 
@@ -460,6 +465,22 @@ mod tests {
     }
 
     #[test]
+    fn raw_filter_rejects_more_than_four_topic_slots() {
+        let json = r#"{
+            "topics": [
+                null,
+                null,
+                null,
+                null,
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ]
+        }"#;
+        let raw: RawLogFilter = serde_json::from_str(json).unwrap();
+        let err = raw.into_filter(100, 90).unwrap_err();
+        assert!(err.contains("at most 4"));
+    }
+
+    #[test]
     fn raw_filter_defaults_to_latest() {
         let json = r#"{}"#;
         let raw: RawLogFilter = serde_json::from_str(json).unwrap();
@@ -528,7 +549,7 @@ mod tests {
             "topics": [topic],
         }))
         .unwrap();
-        let filter = raw.into_match_filter();
+        let filter = raw.into_match_filter().unwrap();
         assert_eq!(filter.from_block, None);
         assert_eq!(filter.to_block, None);
         assert_eq!(filter.address, Some(vec![Address::from([0x11; 20])]));

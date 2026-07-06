@@ -884,7 +884,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .filter_registry
                 .get_log_filter(&id)
                 .ok_or_else(|| not_found("filter not found"))?;
-            let filter = raw.into_match_filter();
+            let filter = raw.into_match_filter().map_err(internal_err)?;
 
             let mut results = Vec::new();
             let actual_to = capped_filter_poll_to(from, latest);

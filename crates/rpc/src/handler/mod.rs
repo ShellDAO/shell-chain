@@ -5040,6 +5040,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_filter_rejects_more_than_four_topic_slots() {
+        let handler = setup();
+        let raw: crate::filter::RawLogFilter = serde_json::from_str(
+            r#"{
+                "topics": [
+                    null,
+                    null,
+                    null,
+                    null,
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = EthApiServer::new_filter(&handler, raw).await.unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("at most 4"));
+    }
+
+    #[tokio::test]
     async fn block_filter_tracks_new_blocks() {
         let handler = setup();
 
