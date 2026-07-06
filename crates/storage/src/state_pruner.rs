@@ -175,8 +175,10 @@ impl StatePruner {
 
             // Build the canonical mapping key: b"n/" ++ block_number (big-endian).
             let key = [CANONICAL_PREFIX, &block_number.to_be_bytes()].concat();
-            batch.delete(key);
-            pruned_count = pruned_count.saturating_add(1);
+            if store.get(&key)?.is_some() {
+                batch.delete(key);
+                pruned_count = pruned_count.saturating_add(1);
+            }
         }
 
         if !batch.is_empty() {
@@ -482,6 +484,23 @@ mod tests {
         // prunable_below is 0 by default — nothing should be pruned.
         let result = pruner.prune(&*store).unwrap();
         assert_eq!(result.pruned_count, 0);
+    }
+
+    #[test]
+    fn missing_canonical_mapping_is_not_counted_as_pruned() {
+        let store = Arc::new(MemoryDb::new());
+        let mut pruner = StatePruner::new(32);
+
+        setup_blocks(&mut pruner, &store, 0..100);
+        store.delete(&canonical_key(10)).unwrap();
+
+        pruner.mark_prunable(80);
+        let result = pruner.prune(&*store).unwrap();
+
+        assert_eq!(result.pruned_count, 67);
+        assert_eq!(result.protected_count, 0);
+        assert!(!pruner.is_tracked(10));
+        assert_eq!(pruner.tracked_block_count(), 32);
     }
 
     // ── should_prune interval ──────────────────────────────────
