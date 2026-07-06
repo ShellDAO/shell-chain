@@ -32,6 +32,9 @@ const MAX_SUBSCRIPTIONS_PER_CONNECTION: u32 = 16;
 /// Auto-disconnect a subscriber after this many consecutive lag events (F-042).
 const MAX_CONSECUTIVE_LAGS: u32 = 3;
 
+/// Maximum topic positions accepted by log subscriptions.
+const MAX_LOG_TOPIC_POSITIONS: usize = 4;
+
 /// Parse a user-facing address string (`0x` + 64 lowercase hex) into an `Address`.
 fn parse_address_input(s: &str) -> Result<Address, jsonrpsee::types::ErrorObjectOwned> {
     Address::parse(s).map_err(|e| invalid_params_err(format!("invalid log filter address: {e}")))
@@ -237,6 +240,11 @@ impl LogFilter {
 
             // Parse topics — array of (hash | hash[] | null).
             if let Some(serde_json::Value::Array(topics_arr)) = obj.get("topics") {
+                if topics_arr.len() > MAX_LOG_TOPIC_POSITIONS {
+                    return Err(invalid_params_err(
+                        "log filter topics must contain at most 4 entries",
+                    ));
+                }
                 for entry in topics_arr {
                     match entry {
                         serde_json::Value::Null => {
@@ -803,6 +811,22 @@ mod tests {
         assert_eq!(filter.topics.len(), 2);
         assert!(filter.topics[0].is_empty()); // null → wildcard
         assert_eq!(filter.topics[1].len(), 1);
+    }
+
+    #[test]
+    fn log_filter_rejects_more_than_four_topic_positions() {
+        let json = serde_json::json!({
+            "topics": [
+                null,
+                null,
+                null,
+                null,
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            ]
+        });
+        let err = LogFilter::from_value(&json).unwrap_err();
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("at most 4"));
     }
 
     #[test]
