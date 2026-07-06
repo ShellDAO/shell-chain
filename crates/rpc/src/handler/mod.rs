@@ -6119,6 +6119,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn estimate_batch_rejects_gas_total_overflow_as_invalid_params() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: None,
+                paymaster: None,
+                inner_calls: vec![make_inner_call_req(dst, 0, Some(u64::MAX))],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("total gas overflow"));
+    }
+
+    #[tokio::test]
     async fn estimate_batch_simulates_when_gas_limit_missing() {
         let handler = setup();
         let dst = Address::from([0xAA; 20]);

@@ -1336,7 +1336,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             }
             inner_sum = inner_sum
                 .checked_add(gas_limit)
-                .ok_or_else(|| internal_err("estimateBatch: inner_sum overflow"))?;
+                .ok_or_else(|| invalid_params("estimateBatch: inner gas total overflow"))?;
             per_inner.push(serde_json::json!({
                 "gas_limit": hex_u64(gas_limit),
                 "simulated": simulated,
@@ -1349,7 +1349,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let total = outer_intrinsic
             .checked_add(inner_sum)
             .and_then(|v| v.checked_add(intrinsic_surcharge))
-            .ok_or_else(|| internal_err("estimateBatch: total_gas overflow"))?;
+            .ok_or_else(|| invalid_params("estimateBatch: total gas overflow"))?;
 
         Ok(serde_json::json!({
             "total_gas": hex_u64(total),
