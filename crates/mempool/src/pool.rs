@@ -694,7 +694,7 @@ fn replacement_fee_required(old_fee: u64, bump_pct: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_core::Transaction;
+    use shell_core::{AaBundle, InnerCall, PubkeyMode, Transaction, AA_BUNDLE_TX_TYPE};
     use shell_crypto::{DilithiumSigner, DilithiumVerifier, Signer};
     use shell_primitives::Bytes;
     use shell_storage::{ChainStore, KvStore, MemoryDb, StorageError, WorldState, WriteBatch};
@@ -821,6 +821,90 @@ mod tests {
         };
         let sig = signer.sign(tx.hash().as_bytes()).unwrap();
         SignedTransaction::with_pubkey(from, tx, sig, pubkey.to_vec())
+    }
+
+    fn make_sponsored_aa_value_tx_with_signers(
+        signer: &DilithiumSigner,
+        pubkey: &[u8],
+        paymaster_signer: &DilithiumSigner,
+        paymaster_pubkey: &[u8],
+        nonce: u64,
+        priority_fee: u64,
+        value: U256,
+    ) -> SignedTransaction {
+        let from = test_address(pubkey);
+        let paymaster = test_address(paymaster_pubkey);
+        let recipient = test_address(b"recipient-placeholder-key-data-for-address");
+        let tx = Transaction {
+            chain_id: 42,
+            nonce,
+            to: Some(recipient),
+            value,
+            data: Bytes::default(),
+            gas_limit: 80_000,
+            max_fee_per_gas: priority_fee + 10,
+            max_priority_fee_per_gas: priority_fee,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![InnerCall {
+                to: Some(recipient),
+                value,
+                data: Bytes::default(),
+                gas_limit: 30_000,
+            }],
+            paymaster: Some(paymaster),
+            paymaster_signature: Some(Bytes::from(vec![0x01])),
+            ..Default::default()
+        };
+        let placeholder_sig = signer.sign(b"placeholder-sender-aa-signature").unwrap();
+        let unsigned = SignedTransaction::with_aa_bundle(
+            from,
+            tx.clone(),
+            placeholder_sig,
+            PubkeyMode::Embedded(pubkey.to_vec()),
+            bundle.clone(),
+        )
+        .unwrap();
+        let sender_sig = signer
+            .sign(unsigned.sender_signing_hash().as_bytes())
+            .unwrap();
+        let sender_signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx.clone(),
+            sender_sig.clone(),
+            PubkeyMode::Embedded(pubkey.to_vec()),
+            bundle.clone(),
+        )
+        .unwrap();
+        let paymaster_sig = paymaster_signer
+            .sign(sender_signed.paymaster_signing_hash().unwrap().as_bytes())
+            .unwrap();
+        let final_bundle = AaBundle {
+            paymaster_signature: Some(Bytes::from(paymaster_sig.data)),
+            ..bundle
+        };
+
+        SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            sender_sig,
+            PubkeyMode::Embedded(pubkey.to_vec()),
+            final_bundle,
+        )
+        .unwrap()
+    }
+
+    fn register_paymaster<S: KvStore + 'static>(
+        cs: &ChainStore<S>,
+        paymaster_pubkey: &[u8],
+    ) -> Address {
+        let paymaster = test_address(paymaster_pubkey);
+        cs.put_pubkey(&paymaster, paymaster_pubkey).unwrap();
+        paymaster
     }
 
     fn setup_validation_ctx() -> (WorldState<MemoryDb>, ChainStore<MemoryDb>) {
@@ -1611,6 +1695,137 @@ mod tests {
         insert_with_balance(&pool, tx0, &verifier, &mut ws, &cs, one_tx_budget).unwrap();
         let err =
             insert_with_balance(&pool, tx1, &verifier, &mut ws, &cs, one_tx_budget).unwrap_err();
+
+        assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&h0));
+        assert!(!pool.contains(&h1));
+    }
+
+    #[test]
+    fn sponsored_aa_accepts_sender_value_only_with_paymaster_gas() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let paymaster_signer = DilithiumSigner::generate();
+        let paymaster_pubkey = paymaster_signer.public_key().to_vec();
+        let paymaster = register_paymaster(&cs, &paymaster_pubkey);
+        let value = U256::from(1_000u64);
+        let tx = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            0,
+            50,
+            value,
+        );
+        let hash = tx.hash();
+        let gas_budget = max_gas_cost(&tx);
+
+        ws.set_balance(&sender, value).unwrap();
+        ws.set_balance(&paymaster, gas_budget).unwrap();
+
+        pool.insert(tx, &mut ws, &cs, &verifier).unwrap();
+
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&hash));
+    }
+
+    #[test]
+    fn sponsored_aa_rejects_pending_paymaster_gas_oversubscription() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let paymaster_signer = DilithiumSigner::generate();
+        let paymaster_pubkey = paymaster_signer.public_key().to_vec();
+        let paymaster = register_paymaster(&cs, &paymaster_pubkey);
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.saturating_add(1);
+        let tx0 = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            first_nonce,
+            50,
+            U256::from(1_000u64),
+        );
+        let tx1 = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            second_nonce,
+            50,
+            U256::from(1_000u64),
+        );
+        let h0 = tx0.hash();
+        let h1 = tx1.hash();
+        let one_tx_gas_budget = max_gas_cost(&tx0);
+
+        ws.set_balance(&sender, U256::from(2_000u64)).unwrap();
+        ws.set_balance(&paymaster, one_tx_gas_budget).unwrap();
+
+        pool.insert(tx0, &mut ws, &cs, &verifier).unwrap();
+        let err = pool.insert(tx1, &mut ws, &cs, &verifier).unwrap_err();
+
+        assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&h0));
+        assert!(!pool.contains(&h1));
+    }
+
+    #[test]
+    fn sponsored_aa_rejects_pending_sender_value_oversubscription() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let paymaster_signer = DilithiumSigner::generate();
+        let paymaster_pubkey = paymaster_signer.public_key().to_vec();
+        let paymaster = register_paymaster(&cs, &paymaster_pubkey);
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.saturating_add(1);
+        let value = U256::from(1_000u64);
+        let tx0 = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            first_nonce,
+            50,
+            value,
+        );
+        let tx1 = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            second_nonce,
+            50,
+            value,
+        );
+        let h0 = tx0.hash();
+        let h1 = tx1.hash();
+        let two_tx_gas_budget = max_gas_cost(&tx0).checked_add(max_gas_cost(&tx1)).unwrap();
+
+        ws.set_balance(&sender, value).unwrap();
+        ws.set_balance(&paymaster, two_tx_gas_budget).unwrap();
+
+        pool.insert(tx0, &mut ws, &cs, &verifier).unwrap();
+        let err = pool.insert(tx1, &mut ws, &cs, &verifier).unwrap_err();
 
         assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
         assert_eq!(pool.len(), 1);
