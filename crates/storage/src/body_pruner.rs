@@ -115,9 +115,13 @@ impl BodyPruner {
                     debug!(block_number, "body pruner: no canonical hash, skipping");
                 }
                 Some(hash) => {
-                    chain_store.delete_body(&hash)?;
-                    result.bodies_pruned += 1;
-                    debug!(block_number, %hash, "body pruner: deleted body");
+                    if chain_store.has_body(&hash)? {
+                        chain_store.delete_body(&hash)?;
+                        result.bodies_pruned += 1;
+                        debug!(block_number, %hash, "body pruner: deleted body");
+                    } else {
+                        debug!(block_number, %hash, "body pruner: body already absent, skipping");
+                    }
                 }
             }
         }
@@ -280,6 +284,20 @@ mod tests {
         // 5 blocks checked, 4 pruned (block 2 skipped), 1 missing
         assert_eq!(result.blocks_checked, 5);
         assert_eq!(result.bodies_pruned, 4);
+    }
+
+    #[test]
+    fn missing_body_is_not_counted_as_pruned() {
+        let cs = setup_chain(10);
+        let hash = cs.get_block_hash_by_number(2).unwrap().unwrap();
+        cs.delete_body(&hash).unwrap();
+
+        let mut pruner = BodyPruner::new(5);
+        let result = pruner.prune_before(9, &cs).unwrap();
+
+        assert_eq!(result.blocks_checked, 5);
+        assert_eq!(result.bodies_pruned, 4);
+        assert_eq!(pruner.pruned_below(), 5);
     }
 
     #[test]
