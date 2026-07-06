@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.2] — 2026-07-07 — Runtime hardening and RPC bounds
+
+### Fixed
+
+- Hardened JSON-RPC validation for filters, trace options, raw byte fields,
+  log topics, fee history, paymaster simulation, and governance gas estimation
+  so malformed requests fail before expensive work.
+- Bounded block/body sync imports and response handling to avoid unbounded
+  memory use from peers or control messages.
+- Preserved pending balance reservations for standard, sponsored, and AA
+  transactions, reducing nonce and balance races in the mempool.
+- Validated reorg chain segments, finalized fork ancestors, pending block
+  candidates, and block gas accounting during node operation.
+- Improved witness, finality-tag, pruning, STARK proof amendment, and
+  storage-profile behavior under edge-case queries.
+
 ## [0.25.1] — 2026-06-29 — RPC v2 correctness fixes
 
 ### Fixed
