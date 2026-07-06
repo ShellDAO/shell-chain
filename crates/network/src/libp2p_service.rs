@@ -53,6 +53,19 @@ enum SwarmCommand {
     Shutdown,
 }
 
+fn uses_sequence_scoped_message_id(message: &NetworkMessage) -> bool {
+    matches!(
+        message,
+        NetworkMessage::BlockRequest { .. }
+            | NetworkMessage::BlockResponse { .. }
+            | NetworkMessage::BodyRequest { .. }
+            | NetworkMessage::BodyResponse { .. }
+            | NetworkMessage::StorageCapability { .. }
+            | NetworkMessage::Ping
+            | NetworkMessage::Pong
+    )
+}
+
 /// Combined libp2p network behaviour for shell-chain.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct ShellBehaviour {
@@ -261,15 +274,7 @@ fn build_swarm_with_identity(
     let message_id_fn = |msg: &gossipsub::Message| {
         let control_message = serde_json::from_slice::<NetworkMessage>(&msg.data)
             .ok()
-            .map(|message| {
-                matches!(
-                    message,
-                    NetworkMessage::BlockRequest { .. }
-                        | NetworkMessage::BlockResponse { .. }
-                        | NetworkMessage::Ping
-                        | NetworkMessage::Pong
-                )
-            })
+            .map(|message| uses_sequence_scoped_message_id(&message))
             .unwrap_or(false);
 
         if control_message {
@@ -1083,6 +1088,38 @@ mod tests {
     fn config_defaults_enable_peer_scoring() {
         let config = NetworkConfig::default();
         assert!(config.enable_peer_scoring);
+    }
+
+    #[test]
+    fn source_dependent_messages_use_sequence_scoped_message_ids() {
+        assert!(uses_sequence_scoped_message_id(
+            &NetworkMessage::BlockRequest {
+                start_number: 1,
+                count: 1,
+                nonce: 7,
+            }
+        ));
+        assert!(uses_sequence_scoped_message_id(
+            &NetworkMessage::BodyRequest {
+                start_number: 1,
+                count: 128,
+            }
+        ));
+        assert!(uses_sequence_scoped_message_id(
+            &NetworkMessage::BodyResponse { blocks: Vec::new() }
+        ));
+        assert!(uses_sequence_scoped_message_id(
+            &NetworkMessage::StorageCapability {
+                profile: "full".into(),
+                oldest_body_block: 0,
+            }
+        ));
+        assert!(!uses_sequence_scoped_message_id(
+            &NetworkMessage::ProofAck {
+                block_hash: shell_primitives::ShellHash::ZERO,
+                holder: shell_primitives::Address::ZERO,
+            }
+        ));
     }
 
     #[test]
