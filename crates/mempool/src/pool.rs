@@ -224,6 +224,13 @@ impl TxPool {
             }
         }
 
+        let evicted_hashes = match evict_hash {
+            Some(hash) if evict_descendants => Self::entry_and_descendant_hashes(&inner, &hash),
+            Some(hash) => vec![hash],
+            None => Vec::new(),
+        };
+        Self::ensure_pending_balance_available(&inner, &tx, world_state, &evicted_hashes)?;
+
         if validation.should_register_pubkey {
             chain_store
                 .put_pubkey(&tx.from, &validation.pubkey)
@@ -543,22 +550,103 @@ impl TxPool {
     /// Remove a pool-capacity eviction candidate and all later transactions
     /// from the same sender, preserving nonce contiguity for block production.
     fn remove_entry_and_descendants(inner: &mut PoolInner, hash: &ShellHash) -> usize {
-        let Some(entry) = inner.by_hash.get(hash) else {
-            return 0;
-        };
-        let sender = entry.tx.sender();
-        let nonce = entry.tx.tx.nonce;
-        let hashes: Vec<ShellHash> = inner
-            .by_sender
-            .get(&sender)
-            .map(|queue| queue.range(nonce..).map(|(_nonce, hash)| *hash).collect())
-            .unwrap_or_else(|| vec![*hash]);
-
+        let hashes = Self::entry_and_descendant_hashes(inner, hash);
         hashes
             .into_iter()
             .filter(|hash| Self::remove_entry(inner, hash))
             .count()
     }
+
+    fn entry_and_descendant_hashes(inner: &PoolInner, hash: &ShellHash) -> Vec<ShellHash> {
+        let Some(entry) = inner.by_hash.get(hash) else {
+            return Vec::new();
+        };
+        let sender = entry.tx.sender();
+        let nonce = entry.tx.tx.nonce;
+        inner
+            .by_sender
+            .get(&sender)
+            .map(|queue| queue.range(nonce..).map(|(_nonce, hash)| *hash).collect())
+            .unwrap_or_else(|| vec![*hash])
+    }
+
+    fn ensure_pending_balance_available<S: KvStore + 'static>(
+        inner: &PoolInner,
+        tx: &SignedTransaction,
+        world_state: &WorldState<S>,
+        excluded_hashes: &[ShellHash],
+    ) -> Result<(), MempoolError> {
+        for account in Self::reservation_accounts(tx) {
+            let incoming = Self::reserved_cost_for(tx, &account);
+            if incoming == U256::ZERO {
+                continue;
+            }
+
+            let pending = inner
+                .by_hash
+                .iter()
+                .filter(|(hash, _entry)| !excluded_hashes.contains(hash))
+                .map(|(_hash, entry)| Self::reserved_cost_for(&entry.tx, &account))
+                .fold(U256::ZERO, add_or_max);
+            let needed = add_or_max(pending, incoming);
+            let have = world_state.get_balance(&account).unwrap_or(U256::ZERO);
+            if have < needed {
+                return Err(MempoolError::InsufficientBalance { needed, have });
+            }
+        }
+        Ok(())
+    }
+
+    fn reservation_accounts(tx: &SignedTransaction) -> Vec<Address> {
+        let sender = tx.sender();
+        let gas_payer = gas_payer(tx);
+        if gas_payer == sender {
+            vec![sender]
+        } else {
+            vec![sender, gas_payer]
+        }
+    }
+
+    fn reserved_cost_for(tx: &SignedTransaction, account: &Address) -> U256 {
+        let sender = tx.sender();
+        let gas_payer = gas_payer(tx);
+        let gas_cost = max_gas_cost(tx);
+
+        if gas_payer == sender {
+            return if *account == sender {
+                add_or_max(gas_cost, tx.tx.value)
+            } else {
+                U256::ZERO
+            };
+        }
+
+        let mut cost = U256::ZERO;
+        if *account == gas_payer {
+            cost = add_or_max(cost, gas_cost);
+        }
+        if *account == sender {
+            cost = add_or_max(cost, tx.tx.value);
+        }
+        cost
+    }
+}
+
+fn gas_payer(tx: &SignedTransaction) -> Address {
+    let sender = tx.sender();
+    tx.aa_bundle()
+        .and_then(|bundle| bundle.paymaster)
+        .filter(|paymaster| *paymaster != sender)
+        .unwrap_or(sender)
+}
+
+fn max_gas_cost(tx: &SignedTransaction) -> U256 {
+    U256::from(tx.tx.gas_limit)
+        .checked_mul(U256::from(tx.tx.max_fee_per_gas))
+        .unwrap_or(U256::MAX)
+}
+
+fn add_or_max(left: U256, right: U256) -> U256 {
+    left.checked_add(right).unwrap_or(U256::MAX)
 }
 
 fn map_aa_validation_error(tx: &SignedTransaction, err: AaValidationError) -> MempoolError {
@@ -706,12 +794,22 @@ mod tests {
         nonce: u64,
         priority_fee: u64,
     ) -> SignedTransaction {
+        make_signed_value_tx_with_signer(signer, pubkey, nonce, priority_fee, U256::ZERO)
+    }
+
+    fn make_signed_value_tx_with_signer(
+        signer: &DilithiumSigner,
+        pubkey: &[u8],
+        nonce: u64,
+        priority_fee: u64,
+        value: U256,
+    ) -> SignedTransaction {
         let from = test_address(pubkey);
         let tx = Transaction {
             chain_id: 42,
             nonce,
             to: Some(test_address(b"recipient-placeholder-key-data-for-address")),
-            value: Default::default(),
+            value,
             data: Bytes::default(),
             gas_limit: 21_000,
             max_fee_per_gas: priority_fee + 10,
@@ -1480,6 +1578,32 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn reject_pending_sender_balance_oversubscription() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let tx0 = make_signed_value_tx_with_signer(&signer, &pubkey, 0, 50, U256::from(1_000u64));
+        let tx1 = make_signed_value_tx_with_signer(&signer, &pubkey, 1, 50, U256::from(1_000u64));
+        let h0 = tx0.hash();
+        let h1 = tx1.hash();
+        let one_tx_budget = U256::from(21_000u64 * 60)
+            .checked_add(U256::from(1_000u64))
+            .unwrap();
+
+        insert_with_balance(&pool, tx0, &verifier, &mut ws, &cs, one_tx_budget).unwrap();
+        let err =
+            insert_with_balance(&pool, tx1, &verifier, &mut ws, &cs, one_tx_budget).unwrap_err();
+
+        assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&h0));
+        assert!(!pool.contains(&h1));
+    }
+
     // --- F-021: RBF tests ---
 
     #[test]
@@ -1500,6 +1624,32 @@ mod tests {
         let tx_new = make_signed_tx_with_signer(&signer, &pubkey, 0, 111);
         let new_hash = tx_new.hash();
         insert_rich(&pool, tx_new, &verifier, &mut ws, &cs).unwrap();
+
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.contains(&old_hash));
+        assert!(pool.contains(&new_hash));
+    }
+
+    #[test]
+    fn rbf_balance_check_excludes_replaced_transaction() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let tx_old =
+            make_signed_value_tx_with_signer(&signer, &pubkey, 0, 100, U256::from(1_000u64));
+        let old_hash = tx_old.hash();
+        let tx_new =
+            make_signed_value_tx_with_signer(&signer, &pubkey, 0, 111, U256::from(1_500u64));
+        let new_hash = tx_new.hash();
+        let new_tx_budget = U256::from(21_000u64 * 121)
+            .checked_add(U256::from(1_500u64))
+            .unwrap();
+
+        insert_with_balance(&pool, tx_old, &verifier, &mut ws, &cs, new_tx_budget).unwrap();
+        insert_with_balance(&pool, tx_new, &verifier, &mut ws, &cs, new_tx_budget).unwrap();
 
         assert_eq!(pool.len(), 1);
         assert!(!pool.contains(&old_hash));
