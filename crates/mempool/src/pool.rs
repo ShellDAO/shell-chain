@@ -144,6 +144,11 @@ impl TxPool {
 
         let hash = tx.hash();
         let nonce = tx.tx.nonce;
+        if nonce == u64::MAX {
+            return Err(MempoolError::InvalidTransaction(
+                "nonce cannot advance past u64::MAX".into(),
+            ));
+        }
         let priority_fee = tx.tx.max_priority_fee_per_gas;
         let chain_nonce = world_state
             .get_nonce(&sender)
@@ -1380,6 +1385,23 @@ mod tests {
         assert_eq!(sender_hashes.len(), 3);
         assert_eq!(sender_hashes, vec![hash0, hash1, hash2]);
         assert_eq!(pool.sender_count(&sender), 3);
+    }
+
+    #[test]
+    fn insert_rejects_max_nonce_that_cannot_advance() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let tx = make_signed_tx_with_signer(&signer, &pubkey, u64::MAX, 50);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::InvalidTransaction(message) if message.contains("u64::MAX"))
+        );
+        assert!(pool.is_empty());
     }
 
     #[test]

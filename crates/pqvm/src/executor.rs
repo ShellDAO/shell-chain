@@ -43,6 +43,9 @@ pub enum ExecutorError {
 
     #[error("nonce mismatch: expected {expected}, got {got}")]
     NonceMismatch { expected: u64, got: u64 },
+
+    #[error("nonce cannot advance past u64::MAX")]
+    NonceOverflow,
 }
 
 /// Result of executing a single transaction.
@@ -80,6 +83,10 @@ pub struct ShellPqvm<S: KvStore + 'static> {
 
 const OPCODE_CALLCODE: u8 = 0xF2;
 const OPCODE_SELFDESTRUCT: u8 = 0xFF;
+
+fn next_sender_nonce(nonce: u64) -> Result<u64, ExecutorError> {
+    nonce.checked_add(1).ok_or(ExecutorError::NonceOverflow)
+}
 
 fn remove_legacy_opcodes<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
 where
@@ -154,7 +161,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // ── Normal PQVM/revm execution path ──────────────────────────
         let tx = &signed_tx.tx;
         let sender_shell_addr = signed_tx.from;
-        let sender_nonce_after = tx.nonce.saturating_add(1);
+        let sender_nonce_after = next_sender_nonce(tx.nonce)?;
 
         // Register the sender's full 32-byte address so ShellStateDb can find
         // it when revm queries by the 20-byte truncated form.
@@ -356,7 +363,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 got: tx.nonce,
             });
         }
-        let sender_nonce_after = sender_pre_nonce.saturating_add(1);
+        let sender_nonce_after = next_sender_nonce(sender_pre_nonce)?;
 
         // Capture pre-bundle state root for atomic rollback on inner failure.
         let pre_root = self.state_db.world_state_mut().state_root()?;
@@ -1098,6 +1105,39 @@ mod tests {
         assert_eq!(tx_result.receipt.block_number, 1);
         assert!(tx_result.gas_used > 0);
         assert!(tx_result.gas_used <= 21_000);
+    }
+
+    #[test]
+    fn execute_transfer_rejects_max_nonce_that_cannot_advance() {
+        let mut evm = setup_evm();
+
+        let from = ShellAddress::from([0x42; 20]);
+        fund_account(&mut evm, &from, U256::from(10_000_000_000u64));
+        set_nonce(&mut evm, &from, u64::MAX);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: u64::MAX,
+            to: Some(ShellAddress::from([0x01; 20])),
+            value: U256::from(100),
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xAA; 100]);
+        let signed = SignedTransaction::new(from, tx, sig);
+
+        let err = match evm.execute_tx(&signed, &sample_header(), 0, 0) {
+            Ok(_) => panic!("max nonce transaction should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ExecutorError::NonceOverflow));
     }
 
     #[test]

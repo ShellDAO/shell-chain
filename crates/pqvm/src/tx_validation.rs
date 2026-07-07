@@ -31,6 +31,9 @@ pub enum TxValidationError {
     #[error("nonce mismatch: expected {expected}, got {got}")]
     NonceMismatch { expected: u64, got: u64 },
 
+    #[error("nonce cannot advance past u64::MAX")]
+    NonceOverflow,
+
     #[error("insufficient balance: need {needed}, have {have}")]
     InsufficientBalance { needed: U256, have: U256 },
 
@@ -118,6 +121,7 @@ impl TxValidationError {
             Self::AddressMismatch { .. } => "address_mismatch",
             Self::SignatureInvalid => "signature_invalid",
             Self::NonceMismatch { .. } => "nonce_mismatch",
+            Self::NonceOverflow => "nonce_overflow",
             Self::InsufficientBalance { .. } => "insufficient_balance",
             Self::ChainIdMismatch { .. } => "chain_id_mismatch",
             Self::GasTooLow(_) => "gas_too_low",
@@ -143,6 +147,13 @@ impl TxValidationError {
             Self::AaValidation(_) => "aa_validation_failed",
         }
     }
+}
+
+fn ensure_nonce_can_advance(nonce: u64) -> Result<(), TxValidationError> {
+    nonce
+        .checked_add(1)
+        .map(|_| ())
+        .ok_or(TxValidationError::NonceOverflow)
 }
 
 /// Validate a signed transaction before PQVM/revm execution.
@@ -192,6 +203,8 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
 
     // 1d. AA bundle structural + intrinsic gas pre-check (M2 native AA).
     let aa_extra_gas = validate_aa_bundle_structure(signed_tx)?;
+
+    ensure_nonce_can_advance(tx.nonce)?;
 
     // 2. Intrinsic gas check
     let intrinsic =
@@ -390,6 +403,8 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
 
     // 2c. AA bundle structural + intrinsic gas pre-check (M2 native AA).
     let aa_extra_gas = validate_aa_bundle_structure(signed_tx)?;
+
+    ensure_nonce_can_advance(tx.nonce)?;
 
     // 3. Intrinsic gas
     let intrinsic =
@@ -854,6 +869,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_max_nonce_that_cannot_advance() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::from(1_000_000));
+
+        let tx = simple_transfer(test_chain_id(), u64::MAX);
+        let signed = sign_tx(&signer, tx, true);
+
+        let verifier = DilithiumVerifier;
+        let result = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
+        assert!(matches!(result, Err(TxValidationError::NonceOverflow)));
+    }
+
+    #[test]
     fn validate_import_rejects_nonce_mismatch() {
         let signer = make_signer();
         let (mut ws, cs) = setup_stores();
@@ -874,6 +904,28 @@ mod tests {
             ),
             "got {result:?}"
         );
+    }
+
+    #[test]
+    fn validate_import_rejects_max_nonce_that_cannot_advance() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::from(1_000_000));
+
+        let tx = simple_transfer(test_chain_id(), u64::MAX);
+        let signed = sign_tx(&signer, tx, true);
+
+        let verifier = DilithiumVerifier;
+        let result = validate_tx_for_import_with_expected_nonce(
+            &signed,
+            &mut ws,
+            &cs,
+            &verifier,
+            test_chain_id(),
+            u64::MAX,
+        );
+        assert!(matches!(result, Err(TxValidationError::NonceOverflow)));
     }
 
     #[test]
@@ -1591,6 +1643,7 @@ mod tests {
                 expected: 1,
                 got: 0,
             },
+            TxValidationError::NonceOverflow,
             TxValidationError::InsufficientBalance {
                 needed: U256::from(1u64),
                 have: U256::ZERO,
