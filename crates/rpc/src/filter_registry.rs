@@ -162,7 +162,7 @@ impl FilterRegistry {
         let ttl = std::time::Duration::from_secs(self.ttl_secs);
         self.filters
             .write()
-            .retain(|_, entry| now.duration_since(entry.last_access) <= ttl);
+            .retain(|_, entry| now.saturating_duration_since(entry.last_access) <= ttl);
     }
 
     /// Returns the number of active filters.
@@ -346,5 +346,23 @@ mod tests {
         let _id = reg.new_filter(FilterKind::Block, 0).unwrap();
         reg.cleanup_expired();
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_tolerates_future_last_access() {
+        let reg = FilterRegistry::with_ttl(0);
+        let id = "0x11111111111111111111111111111111".to_string();
+        reg.filters.write().insert(
+            id.clone(),
+            FilterEntry {
+                kind: FilterKind::Block,
+                last_poll_block: 0,
+                last_access: Instant::now() + std::time::Duration::from_secs(60),
+            },
+        );
+
+        reg.cleanup_expired();
+
+        assert!(reg.uninstall(&id));
     }
 }

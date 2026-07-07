@@ -42,7 +42,7 @@ impl RateLimiterState {
     fn check_and_record(&mut self) -> bool {
         let now = Instant::now();
         self.last_seen = now;
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+        if now.saturating_duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;
             self.count = 0;
         }
@@ -164,7 +164,8 @@ fn prune_rate_limit_buckets(buckets: &mut HashMap<String, RateLimiterState>) {
         return;
     }
     let now = Instant::now();
-    buckets.retain(|_, state| now.duration_since(state.last_seen) < RATE_LIMIT_BUCKET_TTL);
+    buckets
+        .retain(|_, state| now.saturating_duration_since(state.last_seen) < RATE_LIMIT_BUCKET_TTL);
     if buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
         let mut keys_by_age: Vec<(String, Instant)> = buckets
             .iter()
@@ -369,6 +370,40 @@ mod tests {
             .unwrap();
         assert_eq!(public.status(), StatusCode::OK);
         assert_eq!(layer.bucket_count(), 2);
+    }
+
+    #[test]
+    fn rate_limit_prune_tolerates_future_bucket_timestamps() {
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(RATE_LIMIT_BUCKET_TTL + Duration::from_secs(1))
+            .unwrap_or(now);
+        let mut buckets = HashMap::new();
+        buckets.insert(
+            "future".to_string(),
+            RateLimiterState {
+                max_per_sec: 1,
+                window_start: now,
+                last_seen: now + Duration::from_secs(60),
+                count: 0,
+            },
+        );
+        for i in 0..MAX_RATE_LIMIT_BUCKETS {
+            buckets.insert(
+                format!("stale-{i}"),
+                RateLimiterState {
+                    max_per_sec: 1,
+                    window_start: stale,
+                    last_seen: stale,
+                    count: 0,
+                },
+            );
+        }
+
+        prune_rate_limit_buckets(&mut buckets);
+
+        assert!(buckets.contains_key("future"));
+        assert!(buckets.len() < MAX_RATE_LIMIT_BUCKETS);
     }
 
     #[tokio::test]
