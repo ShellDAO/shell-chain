@@ -2506,6 +2506,72 @@ mod tests {
     }
 
     #[test]
+    fn staking_mode_bond_and_unbond_update_weight_balance_and_totals() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        ws.set_validator_stake_and_weight(&v1, U256::from(1_000u64), U256::from(1_000u64), 100)
+            .unwrap();
+        ws.set_total_staked(U256::from(1_000u64)).unwrap();
+        ws.add_balance(&v1, U256::from(5_000u64)).unwrap();
+
+        let bond_calldata = encode_bond_validator_stake_calldata(&v1, U256::from(1_500u64));
+        let (bond_output, _) = execute_system_contract(&v1, &bond_calldata, &mut ws).unwrap();
+        assert_eq!(bond_output, encode_bool(true));
+        assert_eq!(ws.get_balance(&v1).unwrap(), U256::from(3_500u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_500u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(2_500u64));
+
+        let unbond_calldata = encode_unbond_validator_stake_calldata(&v1, U256::from(500u64));
+        let (unbond_output, _) = execute_system_contract(&v1, &unbond_calldata, &mut ws).unwrap();
+        assert_eq!(unbond_output, encode_bool(true));
+        assert_eq!(ws.get_balance(&v1).unwrap(), U256::from(4_000u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(2_000u64));
+    }
+
+    #[test]
+    fn staking_mode_unbond_rejects_below_nonzero_weight() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        ws.set_validator_stake_and_weight(&v1, U256::from(1_000u64), U256::from(1_000u64), 100)
+            .unwrap();
+        ws.set_total_staked(U256::from(1_000u64)).unwrap();
+
+        let calldata = encode_unbond_validator_stake_calldata(&v1, U256::from(1u64));
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+        assert!(matches!(err, SystemContractError::StakeTooLow));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(1_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 1);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(1_000u64));
+    }
+
+    #[test]
+    fn staking_mode_bond_unbond_are_self_only() {
+        let v1 = Address::from([0x01; 20]);
+        let v2 = Address::from([0x02; 20]);
+        let mut ws = setup_with_validators(&[v1, v2]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        for v in [v1, v2] {
+            ws.set_validator_stake_and_weight(&v, U256::from(1_000u64), U256::from(1_000u64), 100)
+                .unwrap();
+            ws.add_balance(&v, U256::from(2_000u64)).unwrap();
+        }
+        ws.set_total_staked(U256::from(2_000u64)).unwrap();
+
+        let bond_other = encode_bond_validator_stake_calldata(&v2, U256::from(1_000u64));
+        let err = execute_system_contract(&v1, &bond_other, &mut ws).unwrap_err();
+        assert!(matches!(err, SystemContractError::Unauthorized));
+
+        let unbond_other = encode_unbond_validator_stake_calldata(&v2, U256::from(1u64));
+        let err = execute_system_contract(&v1, &unbond_other, &mut ws).unwrap_err();
+        assert!(matches!(err, SystemContractError::Unauthorized));
+    }
+
+    #[test]
     fn staking_mode_requires_pre_stake_before_add_validator() {
         let v1 = Address::from([0x01; 20]);
         let new_val = Address::from([0x04; 20]);
