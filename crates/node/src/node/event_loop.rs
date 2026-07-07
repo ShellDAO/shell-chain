@@ -740,7 +740,14 @@ impl<S: KvStore + 'static> Node<S> {
                                 continue;
                             }
                             let view = self.consensus.read().current_view();
-                            let block_number = self.head_number().saturating_add(1);
+                            let block_number =
+                                match ChainStateMachine::next_block_number(self.head_number()) {
+                                    Ok(block_number) => block_number,
+                                    Err(e) => {
+                                        warn!("W.5: cannot broadcast view-change message: {e}");
+                                        continue;
+                                    }
+                                };
                             let chain_id = self.config.chain_id;
                             let highest_qc_hash = *self.finality.read().last_finalized_hash();
                             let signing_message = ViewChangeMessage::signing_message(

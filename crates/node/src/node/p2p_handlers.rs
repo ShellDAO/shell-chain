@@ -634,8 +634,8 @@ impl<S: KvStore + 'static> Node<S> {
             .get_head_block()
             .ok()
             .flatten()
-            .map(|b| b.number().saturating_add(1))
-            .unwrap_or(1);
+            .map(|b| ChainStateMachine::next_block_number(b.number()))
+            .unwrap_or(Ok(1))?;
         if msg.block_number != expected_block {
             return Err(NodeError::Startup(format!(
                 "view-change block_number {} does not match expected height {}",

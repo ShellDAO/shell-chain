@@ -6680,7 +6680,7 @@ mod tests {
         }
 
         #[test]
-        fn wpoa_view_change_validates_max_head_height() {
+        fn wpoa_view_change_rejects_max_head_height() {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
             node.register_authority_pubkey(authority, signer.public_key().to_vec());
@@ -6728,7 +6728,13 @@ mod tests {
                 signature.data,
             );
 
-            assert!(node.handle_wpoa_view_change(msg, &MultiVerifier).is_ok());
+            let err = node
+                .handle_wpoa_view_change(msg, &MultiVerifier)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                NodeError::Startup(message) if message.contains("overflows u64")
+            ));
         }
 
         // ── 6. Serde: NetworkMessage::WPoaVote roundtrip ──────────────────────
