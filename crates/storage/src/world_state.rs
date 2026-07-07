@@ -198,10 +198,10 @@ impl<S: KvStore + 'static> WorldState<S> {
 
     pub fn sub_balance(&mut self, address: &Address, amount: U256) -> Result<(), StorageError> {
         let mut account = self.get_or_default(address)?;
-        if account.balance < amount {
-            return Err(StorageError::State("insufficient balance".into()));
-        }
-        account.balance = account.balance.saturating_sub(amount);
+        account.balance = account
+            .balance
+            .checked_sub(amount)
+            .ok_or_else(|| StorageError::State("insufficient balance".into()))?;
         self.set_account(address, &account)
     }
 
@@ -840,6 +840,18 @@ mod tests {
         ws.add_balance(&addr, U256::from(100)).unwrap();
         let err = ws.sub_balance(&addr, U256::from(200)).unwrap_err();
         assert!(matches!(err, StorageError::State(_)));
+    }
+
+    #[test]
+    fn sub_balance_exact_amount_zeroes_balance() {
+        let store = test_store();
+        let mut ws = WorldState::new(store);
+        let addr = test_address(b"exact");
+
+        ws.add_balance(&addr, U256::from(100)).unwrap();
+        ws.sub_balance(&addr, U256::from(100)).unwrap();
+
+        assert_eq!(ws.get_balance(&addr).unwrap(), U256::ZERO);
     }
 
     #[test]
