@@ -15,9 +15,6 @@ use crate::error::NetworkError;
 use crate::message::{NetworkEvent, NetworkMessage, PeerId};
 use crate::service::NetworkService;
 
-/// Default message size limit used by ChannelNetwork when no config override.
-const CHANNEL_MAX_MESSAGE_SIZE: usize = crate::message::MAX_MESSAGE_SIZE;
-
 /// Shared broadcast bus that multiple `ChannelNetwork` instances connect to.
 pub struct NetworkBus {
     tx: broadcast::Sender<(PeerId, Vec<u8>)>,
@@ -56,12 +53,10 @@ impl NetworkBus {
                         if sender == my_id {
                             continue;
                         }
-                        // F-069: validate message size before deserialization.
-                        if let Err(_e) = crate::message::validate_message_size(&data, max_msg_size)
+                        // F-069: validate the raw payload and decoded message kind.
+                        if let Ok(message) =
+                            crate::message::deserialize_checked(&data, max_msg_size)
                         {
-                            continue;
-                        }
-                        if let Ok(message) = serde_json::from_slice::<NetworkMessage>(&data) {
                             let _ = event_tx
                                 .send(NetworkEvent::MessageReceived {
                                     peer: sender,
@@ -84,6 +79,7 @@ impl NetworkBus {
             event_rx,
             running,
             peer_count: Arc::clone(&self.peer_counter),
+            max_msg_size,
         }
     }
 }
@@ -95,6 +91,7 @@ pub struct ChannelNetwork {
     event_rx: mpsc::Receiver<NetworkEvent>,
     running: Arc<AtomicBool>,
     peer_count: Arc<AtomicUsize>,
+    max_msg_size: usize,
 }
 
 impl ChannelNetwork {
@@ -110,7 +107,7 @@ impl NetworkService for ChannelNetwork {
         let data =
             serde_json::to_vec(&msg).map_err(|e| NetworkError::Serialization(e.to_string()))?;
         // F-069: validate outbound message size.
-        crate::message::validate_message_size(&data, CHANNEL_MAX_MESSAGE_SIZE)?;
+        crate::message::validate_message_size(&data, self.max_msg_size)?;
         crate::message::validate_message_size(&data, msg.max_serialized_size())?;
         self.bus_tx
             .send((self.peer_id.clone(), data))
@@ -140,8 +137,9 @@ impl NetworkService for ChannelNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_core::{Block, BlockHeader};
-    use shell_primitives::{Address, Bytes, ShellHash};
+    use shell_core::{Block, BlockHeader, SignedTransaction, Transaction};
+    use shell_crypto::PQSignature;
+    use shell_primitives::{Address, Bytes, ShellHash, U256};
     use tokio::time::{timeout, Duration};
 
     fn test_block(number: u64) -> Block {
@@ -170,6 +168,27 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         }
+    }
+
+    fn test_transaction(data_size: usize) -> SignedTransaction {
+        SignedTransaction::new(
+            Address::from_public_key(b"sender-key", 0),
+            Transaction {
+                chain_id: 1,
+                nonce: 0,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 100_000_000,
+                gas_limit: 21_000,
+                to: None,
+                value: U256::ZERO,
+                data: Bytes::from(vec![0xAA; data_size]),
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+            PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+        )
     }
 
     #[tokio::test]
@@ -221,6 +240,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broadcast_respects_configured_message_limit() {
+        let bus = NetworkBus::new(64);
+        let config = NetworkConfig {
+            max_message_size: 1,
+            ..NetworkConfig::default()
+        };
+
+        let node = bus.join(&config);
+
+        let err = node.broadcast(NetworkMessage::Ping).await.unwrap_err();
+        match err {
+            NetworkError::MessageTooLarge { limit, .. } => assert_eq!(limit, 1),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_rejects_variant_specific_oversized_messages() {
+        let bus = NetworkBus::new(64);
+        let config = NetworkConfig::default();
+        let mut node_b = bus.join(&config);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let tx = test_transaction(crate::message::MAX_TX_GOSSIP_SIZE + 1);
+        let data = serde_json::to_vec(&NetworkMessage::NewTransaction(Box::new(tx))).unwrap();
+        assert!(data.len() < crate::message::MAX_MESSAGE_SIZE);
+
+        bus.tx.send((PeerId::from("external"), data)).unwrap();
+
+        let result = timeout(Duration::from_millis(100), node_b.next_event()).await;
+        assert!(
+            result.is_err(),
+            "oversized transaction gossip should be dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn peer_count() {
         let bus = NetworkBus::new(16);
         let config = NetworkConfig::default();
@@ -242,28 +299,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        use shell_core::{SignedTransaction, Transaction};
-        use shell_crypto::PQSignature;
-        use shell_primitives::U256;
-
-        let tx = SignedTransaction::new(
-            Address::from_public_key(b"sender-key", 0),
-            Transaction {
-                chain_id: 1,
-                nonce: 0,
-                max_fee_per_gas: 1_000_000_000,
-                max_priority_fee_per_gas: 100_000_000,
-                gas_limit: 21_000,
-                to: None,
-                value: U256::ZERO,
-                data: Bytes::default(),
-                access_list: None,
-                tx_type: 2,
-                max_fee_per_blob_gas: None,
-                blob_versioned_hashes: None,
-            },
-            PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
-        );
+        let tx = test_transaction(0);
 
         node_a
             .broadcast(NetworkMessage::NewTransaction(Box::new(tx)))
