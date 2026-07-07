@@ -241,6 +241,12 @@ impl TxPool {
         };
         Self::ensure_pending_balance_available(&inner, &tx, world_state, &evicted_hashes)?;
 
+        let Some(next_seq) = inner.seq.checked_add(1) else {
+            return Err(MempoolError::InvalidTransaction(
+                "mempool arrival sequence exhausted".into(),
+            ));
+        };
+
         if validation.should_register_pubkey {
             chain_store
                 .put_pubkey(&tx.from, &validation.pubkey)
@@ -257,7 +263,7 @@ impl TxPool {
 
         // --- Insert ---
         let seq = inner.seq;
-        inner.seq += 1;
+        inner.seq = next_seq;
 
         let priority_key = PriorityKey {
             neg_priority_fee: -(priority_fee as i128),
@@ -1409,6 +1415,24 @@ mod tests {
             matches!(err, MempoolError::InvalidTransaction(message) if message.contains("u64::MAX"))
         );
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn insert_rejects_exhausted_arrival_sequence_without_side_effects() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        pool.inner.write().seq = u64::MAX;
+
+        let (tx, _pk) = make_signed_tx(0, 100);
+        let sender = tx.sender();
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(
+            matches!(err, MempoolError::InvalidTransaction(message) if message.contains("arrival sequence exhausted"))
+        );
+        assert!(pool.is_empty());
+        assert_eq!(cs.get_pubkey(&sender).unwrap(), None);
     }
 
     #[test]
