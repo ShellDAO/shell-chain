@@ -217,7 +217,7 @@ curl http://localhost:9090/health
 **Response (200 OK):**
 
 ```json
-{"status":"ok","version":"0.25.2","block_height":1234}
+{"status":"ok","version":"0.26.0","block_height":1234}
 ```
 
 The node is considered alive if the process is running and can respond to HTTP requests.
