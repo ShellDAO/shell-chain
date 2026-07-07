@@ -286,7 +286,11 @@ impl TxPool {
     /// Returns `true` if the transaction was found and removed.
     pub fn remove(&self, hash: &ShellHash) -> bool {
         let mut inner = self.inner.write();
-        Self::remove_entry(&mut inner, hash)
+        let removed = Self::remove_entry(&mut inner, hash);
+        if inner.by_hash.is_empty() {
+            inner.seq = 0;
+        }
+        removed
     }
 
     /// Remove a batch of transactions (e.g., after block inclusion).
@@ -294,6 +298,9 @@ impl TxPool {
         let mut inner = self.inner.write();
         for hash in hashes {
             Self::remove_entry(&mut inner, hash);
+        }
+        if inner.by_hash.is_empty() {
+            inner.seq = 0;
         }
     }
 
@@ -336,6 +343,7 @@ impl TxPool {
         inner.by_hash.clear();
         inner.by_sender.clear();
         inner.by_priority.clear();
+        inner.seq = 0;
     }
 
     /// Get a transaction by hash.
@@ -1433,6 +1441,41 @@ mod tests {
         );
         assert!(pool.is_empty());
         assert_eq!(cs.get_pubkey(&sender).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_resets_exhausted_arrival_sequence() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        pool.inner.write().seq = u64::MAX;
+
+        pool.clear();
+
+        let (tx, _pk) = make_signed_tx(0, 100);
+        insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_transaction_resets_exhausted_arrival_sequence() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let first = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let first_hash = first.hash();
+        insert_rich(&pool, first, &verifier, &mut ws, &cs).unwrap();
+
+        pool.inner.write().seq = u64::MAX;
+        assert!(pool.remove(&first_hash));
+        assert!(pool.is_empty());
+
+        let second = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        insert_rich(&pool, second, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]
