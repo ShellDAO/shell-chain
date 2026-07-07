@@ -147,6 +147,7 @@ impl Libp2pNetwork {
             bandwidth: Arc::clone(&bandwidth),
             boot_nodes,
             max_msg_size: config.max_message_size,
+            peer_security: PeerSecurityConfig::from(config),
         };
 
         tokio::spawn(swarm_loop(swarm, cmd_rx, event_tx, loop_config));
@@ -540,6 +541,24 @@ struct SwarmLoopConfig {
     bandwidth: Arc<BandwidthTracker>,
     boot_nodes: Vec<Multiaddr>,
     max_msg_size: usize,
+    peer_security: PeerSecurityConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerSecurityConfig {
+    max_peers: usize,
+    ban_threshold: u32,
+    ban_duration: Duration,
+}
+
+impl From<&NetworkConfig> for PeerSecurityConfig {
+    fn from(config: &NetworkConfig) -> Self {
+        Self {
+            max_peers: config.max_peers,
+            ban_threshold: config.ban_threshold,
+            ban_duration: Duration::from_secs(config.ban_duration_secs),
+        }
+    }
 }
 
 /// Background task that drives the libp2p Swarm.
@@ -550,8 +569,11 @@ async fn swarm_loop(
     loop_config: SwarmLoopConfig,
 ) {
     // F-305: Initialize peer tracking and ban list.
-    let mut peer_tracker = crate::security::PeerTracker::new(128);
-    let mut peer_ban_list = crate::security::PeerBanList::new(5, Duration::from_secs(600));
+    let mut peer_tracker = crate::security::PeerTracker::new(loop_config.peer_security.max_peers);
+    let mut peer_ban_list = crate::security::PeerBanList::new(
+        loop_config.peer_security.ban_threshold,
+        loop_config.peer_security.ban_duration,
+    );
 
     // Subscribe to gossipsub topics.
     if let Err(e) = swarm
@@ -1089,6 +1111,27 @@ mod tests {
     fn config_defaults_enable_peer_scoring() {
         let config = NetworkConfig::default();
         assert!(config.enable_peer_scoring);
+    }
+
+    #[test]
+    fn peer_security_config_uses_network_config_limits() {
+        let config = NetworkConfig {
+            max_peers: 7,
+            ban_threshold: 2,
+            ban_duration_secs: 42,
+            ..Default::default()
+        };
+
+        let security = PeerSecurityConfig::from(&config);
+
+        assert_eq!(
+            security,
+            PeerSecurityConfig {
+                max_peers: 7,
+                ban_threshold: 2,
+                ban_duration: Duration::from_secs(42),
+            }
+        );
     }
 
     #[tokio::test]
