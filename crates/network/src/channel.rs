@@ -5,7 +5,7 @@
 //! local development without real TCP connections.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
@@ -18,7 +18,57 @@ use crate::service::NetworkService;
 /// Shared broadcast bus that multiple `ChannelNetwork` instances connect to.
 pub struct NetworkBus {
     tx: broadcast::Sender<(PeerId, Vec<u8>)>,
-    peer_counter: Arc<AtomicUsize>,
+    next_peer_id: Arc<AtomicUsize>,
+    peer_counts: Arc<PeerCountState>,
+}
+
+struct PeerCountState {
+    live_peers: AtomicUsize,
+    handles: Mutex<Vec<Weak<AtomicUsize>>>,
+}
+
+impl PeerCountState {
+    fn new() -> Self {
+        Self {
+            live_peers: AtomicUsize::new(0),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(&self, connected_peer_count: &Arc<AtomicUsize>) {
+        let live_peers = self.live_peers.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        handles.push(Arc::downgrade(connected_peer_count));
+        Self::refresh_handles(&mut handles, live_peers);
+    }
+
+    fn unregister(&self) {
+        let live_peers = self
+            .live_peers
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_sub(1)
+            })
+            .map(|previous| previous - 1)
+            .unwrap_or(0);
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        Self::refresh_handles(&mut handles, live_peers);
+    }
+
+    fn connected_peers(&self) -> usize {
+        self.live_peers.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
+    fn refresh_handles(handles: &mut Vec<Weak<AtomicUsize>>, live_peers: usize) {
+        let connected_peers = live_peers.saturating_sub(1);
+        handles.retain(|handle| {
+            if let Some(handle) = handle.upgrade() {
+                handle.store(connected_peers, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 impl NetworkBus {
@@ -27,19 +77,22 @@ impl NetworkBus {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
-            peer_counter: Arc::new(AtomicUsize::new(0)),
+            next_peer_id: Arc::new(AtomicUsize::new(0)),
+            peer_counts: Arc::new(PeerCountState::new()),
         }
     }
 
     /// Create a `ChannelNetwork` node connected to this bus.
     pub fn join(&self, config: &NetworkConfig) -> ChannelNetwork {
-        let id = self.peer_counter.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         let peer_id = PeerId(format!("local-{id}"));
         let rx = self.tx.subscribe();
         let (event_tx, event_rx) = mpsc::channel(256);
         let bus_tx = self.tx.clone();
         let running = Arc::new(AtomicBool::new(true));
         let max_msg_size = config.max_message_size;
+        let connected_peer_count = Arc::new(AtomicUsize::new(0));
+        self.peer_counts.register(&connected_peer_count);
 
         // Background task: convert broadcast messages into NetworkEvents.
         let my_id = peer_id.clone();
@@ -78,7 +131,8 @@ impl NetworkBus {
             bus_tx,
             event_rx,
             running,
-            peer_count: Arc::clone(&self.peer_counter),
+            peer_counts: Arc::clone(&self.peer_counts),
+            connected_peer_count,
             max_msg_size,
         }
     }
@@ -90,7 +144,8 @@ pub struct ChannelNetwork {
     bus_tx: broadcast::Sender<(PeerId, Vec<u8>)>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     running: Arc<AtomicBool>,
-    peer_count: Arc<AtomicUsize>,
+    peer_counts: Arc<PeerCountState>,
+    connected_peer_count: Arc<AtomicUsize>,
     max_msg_size: usize,
 }
 
@@ -120,17 +175,34 @@ impl NetworkService for ChannelNetwork {
     }
 
     async fn peer_count(&self) -> usize {
-        // Subtract 1 to exclude self.
-        self.peer_count.load(Ordering::Relaxed).saturating_sub(1)
+        self.peer_counts.connected_peers()
     }
 
     fn peer_count_handle(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.peer_count)
+        Arc::clone(&self.connected_peer_count)
     }
 
     async fn shutdown(&self) -> Result<(), NetworkError> {
-        self.running.store(false, Ordering::Relaxed);
+        if self
+            .running
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.peer_counts.unregister();
+        }
         Ok(())
+    }
+}
+
+impl Drop for ChannelNetwork {
+    fn drop(&mut self) {
+        if self
+            .running
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.peer_counts.unregister();
+        }
     }
 }
 
@@ -287,6 +359,41 @@ mod tests {
         let _n3 = bus.join(&config);
 
         assert_eq!(n1.peer_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn peer_count_handle_excludes_self() {
+        let bus = NetworkBus::new(16);
+        let config = NetworkConfig::default();
+
+        let n1 = bus.join(&config);
+        let handle = n1.peer_count_handle();
+        assert_eq!(handle.load(Ordering::Relaxed), 0);
+
+        let _n2 = bus.join(&config);
+        assert_eq!(handle.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_count_updates_after_shutdown_and_drop() {
+        let bus = NetworkBus::new(16);
+        let config = NetworkConfig::default();
+
+        let n1 = bus.join(&config);
+        let n2 = bus.join(&config);
+        let n3 = bus.join(&config);
+        let handle = n1.peer_count_handle();
+
+        assert_eq!(n1.peer_count().await, 2);
+        assert_eq!(handle.load(Ordering::Relaxed), 2);
+
+        n2.shutdown().await.unwrap();
+        assert_eq!(n1.peer_count().await, 1);
+        assert_eq!(handle.load(Ordering::Relaxed), 1);
+
+        drop(n3);
+        assert_eq!(n1.peer_count().await, 0);
+        assert_eq!(handle.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
