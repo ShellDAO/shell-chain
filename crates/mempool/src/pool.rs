@@ -112,7 +112,9 @@ impl TxPool {
             .filter(|pm| *pm != sender)
             .unwrap_or(sender);
 
-        let payer_gas_balance = world_state.get_balance(&payer).unwrap_or(U256::ZERO);
+        let payer_gas_balance = world_state
+            .get_balance(&payer)
+            .map_err(MempoolError::Storage)?;
         if payer_gas_balance < gas_cost {
             return Err(MempoolError::InsufficientBalance {
                 needed: gas_cost,
@@ -122,7 +124,9 @@ impl TxPool {
 
         // Sender must still cover the transferred value even when paymaster pays gas.
         let needed_for_value = tx.tx.value;
-        let sender_balance = world_state.get_balance(&sender).unwrap_or(U256::ZERO);
+        let sender_balance = world_state
+            .get_balance(&sender)
+            .map_err(MempoolError::Storage)?;
         if payer != sender {
             // Paymaster covers gas; only check sender has enough for the value transfer.
             if sender_balance < needed_for_value {
@@ -613,7 +617,9 @@ impl TxPool {
                 .map(|(_hash, entry)| Self::reserved_cost_for(&entry.tx, &account))
                 .fold(U256::ZERO, add_or_max);
             let needed = add_or_max(pending, incoming);
-            let have = world_state.get_balance(&account).unwrap_or(U256::ZERO);
+            let have = world_state
+                .get_balance(&account)
+                .map_err(MempoolError::Storage)?;
             if have < needed {
                 return Err(MempoolError::InsufficientBalance { needed, have });
             }
@@ -685,6 +691,7 @@ fn map_aa_validation_error(tx: &SignedTransaction, err: AaValidationError) -> Me
             MempoolError::InvalidSignature("PQ signature verification failed".into())
         }
         AaValidationError::Crypto(err) => MempoolError::Crypto(err),
+        AaValidationError::Storage(err) => MempoolError::Storage(err),
         AaValidationError::DisallowedAlgorithm(sig_type) => MempoolError::InvalidTransaction(
             format!("disallowed signature algorithm: {sig_type:?}"),
         ),
@@ -735,6 +742,7 @@ mod tests {
     #[derive(Debug)]
     struct FailingPubkeyStore {
         inner: MemoryDb,
+        fail_get: AtomicBool,
         fail_pubkey_put: AtomicBool,
     }
 
@@ -742,13 +750,21 @@ mod tests {
         fn new(fail_pubkey_put: bool) -> Self {
             Self {
                 inner: MemoryDb::new(),
+                fail_get: AtomicBool::new(false),
                 fail_pubkey_put: AtomicBool::new(fail_pubkey_put),
             }
+        }
+
+        fn fail_gets(&self) {
+            self.fail_get.store(true, Ordering::SeqCst);
         }
     }
 
     impl KvStore for FailingPubkeyStore {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_get.load(Ordering::SeqCst) && !key.starts_with(b"pk/") {
+                return Err(StorageError::Database("injected get failure".into()));
+            }
             self.inner.get(key)
         }
 
@@ -1835,6 +1851,50 @@ mod tests {
 
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&hash));
+    }
+
+    #[test]
+    fn balance_lookup_storage_failure_returns_storage_error() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let state_store = Arc::new(FailingPubkeyStore::new(false));
+        let mut ws = WorldState::new(Arc::clone(&state_store));
+        let cs = ChainStore::new(Arc::clone(&state_store));
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let paymaster_signer = DilithiumSigner::generate();
+        let paymaster_pubkey = paymaster_signer.public_key().to_vec();
+        let paymaster = register_paymaster(&cs, &paymaster_pubkey);
+        let first_nonce = u64::default();
+        let tx = make_sponsored_aa_value_tx_with_signers(
+            &signer,
+            &pubkey,
+            &paymaster_signer,
+            &paymaster_pubkey,
+            first_nonce,
+            50,
+            U256::ZERO,
+        );
+
+        ws.set_balance(&paymaster, max_gas_cost(&tx)).unwrap();
+        let mut ws = ws.snapshot().unwrap();
+        // Cache the sender account so AA validation can complete; the following
+        // balance check for the uncached paymaster must surface the storage fault.
+        assert_eq!(ws.get_account(&sender).unwrap(), None);
+        state_store.fail_gets();
+
+        let err = pool.insert(tx, &mut ws, &cs, &verifier).unwrap_err();
+
+        match err {
+            MempoolError::Storage(err) => {
+                assert!(err.to_string().contains("injected get failure"));
+            }
+            other => panic!("expected storage get failure, got {other:?}"),
+        }
+        assert_eq!(pool.len(), 0);
+        assert_eq!(cs.get_pubkey(&paymaster).unwrap(), Some(paymaster_pubkey));
     }
 
     #[test]
