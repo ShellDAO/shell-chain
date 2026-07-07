@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use crate::error::NetworkError;
 use crate::message::PeerId;
 
+const MAX_TEMP_BAN_DURATION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 // ---------------------------------------------------------------------------
 // F-070: Peer connection tracker
 // ---------------------------------------------------------------------------
@@ -119,7 +121,7 @@ impl PeerBanList {
         record.violations = record.violations.saturating_add(1);
 
         if record.violations >= self.ban_threshold && record.banned_until.is_none() {
-            record.banned_until = Some(Instant::now() + self.ban_duration);
+            record.banned_until = Some(ban_deadline(Instant::now(), self.ban_duration));
             return true;
         }
         false
@@ -200,6 +202,23 @@ impl PeerBanList {
             .filter(|r| r.banned_until.is_some_and(|until| now < until))
             .count()
     }
+}
+
+fn ban_deadline(now: Instant, duration: Duration) -> Instant {
+    let duration = duration.min(MAX_TEMP_BAN_DURATION);
+    if let Some(deadline) = now.checked_add(duration) {
+        return deadline;
+    }
+
+    let mut capped = duration;
+    while !capped.is_zero() {
+        capped /= 2;
+        if let Some(deadline) = now.checked_add(capped) {
+            return deadline;
+        }
+    }
+
+    now
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +381,16 @@ mod tests {
         let remaining = bans.remaining_ban_secs(&peer);
         assert!(remaining > 0);
         assert!(remaining <= 300);
+    }
+
+    #[test]
+    fn extreme_ban_duration_does_not_panic() {
+        let mut bans = PeerBanList::new(1, Duration::MAX);
+        let peer = PeerId::from("long-ban");
+
+        assert!(bans.record_violation(&peer));
+        assert!(bans.is_banned(&peer));
+        assert!(bans.remaining_ban_secs(&peer) <= MAX_TEMP_BAN_DURATION.as_secs());
     }
 
     #[test]
