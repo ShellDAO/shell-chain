@@ -131,6 +131,13 @@ wscat -c ws://127.0.0.1:8546
 < {"jsonrpc":"2.0","id":2,"result":"0x2"}
 ```
 
+`logs` filters reject invalid `address` or `topics` values. Addresses must use
+the canonical `0x`-prefixed 64-hex-character Shell address form. Topic entries
+must be `null`, a `0x`-prefixed 32-byte hash, or an array of `0x`-prefixed
+32-byte hashes. The `topics` array can contain at most four positional entries.
+Within `topics`, `null` is a wildcard for that position; an empty alternatives
+array (`[]`) matches no logs at that position.
+
 **Example — newPendingTransactions:**
 
 ```bash
@@ -621,7 +628,7 @@ Returns logs matching a filter.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Filter: `{address?, topics?, fromBlock?, toBlock?}` |
+| 1 | `Object` | Yes | Filter: `{address?, topics?, fromBlock?, toBlock?}`. Addresses use the canonical `0x`-prefixed 64-hex-character Shell address form; `topics` can contain at most four positional entries. Topic entries are `null`, a `0x`-prefixed 32-byte hash, or an array of `0x`-prefixed 32-byte hashes. `null` is a positional wildcard; an empty alternatives array (`[]`) matches no logs at that position. |
 
 **Returns:** `Array` — Log objects with `address`, `topics`, `data`, `blockNumber`, `blockHash`, `transactionHash`, `transactionIndex`, `logIndex`, `removed`.
 
@@ -642,7 +649,7 @@ Creates a poll-based log filter.
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Filter: `{address?, topics?, fromBlock?, toBlock?}` |
+| 1 | `Object` | Yes | Filter: `{address?, topics?, fromBlock?, toBlock?}`. Addresses use the canonical `0x`-prefixed 64-hex-character Shell address form; `topics` can contain at most four positional entries. Topic entries are `null`, a `0x`-prefixed 32-byte hash, or an array of `0x`-prefixed 32-byte hashes. `null` is a positional wildcard; an empty alternatives array (`[]`) matches no logs at that position. |
 
 **Returns:** `String` — Filter ID.
 
