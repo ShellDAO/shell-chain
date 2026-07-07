@@ -5182,12 +5182,30 @@ mod tests {
             .get_filter_info(&block_filter)
             .unwrap();
         assert_eq!(last_poll, u64::MAX);
+        let block_changes = EthApiServer::get_filter_changes(&handler, block_filter.clone())
+            .await
+            .unwrap();
+        assert!(block_changes.as_array().unwrap().is_empty());
+        let (_, last_poll) = handler
+            .filter_registry
+            .get_filter_info(&block_filter)
+            .unwrap();
+        assert_eq!(last_poll, u64::MAX);
 
         let raw: RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
         let log_filter = handler
             .filter_registry
             .new_filter(FilterKind::Log(raw), u64::MAX - 1)
             .unwrap();
+        let log_changes = EthApiServer::get_filter_changes(&handler, log_filter.clone())
+            .await
+            .unwrap();
+        assert!(log_changes.as_array().unwrap().is_empty());
+        let (_, last_poll) = handler
+            .filter_registry
+            .get_filter_info(&log_filter)
+            .unwrap();
+        assert_eq!(last_poll, u64::MAX);
         let log_changes = EthApiServer::get_filter_changes(&handler, log_filter.clone())
             .await
             .unwrap();

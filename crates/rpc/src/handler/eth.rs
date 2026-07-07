@@ -873,7 +873,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
 
         if is_log {
             // Log filter: query logs from (last_poll_block + 1) to latest.
-            let from = last_poll_block.saturating_add(1);
+            let Some(from) = last_poll_block.checked_add(1) else {
+                self.filter_registry.update_last_poll(&id, latest);
+                return Ok(serde_json::json!([]));
+            };
             if from > latest {
                 self.filter_registry.update_last_poll(&id, latest);
                 return Ok(serde_json::json!([]));
@@ -937,7 +940,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             Ok(serde_json::to_value(&results).unwrap_or(serde_json::json!([])))
         } else {
             // Block filter: collect hashes of blocks since last poll.
-            let from = last_poll_block.saturating_add(1);
+            let Some(from) = last_poll_block.checked_add(1) else {
+                self.filter_registry.update_last_poll(&id, latest);
+                return Ok(serde_json::json!([]));
+            };
             if from > latest {
                 self.filter_registry.update_last_poll(&id, latest);
                 return Ok(serde_json::json!([]));
