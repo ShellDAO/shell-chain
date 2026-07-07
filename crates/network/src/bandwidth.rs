@@ -129,17 +129,17 @@ impl BandwidthTracker {
     ) -> bool {
         Self::saturating_add_counter(total_counter, bytes);
         if max_bytes == 0 {
-            window_counter.fetch_add(bytes, Ordering::Relaxed);
+            Self::saturating_add_counter(window_counter, bytes);
             return true;
         }
 
         let Some(limiter) = limiter else {
-            window_counter.fetch_add(bytes, Ordering::Relaxed);
+            Self::saturating_add_counter(window_counter, bytes);
             return true;
         };
         let allowed = Self::lock_unpoisoned(limiter).allow(bytes, Instant::now());
         if allowed {
-            window_counter.fetch_add(bytes, Ordering::Relaxed);
+            Self::saturating_add_counter(window_counter, bytes);
         }
         allowed
     }
@@ -300,6 +300,24 @@ mod tests {
             .store(u64::MAX - 10, Ordering::Relaxed);
         tracker.record_inbound(100);
         assert_eq!(tracker.stats().total_inbound, u64::MAX);
+    }
+
+    #[test]
+    fn window_counters_saturate_not_wrap() {
+        let tracker = BandwidthTracker::new(0, 0);
+        tracker
+            .inbound_bytes
+            .store(u64::MAX - 10, Ordering::Relaxed);
+        tracker
+            .outbound_bytes
+            .store(u64::MAX - 5, Ordering::Relaxed);
+
+        assert!(tracker.record_inbound(100));
+        assert!(tracker.record_outbound(100));
+
+        let stats = tracker.stats();
+        assert_eq!(stats.inbound_bytes_per_sec, u64::MAX);
+        assert_eq!(stats.outbound_bytes_per_sec, u64::MAX);
     }
 
     #[test]
