@@ -10,9 +10,10 @@ pub const MAX_BLOCK_RANGE: u64 = 10_000;
 /// Ethereum-compatible log filter used by `eth_getLogs`.
 ///
 /// Topic matching follows standard Ethereum rules:
-/// - `topics[i] = None`        → any value at position i
-/// - `topics[i] = Some([A])`   → topic at position i must equal A
-/// - `topics[i] = Some([A,B])` → topic at position i must equal A **or** B
+/// - `topics[i] = None`        -> any value at position i
+/// - `topics[i] = Some([])`    -> no accepted values at position i
+/// - `topics[i] = Some([A])`   -> topic at position i must equal A
+/// - `topics[i] = Some([A,B])` -> topic at position i must equal A **or** B
 #[derive(Debug, Clone)]
 pub struct LogFilter {
     pub from_block: Option<u64>,
@@ -48,11 +49,13 @@ impl LogFilter {
 
         // Each topic position that has a filter must have at least one bloom hit.
         for hashes in self.topics.iter().flatten() {
-            if !hashes.is_empty() {
-                let any_match = hashes.iter().any(|h| bloom_contains(bloom, h.as_bytes()));
-                if !any_match {
-                    return false;
-                }
+            if hashes.is_empty() {
+                return false;
+            }
+
+            let any_match = hashes.iter().any(|h| bloom_contains(bloom, h.as_bytes()));
+            if !any_match {
+                return false;
             }
         }
 
@@ -72,7 +75,7 @@ impl LogFilter {
         for (i, slot) in self.topics.iter().enumerate() {
             if let Some(hashes) = slot {
                 if hashes.is_empty() {
-                    continue;
+                    return false;
                 }
                 match log.topics.get(i) {
                     Some(log_topic) => {
@@ -338,6 +341,19 @@ mod tests {
             vec![ShellHash::from_slice(&[0x33; 32])],
             b""
         )));
+    }
+
+    #[test]
+    fn empty_topic_alternative_array_matches_no_logs() {
+        let topic = ShellHash::from_slice(&[0x11; 32]);
+        let log = make_log(Address::ZERO, vec![topic], b"");
+        let bloom = logs_bloom(std::slice::from_ref(&log));
+        let raw: RawLogFilter = serde_json::from_str(r#"{"topics":[[]]}"#).unwrap();
+        let filter = raw.into_filter(100, 90).unwrap();
+
+        assert_eq!(filter.topics[0], Some(vec![]));
+        assert!(!filter.matches_log(&log));
+        assert!(!filter.matches_bloom(&bloom));
     }
 
     #[test]
