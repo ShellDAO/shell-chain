@@ -302,10 +302,59 @@ impl<S: KvStore + 'static> WorldState<S> {
     }
 
     fn validator_weight_key(address: &Address) -> ShellHash {
-        let mut bytes = Vec::with_capacity(b"validator_weight:".len() + 20);
+        let mut bytes = Vec::with_capacity(b"validator_weight:".len() + 32);
         bytes.extend_from_slice(b"validator_weight:");
         bytes.extend_from_slice(address.as_bytes());
         keccak256(&bytes)
+    }
+
+    fn validator_stake_key(address: &Address) -> ShellHash {
+        let mut bytes = Vec::with_capacity(b"validator_stake:".len() + 32);
+        bytes.extend_from_slice(b"validator_stake:");
+        bytes.extend_from_slice(address.as_bytes());
+        keccak256(&bytes)
+    }
+
+    fn staking_enabled_key() -> ShellHash {
+        keccak256(b"staking_enabled")
+    }
+
+    fn total_supply_key() -> ShellHash {
+        keccak256(b"total_supply")
+    }
+
+    fn total_staked_key() -> ShellHash {
+        keccak256(b"total_staked")
+    }
+
+    fn stake_unit_key() -> ShellHash {
+        keccak256(b"stake_unit")
+    }
+
+    fn max_validator_weight_key() -> ShellHash {
+        keccak256(b"max_validator_weight")
+    }
+
+    fn u64_to_hash(value: u64) -> ShellHash {
+        let mut bytes = [0u8; 32];
+        bytes[24..32].copy_from_slice(&value.to_be_bytes());
+        ShellHash::from(bytes)
+    }
+
+    fn hash_to_u64(value: ShellHash) -> Result<u64, StorageError> {
+        Ok(u64::from_be_bytes(
+            value.as_bytes()[24..32]
+                .try_into()
+                .map_err(|e: std::array::TryFromSliceError| StorageError::Codec(e.to_string()))?,
+        ))
+    }
+
+    fn u256_to_hash(value: U256) -> ShellHash {
+        ShellHash::from(value.to_be_bytes::<32>())
+    }
+
+    fn hash_to_u256(value: ShellHash) -> U256 {
+        U256::from_be_slice(value.as_bytes())
     }
 
     /// Read the current validator set from the validator registry in world state.
@@ -390,11 +439,7 @@ impl<S: KvStore + 'static> WorldState<S> {
         if raw == ShellHash::ZERO {
             return Ok(1);
         }
-        let weight = u64::from_be_bytes(
-            raw.as_bytes()[24..32]
-                .try_into()
-                .map_err(|e: std::array::TryFromSliceError| StorageError::Codec(e.to_string()))?,
-        );
+        let weight = Self::hash_to_u64(raw)?;
         Ok(weight.max(1))
     }
 
@@ -405,12 +450,10 @@ impl<S: KvStore + 'static> WorldState<S> {
         weight: u64,
     ) -> Result<(), StorageError> {
         let registry = validator_registry_addr();
-        let mut bytes = [0u8; 32];
-        bytes[24..32].copy_from_slice(&weight.max(1).to_be_bytes());
         self.set_storage(
             &registry,
             &Self::validator_weight_key(validator),
-            &ShellHash::from(bytes),
+            &Self::u64_to_hash(weight.max(1)),
         )
     }
 
@@ -424,6 +467,146 @@ impl<S: KvStore + 'static> WorldState<S> {
             self.set_validator_weight(validator, weights.get(idx).copied().unwrap_or(1))?;
         }
         Ok(())
+    }
+
+    /// Return true when validator weights are derived from locked SHELL stake.
+    pub fn staking_enabled(&self) -> Result<bool, StorageError> {
+        let registry = validator_registry_addr();
+        let raw = self.get_storage(&registry, &Self::staking_enabled_key())?;
+        Ok(raw != ShellHash::ZERO)
+    }
+
+    pub fn set_staking_enabled(&mut self, enabled: bool) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::staking_enabled_key(),
+            &if enabled {
+                Self::u64_to_hash(1)
+            } else {
+                ShellHash::ZERO
+            },
+        )
+    }
+
+    pub fn get_total_supply(&self) -> Result<U256, StorageError> {
+        let registry = validator_registry_addr();
+        Ok(Self::hash_to_u256(
+            self.get_storage(&registry, &Self::total_supply_key())?,
+        ))
+    }
+
+    pub fn set_total_supply(&mut self, value: U256) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::total_supply_key(),
+            &Self::u256_to_hash(value),
+        )
+    }
+
+    pub fn get_total_staked(&self) -> Result<U256, StorageError> {
+        let registry = validator_registry_addr();
+        Ok(Self::hash_to_u256(
+            self.get_storage(&registry, &Self::total_staked_key())?,
+        ))
+    }
+
+    pub fn set_total_staked(&mut self, value: U256) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::total_staked_key(),
+            &Self::u256_to_hash(value),
+        )
+    }
+
+    pub fn get_stake_unit(&self) -> Result<U256, StorageError> {
+        let registry = validator_registry_addr();
+        Ok(Self::hash_to_u256(
+            self.get_storage(&registry, &Self::stake_unit_key())?,
+        ))
+    }
+
+    pub fn set_stake_unit(&mut self, value: U256) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::stake_unit_key(),
+            &Self::u256_to_hash(value),
+        )
+    }
+
+    pub fn get_max_validator_weight(&self) -> Result<u64, StorageError> {
+        let registry = validator_registry_addr();
+        let raw = self.get_storage(&registry, &Self::max_validator_weight_key())?;
+        if raw == ShellHash::ZERO {
+            return Ok(u64::MAX);
+        }
+        Self::hash_to_u64(raw)
+    }
+
+    pub fn set_max_validator_weight(&mut self, value: u64) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::max_validator_weight_key(),
+            &Self::u64_to_hash(value.max(1)),
+        )
+    }
+
+    pub fn get_validator_stake(&self, validator: &Address) -> Result<U256, StorageError> {
+        let registry = validator_registry_addr();
+        Ok(Self::hash_to_u256(self.get_storage(
+            &registry,
+            &Self::validator_stake_key(validator),
+        )?))
+    }
+
+    pub fn set_validator_stake(
+        &mut self,
+        validator: &Address,
+        stake: U256,
+    ) -> Result<(), StorageError> {
+        let registry = validator_registry_addr();
+        self.set_storage(
+            &registry,
+            &Self::validator_stake_key(validator),
+            &Self::u256_to_hash(stake),
+        )
+    }
+
+    pub fn derive_validator_weight_from_stake(
+        stake: U256,
+        stake_unit: U256,
+        max_validator_weight: u64,
+    ) -> Result<u64, StorageError> {
+        if stake_unit == U256::ZERO {
+            return Err(StorageError::Codec(
+                "stake_unit must be greater than zero".into(),
+            ));
+        }
+        if max_validator_weight == 0 {
+            return Err(StorageError::Codec(
+                "max_validator_weight must be greater than zero".into(),
+            ));
+        }
+        let raw = stake / stake_unit;
+        Ok(raw.min(U256::from(max_validator_weight)).to::<u64>())
+    }
+
+    pub fn set_validator_stake_and_weight(
+        &mut self,
+        validator: &Address,
+        stake: U256,
+        stake_unit: U256,
+        max_validator_weight: u64,
+    ) -> Result<u64, StorageError> {
+        let weight =
+            Self::derive_validator_weight_from_stake(stake, stake_unit, max_validator_weight)?;
+        self.set_validator_stake(validator, stake)?;
+        self.set_validator_weight(validator, weight.max(1))?;
+        Ok(weight.max(1))
     }
 
     // ── State root ─────────────────────────────────────────────
@@ -849,6 +1032,38 @@ mod tests {
         let ws2 = WorldState::at_root(store, &root).unwrap();
         assert_eq!(ws2.get_validator_weight(&v1).unwrap(), 3);
         assert_eq!(ws2.get_validator_weight(&v2).unwrap(), 1);
+    }
+
+    #[test]
+    fn validator_stake_economics_roundtrip_and_derive_weight() {
+        let store = test_store();
+        let mut ws = WorldState::new(Arc::clone(&store));
+        let validator = Address::from([0x33; 20]);
+        let stake_unit = U256::from(1_000u64);
+
+        ws.set_staking_enabled(true).unwrap();
+        ws.set_total_supply(U256::from(10_000u64)).unwrap();
+        ws.set_total_staked(U256::from(0u64)).unwrap();
+        ws.set_stake_unit(stake_unit).unwrap();
+        ws.set_max_validator_weight(10).unwrap();
+        let weight = ws
+            .set_validator_stake_and_weight(&validator, U256::from(3_500u64), stake_unit, 10)
+            .unwrap();
+        ws.set_total_staked(U256::from(3_500u64)).unwrap();
+
+        assert_eq!(weight, 3);
+        let root = ws.state_root().unwrap();
+        let ws2 = WorldState::at_root(store, &root).unwrap();
+        assert!(ws2.staking_enabled().unwrap());
+        assert_eq!(ws2.get_total_supply().unwrap(), U256::from(10_000u64));
+        assert_eq!(ws2.get_total_staked().unwrap(), U256::from(3_500u64));
+        assert_eq!(ws2.get_stake_unit().unwrap(), stake_unit);
+        assert_eq!(ws2.get_max_validator_weight().unwrap(), 10);
+        assert_eq!(
+            ws2.get_validator_stake(&validator).unwrap(),
+            U256::from(3_500u64)
+        );
+        assert_eq!(ws2.get_validator_weight(&validator).unwrap(), 3);
     }
 
     #[test]

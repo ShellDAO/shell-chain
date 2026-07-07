@@ -9,7 +9,7 @@ Deployment manifests for the **Shell-Chain wPoA public testnet** (chain_id=10).
 | Chain ID        | 10                                        |
 | Engine          | wPoA (Weighted Proof of Authority)        |
 | Block time      | 2 s                                       |
-| Validators      | 3 (weights: 2, 1, 1)                      |
+| Validators      | 3 (stake-derived weights: 2, 1, 1)        |
 | Currency        | SHELL                                     |
 | Native decimals | 18                                        |
 
@@ -24,7 +24,7 @@ mkdir -p keys
 # … copy node1.key, node2.key, node3.key here
 
 # 3. Set environment
-export SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.24.3
+export SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.26.0
 export NODE1_KEY_PATH=./keys/node1.key
 export NODE2_KEY_PATH=./keys/node2.key
 export NODE3_KEY_PATH=./keys/node3.key

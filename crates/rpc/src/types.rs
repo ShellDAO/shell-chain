@@ -295,6 +295,7 @@ pub struct RpcChainSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct RpcValidatorSnapshot {
     pub validators: serde_json::Value,
+    pub stake_derived_weights: bool,
     pub current_proposer: serde_json::Value,
     pub block_number: u64,
     pub epoch: serde_json::Value,

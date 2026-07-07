@@ -422,6 +422,56 @@ enum GenesisCommands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Configure staking economics for a genesis JSON file.
+    SetEconomics {
+        /// Path to genesis.json to modify.
+        #[arg(long)]
+        genesis: PathBuf,
+
+        /// Total SHELL minted at genesis.
+        #[arg(long)]
+        initial_supply: String,
+
+        /// Amount of staked SHELL represented by one validator weight unit.
+        #[arg(long)]
+        stake_unit: String,
+
+        /// Minimum locked stake required for an active validator.
+        #[arg(long)]
+        min_validator_stake: String,
+
+        /// Maximum derived validator weight.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_validator_weight: u64,
+
+        /// Write output to this file instead of modifying genesis in-place.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Set a validator's locked genesis stake.
+    SetValidatorStake {
+        /// Path to genesis.json to modify.
+        #[arg(long)]
+        genesis: PathBuf,
+
+        /// Validator address already present in consensus.authorities.
+        #[arg(long)]
+        address: String,
+
+        /// Locked stake amount in wei.
+        #[arg(long)]
+        stake: String,
+
+        /// Write output to this file instead of modifying genesis in-place.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Validate genesis initial_supply == alloc + locked validator stakes.
+    ValidateSupply {
+        /// Path to genesis.json to validate.
+        #[arg(long)]
+        genesis: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -758,6 +808,30 @@ async fn main() {
                 balance,
                 output,
             } => commands::genesis_add_alloc(genesis, address, balance, output),
+            GenesisCommands::SetEconomics {
+                genesis,
+                initial_supply,
+                stake_unit,
+                min_validator_stake,
+                max_validator_weight,
+                output,
+            } => commands::genesis_set_economics(
+                genesis,
+                initial_supply,
+                stake_unit,
+                min_validator_stake,
+                max_validator_weight,
+                output,
+            ),
+            GenesisCommands::SetValidatorStake {
+                genesis,
+                address,
+                stake,
+                output,
+            } => commands::genesis_set_validator_stake(genesis, address, stake, output),
+            GenesisCommands::ValidateSupply { genesis } => {
+                commands::genesis_validate_supply(genesis)
+            }
         },
         Commands::ExportState { block, output } => {
             commands::export_state(cli.datadir, output, block)

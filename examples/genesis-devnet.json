@@ -1,7 +1,7 @@
 {
   "chain_id": 1337,
   "chain_name": "shell-devnet",
-  "timestamp": 0,
+  "timestamp": 1783382400,
   "gas_limit": 30000000,
   "extra_data": "shell-devnet-genesis",
   "consensus": {

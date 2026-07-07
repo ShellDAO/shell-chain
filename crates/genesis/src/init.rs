@@ -12,6 +12,8 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     config: &GenesisConfig,
     store: std::sync::Arc<S>,
 ) -> Result<Block, GenesisError> {
+    config.validate_economics()?;
+
     let mut world_state = WorldState::new(std::sync::Arc::clone(&store));
 
     // Apply allocations
@@ -26,8 +28,41 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         world_state
             .set_validators(&authorities)
             .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        let weights = config.effective_authority_weights()?;
         world_state
-            .set_validator_weights(&authorities, &config.consensus.authority_weights())
+            .set_validator_weights(&authorities, &weights)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+    }
+
+    if let Some(economics) = &config.economics {
+        world_state
+            .set_staking_enabled(economics.staking_enabled)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        world_state
+            .set_total_supply(economics.initial_supply)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        world_state
+            .set_stake_unit(economics.stake_unit)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        world_state
+            .set_max_validator_weight(economics.max_validator_weight)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+
+        let stakes = config.consensus.authority_stakes();
+        let mut total_staked = shell_primitives::U256::ZERO;
+        for (validator, stake) in authorities.iter().zip(stakes.iter().copied()) {
+            total_staked = total_staked.saturating_add(stake);
+            world_state
+                .set_validator_stake_and_weight(
+                    validator,
+                    stake,
+                    economics.stake_unit,
+                    economics.max_validator_weight,
+                )
+                .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        }
+        world_state
+            .set_total_staked(total_staked)
             .map_err(|e| GenesisError::StateInit(e.to_string()))?;
     }
 
@@ -250,6 +285,7 @@ mod tests {
                 max_future_secs: 60,
                 epoch_length: 0,
             },
+            economics: None,
             alloc,
             boot_nodes: vec![],
         }
@@ -443,6 +479,7 @@ mod tests {
                 max_future_secs: 60,
                 epoch_length: 0,
                 weights: vec![3, 0],
+                stakes: vec![],
             },
             ..test_genesis()
         };
@@ -452,6 +489,83 @@ mod tests {
         let ws = WorldState::at_root(store, &block.header.state_root).unwrap();
         assert_eq!(ws.get_validator_weight(&v1).unwrap(), 3);
         assert_eq!(ws.get_validator_weight(&v2).unwrap(), 1);
+    }
+
+    #[test]
+    fn staking_genesis_derives_weights_and_supply_from_locked_stake() {
+        let v1 = Address::from([0x01; 32]);
+        let v2 = Address::from([0x02; 32]);
+        let faucet = Address::from([0xAA; 32]);
+        let stake_unit = U256::from(1_000u64);
+        let mut alloc = HashMap::new();
+        alloc.insert(
+            faucet,
+            AllocEntry {
+                balance: U256::from(500u64),
+                nonce: 0,
+                code: None,
+                storage: None,
+            },
+        );
+        let config = GenesisConfig {
+            consensus: ConsensusConfig::WPoA {
+                authorities: vec![v1, v2],
+                authority_pubkeys: vec![],
+                block_time_secs: 1,
+                max_future_secs: 60,
+                epoch_length: 0,
+                weights: vec![],
+                stakes: vec![U256::from(2_000u64), U256::from(1_000u64)],
+            },
+            economics: Some(crate::EconomicsConfig {
+                staking_enabled: true,
+                initial_supply: U256::from(3_500u64),
+                stake_unit,
+                min_validator_stake: stake_unit,
+                max_validator_weight: 100,
+            }),
+            alloc,
+            ..test_genesis()
+        };
+
+        let store = Arc::new(MemoryDb::new());
+        let block = initialize_genesis(&config, Arc::clone(&store)).unwrap();
+        let ws = WorldState::at_root(store, &block.header.state_root).unwrap();
+        assert!(ws.staking_enabled().unwrap());
+        assert_eq!(ws.get_total_supply().unwrap(), U256::from(3_500u64));
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(3_000u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_000u64));
+        assert_eq!(ws.get_validator_stake(&v2).unwrap(), U256::from(1_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_validator_weight(&v2).unwrap(), 1);
+    }
+
+    #[test]
+    fn staking_genesis_rejects_supply_mismatch() {
+        let v1 = Address::from([0x01; 32]);
+        let config = GenesisConfig {
+            consensus: ConsensusConfig::WPoA {
+                authorities: vec![v1],
+                authority_pubkeys: vec![],
+                block_time_secs: 1,
+                max_future_secs: 60,
+                epoch_length: 0,
+                weights: vec![],
+                stakes: vec![U256::from(1_000u64)],
+            },
+            economics: Some(crate::EconomicsConfig {
+                staking_enabled: true,
+                initial_supply: U256::from(999u64),
+                stake_unit: U256::from(1_000u64),
+                min_validator_stake: U256::from(1_000u64),
+                max_validator_weight: 100,
+            }),
+            alloc: HashMap::new(),
+            ..test_genesis()
+        };
+
+        let err = initialize_genesis(&config, Arc::new(MemoryDb::new())).unwrap_err();
+        assert!(err.to_string().contains("genesis supply mismatch"));
     }
 
     #[test]

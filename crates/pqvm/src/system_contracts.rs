@@ -13,6 +13,9 @@
 //! | ValidatorRegistry | `addValidator(address)` | validators |
 //! | ValidatorRegistry | `removeValidator(address)` | validators |
 //! | ValidatorRegistry | `setValidatorWeight(address,uint64)` | validators |
+//! | ValidatorRegistry | `setValidatorStake(address,uint256)` | validators |
+//! | ValidatorRegistry | `bondValidatorStake(address,uint256)` | self |
+//! | ValidatorRegistry | `unbondValidatorStake(address,uint256)` | self |
 //! | ValidatorRegistry | `proposeAlgorithmActivation(uint8,uint64,bytes32)` | validators |
 //! | ValidatorRegistry | `deprecateAlgorithm(uint8)` | validators |
 //! | ValidatorRegistry | `getValidators()` | anyone |
@@ -72,6 +75,15 @@ pub const REMOVE_VALIDATOR_SELECTOR: [u8; 4] = compute_selector(b"removeValidato
 /// keccak256("setValidatorWeight(address,uint64)")[..4]
 pub const SET_VALIDATOR_WEIGHT_SELECTOR: [u8; 4] =
     compute_selector(b"setValidatorWeight(address,uint64)");
+/// keccak256("setValidatorStake(address,uint256)")[..4]
+pub const SET_VALIDATOR_STAKE_SELECTOR: [u8; 4] =
+    compute_selector(b"setValidatorStake(address,uint256)");
+/// keccak256("bondValidatorStake(address,uint256)")[..4]
+pub const BOND_VALIDATOR_STAKE_SELECTOR: [u8; 4] =
+    compute_selector(b"bondValidatorStake(address,uint256)");
+/// keccak256("unbondValidatorStake(address,uint256)")[..4]
+pub const UNBOND_VALIDATOR_STAKE_SELECTOR: [u8; 4] =
+    compute_selector(b"unbondValidatorStake(address,uint256)");
 /// keccak256("proposeAlgorithmActivation(uint8,uint64,bytes32)")[..4]
 pub const PROPOSE_ALGORITHM_ACTIVATION_SELECTOR: [u8; 4] =
     compute_selector(b"proposeAlgorithmActivation(uint8,uint64,bytes32)");
@@ -181,6 +193,12 @@ pub enum SystemContractError {
     InvalidActivationHeight(u64, u64),
     #[error("duplicate vote: this validator has already cast a vote for this proposal")]
     DuplicateVote,
+    #[error("staking is disabled for this chain")]
+    StakingDisabled,
+    #[error("direct validator weight changes are disabled when stake-derived weights are active")]
+    StakeDerivedWeightsActive,
+    #[error("validator stake must derive a non-zero weight")]
+    StakeTooLow,
     #[error("activation height {0} conflicts with open proposal (stored: {1})")]
     HeightMismatch(u64, u64),
     #[error("verifier_hash conflicts with open proposal")]
@@ -237,7 +255,10 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
         let selector = decode_selector(input)?;
         if (selector == ADD_VALIDATOR_SELECTOR
             || selector == REMOVE_VALIDATOR_SELECTOR
-            || selector == SET_VALIDATOR_WEIGHT_SELECTOR)
+            || selector == SET_VALIDATOR_WEIGHT_SELECTOR
+            || selector == SET_VALIDATOR_STAKE_SELECTOR
+            || selector == BOND_VALIDATOR_STAKE_SELECTOR
+            || selector == UNBOND_VALIDATOR_STAKE_SELECTOR)
             && output == encode_bool(true)
         {
             effects.validator_set_changed = true;
@@ -286,6 +307,24 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
         s if s == SET_VALIDATOR_WEIGHT_SELECTOR => {
             let (addr, weight) = decode_address_u64(params)?;
             let applied = set_validator_weight_op(caller, &addr, weight, world_state)?;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
+            Ok((encode_bool(applied), gas))
+        }
+        s if s == SET_VALIDATOR_STAKE_SELECTOR => {
+            let (addr, stake) = decode_address_u256(params)?;
+            let applied = set_validator_stake_op(caller, &addr, stake, world_state)?;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
+            Ok((encode_bool(applied), gas))
+        }
+        s if s == BOND_VALIDATOR_STAKE_SELECTOR => {
+            let (addr, amount) = decode_address_u256(params)?;
+            let applied = bond_validator_stake(caller, &addr, amount, world_state)?;
+            let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
+            Ok((encode_bool(applied), gas))
+        }
+        s if s == UNBOND_VALIDATOR_STAKE_SELECTOR => {
+            let (addr, amount) = decode_address_u256(params)?;
+            let applied = unbond_validator_stake(caller, &addr, amount, world_state)?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
         }
@@ -437,6 +476,17 @@ fn add_validator<S: KvStore + 'static>(
             return Err(SystemContractError::ValidatorPubkeyMissing(*target));
         }
     }
+    if world_state
+        .staking_enabled()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        let stake = world_state
+            .get_validator_stake(target)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        if derived_weight(world_state, stake)? == 0 {
+            return Err(SystemContractError::StakeTooLow);
+        }
+    }
 
     if !record_validator_vote(
         world_state,
@@ -452,9 +502,19 @@ fn add_validator<S: KvStore + 'static>(
     world_state
         .set_validators(&validators)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-    world_state
-        .set_validator_weight(target, 1)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if world_state
+        .staking_enabled()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        let stake = world_state
+            .get_validator_stake(target)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        apply_validator_stake(world_state, target, stake)?;
+    } else {
+        world_state
+            .set_validator_weight(target, 1)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    }
 
     Ok(true)
 }
@@ -512,6 +572,13 @@ fn set_validator_weight_op<S: KvStore + 'static>(
     new_weight: u64,
     world_state: &mut WorldState<S>,
 ) -> Result<bool, SystemContractError> {
+    if world_state
+        .staking_enabled()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        return Err(SystemContractError::StakeDerivedWeightsActive);
+    }
+
     let validators = world_state
         .get_validators()
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -549,6 +616,182 @@ fn set_validator_weight_op<S: KvStore + 'static>(
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
 
     Ok(true)
+}
+
+fn set_validator_stake_op<S: KvStore + 'static>(
+    caller: &Address,
+    target: &Address,
+    new_stake: U256,
+    world_state: &mut WorldState<S>,
+) -> Result<bool, SystemContractError> {
+    ensure_staking_enabled(world_state)?;
+    let validators = world_state
+        .get_validators()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+
+    if !validators.contains(caller) {
+        return Err(SystemContractError::Unauthorized);
+    }
+    if derived_weight(world_state, new_stake)? == 0 {
+        return Err(SystemContractError::StakeTooLow);
+    }
+    if !record_validator_vote(
+        world_state,
+        ValidatorRegistryOp::SetStake(new_stake),
+        target,
+        caller,
+        &validators,
+    )? {
+        return Ok(false);
+    }
+
+    let old_stake = world_state
+        .get_validator_stake(target)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if new_stake > old_stake {
+        world_state
+            .sub_balance(target, new_stake - old_stake)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    } else if old_stake > new_stake {
+        world_state
+            .add_balance(target, old_stake - new_stake)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    }
+    apply_validator_stake(world_state, target, new_stake)?;
+    Ok(true)
+}
+
+fn bond_validator_stake<S: KvStore + 'static>(
+    caller: &Address,
+    target: &Address,
+    amount: U256,
+    world_state: &mut WorldState<S>,
+) -> Result<bool, SystemContractError> {
+    ensure_staking_enabled(world_state)?;
+    if caller != target {
+        return Err(SystemContractError::Unauthorized);
+    }
+    let validators = world_state
+        .get_validators()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if !validators.contains(target) {
+        return Err(SystemContractError::NotFound(*target));
+    }
+    let current = world_state
+        .get_validator_stake(target)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let updated = current
+        .checked_add(amount)
+        .ok_or_else(|| SystemContractError::AbiDecode("validator stake overflow".into()))?;
+    if derived_weight(world_state, updated)? == 0 {
+        return Err(SystemContractError::StakeTooLow);
+    }
+    world_state
+        .sub_balance(caller, amount)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    apply_validator_stake(world_state, target, updated)?;
+    Ok(true)
+}
+
+fn unbond_validator_stake<S: KvStore + 'static>(
+    caller: &Address,
+    target: &Address,
+    amount: U256,
+    world_state: &mut WorldState<S>,
+) -> Result<bool, SystemContractError> {
+    ensure_staking_enabled(world_state)?;
+    if caller != target {
+        return Err(SystemContractError::Unauthorized);
+    }
+    let validators = world_state
+        .get_validators()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if !validators.contains(target) {
+        return Err(SystemContractError::NotFound(*target));
+    }
+    let current = world_state
+        .get_validator_stake(target)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if amount > current {
+        return Err(SystemContractError::AbiDecode(
+            "cannot unbond more than validator stake".into(),
+        ));
+    }
+    let updated = current - amount;
+    if derived_weight(world_state, updated)? == 0 {
+        return Err(SystemContractError::StakeTooLow);
+    }
+    apply_validator_stake(world_state, target, updated)?;
+    world_state
+        .add_balance(caller, amount)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(true)
+}
+
+fn ensure_staking_enabled<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+) -> Result<(), SystemContractError> {
+    if world_state
+        .staking_enabled()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        Ok(())
+    } else {
+        Err(SystemContractError::StakingDisabled)
+    }
+}
+
+fn derived_weight<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+    stake: U256,
+) -> Result<u64, SystemContractError> {
+    let stake_unit = world_state
+        .get_stake_unit()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let max_weight = world_state
+        .get_max_validator_weight()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    WorldState::<S>::derive_validator_weight_from_stake(stake, stake_unit, max_weight)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))
+}
+
+fn apply_validator_stake<S: KvStore + 'static>(
+    world_state: &mut WorldState<S>,
+    target: &Address,
+    new_stake: U256,
+) -> Result<(), SystemContractError> {
+    let old_stake = world_state
+        .get_validator_stake(target)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let total_staked = world_state
+        .get_total_staked()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let updated_total = if new_stake >= old_stake {
+        total_staked
+            .checked_add(new_stake - old_stake)
+            .ok_or_else(|| SystemContractError::AbiDecode("total staked overflow".into()))?
+    } else {
+        total_staked.saturating_sub(old_stake - new_stake)
+    };
+    let stake_unit = world_state
+        .get_stake_unit()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let max_weight = world_state
+        .get_max_validator_weight()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let weight =
+        WorldState::<S>::derive_validator_weight_from_stake(new_stake, stake_unit, max_weight)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if weight == 0 {
+        return Err(SystemContractError::StakeTooLow);
+    }
+    world_state
+        .set_validator_stake_and_weight(target, new_stake, stake_unit, max_weight)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    world_state
+        .set_total_staked(updated_total)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 fn propose_algorithm_activation_op<S: KvStore + 'static>(
@@ -700,6 +943,7 @@ enum ValidatorRegistryOp {
     Add,
     Remove,
     SetWeight(u64),
+    SetStake(U256),
 }
 
 impl ValidatorRegistryOp {
@@ -708,12 +952,15 @@ impl ValidatorRegistryOp {
             Self::Add => b"add",
             Self::Remove => b"remove",
             Self::SetWeight(_) => b"set_weight",
+            Self::SetStake(_) => b"set_stake",
         }
     }
 
     fn write_context(self, bytes: &mut Vec<u8>) {
-        if let Self::SetWeight(weight) = self {
-            bytes.extend_from_slice(&weight.to_be_bytes());
+        match self {
+            Self::SetWeight(weight) => bytes.extend_from_slice(&weight.to_be_bytes()),
+            Self::SetStake(stake) => bytes.extend_from_slice(&stake.to_be_bytes::<32>()),
+            Self::Add | Self::Remove => {}
         }
     }
 }
@@ -1643,6 +1890,31 @@ pub fn encode_set_validator_weight_calldata(address: &Address, weight: u64) -> V
     data
 }
 
+fn encode_address_u256_calldata(selector: &[u8; 4], address: &Address, value: U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4usize.saturating_add(64));
+    data.extend_from_slice(selector);
+    let mut addr_word = [0u8; 32];
+    addr_word.copy_from_slice(address.as_bytes());
+    data.extend_from_slice(&addr_word);
+    data.extend_from_slice(&value.to_be_bytes::<32>());
+    data
+}
+
+/// Encode calldata for `setValidatorStake(address,uint256)`.
+pub fn encode_set_validator_stake_calldata(address: &Address, stake: U256) -> Vec<u8> {
+    encode_address_u256_calldata(&SET_VALIDATOR_STAKE_SELECTOR, address, stake)
+}
+
+/// Encode calldata for `bondValidatorStake(address,uint256)`.
+pub fn encode_bond_validator_stake_calldata(address: &Address, amount: U256) -> Vec<u8> {
+    encode_address_u256_calldata(&BOND_VALIDATOR_STAKE_SELECTOR, address, amount)
+}
+
+/// Encode calldata for `unbondValidatorStake(address,uint256)`.
+pub fn encode_unbond_validator_stake_calldata(address: &Address, amount: U256) -> Vec<u8> {
+    encode_address_u256_calldata(&UNBOND_VALIDATOR_STAKE_SELECTOR, address, amount)
+}
+
 /// Encode calldata for `proposeAlgorithmActivation(uint8,uint64,bytes32)`.
 ///
 /// ABI layout: selector (4) + algo_id (32) + activation_height (32) + verifier_hash (32).
@@ -1689,6 +1961,22 @@ pub fn decode_address_u64(input: &[u8]) -> Result<(Address, u64), SystemContract
             .map_err(|_| SystemContractError::AbiDecode("bad uint64 word".into()))?,
     );
     Ok((addr, weight))
+}
+
+/// Decode `(address, uint256)` from ABI-encoded params (2 × 32-byte words).
+pub fn decode_address_u256(input: &[u8]) -> Result<(Address, U256), SystemContractError> {
+    if input.len() < 64 {
+        return Err(SystemContractError::AbiDecode(format!(
+            "expected 64 bytes for (address, uint256), got {}",
+            input.len()
+        )));
+    }
+    let raw32: [u8; 32] = input[0..32]
+        .try_into()
+        .map_err(|_| SystemContractError::AbiDecode("bad address word".into()))?;
+    let addr = Address::from(raw32);
+    let value = U256::from_be_slice(&input[32..64]);
+    Ok((addr, value))
 }
 
 /// Encode calldata for `setGuardians(address[],uint8,uint64)`.
@@ -1962,6 +2250,14 @@ mod tests {
         ws
     }
 
+    fn enable_staking(ws: &mut WorldState<MemoryDb>, stake_unit: U256) {
+        ws.set_staking_enabled(true).unwrap();
+        ws.set_stake_unit(stake_unit).unwrap();
+        ws.set_max_validator_weight(100).unwrap();
+        ws.set_total_supply(U256::from(1_000_000u64)).unwrap();
+        ws.set_total_staked(U256::ZERO).unwrap();
+    }
+
     fn setup_account_manager() -> (WorldState<MemoryDb>, ChainStore<MemoryDb>) {
         let ws = WorldState::new(Arc::new(MemoryDb::new()));
         let cs = ChainStore::new(Arc::new(MemoryDb::new()));
@@ -2165,6 +2461,68 @@ mod tests {
 
         let (third_output, _) = execute_system_contract(&v1, &calldata, &mut ws).unwrap();
         assert_eq!(third_output, encode_bool(true));
+        assert!(ws.get_validators().unwrap().contains(&new_val));
+        assert_eq!(ws.get_validator_weight(&new_val).unwrap(), 1);
+    }
+
+    #[test]
+    fn staking_mode_rejects_direct_weight_changes() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        let calldata = encode_set_validator_weight_calldata(&v1, 2);
+
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+        assert!(matches!(
+            err,
+            SystemContractError::StakeDerivedWeightsActive
+        ));
+    }
+
+    #[test]
+    fn staking_mode_sets_stake_and_derives_weight_after_quorum() {
+        let v1 = Address::from([0x01; 20]);
+        let v2 = Address::from([0x02; 20]);
+        let v3 = Address::from([0x03; 20]);
+        let mut ws = setup_with_validators(&[v1, v2, v3]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        for v in [v1, v2, v3] {
+            ws.set_validator_stake_and_weight(&v, U256::from(1_000u64), U256::from(1_000u64), 100)
+                .unwrap();
+        }
+        ws.set_total_staked(U256::from(3_000u64)).unwrap();
+        ws.add_balance(&v1, U256::from(2_000u64)).unwrap();
+        let calldata = encode_set_validator_stake_calldata(&v1, U256::from(2_500u64));
+
+        let (first_output, _) = execute_system_contract(&v1, &calldata, &mut ws).unwrap();
+        assert_eq!(first_output, encode_bool(false));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 1);
+
+        let (second_output, _) = execute_system_contract(&v2, &calldata, &mut ws).unwrap();
+        assert_eq!(second_output, encode_bool(true));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_500u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(4_500u64));
+    }
+
+    #[test]
+    fn staking_mode_requires_pre_stake_before_add_validator() {
+        let v1 = Address::from([0x01; 20]);
+        let new_val = Address::from([0x04; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        ws.add_balance(&new_val, U256::from(1_000u64)).unwrap();
+        let calldata = encode_add_validator_calldata(&new_val);
+
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+        assert!(matches!(err, SystemContractError::StakeTooLow));
+
+        let stake_calldata = encode_set_validator_stake_calldata(&new_val, U256::from(1_000u64));
+        let (stake_output, _) = execute_system_contract(&v1, &stake_calldata, &mut ws).unwrap();
+        assert_eq!(stake_output, encode_bool(true));
+
+        let (add_output, _) = execute_system_contract(&v1, &calldata, &mut ws).unwrap();
+        assert_eq!(add_output, encode_bool(true));
         assert!(ws.get_validators().unwrap().contains(&new_val));
         assert_eq!(ws.get_validator_weight(&new_val).unwrap(), 1);
     }

@@ -99,6 +99,7 @@ pub fn init(
                     max_future_secs: 60,
                     epoch_length: 0,
                 },
+                economics: None,
                 alloc,
                 boot_nodes: vec![],
             }

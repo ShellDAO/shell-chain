@@ -450,6 +450,14 @@ pub trait ShellApi {
         address: String,
     ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Encode calldata for `setValidatorStake(address,uint256)` system contract call.
+    #[method(name = "encodeSetValidatorStake")]
+    async fn encode_set_validator_stake(
+        &self,
+        address: String,
+        stake: String,
+    ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Propose adding a validator via system contract transaction.
     /// Requires the node to be configured as a validator.
     /// Returns the transaction hash on success.
@@ -477,6 +485,15 @@ pub trait ShellApi {
         &self,
         address: String,
         weight: u64,
+    ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Propose updating a validator's locked stake via system contract transaction.
+    /// In staking mode, consensus weight is derived from this stake.
+    #[method(name = "proposeSetValidatorStake")]
+    async fn propose_set_validator_stake(
+        &self,
+        address: String,
+        stake: String,
     ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
     /// Returns whether an address is currently a validator.

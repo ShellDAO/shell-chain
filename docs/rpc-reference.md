@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (42 methods)
+- **`shell_`** (44 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -507,6 +507,13 @@ encode_remove_validator(address: String, ) → String
 
 Encode calldata for `removeValidator(address)` system contract call.
 
+### shell_encodeSetValidatorStake
+```
+encode_set_validator_stake(address: String, stake: String, ) → String
+```
+
+Encode calldata for `setValidatorStake(address,uint256)` system contract call.
+
 ### shell_proposeAddValidator
 ```
 propose_add_validator(address: String, ) → String
@@ -534,6 +541,14 @@ Propose updating a validator's governance weight via system contract transaction
 Requires the node to be configured as a validator.
 Takes effect when a weighted quorum (>2/3 of total weight) supports the change.
 Returns the transaction hash on success.
+
+### shell_proposeSetValidatorStake
+```
+propose_set_validator_stake(address: String, stake: String, ) → String
+```
+
+Propose updating a validator's locked stake via system contract transaction.
+In staking mode, consensus weight is derived from this stake.
 
 ### shell_getValidatorStatus
 ```

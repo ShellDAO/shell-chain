@@ -505,6 +505,7 @@ async fn run_with_store<S: KvStore + 'static>(
                 max_future_secs: 60,
                 epoch_length: 0,
             },
+            economics: None,
             alloc,
             boot_nodes: vec![],
         };
@@ -587,13 +588,9 @@ async fn run_with_store<S: KvStore + 'static>(
             };
             let build_wpoa = || -> WPoaConfig {
                 let base_poa = build_poa();
-                match &genesis_config.consensus {
-                    ConsensusConfig::WPoA { weights, .. } => {
-                        if weights.len() == authorities.len() {
-                            WPoaConfig::with_weights(base_poa, weights.clone())
-                        } else {
-                            WPoaConfig::from_poa(base_poa)
-                        }
+                match genesis_config.effective_authority_weights() {
+                    Ok(weights) if weights.len() == authorities.len() => {
+                        WPoaConfig::with_weights(base_poa, weights)
                     }
                     _ => WPoaConfig::from_poa(base_poa),
                 }
@@ -1043,6 +1040,7 @@ mod tests {
                 max_future_secs: 60,
                 epoch_length: 0,
             },
+            economics: None,
             alloc: HashMap::from([(
                 authority,
                 AllocEntry {

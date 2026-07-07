@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
+
+### Added
+
+- Added staking-enabled wPoA genesis economics: `initial_supply`,
+  `stake_unit`, `min_validator_stake`, `max_validator_weight`, and
+  per-validator locked `stakes`.
+- Validator weights can now be derived from staked SHELL at genesis and stored
+  in the validator registry alongside total supply and total staked counters.
+- Added system-contract calldata and RPC helpers for stake-driven validator
+  governance.
+
+### Changed
+
+- Updated testnet/devnet genesis examples to use a non-zero 2026 genesis
+  timestamp and documented the initial supply invariant.
+
 ## [0.25.2] — 2026-07-07 — Runtime hardening and RPC bounds
 
 ### Fixed

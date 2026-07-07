@@ -2,7 +2,7 @@
   "chain_id": 10,
   "chain_name": "shell-testnet-wpoa",
   "network_type": "Testnet",
-  "timestamp": 1700000000,
+  "timestamp": 1783382400,
   "gas_limit": 30000000,
   "extra_data": "shell-testnet-wpoa-genesis",
   "consensus": {
@@ -12,10 +12,21 @@
       "0x0000000000000000000000000000000000000000000000000000000000000002",
       "0x0000000000000000000000000000000000000000000000000000000000000003"
     ],
-    "weights": [2, 1, 1],
+    "stakes": [
+      "0x6c6b935b8bbd400000",
+      "0x3635c9adc5dea00000",
+      "0x3635c9adc5dea00000"
+    ],
     "block_time_secs": 2,
     "max_future_secs": 60,
     "epoch_length": 0
+  },
+  "economics": {
+    "staking_enabled": true,
+    "initial_supply": "0x1b1bc2e24e29c640000",
+    "stake_unit": "0x3635c9adc5dea00000",
+    "min_validator_stake": "0x3635c9adc5dea00000",
+    "max_validator_weight": 1000000
   },
   "alloc": {
     "0x0000000000000000000000000000000000000000000000000000000000000001": {

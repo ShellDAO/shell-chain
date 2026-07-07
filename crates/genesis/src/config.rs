@@ -149,6 +149,10 @@ pub struct GenesisConfig {
     pub extra_data: String,
     /// Consensus engine configuration.
     pub consensus: ConsensusConfig,
+    /// Optional economic parameters used to derive wPoA weights from locked
+    /// validator stake at genesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economics: Option<EconomicsConfig>,
     /// Initial account allocations (address → balance + optional code/storage).
     #[serde(default)]
     pub alloc: HashMap<Address, AllocEntry>,
@@ -217,9 +221,44 @@ pub enum ConsensusConfig {
         #[serde(default)]
         epoch_length: u64,
         /// Per-validator weights (aligned with `authorities`). Defaults to all-1.
+        ///
+        /// Legacy field. New staking-enabled genesis files should leave this
+        /// empty and set `stakes` instead so weights are derived from SHELL
+        /// stake.
         #[serde(default)]
         weights: Vec<u64>,
+        /// Locked validator stakes aligned with `authorities`.
+        ///
+        /// Used only when `economics.staking_enabled` is true.
+        #[serde(default)]
+        stakes: Vec<U256>,
     },
+}
+
+fn default_staking_enabled() -> bool {
+    true
+}
+
+fn default_max_validator_weight() -> u64 {
+    1_000_000
+}
+
+/// Economic parameters embedded in genesis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EconomicsConfig {
+    /// Enables stake-derived wPoA weights.
+    #[serde(default = "default_staking_enabled")]
+    pub staking_enabled: bool,
+    /// Total SHELL minted at genesis. Must equal spendable alloc plus locked
+    /// validator stake when staking is enabled.
+    pub initial_supply: U256,
+    /// Amount of staked SHELL represented by one validator weight unit.
+    pub stake_unit: U256,
+    /// Minimum stake required for a genesis validator to be active.
+    pub min_validator_stake: U256,
+    /// Maximum derived validator weight after clamping.
+    #[serde(default = "default_max_validator_weight")]
+    pub max_validator_weight: u64,
 }
 
 impl ConsensusConfig {
@@ -287,6 +326,25 @@ impl ConsensusConfig {
                 .map(|idx| weights.get(idx).copied().unwrap_or(1).max(1))
                 .collect(),
         }
+    }
+
+    /// Return validator stakes aligned with `authorities`.
+    pub fn authority_stakes(&self) -> Vec<U256> {
+        match self {
+            Self::PoA { authorities, .. } => vec![U256::ZERO; authorities.len()],
+            Self::WPoA {
+                authorities,
+                stakes,
+                ..
+            } => (0..authorities.len())
+                .map(|idx| stakes.get(idx).copied().unwrap_or(U256::ZERO))
+                .collect(),
+        }
+    }
+
+    /// Returns true when the legacy explicit weights vector is present.
+    pub fn has_explicit_weights(&self) -> bool {
+        matches!(self, Self::WPoA { weights, .. } if !weights.is_empty())
     }
 }
 
@@ -372,6 +430,136 @@ impl GenesisConfig {
         }
         Ok(())
     }
+
+    /// Return true when this genesis derives validator weights from stake.
+    pub fn staking_enabled(&self) -> bool {
+        self.economics
+            .as_ref()
+            .map(|e| e.staking_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Derive a validator weight from a locked stake using genesis economics.
+    pub fn derive_validator_weight(&self, stake: U256) -> Result<u64, GenesisError> {
+        let economics = self
+            .economics
+            .as_ref()
+            .ok_or_else(|| GenesisError::Validation("missing economics config".into()))?;
+        derive_weight_from_stake(stake, economics)
+    }
+
+    /// Return validator weights aligned with authorities, using stake-derived
+    /// weights when enabled and legacy explicit weights otherwise.
+    pub fn effective_authority_weights(&self) -> Result<Vec<u64>, GenesisError> {
+        if !self.staking_enabled() {
+            return Ok(self.consensus.authority_weights());
+        }
+        self.consensus
+            .authority_stakes()
+            .into_iter()
+            .map(|stake| self.derive_validator_weight(stake))
+            .collect()
+    }
+
+    /// Validate staking economics and initial supply invariants.
+    pub fn validate_economics(&self) -> Result<(), GenesisError> {
+        let Some(economics) = &self.economics else {
+            return Ok(());
+        };
+        if !economics.staking_enabled {
+            return Ok(());
+        }
+        if economics.initial_supply == U256::ZERO {
+            return Err(GenesisError::Validation(
+                "economics.initial_supply must be greater than zero".into(),
+            ));
+        }
+        if economics.stake_unit == U256::ZERO {
+            return Err(GenesisError::Validation(
+                "economics.stake_unit must be greater than zero".into(),
+            ));
+        }
+        if economics.max_validator_weight == 0 {
+            return Err(GenesisError::Validation(
+                "economics.max_validator_weight must be greater than zero".into(),
+            ));
+        }
+        if !matches!(self.consensus, ConsensusConfig::WPoA { .. }) {
+            return Err(GenesisError::Validation(
+                "stake-derived validator weights require wpoa consensus".into(),
+            ));
+        }
+        if self.consensus.has_explicit_weights() {
+            return Err(GenesisError::Validation(
+                "staking-enabled genesis must not also define explicit consensus.weights".into(),
+            ));
+        }
+
+        let authorities = self.consensus.authorities();
+        let stakes = match &self.consensus {
+            ConsensusConfig::WPoA { stakes, .. } => {
+                if stakes.len() != authorities.len() {
+                    return Err(GenesisError::Validation(format!(
+                        "validator stakes length {} does not match authorities length {}",
+                        stakes.len(),
+                        authorities.len()
+                    )));
+                }
+                stakes.clone()
+            }
+            ConsensusConfig::PoA { .. } => unreachable!("PoA rejected above"),
+        };
+
+        let mut total_staked = U256::ZERO;
+        for (idx, stake) in stakes.iter().copied().enumerate() {
+            if stake < economics.min_validator_stake {
+                return Err(GenesisError::Validation(format!(
+                    "validator stake at index {idx} is below min_validator_stake"
+                )));
+            }
+            let weight = derive_weight_from_stake(stake, economics)?;
+            if weight == 0 {
+                return Err(GenesisError::Validation(format!(
+                    "validator stake at index {idx} derives zero weight"
+                )));
+            }
+            total_staked = total_staked
+                .checked_add(stake)
+                .ok_or_else(|| GenesisError::Validation("validator stake total overflow".into()))?;
+        }
+
+        let mut total_alloc = U256::ZERO;
+        for entry in self.alloc.values() {
+            total_alloc = total_alloc
+                .checked_add(entry.balance)
+                .ok_or_else(|| GenesisError::Validation("genesis alloc total overflow".into()))?;
+        }
+        let observed_supply = total_alloc
+            .checked_add(total_staked)
+            .ok_or_else(|| GenesisError::Validation("genesis supply total overflow".into()))?;
+        if observed_supply != economics.initial_supply {
+            return Err(GenesisError::Validation(format!(
+                "genesis supply mismatch: alloc + validator stakes = {observed_supply}, initial_supply = {}",
+                economics.initial_supply
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn derive_weight_from_stake(
+    stake: U256,
+    economics: &EconomicsConfig,
+) -> Result<u64, GenesisError> {
+    if economics.stake_unit == U256::ZERO {
+        return Err(GenesisError::Validation(
+            "economics.stake_unit must be greater than zero".into(),
+        ));
+    }
+    let raw = stake / economics.stake_unit;
+    let max = U256::from(economics.max_validator_weight);
+    let clamped = raw.min(max);
+    Ok(clamped.to::<u64>())
 }
 
 use thiserror::Error;

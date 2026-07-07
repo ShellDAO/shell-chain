@@ -1,7 +1,7 @@
 {
   "chain_id": 31337,
   "chain_name": "shell-testnet",
-  "timestamp": 1700000000,
+  "timestamp": 1783382400,
   "gas_limit": 30000000,
   "extra_data": "shell-testnet-genesis",
   "consensus": {

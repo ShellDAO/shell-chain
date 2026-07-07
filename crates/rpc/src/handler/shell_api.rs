@@ -687,6 +687,10 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 .get("validators")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([])),
+            stake_derived_weights: consensus
+                .get("stakeDerivedWeights")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             current_proposer: consensus
                 .get("current_proposer")
                 .cloned()
@@ -748,6 +752,17 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(format!("0x{}", hex::encode(calldata)))
     }
 
+    async fn encode_set_validator_stake(
+        &self,
+        address: String,
+        stake: String,
+    ) -> Result<String, ErrorObjectOwned> {
+        let addr = parse_address(&address)?;
+        let stake = parse_hex_u256(&stake)?;
+        let calldata = shell_pqvm::encode_set_validator_stake_calldata(&addr, stake);
+        Ok(format!("0x{}", hex::encode(calldata)))
+    }
+
     async fn propose_add_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
         let calldata = shell_pqvm::encode_add_validator_calldata(&addr);
@@ -773,6 +788,18 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(format!("0x{}", hex::encode(hash.0)))
     }
 
+    async fn propose_set_validator_stake(
+        &self,
+        address: String,
+        stake: String,
+    ) -> Result<String, ErrorObjectOwned> {
+        let addr = parse_address(&address)?;
+        let stake = parse_hex_u256(&stake)?;
+        let calldata = shell_pqvm::encode_set_validator_stake_calldata(&addr, stake);
+        let hash = self.propose_validator_tx(calldata)?;
+        Ok(format!("0x{}", hex::encode(hash.0)))
+    }
+
     async fn get_validator_status(
         &self,
         address: Address,
@@ -780,26 +807,36 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let ws = self.world_state.read();
         let validators = ws.get_validators().map_err(internal_err)?;
         let is_validator = validators.contains(&address);
+        let weight = ws.get_validator_weight(&address).map_err(internal_err)?;
+        let stake = ws.get_validator_stake(&address).map_err(internal_err)?;
         Ok(serde_json::json!({
             "address": address,
             "isValidator": is_validator,
+            "weight": weight,
+            "stake": hex_u256(stake),
         }))
     }
 
     async fn get_governance_info(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
         let ws = self.world_state.read();
         let validators = ws.get_validators().map_err(internal_err)?;
+        let total_supply = ws.get_total_supply().map_err(internal_err)?;
+        let total_staked = ws.get_total_staked().map_err(internal_err)?;
+        let staking_enabled = ws.staking_enabled().map_err(internal_err)?;
         Ok(serde_json::json!({
             "validatorCount": validators.len(),
             "validators": validators,
             "systemContractAddress": shell_pqvm::registry_address(),
             "proposalGasLimit": 100_000,
+            "stakingEnabled": staking_enabled,
+            "totalSupply": hex_u256(total_supply),
+            "totalStaked": hex_u256(total_staked),
         }))
     }
 
     async fn estimate_governance_gas(&self, operation: String) -> Result<String, ErrorObjectOwned> {
         let gas = match operation.as_str() {
-            "addValidator" | "removeValidator" => {
+            "addValidator" | "removeValidator" | "setValidatorStake" => {
                 shell_pqvm::SYSTEM_CALL_BASE_GAS + shell_pqvm::SYSTEM_CALL_OP_GAS
             }
             "getValidators" | "isValidator" => shell_pqvm::SYSTEM_CALL_BASE_GAS,
@@ -976,9 +1013,25 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
         // Build validator list with weights.
         let weights = engine.validator_weights();
+        let staking_enabled = self
+            .world_state
+            .read()
+            .staking_enabled()
+            .map_err(internal_err)?;
         let mut validators: Vec<serde_json::Value> = weights
             .iter()
-            .map(|(addr, w)| serde_json::json!({ "address": format!("{addr}"), "weight": w }))
+            .map(|(addr, w)| {
+                let stake = self
+                    .world_state
+                    .read()
+                    .get_validator_stake(addr)
+                    .unwrap_or(U256::ZERO);
+                serde_json::json!({
+                    "address": format!("{addr}"),
+                    "weight": w,
+                    "stake": hex_u256(stake),
+                })
+            })
             .collect();
         validators.sort_by_key(|v| v["address"].as_str().unwrap_or("").to_string());
 
@@ -997,6 +1050,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(serde_json::json!({
             "engine": engine_name,
             "validators": validators,
+            "stakeDerivedWeights": staking_enabled,
             "current_proposer": format!("{current_proposer}"),
             "block_number": head_number,
             "epoch": epoch,
