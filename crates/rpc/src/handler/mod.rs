@@ -825,7 +825,7 @@ pub(crate) fn parse_block_tag(s: &str) -> Result<BlockTag, ErrorObjectOwned> {
         "pending" => Ok(BlockTag::Pending),
         "earliest" => Ok(BlockTag::Number(0)),
         hex if hex.starts_with("0x") => parse_hex_u64(hex).map(BlockTag::Number),
-        _ => Err(invalid_params_err(format!("invalid block number: {s}"))),
+        _ => Err(invalid_block_tag_err()),
     }
 }
 
@@ -843,8 +843,12 @@ pub(crate) fn validate_state_block_is_latest(s: &str) -> Result<(), ErrorObjectO
                 "historical state queries are not supported; use latest or pending",
             ))
         }
-        _ => Err(invalid_params_err(format!("invalid block tag: {s}"))),
+        _ => Err(invalid_block_tag_err()),
     }
+}
+
+fn invalid_block_tag_err() -> ErrorObjectOwned {
+    invalid_params_err("invalid block tag: expected latest, pending, earliest, safe, finalized, or 0x-prefixed quantity")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1447,6 +1451,27 @@ mod tests {
         assert!(
             !err.message().contains(&"f".repeat(128)),
             "error should not reflect large invalid quantities"
+        );
+    }
+
+    #[test]
+    fn block_tag_errors_do_not_echo_large_invalid_input() {
+        let value = "not-a-block-tag".repeat(128);
+        let err = match parse_block_tag(&value) {
+            Ok(_) => panic!("large invalid block tag should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.message().contains("invalid block tag"));
+        assert!(
+            !err.message().contains("not-a-block-tag"),
+            "block tag errors should not reflect caller input"
+        );
+
+        let err = validate_state_block_is_latest(&value).unwrap_err();
+        assert!(err.message().contains("invalid block tag"));
+        assert!(
+            !err.message().contains("not-a-block-tag"),
+            "state block validation errors should not reflect caller input"
         );
     }
 
