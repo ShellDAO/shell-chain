@@ -89,6 +89,7 @@ pub struct Libp2pNetwork {
     event_rx: mpsc::Receiver<NetworkEvent>,
     peer_count: Arc<AtomicUsize>,
     bandwidth: Arc<BandwidthTracker>,
+    max_msg_size: usize,
 }
 
 impl Libp2pNetwork {
@@ -145,6 +146,7 @@ impl Libp2pNetwork {
             attestation_topic,
             bandwidth: Arc::clone(&bandwidth),
             boot_nodes,
+            max_msg_size: config.max_message_size,
         };
 
         tokio::spawn(swarm_loop(swarm, cmd_rx, event_tx, loop_config));
@@ -154,6 +156,7 @@ impl Libp2pNetwork {
             event_rx,
             peer_count,
             bandwidth,
+            max_msg_size: config.max_message_size,
         })
     }
 
@@ -238,6 +241,7 @@ fn build_swarm_with_identity(
     let blocks_topic_name = config.blocks_topic.clone();
     let txs_topic_name = config.txs_topic.clone();
     let attestation_topic_name = config.attestation_topic.clone();
+    let max_msg_size = config.max_message_size;
 
     // Build libp2p connection limits from config.
     let mut conn_limits = connection_limits::ConnectionLimits::default();
@@ -299,7 +303,7 @@ fn build_swarm_with_identity(
         .validation_mode(gossipsub::ValidationMode::Strict)
         .validate_messages() // F-062: hold messages until application validates
         .message_id_fn(message_id_fn)
-        .max_transmit_size(50 * 1024 * 1024) // 50 MiB — PQ sigs (ML-DSA-65 ~3.3 KB) inflate blocks
+        .max_transmit_size(max_msg_size)
         .build()
         .map_err(|e| NetworkError::Transport(format!("gossipsub config: {e}")))?;
 
@@ -535,6 +539,7 @@ struct SwarmLoopConfig {
     attestation_topic: IdentTopic,
     bandwidth: Arc<BandwidthTracker>,
     boot_nodes: Vec<Multiaddr>,
+    max_msg_size: usize,
 }
 
 /// Background task that drives the libp2p Swarm.
@@ -630,8 +635,7 @@ async fn swarm_loop(
                     event,
                     &mut swarm,
                     &event_tx,
-                    &loop_config.peer_count,
-                    &loop_config.bandwidth,
+                    &loop_config,
                     &mut peer_tracker,
                     &mut peer_ban_list,
                 ).await;
@@ -704,8 +708,7 @@ async fn handle_swarm_event(
     event: SwarmEvent<ShellBehaviourEvent>,
     swarm: &mut Swarm<ShellBehaviour>,
     event_tx: &mpsc::Sender<NetworkEvent>,
-    peer_count: &Arc<AtomicUsize>,
-    bandwidth: &Arc<BandwidthTracker>,
+    loop_config: &SwarmLoopConfig,
     peer_tracker: &mut crate::security::PeerTracker,
     peer_ban_list: &mut crate::security::PeerBanList,
 ) {
@@ -718,12 +721,12 @@ async fn handle_swarm_event(
         })) => {
             let data_len = message.data.len() as u64;
             // F-069: reject messages exceeding the application-level size limit.
-            if message.data.len() > crate::message::MAX_MESSAGE_SIZE {
+            if message.data.len() > loop_config.max_msg_size {
                 warn!(
                     bytes = message.data.len(),
-                    limit = crate::message::MAX_MESSAGE_SIZE,
+                    limit = loop_config.max_msg_size,
                     peer = %propagation_source,
-                    "Message exceeds MAX_MESSAGE_SIZE — rejecting"
+                    "Message exceeds configured message size limit — rejecting"
                 );
                 // F-305: Record violation for oversized messages.
                 let peer = PeerId(propagation_source.to_string());
@@ -742,7 +745,7 @@ async fn handle_swarm_event(
                 return;
             }
             // F-065: drop message when bandwidth limit exceeded.
-            if !bandwidth.record_inbound(data_len) {
+            if !loop_config.bandwidth.record_inbound(data_len) {
                 warn!(
                     bytes = data_len,
                     peer = %propagation_source,
@@ -759,10 +762,7 @@ async fn handle_swarm_event(
                 return;
             }
             let peer = PeerId(propagation_source.to_string());
-            match crate::message::deserialize_checked(
-                &message.data,
-                crate::message::MAX_MESSAGE_SIZE,
-            ) {
+            match crate::message::deserialize_checked(&message.data, loop_config.max_msg_size) {
                 Ok(msg) => {
                     // F-062: accept valid message so gossipsub propagates it.
                     swarm
@@ -839,7 +839,7 @@ async fn handle_swarm_event(
                     .send(NetworkEvent::PeerConnected(PeerId(peer_id.to_string())))
                     .await;
             }
-            update_peer_count(swarm, peer_count);
+            update_peer_count(swarm, &loop_config.peer_count);
         }
         // mDNS peer expired.
         SwarmEvent::Behaviour(ShellBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -853,7 +853,7 @@ async fn handle_swarm_event(
                     .send(NetworkEvent::PeerDisconnected(PeerId(peer_id.to_string())))
                     .await;
             }
-            update_peer_count(swarm, peer_count);
+            update_peer_count(swarm, &loop_config.peer_count);
         }
         // Relay client events.
         SwarmEvent::Behaviour(ShellBehaviourEvent::RelayClient(event)) => {
@@ -940,14 +940,14 @@ async fn handle_swarm_event(
                 return;
             }
             debug!("Connected to {peer_id}");
-            update_peer_count(swarm, peer_count);
+            update_peer_count(swarm, &loop_config.peer_count);
         }
         // Connection closed.
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             let peer = PeerId(peer_id.to_string());
             peer_tracker.remove_peer(&peer);
             debug!("Disconnected from {peer_id}");
-            update_peer_count(swarm, peer_count);
+            update_peer_count(swarm, &loop_config.peer_count);
         }
         // Outgoing connection failed — surface relay/NAT failures for debugging.
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1029,6 +1029,7 @@ impl NetworkService for Libp2pNetwork {
 
         let data =
             serde_json::to_vec(&msg).map_err(|e| NetworkError::Serialization(e.to_string()))?;
+        crate::message::validate_message_size(&data, self.max_msg_size)?;
         crate::message::validate_message_size(&data, msg.max_serialized_size())?;
 
         self.cmd_tx
@@ -1088,6 +1089,30 @@ mod tests {
     fn config_defaults_enable_peer_scoring() {
         let config = NetworkConfig::default();
         assert!(config.enable_peer_scoring);
+    }
+
+    #[tokio::test]
+    async fn libp2p_broadcast_respects_configured_message_limit() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            max_message_size: 1,
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_peer_scoring: false,
+            enable_relay: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let network = Libp2pNetwork::new(&config).await.unwrap();
+
+        let err = network.broadcast(NetworkMessage::Ping).await.unwrap_err();
+        match err {
+            NetworkError::MessageTooLarge { limit, .. } => assert_eq!(limit, 1),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        network.shutdown().await.unwrap();
     }
 
     #[test]
