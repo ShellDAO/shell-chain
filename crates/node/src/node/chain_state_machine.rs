@@ -15,6 +15,12 @@ pub(crate) enum BlockImportTransition {
 pub(crate) struct ChainStateMachine;
 
 impl ChainStateMachine {
+    pub(crate) fn next_block_number(parent_number: u64) -> Result<u64, NodeError> {
+        parent_number
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Startup("block number overflows u64".into()))
+    }
+
     pub(crate) fn classify_import(
         head_number: u64,
         head_hash: ShellHash,
@@ -34,13 +40,13 @@ impl ChainStateMachine {
             });
         }
 
-        let expected = head_number.saturating_add(1);
         if incoming_number == head_number && incoming_hash != head_hash {
             return Ok(BlockImportTransition::SameHeightFork);
         }
         if incoming_number <= head_number {
             return Ok(BlockImportTransition::DuplicateOrStale);
         }
+        let expected = Self::next_block_number(head_number)?;
         if incoming_number == expected && incoming_parent != head_hash {
             return Ok(BlockImportTransition::NextHeightFork);
         }
@@ -106,6 +112,13 @@ mod tests {
 
     fn h(byte: u8) -> ShellHash {
         ShellHash::from_slice(&[byte; 32])
+    }
+
+    #[test]
+    fn next_block_number_rejects_height_overflow() {
+        assert_eq!(ChainStateMachine::next_block_number(41).unwrap(), 42);
+        let err = ChainStateMachine::next_block_number(u64::MAX).unwrap_err();
+        assert!(matches!(err, NodeError::Startup(message) if message.contains("overflows u64")));
     }
 
     #[test]

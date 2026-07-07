@@ -54,7 +54,8 @@ impl<S: KvStore + 'static> Node<S> {
                     cfg.block_time_secs
                 )));
             }
-            if block.header.number != parent.header.number.saturating_add(1) {
+            let expected_number = ChainStateMachine::next_block_number(parent.header.number)?;
+            if block.header.number != expected_number {
                 return Err(NodeError::Startup(format!(
                     "block number {} != parent {} + 1",
                     block.header.number, parent.header.number

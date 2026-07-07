@@ -30,7 +30,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
         let head_hash = head.hash();
-        let next_number = head.number() + 1;
+        let next_number = ChainStateMachine::next_block_number(head.number())?;
 
         let proposer_addr = self.config.proposer_address.ok_or(NodeError::NotProposer)?;
         consensus.ensure_local_proposer(next_number, proposer_addr)?;
