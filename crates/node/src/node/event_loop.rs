@@ -10,6 +10,14 @@ fn body_response_import_allowed(block_count: usize) -> bool {
     block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
 
+fn bounded_request_numbers(
+    start_number: u64,
+    count: u64,
+    max_count: u64,
+) -> impl Iterator<Item = u64> {
+    (0..count.min(max_count)).filter_map(move |offset| start_number.checked_add(offset))
+}
+
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
@@ -998,7 +1006,11 @@ impl<S: KvStore + 'static> Node<S> {
                                         "received BlockRequest"
                                     );
                                     let mut blocks = Vec::new();
-                                    for n in start_number..start_number.saturating_add(safe_count) {
+                                    for n in bounded_request_numbers(
+                                        start_number,
+                                        safe_count,
+                                        MAX_BLOCK_SYNC_RESPONSE_BLOCKS as u64,
+                                    ) {
                                         match self.chain_store.get_block_by_number(n) {
                                             Ok(Some(block)) => blocks.push(block),
                                             _ => break,
@@ -1473,11 +1485,12 @@ impl<S: KvStore + 'static> Node<S> {
                                 // L4: Peer requests block bodies for historical back-fill.
                                 NetworkMessage::BodyRequest { start_number, count } => {
                                     debug!(%peer, start_number, count, "L4: received BodyRequest");
-                                    let end = start_number.saturating_add(
-                                        count.min(crate::historical_sync::BODY_BACKFILL_BATCH_SIZE),
-                                    );
                                     let mut blocks = Vec::new();
-                                    for n in start_number..end {
+                                    for n in bounded_request_numbers(
+                                        start_number,
+                                        count,
+                                        crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                    ) {
                                         if let Ok(Some(block)) = self.chain_store.get_block_by_number(n) {
                                             blocks.push(block);
                                         } else {
@@ -2434,6 +2447,24 @@ mod cadence_tests {
         assert!(!body_response_import_allowed(
             crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize + 1
         ));
+    }
+
+    #[test]
+    fn bounded_request_numbers_includes_terminal_height() {
+        let numbers: Vec<_> = bounded_request_numbers(u64::MAX, 4, 128).collect();
+        assert_eq!(numbers, vec![u64::MAX]);
+    }
+
+    #[test]
+    fn bounded_request_numbers_stops_at_height_overflow() {
+        let numbers: Vec<_> = bounded_request_numbers(u64::MAX - 1, 4, 128).collect();
+        assert_eq!(numbers, vec![u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
+    fn bounded_request_numbers_caps_peer_count() {
+        let numbers: Vec<_> = bounded_request_numbers(10, 4, 2).collect();
+        assert_eq!(numbers, vec![10, 11]);
     }
 
     #[test]
