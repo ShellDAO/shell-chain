@@ -18,6 +18,10 @@ fn bounded_request_numbers(
     (0..count.min(max_count)).filter_map(move |offset| start_number.checked_add(offset))
 }
 
+fn next_block_sync_request_start(last_imported: u64) -> Option<u64> {
+    last_imported.checked_add(1)
+}
+
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
@@ -1153,12 +1157,29 @@ impl<S: KvStore + 'static> Node<S> {
                                             ));
                                             continue;
                                         }
+                                        let Some(next_start) =
+                                            next_block_sync_request_start(last_ok)
+                                        else {
+                                            sync_requested = false;
+                                            sync_request_nonce = None;
+                                            production_readiness.refresh(
+                                                peers,
+                                                sync_requested,
+                                                self.head_number(),
+                                                std::time::Instant::now(),
+                                            );
+                                            sync_retry_attempts_without_progress = 0;
+                                            sync_retry_timer.reset_after(Duration::from_secs(
+                                                SYNC_RETRY_BASE_INTERVAL_SECS,
+                                            ));
+                                            continue;
+                                        };
                                         let nonce = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() as u64;
                                         let req = NetworkMessage::BlockRequest {
-                                            start_number: last_ok + 1,
+                                            start_number: next_start,
                                             count: 1, // 1 block at a time — PQ-signed blocks can be several MB
                                             nonce,
                                         };
@@ -2465,6 +2486,16 @@ mod cadence_tests {
     fn bounded_request_numbers_caps_peer_count() {
         let numbers: Vec<_> = bounded_request_numbers(10, 4, 2).collect();
         assert_eq!(numbers, vec![10, 11]);
+    }
+
+    #[test]
+    fn next_block_sync_request_start_advances_imported_height() {
+        assert_eq!(next_block_sync_request_start(41), Some(42));
+    }
+
+    #[test]
+    fn next_block_sync_request_start_stops_at_terminal_height() {
+        assert_eq!(next_block_sync_request_start(u64::MAX), None);
     }
 
     #[test]
