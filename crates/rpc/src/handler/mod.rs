@@ -1033,8 +1033,8 @@ pub(crate) fn block_to_rpc_with_detail(block: &Block, detail: BlockTxDetail) -> 
         mix_hash: ShellHash::ZERO,
         extra_data: hex_bytes(block.header.extra_data.as_ref()),
         logs_bloom,
-        withdrawals_root: format!("{:?}", block.header.withdrawals_root),
-        parent_beacon_block_root: format!("{:?}", block.header.parent_beacon_block_root),
+        withdrawals_root: block.header.withdrawals_root.to_string(),
+        parent_beacon_block_root: block.header.parent_beacon_block_root.to_string(),
         blob_gas_used: hex_u64(block.header.blob_gas_used),
         excess_blob_gas: hex_u64(block.header.excess_blob_gas),
         sig_aggregate_proof_size: block
@@ -4579,6 +4579,31 @@ mod tests {
 
         assert!(rpc.logs_bloom.starts_with("0xff"));
         assert!(rpc.logs_bloom.ends_with("aa"));
+    }
+
+    #[tokio::test]
+    async fn rpc_block_roots_are_plain_hex_strings() {
+        let handler = setup();
+        let mut block = make_genesis_block();
+        block.header.withdrawals_root = ShellHash::from([0x11; 32]);
+        block.header.parent_beacon_block_root = ShellHash::from([0x22; 32]);
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let rpc = EthApiServer::get_block_by_number(&handler, "0x0".into(), false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rpc.withdrawals_root, format!("0x{}", "11".repeat(32)));
+        assert_eq!(
+            rpc.parent_beacon_block_root,
+            format!("0x{}", "22".repeat(32))
+        );
+        assert!(!rpc.withdrawals_root.contains("ShellHash"));
+        assert!(!rpc.parent_beacon_block_root.contains("ShellHash"));
     }
 
     #[tokio::test]
