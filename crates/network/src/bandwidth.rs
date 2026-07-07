@@ -236,9 +236,11 @@ mod tests {
 
     #[test]
     fn reset_clears_window_counters() {
-        let tracker = BandwidthTracker::new(1, 100);
+        let tracker = BandwidthTracker::new(1, 1);
         assert!(tracker.record_inbound(1));
         assert!(!tracker.record_inbound(1));
+        assert!(tracker.record_outbound(1));
+        assert!(!tracker.record_outbound(1));
 
         // Force a reset by backdating both the stats window and limiter clock.
         {
@@ -249,10 +251,15 @@ mod tests {
             let mut limiter = tracker.inbound_limiter.as_ref().unwrap().lock().unwrap();
             limiter.last_refill = Instant::now() - Duration::from_secs(2);
         }
+        {
+            let mut limiter = tracker.outbound_limiter.as_ref().unwrap().lock().unwrap();
+            limiter.last_refill = Instant::now() - Duration::from_secs(2);
+        }
         tracker.reset_if_needed();
 
         // Window counters are zeroed; should be allowed again.
         assert!(tracker.record_inbound(1));
+        assert!(tracker.record_outbound(1));
     }
 
     #[test]
