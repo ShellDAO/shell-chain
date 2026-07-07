@@ -722,6 +722,11 @@ pub(crate) fn invalid_params_err(msg: impl std::fmt::Display) -> ErrorObjectOwne
     ErrorObjectOwned::owned(-32602, msg.to_string(), None::<()>)
 }
 
+pub(crate) fn buffered_gas_estimate(gas_used: u64, minimum: u64) -> u64 {
+    let buffered = gas_used.saturating_add(gas_used / 5);
+    buffered.max(minimum)
+}
+
 /// Parse a user-facing address string. Only `0x` + 64 lowercase hex is accepted.
 pub(crate) fn parse_address(s: &str) -> Result<Address, ErrorObjectOwned> {
     Address::parse(s).map_err(|e| invalid_params_err(format!("invalid address: {e}")))
@@ -1346,6 +1351,14 @@ mod tests {
         let handler = setup();
         let result = EthApiServer::block_number(&handler).await.unwrap();
         assert_eq!(result, "0x0");
+    }
+
+    #[test]
+    fn buffered_gas_estimate_uses_integer_math_and_saturates() {
+        assert_eq!(buffered_gas_estimate(0, 21_000), 21_000);
+        assert_eq!(buffered_gas_estimate(21_000, 21_000), 25_200);
+        assert_eq!(buffered_gas_estimate(21_001, 21_000), 25_201);
+        assert_eq!(buffered_gas_estimate(u64::MAX, 21_000), u64::MAX);
     }
 
     #[test]

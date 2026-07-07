@@ -1325,8 +1325,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                             ))
                         }
                     })?;
-                    let buffered = ((used as f64) * 1.2) as u64;
-                    (std::cmp::max(buffered, PER_INNER_DEFAULT_FLOOR), true)
+                    (buffered_gas_estimate(used, PER_INNER_DEFAULT_FLOOR), true)
                 }
             };
             if gas_limit == 0 {

@@ -663,7 +663,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     ) -> Result<String, ErrorObjectOwned> {
         let (_output, gas_used) = self.execute_call(&tx)?;
         // Add a 20% buffer to the estimated gas, with a minimum of 21000.
-        let estimate = std::cmp::max((gas_used as f64 * 1.2) as u64, 21_000);
+        let estimate = buffered_gas_estimate(gas_used, 21_000);
         Ok(hex_u64(estimate))
     }
 
