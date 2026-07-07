@@ -771,7 +771,9 @@ fn apply_validator_stake<S: KvStore + 'static>(
             .checked_add(new_stake - old_stake)
             .ok_or_else(|| SystemContractError::AbiDecode("total staked overflow".into()))?
     } else {
-        total_staked.saturating_sub(old_stake - new_stake)
+        total_staked
+            .checked_sub(old_stake - new_stake)
+            .ok_or_else(|| SystemContractError::AbiDecode("total staked underflow".into()))?
     };
     let stake_unit = world_state
         .get_stake_unit()
@@ -2547,6 +2549,29 @@ mod tests {
         assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(1_000u64));
         assert_eq!(ws.get_validator_weight(&v1).unwrap(), 1);
         assert_eq!(ws.get_total_staked().unwrap(), U256::from(1_000u64));
+    }
+
+    #[test]
+    fn staking_mode_unbond_rejects_total_staked_underflow() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        ws.set_validator_stake_and_weight(&v1, U256::from(2_000u64), U256::from(1_000u64), 100)
+            .unwrap();
+        ws.set_total_staked(U256::from(250u64)).unwrap();
+        ws.add_balance(&v1, U256::from(1_000u64)).unwrap();
+
+        let calldata = encode_unbond_validator_stake_calldata(&v1, U256::from(500u64));
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SystemContractError::AbiDecode(msg) if msg == "total staked underflow"
+        ));
+        assert_eq!(ws.get_balance(&v1).unwrap(), U256::from(1_000u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(250u64));
     }
 
     #[test]
