@@ -21,6 +21,9 @@ const DEFAULT_TTL_SECS: u64 = 300;
 /// Maximum number of concurrent filters to prevent resource exhaustion.
 const MAX_FILTERS: usize = 1024;
 
+/// Maximum random ID attempts before reporting allocation failure.
+const MAX_FILTER_ID_GENERATION_ATTEMPTS: usize = 8;
+
 /// Types of filters that can be registered.
 pub enum FilterKind {
     /// Log filter with criteria (from `eth_newFilter`).
@@ -81,19 +84,39 @@ impl FilterRegistry {
     /// Install a new filter and return its hex-encoded ID.
     /// Returns `None` if the maximum filter count has been reached.
     pub fn new_filter(&self, kind: FilterKind, current_block: u64) -> Option<String> {
+        self.new_filter_with_id_generator(kind, current_block, random_filter_id)
+    }
+
+    fn new_filter_with_id_generator<F>(
+        &self,
+        kind: FilterKind,
+        current_block: u64,
+        mut next_id: F,
+    ) -> Option<String>
+    where
+        F: FnMut() -> String,
+    {
         let mut filters = self.filters.write();
         if filters.len() >= MAX_FILTERS {
             return None;
         }
-        // F-126: generate a random 128-bit hex ID to prevent enumeration.
-        let id = format!("0x{:032x}", rand::rng().random::<u128>());
-        let entry = FilterEntry {
-            kind,
-            last_poll_block: current_block,
-            last_access: Instant::now(),
-        };
-        filters.insert(id.clone(), entry);
-        Some(id)
+
+        for _ in 0..MAX_FILTER_ID_GENERATION_ATTEMPTS {
+            let id = next_id();
+            if filters.contains_key(&id) {
+                continue;
+            }
+
+            let entry = FilterEntry {
+                kind,
+                last_poll_block: current_block,
+                last_access: Instant::now(),
+            };
+            filters.insert(id.clone(), entry);
+            return Some(id);
+        }
+
+        None
     }
 
     /// Get the filter kind and last poll block for a given filter ID.
@@ -173,6 +196,10 @@ impl FilterRegistry {
     }
 }
 
+fn random_filter_id() -> String {
+    format!("0x{:032x}", rand::rng().random::<u128>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +231,35 @@ mod tests {
         assert_ne!(id1, id2);
         // Random IDs should be long hex strings (0x + 32 hex chars).
         assert!(id1.len() >= 34);
+    }
+
+    #[test]
+    fn new_filter_retries_colliding_ids() {
+        let reg = FilterRegistry::new();
+        let duplicate = reg.new_filter(FilterKind::Block, 1).unwrap();
+        let unique = "0x11111111111111111111111111111111".to_string();
+        let mut ids = [duplicate.clone(), unique.clone()].into_iter();
+
+        let id = reg
+            .new_filter_with_id_generator(FilterKind::Block, 2, || ids.next().unwrap())
+            .unwrap();
+
+        assert_eq!(id, unique);
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.get_filter_info(&duplicate).unwrap().1, 1);
+        assert_eq!(reg.get_filter_info(&unique).unwrap().1, 2);
+    }
+
+    #[test]
+    fn new_filter_returns_none_when_id_generation_keeps_colliding() {
+        let reg = FilterRegistry::new();
+        let duplicate = reg.new_filter(FilterKind::Block, 1).unwrap();
+
+        let id = reg.new_filter_with_id_generator(FilterKind::Block, 2, || duplicate.clone());
+
+        assert!(id.is_none());
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.get_filter_info(&duplicate).unwrap().1, 1);
     }
 
     #[test]
