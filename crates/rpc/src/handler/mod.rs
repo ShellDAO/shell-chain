@@ -3582,6 +3582,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_logs_empty_topic_alternative_array_returns_empty() {
+        let handler = setup();
+        let topic = ShellHash::from_slice(&[0x11; 32]);
+        let log =
+            shell_core::Log::new(Address::from([0x01; 20]), vec![topic], Bytes::new()).unwrap();
+
+        store_block_with_logs(&handler, 0, vec![vec![log]]);
+
+        let raw: crate::filter::RawLogFilter =
+            serde_json::from_str(r#"{"fromBlock":"0x0","toBlock":"0x0","topics":[[]]}"#).unwrap();
+
+        let result = EthApiServer::get_logs(&handler, raw).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_logs_bloom_fast_path_skips_block() {
         let handler = setup();
         // Block contains log from address 0xBB only.
