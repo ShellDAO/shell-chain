@@ -645,19 +645,29 @@ fn set_validator_stake_op<S: KvStore + 'static>(
         return Ok(false);
     }
 
-    let old_stake = world_state
-        .get_validator_stake(target)
+    let (old_stake, _) = validate_validator_stake_total(world_state, target, new_stake)?;
+    let current_balance = world_state
+        .get_balance(target)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-    if new_stake > old_stake {
-        world_state
-            .sub_balance(target, new_stake - old_stake)
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let updated_balance = if new_stake > old_stake {
+        let delta = new_stake - old_stake;
+        if current_balance < delta {
+            return Err(SystemContractError::Storage("insufficient balance".into()));
+        }
+        current_balance - delta
     } else if old_stake > new_stake {
+        current_balance
+            .checked_add(old_stake - new_stake)
+            .ok_or_else(|| SystemContractError::Storage("balance overflow".into()))?
+    } else {
+        current_balance
+    };
+    apply_validator_stake(world_state, target, new_stake)?;
+    if updated_balance != current_balance {
         world_state
-            .add_balance(target, old_stake - new_stake)
+            .set_balance(target, updated_balance)
             .map_err(|e| SystemContractError::Storage(e.to_string()))?;
     }
-    apply_validator_stake(world_state, target, new_stake)?;
     Ok(true)
 }
 
@@ -686,6 +696,7 @@ fn bond_validator_stake<S: KvStore + 'static>(
     if derived_weight(world_state, updated)? == 0 {
         return Err(SystemContractError::StakeTooLow);
     }
+    validate_validator_stake_total(world_state, target, updated)?;
     world_state
         .sub_balance(caller, amount)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -760,21 +771,7 @@ fn apply_validator_stake<S: KvStore + 'static>(
     target: &Address,
     new_stake: U256,
 ) -> Result<(), SystemContractError> {
-    let old_stake = world_state
-        .get_validator_stake(target)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-    let total_staked = world_state
-        .get_total_staked()
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-    let updated_total = if new_stake >= old_stake {
-        total_staked
-            .checked_add(new_stake - old_stake)
-            .ok_or_else(|| SystemContractError::AbiDecode("total staked overflow".into()))?
-    } else {
-        total_staked
-            .checked_sub(old_stake - new_stake)
-            .ok_or_else(|| SystemContractError::AbiDecode("total staked underflow".into()))?
-    };
+    let (_, updated_total) = validate_validator_stake_total(world_state, target, new_stake)?;
     let stake_unit = world_state
         .get_stake_unit()
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -794,6 +791,29 @@ fn apply_validator_stake<S: KvStore + 'static>(
         .set_total_staked(updated_total)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
     Ok(())
+}
+
+fn validate_validator_stake_total<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+    target: &Address,
+    new_stake: U256,
+) -> Result<(U256, U256), SystemContractError> {
+    let old_stake = world_state
+        .get_validator_stake(target)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let total_staked = world_state
+        .get_total_staked()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    let updated_total = if new_stake >= old_stake {
+        total_staked
+            .checked_add(new_stake - old_stake)
+            .ok_or_else(|| SystemContractError::AbiDecode("total staked overflow".into()))?
+    } else {
+        total_staked
+            .checked_sub(old_stake - new_stake)
+            .ok_or_else(|| SystemContractError::AbiDecode("total staked underflow".into()))?
+    };
+    Ok((old_stake, updated_total))
 }
 
 fn propose_algorithm_activation_op<S: KvStore + 'static>(
@@ -2572,6 +2592,52 @@ mod tests {
         assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_000u64));
         assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
         assert_eq!(ws.get_total_staked().unwrap(), U256::from(250u64));
+    }
+
+    #[test]
+    fn staking_mode_set_stake_rejects_total_staked_underflow_before_balance_credit() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1_000u64));
+        ws.set_validator_stake_and_weight(&v1, U256::from(2_000u64), U256::from(1_000u64), 100)
+            .unwrap();
+        ws.set_total_staked(U256::from(250u64)).unwrap();
+        ws.add_balance(&v1, U256::from(1_000u64)).unwrap();
+
+        let calldata = encode_set_validator_stake_calldata(&v1, U256::from(1_500u64));
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SystemContractError::AbiDecode(msg) if msg == "total staked underflow"
+        ));
+        assert_eq!(ws.get_balance(&v1).unwrap(), U256::from(1_000u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(2_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 2);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::from(250u64));
+    }
+
+    #[test]
+    fn staking_mode_bond_rejects_total_staked_overflow_before_balance_debit() {
+        let v1 = Address::from([0x01; 20]);
+        let mut ws = setup_with_validators(&[v1]);
+        enable_staking(&mut ws, U256::from(1u64));
+        ws.set_validator_stake_and_weight(&v1, U256::from(1_000u64), U256::from(1u64), 100)
+            .unwrap();
+        ws.set_total_staked(U256::MAX).unwrap();
+        ws.add_balance(&v1, U256::from(100u64)).unwrap();
+
+        let calldata = encode_bond_validator_stake_calldata(&v1, U256::from(1u64));
+        let err = execute_system_contract(&v1, &calldata, &mut ws).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SystemContractError::AbiDecode(msg) if msg == "total staked overflow"
+        ));
+        assert_eq!(ws.get_balance(&v1).unwrap(), U256::from(100u64));
+        assert_eq!(ws.get_validator_stake(&v1).unwrap(), U256::from(1_000u64));
+        assert_eq!(ws.get_validator_weight(&v1).unwrap(), 100);
+        assert_eq!(ws.get_total_staked().unwrap(), U256::MAX);
     }
 
     #[test]
