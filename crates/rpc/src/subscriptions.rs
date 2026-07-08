@@ -313,6 +313,25 @@ impl LogFilter {
     }
 }
 
+fn parse_pending_tx_full_txs(
+    params: Option<&serde_json::Value>,
+) -> Result<bool, jsonrpsee::types::ErrorObjectOwned> {
+    match params {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(full_txs)) => Ok(*full_txs),
+        Some(serde_json::Value::Object(obj)) => match obj.get("includeTransactions") {
+            None => Ok(false),
+            Some(serde_json::Value::Bool(full_txs)) => Ok(*full_txs),
+            Some(_) => Err(invalid_params_err(
+                "newPendingTransactions includeTransactions must be boolean",
+            )),
+        },
+        Some(_) => Err(invalid_params_err(
+            "newPendingTransactions params must be a boolean or object",
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RPC trait definition
 // ---------------------------------------------------------------------------
@@ -388,16 +407,14 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                 let rx = self.pending_tx_event_sender().subscribe();
                 // F-138: parse Geth-compatible parameter format.
                 // Accepts: true/false (bool) or {"includeTransactions": true} (object).
-                let full_txs = params
-                    .as_ref()
-                    .and_then(|v| {
-                        v.as_bool().or_else(|| {
-                            v.as_object()
-                                .and_then(|obj| obj.get("includeTransactions"))
-                                .and_then(|v| v.as_bool())
-                        })
-                    })
-                    .unwrap_or(false);
+                let full_txs = match parse_pending_tx_full_txs(params.as_ref()) {
+                    Ok(full_txs) => full_txs,
+                    Err(err) => {
+                        tracker.release_for_connection(conn_id);
+                        pending.reject(err).await;
+                        return Ok(());
+                    }
+                };
                 let sink = pending.accept().await?;
                 let t = tracker.clone();
                 tokio::spawn(async move {
@@ -1017,6 +1034,36 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap(), h1);
         assert_eq!(rx.recv().await.unwrap(), h2);
         assert_eq!(rx.recv().await.unwrap(), h3);
+    }
+
+    #[test]
+    fn pending_tx_params_parse_geth_compatible_forms() {
+        assert!(!parse_pending_tx_full_txs(None).unwrap());
+        assert!(parse_pending_tx_full_txs(Some(&serde_json::json!(true))).unwrap());
+        assert!(!parse_pending_tx_full_txs(Some(&serde_json::json!(false))).unwrap());
+        assert!(
+            parse_pending_tx_full_txs(Some(&serde_json::json!({"includeTransactions": true})))
+                .unwrap()
+        );
+        assert!(!parse_pending_tx_full_txs(Some(
+            &serde_json::json!({"includeTransactions": false})
+        ))
+        .unwrap());
+        assert!(!parse_pending_tx_full_txs(Some(&serde_json::json!({}))).unwrap());
+    }
+
+    #[test]
+    fn pending_tx_params_reject_malformed_values() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("true"),
+            serde_json::json!([]),
+            serde_json::json!({"includeTransactions": "true"}),
+        ] {
+            let err = parse_pending_tx_full_txs(Some(&value)).unwrap_err();
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            assert!(err.message().contains("newPendingTransactions"));
+        }
     }
 
     // -------------------------------------------------------------------
