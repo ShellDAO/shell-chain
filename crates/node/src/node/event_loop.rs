@@ -22,6 +22,10 @@ fn next_block_sync_request_start(last_imported: u64) -> Option<u64> {
     last_imported.checked_add(1)
 }
 
+fn stark_backlog_tail_extends(max_existing: Option<u64>, first_new_block: u64) -> bool {
+    max_existing.and_then(|max| max.checked_add(1)) == Some(first_new_block)
+}
+
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
@@ -2311,7 +2315,7 @@ impl<S: KvStore + 'static> Node<S> {
                         backlog.push_front(task);
                     }
                 }
-            } else if max_existing.is_some_and(|max| first_new_block == max + 1) {
+            } else if stark_backlog_tail_extends(max_existing, first_new_block) {
                 // Case 2: new tasks start immediately after the backlog tail →
                 // append to the back. This is contiguous extension: the prover
                 // will process the existing window first, then pick up these
@@ -2499,6 +2503,14 @@ mod cadence_tests {
     #[test]
     fn next_block_sync_request_start_stops_at_terminal_height() {
         assert_eq!(next_block_sync_request_start(u64::MAX), None);
+    }
+
+    #[test]
+    fn stark_backlog_tail_extends_stops_at_terminal_height() {
+        assert!(stark_backlog_tail_extends(Some(41), 42));
+        assert!(!stark_backlog_tail_extends(Some(41), 43));
+        assert!(!stark_backlog_tail_extends(None, 0));
+        assert!(!stark_backlog_tail_extends(Some(u64::MAX), u64::MAX));
     }
 
     #[test]
