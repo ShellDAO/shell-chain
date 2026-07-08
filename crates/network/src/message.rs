@@ -241,10 +241,64 @@ pub fn validate_message_size(data: &[u8], limit: usize) -> Result<(), NetworkErr
 /// Combines size validation and JSON deserialization in a single call.
 pub fn deserialize_checked(data: &[u8], limit: usize) -> Result<NetworkMessage, NetworkError> {
     validate_message_size(data, limit)?;
+    if let Some(limit) = serialized_message_size_limit(data) {
+        validate_message_size(data, limit)?;
+    }
     let msg: NetworkMessage =
         serde_json::from_slice(data).map_err(|e| NetworkError::Serialization(e.to_string()))?;
     validate_message_size(data, msg.max_serialized_size())?;
     Ok(msg)
+}
+
+fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
+    let variant = serialized_message_variant(data)?;
+    Some(match variant {
+        "NewBlock" | "BlockResponse" | "BodyResponse" => MAX_MESSAGE_SIZE,
+        "NewTransaction" => MAX_TX_GOSSIP_SIZE,
+        "NewAttestation"
+        | "ProofAmendment"
+        | "ProofAck"
+        | "EquivocationEvidence"
+        | "ProofChallenge"
+        | "ProofChallengeResponse"
+        | "WPoaVote"
+        | "WPoaViewChange" => MAX_CONSENSUS_MESSAGE_SIZE,
+        "BlockRequest" | "BodyRequest" | "Ping" | "Pong" | "StorageCapability" => {
+            MAX_CONTROL_MESSAGE_SIZE
+        }
+        _ => return None,
+    })
+}
+
+fn serialized_message_variant(data: &[u8]) -> Option<&str> {
+    let data = trim_json_ws(data);
+    match data.first()? {
+        b'"' => quoted_json_str(data),
+        b'{' => {
+            let rest = trim_json_ws(data.get(1..)?);
+            quoted_json_str(rest)
+        }
+        _ => None,
+    }
+}
+
+fn quoted_json_str(data: &[u8]) -> Option<&str> {
+    let rest = data.strip_prefix(b"\"")?;
+    let end = rest.iter().position(|byte| *byte == b'"')?;
+    std::str::from_utf8(&rest[..end]).ok()
+}
+
+fn trim_json_ws(data: &[u8]) -> &[u8] {
+    let start = data
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(data.len());
+    let end = data
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &data[start..end]
 }
 
 #[cfg(test)]
@@ -537,6 +591,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn deserialize_checked_rejects_oversized_variant_before_full_decode() {
+        let mut json = br#"{"NewTransaction":"#.to_vec();
+        json.extend(std::iter::repeat_n(b' ', MAX_TX_GOSSIP_SIZE + 1));
+        json.push(b'}');
+        assert!(json.len() < MAX_MESSAGE_SIZE);
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::MessageTooLarge {
+                limit: MAX_TX_GOSSIP_SIZE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn deserialize_checked_prechecks_control_message_size() {
+        let mut json = br#"{"BlockRequest":"#.to_vec();
+        json.extend(std::iter::repeat_n(b' ', MAX_CONTROL_MESSAGE_SIZE + 1));
+        json.push(b'}');
+        assert!(json.len() < MAX_MESSAGE_SIZE);
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::MessageTooLarge {
+                limit: MAX_CONTROL_MESSAGE_SIZE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serialized_message_variant_detects_unit_and_object_variants() {
+        let ping = serde_json::to_vec(&NetworkMessage::Ping).unwrap();
+        assert_eq!(serialized_message_variant(&ping), Some("Ping"));
+
+        let request = serde_json::to_vec(&NetworkMessage::BlockRequest {
+            start_number: 7,
+            count: 1,
+            nonce: 9,
+        })
+        .unwrap();
+        assert_eq!(serialized_message_variant(&request), Some("BlockRequest"));
+
+        assert_eq!(serialized_message_variant(b"not-json"), None);
     }
 
     #[test]
