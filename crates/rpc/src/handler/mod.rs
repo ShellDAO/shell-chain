@@ -6450,9 +6450,19 @@ mod tests {
 
         for (inner_calls_data, paymaster_context, expected) in [
             (
+                Some("".into()),
+                None,
+                "inner_calls_data must be 0x-prefixed",
+            ),
+            (
                 Some("01".into()),
                 None,
                 "inner_calls_data must be 0x-prefixed",
+            ),
+            (
+                None,
+                Some("".into()),
+                "paymaster_context must be 0x-prefixed",
             ),
             (
                 None,

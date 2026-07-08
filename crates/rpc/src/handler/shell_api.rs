@@ -1633,7 +1633,7 @@ fn parse_optional_hex_bytes(
     let Some(value) = value else {
         return Ok(vec![]);
     };
-    if value.is_empty() || value == "0x" {
+    if value == "0x" {
         return Ok(vec![]);
     }
     let Some(hex) = value.strip_prefix("0x") else {
