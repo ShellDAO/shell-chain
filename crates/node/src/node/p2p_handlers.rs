@@ -540,6 +540,26 @@ impl<S: KvStore + 'static> Node<S> {
                 warn!(block_number, %block_hash, %signer, "FF.7: certificate signer pubkey unknown");
                 return false;
             };
+            let Some(sig_type) = shell_crypto::infer_signature_type_from_address(&pubkey, &signer)
+            else {
+                warn!(block_number, %block_hash, %signer, "FF.7: certificate signer algorithm unknown");
+                return false;
+            };
+            if !shell_crypto::is_algorithm_allowed(sig_type) {
+                warn!(block_number, %block_hash, %signer, algorithm = ?sig_type, "FF.7: certificate signer algorithm not allowed");
+                return false;
+            }
+            if sig.sig_type != sig_type {
+                warn!(
+                    block_number,
+                    %block_hash,
+                    %signer,
+                    claimed = ?sig.sig_type,
+                    expected = ?sig_type,
+                    "FF.7: certificate signature algorithm mismatch"
+                );
+                return false;
+            }
             match verifier.verify(&pubkey, block_hash.as_bytes(), &sig) {
                 Ok(true) => signed_weight += weight,
                 Ok(false) => {

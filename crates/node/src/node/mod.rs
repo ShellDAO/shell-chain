@@ -6721,6 +6721,30 @@ mod tests {
         }
 
         #[test]
+        fn fast_finalize_rejects_certificate_sig_type_mismatch() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            store_genesis_wpoa(&node);
+
+            let block_hash = hash(88);
+            let real_sig = signer.sign(block_hash.as_bytes()).unwrap();
+            let mut quorum_signatures = HashMap::new();
+            quorum_signatures.insert(
+                authority,
+                PQSignature::new(SignatureType::MlDsa65, real_sig.data),
+            );
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&quorum_signatures).unwrap();
+
+            assert!(!node.fast_finalize_with_certificate(1, block_hash, &cert));
+            assert!(node
+                .chain_store
+                .get_commit_certificate(&block_hash)
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
         fn wpoa_view_change_rejects_max_head_height() {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
