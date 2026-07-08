@@ -1242,7 +1242,7 @@ mod tests {
             ..Default::default()
         };
         let from = signer_address(&signer);
-        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let sig = signer.sign(b"aa-gas-boundary").unwrap();
         let mut signed = SignedTransaction::new(from, tx, sig);
         signed.aa_bundle = Some(bundle);
 
