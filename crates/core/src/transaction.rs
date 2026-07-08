@@ -464,12 +464,13 @@ pub struct SessionAuth {
 impl SessionAuth {
     /// Canonical hash that the root key signs to authorize this session key (WP §AA-spec).
     ///
-    /// `blake3(PQTX_SESSION_V1\0(16B) || session_pubkey || target(32B|zero) || value_cap(32B BE) || expiry_block(8B BE) || chain_id(8B BE))`
+    /// `blake3(PQTX_SESSION_V1\0(16B) || session_pubkey || session_algo(1B) || target(32B|zero) || value_cap(32B BE) || expiry_block(8B BE) || chain_id(8B BE))`
     pub fn auth_hash(&self, chain_id: u64) -> ShellHash {
         use shell_primitives::blake3_hash;
-        let mut preimage = Vec::with_capacity(16 + self.session_pubkey.len() + 32 + 32 + 8 + 8);
+        let mut preimage = Vec::with_capacity(16 + self.session_pubkey.len() + 1 + 32 + 32 + 8 + 8);
         preimage.extend_from_slice(PQTX_SESSION_DOMAIN);
         preimage.extend_from_slice(self.session_pubkey.as_ref());
+        preimage.push(self.session_algo);
         match &self.target {
             Some(addr) => preimage.extend_from_slice(addr.0.as_slice()),
             None => preimage.extend_from_slice(&[0u8; 32]),
@@ -2929,6 +2930,23 @@ mod tests {
         let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
             .unwrap_err();
         assert!(err.contains("paymaster must differ from sender"));
+    }
+
+    #[test]
+    fn session_auth_hash_binds_session_algorithm() {
+        let base = SessionAuth {
+            session_pubkey: Bytes::from(vec![0xA5; 32]),
+            session_algo: SignatureType::Dilithium3.as_u8(),
+            target: Some(Address::from([0x11; 32])),
+            value_cap: U256::from(1_000u64),
+            expiry_block: 42,
+            root_signature: Bytes::from(vec![0x01; 96]),
+            session_signature: Bytes::from(vec![0x02; 96]),
+        };
+        let mut other_algo = base.clone();
+        other_algo.session_algo = SignatureType::MlDsa65.as_u8();
+
+        assert_ne!(base.auth_hash(1337), other_algo.auth_hash(1337));
     }
 
     #[test]

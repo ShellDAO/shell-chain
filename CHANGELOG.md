@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   the self-sponsored gas and value balance invariant.
 - Deferred first-use pubkey registration until transaction validation passes
   nonce and balance checks.
+- Bound AA session-key root authorizations to the declared session signature
+  algorithm.
 
 ## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
 
