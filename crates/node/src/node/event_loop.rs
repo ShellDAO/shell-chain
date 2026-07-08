@@ -1071,7 +1071,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     );
                                     let response_matches_sync = sync_request_nonce == Some(nonce);
                                     let verifier = MultiVerifier;
-                                    let mut last_ok = 0u64;
+                                    let mut last_ok: Option<u64> = None;
                                     let certs: HashMap<ShellHash, Vec<u8>> =
                                         commit_certificates.into_iter().collect();
                                     for block in blocks {
@@ -1094,7 +1094,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                     );
                                                     continue;
                                                 }
-                                                last_ok = num;
+                                                last_ok = Some(num);
                                                 production_readiness.note_import_progress(num);
                                                 self.metrics.blocks_imported.inc();
                                                 self.metrics.block_height.set(num as i64);
@@ -1140,7 +1140,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     }
                                     // Request next batch if we imported blocks
                                     // (there may be more to catch up on).
-                                    if last_ok > 0 {
+                                    if let Some(last_ok) = last_ok {
                                         let peers = network.peer_count().await;
                                         if peers == 0 {
                                             sync_requested = false;
@@ -2492,6 +2492,7 @@ mod cadence_tests {
 
     #[test]
     fn next_block_sync_request_start_advances_imported_height() {
+        assert_eq!(next_block_sync_request_start(0), Some(1));
         assert_eq!(next_block_sync_request_start(41), Some(42));
     }
 
