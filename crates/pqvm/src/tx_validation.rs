@@ -508,8 +508,8 @@ pub fn validate_aa_bundle_structure(
         .map_err(|e| TxValidationError::InvalidAaBundle(e.to_string()))?;
     let inner_sum = bundle.inner_gas_sum();
     let surcharge = bundle.intrinsic_gas_surcharge();
-    // Saturating cast: outer gas_limit is u64; bundle limits guarantee
-    // inner_sum fits in u64 (16 calls × u64 each is well within range).
+    // Keep this sum wider than the outer u64 gas limit so oversized bundles
+    // are rejected before returning the surcharge to callers.
     let combined = inner_sum.saturating_add(surcharge as u128);
     if combined > tx.gas_limit as u128 {
         return Err(TxValidationError::InvalidAaBundle(format!(
@@ -1227,6 +1227,25 @@ mod tests {
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
         let mut signed = SignedTransaction::new(from, tx, sig);
         signed.aa_bundle = Some(bundle);
+        let err = validate_aa_bundle_structure(&signed).unwrap_err();
+        assert!(matches!(err, TxValidationError::InvalidAaBundle(_)));
+    }
+
+    #[test]
+    fn validate_aa_bundle_rejects_inner_gas_above_u64_limit() {
+        let signer = make_signer();
+        let tx = aa_outer_tx(test_chain_id(), 0, u64::MAX, 0);
+        let bundle = AaBundle {
+            inner_calls: vec![inner(0, u64::MAX), inner(0, 1)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let from = signer_address(&signer);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 1]);
+        let mut signed = SignedTransaction::new(from, tx, sig);
+        signed.aa_bundle = Some(bundle);
+
         let err = validate_aa_bundle_structure(&signed).unwrap_err();
         assert!(matches!(err, TxValidationError::InvalidAaBundle(_)));
     }
