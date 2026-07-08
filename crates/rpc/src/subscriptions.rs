@@ -213,70 +213,72 @@ impl LogFilter {
     fn from_value(v: &serde_json::Value) -> Result<Self, jsonrpsee::types::ErrorObjectOwned> {
         let mut filter = LogFilter::default();
 
-        if let Some(obj) = v.as_object() {
-            // Parse address(es).
-            if let Some(addr_val) = obj.get("address") {
-                match addr_val {
-                    serde_json::Value::String(s) => {
+        let Some(obj) = v.as_object() else {
+            return Err(invalid_params_err("log filter params must be an object"));
+        };
+
+        // Parse address(es).
+        if let Some(addr_val) = obj.get("address") {
+            match addr_val {
+                serde_json::Value::String(s) => {
+                    filter.addresses.push(parse_address_input(s)?);
+                }
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            return Err(invalid_params_err(
+                                "log filter address entries must be strings",
+                            ));
+                        };
                         filter.addresses.push(parse_address_input(s)?);
                     }
+                }
+                _ => {
+                    return Err(invalid_params_err(
+                        "log filter address must be a string or array",
+                    ))
+                }
+            }
+        }
+
+        // Parse topics — array of (hash | hash[] | null).
+        if let Some(serde_json::Value::Array(topics_arr)) = obj.get("topics") {
+            if topics_arr.len() > MAX_LOG_TOPIC_POSITIONS {
+                return Err(invalid_params_err(
+                    "log filter topics must contain at most 4 entries",
+                ));
+            }
+            for entry in topics_arr {
+                match entry {
+                    serde_json::Value::Null => {
+                        filter.topics.push(None);
+                    }
+                    serde_json::Value::String(s) => {
+                        filter.topics.push(Some(vec![parse_hash_hex(s)?]));
+                    }
                     serde_json::Value::Array(arr) => {
-                        for item in arr {
-                            let Some(s) = item.as_str() else {
-                                return Err(invalid_params_err(
-                                    "log filter address entries must be strings",
-                                ));
-                            };
-                            filter.addresses.push(parse_address_input(s)?);
-                        }
+                        let hashes: Vec<ShellHash> = arr
+                            .iter()
+                            .map(|v| {
+                                let Some(s) = v.as_str() else {
+                                    return Err(invalid_params_err(
+                                        "log filter topic entries must be strings",
+                                    ));
+                                };
+                                parse_hash_hex(s)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        filter.topics.push(Some(hashes));
                     }
                     _ => {
                         return Err(invalid_params_err(
-                            "log filter address must be a string or array",
+                            "log filter topic must be a hash, array, or null",
                         ))
                     }
                 }
             }
-
-            // Parse topics — array of (hash | hash[] | null).
-            if let Some(serde_json::Value::Array(topics_arr)) = obj.get("topics") {
-                if topics_arr.len() > MAX_LOG_TOPIC_POSITIONS {
-                    return Err(invalid_params_err(
-                        "log filter topics must contain at most 4 entries",
-                    ));
-                }
-                for entry in topics_arr {
-                    match entry {
-                        serde_json::Value::Null => {
-                            filter.topics.push(None);
-                        }
-                        serde_json::Value::String(s) => {
-                            filter.topics.push(Some(vec![parse_hash_hex(s)?]));
-                        }
-                        serde_json::Value::Array(arr) => {
-                            let hashes: Vec<ShellHash> = arr
-                                .iter()
-                                .map(|v| {
-                                    let Some(s) = v.as_str() else {
-                                        return Err(invalid_params_err(
-                                            "log filter topic entries must be strings",
-                                        ));
-                                    };
-                                    parse_hash_hex(s)
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            filter.topics.push(Some(hashes));
-                        }
-                        _ => {
-                            return Err(invalid_params_err(
-                                "log filter topic must be a hash, array, or null",
-                            ))
-                        }
-                    }
-                }
-            } else if obj.contains_key("topics") {
-                return Err(invalid_params_err("log filter topics must be an array"));
-            }
+        } else if obj.contains_key("topics") {
+            return Err(invalid_params_err("log filter topics must be an array"));
         }
 
         Ok(filter)
@@ -813,6 +815,20 @@ mod tests {
         assert_eq!(filter.topics.len(), 2);
         assert!(filter.topics[0].is_none()); // null -> wildcard
         assert_eq!(filter.topics[1].as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn log_filter_rejects_non_object_params() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!("latest"),
+        ] {
+            let err = LogFilter::from_value(&value).unwrap_err();
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            assert!(err.message().contains("must be an object"));
+        }
     }
 
     #[test]
