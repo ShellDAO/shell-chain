@@ -5059,7 +5059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_block_number_saturates_at_max_head() {
+    async fn pending_block_returns_none_at_terminal_height() {
         let handler = setup();
         let mut block = make_genesis_block();
         block.header.number = u64::MAX;
@@ -5070,12 +5070,9 @@ mod tests {
 
         let rpc = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
             .await
-            .unwrap()
             .unwrap();
 
-        assert_eq!(rpc.number, "0xffffffffffffffff");
-        assert_eq!(rpc.parent_hash, hash);
-        assert_eq!(rpc.hash, ShellHash::ZERO);
+        assert!(rpc.is_none());
     }
 
     #[tokio::test]

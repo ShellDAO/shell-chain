@@ -143,6 +143,9 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     Some(b) => b,
                     None => return Ok(None),
                 };
+                let Some(pending_number) = head.header.number.checked_add(1) else {
+                    return Ok(None);
+                };
                 let all_pending = self.tx_pool.pending_for_block(1000);
                 // F-101: cap pending block candidates by gas_limit to prevent
                 // oversized pseudo-blocks.
@@ -167,7 +170,6 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 let tx_size: usize = pending_txs.iter().map(|tx| tx.length()).sum();
                 let header_size = head.header.length();
                 let size = header_size + tx_size;
-                let pending_number = head.header.number.saturating_add(1);
 
                 let transactions = if full_txs {
                     serde_json::to_value(
