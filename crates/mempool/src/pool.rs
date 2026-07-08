@@ -1374,7 +1374,7 @@ mod tests {
         let pubkey = signer.public_key().to_vec();
         let from = test_address(&pubkey);
 
-        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, ws.get_nonce(&from).unwrap(), 100);
+        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
         let tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 90);
         let h0 = insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
         let h1 = insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
@@ -1394,7 +1394,7 @@ mod tests {
         let pubkey = signer.public_key().to_vec();
         let from = test_address(&pubkey);
 
-        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, ws.get_nonce(&from).unwrap(), 100);
         insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
         pool.inner.write().seq = u64::MAX;
 
