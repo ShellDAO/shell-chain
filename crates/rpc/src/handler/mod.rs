@@ -4770,6 +4770,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_block_receipts_pending_returns_no_latest_receipts() {
+        let handler = setup();
+        store_block_with_logs(&handler, 0, vec![vec![]]);
+
+        let latest = EthApiServer::get_block_receipts(&handler, "latest".into())
+            .await
+            .unwrap();
+        let pending = EthApiServer::get_block_receipts(&handler, "pending".into())
+            .await
+            .unwrap();
+
+        assert_eq!(latest.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
     async fn witness_queries_reject_invalid_hash_as_invalid_params() {
         let handler = setup();
         let invalid_hash = format!("0x{}zz", "00".repeat(31));

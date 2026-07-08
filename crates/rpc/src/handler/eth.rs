@@ -398,12 +398,19 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .get_block_by_hash(&hash)
                 .map_err(internal_err)?
         } else {
-            match self.parse_block_number(&block)? {
-                Some(num) => self
+            match parse_block_tag(&block)? {
+                BlockTag::Pending => None,
+                BlockTag::Latest => self.chain_store.get_head_block().map_err(internal_err)?,
+                BlockTag::Finalized => {
+                    let num = *self.finalized_number.read();
+                    self.chain_store
+                        .get_block_by_number(num)
+                        .map_err(internal_err)?
+                }
+                BlockTag::Number(num) => self
                     .chain_store
                     .get_block_by_number(num)
                     .map_err(internal_err)?,
-                None => self.chain_store.get_head_block().map_err(internal_err)?,
             }
         };
 
