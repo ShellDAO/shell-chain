@@ -247,7 +247,7 @@ fn decode_system_transaction_list(buf: &mut &[u8]) -> alloy_rlp::Result<Vec<Syst
     if !system_txs_header.list {
         return Err(alloy_rlp::Error::UnexpectedString);
     }
-    let system_txs_end = buf.len().saturating_sub(system_txs_header.payload_length);
+    let system_txs_end = crate::rlp_payload_end(buf.len(), system_txs_header.payload_length)?;
     let mut system_transactions = Vec::new();
     while buf.len() > system_txs_end {
         let bytes = Bytes::decode(buf)?;
@@ -421,7 +421,7 @@ impl Decodable for Block {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
-        let end = remaining.saturating_sub(header.payload_length);
+        let end = crate::rlp_payload_end(remaining, header.payload_length)?;
 
         let block_header = BlockHeader::decode(buf)?;
 
@@ -431,7 +431,7 @@ impl Decodable for Block {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut transactions = Vec::new();
-        let txs_end = buf.len().saturating_sub(txs_header.payload_length);
+        let txs_end = crate::rlp_payload_end(buf.len(), txs_header.payload_length)?;
         while buf.len() > txs_end {
             transactions.push(SignedTransaction::decode(buf)?);
         }
@@ -679,7 +679,7 @@ impl Decodable for StrippedBlock {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
-        let end = remaining.saturating_sub(header.payload_length);
+        let end = crate::rlp_payload_end(remaining, header.payload_length)?;
 
         let block_header = BlockHeader::decode(buf)?;
 
@@ -688,7 +688,7 @@ impl Decodable for StrippedBlock {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut transactions = Vec::new();
-        let txs_end = buf.len().saturating_sub(txs_header.payload_length);
+        let txs_end = crate::rlp_payload_end(buf.len(), txs_header.payload_length)?;
         while buf.len() > txs_end {
             transactions.push(StrippedTransaction::decode(buf)?);
         }

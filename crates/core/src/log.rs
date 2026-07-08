@@ -79,8 +79,11 @@ impl Decodable for Log {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut topics = Vec::new();
-        let topics_end = buf.len().saturating_sub(topics_header.payload_length);
+        let topics_end = crate::rlp_payload_end(buf.len(), topics_header.payload_length)?;
         while buf.len() > topics_end {
+            if topics.len() == MAX_LOG_TOPICS {
+                return Err(alloy_rlp::Error::Custom("too many log topics"));
+            }
             topics.push(ShellHash::decode(buf)?);
         }
 
@@ -174,5 +177,19 @@ mod tests {
         log.encode(&mut buf);
         let decoded = Log::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(log, decoded);
+    }
+
+    #[test]
+    fn log_rlp_rejects_too_many_topics() {
+        let log = Log {
+            address: Address::default(),
+            topics: vec![ShellHash::ZERO; MAX_LOG_TOPICS + 1],
+            data: Bytes::new(),
+        };
+        let mut buf = Vec::new();
+        log.encode(&mut buf);
+
+        let err = Log::decode(&mut buf.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("too many log topics"));
     }
 }

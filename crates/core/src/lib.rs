@@ -23,3 +23,9 @@ pub use transaction::{
     PQTX_BUNDLE_DOMAIN, PQTX_PAYMASTER_DOMAIN, PQTX_SESSION_DOMAIN, PQTX_SIGNING_DOMAIN,
 };
 pub use witness::{StrippedTransaction, TxWitness, WitnessBundle};
+
+pub(crate) fn rlp_payload_end(buf_len: usize, payload_length: usize) -> alloy_rlp::Result<usize> {
+    buf_len
+        .checked_sub(payload_length)
+        .ok_or(alloy_rlp::Error::InputTooShort)
+}

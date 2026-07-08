@@ -139,7 +139,7 @@ impl Decodable for TransactionReceipt {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut logs = Vec::new();
-        let logs_end = buf.len().saturating_sub(logs_header.payload_length);
+        let logs_end = crate::rlp_payload_end(buf.len(), logs_header.payload_length)?;
         while buf.len() > logs_end {
             logs.push(Log::decode(buf)?);
         }

@@ -1048,7 +1048,7 @@ impl Decodable for AaBundle {
         if !inner_header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let inner_end = buf.len().saturating_sub(inner_header.payload_length);
+        let inner_end = crate::rlp_payload_end(buf.len(), inner_header.payload_length)?;
         let mut inner_calls = Vec::new();
         while buf.len() > inner_end {
             inner_calls.push(InnerCall::decode(buf)?);
@@ -1659,22 +1659,41 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = buf.len().saturating_sub(header.payload_length);
+        let end = crate::rlp_payload_end(buf.len(), header.payload_length)?;
         let mut items = Vec::new();
         while buf.len() > end {
+            if items.len() == MAX_ACCESS_LIST_ENTRIES {
+                return Err(alloy_rlp::Error::Custom(
+                    "access list exceeds maximum entry count",
+                ));
+            }
             let entry_header = alloy_rlp::Header::decode(buf)?;
             if !entry_header.list {
                 return Err(alloy_rlp::Error::UnexpectedString);
             }
+            let entry_remaining = buf.len();
+            let entry_end = crate::rlp_payload_end(entry_remaining, entry_header.payload_length)?;
             let address = Address::decode(buf)?;
             let keys_header = alloy_rlp::Header::decode(buf)?;
             if !keys_header.list {
                 return Err(alloy_rlp::Error::UnexpectedString);
             }
-            let keys_end = buf.len().saturating_sub(keys_header.payload_length);
+            let keys_end = crate::rlp_payload_end(buf.len(), keys_header.payload_length)?;
             let mut storage_keys = Vec::new();
             while buf.len() > keys_end {
+                if storage_keys.len() == MAX_ACCESS_LIST_STORAGE_KEYS {
+                    return Err(alloy_rlp::Error::Custom(
+                        "access list entry exceeds maximum storage key count",
+                    ));
+                }
                 storage_keys.push(ShellHash::decode(buf)?);
+            }
+            if buf.len() != entry_end {
+                let entry_consumed = entry_remaining.saturating_sub(buf.len());
+                return Err(alloy_rlp::Error::ListLengthMismatch {
+                    expected: entry_header.payload_length,
+                    got: entry_consumed,
+                });
             }
             items.push(AccessListItem {
                 address,
@@ -1692,7 +1711,7 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = buf.len().saturating_sub(header.payload_length);
+        let end = crate::rlp_payload_end(buf.len(), header.payload_length)?;
         let mut hashes = Vec::new();
         while buf.len() > end {
             hashes.push(ShellHash::decode(buf)?);
@@ -2288,6 +2307,47 @@ mod tests {
             decoded.access_list.as_ref().unwrap()[0].storage_keys.len(),
             2
         );
+    }
+
+    #[test]
+    fn access_list_decode_rejects_entry_payload_overrun() {
+        let address = Address::from([0xCC; 20]);
+
+        let mut first_entry_fields = Vec::new();
+        address.encode(&mut first_entry_fields);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut first_entry_fields);
+
+        let mut second_entry = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: first_entry_fields.len(),
+        }
+        .encode(&mut second_entry);
+        second_entry.extend_from_slice(&first_entry_fields);
+
+        let mut oversized_entry_fields = first_entry_fields.clone();
+        oversized_entry_fields.extend_from_slice(&second_entry);
+
+        let mut access_list = Vec::new();
+        let entry_header = alloy_rlp::Header {
+            list: true,
+            payload_length: oversized_entry_fields.len(),
+        };
+        let outer_payload_len = entry_header.length() + oversized_entry_fields.len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: outer_payload_len,
+        }
+        .encode(&mut access_list);
+        entry_header.encode(&mut access_list);
+        access_list.extend_from_slice(&oversized_entry_fields);
+
+        let err = Transaction::decode_access_list(&mut access_list.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
     #[test]
