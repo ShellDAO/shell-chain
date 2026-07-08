@@ -1313,7 +1313,8 @@ mod tests {
     #[test]
     fn validate_aa_bundle_rejects_inner_value_overflow() {
         let signer = make_signer();
-        let mut tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
+        let nonce = u64::default();
+        let mut tx = aa_outer_tx(test_chain_id(), nonce, 200_000, 0);
         tx.value = U256::MAX;
         let bundle = AaBundle {
             inner_calls: vec![
