@@ -6,6 +6,10 @@ use shell_primitives::{Address, ShellHash};
 
 /// Maximum number of blocks that can be queried in a single `eth_getLogs` call.
 pub const MAX_BLOCK_RANGE: u64 = 10_000;
+/// Maximum addresses accepted in a single log filter.
+pub const MAX_LOG_FILTER_ADDRESSES: usize = 128;
+/// Maximum topic alternatives accepted per topic position.
+pub const MAX_LOG_TOPIC_VALUES_PER_POSITION: usize = 128;
 
 /// Ethereum-compatible log filter used by `eth_getLogs`.
 ///
@@ -139,10 +143,18 @@ where
     }
 
     let opt: Option<AddrOrList> = Option::deserialize(deserializer)?;
-    Ok(opt.map(|a| match a {
+    let addresses = opt.map(|a| match a {
         AddrOrList::Single(addr) => vec![addr],
         AddrOrList::Multiple(addrs) => addrs,
-    }))
+    });
+    if let Some(addresses) = &addresses {
+        if addresses.len() > MAX_LOG_FILTER_ADDRESSES {
+            return Err(serde::de::Error::custom(format!(
+                "address filter supports at most {MAX_LOG_FILTER_ADDRESSES} entries"
+            )));
+        }
+    }
+    Ok(addresses)
 }
 
 impl RawLogFilter {
@@ -155,7 +167,15 @@ impl RawLogFilter {
                 return Err("topics must contain at most 4 entries".to_string());
             }
             for (i, entry) in raw_topics.into_iter().enumerate() {
-                topics[i] = entry.map(|e| e.into_vec());
+                let values = entry.map(|e| e.into_vec());
+                if let Some(values) = &values {
+                    if values.len() > MAX_LOG_TOPIC_VALUES_PER_POSITION {
+                        return Err(format!(
+                            "topic position {i} supports at most {MAX_LOG_TOPIC_VALUES_PER_POSITION} values"
+                        ));
+                    }
+                }
+                topics[i] = values;
             }
         }
         Ok(topics)
@@ -471,6 +491,16 @@ mod tests {
     }
 
     #[test]
+    fn raw_filter_rejects_too_many_addresses() {
+        let addresses = vec![Address::from([0x01; 20]).to_string(); MAX_LOG_FILTER_ADDRESSES + 1];
+        let json = serde_json::json!({ "address": addresses });
+
+        let err = serde_json::from_value::<RawLogFilter>(json).unwrap_err();
+
+        assert!(err.to_string().contains("address filter supports at most"));
+    }
+
+    #[test]
     fn raw_filter_topics() {
         let json = r#"{"topics":[null,"0x0000000000000000000000000000000000000000000000000000000000000001"]}"#;
         let raw: RawLogFilter = serde_json::from_str(json).unwrap();
@@ -494,6 +524,19 @@ mod tests {
         let raw: RawLogFilter = serde_json::from_str(json).unwrap();
         let err = raw.into_filter(100, 90).unwrap_err();
         assert!(err.contains("at most 4"));
+    }
+
+    #[test]
+    fn raw_filter_rejects_too_many_topic_values() {
+        let topics = vec![ShellHash::from([0x11; 32]); MAX_LOG_TOPIC_VALUES_PER_POSITION + 1];
+        let raw: RawLogFilter = serde_json::from_value(serde_json::json!({
+            "topics": [topics]
+        }))
+        .unwrap();
+
+        let err = raw.into_filter(100, 90).unwrap_err();
+
+        assert!(err.contains("supports at most"));
     }
 
     #[test]

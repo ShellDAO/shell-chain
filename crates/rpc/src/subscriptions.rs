@@ -19,6 +19,7 @@ use shell_primitives::{Address, ShellHash};
 use shell_storage::KvStore;
 use tokio::sync::broadcast;
 
+use crate::filter::{MAX_LOG_FILTER_ADDRESSES, MAX_LOG_TOPIC_VALUES_PER_POSITION};
 use crate::handler::invalid_params_err;
 use crate::handler::RpcHandler;
 use crate::types::{hex_bytes, hex_u64};
@@ -226,6 +227,11 @@ impl LogFilter {
                     filter.addresses.push(parse_address_input(s)?);
                 }
                 serde_json::Value::Array(arr) => {
+                    if arr.len() > MAX_LOG_FILTER_ADDRESSES {
+                        return Err(invalid_params_err(format!(
+                            "log filter address supports at most {MAX_LOG_FILTER_ADDRESSES} entries"
+                        )));
+                    }
                     for item in arr {
                         let Some(s) = item.as_str() else {
                             return Err(invalid_params_err(
@@ -259,6 +265,11 @@ impl LogFilter {
                         filter.topics.push(Some(vec![parse_hash_hex(s)?]));
                     }
                     serde_json::Value::Array(arr) => {
+                        if arr.len() > MAX_LOG_TOPIC_VALUES_PER_POSITION {
+                            return Err(invalid_params_err(format!(
+                                "log filter topic supports at most {MAX_LOG_TOPIC_VALUES_PER_POSITION} values"
+                            )));
+                        }
                         let hashes: Vec<ShellHash> = arr
                             .iter()
                             .map(|v| {
@@ -997,6 +1008,19 @@ mod tests {
         assert!(err.message().contains("invalid log topic hex"));
     }
 
+    #[test]
+    fn log_filter_rejects_too_many_topic_values() {
+        let topic = format!("0x{}", "11".repeat(32));
+        let topics = vec![topic; MAX_LOG_TOPIC_VALUES_PER_POSITION + 1];
+        let err = LogFilter::from_value(&serde_json::json!({
+            "topics": [topics]
+        }))
+        .unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("topic supports at most"));
+    }
+
     // -------------------------------------------------------------------
     // newPendingTransactions subscription tests
     // -------------------------------------------------------------------
@@ -1358,6 +1382,20 @@ mod tests {
         });
         let filter = LogFilter::from_value(&json).unwrap();
         assert_eq!(filter.addresses.len(), 2);
+    }
+
+    #[test]
+    fn log_filter_rejects_too_many_addresses() {
+        let addresses = vec![Address::from([0xAA; 20]).to_string(); MAX_LOG_FILTER_ADDRESSES + 1];
+        let json = serde_json::json!({
+            "address": addresses,
+            "topics": []
+        });
+
+        let err = LogFilter::from_value(&json).unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("address supports at most"));
     }
 
     #[test]
