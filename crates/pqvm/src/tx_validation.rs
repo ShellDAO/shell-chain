@@ -892,7 +892,8 @@ mod tests {
         let from = signer_address(&signer);
         fund_account(&mut ws, &from, U256::from(1_000_000));
 
-        let tx = simple_transfer(test_chain_id(), 5);
+        let mismatched_sequence = fixture_account_sequence(&from);
+        let tx = simple_transfer(test_chain_id(), mismatched_sequence);
         let signed = sign_tx(&signer, tx, true);
 
         let verifier = DilithiumVerifier;
@@ -901,8 +902,8 @@ mod tests {
             result,
             Err(TxValidationError::NonceMismatch {
                 expected: 0,
-                got: 5
-            })
+                got
+            }) if got == mismatched_sequence
         ));
         assert_eq!(cs.get_pubkey(&from).unwrap(), None);
     }
