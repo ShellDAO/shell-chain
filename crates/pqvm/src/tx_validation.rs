@@ -1234,7 +1234,8 @@ mod tests {
     #[test]
     fn validate_aa_bundle_rejects_inner_gas_above_u64_limit() {
         let signer = make_signer();
-        let tx = aa_outer_tx(test_chain_id(), 0, u64::MAX, 0);
+        let nonce = u64::default();
+        let tx = aa_outer_tx(test_chain_id(), nonce, u64::MAX, 0);
         let bundle = AaBundle {
             inner_calls: vec![inner(0, u64::MAX), inner(0, 1)],
             paymaster: None,
