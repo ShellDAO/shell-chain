@@ -338,6 +338,9 @@ impl TxPool {
         for hash in stale_hashes {
             Self::remove_entry(&mut inner, &hash);
         }
+        if inner.by_hash.is_empty() {
+            inner.seq = 0;
+        }
         pruned
     }
 
@@ -1371,7 +1374,7 @@ mod tests {
         let pubkey = signer.public_key().to_vec();
         let from = test_address(&pubkey);
 
-        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, ws.get_nonce(&from).unwrap(), 100);
         let tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 90);
         let h0 = insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
         let h1 = insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
@@ -1380,6 +1383,27 @@ mod tests {
         assert_eq!(pool.prune_nonce_too_low(&ws), 1);
         assert!(!pool.contains(&h0));
         assert!(pool.contains(&h1));
+    }
+
+    #[test]
+    fn prune_nonce_too_low_resets_sequence_when_pool_empties() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+
+        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
+        pool.inner.write().seq = u64::MAX;
+
+        ws.increment_nonce(&from).unwrap();
+        assert_eq!(pool.prune_nonce_too_low(&ws), 1);
+        assert!(pool.is_empty());
+
+        let tx1 = make_signed_tx_with_signer(&signer, &pubkey, ws.get_nonce(&from).unwrap(), 100);
+        assert!(insert_rich(&pool, tx1, &verifier, &mut ws, &cs).is_ok());
     }
 
     #[test]
