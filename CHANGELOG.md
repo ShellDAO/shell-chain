@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   comparing against the outer transaction value.
 - Rejected AA bundles that set the sender as their own paymaster, preserving
   the self-sponsored gas and value balance invariant.
+- Deferred first-use pubkey registration until transaction validation passes
+  nonce and balance checks.
 
 ## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
 

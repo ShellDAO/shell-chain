@@ -215,11 +215,6 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     let validation = validate_aa_tx(signed_tx, world_state, chain_store, verifier)?;
     let pubkey = validation.pubkey;
 
-    // 6. Register pubkey if this is the first transaction (sender_pubkey present)
-    if validation.should_register_pubkey {
-        chain_store.put_pubkey(&signed_tx.from, &pubkey)?;
-    }
-
     // 7. Nonce check
     if validation.protocol_checks_nonce {
         let account_nonce = world_state.get_nonce(&signed_tx.from)?;
@@ -267,6 +262,9 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
                     have: balance,
                 });
             }
+            if validation.should_register_pubkey {
+                chain_store.put_pubkey(&signed_tx.from, &pubkey)?;
+            }
             return Ok(pubkey);
         }
         // Self-sponsored AA bundle: sender pays gas + outer value budget.
@@ -285,6 +283,9 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
                 needed,
                 have: balance,
             });
+        }
+        if validation.should_register_pubkey {
+            chain_store.put_pubkey(&signed_tx.from, &pubkey)?;
         }
         return Ok(pubkey);
     }
@@ -307,6 +308,11 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
             needed,
             have: balance,
         });
+    }
+
+    // Register first-use pubkeys only after every validation gate has passed.
+    if validation.should_register_pubkey {
+        chain_store.put_pubkey(&signed_tx.from, &pubkey)?;
     }
 
     Ok(pubkey)
@@ -880,6 +886,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejected_first_use_does_not_register_pubkey() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::from(1_000_000));
+
+        let tx = simple_transfer(test_chain_id(), 5);
+        let signed = sign_tx(&signer, tx, true);
+
+        let verifier = DilithiumVerifier;
+        let result = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
+        assert!(matches!(
+            result,
+            Err(TxValidationError::NonceMismatch {
+                expected: 0,
+                got: 5
+            })
+        ));
+        assert_eq!(cs.get_pubkey(&from).unwrap(), None);
+    }
+
+    #[test]
     fn validate_rejects_max_nonce_that_cannot_advance() {
         let signer = make_signer();
         let (mut ws, cs) = setup_stores();
@@ -1020,6 +1048,7 @@ mod tests {
             result,
             Err(TxValidationError::InsufficientBalance { .. })
         ));
+        assert_eq!(cs.get_pubkey(&from).unwrap(), None);
     }
 
     #[test]
