@@ -481,7 +481,7 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
         target_peer: Option<&shell_network::PeerId>,
         limit: usize,
     ) -> Vec<SignedTransaction> {
-        let txs = self.tx_pool.pending(limit);
+        let txs = self.tx_pool.pending_for_block(limit);
         if txs.is_empty() || target_peer.is_some() {
             return txs;
         }
@@ -1511,6 +1511,46 @@ mod tests {
         let (node, _signer) = setup_node();
         assert_eq!(node.config.chain_id, 1337);
         assert!(node.config.proposer_address.is_some());
+    }
+
+    #[test]
+    fn rebroadcast_pending_transactions_preserves_sender_nonce_order_for_peer() {
+        let (node, _proposer_signer) = setup_node();
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0x55; 32]);
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+
+        let make_tx = |nonce, priority_fee| Transaction {
+            chain_id: 1337,
+            nonce,
+            to: Some(receiver),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE + priority_fee,
+            max_priority_fee_per_gas: priority_fee,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+
+        let nonce0_hash = submit_signed_tx(&node, &tx_signer, sender, make_tx(0, 1));
+        let nonce1_hash = submit_signed_tx(&node, &tx_signer, sender, make_tx(1, 100));
+        let peer = shell_network::PeerId("peer-a".to_string());
+
+        let first = node.mem_pool().pending_for_rebroadcast(Some(&peer), 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].hash(), nonce0_hash);
+
+        let ordered_hashes: Vec<_> = node
+            .mem_pool()
+            .pending_for_rebroadcast(Some(&peer), 2)
+            .into_iter()
+            .map(|tx| tx.hash())
+            .collect();
+        assert_eq!(ordered_hashes, vec![nonce0_hash, nonce1_hash]);
     }
 
     #[test]
