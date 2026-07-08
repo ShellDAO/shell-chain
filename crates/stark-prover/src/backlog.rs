@@ -11,6 +11,14 @@ use shell_primitives::ShellHash;
 
 use crate::prover::SigBatchEntry;
 
+fn next_block_number(block_number: u64) -> Option<u64> {
+    block_number.checked_add(1)
+}
+
+fn is_next_block_number(current: u64, next: u64) -> bool {
+    next_block_number(current) == Some(next)
+}
+
 // ── ProofTask ─────────────────────────────────────────────────────────────────
 
 /// A single unit of work for the async prover: one block worth of signatures.
@@ -252,7 +260,7 @@ impl ProofBacklog {
             let Some(next) = self.pending.get(take) else {
                 break;
             };
-            if next.layer != layer || next.block_number != end_block.saturating_add(1) {
+            if next.layer != layer || !is_next_block_number(end_block, next.block_number) {
                 break;
             }
             entries = entries.saturating_add(next.entries.len());
@@ -283,7 +291,7 @@ impl ProofBacklog {
                 let Some(next) = self.pending.get(scan) else {
                     break;
                 };
-                if next.layer != layer || next.block_number != end_block.saturating_add(1) {
+                if next.layer != layer || !is_next_block_number(end_block, next.block_number) {
                     break;
                 }
                 entries = entries.saturating_add(next.entries.len());
@@ -366,8 +374,8 @@ impl ProofBacklog {
             let Some(next) = self.pending.get(take) else {
                 break;
             };
-            if next.layer != 1 || next.block_number != end_block.saturating_add(1) {
-                gap_at = Some(end_block.saturating_add(1));
+            if next.layer != 1 || !is_next_block_number(end_block, next.block_number) {
+                gap_at = next_block_number(end_block);
                 break;
             }
             entries = entries.saturating_add(next.entries.len());
@@ -384,8 +392,8 @@ impl ProofBacklog {
                 let Some(next) = self.pending.get(scan) else {
                     break;
                 };
-                if next.layer != 1 || next.block_number != end_block.saturating_add(1) {
-                    gap_at = Some(end_block.saturating_add(1));
+                if next.layer != 1 || !is_next_block_number(end_block, next.block_number) {
+                    gap_at = next_block_number(end_block);
                     break;
                 }
                 entries = entries.saturating_add(next.entries.len());
@@ -662,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn pop_contiguous_does_not_merge_terminal_height_duplicate() {
+        let mut b = ProofBacklog::new();
+        b.push(ProofTask::new([1u8; 32], u64::MAX, vec![make_entry(1)]));
+        b.push(ProofTask::new([2u8; 32], u64::MAX, vec![make_entry(2)]));
+
+        let merged = b.pop_contiguous(8).unwrap();
+        assert_eq!(merged.block_number, u64::MAX);
+        assert_eq!(merged.source_hashes.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.peek().unwrap().block_number, u64::MAX);
+    }
+
+    #[test]
     fn l1_pop_always_waits_when_below_threshold_even_at_tail() {
         // Under the strict policy, L1 ranges with fewer than MIN_L1_STARK_TXS
         // entries must never be dispatched, regardless of whether there is a
@@ -759,6 +780,26 @@ mod tests {
             at_tail.diagnose_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS),
             Some((200, None, 2)),
             "legacy tuple diagnosis remains compatible"
+        );
+
+        let mut at_terminal = ProofBacklog::new();
+        at_terminal.push(ProofTask::new(
+            [u8::MAX; 32],
+            u64::MAX,
+            vec![make_entry(1); 100],
+        ));
+        at_terminal.push(ProofTask::new(
+            [0xFE; 32],
+            u64::MAX,
+            vec![make_entry(2); 100],
+        ));
+
+        assert_eq!(
+            at_terminal.diagnose_l1_stall(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS),
+            Some(L1StallDiagnosis::AwaitingMoreEntries {
+                entries: 100,
+                contiguous_take: 1,
+            })
         );
     }
 
