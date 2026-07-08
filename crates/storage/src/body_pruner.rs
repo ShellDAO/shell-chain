@@ -108,7 +108,7 @@ impl BodyPruner {
         let start = self.pruned_below;
 
         for block_number in start..expiry_horizon {
-            result.blocks_checked += 1;
+            result.blocks_checked = result.blocks_checked.saturating_add(1);
 
             // Resolve canonical hash for this block number.
             match chain_store.get_block_hash_by_number(block_number)? {
@@ -119,7 +119,7 @@ impl BodyPruner {
                 Some(hash) => {
                     if chain_store.has_body(&hash)? {
                         chain_store.delete_body(&hash)?;
-                        result.bodies_pruned += 1;
+                        result.bodies_pruned = result.bodies_pruned.saturating_add(1);
                         debug!(block_number, %hash, "body pruner: deleted body");
                     } else {
                         debug!(block_number, %hash, "body pruner: body already absent, skipping");

@@ -126,14 +126,14 @@ impl WitnessPruner {
                             block = block_number,
                             "witness pruner: deleted bundle for finalized block"
                         );
-                        result.pruned_count += 1;
+                        result.pruned_count = result.pruned_count.saturating_add(1);
                     } else {
-                        result.not_found_count += 1;
+                        result.not_found_count = result.not_found_count.saturating_add(1);
                     }
                 }
                 None => {
                     // Block hash not available (e.g. canonical mapping already pruned).
-                    result.not_found_count += 1;
+                    result.not_found_count = result.not_found_count.saturating_add(1);
                 }
             }
         }
