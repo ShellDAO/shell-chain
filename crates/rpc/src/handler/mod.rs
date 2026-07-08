@@ -2233,6 +2233,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_by_number_finality_tags_resolve_finalized_block() {
+        let handler = setup();
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        let block1 = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let block1_hash = block1.hash();
+
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+        handler.chain_store.put_block(&block1).unwrap();
+        handler.chain_store.set_canonical(1, &block1_hash).unwrap();
+        handler.chain_store.set_head(&block1_hash).unwrap();
+        *handler.finalized_number.write() = 0;
+
+        for tag in ["safe", "finalized"] {
+            let eth_block = EthApiServer::get_block_by_number(&handler, tag.into(), false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(eth_block.number, "0x0");
+
+            let shell_block = ShellApiServer::shell_get_block_by_number(
+                &handler,
+                tag.into(),
+                Some("summary".into()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(shell_block.number, "0x0");
+        }
+    }
+
+    #[tokio::test]
     async fn get_balance_default_zero() {
         let handler = setup();
         let addr = test_address(b"test-address-key");
