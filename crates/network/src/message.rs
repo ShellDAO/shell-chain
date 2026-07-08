@@ -270,6 +270,22 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
     })
 }
 
+#[cfg(any(test, feature = "libp2p"))]
+pub(crate) fn serialized_message_uses_sequence_scoped_id(data: &[u8]) -> bool {
+    matches!(
+        serialized_message_variant(data),
+        Some(
+            "BlockRequest"
+                | "BlockResponse"
+                | "BodyRequest"
+                | "BodyResponse"
+                | "StorageCapability"
+                | "Ping"
+                | "Pong"
+        )
+    )
+}
+
 fn serialized_message_variant(data: &[u8]) -> Option<&str> {
     let data = trim_json_ws(data);
     match data.first()? {
@@ -643,6 +659,23 @@ mod tests {
         assert_eq!(serialized_message_variant(&request), Some("BlockRequest"));
 
         assert_eq!(serialized_message_variant(b"not-json"), None);
+    }
+
+    #[test]
+    fn serialized_message_uses_sequence_scoped_id_without_decoding_payload() {
+        let ping = serde_json::to_vec(&NetworkMessage::Ping).unwrap();
+        assert!(serialized_message_uses_sequence_scoped_id(&ping));
+
+        let body_response =
+            serde_json::to_vec(&NetworkMessage::BodyResponse { blocks: Vec::new() }).unwrap();
+        assert!(serialized_message_uses_sequence_scoped_id(&body_response));
+
+        let tx = serde_json::to_vec(&NetworkMessage::NewTransaction(Box::new(test_signed_tx())))
+            .unwrap();
+        assert!(!serialized_message_uses_sequence_scoped_id(&tx));
+        assert!(!serialized_message_uses_sequence_scoped_id(
+            b"{\"Unknown\":{}}"
+        ));
     }
 
     #[test]
