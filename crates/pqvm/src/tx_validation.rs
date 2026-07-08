@@ -502,6 +502,11 @@ pub fn validate_aa_bundle_structure(
     bundle
         .validate_structure()
         .map_err(|e| TxValidationError::InvalidAaBundle(e.to_string()))?;
+    if bundle.paymaster == Some(signed_tx.from) {
+        return Err(TxValidationError::InvalidAaBundle(
+            "paymaster must differ from sender".into(),
+        ));
+    }
     let inner_sum = bundle.inner_gas_sum();
     let surcharge = bundle.intrinsic_gas_surcharge();
     // Keep this sum wider than the outer u64 gas limit so oversized bundles
@@ -1340,6 +1345,30 @@ mod tests {
         assert!(matches!(
             err,
             TxValidationError::InvalidAaBundle(msg) if msg.contains("overflows U256")
+        ));
+    }
+
+    #[test]
+    fn validate_aa_bundle_rejects_sender_as_paymaster() {
+        let signer = make_signer();
+        let nonce = u64::default();
+        let tx = aa_outer_tx(test_chain_id(), nonce, 200_000, 1);
+        let from = signer_address(&signer);
+        let bundle = AaBundle {
+            inner_calls: vec![inner(1, 50_000)],
+            paymaster: Some(from),
+            paymaster_signature: Some(ShellBytes::from(vec![0xCD; 96])),
+            ..Default::default()
+        };
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        let mut signed = SignedTransaction::new(from, tx, sig);
+        signed.aa_bundle = Some(bundle);
+
+        let err = validate_aa_bundle_structure(&signed).unwrap_err();
+        assert!(matches!(
+            err,
+            TxValidationError::InvalidAaBundle(msg)
+                if msg.contains("paymaster must differ from sender")
         ));
     }
 

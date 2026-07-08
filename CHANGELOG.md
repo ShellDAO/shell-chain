@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Rejected AA bundles whose inner-call value sum overflows `U256` before
   comparing against the outer transaction value.
+- Rejected AA bundles that set the sender as their own paymaster, preserving
+  the self-sponsored gas and value balance invariant.
 
 ## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
 

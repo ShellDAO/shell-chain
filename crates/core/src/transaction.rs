@@ -1410,6 +1410,9 @@ impl SignedTransaction {
         if aa_bundle.inner_gas_sum() > tx.gas_limit as u128 {
             return Err("with_aa_bundle: sum(inner.gas_limit) exceeds outer gas_limit");
         }
+        if aa_bundle.paymaster == Some(from) {
+            return Err("with_aa_bundle: paymaster must differ from sender");
+        }
         match aa_bundle.checked_inner_value_sum() {
             Some(inner_value_sum) if inner_value_sum <= tx.value => {}
             Some(_) => return Err("with_aa_bundle: sum(inner.value) exceeds outer value"),
@@ -2910,6 +2913,22 @@ mod tests {
         let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
             .unwrap_err();
         assert!(err.contains("overflows U256"));
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rejects_sender_as_paymaster() {
+        let tx = sample_aa_tx();
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, tx.hash().as_bytes().to_vec());
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: Some(from),
+            paymaster_signature: Some(Bytes::from(vec![0xCD; 96])),
+            ..Default::default()
+        };
+        let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+            .unwrap_err();
+        assert!(err.contains("paymaster must differ from sender"));
     }
 
     #[test]
