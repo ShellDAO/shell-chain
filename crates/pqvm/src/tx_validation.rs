@@ -8,7 +8,7 @@
 //! 5. **Balance check** — sender must afford gas_limit × max_fee_per_gas + value
 
 use crate::aa_validation::{validate_aa_tx, AaValidationError};
-use shell_core::SignedTransaction;
+use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{infer_signature_type_from_address, Verifier};
 use shell_primitives::{
     Address, ACCESS_LIST_ADDRESS_COST, ACCESS_LIST_STORAGE_KEY_COST, GAS_CONTRACT_CREATION,
@@ -207,9 +207,7 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     ensure_nonce_can_advance(tx.nonce)?;
 
     // 2. Intrinsic gas check
-    let intrinsic =
-        compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
-            .saturating_add(aa_extra_gas);
+    let intrinsic = total_intrinsic_gas(tx, aa_extra_gas)?;
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -407,9 +405,7 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
     ensure_nonce_can_advance(tx.nonce)?;
 
     // 3. Intrinsic gas
-    let intrinsic =
-        compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
-            .saturating_add(aa_extra_gas);
+    let intrinsic = total_intrinsic_gas(tx, aa_extra_gas)?;
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -525,6 +521,12 @@ pub fn validate_aa_bundle_structure(
         )));
     }
     Ok(combined as u64)
+}
+
+fn total_intrinsic_gas(tx: &Transaction, aa_extra_gas: u64) -> Result<u64, TxValidationError> {
+    compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
+        .checked_add(aa_extra_gas)
+        .ok_or(TxValidationError::GasTooLow(tx.gas_limit))
 }
 
 /// Compute intrinsic gas cost for a transaction.
@@ -1249,6 +1251,43 @@ mod tests {
 
         let err = validate_aa_bundle_structure(&signed).unwrap_err();
         assert!(matches!(err, TxValidationError::InvalidAaBundle(_)));
+    }
+
+    #[test]
+    fn validate_aa_bundle_inner_gas_plus_base_overflow_rejected() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let tx = aa_outer_tx(test_chain_id(), u64::default(), u64::MAX, 0);
+        let bundle = AaBundle {
+            inner_calls: vec![inner(0, u64::MAX)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let signed = sign_aa(&signer, tx, bundle, true);
+        let verifier = DilithiumVerifier;
+
+        let err = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id()).unwrap_err();
+        assert!(matches!(err, TxValidationError::GasTooLow(u64::MAX)));
+    }
+
+    #[test]
+    fn validate_import_aa_bundle_inner_gas_plus_base_overflow_rejected() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let tx = aa_outer_tx(test_chain_id(), u64::default(), u64::MAX, 0);
+        let bundle = AaBundle {
+            inner_calls: vec![inner(0, u64::MAX)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let signed = sign_aa(&signer, tx, bundle, true);
+        let verifier = DilithiumVerifier;
+
+        let err =
+            validate_tx_for_import(&signed, &mut ws, &cs, &verifier, test_chain_id()).unwrap_err();
+        assert!(matches!(err, TxValidationError::GasTooLow(u64::MAX)));
     }
 
     #[test]

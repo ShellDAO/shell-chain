@@ -500,12 +500,17 @@ impl TxPool {
         let aa_extra_gas = validate_aa_bundle_structure(tx)
             .map_err(|e: TxValidationError| MempoolError::InvalidTransaction(e.to_string()))?;
 
-        let intrinsic = compute_intrinsic_gas(
+        let Some(intrinsic) = compute_intrinsic_gas(
             tx.tx.data.as_ref(),
             tx.tx.is_contract_creation(),
             &tx.tx.access_list,
         )
-        .saturating_add(aa_extra_gas);
+        .checked_add(aa_extra_gas) else {
+            return Err(MempoolError::GasTooLow {
+                got: tx.tx.gas_limit,
+                minimum: u64::MAX,
+            });
+        };
         if tx.tx.gas_limit < intrinsic {
             return Err(MempoolError::GasTooLow {
                 got: tx.tx.gas_limit,
@@ -1118,6 +1123,49 @@ mod tests {
         };
         let sig = signer.sign(tx.hash().as_bytes()).unwrap();
         let signed = SignedTransaction::with_pubkey(from, tx, sig, pubkey);
+
+        let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
+        assert!(matches!(err, MempoolError::GasTooLow { .. }));
+    }
+
+    #[test]
+    fn reject_aa_intrinsic_gas_overflow() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: Some(test_address(b"recipient-placeholder-key-data-for-address")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            gas_limit: u64::MAX,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 50,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![InnerCall {
+                to: Some(test_address(b"recipient-placeholder-key-data-for-address")),
+                value: U256::ZERO,
+                data: Bytes::default(),
+                gas_limit: u64::MAX,
+            }],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        let signed =
+            SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Embedded(pubkey), bundle)
+                .unwrap();
 
         let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
         assert!(matches!(err, MempoolError::GasTooLow { .. }));
