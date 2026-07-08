@@ -60,7 +60,7 @@ pub struct NetworkConfig {
     pub max_outbound_bandwidth: u64,
     /// F-069: Maximum allowed incoming message size in bytes.
     pub max_message_size: usize,
-    /// F-071: Number of violations before a peer is temporarily banned.
+    /// F-071: Number of violations before a peer is temporarily banned (0 = disabled).
     pub ban_threshold: u32,
     /// F-071: Duration of a temporary ban in seconds.
     pub ban_duration_secs: u64,

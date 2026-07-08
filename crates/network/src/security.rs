@@ -88,7 +88,8 @@ struct PeerRecord {
 /// Manages peer reputation and temporary bans.
 ///
 /// When a peer accumulates `ban_threshold` violations it is banned for
-/// `ban_duration`. Bans are time-limited and automatically expire.
+/// `ban_duration`. A threshold of 0 disables temporary bans. Bans are
+/// time-limited and automatically expire.
 #[derive(Debug)]
 pub struct PeerBanList {
     records: HashMap<String, PeerRecord>,
@@ -99,7 +100,7 @@ pub struct PeerBanList {
 impl PeerBanList {
     /// Create a new ban list.
     ///
-    /// * `ban_threshold` — violations before a temporary ban is imposed.
+    /// * `ban_threshold` — violations before a temporary ban is imposed (0 = disabled).
     /// * `ban_duration` — how long a ban lasts.
     pub fn new(ban_threshold: u32, ban_duration: Duration) -> Self {
         Self {
@@ -120,7 +121,10 @@ impl PeerBanList {
 
         record.violations = record.violations.saturating_add(1);
 
-        if record.violations >= self.ban_threshold && record.banned_until.is_none() {
+        if self.ban_threshold > 0
+            && record.violations >= self.ban_threshold
+            && record.banned_until.is_none()
+        {
             record.banned_until = Some(ban_deadline(Instant::now(), self.ban_duration));
             return true;
         }
@@ -308,6 +312,18 @@ mod tests {
         bans.record_violation(&peer);
         assert!(!bans.is_banned(&peer));
         assert_eq!(bans.violations(&peer), 2);
+    }
+
+    #[test]
+    fn zero_threshold_disables_bans() {
+        let mut bans = PeerBanList::new(0, Duration::from_secs(60));
+        let peer = PeerId::from("disabled-ban");
+
+        assert!(!bans.record_violation(&peer));
+        assert!(!bans.record_violation(&peer));
+        assert!(!bans.is_banned(&peer));
+        assert_eq!(bans.violations(&peer), 2);
+        assert_eq!(bans.banned_count(), 0);
     }
 
     #[test]
