@@ -129,6 +129,16 @@ mod base64_bytes {
     }
 }
 
+fn saturating_entry_data_len(key_len: usize, value_len: usize) -> u64 {
+    u64::try_from(key_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
+}
+
+fn saturating_entry_data_size(key: &[u8], value: &[u8]) -> u64 {
+    saturating_entry_data_len(key.len(), value.len())
+}
+
 /// Snapshot writer: exports key-value data in a streaming format.
 ///
 /// Format: newline-separated JSON entries followed by a META: footer line.
@@ -170,7 +180,7 @@ impl<W: Write> SnapshotWriter<W> {
         self.entry_count = self.entry_count.saturating_add(1);
         self.data_size = self
             .data_size
-            .saturating_add((key.len().saturating_add(value.len())) as u64);
+            .saturating_add(saturating_entry_data_size(key, value));
         // Feed data into SHA-256 hasher for integrity checksum (F-089).
         self.hasher.update(key);
         self.hasher.update(value);
@@ -325,6 +335,19 @@ mod tests {
 
     fn test_metadata() -> SnapshotMetadata {
         SnapshotMetadata::new(1337, 100, ShellHash::ZERO, ShellHash::ZERO, ShellHash::ZERO)
+    }
+
+    #[test]
+    fn snapshot_writer_tracks_data_size_with_saturating_math() {
+        let meta = test_metadata();
+        let mut buffer = Vec::new();
+        let mut writer = SnapshotWriter::new(Cursor::new(&mut buffer), meta).unwrap();
+        writer.write_entry(b"key", b"value").unwrap();
+        writer.write_entry(b"longer-key", b"x").unwrap();
+        let written_meta = writer.finalize().unwrap();
+
+        assert_eq!(written_meta.data_size, 19);
+        assert_eq!(saturating_entry_data_len(usize::MAX, usize::MAX), u64::MAX);
     }
 
     #[test]
