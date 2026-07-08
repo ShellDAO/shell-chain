@@ -2123,6 +2123,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_range_finality_tags_start_at_finalized_block() {
+        let handler = setup();
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+
+        let block1 = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let block1_hash = block1.hash();
+        handler.chain_store.put_block(&block1).unwrap();
+        handler.chain_store.set_canonical(1, &block1_hash).unwrap();
+        handler.chain_store.set_head(&block1_hash).unwrap();
+        *handler.finalized_number.write() = 0;
+
+        for tag in ["safe", "finalized"] {
+            let page = ShellApiServer::get_blocks_range(
+                &handler,
+                tag.into(),
+                Some(RpcBlocksRangeOptions {
+                    direction: RpcListDirection::Desc,
+                    limit: Some(10),
+                    tx_detail: RpcV2TxDetail::Summary,
+                    tx_limit: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.start, tag);
+            assert_eq!(page.blocks.len(), 1);
+            assert_eq!(page.blocks[0].number, "0x0");
+            assert_eq!(page.next_start, None);
+        }
+    }
+
+    #[tokio::test]
     async fn blocks_range_ascending_stops_at_max_height() {
         let handler = setup();
         let mut block = make_genesis_block();
