@@ -266,7 +266,9 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
         "BlockRequest" | "BodyRequest" | "Ping" | "Pong" | "StorageCapability" => {
             MAX_CONTROL_MESSAGE_SIZE
         }
-        _ => return None,
+        // Unknown variants will be rejected during deserialization, so cap them
+        // at the control-message budget instead of spending the full raw limit.
+        _ => MAX_CONTROL_MESSAGE_SIZE,
     })
 }
 
@@ -630,6 +632,24 @@ mod tests {
     #[test]
     fn deserialize_checked_prechecks_control_message_size() {
         let mut json = br#"{"BlockRequest":"#.to_vec();
+        json.extend(std::iter::repeat_n(b' ', MAX_CONTROL_MESSAGE_SIZE + 1));
+        json.push(b'}');
+        assert!(json.len() < MAX_MESSAGE_SIZE);
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::MessageTooLarge {
+                limit: MAX_CONTROL_MESSAGE_SIZE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn deserialize_checked_prechecks_unknown_variant_size() {
+        let mut json = br#"{"FutureLargeVariant":"#.to_vec();
         json.extend(std::iter::repeat_n(b' ', MAX_CONTROL_MESSAGE_SIZE + 1));
         json.push(b'}');
         assert!(json.len() < MAX_MESSAGE_SIZE);
