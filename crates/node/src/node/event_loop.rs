@@ -7,7 +7,7 @@ fn block_response_import_allowed(block_count: usize, commit_certificate_count: u
 }
 
 fn body_response_import_allowed(block_count: usize) -> bool {
-    block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
+    block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
 
 fn bounded_request_numbers(
@@ -1542,7 +1542,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             %peer,
                                             count = blocks.len(),
                                             max_blocks = crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
-                                            "L4: dropping oversized BodyResponse"
+                                            "L4: dropping invalid BodyResponse size"
                                         );
                                         continue;
                                     }
@@ -2462,6 +2462,8 @@ mod cadence_tests {
 
     #[test]
     fn body_response_import_rejects_oversized_responses() {
+        assert!(!body_response_import_allowed(0));
+        assert!(body_response_import_allowed(1));
         assert!(body_response_import_allowed(
             crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
         ));
