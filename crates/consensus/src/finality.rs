@@ -161,6 +161,10 @@ impl FinalityState {
         attestation: Attestation,
         attester_weight: u64,
     ) -> bool {
+        if attestation.block_number <= self.last_finalized_number {
+            return false;
+        }
+
         // Reject attestations for unknown blocks when at capacity.
         if !self
             .pending_attestations
@@ -837,6 +841,19 @@ mod tests {
         assert_eq!(state.last_finalized_number(), 100);
         assert_eq!(state.last_finalized_hash(), &hash);
         assert_eq!(state.total_pending_attestations(), 0);
+    }
+
+    #[test]
+    fn finalized_or_stale_attestations_are_rejected() {
+        let mut state = FinalityState::with_finalized(10, make_hash(10));
+
+        assert!(!state.record_attestation(make_att(make_hash(9), 9, make_addr(1), vec![],)));
+        assert!(!state.record_attestation(make_att(make_hash(10), 10, make_addr(2), vec![],)));
+
+        let future_hash = make_hash(11);
+        assert!(state.record_attestation(make_att(future_hash, 11, make_addr(3), vec![],)));
+        assert_eq!(state.total_pending_attestations(), 1);
+        assert_eq!(state.attestation_count(&future_hash), 1);
     }
 
     #[test]

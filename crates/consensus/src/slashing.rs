@@ -473,12 +473,9 @@ mod tests {
         let b1 = signed_block(10, addr(1), 0, &signer);
         let b2 = signed_block(10, addr(1), 99, &signer);
         let mut eq = EquivocationProof::from_blocks(&b1, &b2).expect("signed proof");
-        eq.seal_b
-            .as_mut()
-            .expect("seal_b")
-            .data
-            .first_mut()
-            .map(|byte| *byte ^= 0x01);
+        if let Some(byte) = eq.seal_b.as_mut().expect("seal_b").data.first_mut() {
+            *byte ^= 0x01;
+        }
         assert!(
             !eq.verify_signed(signer.public_key(), &MultiVerifier),
             "tampered seal should fail signed verification"
