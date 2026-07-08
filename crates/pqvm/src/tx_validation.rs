@@ -513,7 +513,11 @@ pub fn validate_aa_bundle_structure(
             tx.gas_limit
         )));
     }
-    let inner_value_sum = bundle.inner_value_sum();
+    let Some(inner_value_sum) = bundle.checked_inner_value_sum() else {
+        return Err(TxValidationError::InvalidAaBundle(
+            "inner_value_sum overflows U256".into(),
+        ));
+    };
     if inner_value_sum > tx.value {
         return Err(TxValidationError::InvalidAaBundle(format!(
             "inner_value_sum ({inner_value_sum}) exceeds outer value ({})",
@@ -1304,6 +1308,38 @@ mod tests {
         signed.tx.value = U256::from(1u64);
         let err = validate_aa_bundle_structure(&signed).unwrap_err();
         assert!(matches!(err, TxValidationError::InvalidAaBundle(_)));
+    }
+
+    #[test]
+    fn validate_aa_bundle_rejects_inner_value_overflow() {
+        let signer = make_signer();
+        let mut tx = aa_outer_tx(test_chain_id(), 0, 200_000, 0);
+        tx.value = U256::MAX;
+        let bundle = AaBundle {
+            inner_calls: vec![
+                InnerCall {
+                    value: U256::MAX,
+                    ..inner(0, 50_000)
+                },
+                InnerCall {
+                    value: U256::from(1u64),
+                    ..inner(0, 50_000)
+                },
+            ],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let from = signer_address(&signer);
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        let mut signed = SignedTransaction::new(from, tx, sig);
+        signed.aa_bundle = Some(bundle);
+
+        let err = validate_aa_bundle_structure(&signed).unwrap_err();
+        assert!(matches!(
+            err,
+            TxValidationError::InvalidAaBundle(msg) if msg.contains("overflows U256")
+        ));
     }
 
     #[test]

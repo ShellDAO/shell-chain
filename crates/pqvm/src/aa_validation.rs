@@ -561,9 +561,15 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
     }
 
     // 2. Value cap check: sum of all inner call values must not exceed cap.
-    let value_sum: U256 = inner_calls
+    let Some(value_sum) = inner_calls
         .iter()
-        .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value));
+        .try_fold(U256::ZERO, |acc, c| acc.checked_add(c.value))
+    else {
+        return Err(AaValidationError::SessionValueCapExceeded {
+            sum: "overflow".into(),
+            cap: format!("{:?}", session_auth.value_cap),
+        });
+    };
     if value_sum > session_auth.value_cap {
         return Err(AaValidationError::SessionValueCapExceeded {
             sum: format!("{value_sum:?}"),

@@ -349,7 +349,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let max_fee = U256::from(tx.max_fee_per_gas);
         let is_sponsored = payer != sender;
         let declared_value = tx.value;
-        let inner_value_sum = bundle.inner_value_sum();
+        let Some(inner_value_sum) = bundle.checked_inner_value_sum() else {
+            return Err(ExecutorError::Revm(
+                "aa bundle inner value sum overflows U256".into(),
+            ));
+        };
         if inner_value_sum > declared_value {
             return Err(ExecutorError::Revm(format!(
                 "aa bundle inner value sum ({inner_value_sum}) exceeds outer value ({declared_value})"
@@ -511,7 +515,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                             all_logs.push(l);
                         }
                     }
-                    successful_values_sum = successful_values_sum.saturating_add(inner.value);
+                    successful_values_sum = successful_values_sum
+                        .checked_add(inner.value)
+                        .ok_or_else(|| {
+                            ExecutorError::Revm(
+                                "aa bundle successful value sum overflows U256".into(),
+                            )
+                        })?;
                     // Build a minimal result for commit_pqvm_state; no PQ addresses in AA
                     // inner calls (they use EVM-canonical addresses), no nonce advance here
                     // as outer tx handles it.
@@ -3840,6 +3850,60 @@ mod tests {
         assert!(
             matches!(res, Err(ExecutorError::Revm(msg)) if msg.contains("exceeds outer value"))
         );
+        assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);
+        assert_eq!(get_nonce(&mut evm, &sender), 0);
+    }
+
+    #[test]
+    fn execute_aa_bundle_rejects_inner_value_overflow() {
+        use shell_core::{AaBundle, InnerCall, AA_BUNDLE_TX_TYPE};
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let dst = ShellAddress::from([0xAA; 20]);
+        fund_account(&mut evm, &sender, U256::MAX);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::MAX,
+            data: PBytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![
+                InnerCall {
+                    to: Some(dst),
+                    value: U256::MAX,
+                    data: PBytes::new(),
+                    gas_limit: 50_000,
+                },
+                InnerCall {
+                    to: Some(dst),
+                    value: U256::from(1u64),
+                    data: PBytes::new(),
+                    gas_limit: 50_000,
+                },
+            ],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let sig = PQSignature::new(SignatureType::Dilithium3, tx.hash().as_bytes().to_vec());
+        let mut signed = SignedTransaction::new(sender, tx, sig);
+        signed.aa_bundle = Some(bundle);
+
+        let header = sample_header();
+        let res = evm.execute_aa_bundle(&signed, &header, 0, 0);
+        assert!(matches!(res, Err(ExecutorError::Revm(msg)) if msg.contains("overflows U256")));
         assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);
         assert_eq!(get_nonce(&mut evm, &sender), 0);
     }

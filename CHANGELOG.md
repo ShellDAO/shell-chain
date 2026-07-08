@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Rejected AA bundles whose inner-call value sum overflows `U256` before
+  comparing against the outer transaction value.
+
 ## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
 
 ### Added

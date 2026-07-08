@@ -838,9 +838,14 @@ impl AaBundle {
     /// Sum of inner-call ETH values. Caller MUST verify this is ≤ outer
     /// `Transaction.value`.
     pub fn inner_value_sum(&self) -> U256 {
+        self.checked_inner_value_sum().unwrap_or(U256::MAX)
+    }
+
+    /// Checked sum of inner-call ETH values.
+    pub fn checked_inner_value_sum(&self) -> Option<U256> {
         self.inner_calls
             .iter()
-            .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value))
+            .try_fold(U256::ZERO, |acc, c| acc.checked_add(c.value))
     }
 
     /// Intrinsic gas surcharge added by the bundle on top of the standard
@@ -1405,8 +1410,10 @@ impl SignedTransaction {
         if aa_bundle.inner_gas_sum() > tx.gas_limit as u128 {
             return Err("with_aa_bundle: sum(inner.gas_limit) exceeds outer gas_limit");
         }
-        if aa_bundle.inner_value_sum() > tx.value {
-            return Err("with_aa_bundle: sum(inner.value) exceeds outer value");
+        match aa_bundle.checked_inner_value_sum() {
+            Some(inner_value_sum) if inner_value_sum <= tx.value => {}
+            Some(_) => return Err("with_aa_bundle: sum(inner.value) exceeds outer value"),
+            None => return Err("with_aa_bundle: sum(inner.value) overflows U256"),
         }
         Ok(Self {
             from,
@@ -2877,6 +2884,32 @@ mod tests {
         let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
             .unwrap_err();
         assert!(err.contains("exceeds outer value"));
+    }
+
+    #[test]
+    fn signed_tx_with_aa_bundle_rejects_inner_value_overflow() {
+        let mut tx = sample_aa_tx();
+        tx.value = U256::MAX;
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, tx.hash().as_bytes().to_vec());
+        let bundle = AaBundle {
+            inner_calls: vec![
+                InnerCall {
+                    value: U256::MAX,
+                    ..sample_inner_call(0)
+                },
+                InnerCall {
+                    value: U256::from(1u64),
+                    ..sample_inner_call(0)
+                },
+            ],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+        let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
+            .unwrap_err();
+        assert!(err.contains("overflows U256"));
     }
 
     #[test]
