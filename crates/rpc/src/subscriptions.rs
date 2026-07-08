@@ -35,6 +35,8 @@ const MAX_CONSECUTIVE_LAGS: u32 = 3;
 /// Maximum topic positions accepted by log subscriptions.
 const MAX_LOG_TOPIC_POSITIONS: usize = 4;
 
+const SUPPORTED_SUBSCRIPTION_TYPES: &str = "newHeads, logs, newPendingTransactions, or syncing";
+
 /// Parse a user-facing address string (`0x` + 64 lowercase hex) into an `Address`.
 fn parse_address_input(s: &str) -> Result<Address, jsonrpsee::types::ErrorObjectOwned> {
     Address::parse(s).map_err(|e| invalid_params_err(format!("invalid log filter address: {e}")))
@@ -332,6 +334,12 @@ fn parse_pending_tx_full_txs(
     }
 }
 
+fn unsupported_subscription_type_err(_sub_type: &str) -> jsonrpsee::types::ErrorObjectOwned {
+    invalid_params_err(format!(
+        "unsupported subscription type: expected {SUPPORTED_SUBSCRIPTION_TYPES}"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // RPC trait definition
 // ---------------------------------------------------------------------------
@@ -434,11 +442,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
             _ => {
                 tracker.release_for_connection(conn_id);
                 pending
-                    .reject(jsonrpsee::types::ErrorObject::owned(
-                        -32602,
-                        format!("unsupported subscription type: {sub_type}"),
-                        None::<()>,
-                    ))
+                    .reject(unsupported_subscription_type_err(&sub_type))
                     .await;
             }
         }
@@ -1064,6 +1068,20 @@ mod tests {
             assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
             assert!(err.message().contains("newPendingTransactions"));
         }
+    }
+
+    #[test]
+    fn unsupported_subscription_type_error_does_not_echo_input() {
+        let oversized = "x".repeat(1024);
+        let err = unsupported_subscription_type_err(&oversized);
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("unsupported subscription type"));
+        assert!(err.message().contains("newPendingTransactions"));
+        assert!(
+            !err.message().contains(&"x".repeat(128)),
+            "error should not reflect unsupported subscription type inputs"
+        );
     }
 
     // -------------------------------------------------------------------
