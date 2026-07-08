@@ -4351,7 +4351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_info_saturates_next_block_at_max_head() {
+    async fn consensus_info_omits_next_block_fields_at_terminal_head() {
         let handler = setup();
         let mut block = make_genesis_block();
         block.header.number = u64::MAX;
@@ -4369,9 +4369,10 @@ mod tests {
         let result = ShellApiServer::consensus_info(&handler).await.unwrap();
 
         assert_eq!(result["block_number"], u64::MAX);
-        assert_eq!(result["current_proposer"], authority.to_string());
-        assert_eq!(result["epoch"], u64::MAX / 10);
-        assert_eq!(result["epoch_progress"], u64::MAX % 10);
+        assert_eq!(result["current_proposer"], serde_json::Value::Null);
+        assert_eq!(result["epoch"], serde_json::Value::Null);
+        assert_eq!(result["epoch_progress"], serde_json::Value::Null);
+        assert_eq!(result["epoch_length"], 10);
     }
 
     // ── shell_getNetworkStats ──────────────────────────────────────

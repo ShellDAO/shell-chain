@@ -1035,23 +1035,35 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             .collect();
         validators.sort_by_key(|v| v["address"].as_str().unwrap_or("").to_string());
 
-        // Current proposer for the next block.
-        let next_number = head_number.saturating_add(1);
         let poa_cfg = engine.poa_config();
-        let current_proposer = poa_cfg.proposer_for_block(next_number);
-        let epoch = poa_cfg.epoch_of(next_number);
         let epoch_length = poa_cfg.epoch_length;
-        let epoch_progress = if epoch_length == 0 {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!(next_number % epoch_length)
+        let (current_proposer, epoch, epoch_progress) = match head_number.checked_add(1) {
+            Some(next_number) => {
+                let proposer = poa_cfg.proposer_for_block(next_number);
+                let epoch = poa_cfg.epoch_of(next_number);
+                let epoch_progress = if epoch_length == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(next_number % epoch_length)
+                };
+                (
+                    serde_json::json!(format!("{proposer}")),
+                    serde_json::json!(epoch),
+                    epoch_progress,
+                )
+            }
+            None => (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
         };
 
         Ok(serde_json::json!({
             "engine": engine_name,
             "validators": validators,
             "stakeDerivedWeights": staking_enabled,
-            "current_proposer": format!("{current_proposer}"),
+            "current_proposer": current_proposer,
             "block_number": head_number,
             "epoch": epoch,
             "epoch_length": epoch_length,
