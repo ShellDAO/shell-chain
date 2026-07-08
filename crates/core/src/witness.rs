@@ -139,6 +139,14 @@ impl Decodable for StrippedTransaction {
             None
         };
 
+        let consumed = start_remaining.saturating_sub(buf.len());
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+
         Ok(Self {
             from,
             tx,
@@ -384,7 +392,7 @@ impl Decodable for WitnessBundle {
 mod tests {
     use super::*;
     use shell_crypto::{DilithiumSigner, PQSignature, Signer};
-    use shell_primitives::Address;
+    use shell_primitives::{Address, Bytes, U256};
 
     fn dummy_tx() -> Transaction {
         use crate::transaction::Transaction;
@@ -422,6 +430,41 @@ mod tests {
         let encoded = stripped.rlp_encode();
         let decoded = StrippedTransaction::rlp_decode(&encoded).expect("decode failed");
         assert_eq!(stripped, decoded);
+    }
+
+    #[test]
+    fn stripped_tx_rejects_trailing_payload_after_aa_bundle() {
+        let from = Address::from([0xAA; 20]);
+        let mut tx = dummy_tx();
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        tx.gas_limit = 100_000;
+        let bundle = AaBundle {
+            inner_calls: vec![crate::InnerCall {
+                to: Some(Address::from([0xBB; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            }],
+            ..Default::default()
+        };
+
+        let mut payload = Vec::new();
+        from.encode(&mut payload);
+        tx.encode(&mut payload);
+        payload.push(AA_BUNDLE_PRESENCE_FLAG);
+        bundle.encode(&mut payload);
+        payload.push(0x80);
+
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+
+        let err = StrippedTransaction::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
     #[test]
