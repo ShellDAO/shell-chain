@@ -346,7 +346,13 @@ impl PoaEngine {
                     header.number, header.timestamp, parent.timestamp, self.config.block_time_secs,
                 )));
             }
-            if header.number != parent.number.saturating_add(1) {
+            let Some(expected_number) = parent.number.checked_add(1) else {
+                return Err(ConsensusError::InvalidTimestamp(format!(
+                    "parent block number {} cannot advance",
+                    parent.number,
+                )));
+            };
+            if header.number != expected_number {
                 return Err(ConsensusError::InvalidTimestamp(format!(
                     "block number {} != parent {} + 1",
                     header.number, parent.number,
@@ -606,6 +612,24 @@ mod tests {
 
         let result = engine.verify_timestamp(&child, Some(&parent), 2000);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_timestamp_rejects_terminal_parent_height() {
+        let (config, addr, _) = test_config();
+        let engine = PoaEngine::new(config);
+
+        let parent = sample_header(u64::MAX, addr, 1000);
+        let mut child = sample_header(u64::MAX, addr, 1001);
+        child.parent_hash = parent.hash();
+
+        let err = engine
+            .verify_timestamp(&child, Some(&parent), 2000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot advance"),
+            "expected terminal parent rejection, got {err}"
+        );
     }
 
     #[test]
