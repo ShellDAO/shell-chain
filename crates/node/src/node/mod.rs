@@ -74,6 +74,10 @@ fn tx_fits_remaining_block_gas(
     tx.tx.gas_limit <= block_gas_limit.saturating_sub(cumulative_gas)
 }
 
+fn next_block_request_start(head_number: u64) -> Option<u64> {
+    head_number.checked_add(1)
+}
+
 /// A running shell-chain node.
 ///
 /// Orchestrates storage, consensus, EVM, mempool, network, and RPC
@@ -918,8 +922,18 @@ impl<S: KvStore + 'static> Node<S> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+        let Some(start_number) = next_block_request_start(head_number) else {
+            tracing::warn!(
+                head = head_number,
+                reason,
+                "skipping missing-block request at terminal block height"
+            );
+            *sync_requested = false;
+            *sync_request_nonce = None;
+            return;
+        };
         let req = NetworkMessage::BlockRequest {
-            start_number: head_number + 1,
+            start_number,
             count: 1, // request 1 block at a time — PQ-signed blocks can be several MB each
             nonce,
         };
@@ -1302,6 +1316,13 @@ mod tests {
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.inner.scan_prefix(prefix)
         }
+    }
+
+    #[test]
+    fn next_block_request_start_stops_at_terminal_height() {
+        assert_eq!(next_block_request_start(0), Some(1));
+        assert_eq!(next_block_request_start(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(next_block_request_start(u64::MAX), None);
     }
 
     fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
