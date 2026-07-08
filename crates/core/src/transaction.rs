@@ -1754,6 +1754,11 @@ impl Decodable for SignedTransaction {
             if flag != AA_BUNDLE_PRESENCE_FLAG {
                 return Err(alloy_rlp::Error::Custom("invalid aa bundle presence flag"));
             }
+            if tx.tx_type != AA_BUNDLE_TX_TYPE {
+                return Err(alloy_rlp::Error::Custom(
+                    "aa bundle requires AA_BUNDLE_TX_TYPE",
+                ));
+            }
             Some(AaBundle::decode(buf)?)
         } else {
             None
@@ -2914,6 +2919,39 @@ mod tests {
         let err = SignedTransaction::with_aa_bundle(from, tx, sig, PubkeyMode::Reference, bundle)
             .unwrap_err();
         assert!(err.contains("AA_BUNDLE_TX_TYPE"));
+    }
+
+    #[test]
+    fn signed_tx_decode_rejects_aa_bundle_with_wrong_tx_type() {
+        let tx = sample_tx(); // tx_type = 2
+        let from = Address::from([0x42; 20]);
+        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+
+        let mut payload = Vec::new();
+        from.encode(&mut payload);
+        tx.encode(&mut payload);
+        sig.encode(&mut payload);
+        let empty: &[u8] = &[];
+        empty.encode(&mut payload);
+        payload.push(AA_BUNDLE_PRESENCE_FLAG);
+        bundle.encode(&mut payload);
+
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+
+        let err = SignedTransaction::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("AA_BUNDLE_TX_TYPE"));
     }
 
     #[test]

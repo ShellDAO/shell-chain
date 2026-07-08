@@ -133,6 +133,11 @@ impl Decodable for StrippedTransaction {
                     "invalid AA bundle presence flag in StrippedTransaction",
                 ));
             }
+            if tx.tx_type != AA_BUNDLE_TX_TYPE {
+                return Err(alloy_rlp::Error::Custom(
+                    "aa bundle requires AA_BUNDLE_TX_TYPE in StrippedTransaction",
+                ));
+            }
             *buf = &buf[1..];
             Some(AaBundle::decode(buf)?)
         } else {
@@ -465,6 +470,38 @@ mod tests {
 
         let err = StrippedTransaction::decode(&mut encoded.as_slice()).unwrap_err();
         assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn stripped_tx_decode_rejects_aa_bundle_with_wrong_tx_type() {
+        let from = Address::from([0xAA; 20]);
+        let tx = dummy_tx();
+        let bundle = AaBundle {
+            inner_calls: vec![crate::InnerCall {
+                to: Some(Address::from([0xBB; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            }],
+            ..Default::default()
+        };
+
+        let mut payload = Vec::new();
+        from.encode(&mut payload);
+        tx.encode(&mut payload);
+        payload.push(AA_BUNDLE_PRESENCE_FLAG);
+        bundle.encode(&mut payload);
+
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+
+        let err = StrippedTransaction::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("AA_BUNDLE_TX_TYPE"));
     }
 
     #[test]
