@@ -191,7 +191,33 @@ impl<S: KvStore + 'static> Node<S> {
                             continue;
                         }
                     }
-                    cumulative_gas += result.gas_used;
+                    let Some(next_cumulative_gas) = checked_cumulative_block_gas(
+                        cumulative_gas,
+                        result.gas_used,
+                        header.gas_limit,
+                    ) else {
+                        if let Err(rollback_err) = evm
+                            .state_db_mut()
+                            .world_state_mut()
+                            .rollback_to_root(&pre_tx_root)
+                        {
+                            warn!(
+                                tx_hash = %tx.hash(),
+                                error = %rollback_err,
+                                target_root = %pre_tx_root,
+                                "produce_block: failed to roll back isolated state after gas accounting overflow"
+                            );
+                        }
+                        warn!(
+                            tx_hash = %tx.hash(),
+                            gas_used = result.gas_used,
+                            cumulative_gas,
+                            block_gas_limit = header.gas_limit,
+                            "produce_block: skipping tx after invalid gas accounting"
+                        );
+                        continue;
+                    };
+                    cumulative_gas = next_cumulative_gas;
                     total_effective_fees = total_effective_fees.saturating_add(
                         U256::from(result.gas_used).saturating_mul(U256::from(price)),
                     );

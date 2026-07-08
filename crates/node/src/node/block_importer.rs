@@ -527,7 +527,20 @@ impl<S: KvStore + 'static> Node<S> {
                 };
                 match exec_result {
                     Ok(result) => {
-                        cumulative_gas += result.gas_used;
+                        let Some(next_cumulative_gas) = checked_cumulative_block_gas(
+                            cumulative_gas,
+                            result.gas_used,
+                            block.header.gas_limit,
+                        ) else {
+                            return Err(NodeError::Startup(format!(
+                                "block {} tx {} gas_used {} exceeds remaining block gas {}",
+                                block.number(),
+                                idx,
+                                result.gas_used,
+                                block.header.gas_limit.saturating_sub(cumulative_gas)
+                            )));
+                        };
+                        cumulative_gas = next_cumulative_gas;
                         let price = effective_gas_price(
                             tx.tx.max_fee_per_gas,
                             tx.tx.max_priority_fee_per_gas,

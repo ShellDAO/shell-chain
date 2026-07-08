@@ -71,7 +71,17 @@ fn tx_fits_remaining_block_gas(
     cumulative_gas: u64,
     block_gas_limit: u64,
 ) -> bool {
-    tx.tx.gas_limit <= block_gas_limit.saturating_sub(cumulative_gas)
+    cumulative_gas <= block_gas_limit && tx.tx.gas_limit <= block_gas_limit - cumulative_gas
+}
+
+fn checked_cumulative_block_gas(
+    cumulative_gas: u64,
+    gas_used: u64,
+    block_gas_limit: u64,
+) -> Option<u64> {
+    cumulative_gas
+        .checked_add(gas_used)
+        .filter(|next| *next <= block_gas_limit)
 }
 
 fn next_block_request_start(head_number: u64) -> Option<u64> {
@@ -1323,6 +1333,43 @@ mod tests {
         assert_eq!(next_block_request_start(0), Some(1));
         assert_eq!(next_block_request_start(u64::MAX - 1), Some(u64::MAX));
         assert_eq!(next_block_request_start(u64::MAX), None);
+    }
+
+    #[test]
+    fn tx_fits_remaining_block_gas_rejects_invalid_cumulative_gas() {
+        let tx = signed_tx_with_gas_limit(0);
+
+        assert!(tx_fits_remaining_block_gas(&tx, 30_000_000, 30_000_000));
+        assert!(!tx_fits_remaining_block_gas(&tx, 30_000_001, 30_000_000));
+    }
+
+    #[test]
+    fn checked_cumulative_block_gas_rejects_limit_and_u64_overflow() {
+        assert_eq!(checked_cumulative_block_gas(20, 10, 30), Some(30));
+        assert_eq!(checked_cumulative_block_gas(20, 11, 30), None);
+        assert_eq!(checked_cumulative_block_gas(u64::MAX, 1, u64::MAX), None);
+    }
+
+    fn signed_tx_with_gas_limit(gas_limit: u64) -> SignedTransaction {
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(Address::ZERO),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            gas_limit,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        SignedTransaction::with_pubkey(from, tx, sig, pubkey)
     }
 
     fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
