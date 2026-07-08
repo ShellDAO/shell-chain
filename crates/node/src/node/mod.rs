@@ -1195,7 +1195,7 @@ impl<S: KvStore + 'static> Node<S> {
                     .count() as u64;
                 match wpruner.prune_before(
                     finalized_number,
-                    stark_frontier,
+                    Some(stark_frontier),
                     &self.chain_store,
                     &self.witness_store,
                 ) {
@@ -5090,11 +5090,46 @@ mod tests {
         node.finality
             .write()
             .set_finalized_direct(3, finalized_hash);
+        let block_0_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let block_1_hash = node
+            .chain_store
+            .get_block_hash_by_number(1)
+            .unwrap()
+            .unwrap();
+        node.settled_stark_sources
+            .lock()
+            .extend([(1, block_0_hash), (1, block_1_hash)]);
 
         node.produce_block(&signer, 0).unwrap();
 
         assert_eq!(node.body_pruner.read().pruned_below(), 2);
         assert_eq!(node.witness_pruner.read().pruned_below(), 2);
+    }
+
+    #[test]
+    fn witness_pruning_waits_for_zero_stark_frontier() {
+        let (node, signer) = setup_node_with_retention(2, 2);
+        store_genesis(&node);
+
+        for _ in 0..5 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+
+        let finalized = node.chain_store.get_block_by_number(3).unwrap().unwrap();
+        let finalized_hash = finalized.hash();
+        node.chain_store.set_finalized_number(3).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(3, finalized_hash);
+
+        node.produce_block(&signer, 0).unwrap();
+
+        assert_eq!(node.body_pruner.read().pruned_below(), 2);
+        assert_eq!(node.witness_pruner.read().pruned_below(), 0);
     }
 
     // ── Block sync integration tests ───────────────────────────────────

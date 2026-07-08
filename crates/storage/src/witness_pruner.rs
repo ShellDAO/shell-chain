@@ -44,7 +44,7 @@ pub struct WitnessPruneResult {
 /// # Usage
 /// ```rust,ignore
 /// let pruner = WitnessPruner::new(128);
-/// pruner.prune_before(finalized_number, &chain_store, &witness_store)?;
+/// pruner.prune_before(finalized_number, Some(stark_frontier), &chain_store, &witness_store)?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct WitnessPruner {
@@ -83,14 +83,14 @@ impl WitnessPruner {
     /// `stark_frontier` is the first block number that has NOT yet been
     /// STARK-proved.  Witnesses for blocks at or above this number are always
     /// retained regardless of the retention window — the prover still needs them
-    /// to build future proofs.  Pass `0` to disable the guard.
+    /// to build future proofs.  Pass `None` only when no proving guard applies.
     ///
     /// The method is idempotent: calling it multiple times with the same
     /// `current_head` is safe and will only prune newly-eligible blocks.
     pub fn prune_before<S: KvStore>(
         &mut self,
         current_head: u64,
-        stark_frontier: u64,
+        stark_frontier: Option<u64>,
         chain_store: &ChainStore<S>,
         witness_store: &WitnessStore<S>,
     ) -> Result<WitnessPruneResult, StorageError> {
@@ -102,12 +102,9 @@ impl WitnessPruner {
         let retention_cutoff = retention_cutoff(current_head, self.retention_count);
 
         // STARK guard: never prune witnesses for blocks that haven't been proved yet.
-        // stark_frontier == 0 means the guard is disabled (prune normally).
-        let cutoff = if stark_frontier > 0 {
-            retention_cutoff.min(stark_frontier)
-        } else {
-            retention_cutoff
-        };
+        let cutoff = stark_frontier
+            .map(|frontier| retention_cutoff.min(frontier))
+            .unwrap_or(retention_cutoff);
 
         if cutoff <= self.pruned_below {
             // Nothing new to prune.
@@ -227,7 +224,7 @@ mod tests {
         store_bundle(&ws, &hash);
 
         let mut pruner = WitnessPruner::archive();
-        let result = pruner.prune_before(500, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(500, None, &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 0);
         assert!(
             ws.has_bundle(&hash).unwrap(),
@@ -246,7 +243,7 @@ mod tests {
 
         // Retention = 4; current head = 9 → cutoff = 9+1-4 = 6.
         let mut pruner = WitnessPruner::new(4);
-        let result = pruner.prune_before(9, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(9, None, &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 6); // blocks 0..6
         assert_eq!(result.not_found_count, 0);
 
@@ -277,12 +274,12 @@ mod tests {
         let mut pruner = WitnessPruner::new(4);
 
         // First prune: head=9, cutoff=6 → prune 0..6.
-        let r1 = pruner.prune_before(9, 0, &cs, &ws).unwrap();
+        let r1 = pruner.prune_before(9, None, &cs, &ws).unwrap();
         assert_eq!(r1.pruned_count, 6);
         assert_eq!(pruner.pruned_below(), 6);
 
         // Second prune: head=15, cutoff=12 → prune 6..12.
-        let r2 = pruner.prune_before(15, 0, &cs, &ws).unwrap();
+        let r2 = pruner.prune_before(15, None, &cs, &ws).unwrap();
         assert_eq!(r2.pruned_count, 6);
         assert_eq!(pruner.pruned_below(), 12);
 
@@ -304,11 +301,11 @@ mod tests {
         }
 
         let mut pruner = WitnessPruner::new(4);
-        let r1 = pruner.prune_before(9, 0, &cs, &ws).unwrap();
+        let r1 = pruner.prune_before(9, None, &cs, &ws).unwrap();
         assert_eq!(r1.pruned_count, 6);
 
         // Same head again — nothing new to prune.
-        let r2 = pruner.prune_before(9, 0, &cs, &ws).unwrap();
+        let r2 = pruner.prune_before(9, None, &cs, &ws).unwrap();
         assert_eq!(r2.pruned_count, 0);
     }
 
@@ -322,7 +319,7 @@ mod tests {
         }
 
         let mut pruner = WitnessPruner::new(10);
-        let result = pruner.prune_before(4, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(4, None, &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 0);
         for h in &hashes {
             assert!(ws.has_bundle(h).unwrap());
@@ -338,7 +335,7 @@ mod tests {
         store_bundle(&ws, &hashes[3]);
 
         let mut pruner = WitnessPruner::new(2); // cutoff at head=4: 4+1-2=3
-        let result = pruner.prune_before(4, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(4, None, &cs, &ws).unwrap();
 
         // Eligible: blocks 0..3. Bundles exist for 1 and 3. But 3 is not < 3 → only 1 is pruned.
         // Blocks with no bundle → not_found.
@@ -358,7 +355,7 @@ mod tests {
         // Without STARK guard: retention=4, head=19 → cutoff=16 → prune [0, 16) (blocks 0–15).
         // With STARK guard at frontier=10: effective cutoff = min(16, 10) = 10 → prune [0, 10) (blocks 0–9).
         let mut pruner = WitnessPruner::new(4);
-        let result = pruner.prune_before(19, 10, &cs, &ws).unwrap();
+        let result = pruner.prune_before(19, Some(10), &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 10); // blocks 0..10 pruned
         assert_eq!(pruner.pruned_below(), 10);
 
@@ -373,17 +370,36 @@ mod tests {
     }
 
     #[test]
-    fn stark_frontier_zero_disables_guard() {
+    fn no_stark_frontier_disables_guard() {
         let (_db, cs, ws) = make_store();
         let hashes: Vec<ShellHash> = (0..10).map(|n| store_block(&cs, n)).collect();
         for h in &hashes {
             store_bundle(&ws, h);
         }
 
-        // stark_frontier=0 means no guard → prune normally up to cutoff=6.
+        // Without a STARK frontier guard, prune normally up to cutoff=6.
         let mut pruner = WitnessPruner::new(4);
-        let result = pruner.prune_before(9, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(9, None, &cs, &ws).unwrap();
         assert_eq!(result.pruned_count, 6);
+    }
+
+    #[test]
+    fn stark_frontier_zero_retains_unproved_witnesses() {
+        let (_db, cs, ws) = make_store();
+        let hashes: Vec<ShellHash> = (0..10).map(|n| store_block(&cs, n)).collect();
+        for h in &hashes {
+            store_bundle(&ws, h);
+        }
+
+        // Frontier 0 means block 0 is the first unproved block, so every witness
+        // bundle is still needed even though the retention cutoff is 6.
+        let mut pruner = WitnessPruner::new(4);
+        let result = pruner.prune_before(9, Some(0), &cs, &ws).unwrap();
+        assert_eq!(result.pruned_count, 0);
+        assert_eq!(pruner.pruned_below(), 0);
+        for hash in hashes {
+            assert!(ws.has_bundle(&hash).unwrap());
+        }
     }
 
     #[test]
@@ -405,7 +421,7 @@ mod tests {
 
         let mut pruner = WitnessPruner::new(1);
         pruner.pruned_below = first_number;
-        let result = pruner.prune_before(u64::MAX, 0, &cs, &ws).unwrap();
+        let result = pruner.prune_before(u64::MAX, None, &cs, &ws).unwrap();
 
         assert_eq!(result.pruned_count, 2);
         assert_eq!(result.not_found_count, 0);
