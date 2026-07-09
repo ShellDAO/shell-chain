@@ -1371,6 +1371,12 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let mut per_inner = Vec::with_capacity(req.inner_calls.len());
         let mut inner_sum: u64 = 0;
         for (idx, call) in req.inner_calls.iter().enumerate() {
+            let _ = call.value.as_deref().map(parse_hex_u256).transpose()?;
+            let _ = parse_optional_hex_bytes(
+                call.data.as_deref(),
+                &format!("estimateBatch: inner[{idx}] data"),
+                shell_mempool::MAX_TX_SIZE,
+            )?;
             let (gas_limit, simulated) = match call.gas_limit.as_deref() {
                 Some(hex) => (parse_hex_u64(hex)?, false),
                 None => {

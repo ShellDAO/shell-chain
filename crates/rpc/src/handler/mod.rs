@@ -6533,7 +6533,84 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code(), -32602);
-        assert!(err.message().contains("invalid call data hex"));
+        assert!(err.message().contains("invalid hex"));
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_validates_inner_data_with_explicit_gas_limit() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: Some(Address::ZERO),
+                paymaster: None,
+                inner_calls: vec![crate::types::BatchInnerCallRequest {
+                    to: Some(dst),
+                    value: Some("0x0".into()),
+                    data: Some("0xzz".into()),
+                    gas_limit: Some("0x5208".into()),
+                }],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("invalid hex"));
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_rejects_oversized_inner_data_with_explicit_gas_limit() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE + 1));
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: Some(Address::ZERO),
+                paymaster: None,
+                inner_calls: vec![crate::types::BatchInnerCallRequest {
+                    to: Some(dst),
+                    value: Some("0x0".into()),
+                    data: Some(oversized),
+                    gas_limit: Some("0x5208".into()),
+                }],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("maximum size"));
+        assert!(
+            !err.message().contains(&"00".repeat(128)),
+            "error should not reflect large inner call data"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_validates_inner_value_with_explicit_gas_limit() {
+        let handler = setup();
+        let dst = Address::from([0xAA; 20]);
+        let err = ShellApiServer::estimate_batch(
+            &handler,
+            crate::types::BatchEstimateRequest {
+                from: Some(Address::ZERO),
+                paymaster: None,
+                inner_calls: vec![crate::types::BatchInnerCallRequest {
+                    to: Some(dst),
+                    value: Some("1".into()),
+                    data: Some("0x".into()),
+                    gas_limit: Some("0x5208".into()),
+                }],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("missing 0x prefix"));
     }
 
     #[tokio::test]
