@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::bandwidth::BandwidthTracker;
 use crate::config::NetworkConfig;
 use crate::error::NetworkError;
-use crate::message::{NetworkEvent, NetworkMessage, PeerId};
+use crate::message::{NetworkEvent, NetworkMessage, NetworkTopic, PeerId};
 use crate::service::NetworkService;
 
 const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
@@ -1042,24 +1042,14 @@ fn log_peer_scores(swarm: &Swarm<ShellBehaviour>) {
 }
 
 fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
-    match msg {
-        NetworkMessage::NewBlock(_)
-        | NetworkMessage::BlockRequest { .. }
-        | NetworkMessage::BlockResponse { .. }
-        | NetworkMessage::BodyRequest { .. }
-        | NetworkMessage::BodyResponse { .. }
-        | NetworkMessage::Ping
-        | NetworkMessage::Pong => TopicKind::Blocks,
-        NetworkMessage::NewTransaction(_) => TopicKind::Transactions,
-        NetworkMessage::NewAttestation(_) => TopicKind::Attestation,
-        NetworkMessage::ProofAmendment { .. }
-        | NetworkMessage::ProofAck { .. }
-        | NetworkMessage::EquivocationEvidence(_)
-        | NetworkMessage::ProofChallenge(_)
-        | NetworkMessage::ProofChallengeResponse(_) => TopicKind::Proofs,
-        NetworkMessage::StorageCapability { .. }
-        | NetworkMessage::WPoaVote { .. }
-        | NetworkMessage::WPoaViewChange(_) => TopicKind::Attestation,
+    match msg
+        .topic()
+        .expect("all network messages have a gossipsub topic")
+    {
+        NetworkTopic::Blocks => TopicKind::Blocks,
+        NetworkTopic::Transactions => TopicKind::Transactions,
+        NetworkTopic::Attestation => TopicKind::Attestation,
+        NetworkTopic::Proofs => TopicKind::Proofs,
     }
 }
 

@@ -159,8 +159,12 @@ pub enum NetworkMessage {
 pub enum NetworkTopic {
     /// Block and block-body propagation traffic.
     Blocks,
-    /// Consensus and proof-related traffic.
-    Consensus,
+    /// Transaction gossip traffic.
+    Transactions,
+    /// Attestation and wPoA vote traffic.
+    Attestation,
+    /// STARK proof amendment and challenge traffic.
+    Proofs,
 }
 
 impl NetworkMessage {
@@ -188,16 +192,25 @@ impl NetworkMessage {
     }
 
     /// Returns the propagation topic for this message type.
-    ///
-    /// Returns `None` for messages that don't map to a specific topic
-    /// (handled by transport-specific routing logic).
     pub fn topic(&self) -> Option<NetworkTopic> {
         match self {
-            Self::StorageCapability { .. }
+            Self::NewBlock(_)
+            | Self::BlockRequest { .. }
+            | Self::BlockResponse { .. }
+            | Self::Ping
+            | Self::Pong
+            | Self::StorageCapability { .. }
             | Self::BodyRequest { .. }
             | Self::BodyResponse { .. } => Some(NetworkTopic::Blocks),
-            Self::WPoaVote { .. } | Self::WPoaViewChange(_) => Some(NetworkTopic::Consensus),
-            _ => None,
+            Self::NewTransaction(_) => Some(NetworkTopic::Transactions),
+            Self::NewAttestation(_) | Self::WPoaVote { .. } | Self::WPoaViewChange(_) => {
+                Some(NetworkTopic::Attestation)
+            }
+            Self::ProofAmendment { .. }
+            | Self::ProofAck { .. }
+            | Self::EquivocationEvidence(_)
+            | Self::ProofChallenge(_)
+            | Self::ProofChallengeResponse(_) => Some(NetworkTopic::Proofs),
         }
     }
 }
@@ -485,6 +498,41 @@ mod tests {
         let json = serde_json::to_vec(&msg).unwrap();
         let decoded: NetworkMessage = serde_json::from_slice(&json).unwrap();
         assert!(matches!(decoded, NetworkMessage::NewTransaction(_)));
+    }
+
+    #[test]
+    fn network_message_topic_classifies_routed_variants() {
+        assert_eq!(NetworkMessage::Ping.topic(), Some(NetworkTopic::Blocks));
+        assert_eq!(
+            NetworkMessage::StorageCapability {
+                profile: "full".to_string(),
+                oldest_body_block: 3,
+            }
+            .topic(),
+            Some(NetworkTopic::Blocks)
+        );
+        assert_eq!(
+            NetworkMessage::NewTransaction(Box::new(test_signed_tx())).topic(),
+            Some(NetworkTopic::Transactions)
+        );
+        assert_eq!(
+            NetworkMessage::WPoaVote {
+                block_hash: ShellHash::ZERO,
+                block_number: 1,
+                voter: Address::ZERO,
+                signature: PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+            }
+            .topic(),
+            Some(NetworkTopic::Attestation)
+        );
+        assert_eq!(
+            NetworkMessage::ProofAck {
+                block_hash: ShellHash::ZERO,
+                holder: Address::ZERO,
+            }
+            .topic(),
+            Some(NetworkTopic::Proofs)
+        );
     }
 
     #[test]
