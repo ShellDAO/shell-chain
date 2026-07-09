@@ -43,11 +43,12 @@ impl LogFilter {
 
         // Every filtered address must have at least one bloom hit.
         if let Some(addrs) = &self.address {
-            if !addrs.is_empty() {
-                let any_match = addrs.iter().any(|a| bloom_contains(bloom, a.as_bytes()));
-                if !any_match {
-                    return false;
-                }
+            if addrs.is_empty() {
+                return false;
+            }
+            let any_match = addrs.iter().any(|a| bloom_contains(bloom, a.as_bytes()));
+            if !any_match {
+                return false;
             }
         }
 
@@ -70,7 +71,7 @@ impl LogFilter {
     pub fn matches_log(&self, log: &shell_core::Log) -> bool {
         // Address filter
         if let Some(addrs) = &self.address {
-            if !addrs.is_empty() && !addrs.contains(&log.address) {
+            if addrs.is_empty() || !addrs.contains(&log.address) {
                 return false;
             }
         }
@@ -319,6 +320,18 @@ mod tests {
         assert!(filter.matches_log(&make_log(a, vec![], b"")));
         assert!(filter.matches_log(&make_log(b, vec![], b"")));
         assert!(!filter.matches_log(&make_log(Address::from([0xCC; 20]), vec![], b"")));
+    }
+
+    #[test]
+    fn empty_address_array_matches_no_logs() {
+        let log = make_log(Address::from([0xAA; 20]), vec![], b"");
+        let bloom = logs_bloom(std::slice::from_ref(&log));
+        let raw: RawLogFilter = serde_json::from_str(r#"{"address":[]}"#).unwrap();
+        let filter = raw.into_filter(100, 90).unwrap();
+
+        assert_eq!(filter.address, Some(vec![]));
+        assert!(!filter.matches_log(&log));
+        assert!(!filter.matches_bloom(&bloom));
     }
 
     // ── Topic filtering ─────────────────────────────────────────

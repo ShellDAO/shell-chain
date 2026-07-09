@@ -205,8 +205,8 @@ impl Default for SubscriptionTracker {
 /// Simple log filter matching the subset of `eth_getLogs` filter params.
 #[derive(Debug, Clone, Default)]
 struct LogFilter {
-    /// If non-empty, only logs from these addresses are included.
-    addresses: Vec<Address>,
+    /// When present, only logs from these addresses are included.
+    addresses: Option<Vec<Address>>,
     /// Per-position topic filter. `None` is a wildcard; `Some` values are ORed
     /// within the position and ANDed across positions.
     topics: Vec<Option<Vec<ShellHash>>>,
@@ -224,7 +224,7 @@ impl LogFilter {
         if let Some(addr_val) = obj.get("address") {
             match addr_val {
                 serde_json::Value::String(s) => {
-                    filter.addresses.push(parse_address_input(s)?);
+                    filter.addresses = Some(vec![parse_address_input(s)?]);
                 }
                 serde_json::Value::Array(arr) => {
                     if arr.len() > MAX_LOG_FILTER_ADDRESSES {
@@ -232,14 +232,16 @@ impl LogFilter {
                             "log filter address supports at most {MAX_LOG_FILTER_ADDRESSES} entries"
                         )));
                     }
+                    let mut addresses = Vec::with_capacity(arr.len());
                     for item in arr {
                         let Some(s) = item.as_str() else {
                             return Err(invalid_params_err(
                                 "log filter address entries must be strings",
                             ));
                         };
-                        filter.addresses.push(parse_address_input(s)?);
+                        addresses.push(parse_address_input(s)?);
                     }
+                    filter.addresses = Some(addresses);
                 }
                 _ => {
                     return Err(invalid_params_err(
@@ -300,8 +302,10 @@ impl LogFilter {
     /// Returns `true` if the given log matches this filter.
     fn matches(&self, log: &shell_core::Log) -> bool {
         // Address filter.
-        if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
-            return false;
+        if let Some(addresses) = &self.addresses {
+            if addresses.is_empty() || !addresses.contains(&log.address) {
+                return false;
+            }
         }
 
         // Topic filters.
@@ -764,7 +768,7 @@ mod tests {
     fn log_filter_address_match() {
         let addr = Address::from([0xAA; 20]);
         let filter = LogFilter {
-            addresses: vec![addr],
+            addresses: Some(vec![addr]),
             topics: vec![],
         };
         let log = Log {
@@ -778,7 +782,7 @@ mod tests {
     #[test]
     fn log_filter_address_mismatch() {
         let filter = LogFilter {
-            addresses: vec![Address::from([0xAA; 20])],
+            addresses: Some(vec![Address::from([0xAA; 20])]),
             topics: vec![],
         };
         let log = Log {
@@ -793,7 +797,7 @@ mod tests {
     fn log_filter_topic_match() {
         let topic = shell_primitives::keccak256(b"Transfer(address,address,uint256)");
         let filter = LogFilter {
-            addresses: vec![],
+            addresses: None,
             topics: vec![Some(vec![topic])],
         };
         let log = Log {
@@ -809,7 +813,7 @@ mod tests {
         let topic_a = shell_primitives::keccak256(b"Transfer");
         let topic_b = shell_primitives::keccak256(b"Approval");
         let filter = LogFilter {
-            addresses: vec![],
+            addresses: None,
             topics: vec![Some(vec![topic_a])],
         };
         let log = Log {
@@ -824,7 +828,7 @@ mod tests {
     fn log_filter_wildcard_position() {
         let topic_b = shell_primitives::keccak256(b"value");
         let filter = LogFilter {
-            addresses: vec![],
+            addresses: None,
             // First position is wildcard, second must match.
             topics: vec![None, Some(vec![topic_b])],
         };
@@ -843,7 +847,7 @@ mod tests {
             "topics": [null, "0x0000000000000000000000000000000000000000000000000000000000000000"]
         });
         let filter = LogFilter::from_value(&json).unwrap();
-        assert_eq!(filter.addresses.len(), 1);
+        assert_eq!(filter.addresses.as_ref().unwrap().len(), 1);
         assert_eq!(filter.topics.len(), 2);
         assert!(filter.topics[0].is_none()); // null -> wildcard
         assert_eq!(filter.topics[1].as_ref().unwrap().len(), 1);
@@ -873,6 +877,20 @@ mod tests {
         let log = Log {
             address: Address::ZERO,
             topics: vec![topic],
+            data: Bytes::new(),
+        };
+        assert!(!filter.matches(&log));
+    }
+
+    #[test]
+    fn log_filter_empty_address_array_matches_nothing() {
+        let filter = LogFilter::from_value(&serde_json::json!({
+            "address": []
+        }))
+        .unwrap();
+        let log = Log {
+            address: Address::from([0xAA; 20]),
+            topics: vec![],
             data: Bytes::new(),
         };
         assert!(!filter.matches(&log));
@@ -961,7 +979,7 @@ mod tests {
         let addr = Address::from([0xCC; 20]);
         let topic = shell_primitives::keccak256(b"Transfer(address,address,uint256)");
         let filter = LogFilter {
-            addresses: vec![addr],
+            addresses: Some(vec![addr]),
             topics: vec![Some(vec![topic])],
         };
 
@@ -1310,7 +1328,7 @@ mod tests {
         let addr = Address::from([0xAA; 20]);
         let topic = shell_primitives::keccak256(b"Transfer(address,address,uint256)");
         let filter = LogFilter {
-            addresses: vec![addr],
+            addresses: Some(vec![addr]),
             topics: vec![Some(vec![topic])],
         };
 
@@ -1344,7 +1362,7 @@ mod tests {
         let addr_a = Address::from([0xAA; 20]);
         let addr_b = Address::from([0xBB; 20]);
         let filter = LogFilter {
-            addresses: vec![addr_a, addr_b],
+            addresses: Some(vec![addr_a, addr_b]),
             topics: vec![],
         };
 
@@ -1381,7 +1399,7 @@ mod tests {
             "topics": []
         });
         let filter = LogFilter::from_value(&json).unwrap();
-        assert_eq!(filter.addresses.len(), 2);
+        assert_eq!(filter.addresses.as_ref().unwrap().len(), 2);
     }
 
     #[test]

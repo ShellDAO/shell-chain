@@ -3670,6 +3670,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_logs_empty_address_array_returns_empty() {
+        let handler = setup();
+        let log = shell_core::Log::new(Address::from([0xAA; 20]), vec![], Bytes::new()).unwrap();
+        store_block_with_logs(&handler, 0, vec![vec![log]]);
+
+        let raw: crate::filter::RawLogFilter =
+            serde_json::from_str(r#"{"fromBlock":"0x0","toBlock":"0x0","address":[]}"#).unwrap();
+
+        let result = EthApiServer::get_logs(&handler, raw).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_logs_topic_filtering() {
         let handler = setup();
         let topic_a = ShellHash::from_slice(&[0x11; 32]);
