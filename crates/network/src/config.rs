@@ -211,6 +211,7 @@ mod tests {
         assert_eq!(config.blocks_topic, "/shell/blocks/1");
         assert_eq!(config.txs_topic, "/shell/txs/1");
         assert_eq!(config.attestation_topic, "/shell/attestation/1");
+        assert_eq!(config.proofs_topic, "/shell/proofs/1");
         assert_eq!(config.max_peers, 50);
         assert!(!config.enable_mdns);
         assert!(config.enable_kademlia);

@@ -34,10 +34,12 @@ use crate::service::NetworkService;
 const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
 
 /// Topic category for gossipsub routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopicKind {
     Blocks,
     Transactions,
     Attestation,
+    Proofs,
 }
 
 /// Commands sent to the Swarm background task.
@@ -126,11 +128,13 @@ impl Libp2pNetwork {
         let blocks_topic = IdentTopic::new(&config.blocks_topic);
         let txs_topic = IdentTopic::new(&config.txs_topic);
         let attestation_topic = IdentTopic::new(&config.attestation_topic);
+        let proofs_topic = IdentTopic::new(&config.proofs_topic);
         let loop_config = SwarmLoopConfig {
             peer_count: Arc::clone(&peer_count),
             blocks_topic,
             txs_topic,
             attestation_topic,
+            proofs_topic,
             bandwidth: Arc::clone(&bandwidth),
             boot_nodes,
             max_msg_size: config.max_message_size,
@@ -229,6 +233,7 @@ fn build_swarm_with_identity(
     let blocks_topic_name = config.blocks_topic.clone();
     let txs_topic_name = config.txs_topic.clone();
     let attestation_topic_name = config.attestation_topic.clone();
+    let proofs_topic_name = config.proofs_topic.clone();
     let max_msg_size = config.max_message_size;
 
     // Build libp2p connection limits from config.
@@ -353,14 +358,31 @@ fn build_swarm_with_identity(
                     ..Default::default()
                 };
 
+                let proofs_topic_params = TopicScoreParams {
+                    topic_weight: 0.8,
+                    time_in_mesh_weight: 0.4,
+                    time_in_mesh_quantum: Duration::from_secs(1),
+                    time_in_mesh_cap: 3600.0,
+                    first_message_deliveries_weight: 3.0,
+                    first_message_deliveries_cap: 200.0,
+                    first_message_deliveries_decay: 0.99,
+                    invalid_message_deliveries_weight: -80.0,
+                    invalid_message_deliveries_decay: 0.5,
+                    mesh_message_deliveries_weight: 0.0,
+                    mesh_failure_penalty_weight: 0.0,
+                    ..Default::default()
+                };
+
                 let blocks_hash = IdentTopic::new(&blocks_topic_name).hash();
                 let txs_hash = IdentTopic::new(&txs_topic_name).hash();
                 let attestation_hash = IdentTopic::new(&attestation_topic_name).hash();
+                let proofs_hash = IdentTopic::new(&proofs_topic_name).hash();
 
                 let mut topic_scores = HashMap::new();
                 topic_scores.insert(blocks_hash, blocks_topic_params);
                 topic_scores.insert(txs_hash, txs_topic_params);
                 topic_scores.insert(attestation_hash, attestation_topic_params);
+                topic_scores.insert(proofs_hash, proofs_topic_params);
 
                 let peer_score_params = PeerScoreParams {
                     topics: topic_scores,
@@ -522,6 +544,7 @@ struct SwarmLoopConfig {
     blocks_topic: IdentTopic,
     txs_topic: IdentTopic,
     attestation_topic: IdentTopic,
+    proofs_topic: IdentTopic,
     bandwidth: Arc<BandwidthTracker>,
     boot_nodes: Vec<Multiaddr>,
     max_msg_size: usize,
@@ -581,6 +604,13 @@ async fn swarm_loop(
     {
         warn!("Failed to subscribe to attestation topic: {e}");
     }
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&loop_config.proofs_topic)
+    {
+        warn!("Failed to subscribe to proofs topic: {e}");
+    }
 
     // Periodic Kademlia bootstrap refresh (every 5 minutes).
     let mut kad_bootstrap_interval = interval(Duration::from_secs(300));
@@ -611,6 +641,7 @@ async fn swarm_loop(
                             TopicKind::Blocks => loop_config.blocks_topic.clone(),
                             TopicKind::Transactions => loop_config.txs_topic.clone(),
                             TopicKind::Attestation => loop_config.attestation_topic.clone(),
+                            TopicKind::Proofs => loop_config.proofs_topic.clone(),
                         };
                         // F-065: skip publish when outbound bandwidth exceeded.
                         if !loop_config.bandwidth.record_outbound(data_len) {
@@ -1010,28 +1041,32 @@ fn log_peer_scores(swarm: &Swarm<ShellBehaviour>) {
     }
 }
 
+fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
+    match msg {
+        NetworkMessage::NewBlock(_)
+        | NetworkMessage::BlockRequest { .. }
+        | NetworkMessage::BlockResponse { .. }
+        | NetworkMessage::BodyRequest { .. }
+        | NetworkMessage::BodyResponse { .. }
+        | NetworkMessage::Ping
+        | NetworkMessage::Pong => TopicKind::Blocks,
+        NetworkMessage::NewTransaction(_) => TopicKind::Transactions,
+        NetworkMessage::NewAttestation(_) => TopicKind::Attestation,
+        NetworkMessage::ProofAmendment { .. }
+        | NetworkMessage::ProofAck { .. }
+        | NetworkMessage::EquivocationEvidence(_)
+        | NetworkMessage::ProofChallenge(_)
+        | NetworkMessage::ProofChallengeResponse(_) => TopicKind::Proofs,
+        NetworkMessage::StorageCapability { .. }
+        | NetworkMessage::WPoaVote { .. }
+        | NetworkMessage::WPoaViewChange(_) => TopicKind::Attestation,
+    }
+}
+
 #[async_trait]
 impl NetworkService for Libp2pNetwork {
     async fn broadcast(&self, msg: NetworkMessage) -> Result<(), NetworkError> {
-        let topic = match &msg {
-            NetworkMessage::NewBlock(_)
-            | NetworkMessage::BlockRequest { .. }
-            | NetworkMessage::BlockResponse { .. }
-            | NetworkMessage::BodyRequest { .. }
-            | NetworkMessage::BodyResponse { .. }
-            | NetworkMessage::Ping
-            | NetworkMessage::Pong => TopicKind::Blocks,
-            NetworkMessage::NewTransaction(_) => TopicKind::Transactions,
-            NetworkMessage::NewAttestation(_) => TopicKind::Attestation,
-            NetworkMessage::ProofAmendment { .. }
-            | NetworkMessage::ProofAck { .. }
-            | NetworkMessage::EquivocationEvidence(_)
-            | NetworkMessage::ProofChallenge(_)
-            | NetworkMessage::ProofChallengeResponse(_) => TopicKind::Blocks,
-            NetworkMessage::StorageCapability { .. }
-            | NetworkMessage::WPoaVote { .. }
-            | NetworkMessage::WPoaViewChange(_) => TopicKind::Attestation,
-        };
+        let topic = topic_kind_for_message(&msg);
 
         let data =
             serde_json::to_vec(&msg).map_err(|e| NetworkError::Serialization(e.to_string()))?;
@@ -1095,6 +1130,31 @@ mod tests {
     fn config_defaults_enable_peer_scoring() {
         let config = NetworkConfig::default();
         assert!(config.enable_peer_scoring);
+    }
+
+    #[test]
+    fn proof_messages_route_to_proofs_topic() {
+        let msg = NetworkMessage::ProofAck {
+            block_hash: shell_primitives::ShellHash::ZERO,
+            holder: shell_primitives::Address::ZERO,
+        };
+
+        assert_eq!(topic_kind_for_message(&msg), TopicKind::Proofs);
+    }
+
+    #[test]
+    fn block_and_control_messages_stay_on_blocks_topic() {
+        assert_eq!(
+            topic_kind_for_message(&NetworkMessage::Ping),
+            TopicKind::Blocks
+        );
+        assert_eq!(
+            topic_kind_for_message(&NetworkMessage::BodyRequest {
+                start_number: 0,
+                count: 1,
+            }),
+            TopicKind::Blocks
+        );
     }
 
     #[test]
@@ -1354,6 +1414,7 @@ mod tests {
             blocks_topic: "/custom/blocks/2".into(),
             txs_topic: "/custom/txs/2".into(),
             attestation_topic: "/custom/attestation/2".into(),
+            proofs_topic: "/custom/proofs/2".into(),
             enable_mdns: false,
             enable_kademlia: false,
             enable_peer_scoring: true,
