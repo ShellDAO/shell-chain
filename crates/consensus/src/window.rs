@@ -225,7 +225,7 @@ impl ProofWindowManager {
         }
         // Expire windows beyond the proof window size.
         let window_cutoff = current_block.saturating_sub(self.config.window_size_blocks);
-        for (_block_number, state) in self.windows.iter_mut() {
+        for state in self.windows.values_mut() {
             if matches!(state, WindowState::Unclaimed) {
                 // Determined by block_number comparison below — mark as expired.
             }
