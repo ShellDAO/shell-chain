@@ -284,6 +284,7 @@ impl Decodable for BlockHeader {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
+        let end = crate::rlp_payload_end(remaining, header.payload_length)?;
 
         let parent_hash = ShellHash::decode(buf)?;
         let state_root = ShellHash::decode(buf)?;
@@ -311,11 +312,9 @@ impl Decodable for BlockHeader {
         let blob_gas_used = u64::decode(buf)?;
         let excess_blob_gas = u64::decode(buf)?;
 
-        // witness_root: empty bytes → None, 32-byte hash → Some
-        // For backward compatibility: older blocks without this field will
-        // hit ListLengthMismatch at consumed != header.payload_length — handled
-        // gracefully by treating absent field as None via the consumed check below.
-        let witness_root = if !buf.is_empty() {
+        // witness_root: empty bytes → None, 32-byte hash → Some. Older headers
+        // ended after excess_blob_gas, so only inspect bytes inside this header.
+        let witness_root = if buf.len() > end {
             let root_bytes = alloy_rlp::Header::decode_bytes(buf, false)?;
             if root_bytes.is_empty() {
                 None
@@ -785,6 +784,76 @@ mod tests {
         buf
     }
 
+    fn encode_header_without_witness_root(header: &BlockHeader, out: &mut Vec<u8>) {
+        let witness_len = match &header.witness_root {
+            Some(root) => root.length(),
+            None => 1,
+        };
+        alloy_rlp::Header {
+            list: true,
+            payload_length: header.fields_len().saturating_sub(witness_len),
+        }
+        .encode(out);
+        header.parent_hash.encode(out);
+        header.state_root.encode(out);
+        header.transactions_root.encode(out);
+        header.receipts_root.encode(out);
+        header.logs_bloom.encode(out);
+        header.number.encode(out);
+        header.gas_limit.encode(out);
+        header.gas_used.encode(out);
+        header.timestamp.encode(out);
+        header.extra_data.encode(out);
+        header.proposer.encode(out);
+        match &header.sig_aggregate_proof {
+            Some(proof) => proof.encode(out),
+            None => Bytes::new().encode(out),
+        }
+        header.base_fee_per_gas.encode(out);
+        header.withdrawals_root.encode(out);
+        header.parent_beacon_block_root.encode(out);
+        header.blob_gas_used.encode(out);
+        header.excess_blob_gas.encode(out);
+    }
+
+    fn encode_legacy_empty_block_without_witness_root(header: &BlockHeader) -> Vec<u8> {
+        let witness_len = match &header.witness_root {
+            Some(root) => root.length(),
+            None => 1,
+        };
+        let header_payload = header.fields_len().saturating_sub(witness_len);
+        let header_len = alloy_rlp::Header {
+            list: true,
+            payload_length: header_payload,
+        }
+        .length()
+        .saturating_add(header_payload);
+        let txs_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .length();
+        let seal_len = 1usize;
+        let payload_length = header_len
+            .saturating_add(txs_list_len)
+            .saturating_add(seal_len);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(&mut buf);
+        encode_header_without_witness_root(header, &mut buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut buf);
+        Bytes::new().encode(&mut buf);
+        buf
+    }
+
     #[test]
     fn genesis_block() {
         let header = sample_header();
@@ -898,6 +967,17 @@ mod tests {
 
         assert!(decoded.system_transactions.is_empty());
         assert_eq!(decoded.proposer_seal, Some(seal));
+    }
+
+    #[test]
+    fn block_decode_accepts_legacy_header_without_witness_root() {
+        let encoded = encode_legacy_empty_block_without_witness_root(&sample_header());
+        let decoded = Block::decode(&mut encoded.as_slice()).unwrap();
+
+        assert!(decoded.header.witness_root.is_none());
+        assert!(decoded.transactions.is_empty());
+        assert!(decoded.system_transactions.is_empty());
+        assert!(decoded.proposer_seal.is_none());
     }
 
     #[test]
