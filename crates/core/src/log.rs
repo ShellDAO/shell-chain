@@ -79,12 +79,20 @@ impl Decodable for Log {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut topics = Vec::new();
-        let topics_end = crate::rlp_payload_end(buf.len(), topics_header.payload_length)?;
+        let topics_remaining = buf.len();
+        let topics_end = crate::rlp_payload_end(topics_remaining, topics_header.payload_length)?;
         while buf.len() > topics_end {
             if topics.len() == MAX_LOG_TOPICS {
                 return Err(alloy_rlp::Error::Custom("too many log topics"));
             }
             topics.push(ShellHash::decode(buf)?);
+        }
+        if buf.len() != topics_end {
+            let consumed = topics_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: topics_header.payload_length,
+                got: consumed,
+            });
         }
 
         let data = Bytes::decode(buf)?;
@@ -191,5 +199,29 @@ mod tests {
 
         let err = Log::decode(&mut buf.as_slice()).unwrap_err();
         assert!(err.to_string().contains("too many log topics"));
+    }
+
+    #[test]
+    fn log_rlp_rejects_topic_payload_overrun() {
+        let mut payload = Vec::new();
+        Address::default().encode(&mut payload);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut payload);
+        ShellHash::ZERO.encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut buf);
+        buf.extend_from_slice(&payload);
+
+        let err = Log::decode(&mut buf.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 }

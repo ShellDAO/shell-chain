@@ -139,9 +139,17 @@ impl Decodable for TransactionReceipt {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut logs = Vec::new();
-        let logs_end = crate::rlp_payload_end(buf.len(), logs_header.payload_length)?;
+        let logs_remaining = buf.len();
+        let logs_end = crate::rlp_payload_end(logs_remaining, logs_header.payload_length)?;
         while buf.len() > logs_end {
             logs.push(Log::decode(buf)?);
+        }
+        if buf.len() != logs_end {
+            let consumed = logs_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: logs_header.payload_length,
+                got: consumed,
+            });
         }
 
         let consumed = remaining.saturating_sub(buf.len());
@@ -249,5 +257,41 @@ mod tests {
         receipt.encode(&mut buf);
         let decoded = TransactionReceipt::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(receipt, decoded);
+    }
+
+    #[test]
+    fn receipt_rlp_rejects_logs_payload_overrun() {
+        let log = Log {
+            address: Address::from([0xCD; 20]),
+            topics: vec![keccak256(b"Transfer(address,address,uint256)")],
+            data: shell_primitives::Bytes::from(vec![1, 2, 3]),
+        };
+
+        let mut payload = Vec::new();
+        keccak256(b"tx").encode(&mut payload);
+        42u64.encode(&mut payload);
+        3u32.encode(&mut payload);
+        1u8.encode(&mut payload);
+        21_000u64.encode(&mut payload);
+        21_000u64.encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut payload);
+        log.encode(&mut payload);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut buf);
+        buf.extend_from_slice(&payload);
+
+        let err = TransactionReceipt::decode(&mut buf.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 }

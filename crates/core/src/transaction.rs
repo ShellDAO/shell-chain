@@ -1048,10 +1048,18 @@ impl Decodable for AaBundle {
         if !inner_header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let inner_end = crate::rlp_payload_end(buf.len(), inner_header.payload_length)?;
+        let inner_remaining = buf.len();
+        let inner_end = crate::rlp_payload_end(inner_remaining, inner_header.payload_length)?;
         let mut inner_calls = Vec::new();
         while buf.len() > inner_end {
             inner_calls.push(InnerCall::decode(buf)?);
+        }
+        if buf.len() != inner_end {
+            let consumed = inner_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: inner_header.payload_length,
+                got: consumed,
+            });
         }
 
         // paymaster
@@ -2933,6 +2941,34 @@ mod tests {
         bundle.encode(&mut buf);
         let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn aa_bundle_decode_rejects_inner_calls_payload_overrun() {
+        let call = sample_inner_call(1);
+
+        let mut payload = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut payload);
+        call.encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+        Bytes::new().encode(&mut payload);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut buf);
+        buf.extend_from_slice(&payload);
+
+        let err = AaBundle::decode(&mut buf.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
     #[test]

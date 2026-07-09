@@ -247,7 +247,8 @@ fn decode_system_transaction_list(buf: &mut &[u8]) -> alloy_rlp::Result<Vec<Syst
     if !system_txs_header.list {
         return Err(alloy_rlp::Error::UnexpectedString);
     }
-    let system_txs_end = crate::rlp_payload_end(buf.len(), system_txs_header.payload_length)?;
+    let list_remaining = buf.len();
+    let system_txs_end = crate::rlp_payload_end(list_remaining, system_txs_header.payload_length)?;
     let mut system_transactions = Vec::new();
     while buf.len() > system_txs_end {
         let bytes = Bytes::decode(buf)?;
@@ -255,6 +256,13 @@ fn decode_system_transaction_list(buf: &mut &[u8]) -> alloy_rlp::Result<Vec<Syst
             SystemTransaction::from_wire_bytes(bytes.as_ref())
                 .map_err(|_| alloy_rlp::Error::Custom("invalid system transaction payload"))?,
         );
+    }
+    if buf.len() != system_txs_end {
+        let consumed = list_remaining.saturating_sub(buf.len());
+        return Err(alloy_rlp::Error::ListLengthMismatch {
+            expected: system_txs_header.payload_length,
+            got: consumed,
+        });
     }
     Ok(system_transactions)
 }
@@ -430,9 +438,17 @@ impl Decodable for Block {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut transactions = Vec::new();
-        let txs_end = crate::rlp_payload_end(buf.len(), txs_header.payload_length)?;
+        let txs_remaining = buf.len();
+        let txs_end = crate::rlp_payload_end(txs_remaining, txs_header.payload_length)?;
         while buf.len() > txs_end {
             transactions.push(SignedTransaction::decode(buf)?);
+        }
+        if buf.len() != txs_end {
+            let consumed = txs_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: txs_header.payload_length,
+                got: consumed,
+            });
         }
 
         let system_transactions = decode_optional_system_transaction_list(buf, end)?;
@@ -687,9 +703,17 @@ impl Decodable for StrippedBlock {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let mut transactions = Vec::new();
-        let txs_end = crate::rlp_payload_end(buf.len(), txs_header.payload_length)?;
+        let txs_remaining = buf.len();
+        let txs_end = crate::rlp_payload_end(txs_remaining, txs_header.payload_length)?;
         while buf.len() > txs_end {
             transactions.push(StrippedTransaction::decode(buf)?);
+        }
+        if buf.len() != txs_end {
+            let consumed = txs_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: txs_header.payload_length,
+                got: consumed,
+            });
         }
 
         let system_transactions = decode_optional_system_transaction_list(buf, end)?;
@@ -1011,6 +1035,30 @@ mod tests {
                 .unwrap(),
             &Bytes::from_static(b"proof-payload")
         );
+    }
+
+    #[test]
+    fn system_transaction_list_rejects_payload_overrun() {
+        let system_tx = SystemTransaction::block_gas_reward(
+            10,
+            7,
+            0,
+            Address::from([0x11; 20]),
+            shell_primitives::U256::from(50u64),
+            ShellHash::from([0x22; 32]),
+        );
+        let wire = system_tx.to_wire_bytes().unwrap();
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut buf);
+        wire.encode(&mut buf);
+
+        let err = decode_system_transaction_list(&mut buf.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
     // ── B2: witness_root tests ─────────────────────────────────────────────
