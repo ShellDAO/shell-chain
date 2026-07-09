@@ -195,7 +195,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     number: hex_u64(pending_number),
                     timestamp: hex_u64(now),
                     gas_limit: hex_u64(head.header.gas_limit),
-                    gas_used: hex_u64(0),
+                    gas_used: hex_u64(cumulative_gas),
                     miner: head.header.proposer,
                     state_root: head.header.state_root,
                     transactions_root: ShellHash::ZERO,

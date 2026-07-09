@@ -4877,6 +4877,7 @@ mod tests {
         assert_eq!(rpc.hash, ShellHash::ZERO);
         // Empty mempool → no transactions.
         assert_eq!(rpc.transactions, serde_json::json!([]));
+        assert_eq!(rpc.gas_used, "0x0");
         // Still has standard Ethereum fields.
         assert_eq!(rpc.total_difficulty, "0x1");
         assert_eq!(rpc.nonce, "0x0000000000000000");
@@ -4972,6 +4973,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(rpc.transactions, serde_json::json!([fit_hash]));
+        assert_eq!(rpc.gas_used, "0x5208");
     }
 
     #[tokio::test]
@@ -5086,6 +5088,7 @@ mod tests {
             rpc.transactions,
             serde_json::json!([other_hash, sender_tx0_hash, sender_tx1_hash])
         );
+        assert_eq!(rpc.gas_used, "0xf618");
     }
 
     #[tokio::test]
