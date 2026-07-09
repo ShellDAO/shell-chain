@@ -388,7 +388,7 @@ impl TxPool {
         let inner = self.inner.read();
         let mut result = Vec::with_capacity(limit.min(inner.by_hash.len()));
 
-        for (_key, hash) in inner.by_priority.iter() {
+        for hash in inner.by_priority.values() {
             if result.len() >= limit {
                 break;
             }
