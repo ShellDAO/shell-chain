@@ -1515,16 +1515,23 @@ mod tests {
         let pubkey = signer.public_key().to_vec();
         let sender = test_address(&pubkey);
         ws.increment_nonce(&sender).unwrap();
+        let chain_nonce = ws.get_nonce(&sender).unwrap();
 
-        let tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 50);
-        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, 2, 50);
+        let tx1 = make_signed_tx_with_signer(&signer, &pubkey, chain_nonce, 50);
+        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, chain_nonce + 1, 50);
 
         insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, tx2, &verifier, &mut ws, &cs).unwrap();
 
-        assert_eq!(pool.pending_nonce(&sender, 1), 3);
-        assert_eq!(pool.pending_nonce(&sender, 2), 3);
-        assert_eq!(pool.pending_nonce(&sender, 3), 3);
+        assert_eq!(pool.pending_nonce(&sender, chain_nonce), chain_nonce + 2);
+        assert_eq!(
+            pool.pending_nonce(&sender, chain_nonce + 1),
+            chain_nonce + 2
+        );
+        assert_eq!(
+            pool.pending_nonce(&sender, chain_nonce + 2),
+            chain_nonce + 2
+        );
     }
 
     #[test]
