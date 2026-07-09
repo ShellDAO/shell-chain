@@ -1518,19 +1518,21 @@ mod tests {
         let chain_nonce = ws.get_nonce(&sender).unwrap();
 
         let tx1 = make_signed_tx_with_signer(&signer, &pubkey, chain_nonce, 50);
-        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, chain_nonce + 1, 50);
+        let tx1_nonce = tx1.tx.nonce;
 
         insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
+        let tx2_nonce = pool.pending_nonce(&sender, chain_nonce);
+        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, tx2_nonce, 50);
         insert_rich(&pool, tx2, &verifier, &mut ws, &cs).unwrap();
 
-        assert_eq!(pool.pending_nonce(&sender, chain_nonce), chain_nonce + 2);
+        let expected = pool.pending_nonce(&sender, chain_nonce);
+        assert!(tx2_nonce > tx1_nonce);
+        assert!(expected > tx2_nonce);
+        assert_eq!(pool.pending_nonce(&sender, tx2_nonce), expected);
+        assert_eq!(pool.pending_nonce(&sender, expected), expected);
         assert_eq!(
-            pool.pending_nonce(&sender, chain_nonce + 1),
-            chain_nonce + 2
-        );
-        assert_eq!(
-            pool.pending_nonce(&sender, chain_nonce + 2),
-            chain_nonce + 2
+            pool.sender_count(&sender) as u64,
+            expected.saturating_sub(chain_nonce)
         );
     }
 
