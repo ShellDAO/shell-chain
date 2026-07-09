@@ -1668,7 +1668,8 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = crate::rlp_payload_end(buf.len(), header.payload_length)?;
+        let list_remaining = buf.len();
+        let end = crate::rlp_payload_end(list_remaining, header.payload_length)?;
         let mut items = Vec::new();
         while buf.len() > end {
             if items.len() == MAX_ACCESS_LIST_ENTRIES {
@@ -1709,6 +1710,13 @@ impl Transaction {
                 storage_keys,
             });
         }
+        if buf.len() != end {
+            let consumed = list_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
         Ok(Some(items))
     }
 
@@ -1720,10 +1728,18 @@ impl Transaction {
         if header.payload_length == 0 {
             return Ok(None);
         }
-        let end = crate::rlp_payload_end(buf.len(), header.payload_length)?;
+        let list_remaining = buf.len();
+        let end = crate::rlp_payload_end(list_remaining, header.payload_length)?;
         let mut hashes = Vec::new();
         while buf.len() > end {
             hashes.push(ShellHash::decode(buf)?);
+        }
+        if buf.len() != end {
+            let consumed = list_remaining.saturating_sub(buf.len());
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
         }
         Ok(Some(hashes))
     }
@@ -2361,6 +2377,50 @@ mod tests {
         access_list.extend_from_slice(&oversized_entry_fields);
 
         let err = Transaction::decode_access_list(&mut access_list.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn access_list_decode_rejects_outer_payload_overrun() {
+        let mut entry_fields = Vec::new();
+        Address::from([0xCC; 20]).encode(&mut entry_fields);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut entry_fields);
+
+        let mut entry = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: entry_fields.len(),
+        }
+        .encode(&mut entry);
+        entry.extend_from_slice(&entry_fields);
+
+        let mut access_list = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut access_list);
+        access_list.extend_from_slice(&entry);
+
+        let err = Transaction::decode_access_list(&mut access_list.as_slice()).unwrap_err();
+        assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn blob_hashes_decode_rejects_outer_payload_overrun() {
+        let mut blob_hashes = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 1,
+        }
+        .encode(&mut blob_hashes);
+        ShellHash::from([0x11; 32]).encode(&mut blob_hashes);
+
+        let err = Transaction::decode_blob_hashes(&mut blob_hashes.as_slice()).unwrap_err();
         assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
