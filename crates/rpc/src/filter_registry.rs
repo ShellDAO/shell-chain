@@ -6,7 +6,7 @@
 //! Filters expire after a configurable TTL (default 5 minutes) of inactivity.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rand::Rng;
@@ -97,6 +97,7 @@ impl FilterRegistry {
         F: FnMut() -> String,
     {
         let mut filters = self.filters.write();
+        cleanup_expired_filters(&mut filters, self.ttl_secs);
         if filters.len() >= MAX_FILTERS {
             return None;
         }
@@ -158,11 +159,7 @@ impl FilterRegistry {
 
     /// Remove filters that have not been accessed within the TTL window.
     pub fn cleanup_expired(&self) {
-        let now = Instant::now();
-        let ttl = std::time::Duration::from_secs(self.ttl_secs);
-        self.filters
-            .write()
-            .retain(|_, entry| now.saturating_duration_since(entry.last_access) <= ttl);
+        cleanup_expired_filters(&mut self.filters.write(), self.ttl_secs);
     }
 
     /// Returns the number of active filters.
@@ -194,6 +191,12 @@ impl FilterRegistry {
             }
         });
     }
+}
+
+fn cleanup_expired_filters(filters: &mut HashMap<String, FilterEntry>, ttl_secs: u64) {
+    let now = Instant::now();
+    let ttl = Duration::from_secs(ttl_secs);
+    filters.retain(|_, entry| now.saturating_duration_since(entry.last_access) <= ttl);
 }
 
 fn random_filter_id() -> String {
@@ -260,6 +263,30 @@ mod tests {
         assert!(id.is_none());
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.get_filter_info(&duplicate).unwrap().1, 1);
+    }
+
+    #[test]
+    fn new_filter_reclaims_expired_capacity_before_rejecting() {
+        let reg = FilterRegistry::with_ttl(1);
+        let expired_at = Instant::now() - std::time::Duration::from_secs(2);
+        {
+            let mut filters = reg.filters.write();
+            for i in 0..MAX_FILTERS {
+                filters.insert(
+                    format!("0x{i:032x}"),
+                    FilterEntry {
+                        kind: FilterKind::Block,
+                        last_poll_block: i as u64,
+                        last_access: expired_at,
+                    },
+                );
+            }
+        }
+
+        let id = reg.new_filter(FilterKind::Block, 99).unwrap();
+
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.get_filter_info(&id).unwrap().1, 99);
     }
 
     #[test]
