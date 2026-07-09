@@ -2352,6 +2352,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_transaction_count_pending_includes_contiguous_mempool_nonces() {
+        let handler = setup();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let addr = signer_address(&signer);
+
+        {
+            let mut ws = handler.world_state.write();
+            let mut account = shell_core::Account::new_user_account(
+                ShellHash::ZERO,
+                U256::from(100_000_000_000_000u64),
+            );
+            account.nonce = 5;
+            ws.set_account(&addr, &account).unwrap();
+        }
+        handler.chain_store.put_pubkey(&addr, &pubkey).unwrap();
+
+        let make_tx = |nonce| {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce,
+                to: Some(test_address(b"pending-nonce-recipient")),
+                value: U256::ZERO,
+                data: Bytes::default(),
+                gas_limit: 21_000,
+                max_fee_per_gas: 1_000_000,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let sig = signer.sign(tx.hash().0.as_slice()).unwrap();
+            SignedTransaction::new(addr, tx, sig)
+        };
+
+        {
+            let mut ws = handler.world_state.write();
+            handler
+                .tx_pool
+                .insert(
+                    make_tx(5),
+                    &mut ws,
+                    handler.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            handler
+                .tx_pool
+                .insert(
+                    make_tx(6),
+                    &mut ws,
+                    handler.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+        }
+
+        let latest = EthApiServer::get_transaction_count(&handler, addr, Some("latest".into()))
+            .await
+            .unwrap();
+        let pending = EthApiServer::get_transaction_count(&handler, addr, Some("pending".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(latest, "0x5");
+        assert_eq!(pending, "0x7");
+    }
+
+    #[tokio::test]
     async fn gas_price_returns_default() {
         let handler = setup();
         let result = EthApiServer::gas_price(&handler).await.unwrap();

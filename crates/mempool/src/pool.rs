@@ -458,6 +458,15 @@ impl TxPool {
             .unwrap_or_default()
     }
 
+    /// Return the next nonce after contiguous pending transactions for a sender.
+    ///
+    /// This is the mempool view used by `"pending"` RPC nonce queries. Stale
+    /// entries below `chain_nonce` are ignored, and gaps stop the count.
+    pub fn pending_nonce(&self, sender: &Address, chain_nonce: u64) -> u64 {
+        let inner = self.inner.read();
+        next_expected_nonce(inner.by_sender.get(sender), chain_nonce)
+    }
+
     // --- Private helpers ---
 
     /// Lightweight validation performed before acquiring the pool lock.
@@ -1494,6 +1503,28 @@ mod tests {
         assert_eq!(sender_hashes.len(), 3);
         assert_eq!(sender_hashes, vec![hash0, hash1, hash2]);
         assert_eq!(pool.sender_count(&sender), 3);
+    }
+
+    #[test]
+    fn pending_nonce_counts_contiguous_sender_queue_from_chain_nonce() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        ws.increment_nonce(&sender).unwrap();
+
+        let tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 50);
+        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, 2, 50);
+
+        insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
+        insert_rich(&pool, tx2, &verifier, &mut ws, &cs).unwrap();
+
+        assert_eq!(pool.pending_nonce(&sender, 1), 3);
+        assert_eq!(pool.pending_nonce(&sender, 2), 3);
+        assert_eq!(pool.pending_nonce(&sender, 3), 3);
     }
 
     #[test]

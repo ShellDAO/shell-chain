@@ -513,11 +513,16 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         address: Address,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
+        let include_pending = matches!(block.as_deref(), Some("pending"));
         if let Some(ref tag) = block {
             validate_state_block_is_latest(tag)?;
         }
         let ws = self.world_state.read();
-        let nonce = ws.get_nonce(&address).map_err(internal_err)?;
+        let mut nonce = ws.get_nonce(&address).map_err(internal_err)?;
+        drop(ws);
+        if include_pending {
+            nonce = self.tx_pool.pending_nonce(&address, nonce);
+        }
         Ok(hex_u64(nonce))
     }
 
