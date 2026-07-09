@@ -484,6 +484,12 @@ impl<S: KvStore + 'static> RpcHandler<S> {
                 let Some(s) = s.strip_prefix("0x") else {
                     return Err(invalid_params_err("call data must be 0x-prefixed"));
                 };
+                if s.len() > shell_mempool::MAX_TX_SIZE.saturating_mul(2) {
+                    return Err(invalid_params_err(format!(
+                        "call data exceeds maximum size of {} bytes",
+                        shell_mempool::MAX_TX_SIZE
+                    )));
+                }
                 hex::decode(s)
                     .map(Bytes::from)
                     .map_err(|e| invalid_params_err(format!("invalid call data hex: {e}")))
@@ -3500,6 +3506,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eth_call_rejects_oversized_data_as_invalid_params() {
+        let handler = setup();
+        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE + 1));
+        let err = EthApiServer::call(
+            &handler,
+            crate::types::CallRequest {
+                from: None,
+                to: None,
+                data: Some(oversized),
+                value: None,
+                gas: None,
+                access_list: None,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("maximum size"));
+        assert!(
+            !err.message().contains(&"00".repeat(128)),
+            "error should not reflect large call data"
+        );
+    }
+
+    #[tokio::test]
     async fn eth_call_rejects_unprefixed_access_list_storage_key_as_invalid_params() {
         let handler = setup();
         let err = EthApiServer::call(
@@ -3564,6 +3597,32 @@ mod tests {
 
         assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
         assert!(err.message().contains("0x-prefixed"));
+    }
+
+    #[tokio::test]
+    async fn eth_estimate_gas_rejects_oversized_data_as_invalid_params() {
+        let handler = setup();
+        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE + 1));
+        let err = EthApiServer::estimate_gas(
+            &handler,
+            crate::types::CallRequest {
+                from: None,
+                to: None,
+                data: Some(oversized),
+                value: None,
+                gas: None,
+                access_list: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(err.message().contains("maximum size"));
+        assert!(
+            !err.message().contains(&"00".repeat(128)),
+            "error should not reflect large call data"
+        );
     }
 
     #[tokio::test]
