@@ -278,11 +278,19 @@ fn decode_optional_system_transaction_list(
     let checkpoint = *buf;
     match decode_system_transaction_list(buf) {
         Ok(system_transactions) => Ok(system_transactions),
-        Err(_) => {
+        Err(err) => {
             *buf = checkpoint;
-            Ok(Vec::new())
+            if legacy_proposer_seal_consumes_remaining(checkpoint, list_end) {
+                Ok(Vec::new())
+            } else {
+                Err(err)
+            }
         }
     }
+}
+
+fn legacy_proposer_seal_consumes_remaining(mut buf: &[u8], list_end: usize) -> bool {
+    PQSignature::decode(&mut buf).is_ok() && buf.len() == list_end
 }
 
 impl Decodable for BlockHeader {
@@ -878,6 +886,39 @@ mod tests {
         buf
     }
 
+    fn encode_empty_block_with_raw_system_field(
+        header: &BlockHeader,
+        raw_system_field: &[u8],
+    ) -> Vec<u8> {
+        let txs_list_len = alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .length();
+        let seal_len = 1usize;
+        let payload_length = header
+            .length()
+            .saturating_add(txs_list_len)
+            .saturating_add(raw_system_field.len())
+            .saturating_add(seal_len);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(&mut buf);
+        header.encode(&mut buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut buf);
+        buf.extend_from_slice(raw_system_field);
+        Bytes::new().encode(&mut buf);
+        buf
+    }
+
     #[test]
     fn genesis_block() {
         let header = sample_header();
@@ -1061,6 +1102,20 @@ mod tests {
         assert!(matches!(err, alloy_rlp::Error::ListLengthMismatch { .. }));
     }
 
+    #[test]
+    fn block_decode_rejects_malformed_system_list_before_empty_seal() {
+        let mut raw_system_field = Vec::new();
+        PQSignature::new(SignatureType::Dilithium3, vec![0xAB; 64]).encode(&mut raw_system_field);
+        let encoded = encode_empty_block_with_raw_system_field(&sample_header(), &raw_system_field);
+
+        let err = Block::decode(&mut encoded.as_slice()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            alloy_rlp::Error::Custom("invalid system transaction payload")
+        ));
+    }
+
     // ── B2: witness_root tests ─────────────────────────────────────────────
 
     #[test]
@@ -1174,6 +1229,20 @@ mod tests {
 
         assert!(decoded.system_transactions.is_empty());
         assert_eq!(decoded.proposer_seal, Some(seal));
+    }
+
+    #[test]
+    fn stripped_block_decode_rejects_malformed_system_list_before_empty_seal() {
+        let mut raw_system_field = Vec::new();
+        PQSignature::new(SignatureType::Dilithium3, vec![0xCD; 64]).encode(&mut raw_system_field);
+        let encoded = encode_empty_block_with_raw_system_field(&sample_header(), &raw_system_field);
+
+        let err = StrippedBlock::decode(&mut encoded.as_slice()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            alloy_rlp::Error::Custom("invalid system transaction payload")
+        ));
     }
 
     #[test]
