@@ -1085,13 +1085,22 @@ impl Decodable for AaBundle {
             Some(Bytes::from(ctx_raw.to_vec()))
         };
 
-        // session_auth: peek at the next byte; if it's a list header decode
-        // SessionAuth, otherwise skip as empty marker.
-        let session_auth = if !buf.is_empty() && (buf[0] & 0xC0) == 0xC0 {
-            Some(SessionAuth::decode(buf)?)
+        // session_auth is an optional trailing field. Older bundles may omit
+        // it entirely; current encodings use either a list or an empty marker.
+        let consumed_so_far = remaining.saturating_sub(buf.len());
+        let session_auth = if consumed_so_far < header.payload_length {
+            if !buf.is_empty() && (buf[0] & 0xC0) == 0xC0 {
+                Some(SessionAuth::decode(buf)?)
+            } else {
+                let marker = alloy_rlp::Header::decode_bytes(buf, false)?;
+                if !marker.is_empty() {
+                    return Err(alloy_rlp::Error::Custom(
+                        "invalid session_auth marker: expected list or empty bytes",
+                    ));
+                }
+                None
+            }
         } else {
-            // Consume the empty bytes marker (0x80).
-            let _ = alloy_rlp::Header::decode_bytes(buf, false)?;
             None
         };
 
@@ -2703,6 +2712,44 @@ mod tests {
         tx
     }
 
+    fn encode_aa_bundle_without_session_auth(bundle: &AaBundle) -> Vec<u8> {
+        assert!(
+            bundle.session_auth.is_none(),
+            "legacy helper omits only absent session_auth"
+        );
+        let mut buf = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: bundle.fields_len().saturating_sub(1),
+        }
+        .encode(&mut buf);
+
+        let inner_payload: usize = bundle.inner_calls.iter().map(|c| c.length()).sum();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: inner_payload,
+        }
+        .encode(&mut buf);
+        for call in &bundle.inner_calls {
+            call.encode(&mut buf);
+        }
+
+        match &bundle.paymaster {
+            Some(addr) => addr.encode(&mut buf),
+            None => Bytes::new().encode(&mut buf),
+        }
+        match &bundle.paymaster_signature {
+            Some(sig) if !sig.is_empty() => sig.encode(&mut buf),
+            _ => Bytes::new().encode(&mut buf),
+        }
+        match &bundle.paymaster_context {
+            Some(ctx) if !ctx.is_empty() => ctx.encode(&mut buf),
+            _ => Bytes::new().encode(&mut buf),
+        }
+
+        buf
+    }
+
     #[test]
     fn inner_call_rlp_roundtrip() {
         let call = sample_inner_call(1234);
@@ -2826,6 +2873,22 @@ mod tests {
         bundle.encode(&mut buf);
         let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn aa_bundle_decode_accepts_legacy_missing_session_auth() {
+        let bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1), sample_inner_call(2)],
+            paymaster: None,
+            paymaster_signature: None,
+            ..Default::default()
+        };
+
+        let buf = encode_aa_bundle_without_session_auth(&bundle);
+        let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(bundle, decoded);
+        assert!(decoded.session_auth.is_none());
     }
 
     #[test]
