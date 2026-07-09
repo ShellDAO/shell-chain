@@ -1042,10 +1042,7 @@ fn log_peer_scores(swarm: &Swarm<ShellBehaviour>) {
 }
 
 fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
-    match msg
-        .topic()
-        .expect("all network messages have a gossipsub topic")
-    {
+    match msg.topic() {
         NetworkTopic::Blocks => TopicKind::Blocks,
         NetworkTopic::Transactions => TopicKind::Transactions,
         NetworkTopic::Attestation => TopicKind::Attestation,

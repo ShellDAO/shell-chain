@@ -192,7 +192,7 @@ impl NetworkMessage {
     }
 
     /// Returns the propagation topic for this message type.
-    pub fn topic(&self) -> Option<NetworkTopic> {
+    pub fn topic(&self) -> NetworkTopic {
         match self {
             Self::NewBlock(_)
             | Self::BlockRequest { .. }
@@ -201,16 +201,16 @@ impl NetworkMessage {
             | Self::Pong
             | Self::StorageCapability { .. }
             | Self::BodyRequest { .. }
-            | Self::BodyResponse { .. } => Some(NetworkTopic::Blocks),
-            Self::NewTransaction(_) => Some(NetworkTopic::Transactions),
+            | Self::BodyResponse { .. } => NetworkTopic::Blocks,
+            Self::NewTransaction(_) => NetworkTopic::Transactions,
             Self::NewAttestation(_) | Self::WPoaVote { .. } | Self::WPoaViewChange(_) => {
-                Some(NetworkTopic::Attestation)
+                NetworkTopic::Attestation
             }
             Self::ProofAmendment { .. }
             | Self::ProofAck { .. }
             | Self::EquivocationEvidence(_)
             | Self::ProofChallenge(_)
-            | Self::ProofChallengeResponse(_) => Some(NetworkTopic::Proofs),
+            | Self::ProofChallengeResponse(_) => NetworkTopic::Proofs,
         }
     }
 }
@@ -502,18 +502,18 @@ mod tests {
 
     #[test]
     fn network_message_topic_classifies_routed_variants() {
-        assert_eq!(NetworkMessage::Ping.topic(), Some(NetworkTopic::Blocks));
+        assert_eq!(NetworkMessage::Ping.topic(), NetworkTopic::Blocks);
         assert_eq!(
             NetworkMessage::StorageCapability {
                 profile: "full".to_string(),
                 oldest_body_block: 3,
             }
             .topic(),
-            Some(NetworkTopic::Blocks)
+            NetworkTopic::Blocks
         );
         assert_eq!(
             NetworkMessage::NewTransaction(Box::new(test_signed_tx())).topic(),
-            Some(NetworkTopic::Transactions)
+            NetworkTopic::Transactions
         );
         assert_eq!(
             NetworkMessage::WPoaVote {
@@ -523,7 +523,7 @@ mod tests {
                 signature: PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
             }
             .topic(),
-            Some(NetworkTopic::Attestation)
+            NetworkTopic::Attestation
         );
         assert_eq!(
             NetworkMessage::ProofAck {
@@ -531,7 +531,7 @@ mod tests {
                 holder: Address::ZERO,
             }
             .topic(),
-            Some(NetworkTopic::Proofs)
+            NetworkTopic::Proofs
         );
     }
 
