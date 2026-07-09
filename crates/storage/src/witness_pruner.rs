@@ -13,6 +13,7 @@
 use tracing::debug;
 
 use crate::{ChainStore, KvStore, StorageError, WitnessStore};
+use shell_primitives::ShellHash;
 
 /// Default number of recent blocks whose witness bundles are always retained.
 /// Set to 256 for testnet to provide STARK prover with additional headroom.
@@ -112,16 +113,17 @@ impl WitnessPruner {
         }
 
         let mut result = WitnessPruneResult::default();
+        let mut hashes_to_prune: Vec<ShellHash> = Vec::new();
 
         for block_number in self.pruned_below..cutoff {
             // Resolve block hash from chain store (canonical mapping).
             match chain_store.get_block_hash_by_number(block_number)? {
                 Some(hash) => {
                     if witness_store.has_bundle(&hash)? {
-                        witness_store.delete_bundle(&hash)?;
+                        hashes_to_prune.push(hash);
                         debug!(
                             block = block_number,
-                            "witness pruner: deleted bundle for finalized block"
+                            "witness pruner: queued bundle deletion for finalized block"
                         );
                         result.pruned_count = result.pruned_count.saturating_add(1);
                     } else {
@@ -135,6 +137,7 @@ impl WitnessPruner {
             }
         }
 
+        witness_store.delete_bundles(&hashes_to_prune)?;
         self.pruned_below = cutoff;
         Ok(result)
     }

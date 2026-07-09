@@ -26,6 +26,7 @@
 use tracing::debug;
 
 use crate::{ChainStore, KvStore, StorageError};
+use shell_primitives::ShellHash;
 
 /// Default number of recent blocks whose bodies are always retained.
 pub const DEFAULT_BODY_RETENTION: u64 = 512;
@@ -106,6 +107,7 @@ impl BodyPruner {
 
         let mut result = BodyPruneResult::default();
         let start = self.pruned_below;
+        let mut hashes_to_prune: Vec<ShellHash> = Vec::new();
 
         for block_number in start..expiry_horizon {
             result.blocks_checked = result.blocks_checked.saturating_add(1);
@@ -118,9 +120,9 @@ impl BodyPruner {
                 }
                 Some(hash) => {
                     if chain_store.has_body(&hash)? {
-                        chain_store.delete_body(&hash)?;
+                        hashes_to_prune.push(hash);
                         result.bodies_pruned = result.bodies_pruned.saturating_add(1);
-                        debug!(block_number, %hash, "body pruner: deleted body");
+                        debug!(block_number, %hash, "body pruner: queued body deletion");
                     } else {
                         debug!(block_number, %hash, "body pruner: body already absent, skipping");
                     }
@@ -128,6 +130,7 @@ impl BodyPruner {
             }
         }
 
+        chain_store.delete_bodies(&hashes_to_prune)?;
         self.pruned_below = expiry_horizon;
         Ok(result)
     }

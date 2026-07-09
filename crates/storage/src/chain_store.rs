@@ -563,6 +563,22 @@ impl<S: KvStore> ChainStore<S> {
         self.store.delete(&Self::body_key(hash))
     }
 
+    /// Delete multiple stripped block bodies in a single write batch.
+    ///
+    /// Headers, witness bundles, and canonical mappings are preserved for each
+    /// block; only the stripped transaction payloads are removed.
+    pub fn delete_bodies(&self, hashes: &[ShellHash]) -> Result<(), StorageError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for hash in hashes {
+            batch.delete(Self::body_key(hash));
+        }
+        self.store.write_batch(batch)
+    }
+
     /// Delete the witness bundle (PQ signatures) for the given block hash.
     ///
     /// Called after a [`ProofAmendment`] (STARK proof) is accepted for the
@@ -1652,6 +1668,19 @@ impl<S: KvStore> WitnessStore<S> {
         self.store.delete(&Self::key(block_hash))
     }
 
+    /// Delete multiple [`WitnessBundle`]s in a single write batch.
+    pub fn delete_bundles(&self, block_hashes: &[ShellHash]) -> Result<(), StorageError> {
+        if block_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for block_hash in block_hashes {
+            batch.delete(Self::key(block_hash));
+        }
+        self.store.write_batch(batch)
+    }
+
     /// Returns `true` if a witness bundle exists for the given block hash.
     pub fn has_bundle(&self, block_hash: &ShellHash) -> Result<bool, StorageError> {
         Ok(self.store.get(&Self::key(block_hash))?.is_some())
@@ -2309,6 +2338,26 @@ mod tests {
         }
 
         assert_eq!(cs.oldest_canonical_body_number().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn delete_bodies_removes_multiple_bodies() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let mut hashes = Vec::new();
+        for number in 0..4 {
+            let block = empty_block(number);
+            let hash = block.hash();
+            put_canonical(&cs, &block);
+            hashes.push(hash);
+        }
+
+        cs.delete_bodies(&hashes[..3]).unwrap();
+
+        for hash in hashes.iter().take(3) {
+            assert!(!cs.has_body(hash).unwrap());
+        }
+        assert!(cs.has_body(&hashes[3]).unwrap());
     }
 
     #[test]
@@ -3268,6 +3317,27 @@ mod tests {
         assert!(ws.has_bundle(&hash).unwrap());
         ws.delete_bundle(&hash).unwrap();
         assert!(!ws.has_bundle(&hash).unwrap());
+    }
+
+    #[test]
+    fn witness_store_delete_bundles_removes_multiple_bundles() {
+        let store = Arc::new(MemoryDb::default());
+        let ws = WitnessStore::new(store);
+        let bundle = dummy_bundle();
+        let hashes: Vec<ShellHash> = (0..4)
+            .map(|n| shell_primitives::keccak256(format!("block-{n}").as_bytes()))
+            .collect();
+
+        for hash in &hashes {
+            ws.put_bundle(hash, &bundle).unwrap();
+        }
+
+        ws.delete_bundles(&hashes[..3]).unwrap();
+
+        for hash in hashes.iter().take(3) {
+            assert!(!ws.has_bundle(hash).unwrap());
+        }
+        assert!(ws.has_bundle(&hashes[3]).unwrap());
     }
 
     #[test]
