@@ -880,16 +880,14 @@ fn do_commit_state<S: KvStore + 'static>(
         let shell_addr = resolve(addr);
         let info = &acct.info;
 
-        let mut account = world_state
-            .get_account(&shell_addr)?
-            .unwrap_or(Account {
-                pq_pubkey_hash: ShellHash::default(),
-                nonce: 0,
-                balance: U256::ZERO,
-                validation_code_hash: None,
-                code_hash: None,
-                storage_root: ShellHash::ZERO,
-            });
+        let mut account = world_state.get_account(&shell_addr)?.unwrap_or(Account {
+            pq_pubkey_hash: ShellHash::default(),
+            nonce: 0,
+            balance: U256::ZERO,
+            validation_code_hash: None,
+            code_hash: None,
+            storage_root: ShellHash::ZERO,
+        });
 
         account.nonce = info.nonce;
         account.balance = info.balance;
