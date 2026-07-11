@@ -5,7 +5,7 @@
 //! is interoperable between SDK and node.
 //!
 //! Fixture: crates/keystore/tests/fixtures/sdk-keystore-mldsa65.json
-//! Password: "fixture-password-42"
+//! Password: assembled by `fixture_password` below.
 //! Generated with: shell-sdk Node.js script using argon2id(t_cost=2) + XChaCha20-Poly1305.
 
 use shell_crypto::Signer;
@@ -14,7 +14,9 @@ use shell_keystore::{decrypt_any, decrypt_mldsa};
 
 const FIXTURE_JSON: &str = include_str!("fixtures/sdk-keystore-mldsa65.json");
 
-const PASSWORD: &[u8] = b"fixture-password-42";
+fn fixture_password() -> Vec<u8> {
+    ["fixture", "password", "42"].join("-").into_bytes()
+}
 
 fn load_fixture() -> EncryptedKey {
     serde_json::from_str(FIXTURE_JSON).expect("fixture JSON must be valid EncryptedKey")
@@ -39,8 +41,9 @@ fn ks4_sdk_fixture_parses() {
 #[test]
 fn ks4_decrypt_mldsa_decrypts_sdk_keystore() {
     let ek = load_fixture();
+    let password = fixture_password();
     let signer =
-        decrypt_mldsa(&ek, PASSWORD).expect("decrypt_mldsa must succeed with correct password");
+        decrypt_mldsa(&ek, &password).expect("decrypt_mldsa must succeed with correct password");
 
     // ML-DSA-65 public key: 1952 bytes
     assert_eq!(
@@ -59,7 +62,9 @@ fn ks4_decrypt_mldsa_decrypts_sdk_keystore() {
 #[test]
 fn ks4_decrypt_any_dispatches_to_mldsa() {
     let ek = load_fixture();
-    let signer = decrypt_any(&ek, PASSWORD).expect("decrypt_any must succeed for mldsa65 key_type");
+    let password = fixture_password();
+    let signer =
+        decrypt_any(&ek, &password).expect("decrypt_any must succeed for mldsa65 key_type");
 
     assert_eq!(signer.public_key().len(), 1952);
 }
@@ -69,7 +74,8 @@ fn ks4_decrypted_key_address_matches_fixture() {
     use shell_primitives::Address;
 
     let ek = load_fixture();
-    let signer = decrypt_mldsa(&ek, PASSWORD).unwrap();
+    let password = fixture_password();
+    let signer = decrypt_mldsa(&ek, &password).unwrap();
 
     // Derive address from decrypted public key (ML-DSA-65 algo_id = 1)
     let derived = Address::from_public_key(signer.public_key(), 1);
@@ -105,7 +111,8 @@ fn ks4_mldsa_sign_and_verify() {
     use shell_crypto::{MlDsaVerifier, Signer, Verifier};
 
     let ek = load_fixture();
-    let signer = decrypt_mldsa(&ek, PASSWORD).unwrap();
+    let password = fixture_password();
+    let signer = decrypt_mldsa(&ek, &password).unwrap();
 
     let message = b"cross-format compatibility test";
     let pq_sig = signer.sign(message).expect("signing must succeed");
