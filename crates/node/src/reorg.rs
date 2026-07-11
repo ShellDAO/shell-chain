@@ -89,6 +89,31 @@ impl ReorgEngine {
             "new_chain",
         )?;
 
+        // Preflight both world-state roots before mutating canonical indexes.
+        // A missing tip trie must not leave a partially applied reorganization.
+        let ancestor_block = chain_store
+            .get_block_by_hash(&ancestor_hash)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!("ancestor block not found: {:?}", ancestor_hash))
+            })?;
+        let mut ancestor_ws =
+            WorldState::at_root(Arc::clone(store), &ancestor_block.header.state_root)?;
+        ancestor_ws.validate()?;
+        let tip_state_root = match new_chain.last() {
+            Some(hash) => {
+                chain_store
+                    .get_block_by_hash(hash)?
+                    .ok_or_else(|| {
+                        NodeError::Startup(format!("new chain block not found: {:?}", hash))
+                    })?
+                    .header
+                    .state_root
+            }
+            None => ancestor_block.header.state_root,
+        };
+        let mut tip_ws = WorldState::at_root(Arc::clone(store), &tip_state_root)?;
+        tip_ws.validate()?;
+
         // Step 1: Collect transactions from blocks being rolled back (newest first)
         let mut reverted_txs = Vec::new();
         for hash in old_chain.iter().rev() {
@@ -98,14 +123,7 @@ impl ReorgEngine {
         }
 
         // Step 2: Restore world state to the ancestor's state root
-        let ancestor_block = chain_store
-            .get_block_by_hash(&ancestor_hash)?
-            .ok_or_else(|| {
-                NodeError::Startup(format!("ancestor block not found: {:?}", ancestor_hash))
-            })?;
-
-        let new_ws = WorldState::at_root(Arc::clone(store), &ancestor_block.header.state_root)?;
-        *world_state.write() = new_ws;
+        *world_state.write() = ancestor_ws;
 
         info!(
             state_root = ?ancestor_block.header.state_root,
@@ -123,7 +141,6 @@ impl ReorgEngine {
 
         let mut applied = 0;
         let mut new_head = ancestor_hash;
-        let mut tip_state_root = ancestor_block.header.state_root;
         for hash in new_chain {
             let block = chain_store.get_block_by_hash(hash)?.ok_or_else(|| {
                 NodeError::Startup(format!("new chain block not found: {:?}", hash))
@@ -131,7 +148,6 @@ impl ReorgEngine {
 
             chain_store.set_canonical(block.number(), hash)?;
             chain_store.index_block_transactions(&block)?;
-            tip_state_root = block.header.state_root;
             new_head = *hash;
             applied += 1;
         }
@@ -147,7 +163,6 @@ impl ReorgEngine {
         }
 
         // Restore world state to the new chain tip's state root.
-        let tip_ws = WorldState::at_root(Arc::clone(store), &tip_state_root)?;
         *world_state.write() = tip_ws;
 
         // Step 4: Update head pointer
@@ -455,6 +470,43 @@ mod tests {
         .to_string();
 
         assert!(err.contains("new_chain height continuity broken"));
+        assert_eq!(
+            chain_store.get_block_by_number(6).unwrap().unwrap().hash(),
+            old_hash
+        );
+        assert_eq!(chain_store.get_head_hash().unwrap().unwrap(), old_hash);
+    }
+
+    #[test]
+    fn test_reorg_rejects_missing_tip_state_before_mutation() {
+        let (store, chain_store, world_state, root) = setup_chain();
+
+        let ancestor = make_block(5, make_hash(0), root);
+        chain_store.put_block(&ancestor).unwrap();
+        let ancestor_hash = ancestor.hash();
+
+        let old6 = make_block(6, ancestor_hash, root);
+        chain_store.put_block(&old6).unwrap();
+        let old_hash = old6.hash();
+        chain_store.set_canonical(6, &old_hash).unwrap();
+        chain_store.set_head(&old_hash).unwrap();
+
+        let new6 = make_block(6, ancestor_hash, make_hash(99));
+        chain_store.put_block(&new6).unwrap();
+        let new_hash = new6.hash();
+
+        ReorgEngine::execute(
+            &chain_store,
+            &world_state,
+            &store,
+            ancestor_hash,
+            5,
+            &[old_hash],
+            &[new_hash],
+            0,
+        )
+        .unwrap_err();
+
         assert_eq!(
             chain_store.get_block_by_number(6).unwrap().unwrap().hash(),
             old_hash

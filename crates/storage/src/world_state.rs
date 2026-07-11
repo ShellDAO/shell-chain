@@ -766,9 +766,11 @@ impl<S: KvStore + 'static> WorldState<S> {
     /// detect DB corruption early.
     pub fn validate(&mut self) -> Result<(), StorageError> {
         // Verify trie can compute root hash without panic.
-        let _root = self
-            .account_trie
-            .root_hash()
+        let root_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.account_trie.root_hash()
+        }))
+        .map_err(|_| StorageError::State("state trie integrity check panicked".into()))?;
+        let _root = root_result
             .map_err(|e| StorageError::State(format!("state trie integrity check failed: {e}")))?;
 
         // Verify the validator registry is readable.
@@ -1125,5 +1127,13 @@ mod tests {
 
         let mut ws2 = WorldState::at_root(store, &root).unwrap();
         assert!(ws2.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_missing_root_returns_error_instead_of_panicking() {
+        let store = test_store();
+        let mut ws = WorldState::at_root(store, &ShellHash::from([0xAB; 32])).unwrap();
+
+        assert!(ws.validate().is_err());
     }
 }
