@@ -87,7 +87,7 @@ impl PeerCapabilityTracker {
         let guard = self.inner.lock();
         guard
             .iter()
-            .filter(|(_, cap)| cap.oldest_body_block <= from_block)
+            .filter(|(_, cap)| cap.richness() > 0 && cap.oldest_body_block <= from_block)
             .max_by_key(|(_, cap)| (cap.richness(), u64::MAX - cap.oldest_body_block))
             .map(|(id, _)| id.clone())
     }
@@ -351,6 +351,20 @@ mod tests {
 
         assert_eq!(pruned.richness(), light.richness());
         assert_eq!(rolling.richness(), light.richness());
+    }
+
+    #[test]
+    fn tracker_ignores_unknown_storage_profiles() {
+        let tracker = PeerCapabilityTracker::new();
+        tracker.record(PeerId("unknown".into()), "untrusted-profile".into(), 0);
+
+        assert!(tracker.best_peer_for_block(100).is_none());
+
+        tracker.record(PeerId("full".into()), "full".into(), 0);
+        assert_eq!(
+            tracker.best_peer_for_block(100),
+            Some(PeerId("full".into()))
+        );
     }
 
     #[test]
