@@ -731,11 +731,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
             };
             // Return value is `bool accepted` ABI-encoded as a 32-byte word.
             // The boolean true is represented as ...0001 (low byte = 1).
-            let accepted = bytes.last().copied().map(|b| b == 1).unwrap_or(false)
-                && bytes
-                    .get(..bytes.len().saturating_sub(1))
-                    .map(|s| s.iter().all(|b| *b == 0))
-                    .unwrap_or(true);
+            let accepted = decode_abi_bool(&bytes) == Some(true);
             if accepted {
                 Ok(())
             } else {
@@ -757,6 +753,18 @@ fn call_paymaster_validate<S: KvStore + 'static>(
                 )))
             }
         }
+    }
+}
+
+fn decode_abi_bool(bytes: &[u8]) -> Option<bool> {
+    let word: &[u8; 32] = bytes.try_into().ok()?;
+    if word[..31].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    match word[31] {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
     }
 }
 
@@ -1047,6 +1055,25 @@ mod tests {
         assert_eq!(&calldata[164..167], call_data.as_slice());
         assert_eq!(read_abi_u64(&calldata[196..228]), context.len() as u64);
         assert_eq!(&calldata[228..230], context.as_slice());
+    }
+
+    #[test]
+    fn paymaster_abi_bool_requires_canonical_word() {
+        let mut accepted = [0u8; 32];
+        accepted[31] = 1;
+        assert_eq!(decode_abi_bool(&accepted), Some(true));
+
+        assert_eq!(decode_abi_bool(&[0u8; 32]), Some(false));
+        assert_eq!(decode_abi_bool(&[1]), None);
+        assert_eq!(decode_abi_bool(&[0u8; 33]), None);
+
+        let mut non_canonical = [0u8; 32];
+        non_canonical[0] = 1;
+        assert_eq!(decode_abi_bool(&non_canonical), None);
+
+        let mut invalid_value = [0u8; 32];
+        invalid_value[31] = 2;
+        assert_eq!(decode_abi_bool(&invalid_value), None);
     }
 
     #[test]
