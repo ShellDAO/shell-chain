@@ -65,7 +65,10 @@ impl PoaConfig {
             self.authorities.len(),
             "authority_weights length must equal authorities length"
         );
-        self.authority_weights = weights;
+        self.authority_weights = weights
+            .into_iter()
+            .map(|weight| weight.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT))
+            .collect();
         self
     }
 
@@ -140,7 +143,7 @@ impl PoaConfig {
         let weights: Vec<u64> = self
             .authority_weights
             .iter()
-            .map(|&w| if w == 0 { 1 } else { w })
+            .map(|&w| w.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT))
             .collect();
 
         // Sum with overflow check; saturate to u64::MAX if weights are extreme (prevents

@@ -369,9 +369,18 @@ impl<S: KvStore + 'static> WorldState<S> {
                 .try_into()
                 .map_err(|e: std::array::TryFromSliceError| StorageError::Codec(e.to_string()))?,
         );
-        let mut validators = Vec::with_capacity(count as usize);
+        let count = usize::try_from(count)
+            .map_err(|_| StorageError::Codec("validator count does not fit usize".into()))?;
+        if count > Self::MAX_VALIDATORS {
+            return Err(StorageError::Codec(format!(
+                "validator count {} exceeds maximum {}",
+                count,
+                Self::MAX_VALIDATORS
+            )));
+        }
+        let mut validators = Vec::with_capacity(count);
         for i in 0..count {
-            let slot = self.get_storage(&registry, &Self::validator_slot_key(i))?;
+            let slot = self.get_storage(&registry, &Self::validator_slot_key(i as u64))?;
             // Address::ZERO is a valid validator (slot value is all zeros).
             // We trust the count field to determine how many validators exist.
             let addr = Address::try_from_slice(slot.as_bytes())
@@ -449,6 +458,12 @@ impl<S: KvStore + 'static> WorldState<S> {
         validator: &Address,
         weight: u64,
     ) -> Result<(), StorageError> {
+        if weight > shell_primitives::MAX_VALIDATOR_WEIGHT {
+            return Err(StorageError::Codec(format!(
+                "validator weight must be between 1 and {}",
+                shell_primitives::MAX_VALIDATOR_WEIGHT
+            )));
+        }
         let registry = validator_registry_addr();
         self.set_storage(
             &registry,
@@ -547,11 +562,17 @@ impl<S: KvStore + 'static> WorldState<S> {
     }
 
     pub fn set_max_validator_weight(&mut self, value: u64) -> Result<(), StorageError> {
+        if value == 0 || value > shell_primitives::MAX_VALIDATOR_WEIGHT {
+            return Err(StorageError::Codec(format!(
+                "max validator weight must be between 1 and {}",
+                shell_primitives::MAX_VALIDATOR_WEIGHT
+            )));
+        }
         let registry = validator_registry_addr();
         self.set_storage(
             &registry,
             &Self::max_validator_weight_key(),
-            &Self::u64_to_hash(value.max(1)),
+            &Self::u64_to_hash(value),
         )
     }
 

@@ -26,6 +26,10 @@ pub const ACCESS_LIST_ADDRESS_COST: u64 = 2_400;
 /// Gas cost per storage key in access list (1_900 Wei)
 pub const ACCESS_LIST_STORAGE_KEY_COST: u64 = 1_900;
 
+/// Maximum validator voting/proposer weight accepted by protocol state.
+/// Keeping this bounded prevents total-weight overflow in consensus arithmetic.
+pub const MAX_VALIDATOR_WEIGHT: u64 = 1_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

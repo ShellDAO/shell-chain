@@ -880,16 +880,14 @@ fn do_commit_state<S: KvStore + 'static>(
         let shell_addr = resolve(addr);
         let info = &acct.info;
 
-        let mut account = world_state
-            .get_account(&shell_addr)?
-            .unwrap_or_else(|| Account {
-                pq_pubkey_hash: ShellHash::default(),
-                nonce: 0,
-                balance: U256::ZERO,
-                validation_code_hash: None,
-                code_hash: None,
-                storage_root: ShellHash::ZERO,
-            });
+        let mut account = world_state.get_account(&shell_addr)?.unwrap_or(Account {
+            pq_pubkey_hash: ShellHash::default(),
+            nonce: 0,
+            balance: U256::ZERO,
+            validation_code_hash: None,
+            code_hash: None,
+            storage_root: ShellHash::ZERO,
+        });
 
         account.nonce = info.nonce;
         account.balance = info.balance;
@@ -919,16 +917,14 @@ fn do_commit_state<S: KvStore + 'static>(
     // so we do it explicitly here for any non-system tx (sender_nonce_after > 0).
     if result.sender_nonce_after > 0 {
         let sender = result.sender_shell_addr;
-        let mut account = world_state
-            .get_account(&sender)?
-            .unwrap_or_else(|| Account {
-                pq_pubkey_hash: ShellHash::default(),
-                nonce: 0,
-                balance: U256::ZERO,
-                validation_code_hash: None,
-                code_hash: None,
-                storage_root: ShellHash::ZERO,
-            });
+        let mut account = world_state.get_account(&sender)?.unwrap_or(Account {
+            pq_pubkey_hash: ShellHash::default(),
+            nonce: 0,
+            balance: U256::ZERO,
+            validation_code_hash: None,
+            code_hash: None,
+            storage_root: ShellHash::ZERO,
+        });
         account.nonce = account.nonce.max(result.sender_nonce_after);
         world_state.set_account(&sender, &account)?;
     }
@@ -1052,7 +1048,7 @@ mod tests {
             .world_state_mut()
             .get_account(addr)
             .unwrap()
-            .unwrap_or_else(|| Account {
+            .unwrap_or(Account {
                 pq_pubkey_hash: ShellHash::ZERO,
                 nonce: 0,
                 balance: U256::ZERO,

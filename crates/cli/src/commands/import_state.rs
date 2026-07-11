@@ -38,20 +38,15 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
         let store = Arc::new(stores.state);
         let chain_store = ChainStore::new(store);
 
-        // Load chain config to validate compatibility, or use snapshot values
-        // if the database is fresh.
-        let (expected_chain_id, expected_genesis_hash) = match chain_store.get_chain_config()? {
-            Some(cfg) => (cfg.chain_id, cfg.genesis_hash),
-            None => {
-                // Fresh database: trust the snapshot metadata.
-                (preview.chain_id, preview.genesis_hash)
-            }
-        };
+        // Require a local chain configuration as the trust anchor. The
+        // snapshot's own genesis hash is metadata, not authentication.
+        let cfg = chain_store.get_chain_config()?.ok_or(
+            "fresh database has no trusted chain config; initialize the chain before importing state",
+        )?;
 
         let file = std::fs::File::open(&snapshot)?;
         let reader = std::io::BufReader::new(file);
-        let metadata =
-            chain_store.import_snapshot(reader, expected_chain_id, &expected_genesis_hash)?;
+        let metadata = chain_store.import_snapshot(reader, cfg.chain_id, &cfg.genesis_hash)?;
 
         eprintln!("✓ State imported successfully");
         eprintln!("  Block:   #{}", metadata.block_number);

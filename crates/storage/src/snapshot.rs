@@ -1,10 +1,17 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shell_primitives::ShellHash;
 
 use crate::StorageError;
+
+/// Maximum encoded JSON-lines snapshot record, including the newline.
+pub const MAX_SNAPSHOT_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum decoded snapshot key size.
+pub const MAX_SNAPSHOT_KEY_BYTES: usize = 1024 * 1024;
+/// Maximum decoded snapshot value size.
+pub const MAX_SNAPSHOT_VALUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Metadata about a state snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,49 +223,87 @@ impl<W: Write> SnapshotWriter<W> {
     }
 }
 
-/// Snapshot reader: imports key-value data from a snapshot file.
+/// Snapshot reader: imports key-value data from a seekable snapshot file.
 ///
-/// Uses `BufReader` for line-by-line parsing to avoid loading the entire
-/// snapshot into a single contiguous `String` (F-079).
+/// The footer is validated in one bounded streaming pass, then entries are
+/// replayed from the beginning during import. This keeps memory independent
+/// of the total snapshot size.
 #[derive(Debug)]
-pub struct SnapshotReader {
-    lines: Vec<String>,
+pub struct SnapshotReader<R> {
+    reader: BufReader<R>,
     metadata: SnapshotMetadata,
-    current_line: usize,
+    finished: bool,
 }
 
-impl SnapshotReader {
+impl<R: Read + Seek> SnapshotReader<R> {
     /// Open a snapshot for reading. Reads metadata from the footer.
     ///
-    /// Uses `BufRead::lines()` to parse line-by-line instead of
-    /// `read_to_string()`, avoiding a redundant full-file buffer.
-    /// Verifies the SHA-256 checksum if present in metadata (F-089).
-    pub fn new<R: Read>(reader: R) -> Result<Self, StorageError> {
-        use std::io::BufRead;
-        let buf_reader = std::io::BufReader::new(reader);
-        let lines: Vec<String> = buf_reader
-            .lines()
-            .collect::<Result<_, _>>()
-            .map_err(|e| StorageError::Database(format!("read snapshot: {e}")))?;
+    /// Verifies the checksum and declared entry metadata while streaming.
+    pub fn new(reader: R) -> Result<Self, StorageError> {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        let mut metadata: Option<SnapshotMetadata> = None;
+        let mut entry_count = 0u64;
+        let mut data_size = 0u64;
+        let mut hasher = Sha256::new();
 
-        if lines.is_empty() {
-            return Err(StorageError::Serialization("empty snapshot file".into()));
+        loop {
+            let bytes_read = read_bounded_line(&mut reader, &mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+            let line_bytes = trim_line_end(&line);
+            if line_bytes.is_empty() {
+                continue;
+            }
+
+            if let Some(meta_json) = line_bytes.strip_prefix(b"META:") {
+                if metadata.is_some() {
+                    return Err(StorageError::Serialization(
+                        "snapshot contains multiple META footers".into(),
+                    ));
+                }
+                metadata =
+                    Some(serde_json::from_slice(meta_json).map_err(|e| {
+                        StorageError::Serialization(format!("parse metadata: {e}"))
+                    })?);
+                continue;
+            }
+
+            if metadata.is_some() {
+                return Err(StorageError::Serialization(
+                    "snapshot contains entries after META footer".into(),
+                ));
+            }
+
+            let entry: SnapshotEntry = serde_json::from_slice(line_bytes)
+                .map_err(|e| StorageError::Serialization(format!("parse entry: {e}")))?;
+            validate_entry_size(&entry)?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| StorageError::State("snapshot entry count overflow".into()))?;
+            data_size = data_size
+                .checked_add(saturating_entry_data_size(&entry.key, &entry.value))
+                .ok_or_else(|| StorageError::State("snapshot data size overflow".into()))?;
+            hasher.update(&entry.key);
+            hasher.update(&entry.value);
         }
 
-        // Find metadata line (last line starting with "META:")
-        let meta_line = lines
-            .last()
-            .ok_or_else(|| StorageError::Serialization("no metadata in snapshot".into()))?;
+        let metadata = metadata
+            .ok_or_else(|| StorageError::Serialization("snapshot missing META footer".into()))?;
 
-        if !meta_line.starts_with("META:") {
-            return Err(StorageError::Serialization(
-                "snapshot missing META footer".into(),
-            ));
+        if metadata.entry_count != entry_count {
+            return Err(StorageError::State(format!(
+                "snapshot entry count mismatch: metadata={}, actual={entry_count}",
+                metadata.entry_count
+            )));
         }
-
-        let meta_json = &meta_line[5..]; // skip "META:" prefix
-        let metadata: SnapshotMetadata = serde_json::from_str(meta_json)
-            .map_err(|e| StorageError::Serialization(format!("parse metadata: {e}")))?;
+        if metadata.data_size != data_size {
+            return Err(StorageError::State(format!(
+                "snapshot data size mismatch: metadata={}, actual={data_size}",
+                metadata.data_size
+            )));
+        }
 
         // Parse every entry before import so malformed data and metadata
         // mismatches cannot be discovered after writes have started.
@@ -302,10 +347,14 @@ impl SnapshotReader {
             }
         }
 
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| StorageError::Database(format!("rewind snapshot: {e}")))?;
+
         Ok(Self {
-            lines,
+            reader,
             metadata,
-            current_line: 0,
+            finished: false,
         })
     }
 
@@ -314,29 +363,43 @@ impl SnapshotReader {
         &self.metadata
     }
 
+    /// Rewind the reader so entries can be validated and then replayed.
+    pub fn rewind(&mut self) -> Result<(), StorageError> {
+        self.reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| StorageError::Database(format!("rewind snapshot: {e}")))?;
+        self.finished = false;
+        Ok(())
+    }
+
     /// Read the next entry. Returns None when all entries have been read.
     pub fn next_entry(&mut self) -> Result<Option<SnapshotEntry>, StorageError> {
-        while self.current_line < self.lines.len() {
-            let line = self
-                .lines
-                .get(self.current_line)
-                .unwrap_or_else(|| unreachable!("current_line < lines.len() checked above"));
-            self.current_line = self.current_line.saturating_add(1);
+        if self.finished {
+            return Ok(None);
+        }
 
-            // Skip metadata line and empty lines
-            if line.starts_with("META:") || line.is_empty() {
+        let mut line = Vec::new();
+        loop {
+            let bytes_read = read_bounded_line(&mut self.reader, &mut line)?;
+            if bytes_read == 0 {
+                self.finished = true;
+                return Ok(None);
+            }
+            let line_bytes = trim_line_end(&line);
+            if line_bytes.is_empty() {
                 continue;
             }
 
-            let entry: SnapshotEntry = serde_json::from_str(line).map_err(|e| {
-                StorageError::Serialization(format!(
-                    "parse entry at line {}: {e}",
-                    self.current_line
-                ))
-            })?;
+            if line_bytes.starts_with(b"META:") {
+                self.finished = true;
+                return Ok(None);
+            }
+
+            let entry: SnapshotEntry = serde_json::from_slice(line_bytes)
+                .map_err(|e| StorageError::Serialization(format!("parse entry: {e}")))?;
+            validate_entry_size(&entry)?;
             return Ok(Some(entry));
         }
-        Ok(None)
     }
 
     /// Read all remaining entries.
@@ -347,6 +410,56 @@ impl SnapshotReader {
         }
         Ok(entries)
     }
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<usize, StorageError> {
+    line.clear();
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|e| StorageError::Database(format!("read snapshot: {e}")))?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if line.len().saturating_add(take) > MAX_SNAPSHOT_LINE_BYTES {
+            return Err(StorageError::State(format!(
+                "snapshot line exceeds maximum of {MAX_SNAPSHOT_LINE_BYTES} bytes"
+            )));
+        }
+        let has_newline = available.get(take.saturating_sub(1)) == Some(&b'\n');
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if has_newline {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn trim_line_end(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn validate_entry_size(entry: &SnapshotEntry) -> Result<(), StorageError> {
+    if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+        return Err(StorageError::State(format!(
+            "snapshot key exceeds maximum of {MAX_SNAPSHOT_KEY_BYTES} bytes"
+        )));
+    }
+    if entry.value.len() > MAX_SNAPSHOT_VALUE_BYTES {
+        return Err(StorageError::State(format!(
+            "snapshot value exceeds maximum of {MAX_SNAPSHOT_VALUE_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

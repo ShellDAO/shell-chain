@@ -138,7 +138,7 @@ impl ValidatorSet {
         let mut set = Self::new(config);
         for (address, weight) in entries {
             let mut info = ValidatorInfo::new(address);
-            info.weight = weight;
+            info.weight = weight.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT);
             info.activation_epoch = Some(0);
             set.order.push(address);
             set.validators.insert(address, info);
@@ -199,7 +199,9 @@ impl ValidatorSet {
             return None;
         }
 
-        let total: u64 = active.iter().map(|v| v.weight).sum();
+        let total = active
+            .iter()
+            .try_fold(0u64, |acc, validator| acc.checked_add(validator.weight))?;
         if total == 0 {
             // Fallback: plain round-robin when all weights are 0.
             let idx = (block_number as usize).checked_rem(n).unwrap_or(0);
@@ -214,7 +216,7 @@ impl ValidatorSet {
         let slot = block_number.checked_rem(total).unwrap_or(0);
         let mut cumulative: u64 = 0;
         for v in &active {
-            cumulative = cumulative.saturating_add(v.weight);
+            cumulative = cumulative.checked_add(v.weight)?;
             if slot < cumulative {
                 return Some(v.address);
             }
@@ -255,6 +257,12 @@ impl ValidatorSet {
         if !info.status.is_active() {
             return Err(ConsensusError::InvalidLifecycleTransition(format!(
                 "{address} is not active"
+            )));
+        }
+        if weight == 0 || weight > shell_primitives::MAX_VALIDATOR_WEIGHT {
+            return Err(ConsensusError::InvalidLifecycleTransition(format!(
+                "validator weight must be between 1 and {}",
+                shell_primitives::MAX_VALIDATOR_WEIGHT
             )));
         }
         info.weight = weight;

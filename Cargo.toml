@@ -47,7 +47,6 @@ shell-core = { path = "crates/core" }
 shell-storage = { path = "crates/storage" }
 shell-consensus = { path = "crates/consensus" }
 pqcrypto-dilithium = "0.5"
-pqcrypto-sphincsplus = "0.7"
 pqcrypto-traits = "0.3"
 fips204 = "0.4.6"
 fips205 = "0.4"
@@ -86,7 +85,6 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy", "z
 
 # --- tls ---
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", features = ["ring"] }
 
 # --- cli ---

@@ -91,7 +91,7 @@ Shell-Chain uses post-quantum cryptography exclusively for signing:
 
 - **ML-DSA-65** (FIPS 204) — primary signing algorithm
 - **Dilithium3** — legacy-compatible active path
-- **SPHINCS+-SHA2-256f** — fallback signing algorithm
+- **SLH-DSA-SHA2-256f** — FIPS 205 fallback signing algorithm (wire-compatible with the documented SPHINCS+-SHA2-256f parameter set)
 - **BLAKE3** — hashing and key derivation (PQ-HD v1)
 - **Argon2id** — keystore KDF
 - **XChaCha20-Poly1305** — keystore encryption
@@ -99,6 +99,17 @@ Shell-Chain uses post-quantum cryptography exclusively for signing:
 Vulnerabilities in the underlying PQC standards (ML-DSA, SPHINCS+) should be
 reported to NIST and the relevant algorithm authors. Implementation-level
 vulnerabilities in how Shell-Chain uses these primitives are in scope here.
+
+### Legacy dependency policy
+
+The pre-FIPS Dilithium implementation remains in the dependency graph only for
+legacy key and transaction compatibility. New validator keys should use
+ML-DSA-65. New SLH-DSA-SHA2-256f keys and signatures use the maintained FIPS
+205 implementation; the legacy SPHINCS+ wrapper is no longer used for new
+signing. Unmaintained transitive crates are tracked by `cargo audit` and must
+not be introduced into new protocol paths. Removing the Dilithium wrapper
+requires a coordinated network upgrade because existing legacy signatures
+must remain verifiable during migration.
 
 ## Bug Bounty
 

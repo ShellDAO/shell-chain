@@ -599,6 +599,12 @@ fn set_validator_weight_op<S: KvStore + 'static>(
             "validator weight must be at least 1".into(),
         ));
     }
+    if new_weight > shell_primitives::MAX_VALIDATOR_WEIGHT {
+        return Err(SystemContractError::AbiDecode(format!(
+            "validator weight must be at most {}",
+            shell_primitives::MAX_VALIDATOR_WEIGHT
+        )));
+    }
 
     // Record vote; proceed only when weighted majority is reached.
     if !record_validator_vote(

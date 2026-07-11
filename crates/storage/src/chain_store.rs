@@ -1,3 +1,4 @@
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use alloy_rlp::{Decodable, Encodable};
@@ -1370,7 +1371,7 @@ impl<S: KvStore> ChainStore<S> {
     ///
     /// Validates the snapshot metadata against the current chain configuration,
     /// then restores all key-value entries from the snapshot.
-    pub fn import_snapshot<R: std::io::Read>(
+    pub fn import_snapshot<R: Read + Seek>(
         &self,
         reader: R,
         expected_chain_id: u64,
@@ -1381,6 +1382,46 @@ impl<S: KvStore> ChainStore<S> {
 
         // Validate compatibility
         metadata.validate_compatibility(expected_chain_id, expected_genesis_hash)?;
+
+        // Validate the canonical head and its state root before writing any
+        // snapshot entries. This prevents a semantic import failure from
+        // leaving partially restored keys in the destination store.
+        let mut head_hash = None;
+        let mut head_header = None;
+        while let Some(entry) = snap_reader.next_entry()? {
+            if entry.key == prefix::HEAD_BLOCK {
+                if entry.value.len() != 32 {
+                    return Err(StorageError::State(
+                        "snapshot HEAD value has invalid length".into(),
+                    ));
+                }
+                head_hash = Some(ShellHash::from_slice(&entry.value));
+            } else if entry.key.starts_with(prefix::HEADER_BY_HASH)
+                && entry.key.len() == prefix::HEADER_BY_HASH.len().saturating_add(32)
+                && head_hash.is_some_and(|hash| {
+                    entry.key[prefix::HEADER_BY_HASH.len()..].as_ref() == hash.as_bytes()
+                })
+            {
+                head_header = Some(decode_versioned::<BlockHeader>(&entry.value)?);
+            }
+        }
+
+        if let Some(head) = head_header {
+            if head.number != metadata.block_number
+                || head.hash() != metadata.block_hash
+                || head.state_root != metadata.state_root
+            {
+                return Err(StorageError::State(
+                    "snapshot head metadata does not match the stored head header".into(),
+                ));
+            }
+        } else if metadata.block_number != 0 {
+            return Err(StorageError::State(
+                "snapshot is missing the canonical head header".into(),
+            ));
+        }
+
+        snap_reader.rewind()?;
 
         // Import all entries
         let mut batch = crate::WriteBatch::new();
@@ -1399,17 +1440,6 @@ impl<S: KvStore> ChainStore<S> {
         // Flush remaining
         if !batch.is_empty() {
             self.store.write_batch(batch)?;
-        }
-
-        // Verify state_root: if a head block was imported, its state_root
-        // must match the snapshot metadata to prevent state injection.
-        if let Ok(Some(head)) = self.get_head_block() {
-            if head.header.state_root != metadata.state_root {
-                return Err(StorageError::State(format!(
-                    "snapshot state_root mismatch: block has {:?}, metadata has {:?}",
-                    head.header.state_root, metadata.state_root
-                )));
-            }
         }
 
         Ok(metadata)
@@ -2682,7 +2712,7 @@ mod tests {
         // Create a snapshot with chain_id=1337
         let meta = crate::SnapshotMetadata::new(
             1337,
-            10,
+            0,
             ShellHash::default(),
             ShellHash::default(),
             ShellHash::default(),
@@ -2704,7 +2734,7 @@ mod tests {
         // Create snapshot with entries
         let meta = crate::SnapshotMetadata::new(
             1337,
-            10,
+            0,
             ShellHash::default(),
             ShellHash::default(),
             ShellHash::default(),

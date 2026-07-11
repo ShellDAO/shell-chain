@@ -26,7 +26,6 @@ alloy-rlp.workspace = true
 tracing.workspace = true
 rand.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 tower.workspace = true
 tower-http.workspace = true

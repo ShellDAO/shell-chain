@@ -18,9 +18,9 @@ use tower::{Layer, Service};
 
 /// Shared state for one fixed-window rate-limit bucket.
 ///
-/// Buckets are keyed by coarse authentication context. The rate limiter must
-/// never retain raw bearer tokens: authentication is handled separately by
-/// [`ApiKeyLayer`], and untrusted token text is attacker-controlled input.
+/// Public buckets use the transport peer address when the server provides it
+/// in request extensions. Authenticated traffic remains keyed by auth context
+/// because the configured bearer key represents one operator/client identity.
 struct RateLimiterState {
     max_per_sec: u32,
     window_start: Instant,
@@ -154,6 +154,10 @@ fn rate_limit_bucket_key<B>(req: &Request<B>) -> String {
         .is_some()
     {
         "authenticated".to_string()
+    } else if let Some(peer) = req.extensions().get::<std::net::SocketAddr>() {
+        // SocketAddr is supplied by the transport, unlike a client-controlled
+        // forwarding header. Do not trust X-Forwarded-For in this layer.
+        format!("public:{}", peer.ip())
     } else {
         "public".to_string()
     }
@@ -369,6 +373,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(public.status(), StatusCode::OK);
+        assert_eq!(layer.bucket_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_separates_transport_peers() {
+        let layer = RateLimitLayer::new(1);
+        let mut svc = layer.layer(OkService);
+        let peer_a: std::net::SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let peer_b: std::net::SocketAddr = "127.0.0.2:10002".parse().unwrap();
+
+        let mut req_a = Request::new(());
+        req_a.extensions_mut().insert(peer_a);
+        let mut req_b = Request::new(());
+        req_b.extensions_mut().insert(peer_b);
+
+        assert_eq!(
+            svc.ready()
+                .await
+                .unwrap()
+                .call(req_a)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            svc.ready()
+                .await
+                .unwrap()
+                .call(req_b)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(layer.bucket_count(), 2);
     }
 

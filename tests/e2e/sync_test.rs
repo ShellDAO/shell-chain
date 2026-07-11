@@ -6,6 +6,7 @@ use shell_e2e::*;
 use shell_primitives::{Address, ShellHash, U256};
 use shell_rpc::api::EthApiServer;
 use shell_storage::{ChainStore, MemoryDb, SnapshotMetadata};
+use std::io::Cursor;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -196,7 +197,7 @@ async fn snapshot_export_import_roundtrip() {
     let db2 = Arc::new(MemoryDb::new());
     let chain_store2 = ChainStore::new(db2.clone());
     let imported_meta = chain_store2
-        .import_snapshot(&buf[..], TEST_CHAIN_ID, &genesis_hash)
+        .import_snapshot(Cursor::new(buf), TEST_CHAIN_ID, &genesis_hash)
         .unwrap();
     assert_eq!(imported_meta.chain_id, TEST_CHAIN_ID);
     assert_eq!(imported_meta.block_number, 1);

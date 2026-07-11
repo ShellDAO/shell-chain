@@ -8,15 +8,9 @@ ignore = [
     # signature verification compatibility. New signing paths should prefer
     # ML-DSA (`fips204`) while this compatibility path is migrated out.
     "RUSTSEC-2024-0380",
-    # SPHINCS+ support is still exposed as a configured PQ signature option.
-    # Keep this explicit until a maintained SLH-DSA implementation replaces it.
-    "RUSTSEC-2026-0160",
     # Shared pqcrypto support crates pulled by the retained legacy PQ backends.
     "RUSTSEC-2026-0162",
     "RUSTSEC-2026-0163",
-    # Direct TLS PEM parsing dependency in shell-rpc. No active vulnerability is
-    # reported; track upstream replacement before removing the exception.
-    "RUSTSEC-2025-0134",
 ]
 # Check the full dependency tree for unmaintained advisories. Each current
 # exception above is explicit and should be removed when upstream migrations

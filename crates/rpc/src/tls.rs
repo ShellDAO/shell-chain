@@ -18,9 +18,10 @@
 //! certificates are caught early, even before the transport layer is wired.
 
 use std::fs;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
+
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 /// Errors that can occur during TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -79,10 +80,9 @@ pub fn load_tls_config(
             // Parse certificate chain.
             let cert_file =
                 fs::File::open(cert_p).map_err(|e| TlsConfigError::CertReadError(e.to_string()))?;
-            let mut cert_reader = BufReader::new(cert_file);
-            let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
-                .filter_map(|r| r.ok())
-                .collect();
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_file)
+                .collect::<Result<_, _>>()
+                .map_err(|e| TlsConfigError::CertReadError(e.to_string()))?;
             if certs.is_empty() {
                 return Err(TlsConfigError::NoCertsFound(cert.to_string()));
             }
@@ -90,10 +90,8 @@ pub fn load_tls_config(
             // Parse private key.
             let key_file =
                 fs::File::open(key_p).map_err(|e| TlsConfigError::KeyReadError(e.to_string()))?;
-            let mut key_reader = BufReader::new(key_file);
-            let private_key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| TlsConfigError::KeyReadError(e.to_string()))?
-                .ok_or_else(|| TlsConfigError::NoKeyFound(key.to_string()))?;
+            let private_key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_file)
+                .map_err(|e| TlsConfigError::KeyReadError(e.to_string()))?;
 
             // Build and validate the ServerConfig.
             // Use an explicit ring provider (default-features = false means no

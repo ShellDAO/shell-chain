@@ -484,6 +484,12 @@ impl GenesisConfig {
                 "economics.max_validator_weight must be greater than zero".into(),
             ));
         }
+        if economics.max_validator_weight > shell_primitives::MAX_VALIDATOR_WEIGHT {
+            return Err(GenesisError::Validation(format!(
+                "economics.max_validator_weight must be <= {}",
+                shell_primitives::MAX_VALIDATOR_WEIGHT
+            )));
+        }
         if !matches!(self.consensus, ConsensusConfig::WPoA { .. }) {
             return Err(GenesisError::Validation(
                 "stake-derived validator weights require wpoa consensus".into(),

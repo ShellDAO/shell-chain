@@ -89,7 +89,14 @@ impl WPoaEngine {
             .authorities
             .iter()
             .enumerate()
-            .map(|(i, _)| config.weights.get(i).copied().unwrap_or(1))
+            .map(|(i, _)| {
+                config
+                    .weights
+                    .get(i)
+                    .copied()
+                    .unwrap_or(1)
+                    .clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT)
+            })
             .collect();
         poa.authority_weights = weights.clone();
 
@@ -363,7 +370,13 @@ impl ConsensusEngine for WPoaEngine {
     fn set_authorities_with_weights(&mut self, authorities: Vec<Address>, weights: Vec<u64>) {
         assert!(!authorities.is_empty(), "authority set must not be empty");
         let weights: Vec<u64> = (0..authorities.len())
-            .map(|idx| weights.get(idx).copied().unwrap_or(1).max(1))
+            .map(|idx| {
+                weights
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(1)
+                    .clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT)
+            })
             .collect();
 
         {

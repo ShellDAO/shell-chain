@@ -220,7 +220,7 @@ algo_id || public_key  ──→  blake3()  ──→  32-byte address  ──�
 |-----------|-----------|------------|-----------|-------------|
 | **Dilithium3** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (128-bit) |
 | **ML-DSA-65** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (FIPS 204) |
-| **SPHINCS+-SHA2-256f** (shell-chain, secondary) | 32 B | 64 B | ~49,856 B | NIST Level 5 (256-bit) |
+| **SLH-DSA-SHA2-256f** (shell-chain, secondary) | 32 B | 64 B | ~49,856 B | NIST Level 5 (256-bit) |
 | ECDSA secp256k1 (Ethereum) | 64 B | 32 B | 64 B | 0-bit PQ (broken) |
 | Ed25519 (Solana) | 32 B | 64 B | 64 B | 0-bit PQ (broken) |
 
@@ -228,7 +228,7 @@ Dilithium3 signatures are ~52× larger than ECDSA, but this is a necessary trade
 
 ### Performance characteristics
 
-| Operation | Dilithium3 | SPHINCS+-SHA2-256f |
+| Operation | Dilithium3 | SLH-DSA-SHA2-256f |
 |-----------|-----------|-------------------|
 | Key generation | < 1 ms | < 1 ms |
 | Sign | < 5 ms | ~50 ms |
@@ -236,7 +236,7 @@ Dilithium3 signatures are ~52× larger than ECDSA, but this is a necessary trade
 | Sign + Verify | < 10 ms (debug < 50 ms) | ~60 ms |
 | 100 Sign+Verify ops | < 1 s | ~6 s |
 
-ML-DSA-65 is the primary governed path, while Dilithium3 remains available for compatibility where older tooling or validator sets still depend on it. SPHINCS+ is available as a conservative alternative with higher security but larger signatures.
+ML-DSA-65 is the primary governed path, while Dilithium3 remains available for compatibility where older tooling or validator sets still depend on it. SLH-DSA-SHA2-256f is available as a conservative alternative with higher security but larger signatures.
 
 ### Batch verification
 
@@ -313,11 +313,11 @@ This prevents replay of old proposals at a later block height.
 The minimum activation delay is **Δ_min = 30 days** (~1,296,000 blocks at 2 s/block),
 giving the network time to upgrade software before the new algorithm goes live.
 
-### SPHINCS+-SHA2-256f (Available Today)
+### SLH-DSA-SHA2-256f (Available Today)
 
-Shell-chain already supports **SPHINCS+-SHA2-256f-simple** as a secondary algorithm. SPHINCS+ is a **stateless hash-based** signature scheme, providing a fundamentally different security assumption from lattice-based Dilithium:
+Shell-chain supports **SLH-DSA-SHA2-256f**, the FIPS 205 successor to the SPHINCS+-SHA2-256f parameter set, as a secondary algorithm. It is a **stateless hash-based** signature scheme, providing a fundamentally different security assumption from lattice-based Dilithium:
 
-| Property | Dilithium3 | SPHINCS+-SHA2-256f |
+| Property | Dilithium3 | SLH-DSA-SHA2-256f |
 |----------|-----------|-------------------|
 | Security basis | Lattice problems (Module-LWE) | Hash function security (SHA-256) |
 | PQ Security | 128-bit (NIST Level 3) | 256-bit (NIST Level 5) |
@@ -325,9 +325,9 @@ Shell-chain already supports **SPHINCS+-SHA2-256f-simple** as a secondary algori
 | Speed | Fast | Slower |
 | Conservative | Moderate | Very conservative |
 
-SPHINCS+ keystores use `"key_type": "sphincs-sha2-256f"` and are managed with the same CLI tools.
+SLH-DSA keystores use `"key_type": "sphincs-sha2-256f"` for wire compatibility and are managed with the same CLI tools.
 
-The `MultiVerifier` automatically detects the algorithm from the signature's embedded type tag, enabling mixed validator sets where some validators use Dilithium3 and others use SPHINCS+.
+The `MultiVerifier` automatically detects the algorithm from the signature's embedded type tag, enabling mixed validator sets where some validators use Dilithium3 and others use SLH-DSA.
 
 ### Generating ML-DSA-65 Keys
 
@@ -360,7 +360,7 @@ This design enables seamless addition of new algorithms without protocol-breakin
 |-----------|--------|-----------|
 | **Signatures (primary)** | ML-DSA-65 | FIPS 204 path and primary governed algorithm |
 | **Signatures (legacy)** | Dilithium3 | Round-3 compatibility for existing deployments and migrations |
-| **Signatures (alt)** | SPHINCS+-SHA2-256f | Conservative, hash-based, NIST Level 5 |
+| **Signatures (alt)** | SLH-DSA-SHA2-256f | Conservative, hash-based, NIST Level 5 |
 | **Hashing** | Keccak-256 | Ethereum compatibility |
 | **Internal hashing** | BLAKE3 | Performance |
 | **Keystore KDF** | Argon2id | Memory-hard, side-channel resistant |

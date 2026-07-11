@@ -12,7 +12,6 @@ batch = ["rayon"]
 [dependencies]
 shell-primitives = { workspace = true }
 pqcrypto-dilithium = { workspace = true }
-pqcrypto-sphincsplus = { workspace = true }
 pqcrypto-traits = { workspace = true }
 fips204 = { workspace = true }
 fips205 = { workspace = true }

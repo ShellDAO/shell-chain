@@ -1,11 +1,11 @@
-use pqcrypto_sphincsplus::sphincssha2256fsimple;
-use pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey};
+use fips205::slh_dsa_sha2_256f;
+use fips205::traits::{SerDes, Signer as FipsSigner, Verifier as FipsVerifier};
 
 use crate::{CryptoError, KeyPair, PQSignature, SignatureType, Signer, Verifier};
 
 // ── Signer ───────────────────────────────────────────────────
 
-/// SPHINCS+-SHA2-256f-simple signer (256-bit PQ security, stateless hash-based).
+/// SLH-DSA-SHA2-256f signer (the FIPS 205 successor to SPHINCS+-SHA2-256f).
 ///
 /// Stores key material as raw bytes wrapped in `Zeroizing` to ensure
 /// secret key is zeroed on drop.
@@ -17,26 +17,41 @@ pub struct SphincsSigner {
 impl SphincsSigner {
     /// Generate a fresh SPHINCS+-SHA2-256f-simple key pair.
     ///
-    /// Uses `pqcrypto-sphincsplus`'s internal CSPRNG.
+    /// Uses the FIPS 205 implementation's operating-system CSPRNG.
     pub fn generate() -> Self {
-        let (pk, sk) = sphincssha2256fsimple::keypair();
+        let (pk, sk) =
+            slh_dsa_sha2_256f::try_keygen().expect("operating-system CSPRNG unavailable");
         Self {
-            secret_key_bytes: zeroize::Zeroizing::new(sk.as_bytes().to_vec()),
-            public_key_bytes: pk.as_bytes().to_vec(),
+            secret_key_bytes: zeroize::Zeroizing::new(sk.into_bytes().to_vec()),
+            public_key_bytes: pk.into_bytes().to_vec(),
         }
     }
 
     /// Reconstruct from raw key bytes.
     pub fn from_bytes(public_key: &[u8], secret_key: &[u8]) -> Result<Self, CryptoError> {
-        sphincssha2256fsimple::PublicKey::from_bytes(public_key).map_err(|_| {
+        let public_key: &[u8; slh_dsa_sha2_256f::PK_LEN] =
+            public_key
+                .try_into()
+                .map_err(|_| CryptoError::InvalidPublicKeyLength {
+                    expected: slh_dsa_sha2_256f::PK_LEN,
+                    got: public_key.len(),
+                })?;
+        let secret_key: &[u8; slh_dsa_sha2_256f::SK_LEN] =
+            secret_key
+                .try_into()
+                .map_err(|_| CryptoError::InvalidSecretKeyLength {
+                    expected: slh_dsa_sha2_256f::SK_LEN,
+                    got: secret_key.len(),
+                })?;
+        slh_dsa_sha2_256f::PublicKey::try_from_bytes(public_key).map_err(|_| {
             CryptoError::InvalidPublicKeyLength {
-                expected: sphincssha2256fsimple::public_key_bytes(),
+                expected: slh_dsa_sha2_256f::PK_LEN,
                 got: public_key.len(),
             }
         })?;
-        sphincssha2256fsimple::SecretKey::from_bytes(secret_key).map_err(|_| {
+        slh_dsa_sha2_256f::PrivateKey::try_from_bytes(secret_key).map_err(|_| {
             CryptoError::InvalidSecretKeyLength {
-                expected: sphincssha2256fsimple::secret_key_bytes(),
+                expected: slh_dsa_sha2_256f::SK_LEN,
                 got: secret_key.len(),
             }
         })?;
@@ -63,8 +78,13 @@ impl SphincsSigner {
         &self.secret_key_bytes
     }
 
-    fn secret_key(&self) -> sphincssha2256fsimple::SecretKey {
-        sphincssha2256fsimple::SecretKey::from_bytes(&self.secret_key_bytes)
+    fn secret_key(&self) -> slh_dsa_sha2_256f::PrivateKey {
+        let bytes: &[u8; slh_dsa_sha2_256f::SK_LEN] = self
+            .secret_key_bytes
+            .as_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("secret key bytes validated at construction"));
+        slh_dsa_sha2_256f::PrivateKey::try_from_bytes(bytes)
             .unwrap_or_else(|_| unreachable!("secret key bytes validated at construction"))
     }
 }
@@ -72,14 +92,12 @@ impl SphincsSigner {
 impl Signer for SphincsSigner {
     fn sign(&self, message: &[u8]) -> Result<PQSignature, CryptoError> {
         let sk = self.secret_key();
-        let sig = sphincssha2256fsimple::detached_sign(message, &sk);
-        // Explicitly consume the temporary SecretKey. The canonical key material
-        // is held in `self.secret_key_bytes` which is wrapped in `Zeroizing`
-        // and will be securely erased when this signer is dropped.
-        let _ = sk;
+        let sig = sk
+            .try_sign(message, b"", true)
+            .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;
         Ok(PQSignature::new(
             SignatureType::SphincsSha2256f,
-            sig.as_bytes().to_vec(),
+            sig.to_vec(),
         ))
     }
 
@@ -109,21 +127,28 @@ impl Verifier for SphincsVerifier {
             return Err(CryptoError::UnsupportedSignatureType(signature.sig_type));
         }
 
-        let pk = sphincssha2256fsimple::PublicKey::from_bytes(pubkey).map_err(|_| {
+        let pubkey: &[u8; slh_dsa_sha2_256f::PK_LEN] =
+            pubkey
+                .try_into()
+                .map_err(|_| CryptoError::InvalidPublicKeyLength {
+                    expected: slh_dsa_sha2_256f::PK_LEN,
+                    got: pubkey.len(),
+                })?;
+        let pk = slh_dsa_sha2_256f::PublicKey::try_from_bytes(pubkey).map_err(|_| {
             CryptoError::InvalidPublicKeyLength {
-                expected: sphincssha2256fsimple::public_key_bytes(),
+                expected: slh_dsa_sha2_256f::PK_LEN,
                 got: pubkey.len(),
             }
         })?;
 
-        let sig = sphincssha2256fsimple::DetachedSignature::from_bytes(&signature.data).map_err(
+        let sig = <[u8; slh_dsa_sha2_256f::SIG_LEN]>::try_from(signature.data.as_slice()).map_err(
             |_| CryptoError::InvalidSignatureLength {
-                expected: sphincssha2256fsimple::signature_bytes(),
+                expected: slh_dsa_sha2_256f::SIG_LEN,
                 got: signature.data.len(),
             },
         )?;
 
-        let valid = sphincssha2256fsimple::verify_detached_signature(&sig, message, &pk).is_ok();
+        let valid = pk.verify(message, &sig, b"");
         Ok(valid)
     }
 

@@ -47,13 +47,24 @@ pub async fn checkpoint_sync<S: KvStore>(
         )));
     }
 
-    // Determine expected genesis_hash for validation.
-    // If the chain store already has a config, use it; otherwise trust the snapshot.
-    let (expected_chain_id_for_import, expected_genesis_hash) =
-        match chain_store.get_chain_config().map_err(NodeError::Storage)? {
-            Some(cfg) => (cfg.chain_id, cfg.genesis_hash),
-            None => (metadata.chain_id, metadata.genesis_hash),
-        };
+    // A checkpoint must be anchored to the local chain configuration. Never
+    // accept the snapshot's own genesis hash as its trust anchor on a fresh
+    // store; that would allow an arbitrary URL to bootstrap a fake chain.
+    let config = chain_store
+        .get_chain_config()
+        .map_err(NodeError::Storage)?
+        .ok_or_else(|| {
+            NodeError::Startup(
+                "checkpoint sync requires an initialized chain config with a trusted genesis hash"
+                    .into(),
+            )
+        })?;
+    if config.chain_id != expected_chain_id {
+        return Err(NodeError::Startup(format!(
+            "local chain config ID {} does not match expected {}",
+            config.chain_id, expected_chain_id
+        )));
+    }
 
     // Import the snapshot into the chain store.
     info!("Importing checkpoint snapshot...");
@@ -61,7 +72,7 @@ pub async fn checkpoint_sync<S: KvStore>(
         .map_err(|e| NodeError::Startup(format!("open snapshot: {e}")))?;
     let reader = BufReader::new(file);
     let imported = chain_store
-        .import_snapshot(reader, expected_chain_id_for_import, &expected_genesis_hash)
+        .import_snapshot(reader, config.chain_id, &config.genesis_hash)
         .map_err(NodeError::Storage)?;
 
     // Verify the imported HEAD block's state_root matches the snapshot metadata.

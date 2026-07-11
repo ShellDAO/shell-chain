@@ -881,7 +881,7 @@ mod tests {
 
         // Same at max capacity with only 1 entry per block but total below threshold
         // (using a small max_sources so threshold is not met).
-        let small_max = (MIN_L1_STARK_TXS / 2) as usize; // e.g. 256 blocks × 1 entry = 256 < 512
+        let small_max = MIN_L1_STARK_TXS / 2; // e.g. 256 blocks × 1 entry = 256 < 512
         let mut b2 = ProofBacklog::new();
         for block_number in 1..=small_max as u64 {
             b2.push(ProofTask::new(
