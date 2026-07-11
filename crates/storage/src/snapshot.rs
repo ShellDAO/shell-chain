@@ -683,7 +683,7 @@ mod tests {
             .unwrap();
 
         let text = String::from_utf8(buffer).unwrap();
-        let tampered = format!("META:{{}}\n{text}");
+        let tampered = format!("{text}{text}");
         let err = SnapshotReader::new(Cursor::new(tampered)).unwrap_err();
         assert!(err.to_string().contains("multiple META footers"));
     }
