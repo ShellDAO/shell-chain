@@ -1562,7 +1562,8 @@ mod tests {
         let (mut ws, cs) = setup_validation_ctx();
         pool.inner.write().seq = u64::MAX;
 
-        let (tx, _pk) = make_signed_tx(0, 100);
+        let first_nonce = u64::default();
+        let (tx, _pk) = make_signed_tx(first_nonce, 100);
         let sender = tx.sender();
         let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
 
@@ -1582,7 +1583,8 @@ mod tests {
 
         pool.clear();
 
-        let (tx, _pk) = make_signed_tx(0, 100);
+        let first_nonce = u64::default();
+        let (tx, _pk) = make_signed_tx(first_nonce, 100);
         insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
         assert_eq!(pool.len(), 1);
     }
@@ -1595,7 +1597,8 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
-        let first = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let first_nonce = u64::default();
+        let first = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 100);
         let first_hash = first.hash();
         insert_rich(&pool, first, &verifier, &mut ws, &cs).unwrap();
 
@@ -1603,7 +1606,7 @@ mod tests {
         assert!(pool.remove(&first_hash));
         assert!(pool.is_empty());
 
-        let second = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let second = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 100);
         insert_rich(&pool, second, &verifier, &mut ws, &cs).unwrap();
         assert_eq!(pool.len(), 1);
     }
@@ -1668,19 +1671,21 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.checked_add(1).unwrap();
 
-        let sender_low_nonce = make_signed_tx_with_signer(&signer, &pubkey, 0, 10);
-        let sender_high_nonce = make_signed_tx_with_signer(&signer, &pubkey, 1, 100);
+        let sender_low_nonce = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 10);
+        let sender_high_nonce = make_signed_tx_with_signer(&signer, &pubkey, second_nonce, 100);
         let low_nonce_hash = sender_low_nonce.hash();
         let high_nonce_hash = sender_high_nonce.hash();
-        let (other_tx, _) = make_signed_tx(0, 50);
+        let (other_tx, _) = make_signed_tx(u64::default(), 50);
         let other_hash = other_tx.hash();
 
         insert_rich(&pool, sender_low_nonce, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, sender_high_nonce, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, other_tx, &verifier, &mut ws, &cs).unwrap();
 
-        let (incoming_tx, _) = make_signed_tx(0, 60);
+        let (incoming_tx, _) = make_signed_tx(u64::default(), 60);
         let incoming_hash = incoming_tx.hash();
         insert_rich(&pool, incoming_tx, &verifier, &mut ws, &cs).unwrap();
 
@@ -1710,19 +1715,22 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.checked_add(1).unwrap();
+        let third_nonce = second_nonce.checked_add(1).unwrap();
 
-        let sender_tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 10);
-        let sender_tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 100);
+        let sender_tx0 = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 10);
+        let sender_tx1 = make_signed_tx_with_signer(&signer, &pubkey, second_nonce, 100);
         let sender_tx0_hash = sender_tx0.hash();
         let sender_tx1_hash = sender_tx1.hash();
-        let (other_tx, _) = make_signed_tx(0, 50);
+        let (other_tx, _) = make_signed_tx(u64::default(), 50);
         let other_hash = other_tx.hash();
 
         insert_rich(&pool, sender_tx0, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, sender_tx1, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, other_tx, &verifier, &mut ws, &cs).unwrap();
 
-        let sender_tx2 = make_signed_tx_with_signer(&signer, &pubkey, 2, 60);
+        let sender_tx2 = make_signed_tx_with_signer(&signer, &pubkey, third_nonce, 60);
         let sender_tx2_hash = sender_tx2.hash();
         insert_rich(&pool, sender_tx2, &verifier, &mut ws, &cs).unwrap();
 
@@ -1755,16 +1763,19 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.checked_add(1).unwrap();
+        let third_nonce = second_nonce.checked_add(1).unwrap();
 
-        let sender_tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 10);
-        let sender_tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 100);
+        let sender_tx0 = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 10);
+        let sender_tx1 = make_signed_tx_with_signer(&signer, &pubkey, second_nonce, 100);
         let sender_tx0_hash = sender_tx0.hash();
         let sender_tx1_hash = sender_tx1.hash();
 
         insert_rich(&pool, sender_tx0, &verifier, &mut ws, &cs).unwrap();
         insert_rich(&pool, sender_tx1, &verifier, &mut ws, &cs).unwrap();
 
-        let sender_tx2 = make_signed_tx_with_signer(&signer, &pubkey, 2, 60);
+        let sender_tx2 = make_signed_tx_with_signer(&signer, &pubkey, third_nonce, 60);
         let err = insert_rich(&pool, sender_tx2, &verifier, &mut ws, &cs).unwrap_err();
 
         assert!(matches!(err, MempoolError::PoolFull { .. }));
@@ -1946,12 +1957,13 @@ mod tests {
         let paymaster_pubkey = paymaster_signer.public_key().to_vec();
         let paymaster = register_paymaster(&cs, &paymaster_pubkey);
         let value = U256::from(1_000u64);
+        let first_nonce = u64::default();
         let tx = make_sponsored_aa_value_tx_with_signers(
             &signer,
             &pubkey,
             &paymaster_signer,
             &paymaster_pubkey,
-            0,
+            first_nonce,
             50,
             value,
         );
