@@ -315,24 +315,35 @@ impl TxPool {
     /// arrived late). Pruning here prevents invalid nonce-too-low transactions
     /// from being selected or rebroadcast indefinitely.
     pub fn prune_nonce_too_low<S: KvStore + 'static>(&self, world_state: &WorldState<S>) -> usize {
+        let senders: Vec<Address> = {
+            let inner = self.inner.read();
+            inner.by_sender.keys().copied().collect()
+        };
+        let canonical_nonces: HashMap<Address, u64> = senders
+            .into_iter()
+            .filter_map(|sender| match world_state.get_nonce(&sender) {
+                Ok(nonce) => Some((sender, nonce)),
+                Err(e) => {
+                    warn!(
+                        sender = ?sender,
+                        error = %e,
+                        "prune_nonce_too_low: get_nonce failed, skipping sender"
+                    );
+                    None
+                }
+            })
+            .collect();
+
         let mut inner = self.inner.write();
         let stale_hashes: Vec<ShellHash> = inner
             .by_hash
             .iter()
-            .filter_map(
-                |(hash, entry)| match world_state.get_nonce(&entry.tx.from) {
-                    Ok(canonical_nonce) => (entry.tx.tx.nonce < canonical_nonce).then_some(*hash),
-                    Err(e) => {
-                        warn!(
-                            tx = ?hash,
-                            sender = ?entry.tx.from,
-                            error = %e,
-                            "prune_nonce_too_low: get_nonce failed, skipping tx"
-                        );
-                        None
-                    }
-                },
-            )
+            .filter_map(|(hash, entry)| {
+                canonical_nonces
+                    .get(&entry.tx.from)
+                    .is_some_and(|nonce| entry.tx.tx.nonce < *nonce)
+                    .then_some(*hash)
+            })
             .collect();
         let pruned = stale_hashes.len();
         for hash in stale_hashes {
