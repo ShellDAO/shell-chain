@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_embedded_metadata_line_is_rejected() {
+    fn test_multiple_metadata_lines_are_rejected() {
         let meta = test_metadata();
         let mut buffer = Vec::new();
         SnapshotWriter::new(Cursor::new(&mut buffer), meta)
@@ -685,6 +685,6 @@ mod tests {
         let text = String::from_utf8(buffer).unwrap();
         let tampered = format!("META:{{}}\n{text}");
         let err = SnapshotReader::new(Cursor::new(tampered)).unwrap_err();
-        assert!(err.to_string().contains("parse entry at line 1"));
+        assert!(err.to_string().contains("multiple META footers"));
     }
 }
