@@ -260,19 +260,40 @@ impl SnapshotReader {
         let metadata: SnapshotMetadata = serde_json::from_str(meta_json)
             .map_err(|e| StorageError::Serialization(format!("parse metadata: {e}")))?;
 
+        // Parse every entry before import so malformed data and metadata
+        // mismatches cannot be discovered after writes have started.
+        let mut actual_entry_count = 0u64;
+        let mut actual_data_size = 0u64;
+        let mut hasher = Sha256::new();
+        for (index, line) in lines[..lines.len() - 1].iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let entry: SnapshotEntry = serde_json::from_str(line).map_err(|e| {
+                StorageError::Serialization(format!("parse entry at line {}: {e}", index + 1))
+            })?;
+            actual_entry_count = actual_entry_count.saturating_add(1);
+            actual_data_size = actual_data_size
+                .saturating_add(saturating_entry_data_size(&entry.key, &entry.value));
+            hasher.update(&entry.key);
+            hasher.update(&entry.value);
+        }
+
+        if actual_entry_count != metadata.entry_count {
+            return Err(StorageError::State(format!(
+                "snapshot entry count mismatch: metadata has {}, actual is {}",
+                metadata.entry_count, actual_entry_count
+            )));
+        }
+        if actual_data_size != metadata.data_size {
+            return Err(StorageError::State(format!(
+                "snapshot data size mismatch: metadata has {}, actual is {}",
+                metadata.data_size, actual_data_size
+            )));
+        }
+
         // Verify SHA-256 checksum if present (F-089).
         if let Some(ref expected_checksum) = metadata.checksum {
-            let mut hasher = Sha256::new();
-            for line in &lines {
-                if line.starts_with("META:") || line.is_empty() {
-                    continue;
-                }
-                let entry: SnapshotEntry = serde_json::from_str(line).map_err(|e| {
-                    StorageError::Serialization(format!("parse entry for checksum: {e}"))
-                })?;
-                hasher.update(&entry.key);
-                hasher.update(&entry.value);
-            }
             let actual = hex::encode(hasher.finalize());
             if actual != *expected_checksum {
                 return Err(StorageError::State(format!(
@@ -541,5 +562,48 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch"));
         }
+    }
+
+    #[test]
+    fn test_metadata_entry_count_is_verified() {
+        let meta = test_metadata();
+        let mut buffer = Vec::new();
+        let mut writer = SnapshotWriter::new(Cursor::new(&mut buffer), meta).unwrap();
+        writer.write_entry(b"key", b"value").unwrap();
+        writer.finalize().unwrap();
+
+        let text = String::from_utf8(buffer).unwrap();
+        let tampered = text.replacen("\"entry_count\":1", "\"entry_count\":2", 1);
+        let err = SnapshotReader::new(Cursor::new(tampered)).unwrap_err();
+        assert!(err.to_string().contains("entry count mismatch"));
+    }
+
+    #[test]
+    fn test_metadata_data_size_is_verified() {
+        let meta = test_metadata();
+        let mut buffer = Vec::new();
+        let mut writer = SnapshotWriter::new(Cursor::new(&mut buffer), meta).unwrap();
+        writer.write_entry(b"key", b"value").unwrap();
+        writer.finalize().unwrap();
+
+        let text = String::from_utf8(buffer).unwrap();
+        let tampered = text.replacen("\"data_size\":8", "\"data_size\":9", 1);
+        let err = SnapshotReader::new(Cursor::new(tampered)).unwrap_err();
+        assert!(err.to_string().contains("data size mismatch"));
+    }
+
+    #[test]
+    fn test_embedded_metadata_line_is_rejected() {
+        let meta = test_metadata();
+        let mut buffer = Vec::new();
+        SnapshotWriter::new(Cursor::new(&mut buffer), meta)
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        let text = String::from_utf8(buffer).unwrap();
+        let tampered = format!("META:{{}}\n{text}");
+        let err = SnapshotReader::new(Cursor::new(tampered)).unwrap_err();
+        assert!(err.to_string().contains("parse entry at line 1"));
     }
 }
