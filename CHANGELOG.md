@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-07-12 — Security and state-integrity hardening
+
+### Changed
+
+- New SPHINCS+ fallback keys and signatures now use the maintained FIPS 205
+  SLH-DSA-SHA2-256f implementation while retaining the documented wire format.
+- TLS PEM parsing now uses the rustls native PKI types, removing the redundant
+  parser dependency.
+- Network message routing now requires explicit topics and applies bounded
+  decoding, sync-response, ban-duration, and bandwidth accounting rules.
+
 ### Fixed
 
 - Rejected AA bundles whose inner-call value sum overflows `U256` before
@@ -14,6 +25,19 @@ All notable changes to this project will be documented in this file.
   nonce and balance checks.
 - Bound AA session-key root authorizations to the declared session signature
   algorithm.
+- Hardened snapshot import and restore validation, canonical index updates,
+  world-state accounting, checkpoint handling, and pruning counters against
+  malformed metadata, partial updates, and arithmetic boundaries.
+- Bounded RPC filters, subscriptions, logs, fee-history percentiles, calldata,
+  access lists, batch inner calls, and reflected error input before expensive
+  processing.
+- Corrected pending nonce, receipt, gas-usage, finality, terminal-height,
+  mempool sequence, and transaction validation behavior at boundary values.
+- Preserved consensus liveness and deterministic proposer behavior across
+  terminal heights, stale attestations, validator weights, rate limiting, and
+  STARK backlog boundaries.
+- Required canonical paymaster boolean encoding and guarded staking balance,
+  total-supply, minimum-stake, and weight calculations.
 
 ## [0.26.0] — 2026-07-07 — Stake-derived wPoA genesis economics
 
