@@ -1062,7 +1062,7 @@ mod tests {
         // Craft a tx where gas_limit * max_fee_per_gas + value overflows U256
         let tx = Transaction {
             chain_id: test_chain_id(),
-            nonce: 0,
+            nonce: ws.get_nonce(&from).unwrap(),
             to: Some(Address::from([0x01; 32])),
             value: U256::MAX, // near-max value
             data: Bytes::new(),

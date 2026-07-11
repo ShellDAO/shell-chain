@@ -1067,6 +1067,13 @@ mod tests {
             .unwrap();
     }
 
+    fn current_nonce(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress) -> u64 {
+        evm.state_db_mut()
+            .world_state_mut()
+            .get_nonce(addr)
+            .unwrap()
+    }
+
     fn fixture_account_sequence(addr: &ShellAddress) -> u64 {
         addr.as_bytes()
             .iter()
@@ -1089,7 +1096,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(to),
             value: U256::from(1000),
             data: shell_primitives::Bytes::new(),
@@ -1159,7 +1166,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(ShellAddress::from([0x01; 20])),
             value: U256::from(100),
             data: shell_primitives::Bytes::new(),
@@ -1202,7 +1209,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: None, // contract creation
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(init_code),
@@ -1241,7 +1248,7 @@ mod tests {
     ) -> SignedTransaction {
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: u64::default(),
             to: Some(to),
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(calldata),
@@ -1367,7 +1374,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(ShellAddress::from([0x01; 20])),
             value: U256::from(100),
             data: shell_primitives::Bytes::new(),
@@ -2265,7 +2272,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &deployer),
             to: None,
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(init_code),
@@ -2296,7 +2303,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &deployer),
             to: None,
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(init_code),
@@ -2331,7 +2338,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(ShellAddress::from([0x01; 20])),
             value: U256::from(100),
             data: shell_primitives::Bytes::new(),
@@ -2365,7 +2372,7 @@ mod tests {
         // Call with barely enough for intrinsic gas but not for SSTORE
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -2796,7 +2803,7 @@ mod tests {
         // Execute without access list
         let tx_no_al = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -2818,7 +2825,7 @@ mod tests {
         // Execute with access list pre-warming the storage slot
         let tx_with_al = Transaction {
             chain_id: 1337,
-            nonce: 2,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -2851,7 +2858,7 @@ mod tests {
         // Transaction with empty access list
         let tx_empty_al = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(to),
             value: U256::from(100),
             data: shell_primitives::Bytes::new(),
@@ -2872,7 +2879,7 @@ mod tests {
         // Transaction with no access list (None)
         let tx_none_al = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &from),
             to: Some(to),
             value: U256::from(100),
             data: shell_primitives::Bytes::new(),
@@ -2982,7 +2989,7 @@ mod tests {
         let blob_hash = ShellHash::from(blob_hash_bytes);
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3018,7 +3025,7 @@ mod tests {
         let blob_hash = ShellHash::from(blob_hash_bytes);
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3262,7 +3269,7 @@ mod tests {
         // Cold SLOAD
         let tx_cold = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3284,7 +3291,7 @@ mod tests {
         // Warm SLOAD via access list
         let tx_warm = Transaction {
             chain_id: 1337,
-            nonce: 2,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3453,7 +3460,7 @@ mod tests {
         // Low excess → low fee
         let tx1 = Transaction {
             chain_id: 1337,
-            nonce: 1,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3475,7 +3482,7 @@ mod tests {
         // High excess → higher fee
         let tx2 = Transaction {
             chain_id: 1337,
-            nonce: 2,
+            nonce: current_nonce(&mut evm, &deployer),
             to: Some(addr),
             value: U256::ZERO,
             data: shell_primitives::Bytes::new(),
@@ -3564,7 +3571,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &from),
             to: None,
             value: U256::from(1u64),
             data: shell_primitives::Bytes::new(),
@@ -3866,7 +3873,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &sender),
             to: None,
             value: U256::MAX,
             data: PBytes::new(),
@@ -4001,7 +4008,7 @@ mod tests {
 
         let tx = Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce: current_nonce(&mut evm, &pq_recipient),
             to: Some(pq_recipient),
             value: U256::from(1_000u64),
             data: shell_primitives::Bytes::new(),
