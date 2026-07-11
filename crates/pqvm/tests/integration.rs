@@ -63,6 +63,13 @@ fn fund_account(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress, balance: U25
         .unwrap();
 }
 
+fn current_nonce(evm: &mut ShellPqvm<MemoryDb>, addr: &ShellAddress) -> u64 {
+    evm.state_db_mut()
+        .world_state_mut()
+        .get_nonce(addr)
+        .unwrap()
+}
+
 fn tx_signing_hash_for_signer<S: Signer>(tx: &Transaction, signer: &S) -> ShellHash {
     tx.signing_hash(signer.sig_type().as_u8())
 }
@@ -82,7 +89,7 @@ fn e2e_transfer_with_real_dilithium_sig() {
 
     let tx = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 0,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(to),
         value: U256::from(1_000_000),
         data: ShellBytes::new(),
@@ -141,7 +148,7 @@ fn e2e_reject_invalid_signature() {
 
     let tx = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 0,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(ShellAddress::from([0xCC; 20])),
         value: U256::from(100),
         data: ShellBytes::new(),
@@ -185,7 +192,7 @@ fn e2e_contract_deployment() {
 
     let tx = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 0,
+        nonce: current_nonce(&mut evm, &from),
         to: None,
         value: U256::ZERO,
         data: ShellBytes::from(init_code),
@@ -229,7 +236,7 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
     // First tx: carries pubkey
     let tx1 = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 0,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(to),
         value: U256::from(100),
         data: ShellBytes::new(),
@@ -268,7 +275,7 @@ fn e2e_hybrid_pubkey_second_tx_from_registry() {
     // Second tx: NO pubkey attached — should read from registry
     let tx2 = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 1,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(to),
         value: U256::from(200),
         data: ShellBytes::new(),
@@ -351,7 +358,7 @@ fn e2e_cumulative_gas_tracking() {
 
     let tx1 = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 0,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(ShellAddress::from([0x01; 20])),
         value: U256::from(100),
         data: ShellBytes::new(),
@@ -372,7 +379,7 @@ fn e2e_cumulative_gas_tracking() {
 
     let tx2 = Transaction {
         chain_id: CHAIN_ID,
-        nonce: 1,
+        nonce: current_nonce(&mut evm, &from),
         to: Some(ShellAddress::from([0x02; 20])),
         value: U256::from(200),
         data: ShellBytes::new(),

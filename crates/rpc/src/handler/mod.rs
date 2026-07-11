@@ -531,7 +531,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
         let tx = Transaction {
             chain_id: self.chain_id,
-            nonce: 0,
+            nonce: u64::default(),
             max_fee_per_gas: 0,
             max_priority_fee_per_gas: 0,
             gas_limit,
