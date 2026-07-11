@@ -125,6 +125,7 @@ impl FilterRegistry {
     /// Updates the last access timestamp.
     pub fn get_filter_info(&self, id: &str) -> Option<(bool, u64)> {
         let mut filters = self.filters.write();
+        remove_expired_filter(&mut filters, id, self.ttl_secs);
         let entry = filters.get_mut(id)?;
         entry.last_access = Instant::now();
         let is_log = matches!(entry.kind, FilterKind::Log(_));
@@ -144,6 +145,7 @@ impl FilterRegistry {
     /// Returns the stored `RawLogFilter` for log filters (cloned).
     pub fn get_log_filter(&self, id: &str) -> Option<RawLogFilter> {
         let mut filters = self.filters.write();
+        remove_expired_filter(&mut filters, id, self.ttl_secs);
         let entry = filters.get_mut(id)?;
         entry.last_access = Instant::now();
         match &entry.kind {
@@ -197,6 +199,16 @@ fn cleanup_expired_filters(filters: &mut HashMap<String, FilterEntry>, ttl_secs:
     let now = Instant::now();
     let ttl = Duration::from_secs(ttl_secs);
     filters.retain(|_, entry| now.saturating_duration_since(entry.last_access) <= ttl);
+}
+
+fn remove_expired_filter(filters: &mut HashMap<String, FilterEntry>, id: &str, ttl_secs: u64) {
+    let ttl = Duration::from_secs(ttl_secs);
+    if filters
+        .get(id)
+        .is_some_and(|entry| Instant::now().saturating_duration_since(entry.last_access) > ttl)
+    {
+        filters.remove(id);
+    }
 }
 
 fn random_filter_id() -> String {
@@ -391,5 +403,28 @@ mod tests {
         reg.cleanup_expired();
 
         assert!(reg.uninstall(&id));
+    }
+
+    #[test]
+    fn get_filter_info_does_not_revive_expired_filter() {
+        let reg = FilterRegistry::with_ttl(1);
+        let id = reg.new_filter(FilterKind::Block, 7).unwrap();
+        reg.filters.write().get_mut(&id).unwrap().last_access =
+            Instant::now() - Duration::from_secs(2);
+
+        assert!(reg.get_filter_info(&id).is_none());
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn get_log_filter_does_not_revive_expired_filter() {
+        let reg = FilterRegistry::with_ttl(1);
+        let raw: RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
+        let id = reg.new_filter(FilterKind::Log(raw), 7).unwrap();
+        reg.filters.write().get_mut(&id).unwrap().last_access =
+            Instant::now() - Duration::from_secs(2);
+
+        assert!(reg.get_log_filter(&id).is_none());
+        assert!(reg.is_empty());
     }
 }
