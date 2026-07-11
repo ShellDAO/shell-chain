@@ -24,6 +24,9 @@ const MAX_FILTERS: usize = 1024;
 /// Maximum random ID attempts before reporting allocation failure.
 const MAX_FILTER_ID_GENERATION_ATTEMPTS: usize = 8;
 
+/// Filter IDs are `0x` plus a 128-bit random value.
+const FILTER_ID_LEN: usize = 34;
+
 /// Types of filters that can be registered.
 pub enum FilterKind {
     /// Log filter with criteria (from `eth_newFilter`).
@@ -124,6 +127,9 @@ impl FilterRegistry {
     /// Returns `None` if the filter does not exist.
     /// Updates the last access timestamp.
     pub fn get_filter_info(&self, id: &str) -> Option<(bool, u64)> {
+        if !is_valid_filter_id(id) {
+            return None;
+        }
         let mut filters = self.filters.write();
         remove_expired_filter(&mut filters, id, self.ttl_secs);
         let entry = filters.get_mut(id)?;
@@ -134,6 +140,9 @@ impl FilterRegistry {
 
     /// Update the last_poll_block for a filter after a successful poll.
     pub fn update_last_poll(&self, id: &str, new_block: u64) {
+        if !is_valid_filter_id(id) {
+            return;
+        }
         let mut filters = self.filters.write();
         if let Some(entry) = filters.get_mut(id) {
             entry.last_poll_block = new_block;
@@ -144,6 +153,9 @@ impl FilterRegistry {
     /// Check if a filter exists and whether it is a log filter.
     /// Returns the stored `RawLogFilter` for log filters (cloned).
     pub fn get_log_filter(&self, id: &str) -> Option<RawLogFilter> {
+        if !is_valid_filter_id(id) {
+            return None;
+        }
         let mut filters = self.filters.write();
         remove_expired_filter(&mut filters, id, self.ttl_secs);
         let entry = filters.get_mut(id)?;
@@ -156,6 +168,9 @@ impl FilterRegistry {
 
     /// Remove a filter. Returns `true` if it existed.
     pub fn uninstall(&self, id: &str) -> bool {
+        if !is_valid_filter_id(id) {
+            return false;
+        }
         self.filters.write().remove(id).is_some()
     }
 
@@ -213,6 +228,12 @@ fn remove_expired_filter(filters: &mut HashMap<String, FilterEntry>, id: &str, t
 
 fn random_filter_id() -> String {
     format!("0x{:032x}", rand::rng().random::<u128>())
+}
+
+fn is_valid_filter_id(id: &str) -> bool {
+    id.len() == FILTER_ID_LEN
+        && id.starts_with("0x")
+        && id[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -332,6 +353,19 @@ mod tests {
     fn get_filter_info_nonexistent() {
         let reg = FilterRegistry::new();
         assert!(reg.get_filter_info("0x999").is_none());
+    }
+
+    #[test]
+    fn malformed_filter_ids_are_rejected_before_lookup() {
+        let reg = FilterRegistry::new();
+        let id = reg.new_filter(FilterKind::Block, 42).unwrap();
+
+        assert!(reg.get_filter_info(&"x".repeat(1024 * 1024)).is_none());
+        assert!(reg
+            .get_filter_info("0xgggggggggggggggggggggggggggggggg")
+            .is_none());
+        assert!(!reg.uninstall("0x1"));
+        assert_eq!(reg.get_filter_info(&id).unwrap().1, 42);
     }
 
     #[test]
