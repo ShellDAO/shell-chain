@@ -55,4 +55,4 @@ jobs:
       - name: Deny check (licenses, bans, advisories)
         run: cargo deny check
       - name: Audit vulnerabilities
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+        run: cargo audit
