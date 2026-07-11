@@ -882,7 +882,7 @@ fn do_commit_state<S: KvStore + 'static>(
 
         let mut account = world_state
             .get_account(&shell_addr)?
-            .unwrap_or_else(|| Account {
+            .unwrap_or(Account {
                 pq_pubkey_hash: ShellHash::default(),
                 nonce: 0,
                 balance: U256::ZERO,
@@ -1052,7 +1052,7 @@ mod tests {
             .world_state_mut()
             .get_account(addr)
             .unwrap()
-            .unwrap_or_else(|| Account {
+            .unwrap_or(Account {
                 pq_pubkey_hash: ShellHash::ZERO,
                 nonce: 0,
                 balance: U256::ZERO,
