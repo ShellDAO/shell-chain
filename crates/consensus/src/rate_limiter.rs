@@ -49,8 +49,7 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new(initial_tokens: u64) -> Self {
-        let now = Instant::now();
+    fn new(initial_tokens: u64, now: Instant) -> Self {
         Self {
             tokens: initial_tokens,
             last_refill: now,
@@ -59,15 +58,25 @@ impl Bucket {
     }
 
     /// Refill tokens based on elapsed time, capped at `initial_tokens`.
-    fn refill(&mut self, config: &RateLimiterConfig) {
-        let elapsed = self.last_refill.elapsed();
-        let interval_ms = config.refill_interval.as_millis().max(1);
-        let elapsed_ms = elapsed.as_millis();
-        if elapsed_ms >= interval_ms {
-            let periods = elapsed_ms / interval_ms;
-            let add = (periods as u64).saturating_mul(config.refill_rate);
+    fn refill(&mut self, config: &RateLimiterConfig, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let interval_nanos = config.refill_interval.as_nanos().max(1);
+        let elapsed_nanos = elapsed.as_nanos();
+        if elapsed_nanos >= interval_nanos {
+            let periods = elapsed_nanos / interval_nanos;
+            let add = periods
+                .saturating_mul(u128::from(config.refill_rate))
+                .min(u128::from(u64::MAX)) as u64;
             self.tokens = self.tokens.saturating_add(add).min(config.initial_tokens);
-            self.last_refill = Instant::now();
+
+            // Preserve the partial interval so frequent callers do not delay
+            // future refills by repeatedly discarding accrued time.
+            let remainder = elapsed_nanos % interval_nanos;
+            let remainder = Duration::new(
+                (remainder / 1_000_000_000) as u64,
+                (remainder % 1_000_000_000) as u32,
+            );
+            self.last_refill = now.checked_sub(remainder).unwrap_or(now);
         }
     }
 }
@@ -95,14 +104,18 @@ impl ProofRateLimiter {
     /// Returns `true` (allowed) if the address has tokens remaining.
     /// Returns `false` (denied) if the bucket is empty.
     pub fn try_consume(&mut self, address: &Address) -> bool {
+        self.try_consume_at(address, Instant::now())
+    }
+
+    fn try_consume_at(&mut self, address: &Address, now: Instant) -> bool {
         let config = &self.config;
         let bucket = self
             .buckets
             .entry(*address)
-            .or_insert_with(|| Bucket::new(config.initial_tokens));
+            .or_insert_with(|| Bucket::new(config.initial_tokens, now));
 
-        bucket.refill(config);
-        bucket.last_used = Instant::now();
+        bucket.refill(config, now);
+        bucket.last_used = now;
 
         if bucket.tokens > 0 {
             bucket.tokens -= 1;
@@ -114,12 +127,16 @@ impl ProofRateLimiter {
 
     /// Return current token count for `address` (after refill).
     pub fn tokens_remaining(&mut self, address: &Address) -> u64 {
+        self.tokens_remaining_at(address, Instant::now())
+    }
+
+    fn tokens_remaining_at(&mut self, address: &Address, now: Instant) -> u64 {
         let config = &self.config;
         let bucket = self
             .buckets
             .entry(*address)
-            .or_insert_with(|| Bucket::new(config.initial_tokens));
-        bucket.refill(config);
+            .or_insert_with(|| Bucket::new(config.initial_tokens, now));
+        bucket.refill(config, now);
         bucket.tokens
     }
 
@@ -127,8 +144,13 @@ impl ProofRateLimiter {
     ///
     /// Should be called periodically (e.g., once per epoch) to bound memory.
     pub fn gc(&mut self) {
+        self.gc_at(Instant::now());
+    }
+
+    fn gc_at(&mut self, now: Instant) {
         let gc_after = self.config.gc_after;
-        self.buckets.retain(|_, b| b.last_used.elapsed() < gc_after);
+        self.buckets
+            .retain(|_, b| now.saturating_duration_since(b.last_used) < gc_after);
     }
 
     /// Number of tracked addresses.
@@ -178,15 +200,14 @@ mod tests {
     fn refill_after_interval() {
         let mut rl = ProofRateLimiter::new(fast_config());
         let a = addr(2);
+        let start = Instant::now();
         // Drain bucket.
         for _ in 0..3 {
-            rl.try_consume(&a);
+            rl.try_consume_at(&a, start);
         }
-        assert!(!rl.try_consume(&a));
-        // Wait for refill interval.
-        std::thread::sleep(Duration::from_millis(60));
+        assert!(!rl.try_consume_at(&a, start));
         // After refill, should be allowed again.
-        assert!(rl.try_consume(&a));
+        assert!(rl.try_consume_at(&a, start + Duration::from_millis(50)));
     }
 
     #[test]
@@ -220,10 +241,10 @@ mod tests {
         config.gc_after = Duration::from_millis(50);
         let mut rl = ProofRateLimiter::new(config);
         let a = addr(4);
-        rl.try_consume(&a);
+        let start = Instant::now();
+        rl.try_consume_at(&a, start);
         assert_eq!(rl.len(), 1);
-        std::thread::sleep(Duration::from_millis(60));
-        rl.gc();
+        rl.gc_at(start + Duration::from_millis(50));
         assert_eq!(rl.len(), 0);
     }
 
@@ -241,10 +262,38 @@ mod tests {
     fn tokens_capped_at_initial_after_multiple_refills() {
         let mut rl = ProofRateLimiter::new(fast_config());
         let a = addr(6);
-        // Use one token, then sleep through multiple refill intervals.
-        rl.try_consume(&a);
-        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        // Use one token, then advance through multiple refill intervals.
+        rl.try_consume_at(&a, start);
         // After several refill periods, tokens should be capped at initial_tokens (3).
-        assert_eq!(rl.tokens_remaining(&a), 3);
+        assert_eq!(
+            rl.tokens_remaining_at(&a, start + Duration::from_millis(200)),
+            3
+        );
+    }
+
+    #[test]
+    fn refill_preserves_partial_interval() {
+        let mut config = fast_config();
+        config.initial_tokens = 2;
+        config.refill_rate = 1;
+        config.refill_interval = Duration::from_millis(100);
+        let mut rl = ProofRateLimiter::new(config);
+        let a = addr(7);
+        let start = Instant::now();
+
+        assert!(rl.try_consume_at(&a, start));
+        assert!(rl.try_consume_at(&a, start));
+        assert_eq!(
+            rl.tokens_remaining_at(&a, start + Duration::from_millis(150)),
+            1
+        );
+
+        // The first refill must retain the extra 50 ms, so another token is
+        // available 50 ms later rather than a full interval later.
+        assert_eq!(
+            rl.tokens_remaining_at(&a, start + Duration::from_millis(200)),
+            2
+        );
     }
 }
