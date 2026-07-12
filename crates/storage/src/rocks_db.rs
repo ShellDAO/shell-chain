@@ -114,6 +114,12 @@ impl Default for RocksDbConfig {
     }
 }
 
+fn mib_to_bytes(field: &str, value: usize) -> Result<usize, StorageError> {
+    value
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| StorageError::InvalidInput(format!("{field} is too large")))
+}
+
 /// RocksDB-backed KvStore targeting a single column family.
 ///
 /// Multiple instances can share the same `Arc<RocksDb>`, each operating
@@ -193,8 +199,11 @@ impl RocksDbStore {
     ) -> Result<RocksDbStores, StorageError> {
         let cfg = config.unwrap_or_default();
 
+        let block_cache_bytes = mib_to_bytes("block_cache_mb", cfg.block_cache_mb)?;
+        let write_buffer_bytes = mib_to_bytes("write_buffer_mb", cfg.write_buffer_mb)?;
+
         // Shared block cache across all CFs
-        let cache = Cache::new_lru_cache(cfg.block_cache_mb * 1024 * 1024);
+        let cache = Cache::new_lru_cache(block_cache_bytes);
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_cache(&cache);
 
@@ -205,7 +214,7 @@ impl RocksDbStore {
         // Build per-CF options with tuning parameters
         let make_cf_opts = |bulk: bool| {
             let mut opts = Options::default();
-            opts.set_write_buffer_size(cfg.write_buffer_mb * 1024 * 1024);
+            opts.set_write_buffer_size(write_buffer_bytes);
             opts.set_max_write_buffer_number(cfg.max_write_buffers);
             opts.set_compaction_style(match cfg.compaction_style {
                 RocksCompactionStyle::Level => DBCompactionStyle::Level,
@@ -612,6 +621,38 @@ mod tests {
         // uniform Zstd since Universal compaction has no stable level mapping)
         stores.chain.put(b"ck", b"cv").unwrap();
         assert_eq!(stores.chain.get(b"ck").unwrap(), Some(b"cv".to_vec()));
+    }
+
+    #[test]
+    fn oversized_memory_config_is_rejected_without_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let block_cache_err = match RocksDbStore::open_all(
+            dir.path(),
+            Some(RocksDbConfig {
+                block_cache_mb: usize::MAX,
+                ..Default::default()
+            }),
+        ) {
+            Ok(_) => panic!("oversized block cache must be rejected"),
+            Err(err) => err,
+        };
+        assert!(block_cache_err
+            .to_string()
+            .contains("block_cache_mb is too large"));
+
+        let write_buffer_err = match RocksDbStore::open_all(
+            dir.path(),
+            Some(RocksDbConfig {
+                write_buffer_mb: usize::MAX,
+                ..Default::default()
+            }),
+        ) {
+            Ok(_) => panic!("oversized write buffer must be rejected"),
+            Err(err) => err,
+        };
+        assert!(write_buffer_err
+            .to_string()
+            .contains("write_buffer_mb is too large"));
     }
 
     #[test]
