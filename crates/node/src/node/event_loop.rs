@@ -98,7 +98,8 @@ impl<S: KvStore + 'static> Node<S> {
                     .map(|block| block.header.proposer)
             })
             .unwrap_or(Address::ZERO);
-        self.challenge_lifecycle
+        let inserted = self
+            .challenge_lifecycle
             .lock()
             .open_challenge(ChallengeRecord {
                 challenge_id,
@@ -107,6 +108,12 @@ impl<S: KvStore + 'static> Node<S> {
                 opened_at_block: self.head_number(),
                 status: ChallengeStatus::Open,
             });
+        if !inserted {
+            debug!(
+                %challenge_id,
+                "challenge already tracked or lifecycle capacity reached; ignoring duplicate"
+            );
+        }
     }
 
     fn resolve_open_challenge(&self, challenge_id: &ShellHash) {

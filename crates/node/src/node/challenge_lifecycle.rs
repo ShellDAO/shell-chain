@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use shell_primitives::{Address, ShellHash};
 
 pub const CHALLENGE_TIMEOUT_BLOCKS: u64 = 7200;
+pub const MAX_TRACKED_CHALLENGES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeStatus {
@@ -32,9 +33,15 @@ impl ChallengeLifecycle {
         }
     }
 
-    pub fn open_challenge(&mut self, mut record: ChallengeRecord) {
+    pub fn open_challenge(&mut self, mut record: ChallengeRecord) -> bool {
+        if self.challenges.contains_key(&record.challenge_id)
+            || self.challenges.len() >= MAX_TRACKED_CHALLENGES
+        {
+            return false;
+        }
         record.status = ChallengeStatus::Open;
         self.challenges.insert(record.challenge_id, record);
+        true
     }
 
     pub fn resolve_challenge(&mut self, id: &ShellHash) -> Option<ChallengeRecord> {
@@ -59,6 +66,13 @@ impl ChallengeLifecycle {
                 slashed.push(record.clone());
             }
         }
+        self.challenges.retain(|_, record| {
+            record.status == ChallengeStatus::Open
+                || current_block
+                    < record
+                        .opened_at_block
+                        .saturating_add(CHALLENGE_TIMEOUT_BLOCKS.saturating_mul(2))
+        });
         slashed
     }
 
@@ -73,6 +87,11 @@ impl ChallengeLifecycle {
             .values()
             .filter(|record| record.status == ChallengeStatus::Open)
             .count()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn tracked_count(&self) -> usize {
+        self.challenges.len()
     }
 }
 
@@ -180,5 +199,50 @@ mod tests {
             lifecycle.get(&challenge_id).unwrap().status,
             ChallengeStatus::Slashed
         );
+    }
+
+    #[test]
+    fn duplicate_challenge_does_not_reset_timeout() {
+        let mut lifecycle = ChallengeLifecycle::new();
+        let challenge_id = hash(7);
+        assert!(lifecycle.open_challenge(open_record(7, 10)));
+        assert!(!lifecycle.open_challenge(open_record(7, 1_000)));
+
+        let slashed = lifecycle.check_timeouts(10 + CHALLENGE_TIMEOUT_BLOCKS);
+
+        assert_eq!(slashed.len(), 1);
+        assert_eq!(slashed[0].challenge_id, challenge_id);
+    }
+
+    #[test]
+    fn challenge_tracking_is_bounded() {
+        let mut lifecycle = ChallengeLifecycle::new();
+        for id in 0..MAX_TRACKED_CHALLENGES {
+            let mut challenge_id_bytes = [0u8; 32];
+            challenge_id_bytes[24..].copy_from_slice(&(id as u64).to_be_bytes());
+            let challenge_id = ShellHash::from(challenge_id_bytes);
+            assert!(lifecycle.open_challenge(ChallengeRecord {
+                challenge_id,
+                prover: addr(1),
+                challenger: addr(2),
+                opened_at_block: 0,
+                status: ChallengeStatus::Open,
+            }));
+        }
+
+        assert!(!lifecycle.open_challenge(open_record(8, 0)));
+        assert_eq!(lifecycle.tracked_count(), MAX_TRACKED_CHALLENGES);
+    }
+
+    #[test]
+    fn terminal_challenges_are_eventually_pruned() {
+        let mut lifecycle = ChallengeLifecycle::new();
+        let challenge_id = hash(9);
+        lifecycle.open_challenge(open_record(9, 10));
+        lifecycle.resolve_challenge(&challenge_id).unwrap();
+
+        lifecycle.check_timeouts(10 + CHALLENGE_TIMEOUT_BLOCKS * 2);
+
+        assert_eq!(lifecycle.tracked_count(), 0);
     }
 }
