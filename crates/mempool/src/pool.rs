@@ -9,7 +9,7 @@ use shell_core::SignedTransaction;
 use shell_crypto::Verifier;
 use shell_pqvm::{
     compute_intrinsic_gas, validate_aa_bundle_structure, validate_aa_tx, AaValidationError,
-    AaValidationOutcome, TxValidationError,
+    TxValidationError,
 };
 use shell_primitives::{Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, WorldState};
@@ -96,7 +96,7 @@ impl TxPool {
         verifier: &V,
     ) -> Result<ShellHash, MempoolError> {
         // --- Stateless checks (before acquiring lock) ---
-        let validation = self.validate_stateless(&tx, world_state, chain_store, verifier)?;
+        self.validate_stateless(&tx, world_state, chain_store, verifier)?;
 
         // --- Balance floor check (F-020) ---
         let sender = tx.sender();
@@ -250,12 +250,6 @@ impl TxPool {
                 "mempool arrival sequence exhausted".into(),
             ));
         };
-
-        if validation.should_register_pubkey {
-            chain_store
-                .put_pubkey(&tx.from, &validation.pubkey)
-                .map_err(MempoolError::Storage)?;
-        }
 
         if let Some(evict_hash) = evict_hash {
             if evict_descendants {
@@ -489,7 +483,7 @@ impl TxPool {
         world_state: &mut WorldState<S>,
         chain_store: &ChainStore<S>,
         verifier: &V,
-    ) -> Result<AaValidationOutcome, MempoolError> {
+    ) -> Result<(), MempoolError> {
         // Chain ID
         if tx.tx.chain_id != self.config.chain_id {
             return Err(MempoolError::ChainIdMismatch {
@@ -562,6 +556,7 @@ impl TxPool {
         }
 
         validate_aa_tx(tx, world_state, chain_store, verifier)
+            .map(|_| ())
             .map_err(|err| map_aa_validation_error(tx, err))
     }
 
@@ -996,17 +991,6 @@ mod tests {
         (ws, cs)
     }
 
-    fn setup_failing_store_ctx(
-        fail_pubkey_put: bool,
-    ) -> (
-        WorldState<FailingPubkeyStore>,
-        ChainStore<FailingPubkeyStore>,
-    ) {
-        let ws = WorldState::new(Arc::new(FailingPubkeyStore::new(false)));
-        let cs = ChainStore::new(Arc::new(FailingPubkeyStore::new(fail_pubkey_put)));
-        (ws, cs)
-    }
-
     fn insert_with_balance<S: KvStore + 'static>(
         pool: &TxPool,
         tx: SignedTransaction,
@@ -1332,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn first_transaction_registers_pubkey_for_follow_up_sends() {
+    fn admitted_transaction_does_not_register_pubkey_before_import() {
         let pool = TxPool::new(make_config());
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
@@ -1359,7 +1343,7 @@ mod tests {
         let first = SignedTransaction::with_pubkey(from, tx0, sig0, pubkey.clone());
         insert_rich(&pool, first, &verifier, &mut ws, &cs).unwrap();
 
-        assert_eq!(cs.get_pubkey(&from).unwrap(), Some(pubkey));
+        assert_eq!(cs.get_pubkey(&from).unwrap(), None);
 
         let tx1 = Transaction {
             chain_id: 42,
@@ -1377,7 +1361,8 @@ mod tests {
         };
         let sig1 = signer.sign(tx1.hash().as_bytes()).unwrap();
         let follow_up = SignedTransaction::new(from, tx1, sig1);
-        insert_rich(&pool, follow_up, &verifier, &mut ws, &cs).unwrap();
+        let err = insert_rich(&pool, follow_up, &verifier, &mut ws, &cs).unwrap_err();
+        assert!(matches!(err, MempoolError::PubkeyRequired { .. }));
     }
 
     #[test]
@@ -1836,32 +1821,6 @@ mod tests {
     }
 
     #[test]
-    fn pool_full_pubkey_storage_failure_keeps_evicted_candidate() {
-        let config = MempoolConfig {
-            max_pool_size: 1,
-            ..make_config()
-        };
-        let pool = TxPool::new(config);
-        let verifier = DilithiumVerifier;
-        let (mut ws, cs_ok) = setup_failing_store_ctx(false);
-        let first_nonce = u64::default();
-
-        let (tx_low, _) = make_signed_tx(first_nonce, 10);
-        let low_hash = tx_low.hash();
-        insert_rich(&pool, tx_low, &verifier, &mut ws, &cs_ok).unwrap();
-
-        let (_, cs_fail) = setup_failing_store_ctx(true);
-        let (tx_high, _) = make_signed_tx(first_nonce, 100);
-        let high_hash = tx_high.hash();
-        let err = insert_rich(&pool, tx_high, &verifier, &mut ws, &cs_fail).unwrap_err();
-
-        assert!(matches!(err, MempoolError::Storage(_)));
-        assert_eq!(pool.len(), 1);
-        assert!(pool.contains(&low_hash));
-        assert!(!pool.contains(&high_hash));
-    }
-
-    #[test]
     fn pool_full_rejects_low_priority() {
         let config = MempoolConfig {
             max_pool_size: 2,
@@ -2232,30 +2191,6 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(!pool.contains(&old_hash));
         assert!(pool.contains(&new_hash));
-    }
-
-    #[test]
-    fn rbf_pubkey_storage_failure_keeps_old_transaction() {
-        let pool = TxPool::new(make_config());
-        let verifier = DilithiumVerifier;
-        let (mut ws, cs_ok) = setup_failing_store_ctx(false);
-
-        let signer = DilithiumSigner::generate();
-        let pubkey = signer.public_key().to_vec();
-        let first_nonce = u64::default();
-        let tx_old = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 100);
-        let old_hash = tx_old.hash();
-        insert_rich(&pool, tx_old, &verifier, &mut ws, &cs_ok).unwrap();
-
-        let (_, cs_fail) = setup_failing_store_ctx(true);
-        let tx_new = make_signed_tx_with_signer(&signer, &pubkey, first_nonce, 111);
-        let new_hash = tx_new.hash();
-        let err = insert_rich(&pool, tx_new, &verifier, &mut ws, &cs_fail).unwrap_err();
-
-        assert!(matches!(err, MempoolError::Storage(_)));
-        assert_eq!(pool.len(), 1);
-        assert!(pool.contains(&old_hash));
-        assert!(!pool.contains(&new_hash));
     }
 
     #[test]
