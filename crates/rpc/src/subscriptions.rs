@@ -198,6 +198,34 @@ impl Default for SubscriptionTracker {
     }
 }
 
+struct SubscriptionSlotGuard {
+    tracker: SubscriptionTracker,
+    conn_id: u32,
+    armed: bool,
+}
+
+impl SubscriptionSlotGuard {
+    fn new(tracker: SubscriptionTracker, conn_id: u32) -> Self {
+        Self {
+            tracker,
+            conn_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubscriptionSlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.tracker.release_for_connection(self.conn_id);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Log filter (for `logs` subscriptions)
 // ---------------------------------------------------------------------------
@@ -397,6 +425,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                 .await;
             return Ok(());
         }
+        let mut slot_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
 
         match sub_type.as_str() {
             "newHeads" => {
@@ -407,6 +436,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     forward_new_heads(rx, sink).await;
                     t.release_for_connection(conn_id);
                 });
+                slot_guard.disarm();
             }
             "logs" => {
                 let rx = self.block_event_sender().subscribe();
@@ -414,7 +444,6 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     Ok(Some(filter)) => filter,
                     Ok(None) => LogFilter::default(),
                     Err(err) => {
-                        tracker.release_for_connection(conn_id);
                         pending.reject(err).await;
                         return Ok(());
                     }
@@ -425,6 +454,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     forward_logs(rx, sink, filter).await;
                     t.release_for_connection(conn_id);
                 });
+                slot_guard.disarm();
             }
             "newPendingTransactions" => {
                 let rx = self.pending_tx_event_sender().subscribe();
@@ -433,7 +463,6 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                 let full_txs = match parse_pending_tx_full_txs(params.as_ref()) {
                     Ok(full_txs) => full_txs,
                     Err(err) => {
-                        tracker.release_for_connection(conn_id);
                         pending.reject(err).await;
                         return Ok(());
                     }
@@ -444,6 +473,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     forward_pending_txs(rx, sink, full_txs).await;
                     t.release_for_connection(conn_id);
                 });
+                slot_guard.disarm();
             }
             "syncing" => {
                 let rx = self.sync_event_sender().subscribe();
@@ -453,9 +483,9 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     forward_syncing(rx, sink).await;
                     t.release_for_connection(conn_id);
                 });
+                slot_guard.disarm();
             }
             _ => {
-                tracker.release_for_connection(conn_id);
                 pending
                     .reject(unsupported_subscription_type_err(&sub_type))
                     .await;
@@ -1204,6 +1234,31 @@ mod tests {
         assert!(!tracker.try_acquire());
         tracker.release();
         assert!(tracker.try_acquire());
+    }
+
+    #[test]
+    fn subscription_slot_guard_releases_failed_handshake_slot() {
+        let tracker = SubscriptionTracker::new(1);
+        assert!(tracker.try_acquire_for_connection(7));
+
+        drop(SubscriptionSlotGuard::new(tracker.clone(), 7));
+
+        assert_eq!(tracker.active_count(), 0);
+        assert!(tracker.try_acquire_for_connection(8));
+    }
+
+    #[test]
+    fn subscription_slot_guard_can_transfer_release_to_forwarder() {
+        let tracker = SubscriptionTracker::new(1);
+        assert!(tracker.try_acquire_for_connection(7));
+        let mut guard = SubscriptionSlotGuard::new(tracker.clone(), 7);
+
+        guard.disarm();
+        drop(guard);
+
+        assert_eq!(tracker.active_count(), 1);
+        tracker.release_for_connection(7);
+        assert_eq!(tracker.active_count(), 0);
     }
 
     #[test]
