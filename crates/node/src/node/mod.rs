@@ -88,6 +88,17 @@ fn next_block_request_start(head_number: u64) -> Option<u64> {
     head_number.checked_add(1)
 }
 
+fn canonical_mapping_retention(body_retention: u64, witness_retention: u64) -> u64 {
+    if body_retention == 0 || witness_retention == 0 {
+        return u64::MAX;
+    }
+
+    body_retention
+        .max(witness_retention)
+        .max(128)
+        .saturating_add(1)
+}
+
 /// A running shell-chain node.
 ///
 /// Orchestrates storage, consensus, EVM, mempool, network, and RPC
@@ -577,7 +588,10 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         let tracker = StateRootTracker::new(config.pruning.clone());
-        let state_pruner = StatePruner::new(128);
+        let state_pruner = StatePruner::new(canonical_mapping_retention(
+            config.pruning.body_retention,
+            config.pruning.witness_retention,
+        ));
         let witness_store = Arc::new(WitnessStore::new(store.clone()));
         let witness_pruner = WitnessPruner::new(config.pruning.witness_retention);
         let body_pruner = BodyPruner::new(config.pruning.body_retention);
@@ -5064,6 +5078,19 @@ mod tests {
         config.pruning.witness_retention = witness_retention;
         let node = Node::new(config, db, chain_store, world_state, tx_pool, consensus);
         (node, signer)
+    }
+
+    #[test]
+    fn canonical_mapping_retention_outlives_dependent_artifacts() {
+        assert_eq!(canonical_mapping_retention(512, 256), 513);
+        assert_eq!(canonical_mapping_retention(64, 256), 257);
+        assert_eq!(canonical_mapping_retention(32, 32), 129);
+    }
+
+    #[test]
+    fn canonical_mapping_retention_preserves_archive_indexes() {
+        assert_eq!(canonical_mapping_retention(0, 256), u64::MAX);
+        assert_eq!(canonical_mapping_retention(512, 0), u64::MAX);
     }
 
     #[test]
