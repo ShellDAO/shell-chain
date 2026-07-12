@@ -1616,10 +1616,15 @@ impl<S: KvStore + 'static> Node<S> {
                                     if let Some(next) = next_start {
                                         if next <= head_number {
                                             // More blocks needed — request next batch.
-                                            let _ = network.broadcast(NetworkMessage::BodyRequest {
-                                                start_number: next,
-                                                count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
-                                            }).await;
+                                            let _ = network
+                                                .send_to_peer(
+                                                    &peer,
+                                                    NetworkMessage::BodyRequest {
+                                                        start_number: next,
+                                                        count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                                    },
+                                                )
+                                                .await;
                                         } else {
                                             info!("L4: historical body back-fill complete");
                                         }
