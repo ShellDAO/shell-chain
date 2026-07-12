@@ -134,6 +134,11 @@ pub fn validator_removed_topic() -> [u8; 32] {
 pub const SYSTEM_CALL_BASE_GAS: u64 = 21_000;
 /// Additional gas per state-mutating operation.
 pub const SYSTEM_CALL_OP_GAS: u64 = 5_000;
+/// Maximum public-key payload accepted by account-management calls.
+///
+/// The largest currently supported public key is 1,952 bytes. Keep bounded
+/// headroom for future algorithms without allowing calldata-sized values to be persisted.
+pub const MAX_ACCOUNT_PUBLIC_KEY_BYTES: usize = 4_096;
 
 /// Minimum blocks between proposal and activation (≈ 30 days at 2 s/block per WP §6.5).
 ///
@@ -173,6 +178,8 @@ pub enum SystemContractError {
     LastValidator,
     #[error("empty pubkey is not allowed")]
     EmptyPubkey,
+    #[error("public key is too large: {0} bytes (max {1})")]
+    PublicKeyTooLarge(usize, usize),
     #[error("validator pubkey is not registered: {0}")]
     ValidatorPubkeyMissing(Address),
     #[error("invalid signature algorithm id: {0}")]
@@ -1466,6 +1473,7 @@ fn submit_recovery<S: KvStore + 'static>(
     if bytes_len == 0 {
         return Err(SystemContractError::EmptyPubkey);
     }
+    validate_public_key_size(bytes_len)?;
     let new_pubkey = params
         .get(data_start..data_end)
         .ok_or_else(|| SystemContractError::AbiDecode("pubkey range OOB".into()))?
@@ -1764,6 +1772,7 @@ fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContrac
             .get(offset..offset.saturating_add(32))
             .ok_or_else(|| SystemContractError::AbiDecode("bytes offset out of range".into()))?,
     )?;
+    validate_public_key_size(bytes_len)?;
     let data_start = offset.saturating_add(32);
     let data_end = data_start
         .checked_add(bytes_len)
@@ -1781,6 +1790,19 @@ fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContrac
             .to_vec(),
         algo_id,
     ))
+}
+
+fn validate_public_key_size(bytes_len: usize) -> Result<(), SystemContractError> {
+    if bytes_len == 0 {
+        return Err(SystemContractError::EmptyPubkey);
+    }
+    if bytes_len > MAX_ACCOUNT_PUBLIC_KEY_BYTES {
+        return Err(SystemContractError::PublicKeyTooLarge(
+            bytes_len,
+            MAX_ACCOUNT_PUBLIC_KEY_BYTES,
+        ));
+    }
+    Ok(())
 }
 
 /// Decode a single ABI-encoded `address` parameter (32 bytes, left-padded with zeros).
@@ -2982,6 +3004,32 @@ mod tests {
     }
 
     #[test]
+    fn rotate_key_rejects_oversized_public_key() {
+        let caller = Address::from([0x12; 20]);
+        let (mut ws, cs) = setup_account_manager();
+        let calldata = encode_rotate_key_calldata(
+            &vec![0x42; MAX_ACCOUNT_PUBLIC_KEY_BYTES + 1],
+            SignatureType::Dilithium3.as_u8(),
+        );
+
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &caller,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SystemContractError::PublicKeyTooLarge(size, MAX_ACCOUNT_PUBLIC_KEY_BYTES)
+                if size == MAX_ACCOUNT_PUBLIC_KEY_BYTES + 1
+        ));
+        assert_eq!(cs.get_pubkey(&caller).unwrap(), None);
+    }
+
+    #[test]
     fn rotate_key_only_updates_caller() {
         let caller = Address::from([0x13; 20]);
         let other = Address::from([0x14; 20]);
@@ -3450,6 +3498,22 @@ mod tests {
         let input = [0u8; 32];
         let decoded = decode_address(&input).unwrap();
         assert_eq!(decoded, Address::ZERO);
+    }
+
+    #[test]
+    fn public_key_size_validation_enforces_bounds() {
+        assert!(validate_public_key_size(MAX_ACCOUNT_PUBLIC_KEY_BYTES).is_ok());
+        assert!(matches!(
+            validate_public_key_size(MAX_ACCOUNT_PUBLIC_KEY_BYTES + 1),
+            Err(SystemContractError::PublicKeyTooLarge(
+                size,
+                MAX_ACCOUNT_PUBLIC_KEY_BYTES
+            )) if size == MAX_ACCOUNT_PUBLIC_KEY_BYTES + 1
+        ));
+        assert!(matches!(
+            validate_public_key_size(0),
+            Err(SystemContractError::EmptyPubkey)
+        ));
     }
 
     #[test]
