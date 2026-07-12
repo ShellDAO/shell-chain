@@ -10,7 +10,8 @@ use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use shell_core::{InnerCall, SessionAuth, SignedTransaction};
 use shell_crypto::{
-    is_algorithm_allowed, PQSignature, SignatureType, Verifier, ALLOWED_ALGORITHMS,
+    infer_signature_type_from_address, is_algorithm_allowed, PQSignature, SignatureType, Verifier,
+    ALLOWED_ALGORITHMS,
 };
 use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
@@ -168,7 +169,15 @@ pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
 
     if registered_pubkey.is_none() {
         let derived = Address::from_public_key(&pubkey, signed_tx.signature.sig_type.as_u8());
-        if signed_tx.from != derived {
+        let uses_session_key = signed_tx
+            .aa_bundle()
+            .is_some_and(|bundle| bundle.session_auth.is_some());
+        let address_matches = if uses_session_key {
+            infer_signature_type_from_address(&pubkey, &signed_tx.from).is_some()
+        } else {
+            signed_tx.from == derived
+        };
+        if !address_matches {
             return Err(AaValidationError::AddressMismatch {
                 from: signed_tx.from,
                 derived,
@@ -903,8 +912,12 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_core::{Account, Transaction};
-    use shell_crypto::{DilithiumSigner, DilithiumVerifier, PQSignature, Signer};
+    use shell_core::{
+        AaBundle, Account, InnerCall, PubkeyMode, SessionAuth, Transaction, AA_BUNDLE_TX_TYPE,
+    };
+    use shell_crypto::{
+        DilithiumSigner, DilithiumVerifier, MlDsaSigner, MultiVerifier, PQSignature, Signer,
+    };
     use shell_primitives::{Bytes, U256};
     use shell_storage::MemoryDb;
     use std::sync::Arc;
@@ -1088,6 +1101,68 @@ mod tests {
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    #[test]
+    fn first_use_session_accepts_distinct_root_key_algorithm() {
+        let root = MlDsaSigner::generate();
+        let session = DilithiumSigner::generate();
+        let from = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
+        let (mut ws, cs) = setup_stores();
+        fund_account(&mut ws, &from);
+
+        let mut auth = SessionAuth {
+            session_pubkey: Bytes::from(session.public_key().to_vec()),
+            session_algo: session.sig_type().as_u8(),
+            target: None,
+            value_cap: U256::ZERO,
+            expiry_block: 10,
+            root_signature: Bytes::new(),
+            session_signature: Bytes::from(vec![1]),
+        };
+        auth.root_signature = Bytes::from(root.sign(auth.auth_hash(1337).as_bytes()).unwrap().data);
+        let mut tx = base_tx(1337, 0);
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        tx.gas_limit = 100_000;
+        let inner_call = InnerCall {
+            to: tx.to,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 50_000,
+        };
+        let placeholder = PQSignature::new(session.sig_type(), vec![1]);
+        let unsigned = SignedTransaction::with_aa_bundle(
+            from,
+            tx.clone(),
+            placeholder,
+            PubkeyMode::Embedded(root.public_key().to_vec()),
+            AaBundle {
+                inner_calls: vec![inner_call.clone()],
+                session_auth: Some(auth.clone()),
+                ..AaBundle::default()
+            },
+        )
+        .unwrap();
+        let session_signature = session
+            .sign(unsigned.sender_signing_hash().as_bytes())
+            .unwrap();
+        auth.session_signature = Bytes::from(session_signature.data.clone());
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            session_signature,
+            PubkeyMode::Embedded(root.public_key().to_vec()),
+            AaBundle {
+                inner_calls: vec![inner_call],
+                session_auth: Some(auth),
+                ..AaBundle::default()
+            },
+        )
+        .unwrap();
+
+        let outcome = validate_aa_tx(&signed, &mut ws, &cs, &MultiVerifier).unwrap();
+        assert_eq!(outcome.pubkey, root.public_key());
+        assert!(outcome.should_register_pubkey);
     }
 
     #[test]
