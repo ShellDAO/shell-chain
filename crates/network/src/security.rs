@@ -19,7 +19,7 @@ const MAX_TEMP_BAN_DURATION: Duration = Duration::from_secs(10 * 365 * 24 * 60 *
 #[derive(Debug)]
 pub struct PeerTracker {
     max_peers: usize,
-    peers: HashMap<PeerId, Instant>,
+    peers: HashMap<PeerId, usize>,
 }
 
 impl PeerTracker {
@@ -37,8 +37,10 @@ impl PeerTracker {
     /// Returns `Ok(())` if the peer was added, or
     /// `Err(NetworkError::ConnectionLimitReached)` if the limit is hit.
     pub fn try_add_peer(&mut self, peer: PeerId) -> Result<(), NetworkError> {
-        // Already tracked — allow (reconnect / duplicate event).
-        if self.peers.contains_key(&peer) {
+        // Multiple connections to one peer consume one peer slot, but each
+        // connection must be tracked so closing one does not free the slot.
+        if let Some(connection_count) = self.peers.get_mut(&peer) {
+            *connection_count = connection_count.saturating_add(1);
             return Ok(());
         }
         if self.max_peers > 0 && self.peers.len() >= self.max_peers {
@@ -47,13 +49,19 @@ impl PeerTracker {
                 max: self.max_peers,
             });
         }
-        self.peers.insert(peer, Instant::now());
+        self.peers.insert(peer, 1);
         Ok(())
     }
 
     /// Remove a peer when it disconnects.
     pub fn remove_peer(&mut self, peer: &PeerId) {
-        self.peers.remove(peer);
+        if let Some(connection_count) = self.peers.get_mut(peer) {
+            if *connection_count > 1 {
+                *connection_count -= 1;
+            } else {
+                self.peers.remove(peer);
+            }
+        }
     }
 
     /// Number of currently tracked peers.
@@ -275,6 +283,21 @@ mod tests {
         // Same peer again should succeed.
         assert!(tracker.try_add_peer(PeerId::from("a")).is_ok());
         assert_eq!(tracker.active_count(), 1);
+    }
+
+    #[test]
+    fn tracker_keeps_slot_until_last_peer_connection_closes() {
+        let mut tracker = PeerTracker::new(1);
+        let peer = PeerId::from("a");
+        tracker.try_add_peer(peer.clone()).unwrap();
+        tracker.try_add_peer(peer.clone()).unwrap();
+
+        tracker.remove_peer(&peer);
+
+        assert!(tracker.is_full());
+        assert!(tracker.try_add_peer(PeerId::from("b")).is_err());
+        tracker.remove_peer(&peer);
+        assert!(!tracker.is_full());
     }
 
     #[test]
