@@ -498,6 +498,12 @@ impl TxPool {
             });
         }
 
+        if tx.tx.max_priority_fee_per_gas > tx.tx.max_fee_per_gas {
+            return Err(MempoolError::InvalidTransaction(
+                "max priority fee per gas exceeds max fee per gas".into(),
+            ));
+        }
+
         // Minimum gas price
         if tx.tx.max_fee_per_gas < self.config.min_gas_price {
             return Err(MempoolError::GasPriceTooLow {
@@ -1121,6 +1127,40 @@ mod tests {
 
         let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
         assert!(matches!(err, MempoolError::GasPriceTooLow { .. }));
+    }
+
+    #[test]
+    fn reject_priority_fee_above_max_fee() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: Some(Address::from([0x11; 20])),
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 101,
+            data: Bytes::default(),
+            tx_type: 0,
+            access_list: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        let signed = SignedTransaction::with_pubkey(from, tx, sig, pubkey);
+        let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message == "max priority fee per gas exceeds max fee per gas"
+        ));
+        assert!(pool.is_empty());
     }
 
     #[test]
