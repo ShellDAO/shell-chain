@@ -131,8 +131,9 @@ impl WitnessPruner {
                     }
                 }
                 None => {
-                    // Block hash not available (e.g. canonical mapping already pruned).
-                    result.not_found_count = result.not_found_count.saturating_add(1);
+                    return Err(StorageError::InvalidInput(format!(
+                        "witness pruner: canonical hash missing for block {block_number}"
+                    )));
                 }
             }
         }
@@ -344,6 +345,27 @@ mod tests {
         // Blocks with no bundle → not_found.
         assert_eq!(result.pruned_count, 1); // block 1
         assert_eq!(result.not_found_count, 2); // blocks 0 and 2 have no bundle
+    }
+
+    #[test]
+    fn missing_canonical_fails_without_advancing_or_deleting() {
+        let (_db, cs, ws) = make_store();
+        let hashes: Vec<ShellHash> = (0..5).map(|n| store_block(&cs, n)).collect();
+        for hash in &hashes {
+            store_bundle(&ws, hash);
+        }
+        cs.delete_canonical(2).unwrap();
+
+        let mut pruner = WitnessPruner::new(2);
+        let err = pruner.prune_before(4, None, &cs, &ws).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("canonical hash missing for block 2"));
+        assert_eq!(pruner.pruned_below(), 0);
+        for hash in hashes {
+            assert!(ws.has_bundle(&hash).unwrap());
+        }
     }
 
     #[test]

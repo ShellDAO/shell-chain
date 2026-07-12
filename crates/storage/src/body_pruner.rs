@@ -115,8 +115,9 @@ impl BodyPruner {
             // Resolve canonical hash for this block number.
             match chain_store.get_block_hash_by_number(block_number)? {
                 None => {
-                    // Block not in canonical chain (pruned canonical or gap) — skip.
-                    debug!(block_number, "body pruner: no canonical hash, skipping");
+                    return Err(StorageError::InvalidInput(format!(
+                        "body pruner: canonical hash missing for block {block_number}"
+                    )));
                 }
                 Some(hash) => {
                     if chain_store.has_body(&hash)? {
@@ -278,17 +279,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_canonical_skipped() {
+    fn missing_canonical_fails_without_advancing_or_deleting() {
         // Create chain but delete the canonical mapping for block 2.
         let cs = setup_chain(10);
         cs.delete_canonical(2).unwrap();
 
         let mut pruner = BodyPruner::new(5);
-        // head=9 → prune 0..5; block 2 has no canonical hash → skipped
-        let result = pruner.prune_before(9, &cs).unwrap();
-        // 5 blocks checked, 4 pruned (block 2 skipped), 1 missing
-        assert_eq!(result.blocks_checked, 5);
-        assert_eq!(result.bodies_pruned, 4);
+        let err = pruner.prune_before(9, &cs).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("canonical hash missing for block 2"));
+        assert_eq!(pruner.pruned_below(), 0);
+        for n in [0, 1, 3, 4] {
+            let hash = cs.get_block_hash_by_number(n).unwrap().unwrap();
+            assert!(cs.has_body(&hash).unwrap());
+        }
     }
 
     #[test]
