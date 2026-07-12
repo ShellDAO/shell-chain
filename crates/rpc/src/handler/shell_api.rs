@@ -107,7 +107,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
                 .unwrap_or(0)
         });
         let from_block = options.from_block.unwrap_or(0);
-        let limit = options.limit.unwrap_or(20).clamp(0, 100);
+        let limit = options.limit.unwrap_or(20).clamp(1, 100);
         let descending = matches!(options.direction, RpcListDirection::Desc);
         let (entries, has_more) = self
             .chain_store
@@ -1118,7 +1118,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 .unwrap_or(0)
         });
         let page = page.unwrap_or(0);
-        let limit = limit.unwrap_or(20).min(100);
+        let limit = limit.unwrap_or(20).clamp(1, 100);
         let offset = page
             .checked_mul(limit)
             .ok_or_else(|| invalid_params_err("page * limit overflow"))?;

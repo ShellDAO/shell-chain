@@ -1905,6 +1905,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn address_transaction_pages_clamp_zero_limit_to_one() {
+        let handler = setup();
+        let address = test_address(b"zero-page-limit");
+
+        let legacy = ShellApiServer::get_transactions_by_address(
+            &handler,
+            address,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy["limit"], 1);
+
+        let v2 = ShellApiServer::get_transactions_by_address_v2(
+            &handler,
+            address,
+            Some(RpcAddressTransactionsV2Options {
+                from_block: Some(0),
+                to_block: Some(0),
+                limit: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2.limit, 1);
+    }
+
+    #[tokio::test]
     async fn get_transactions_by_address_v2_rejects_wide_exact_total() {
         let handler = setup();
         let address = test_address(b"v2-wide-total");
