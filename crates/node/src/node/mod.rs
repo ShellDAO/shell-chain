@@ -1182,7 +1182,6 @@ impl<S: KvStore + 'static> Node<S> {
         {
             let mut pruner = self.state_pruner.write();
             pruner.register_block(block_number, state_root);
-            pruner.mark_active(state_root);
             if finalized_number > 0 && pruner.should_prune(block_number) {
                 pruner.mark_prunable(finalized_number);
                 match pruner.prune(self.store.as_ref()) {
@@ -5106,6 +5105,18 @@ mod tests {
         assert_eq!(tracker.len(), 5, "should track one root per produced block");
         assert_eq!(tracker.oldest().unwrap().block_number, 1);
         assert_eq!(tracker.latest().unwrap().block_number, 5);
+    }
+
+    #[test]
+    fn state_pruner_does_not_pin_every_committed_root() {
+        let (node, signer) = setup_node_with_pruning(128);
+        store_genesis(&node);
+
+        for _ in 0..5 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+
+        assert_eq!(node.state_pruner.read().active_root_count(), 0);
     }
 
     #[test]
