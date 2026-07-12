@@ -161,7 +161,7 @@ impl FinalityState {
         attestation: Attestation,
         attester_weight: u64,
     ) -> bool {
-        if attestation.block_number <= self.last_finalized_number {
+        if attester_weight == 0 || attestation.block_number <= self.last_finalized_number {
             return false;
         }
 
@@ -177,11 +177,10 @@ impl FinalityState {
         let validators = self.pending_attestations.entry(block_hash).or_default();
         let is_new = validators.insert(attestation.validator);
         if is_new {
-            let normalized_weight = attester_weight.max(1);
             self.pending_attested_weight
                 .entry(block_hash)
-                .and_modify(|weight| *weight = weight.saturating_add(normalized_weight))
-                .or_insert(normalized_weight);
+                .and_modify(|weight| *weight = weight.saturating_add(attester_weight))
+                .or_insert(attester_weight);
             self.attestation_store
                 .entry(block_hash)
                 .or_default()
@@ -548,6 +547,18 @@ mod tests {
         assert_eq!(state.attestation_count(&hash), 2);
         assert_eq!(state.attested_weight(&hash), 5);
         assert!(state.check_finality_weighted(&hash, 10, 6));
+    }
+
+    #[test]
+    fn zero_weight_attestation_is_not_recorded() {
+        let mut state = FinalityState::new();
+        let hash = make_hash(12);
+        let validator = make_addr(1);
+
+        assert!(!state.record_attestation_weighted(make_att(hash, 10, validator, vec![]), 0));
+        assert_eq!(state.attestation_count(&hash), 0);
+        assert_eq!(state.attested_weight(&hash), 0);
+        assert!(!state.has_attested(&hash, &validator));
     }
 
     #[test]
