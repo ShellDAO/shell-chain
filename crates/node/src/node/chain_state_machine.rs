@@ -32,7 +32,7 @@ impl ChainStateMachine {
     ) -> Result<BlockImportTransition, NodeError> {
         if finalized_number > 0
             && incoming_number <= finalized_number
-            && canonical_hash_at_incoming.is_some_and(|canonical| canonical != incoming_hash)
+            && canonical_hash_at_incoming != Some(incoming_hash)
         {
             return Err(NodeError::ConflictsWithFinalized {
                 incoming: incoming_number,
@@ -160,6 +160,19 @@ mod tests {
     fn rejects_conflicts_at_finalized_height() {
         let err =
             ChainStateMachine::classify_import(7, h(1), 5, h(2), h(0), 5, Some(h(3))).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::ConflictsWithFinalized {
+                incoming: 5,
+                fin_number: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_finalized_import_when_canonical_mapping_is_missing() {
+        let err = ChainStateMachine::classify_import(7, h(1), 5, h(2), h(0), 5, None).unwrap_err();
 
         assert!(matches!(
             err,
