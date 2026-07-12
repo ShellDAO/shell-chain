@@ -771,6 +771,7 @@ async fn handle_swarm_event(
                 let banned = peer_ban_list.record_violation(&peer);
                 if banned {
                     warn!(peer = %propagation_source, "peer banned for repeated violations");
+                    let _ = swarm.disconnect_peer_id(propagation_source);
                 }
                 swarm
                     .behaviour_mut()
@@ -823,6 +824,7 @@ async fn handle_swarm_event(
                     let banned = peer_ban_list.record_violation(&ban_peer);
                     if banned {
                         warn!(peer = %propagation_source, "peer banned for repeated violations");
+                        let _ = swarm.disconnect_peer_id(propagation_source);
                     }
                     swarm
                         .behaviour_mut()
