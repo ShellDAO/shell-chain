@@ -486,6 +486,17 @@ impl<S: KvStore + 'static> Node<S> {
             return Err(err);
         }
 
+        // Public keys become persistent only once their transactions are part
+        // of the canonical block. Mempool admission must remain read-only so
+        // transactions that are dropped or evicted cannot grow chain storage.
+        for tx in &block.transactions {
+            if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
+                if self.chain_store.get_pubkey(&tx.from)?.is_none() {
+                    block_store.store_pubkey(&tx.from, pubkey)?;
+                }
+            }
+        }
+
         if let Some((task, block_num, original_size)) = pending_proof_task {
             prover.queue_task(task);
             debug!(

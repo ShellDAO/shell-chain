@@ -730,7 +730,12 @@ impl<S: KvStore + 'static> Node<S> {
             .lock()
             .insert(block.header.proposer, block.number());
         for (address, pubkey) in new_pubkeys {
-            block_store.store_pubkey(&address, &pubkey)?;
+            // Execution may have changed the key through the account manager.
+            // Do not overwrite that canonical state with the transaction's
+            // pre-execution embedded key.
+            if self.chain_store.get_pubkey(&address)?.is_none() {
+                block_store.store_pubkey(&address, &pubkey)?;
+            }
         }
 
         // L2 grace-window: flush any witnesses whose delete_at block has been reached.

@@ -4077,13 +4077,12 @@ mod tests {
         assert_ne!(block1_hash, block2_hash);
     }
 
-    /// F-405 Test 1: Block with [Embedded TX₀, Reference TX₁] from same sender.
+    /// A block may contain repeated embedded keys from the same sender.
     ///
-    /// The two-pass pubkey resolution must handle Reference txs that follow
-    /// an Embedded tx from the same sender **within the same block**.
-    /// The follower starts with no registered pubkey for the sender.
+    /// The follower starts with no registered pubkey for the sender and must
+    /// deduplicate the key while importing both transactions.
     #[test]
-    fn block_import_pubkey_dedup_embedded_then_reference_same_block() {
+    fn block_import_pubkey_dedup_repeated_embedded_same_block() {
         let (leader, proposer_signer) = setup_node();
         store_genesis(&leader);
         let proposer = leader.config.proposer_address.unwrap();
@@ -4121,7 +4120,7 @@ mod tests {
         let signed0 =
             SignedTransaction::with_pubkey(sender, tx0, sig0, tx_signer.public_key().to_vec());
 
-        // TX₁: Reference — subsequent tx omits the public key
+        // TX₁ also embeds the key because neither transaction is canonical yet.
         let tx1 = Transaction {
             chain_id: 1337,
             nonce: 1,
@@ -4139,14 +4138,19 @@ mod tests {
         let sig1 = tx_signer
             .sign(tx1.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
-        let signed1 = SignedTransaction::new(sender, tx1, sig1);
+        let signed1 = SignedTransaction::with_pubkey(
+            sender,
+            tx1,
+            sig1,
+            tx_signer.public_key().to_vec(),
+        );
 
         let mut ws = leader.world_state.write();
         leader
             .tx_pool
             .insert(signed0, &mut ws, leader.chain_store.as_ref(), &verifier)
             .unwrap();
-        // Leader already registered pubkey from TX₀; TX₁ Reference resolves fine
+        // Pending admission does not mutate the persistent pubkey registry.
         leader
             .tx_pool
             .insert(signed1, &mut ws, leader.chain_store.as_ref(), &verifier)
