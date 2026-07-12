@@ -83,6 +83,8 @@ struct PeerRecord {
     violations: u32,
     /// If banned, the instant at which the ban expires.
     banned_until: Option<Instant>,
+    /// Most recent violation, used to expire peers that never reached the ban threshold.
+    last_violation: Instant,
 }
 
 /// Manages peer reputation and temporary bans.
@@ -114,18 +116,21 @@ impl PeerBanList {
     /// banned as a result of this violation.
     pub fn record_violation(&mut self, peer: &PeerId) -> bool {
         let key = peer.0.clone();
+        let now = Instant::now();
         let record = self.records.entry(key).or_insert(PeerRecord {
             violations: 0,
             banned_until: None,
+            last_violation: now,
         });
 
         record.violations = record.violations.saturating_add(1);
+        record.last_violation = now;
 
         if self.ban_threshold > 0
             && record.violations >= self.ban_threshold
             && record.banned_until.is_none()
         {
-            record.banned_until = Some(ban_deadline(Instant::now(), self.ban_duration));
+            record.banned_until = Some(ban_deadline(now, self.ban_duration));
             return true;
         }
         false
@@ -186,11 +191,13 @@ impl PeerBanList {
             .unwrap_or(0)
     }
 
-    /// Remove all expired bans, reclaiming memory.
+    /// Remove expired bans and stale below-threshold records, reclaiming memory.
     pub fn purge_expired(&mut self) {
         let now = Instant::now();
-        self.records
-            .retain(|_, r| !matches!(r.banned_until, Some(until) if now >= until));
+        self.records.retain(|_, record| match record.banned_until {
+            Some(until) => now < until,
+            None => now.saturating_duration_since(record.last_violation) < self.ban_duration,
+        });
     }
 
     /// Total number of peers currently tracked (with or without active ban).
@@ -369,6 +376,30 @@ mod tests {
         assert_eq!(bans.tracked_count(), 1);
         bans.purge_expired();
         assert_eq!(bans.tracked_count(), 0);
+    }
+
+    #[test]
+    fn purge_expired_cleans_up_stale_below_threshold_peer() {
+        let mut bans = PeerBanList::new(5, Duration::from_millis(0));
+        let peer = PeerId::from("stale-unbanned");
+        assert!(!bans.record_violation(&peer));
+        assert_eq!(bans.tracked_count(), 1);
+
+        bans.purge_expired();
+
+        assert_eq!(bans.tracked_count(), 0);
+    }
+
+    #[test]
+    fn purge_expired_keeps_recent_below_threshold_peer() {
+        let mut bans = PeerBanList::new(5, Duration::from_secs(60));
+        let peer = PeerId::from("recent-unbanned");
+        assert!(!bans.record_violation(&peer));
+
+        bans.purge_expired();
+
+        assert_eq!(bans.tracked_count(), 1);
+        assert_eq!(bans.violations(&peer), 1);
     }
 
     #[test]

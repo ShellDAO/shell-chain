@@ -689,6 +689,7 @@ async fn swarm_loop(
                 }
             }
             _ = score_log_interval.tick() => {
+                peer_ban_list.purge_expired();
                 log_peer_scores(&swarm);
             }
             _ = bw_tick.tick() => {
