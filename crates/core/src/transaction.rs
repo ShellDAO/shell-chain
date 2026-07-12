@@ -1,6 +1,6 @@
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use shell_crypto::{PQSignature, SignatureType};
+use shell_crypto::{PQSignature, SignatureType, MAX_SIGNATURE_BYTES};
 use shell_primitives::{Address, Bytes, ShellHash, U256};
 use std::sync::OnceLock;
 
@@ -405,6 +405,9 @@ pub const MAX_INNER_CALLDATA: usize = 128 * 1024;
 
 /// Maximum size of `paymaster_context` passed to `IPaymaster.validatePaymasterOp`.
 pub const MAX_PAYMASTER_CONTEXT: usize = 4 * 1024;
+
+/// Maximum encoded session public key size across supported PQ algorithms.
+pub const MAX_SESSION_PUBKEY: usize = 4 * 1024;
 
 /// Domain prefix for PQTX signing hash (WP §1503-1509).
 pub const PQTX_SIGNING_DOMAIN: &[u8; 16] = b"PQTX_SIGNING_V1\0";
@@ -813,14 +816,23 @@ impl AaBundle {
             if sa.session_pubkey.is_empty() {
                 return Err("aa bundle: session_auth.session_pubkey is empty");
             }
+            if sa.session_pubkey.len() > MAX_SESSION_PUBKEY {
+                return Err("aa bundle: session_auth.session_pubkey exceeds size limit");
+            }
             if sa.expiry_block == 0 {
                 return Err("aa bundle: session_auth.expiry_block must be > 0");
             }
             if sa.root_signature.is_empty() {
                 return Err("aa bundle: session_auth.root_signature is empty");
             }
+            if sa.root_signature.len() > MAX_SIGNATURE_BYTES {
+                return Err("aa bundle: session_auth.root_signature exceeds size limit");
+            }
             if sa.session_signature.is_empty() {
                 return Err("aa bundle: session_auth.session_signature is empty");
+            }
+            if sa.session_signature.len() > MAX_SIGNATURE_BYTES {
+                return Err("aa bundle: session_auth.session_signature exceeds size limit");
             }
         }
 
@@ -3204,6 +3216,46 @@ mod tests {
         other_algo.session_algo = SignatureType::MlDsa65.as_u8();
 
         assert_ne!(base.auth_hash(1337), other_algo.auth_hash(1337));
+    }
+
+    #[test]
+    fn aa_bundle_rejects_oversized_session_auth_fields() {
+        let session_auth = SessionAuth {
+            session_pubkey: Bytes::from(vec![0xA5; 32]),
+            session_algo: SignatureType::Dilithium3.as_u8(),
+            target: None,
+            value_cap: U256::ZERO,
+            expiry_block: 42,
+            root_signature: Bytes::from(vec![0x01; 96]),
+            session_signature: Bytes::from(vec![0x02; 96]),
+        };
+        let bundle = |session_auth| AaBundle {
+            inner_calls: vec![sample_inner_call(0)],
+            session_auth: Some(session_auth),
+            ..Default::default()
+        };
+
+        let mut oversized_pubkey = session_auth.clone();
+        oversized_pubkey.session_pubkey = Bytes::from(vec![0; MAX_SESSION_PUBKEY + 1]);
+        assert!(bundle(oversized_pubkey)
+            .validate_structure()
+            .unwrap_err()
+            .contains("session_pubkey exceeds size limit"));
+
+        let mut oversized_root_signature = session_auth.clone();
+        oversized_root_signature.root_signature = Bytes::from(vec![0; MAX_SIGNATURE_BYTES + 1]);
+        assert!(bundle(oversized_root_signature)
+            .validate_structure()
+            .unwrap_err()
+            .contains("root_signature exceeds size limit"));
+
+        let mut oversized_session_signature = session_auth;
+        oversized_session_signature.session_signature =
+            Bytes::from(vec![0; MAX_SIGNATURE_BYTES + 1]);
+        assert!(bundle(oversized_session_signature)
+            .validate_structure()
+            .unwrap_err()
+            .contains("session_signature exceeds size limit"));
     }
 
     #[test]

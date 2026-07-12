@@ -22,7 +22,9 @@ pub use error::CryptoError;
 pub use keypair::KeyPair;
 pub use mldsa::{MlDsaSigner, MlDsaVerifier};
 pub use multi::{infer_signature_type_from_address, verify_signature, MultiVerifier};
-pub use signature::{PQSignature, SignatureType, ALLOWED_ALGORITHMS};
+pub use signature::{
+    PQSignature, SignatureType, ALLOWED_ALGORITHMS, MAX_ML_DSA_65_SIG_BYTES, MAX_SIGNATURE_BYTES,
+};
 pub use signer::Signer;
 pub use sphincs::{SphincsSigner, SphincsVerifier};
 pub use verifier::Verifier;
