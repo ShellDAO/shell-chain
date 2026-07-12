@@ -4138,12 +4138,8 @@ mod tests {
         let sig1 = tx_signer
             .sign(tx1.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
             .expect("sign failed");
-        let signed1 = SignedTransaction::with_pubkey(
-            sender,
-            tx1,
-            sig1,
-            tx_signer.public_key().to_vec(),
-        );
+        let signed1 =
+            SignedTransaction::with_pubkey(sender, tx1, sig1, tx_signer.public_key().to_vec());
 
         let mut ws = leader.world_state.write();
         leader

@@ -6415,7 +6415,7 @@ mod tests {
             result.err()
         );
         assert_eq!(handler.tx_pool.len(), 1);
-        assert!(handler.chain_store.get_pubkey(&addr).unwrap().is_some());
+        assert_eq!(handler.chain_store.get_pubkey(&addr).unwrap(), None);
     }
 
     #[tokio::test]
@@ -6481,7 +6481,7 @@ mod tests {
             result.err()
         );
         assert_eq!(handler.tx_pool.len(), 1);
-        assert!(handler.chain_store.get_pubkey(&addr).unwrap().is_some());
+        assert_eq!(handler.chain_store.get_pubkey(&addr).unwrap(), None);
     }
 
     #[tokio::test]
