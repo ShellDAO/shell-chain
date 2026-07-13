@@ -913,12 +913,20 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .filter_registry
                 .get_log_filter(&id)
                 .ok_or_else(|| not_found("filter not found"))?;
-            let filter = raw.into_match_filter().map_err(internal_err)?;
+            let finalized = *self.finalized_number.read();
+            let filter = raw.into_filter(latest, finalized).map_err(internal_err)?;
+
+            let query_from = from.max(filter.from_block.unwrap_or(from));
+            let query_to = latest.min(filter.to_block.unwrap_or(latest));
+            if query_from > query_to {
+                self.filter_registry.update_last_poll(&id, latest);
+                return Ok(serde_json::json!([]));
+            }
 
             let mut results = Vec::new();
-            let actual_to = capped_filter_poll_to(from, latest);
+            let actual_to = capped_filter_poll_to(query_from, query_to);
 
-            for block_num in from..=actual_to {
+            for block_num in query_from..=actual_to {
                 let block = match self
                     .chain_store
                     .get_block_by_number(block_num)

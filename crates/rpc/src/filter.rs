@@ -244,26 +244,6 @@ impl RawLogFilter {
             topics,
         })
     }
-
-    /// Convert to a `LogFilter` matcher without resolving block range tags.
-    ///
-    /// Used by `eth_getFilterChanges`, which computes the block range from the
-    /// filter cursor and latest head, so re-resolving `fromBlock` / `toBlock`
-    /// on every poll is unnecessary.
-    pub fn into_match_filter(self) -> Result<LogFilter, String> {
-        let RawLogFilter {
-            address,
-            topics: raw_topics,
-            ..
-        } = self;
-        let topics = Self::into_topics(raw_topics)?;
-        Ok(LogFilter {
-            from_block: None,
-            to_block: None,
-            address,
-            topics,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -611,22 +591,5 @@ mod tests {
             !err.contains(&"f".repeat(128)),
             "error should not reflect large invalid quantities"
         );
-    }
-
-    #[test]
-    fn raw_filter_into_match_filter_ignores_block_tags() {
-        let topic = ShellHash::from_slice(&[0x55; 32]);
-        let raw: RawLogFilter = serde_json::from_value(serde_json::json!({
-            "fromBlock": "earliest",
-            "toBlock": "latest",
-            "address": Address::from([0x11; 20]),
-            "topics": [topic],
-        }))
-        .unwrap();
-        let filter = raw.into_match_filter().unwrap();
-        assert_eq!(filter.from_block, None);
-        assert_eq!(filter.to_block, None);
-        assert_eq!(filter.address, Some(vec![Address::from([0x11; 20])]));
-        assert_eq!(filter.topics[0], Some(vec![topic]));
     }
 }

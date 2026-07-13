@@ -5753,6 +5753,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_filter_changes_respect_fixed_to_block() {
+        let handler = setup();
+        let addr = Address::from([0xEF; 20]);
+        let log = || shell_core::Log::new(addr, vec![], Bytes::new()).unwrap();
+        store_block_with_logs(&handler, 0, vec![vec![]]);
+
+        let raw: crate::filter::RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"toBlock":"0x1","address":"{}"}}"#, addr,)).unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        store_block_with_logs(&handler, 1, vec![vec![log()]]);
+        store_block_with_logs(&handler, 2, vec![vec![log()]]);
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["blockNumber"], "0x1");
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        assert!(changes.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn get_filter_logs_returns_all_matching_logs() {
         let handler = setup();
         let addr = Address::from([0xDD; 20]);
