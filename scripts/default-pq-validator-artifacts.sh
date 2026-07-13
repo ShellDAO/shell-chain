@@ -28,7 +28,11 @@ jq -Rs '{
 }' "$CONTRACT" > "$tmp_dir/input.json"
 
 npx --yes "solc@${SOLC_VERSION}" --standard-json \
-  < "$tmp_dir/input.json" > "$tmp_dir/output.json"
+  < "$tmp_dir/input.json" > "$tmp_dir/output.raw"
+
+# solc-js can print an SMT capability notice before its JSON document.
+awk 'found || /^[[:space:]]*\{/ { found=1; print }' \
+  "$tmp_dir/output.raw" > "$tmp_dir/output.json"
 
 if ! jq -e '.contracts["DefaultPQValidator.sol"].DefaultPQValidator' \
   "$tmp_dir/output.json" >/dev/null; then
