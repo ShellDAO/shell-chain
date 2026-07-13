@@ -419,7 +419,7 @@ pub const PQTX_BUNDLE_DOMAIN: &[u8; 16] = b"PQTX_BUNDLE_V1\0\0";
 pub const PQTX_PAYMASTER_DOMAIN: &[u8; 16] = b"PQTX_PAYMASTER_V";
 
 /// Domain tag for session key authorization hash.
-pub const PQTX_SESSION_DOMAIN: &[u8; 16] = b"PQTX_SESSION_V1\0";
+pub const PQTX_SESSION_DOMAIN: &[u8; 16] = b"PQTX_SESSION_V2\0";
 
 /// Intrinsic gas surcharge for each *additional* inner call beyond the first.
 /// One-call bundles cost the same as a normal tx; bundles of N cost
@@ -467,16 +467,23 @@ pub struct SessionAuth {
 impl SessionAuth {
     /// Canonical hash that the root key signs to authorize this session key (WP §AA-spec).
     ///
-    /// `blake3(PQTX_SESSION_V1\0(16B) || session_pubkey || session_algo(1B) || target(32B|zero) || value_cap(32B BE) || expiry_block(8B BE) || chain_id(8B BE))`
+    /// `blake3(PQTX_SESSION_V2\0(16B) || session_pubkey || session_algo(1B) || target_present(1B) || target(32B|zero) || value_cap(32B BE) || expiry_block(8B BE) || chain_id(8B BE))`
     pub fn auth_hash(&self, chain_id: u64) -> ShellHash {
         use shell_primitives::blake3_hash;
-        let mut preimage = Vec::with_capacity(16 + self.session_pubkey.len() + 1 + 32 + 32 + 8 + 8);
+        let mut preimage =
+            Vec::with_capacity(16 + self.session_pubkey.len() + 1 + 1 + 32 + 32 + 8 + 8);
         preimage.extend_from_slice(PQTX_SESSION_DOMAIN);
         preimage.extend_from_slice(self.session_pubkey.as_ref());
         preimage.push(self.session_algo);
         match &self.target {
-            Some(addr) => preimage.extend_from_slice(addr.0.as_slice()),
-            None => preimage.extend_from_slice(&[0u8; 32]),
+            Some(addr) => {
+                preimage.push(1);
+                preimage.extend_from_slice(addr.0.as_slice());
+            }
+            None => {
+                preimage.push(0);
+                preimage.extend_from_slice(&[0u8; 32]);
+            }
         }
         let value_buf = self.value_cap.to_be_bytes::<32>();
         preimage.extend_from_slice(&value_buf);
@@ -3216,6 +3223,39 @@ mod tests {
         other_algo.session_algo = SignatureType::MlDsa65.as_u8();
 
         assert_ne!(base.auth_hash(1337), other_algo.auth_hash(1337));
+    }
+
+    #[test]
+    fn session_auth_hash_distinguishes_unrestricted_from_zero_target() {
+        let unrestricted = SessionAuth {
+            session_pubkey: Bytes::from(vec![0x11; 32]),
+            session_algo: 1,
+            target: None,
+            value_cap: U256::from(100u64),
+            expiry_block: 500,
+            root_signature: Bytes::from(vec![0x22]),
+            session_signature: Bytes::from(vec![0x33]),
+        };
+        let mut zero_target = unrestricted.clone();
+        zero_target.target = Some(Address::ZERO);
+
+        assert_eq!(
+            unrestricted.auth_hash(1337).as_bytes(),
+            &[
+                0x3f, 0xce, 0xca, 0x0e, 0xf7, 0x54, 0x2e, 0x49, 0x33, 0xa9, 0x56, 0x61, 0x8d, 0x2f,
+                0x94, 0xb6, 0x63, 0xfb, 0x72, 0xbe, 0x31, 0x9e, 0x01, 0x5a, 0x09, 0xf9, 0x60, 0x40,
+                0x9e, 0xd8, 0xe4, 0xf7,
+            ]
+        );
+        assert_eq!(
+            zero_target.auth_hash(1337).as_bytes(),
+            &[
+                0x43, 0xfa, 0xa3, 0x98, 0x7b, 0x61, 0xc8, 0x8a, 0x5b, 0x0f, 0x75, 0x80, 0x24, 0xf0,
+                0x9f, 0xa5, 0x49, 0xb1, 0x0e, 0xc6, 0x29, 0x79, 0xa7, 0xba, 0x5c, 0x4c, 0xe6, 0xff,
+                0x5e, 0xe6, 0x50, 0x88,
+            ]
+        );
+        assert_ne!(unrestricted.auth_hash(1337), zero_target.auth_hash(1337));
     }
 
     #[test]
