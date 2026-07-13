@@ -846,9 +846,6 @@ async fn handle_swarm_event(
             // F-064: Do NOT auto-add Kademlia-discovered peers to GossipSub mesh.
             // Peers join gossipsub mesh naturally via subscription protocol;
             // explicit add bypasses peer scoring and enables Eclipse attacks.
-            let _ = event_tx
-                .send(NetworkEvent::PeerConnected(PeerId(peer.to_string())))
-                .await;
             // Emit routing table size update.
             if let Some(kad) = swarm.behaviour_mut().kademlia.as_mut() {
                 let bucket_count: usize = kad.kbuckets().map(|b| b.num_entries()).sum();
@@ -875,9 +872,6 @@ async fn handle_swarm_event(
                 info!("discovered peer on address peer={peer_id} address={addr}");
                 swarm.add_peer_address(peer_id, addr);
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                let _ = event_tx
-                    .send(NetworkEvent::PeerConnected(PeerId(peer_id.to_string())))
-                    .await;
             }
             update_peer_count(swarm, &loop_config.peer_count);
         }
@@ -889,9 +883,6 @@ async fn handle_swarm_event(
                     .behaviour_mut()
                     .gossipsub
                     .remove_explicit_peer(&peer_id);
-                let _ = event_tx
-                    .send(NetworkEvent::PeerDisconnected(PeerId(peer_id.to_string())))
-                    .await;
             }
             update_peer_count(swarm, &loop_config.peer_count);
         }
@@ -974,10 +965,16 @@ async fn handle_swarm_event(
                 return;
             }
             // F-305: Enforce connection limit.
-            if let Err(e) = peer_tracker.try_add_peer(peer) {
-                debug!(peer = %peer_id, error = %e, "connection limit reached, disconnecting");
-                let _ = swarm.disconnect_peer_id(peer_id);
-                return;
+            match track_connection_established(peer_tracker, peer) {
+                Ok(Some(event)) => {
+                    let _ = event_tx.send(event).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "connection limit reached, disconnecting");
+                    let _ = swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
             }
             debug!("Connected to {peer_id}");
             update_peer_count(swarm, &loop_config.peer_count);
@@ -985,7 +982,9 @@ async fn handle_swarm_event(
         // Connection closed.
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             let peer = PeerId(peer_id.to_string());
-            peer_tracker.remove_peer(&peer);
+            if let Some(event) = track_connection_closed(peer_tracker, &peer) {
+                let _ = event_tx.send(event).await;
+            }
             debug!("Disconnected from {peer_id}");
             update_peer_count(swarm, &loop_config.peer_count);
         }
@@ -1003,6 +1002,25 @@ async fn handle_swarm_event(
         }
         _ => {}
     }
+}
+
+fn track_connection_established(
+    peer_tracker: &mut crate::security::PeerTracker,
+    peer: PeerId,
+) -> Result<Option<NetworkEvent>, NetworkError> {
+    let first_connection = !peer_tracker.contains_peer(&peer);
+    peer_tracker.try_add_peer(peer.clone())?;
+    Ok(first_connection.then_some(NetworkEvent::PeerConnected(peer)))
+}
+
+fn track_connection_closed(
+    peer_tracker: &mut crate::security::PeerTracker,
+    peer: &PeerId,
+) -> Option<NetworkEvent> {
+    let tracked = peer_tracker.contains_peer(peer);
+    peer_tracker.remove_peer(peer);
+    (tracked && !peer_tracker.contains_peer(peer))
+        .then(|| NetworkEvent::PeerDisconnected(peer.clone()))
 }
 
 fn update_peer_count(swarm: &Swarm<ShellBehaviour>, counter: &Arc<AtomicUsize>) {
@@ -1258,6 +1276,36 @@ mod tests {
             }
             _ => panic!("wrong event variant"),
         }
+    }
+
+    #[test]
+    fn connection_events_follow_first_and_last_tracked_connection() {
+        let mut tracker = crate::security::PeerTracker::new(2);
+        let peer = PeerId::from("peer-a");
+
+        assert!(matches!(
+            track_connection_established(&mut tracker, peer.clone()).unwrap(),
+            Some(NetworkEvent::PeerConnected(connected)) if connected == peer
+        ));
+        assert!(track_connection_established(&mut tracker, peer.clone())
+            .unwrap()
+            .is_none());
+        assert!(track_connection_closed(&mut tracker, &peer).is_none());
+        assert!(matches!(
+            track_connection_closed(&mut tracker, &peer),
+            Some(NetworkEvent::PeerDisconnected(disconnected)) if disconnected == peer
+        ));
+    }
+
+    #[test]
+    fn rejected_connection_close_does_not_emit_disconnect() {
+        let mut tracker = crate::security::PeerTracker::new(1);
+        let admitted = PeerId::from("admitted");
+        let rejected = PeerId::from("rejected");
+        track_connection_established(&mut tracker, admitted).unwrap();
+
+        assert!(track_connection_established(&mut tracker, rejected.clone()).is_err());
+        assert!(track_connection_closed(&mut tracker, &rejected).is_none());
     }
 
     #[test]

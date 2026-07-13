@@ -64,6 +64,11 @@ impl PeerTracker {
         }
     }
 
+    /// Returns whether at least one connection for `peer` is currently tracked.
+    pub fn contains_peer(&self, peer: &PeerId) -> bool {
+        self.peers.contains_key(peer)
+    }
+
     /// Number of currently tracked peers.
     pub fn active_count(&self) -> usize {
         self.peers.len()
@@ -308,6 +313,18 @@ mod tests {
         tracker.remove_peer(&PeerId::from("a"));
         assert!(!tracker.is_full());
         assert!(tracker.try_add_peer(PeerId::from("b")).is_ok());
+    }
+
+    #[test]
+    fn tracker_contains_peer_tracks_connection_lifetime() {
+        let mut tracker = PeerTracker::new(1);
+        let peer = PeerId::from("a");
+
+        assert!(!tracker.contains_peer(&peer));
+        tracker.try_add_peer(peer.clone()).unwrap();
+        assert!(tracker.contains_peer(&peer));
+        tracker.remove_peer(&peer);
+        assert!(!tracker.contains_peer(&peer));
     }
 
     #[test]
