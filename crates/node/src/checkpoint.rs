@@ -12,6 +12,24 @@ use tracing::info;
 
 use crate::error::NodeError;
 
+struct DownloadedSnapshot {
+    path: PathBuf,
+}
+
+impl DownloadedSnapshot {
+    fn new(datadir: &Path) -> Self {
+        Self {
+            path: datadir.join(format!("checkpoint_snapshot-{}.jsonl", std::process::id())),
+        }
+    }
+}
+
+impl Drop for DownloadedSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Download a snapshot from a URL and import it into the chain store.
 ///
 /// Returns the block number that was imported.
@@ -24,15 +42,15 @@ pub async fn checkpoint_sync<S: KvStore>(
     datadir: &Path,
     expected_chain_id: u64,
 ) -> Result<u64, NodeError> {
-    let snapshot_path = datadir.join("checkpoint_snapshot.jsonl");
+    let snapshot = DownloadedSnapshot::new(datadir);
 
     // Download the snapshot file using curl.
     info!("Downloading checkpoint from {url}...");
-    download_snapshot(url, &snapshot_path).await?;
+    download_snapshot(url, &snapshot.path).await?;
 
     // Validate the snapshot format before importing.
     info!("Validating checkpoint snapshot...");
-    let metadata = validate_snapshot(&snapshot_path)?;
+    let metadata = validate_snapshot(&snapshot.path)?;
     info!(
         "Checkpoint snapshot: block #{}, chain_id={}, entries={}",
         metadata.block_number, metadata.chain_id, metadata.entry_count
@@ -40,7 +58,6 @@ pub async fn checkpoint_sync<S: KvStore>(
 
     // Always validate chain_id against the expected value.
     if metadata.chain_id != expected_chain_id {
-        let _ = std::fs::remove_file(&snapshot_path);
         return Err(NodeError::Startup(format!(
             "snapshot chain_id mismatch: expected {}, got {}",
             expected_chain_id, metadata.chain_id
@@ -68,7 +85,7 @@ pub async fn checkpoint_sync<S: KvStore>(
 
     // Import the snapshot into the chain store.
     info!("Importing checkpoint snapshot...");
-    let file = std::fs::File::open(&snapshot_path)
+    let file = std::fs::File::open(&snapshot.path)
         .map_err(|e| NodeError::Startup(format!("open snapshot: {e}")))?;
     let reader = BufReader::new(file);
     let imported = chain_store
@@ -76,34 +93,38 @@ pub async fn checkpoint_sync<S: KvStore>(
         .map_err(NodeError::Storage)?;
 
     // Verify the imported HEAD block's state_root matches the snapshot metadata.
-    if let Ok(Some(head)) = chain_store.get_head_block() {
-        if head.header.state_root != imported.state_root {
-            // Clean up before returning error.
-            let _ = std::fs::remove_file(&snapshot_path);
-            return Err(NodeError::Startup(format!(
-                "state_root mismatch after import: block has {:?}, snapshot expects {:?}",
-                head.header.state_root, imported.state_root
-            )));
-        }
-    }
-
-    // Clean up the downloaded file.
-    let _ = std::fs::remove_file(&snapshot_path);
+    verify_imported_head(chain_store, imported.state_root)?;
 
     info!("Imported checkpoint at block #{}", imported.block_number);
     Ok(imported.block_number)
 }
 
+fn verify_imported_head<S: KvStore>(
+    chain_store: &ChainStore<S>,
+    expected_state_root: shell_primitives::ShellHash,
+) -> Result<(), NodeError> {
+    let head = chain_store.get_head_block()?.ok_or_else(|| {
+        NodeError::Startup("checkpoint snapshot import did not publish a HEAD block".into())
+    })?;
+    if head.header.state_root != expected_state_root {
+        return Err(NodeError::Startup(format!(
+            "state_root mismatch after import: block has {:?}, snapshot expects {:?}",
+            head.header.state_root, expected_state_root
+        )));
+    }
+    Ok(())
+}
+
 /// Check whether the chain is empty (no blocks beyond genesis).
 ///
 /// Returns `true` if checkpoint sync should proceed: head block is
-/// either missing or is the genesis block (number == 0).
-pub fn should_checkpoint_sync<S: KvStore>(chain_store: &ChainStore<S>) -> bool {
-    match chain_store.get_head_block() {
-        Ok(Some(head)) => head.number() == 0,
-        Ok(None) => true,
-        Err(_) => true,
-    }
+/// either missing or is the genesis block (number == 0). Storage errors are
+/// returned so a damaged or unavailable chain store is never treated as empty.
+pub fn should_checkpoint_sync<S: KvStore>(chain_store: &ChainStore<S>) -> Result<bool, NodeError> {
+    Ok(match chain_store.get_head_block()? {
+        Some(head) => head.number() == 0,
+        None => true,
+    })
 }
 
 /// Download a file from `url` to `dest` using `curl`.
@@ -166,7 +187,7 @@ fn validate_snapshot(path: &Path) -> Result<shell_storage::SnapshotMetadata, Nod
 mod tests {
     use super::*;
     use shell_primitives::ShellHash;
-    use shell_storage::{MemoryDb, SnapshotMetadata, SnapshotWriter};
+    use shell_storage::{MemoryDb, SnapshotMetadata, SnapshotWriter, StorageError, WriteBatch};
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -210,7 +231,7 @@ mod tests {
     fn test_should_checkpoint_sync_empty_chain() {
         let store = Arc::new(MemoryDb::new());
         let chain_store = ChainStore::new(store);
-        assert!(should_checkpoint_sync(&chain_store));
+        assert!(should_checkpoint_sync(&chain_store).unwrap());
     }
 
     #[test]
@@ -252,7 +273,7 @@ mod tests {
         chain_store.set_canonical(5, &hash).unwrap();
         chain_store.set_head(&hash).unwrap();
 
-        assert!(!should_checkpoint_sync(&chain_store));
+        assert!(!should_checkpoint_sync(&chain_store).unwrap());
     }
 
     #[test]
@@ -295,6 +316,79 @@ mod tests {
         chain_store.set_head(&hash).unwrap();
 
         // Genesis-only chain should still allow checkpoint sync.
-        assert!(should_checkpoint_sync(&chain_store));
+        assert!(should_checkpoint_sync(&chain_store).unwrap());
+    }
+
+    struct FailingReadStore;
+
+    impl KvStore for FailingReadStore {
+        fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            Err(StorageError::Database("injected read failure".into()))
+        }
+
+        fn put(&self, _key: &[u8], _value: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn delete(&self, _key: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn write_batch(&self, _batch: WriteBatch) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn scan_prefix(&self, _prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn checkpoint_decision_propagates_head_read_failure() {
+        let chain_store = ChainStore::new(Arc::new(FailingReadStore));
+
+        let err = should_checkpoint_sync(&chain_store).unwrap_err();
+
+        assert!(matches!(err, NodeError::Storage(StorageError::Database(_))));
+    }
+
+    #[test]
+    fn imported_head_verification_propagates_read_failure() {
+        let chain_store = ChainStore::new(Arc::new(FailingReadStore));
+
+        let err = verify_imported_head(&chain_store, ShellHash::ZERO).unwrap_err();
+
+        assert!(matches!(err, NodeError::Storage(StorageError::Database(_))));
+    }
+
+    #[test]
+    fn imported_head_verification_rejects_missing_head() {
+        let chain_store = ChainStore::new(Arc::new(MemoryDb::new()));
+
+        let err = verify_imported_head(&chain_store, ShellHash::ZERO).unwrap_err();
+
+        assert!(matches!(err, NodeError::Startup(message) if message.contains("did not publish")));
+    }
+
+    #[test]
+    fn downloaded_snapshot_guard_removes_file_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell-checkpoint-cleanup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = {
+            let snapshot = DownloadedSnapshot::new(&dir);
+            std::fs::write(&snapshot.path, b"partial snapshot").unwrap();
+            snapshot.path.clone()
+        };
+
+        assert!(!path.exists());
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

@@ -534,7 +534,7 @@ async fn run_with_store<S: KvStore + 'static>(
     // Checkpoint sync: download and import snapshot if --checkpoint-url is set
     // and the chain has no blocks beyond genesis.
     if let Some(ref url) = args.checkpoint_url {
-        if shell_node::checkpoint::should_checkpoint_sync(&chain_store) {
+        if shell_node::checkpoint::should_checkpoint_sync(&chain_store)? {
             info!("Chain is empty, starting checkpoint sync");
             let block_num = shell_node::checkpoint::checkpoint_sync(
                 url,
