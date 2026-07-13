@@ -1121,7 +1121,8 @@ mod tests {
             session_signature: Bytes::from(vec![1]),
         };
         auth.root_signature = Bytes::from(root.sign(auth.auth_hash(1337).as_bytes()).unwrap().data);
-        let mut tx = base_tx(1337, 0);
+        let account_nonce = ws.get_nonce(&from).unwrap();
+        let mut tx = base_tx(1337, account_nonce);
         tx.tx_type = AA_BUNDLE_TX_TYPE;
         tx.gas_limit = 100_000;
         let inner_call = InnerCall {
