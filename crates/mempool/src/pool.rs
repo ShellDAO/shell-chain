@@ -1,6 +1,7 @@
 //! Core transaction pool implementation.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tracing::warn;
@@ -55,7 +56,7 @@ struct PoolInner {
 
 /// Entry in the pool holding the transaction and metadata.
 struct PoolEntry {
-    tx: SignedTransaction,
+    tx: Arc<SignedTransaction>,
     priority_key: PriorityKey,
 }
 
@@ -274,7 +275,13 @@ impl TxPool {
             .entry(sender)
             .or_default()
             .insert(nonce, hash);
-        inner.by_hash.insert(hash, PoolEntry { tx, priority_key });
+        inner.by_hash.insert(
+            hash,
+            PoolEntry {
+                tx: Arc::new(tx),
+                priority_key,
+            },
+        );
 
         Ok(hash)
     }
@@ -361,7 +368,7 @@ impl TxPool {
     /// Get a transaction by hash.
     pub fn get(&self, hash: &ShellHash) -> Option<SignedTransaction> {
         let inner = self.inner.read();
-        inner.by_hash.get(hash).map(|e| e.tx.clone())
+        inner.by_hash.get(hash).map(|e| e.tx.as_ref().clone())
     }
 
     /// Check if a transaction is in the pool.
@@ -391,17 +398,18 @@ impl TxPool {
     /// Within a sender, transactions are nonce-ordered.
     pub fn pending(&self, limit: usize) -> Vec<SignedTransaction> {
         let inner = self.inner.read();
-        let mut result = Vec::with_capacity(limit.min(inner.by_hash.len()));
+        let mut selected = Vec::with_capacity(limit.min(inner.by_hash.len()));
 
         for hash in inner.by_priority.values() {
-            if result.len() >= limit {
+            if selected.len() >= limit {
                 break;
             }
             if let Some(entry) = inner.by_hash.get(hash) {
-                result.push(entry.tx.clone());
+                selected.push(Arc::clone(&entry.tx));
             }
         }
-        result
+        drop(inner);
+        selected.into_iter().map(|tx| tx.as_ref().clone()).collect()
     }
 
     /// Collect transactions for block production while preserving per-sender
@@ -413,7 +421,7 @@ impl TxPool {
     /// pays a higher priority fee.
     pub fn pending_for_block(&self, limit: usize) -> Vec<SignedTransaction> {
         let inner = self.inner.read();
-        let mut result = Vec::with_capacity(limit.min(inner.by_hash.len()));
+        let mut selected = Vec::with_capacity(limit.min(inner.by_hash.len()));
         let mut ready: BTreeMap<PriorityKey, (Address, ShellHash)> = BTreeMap::new();
 
         for (sender, queue) in &inner.by_sender {
@@ -424,7 +432,7 @@ impl TxPool {
             }
         }
 
-        while result.len() < limit {
+        while selected.len() < limit {
             let Some((priority_key, (sender, hash))) = ready.pop_first() else {
                 break;
             };
@@ -433,7 +441,7 @@ impl TxPool {
                 continue;
             };
             let nonce = entry.tx.tx.nonce;
-            result.push(entry.tx.clone());
+            selected.push(Arc::clone(&entry.tx));
 
             if let Some(sender_queue) = inner.by_sender.get(&sender) {
                 if let Some(next_nonce) = nonce.checked_add(1) {
@@ -451,7 +459,8 @@ impl TxPool {
             }
         }
 
-        result
+        drop(inner);
+        selected.into_iter().map(|tx| tx.as_ref().clone()).collect()
     }
 
     /// Collect all pending transaction hashes for a specific sender,
