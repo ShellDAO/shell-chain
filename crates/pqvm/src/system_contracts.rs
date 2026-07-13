@@ -2001,15 +2001,8 @@ pub fn decode_address_u64(input: &[u8]) -> Result<(Address, u64), SystemContract
             input.len()
         )));
     }
-    let raw32: [u8; 32] = input[0..32]
-        .try_into()
-        .map_err(|_| SystemContractError::AbiDecode("bad address word".into()))?;
-    let addr = Address::from(raw32);
-    let weight = u64::from_be_bytes(
-        input[56..64]
-            .try_into()
-            .map_err(|_| SystemContractError::AbiDecode("bad uint64 word".into()))?,
-    );
+    let addr = decode_address(&input[..32])?;
+    let weight = decode_u64(&input[32..64])?;
     Ok((addr, weight))
 }
 
@@ -3210,6 +3203,18 @@ mod tests {
         let short = [0u8; 16];
         let err = decode_address(&short).unwrap_err();
         assert!(matches!(err, SystemContractError::AbiDecode(_)));
+    }
+
+    #[test]
+    fn decode_address_u64_rejects_nonzero_high_bytes() {
+        let mut input = [0u8; 64];
+        input[32] = 1;
+        input[63] = 7;
+
+        assert!(matches!(
+            decode_address_u64(&input),
+            Err(SystemContractError::AbiDecode(_))
+        ));
     }
 
     #[test]
