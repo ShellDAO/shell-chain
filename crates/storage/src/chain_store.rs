@@ -1486,7 +1486,10 @@ impl<S: KvStore> ChainStore<S> {
                 let n = u64::from_be_bytes(arr);
                 Ok(Some(n))
             }
-            _ => Ok(None),
+            Some(_) => Err(StorageError::Codec(
+                "invalid finalized number encoding".into(),
+            )),
+            None => Ok(None),
         }
     }
 
@@ -2740,6 +2743,18 @@ mod tests {
         assert_eq!(cs.get_finalized_number().unwrap(), Some(42));
         cs.set_finalized_number(100).unwrap();
         assert_eq!(cs.get_finalized_number().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn malformed_finalized_number_is_not_treated_as_missing() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        store.put(b"FINALIZED", &[0; 7]).unwrap();
+
+        let error = cs.get_finalized_number().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid finalized number encoding"));
     }
 
     #[test]

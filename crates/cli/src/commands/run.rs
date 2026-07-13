@@ -359,22 +359,23 @@ async fn run_with_store<S: KvStore + 'static>(
 
     // Check if chain is already initialized (persistent storage resume).
     let chain_store = ChainStore::new(store.clone());
-    let mut resumed = if let Ok(Some(head)) = chain_store.get_head_block() {
-        info!(
-            "Resuming from block #{} (state_root: {:?})",
-            head.number(),
-            head.header.state_root
-        );
-        true
-    } else {
-        false
+    let mut resumed = match chain_store.get_head_block()? {
+        Some(head) => {
+            info!(
+                "Resuming from block #{} (state_root: {:?})",
+                head.number(),
+                head.header.state_root
+            );
+            true
+        }
+        None => false,
     };
 
     // Recovery: HEAD key lost (unflushed memtable on ungraceful shutdown) but FINALIZED present.
     // Scan is bounded to MAX_RECOVERY_SCAN_DEPTH blocks to avoid O(chain-height) IO.
     const MAX_RECOVERY_SCAN_DEPTH: u64 = 1024;
     if !resumed {
-        if let Ok(Some(fin)) = chain_store.get_finalized_number() {
+        if let Some(fin) = chain_store.get_finalized_number()? {
             if fin > 0 {
                 warn!("HEAD key missing but FINALIZED={fin}; attempting HEAD recovery");
                 let mut recovered = false;
@@ -382,7 +383,7 @@ async fn run_with_store<S: KvStore + 'static>(
                 let scan_end = fin.saturating_sub(MAX_RECOVERY_SCAN_DEPTH);
                 let mut num = scan_start;
                 loop {
-                    if let Ok(Some(hash)) = chain_store.get_block_hash_by_number(num) {
+                    if let Some(hash) = chain_store.get_block_hash_by_number(num)? {
                         warn!(
                             "Recovering lost HEAD from canonical block #{n} (FINALIZED was {fin})",
                             n = num
@@ -400,7 +401,7 @@ async fn run_with_store<S: KvStore + 'static>(
                 if !recovered {
                     warn!("HEAD recovery failed: no canonical blocks found in [{scan_end}..{scan_start}]");
                     // Clear stale FINALIZED so invariant won't fail with head=0
-                    let _ = chain_store.set_finalized_number(0);
+                    chain_store.set_finalized_number(0)?;
                 }
             }
         }
@@ -409,9 +410,9 @@ async fn run_with_store<S: KvStore + 'static>(
     // Recovery path 2: HEAD exists but is genesis (#0) while FINALIZED > 0.
     // This happens when a previous failed startup wrote genesis after HEAD was lost.
     if resumed {
-        if let (Ok(Some(head)), Ok(Some(fin))) = (
-            chain_store.get_head_block(),
-            chain_store.get_finalized_number(),
+        if let (Some(head), Some(fin)) = (
+            chain_store.get_head_block()?,
+            chain_store.get_finalized_number()?,
         ) {
             if head.number() == 0 && fin > 0 {
                 warn!("HEAD is genesis but FINALIZED={fin}; scanning for actual chain tip");
@@ -421,7 +422,7 @@ async fn run_with_store<S: KvStore + 'static>(
                 let mut num = scan_start;
                 loop {
                     if num > 0 {
-                        if let Ok(Some(hash)) = chain_store.get_block_hash_by_number(num) {
+                        if let Some(hash) = chain_store.get_block_hash_by_number(num)? {
                             warn!(
                                 "Recovering HEAD from canonical block #{n} (FINALIZED was {fin})",
                                 n = num
@@ -441,7 +442,7 @@ async fn run_with_store<S: KvStore + 'static>(
                         "HEAD recovery path 2 failed: no canonical blocks in [{scan_end}..{scan_start}]; resetting FINALIZED"
                     );
                     // Clear stale FINALIZED so invariant won't fail with head=0
-                    let _ = chain_store.set_finalized_number(0);
+                    chain_store.set_finalized_number(0)?;
                 }
             }
         }
