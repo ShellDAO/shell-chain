@@ -127,6 +127,8 @@ pub struct FinalityState {
     pending_attested_weight: HashMap<ShellHash, u64>,
     /// Full attestation objects stored per block hash for verification.
     attestation_store: HashMap<ShellHash, Vec<Attestation>>,
+    /// First attested block per (height, validator), used for constant-time equivocation checks.
+    attested_block_by_height: HashMap<(u64, Address), ShellHash>,
 }
 
 impl FinalityState {
@@ -138,6 +140,7 @@ impl FinalityState {
             pending_attestations: HashMap::new(),
             pending_attested_weight: HashMap::new(),
             attestation_store: HashMap::new(),
+            attested_block_by_height: HashMap::new(),
         }
     }
 
@@ -149,6 +152,7 @@ impl FinalityState {
             pending_attestations: HashMap::new(),
             pending_attested_weight: HashMap::new(),
             attestation_store: HashMap::new(),
+            attested_block_by_height: HashMap::new(),
         }
     }
 
@@ -174,8 +178,10 @@ impl FinalityState {
             return false;
         }
         let block_hash = attestation.block_hash;
+        let block_number = attestation.block_number;
+        let validator = attestation.validator;
         let validators = self.pending_attestations.entry(block_hash).or_default();
-        let is_new = validators.insert(attestation.validator);
+        let is_new = validators.insert(validator);
         if is_new {
             self.pending_attested_weight
                 .entry(block_hash)
@@ -185,6 +191,9 @@ impl FinalityState {
                 .entry(block_hash)
                 .or_default()
                 .push(attestation);
+            self.attested_block_by_height
+                .entry((block_number, validator))
+                .or_insert(block_hash);
         }
         is_new
     }
@@ -290,19 +299,10 @@ impl FinalityState {
         block_number: u64,
         validator: &Address,
     ) -> Option<ShellHash> {
-        for (hash, validators) in &self.pending_attestations {
-            if hash != block_hash && validators.contains(validator) {
-                // Check if any attestation for this different hash is at the same block number
-                if let Some(attestations) = self.attestation_store.get(hash) {
-                    for att in attestations {
-                        if att.block_number == block_number && &att.validator == validator {
-                            return Some(*hash);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.attested_block_by_height
+            .get(&(block_number, *validator))
+            .copied()
+            .filter(|hash| hash != block_hash)
     }
 
     /// Batch verify all stored attestation signatures for a block using
@@ -394,6 +394,8 @@ impl FinalityState {
             self.pending_attested_weight.remove(&hash);
             self.attestation_store.remove(&hash);
         }
+        self.attested_block_by_height
+            .retain(|(block_number, _), _| *block_number > finalized_number);
     }
 }
 
@@ -639,6 +641,11 @@ mod tests {
 
         assert_eq!(state.attestation_count(&hash1), 0); // pruned
         assert_eq!(state.attested_weight(&hash1), 0);
+        assert!(state.attested_block_by_height.is_empty());
+        assert_eq!(
+            state.detect_equivocation(&make_hash(3), 5, &make_addr(1)),
+            None
+        );
         // hash2 also pruned since it's <= finalized (15)
     }
 
