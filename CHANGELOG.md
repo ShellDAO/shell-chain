@@ -493,7 +493,7 @@ All notable changes to this project will be documented in this file.
   `validate_tx_for_import()` both previously called `verify_paymaster_signature()`
   after already invoking `validate_aa_tx()` which performs the same check internally.
   The redundant second call is now removed; PQ (Dilithium) sig verification is
-  performed exactly once per path (~3KB sig overhead). Addresses Copilot review
+  performed exactly once per path (~3KB sig overhead). Addresses the review
   comment on PR #26.
 
 ### Changed (operator-visible)

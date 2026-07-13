@@ -13,7 +13,7 @@ Thank you for considering contributing to Shell-Chain! Below are the guidelines 
 ### Initialization
 
 ```bash
-git clone https://github.com/LucienSong/shell-chain.git
+git clone https://github.com/ShellDAO/shell-chain.git
 cd shell-chain
 cargo build
 cargo test
@@ -96,7 +96,7 @@ For detailed designs, refer to the [docs/](docs/) directory in this repository.
 
 ## Reporting Issues
 
-Use [GitHub Issues](https://github.com/LucienSong/shell-chain/issues) and include:
+Use [GitHub Issues](https://github.com/ShellDAO/shell-chain/issues) and include:
 
 - A clear description of the issue
 - Steps to reproduce

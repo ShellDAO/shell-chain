@@ -87,7 +87,7 @@ backlog_limit     = 1000    # max queued proof tasks
 ### Docker image
 
 ```yaml
-image: ghcr.io/lucienSong/shell-chain:v0.15.0
+image: ghcr.io/shelldao/shell-chain:v0.15.0
 ```
 
 ### Data directory
@@ -446,14 +446,14 @@ These are created automatically on first start.
 
 ## Docker / Docker Compose
 
-The default image is `ghcr.io/lucienSong/shell-chain:v0.13.0`.
+The default image is `ghcr.io/shelldao/shell-chain:v0.13.0`.
 
 Multi-arch images are available for `linux/amd64` and `linux/arm64`:
 
 ```yaml
 services:
   node1:
-    image: ghcr.io/lucienSong/shell-chain:v0.13.0
+    image: ghcr.io/shelldao/shell-chain:v0.13.0
     platform: linux/amd64   # or linux/arm64
 ```
 

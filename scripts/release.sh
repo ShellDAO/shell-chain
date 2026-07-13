@@ -131,9 +131,7 @@ CHANGELOG_EXCERPT=$(awk "/\[${VERSION}\]/{found=1; next} found && /^## \[/{exit}
 
 git tag -a "$TAG" -m "Release ${TAG}
 
-${CHANGELOG_EXCERPT}
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+${CHANGELOG_EXCERPT}"
 
 ok "Created annotated tag: ${TAG}"
 
@@ -144,10 +142,10 @@ if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
     ok "Pushed tag ${TAG} to origin"
     echo ""
     echo "Next steps:"
-    echo "  1. Create a GitHub Release at https://github.com/LucienSong/shell-chain/releases/new?tag=${TAG}"
+    echo "  1. Create a GitHub Release at https://github.com/ShellDAO/shell-chain/releases/new?tag=${TAG}"
     echo "  2. Add CHANGELOG excerpt to the release body"
     echo "  3. Attach pre-compiled binaries (linux-amd64, linux-arm64, darwin-arm64, windows-amd64)"
-    echo "  4. Publish Docker image: docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/luciensong/shell-chain:${TAG} --push ."
+    echo "  4. Publish Docker image: docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/shelldao/shell-chain:${TAG} --push ."
 else
     warn "Tag created locally but NOT pushed. Run: git push origin ${TAG}"
 fi
