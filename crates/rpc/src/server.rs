@@ -3,12 +3,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use jsonrpsee::server::{Server, ServerHandle};
+use jsonrpsee::server::{BatchRequestConfig, Server, ServerHandle};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
 use crate::middleware::{ApiKeyLayer, RateLimitLayer};
 use crate::tls_proxy::{start_tls_proxy, TlsProxyHandle};
+
+const MAX_BATCH_REQUEST_LEN: u32 = 100;
 
 use shell_consensus::{ConsensusEngine, FinalityState};
 use shell_core::SignedTransaction;
@@ -342,6 +344,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_http_middleware(middleware.clone())
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .http_only()
             .build(internal_http)
             .await?;
@@ -352,6 +355,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_http_middleware(middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .ws_only()
             .build(ws_listen)
             .await?;
@@ -380,6 +384,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_http_middleware(middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .build(internal_http)
             .await?;
         let http_addr = server.local_addr()?;
@@ -406,8 +411,16 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::RpcConfig;
+    use super::{start_rpc_server, RpcConfig};
+    use jsonrpsee::core::client::{ClientT, Error as ClientError};
+    use jsonrpsee::core::params::BatchRequestBuilder;
+    use jsonrpsee::http_client::HttpClientBuilder;
+    use jsonrpsee::rpc_params;
+    use shell_consensus::FinalityState;
+    use shell_mempool::{MempoolConfig, TxPool};
+    use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     #[test]
     fn rpc_config_default_disallows_unsafe_dev_exposure() {
@@ -473,5 +486,66 @@ mod tests {
         };
 
         assert!(config.validate_dev_rpc_exposure().is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_server_enforces_batch_request_limit() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            api_namespaces: vec!["web3".into()],
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{}", server.http_addr))
+            .unwrap();
+        let make_batch = |len| {
+            let mut batch = BatchRequestBuilder::new();
+            for _ in 0..len {
+                batch.insert("web3_clientVersion", rpc_params![]).unwrap();
+            }
+            batch
+        };
+
+        assert!(client
+            .batch_request::<String>(make_batch(100))
+            .await
+            .is_ok());
+        let err = match client.batch_request::<String>(make_batch(101)).await {
+            Ok(_) => panic!("oversized batch request was accepted"),
+            Err(err) => err,
+        };
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(matches!(err, ClientError::ParseError(_)));
     }
 }
