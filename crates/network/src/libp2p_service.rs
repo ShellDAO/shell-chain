@@ -803,6 +803,34 @@ async fn handle_swarm_event(
             let peer = PeerId(propagation_source.to_string());
             match crate::message::deserialize_checked(&message.data, loop_config.max_msg_size) {
                 Ok(msg) => {
+                    if !message_matches_topic(
+                        &msg,
+                        &message.topic,
+                        &loop_config.blocks_topic,
+                        &loop_config.txs_topic,
+                        &loop_config.attestation_topic,
+                        &loop_config.proofs_topic,
+                    ) {
+                        warn!(
+                            peer = %propagation_source,
+                            topic = %message.topic,
+                            "Message published on the wrong topic - rejecting"
+                        );
+                        let banned = peer_ban_list.record_violation(&peer);
+                        if banned {
+                            warn!(peer = %propagation_source, "peer banned for repeated violations");
+                            let _ = swarm.disconnect_peer_id(propagation_source);
+                        }
+                        swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                gossipsub::MessageAcceptance::Reject,
+                            );
+                        return;
+                    }
                     // F-062: accept valid message so gossipsub propagates it.
                     swarm
                         .behaviour_mut()
@@ -1071,6 +1099,23 @@ fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
     }
 }
 
+fn message_matches_topic(
+    msg: &NetworkMessage,
+    actual_topic: &gossipsub::TopicHash,
+    blocks_topic: &IdentTopic,
+    txs_topic: &IdentTopic,
+    attestation_topic: &IdentTopic,
+    proofs_topic: &IdentTopic,
+) -> bool {
+    let expected_topic = match topic_kind_for_message(msg) {
+        TopicKind::Blocks => blocks_topic,
+        TopicKind::Transactions => txs_topic,
+        TopicKind::Attestation => attestation_topic,
+        TopicKind::Proofs => proofs_topic,
+    };
+    actual_topic == &expected_topic.hash()
+}
+
 #[async_trait]
 impl NetworkService for Libp2pNetwork {
     async fn broadcast(&self, msg: NetworkMessage) -> Result<(), NetworkError> {
@@ -1163,6 +1208,33 @@ mod tests {
             }),
             TopicKind::Blocks
         );
+    }
+
+    #[test]
+    fn rejects_message_published_on_wrong_topic() {
+        let config = NetworkConfig::default();
+        let blocks_topic = IdentTopic::new(&config.blocks_topic);
+        let txs_topic = IdentTopic::new(&config.txs_topic);
+        let attestation_topic = IdentTopic::new(&config.attestation_topic);
+        let proofs_topic = IdentTopic::new(&config.proofs_topic);
+        let message = NetworkMessage::Ping;
+
+        assert!(message_matches_topic(
+            &message,
+            &blocks_topic.hash(),
+            &blocks_topic,
+            &txs_topic,
+            &attestation_topic,
+            &proofs_topic,
+        ));
+        assert!(!message_matches_topic(
+            &message,
+            &txs_topic.hash(),
+            &blocks_topic,
+            &txs_topic,
+            &attestation_topic,
+            &proofs_topic,
+        ));
     }
 
     #[test]
