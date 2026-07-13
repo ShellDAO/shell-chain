@@ -1387,7 +1387,6 @@ impl<S: KvStore> ChainStore<S> {
         // snapshot entries. This prevents a semantic import failure from
         // leaving partially restored keys in the destination store.
         let mut head_hash = None;
-        let mut head_header = None;
         while let Some(entry) = snap_reader.next_entry()? {
             if entry.key == prefix::HEAD_BLOCK {
                 if entry.value.len() != 32 {
@@ -1395,14 +1394,30 @@ impl<S: KvStore> ChainStore<S> {
                         "snapshot HEAD value has invalid length".into(),
                     ));
                 }
+                if head_hash.is_some() {
+                    return Err(StorageError::State(
+                        "snapshot contains multiple HEAD entries".into(),
+                    ));
+                }
                 head_hash = Some(ShellHash::from_slice(&entry.value));
-            } else if entry.key.starts_with(prefix::HEADER_BY_HASH)
-                && entry.key.len() == prefix::HEADER_BY_HASH.len().saturating_add(32)
-                && head_hash.is_some_and(|hash| {
-                    entry.key[prefix::HEADER_BY_HASH.len()..].as_ref() == hash.as_bytes()
-                })
-            {
-                head_header = Some(decode_versioned::<BlockHeader>(&entry.value)?);
+            }
+        }
+
+        // Resolve the head header in a separate pass so snapshot record order
+        // cannot affect validation.
+        let mut head_header = None;
+        if let Some(head_hash) = head_hash {
+            let head_header_key = Self::header_key(&head_hash);
+            snap_reader.rewind()?;
+            while let Some(entry) = snap_reader.next_entry()? {
+                if entry.key == head_header_key {
+                    if head_header.is_some() {
+                        return Err(StorageError::State(
+                            "snapshot contains multiple canonical head headers".into(),
+                        ));
+                    }
+                    head_header = Some(decode_versioned::<BlockHeader>(&entry.value)?);
+                }
             }
         }
 
@@ -1425,13 +1440,16 @@ impl<S: KvStore> ChainStore<S> {
 
         // Import all entries
         let mut batch = crate::WriteBatch::new();
-        let mut count = 0u64;
+        let mut pending_head = None;
         while let Some(entry) = snap_reader.next_entry()? {
+            if entry.key == prefix::HEAD_BLOCK {
+                pending_head = Some(entry.value);
+                continue;
+            }
             batch.put(entry.key, entry.value);
-            count = count.saturating_add(1);
 
             // Flush in batches of 10000 to avoid excessive memory use
-            if count.is_multiple_of(10_000) {
+            if batch.len() >= 10_000 {
                 self.store.write_batch(batch)?;
                 batch = crate::WriteBatch::new();
             }
@@ -1440,6 +1458,14 @@ impl<S: KvStore> ChainStore<S> {
         // Flush remaining
         if !batch.is_empty() {
             self.store.write_batch(batch)?;
+        }
+
+        // Publish HEAD only after every other record is durable. A failed
+        // streaming import must not make a partial snapshot appear complete.
+        if let Some(head) = pending_head {
+            let mut head_batch = crate::WriteBatch::new();
+            head_batch.put(prefix::HEAD_BLOCK.to_vec(), head);
+            self.store.write_batch(head_batch)?;
         }
 
         Ok(metadata)
@@ -2126,6 +2152,8 @@ mod tests {
     struct FailingBatchStore {
         inner: MemoryDb,
         fail_next_batch: AtomicBool,
+        fail_batch_after: AtomicUsize,
+        batch_calls: AtomicUsize,
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
     }
@@ -2135,6 +2163,8 @@ mod tests {
             Self {
                 inner: MemoryDb::new(),
                 fail_next_batch: AtomicBool::new(false),
+                fail_batch_after: AtomicUsize::new(usize::MAX),
+                batch_calls: AtomicUsize::new(0),
                 fail_put_after: AtomicUsize::new(usize::MAX),
                 put_calls: AtomicUsize::new(0),
             }
@@ -2142,6 +2172,11 @@ mod tests {
 
         fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_batch_after(&self, batch_count: usize) {
+            self.fail_batch_after.store(batch_count, Ordering::SeqCst);
+            self.batch_calls.store(0, Ordering::SeqCst);
         }
 
         fn fail_put_after(&self, put_count: usize) {
@@ -2172,7 +2207,10 @@ mod tests {
         }
 
         fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
-            if self.fail_next_batch.swap(false, Ordering::SeqCst) {
+            let call_num = self.batch_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_next_batch.swap(false, Ordering::SeqCst)
+                || call_num >= self.fail_batch_after.load(Ordering::SeqCst)
+            {
                 return Err(StorageError::Database("injected batch failure".into()));
             }
             self.inner.write_batch(batch)
@@ -2757,6 +2795,85 @@ mod tests {
         // Verify data was written
         assert_eq!(store.get(b"test-key-1").unwrap(), Some(b"value-1".to_vec()));
         assert_eq!(store.get(b"test-key-2").unwrap(), Some(b"value-2".to_vec()));
+    }
+
+    #[test]
+    fn test_import_snapshot_accepts_head_header_before_head_pointer() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let block = empty_block(1);
+        let block_hash = block.hash();
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            block.number(),
+            block_hash,
+            block.header.state_root,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&block_hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, block_hash.as_bytes())
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        cs.import_snapshot(std::io::Cursor::new(&buf), 1337, &ShellHash::ZERO)
+            .unwrap();
+        assert_eq!(cs.get_head_hash().unwrap(), Some(block_hash));
+    }
+
+    #[test]
+    fn test_import_snapshot_preserves_head_when_later_batch_fails() {
+        let store = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let old_head = ShellHash::from([0xAA; 32]);
+        cs.set_head(&old_head).unwrap();
+
+        let block = empty_block(1);
+        let block_hash = block.hash();
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            block.number(),
+            block_hash,
+            block.header.state_root,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, block_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<FailingBatchStore>::header_key(&block_hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            for index in 0..10_000 {
+                writer
+                    .write_entry(format!("snapshot/test/{index:05}").as_bytes(), b"value")
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        store.fail_batch_after(2);
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(&buf), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected batch failure"));
+        assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
     }
 
     #[test]
