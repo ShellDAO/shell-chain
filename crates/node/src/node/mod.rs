@@ -3245,7 +3245,7 @@ mod tests {
     #[test]
     fn produce_block_skips_tx_that_exceeds_remaining_block_gas() {
         let (node, signer) = setup_node();
-        store_genesis_with_gas_limit(&node, 21_000);
+        store_genesis_with_gas_limit(&node, 30_000);
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
@@ -3256,13 +3256,13 @@ mod tests {
         });
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
 
-        let tx = Transaction {
+        let make_tx = |nonce| Transaction {
             chain_id: 1337,
-            nonce: 0,
+            nonce,
             to: Some(receiver),
             value: U256::from(1_000u64),
             data: Bytes::new(),
-            gas_limit: 21_001,
+            gas_limit: 21_000,
             max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
             max_priority_fee_per_gas: 0,
             access_list: None,
@@ -3270,14 +3270,13 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        submit_signed_tx(&node, &tx_signer, sender, tx);
+        submit_signed_tx(&node, &tx_signer, sender, make_tx(0));
+        submit_signed_tx(&node, &tx_signer, sender, make_tx(1));
 
         let block = node.produce_block(&signer, 100).unwrap();
-        assert!(
-            block.transactions.is_empty(),
-            "oversized tx should not be included"
-        );
-        assert_eq!(block.header.gas_used, 0);
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].tx.nonce, 0);
+        assert_eq!(block.header.gas_used, 21_000);
     }
 
     #[test]

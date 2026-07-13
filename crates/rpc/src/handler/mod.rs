@@ -5146,7 +5146,7 @@ mod tests {
     async fn pending_block_skips_oversized_candidates_and_keeps_later_fit_txs() {
         let handler = setup();
         let mut block = make_genesis_block();
-        block.header.gas_limit = 42_000;
+        block.header.gas_limit = 63_000;
         let hash = block.hash();
         handler.chain_store.put_block(&block).unwrap();
         handler.chain_store.set_canonical(0, &hash).unwrap();
@@ -5154,18 +5154,32 @@ mod tests {
 
         let oversized_signer = DilithiumSigner::generate();
         let oversized_addr = signer_address(&oversized_signer);
+        let remaining_oversized_signer = DilithiumSigner::generate();
+        let remaining_oversized_addr = signer_address(&remaining_oversized_signer);
         let fit_signer = DilithiumSigner::generate();
         let fit_addr = signer_address(&fit_signer);
         {
             let mut ws = handler.world_state.write();
             ws.add_balance(&oversized_addr, U256::from(100_000_000_000_000u64))
                 .unwrap();
+            ws.add_balance(
+                &remaining_oversized_addr,
+                U256::from(100_000_000_000_000u64),
+            )
+            .unwrap();
             ws.add_balance(&fit_addr, U256::from(100_000_000_000_000u64))
                 .unwrap();
         }
         handler
             .chain_store
             .put_pubkey(&oversized_addr, oversized_signer.public_key())
+            .unwrap();
+        handler
+            .chain_store
+            .put_pubkey(
+                &remaining_oversized_addr,
+                remaining_oversized_signer.public_key(),
+            )
             .unwrap();
         handler
             .chain_store
@@ -5177,7 +5191,7 @@ mod tests {
             nonce: 0,
             max_priority_fee_per_gas: 100_000_000,
             max_fee_per_gas: 1_000_000_000,
-            gas_limit: 42_001,
+            gas_limit: 42_000,
             to: Some(test_address(b"pending-oversized-to")),
             value: U256::ZERO,
             data: Bytes::default(),
@@ -5190,6 +5204,30 @@ mod tests {
             .sign(oversized_tx.hash().0.as_slice())
             .unwrap();
         let oversized = SignedTransaction::new(oversized_addr, oversized_tx, oversized_sig);
+        let oversized_hash = oversized.hash();
+
+        let remaining_oversized_tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            max_priority_fee_per_gas: 100_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            gas_limit: 30_000,
+            to: Some(test_address(b"pending-remaining-oversized-to")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let remaining_oversized_sig = remaining_oversized_signer
+            .sign(remaining_oversized_tx.hash().0.as_slice())
+            .unwrap();
+        let remaining_oversized = SignedTransaction::new(
+            remaining_oversized_addr,
+            remaining_oversized_tx,
+            remaining_oversized_sig,
+        );
 
         let fit_tx = Transaction {
             chain_id: 42,
@@ -5222,6 +5260,15 @@ mod tests {
                 .unwrap();
             handler
                 .tx_pool
+                .insert(
+                    remaining_oversized,
+                    &mut ws,
+                    handler.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            handler
+                .tx_pool
                 .insert(fit, &mut ws, handler.chain_store.as_ref(), &MultiVerifier)
                 .unwrap();
         }
@@ -5231,8 +5278,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(rpc.transactions, serde_json::json!([fit_hash]));
-        assert_eq!(rpc.gas_used, "0x5208");
+        assert_eq!(
+            rpc.transactions,
+            serde_json::json!([oversized_hash, fit_hash])
+        );
+        assert_eq!(rpc.gas_used, "0xf618");
     }
 
     #[tokio::test]
