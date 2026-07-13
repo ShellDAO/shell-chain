@@ -66,6 +66,20 @@ impl ReorgEngine {
                 finalized_number, ancestor_number
             )));
         }
+        if finalized_number > 0 && ancestor_number == finalized_number {
+            let canonical_finalized = chain_store
+                .get_block_hash_by_number(finalized_number)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "cannot reorg from finalized block {finalized_number}: canonical mapping is missing"
+                    ))
+                })?;
+            if ancestor_hash != canonical_finalized {
+                return Err(NodeError::Startup(format!(
+                    "cannot reorg from non-canonical ancestor at finalized block {finalized_number}"
+                )));
+            }
+        }
 
         info!(
             ancestor = ancestor_number,
@@ -350,6 +364,56 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("cannot reorg past finalized"));
+    }
+
+    #[test]
+    fn test_reorg_from_non_canonical_finalized_ancestor_rejected() {
+        let (store, chain_store, world_state, root) = setup_chain();
+        let finalized = make_block(5, make_hash(0), root);
+        let finalized_hash = finalized.hash();
+        chain_store.put_block(&finalized).unwrap();
+        chain_store.set_canonical(5, &finalized_hash).unwrap();
+
+        let fork_ancestor = make_block(5, make_hash(9), root);
+        let result = ReorgEngine::execute(
+            &chain_store,
+            &world_state,
+            &store,
+            fork_ancestor.hash(),
+            5,
+            &[],
+            &[],
+            5,
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("non-canonical ancestor at finalized block 5"));
+        assert_eq!(
+            chain_store.get_block_hash_by_number(5).unwrap(),
+            Some(finalized_hash)
+        );
+    }
+
+    #[test]
+    fn test_reorg_from_finalized_height_requires_canonical_mapping() {
+        let (store, chain_store, world_state, root) = setup_chain();
+        let ancestor = make_block(5, make_hash(0), root);
+        let ancestor_hash = ancestor.hash();
+        chain_store.put_block(&ancestor).unwrap();
+
+        let result = ReorgEngine::execute(
+            &chain_store,
+            &world_state,
+            &store,
+            ancestor_hash,
+            5,
+            &[],
+            &[],
+            5,
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("canonical mapping is missing"));
     }
 
     #[test]
