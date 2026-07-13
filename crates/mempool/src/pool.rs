@@ -1169,7 +1169,7 @@ mod tests {
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
         set_head(&cs, 30_000_000, 111);
-        let (tx, _pk) = make_signed_tx(0, 100);
+        let (tx, _pk) = make_signed_tx(u64::default(), 100);
 
         let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
 
