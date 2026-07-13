@@ -182,8 +182,9 @@ fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     };
     let count = u32::from_be_bytes(count_bytes.try_into().expect("slice length checked"));
 
-    // C-1: Reject oversized batches up-front to bound CPU work.
-    if count > MAX_BATCH_SIGNATURES {
+    // Reject empty batches so the universal "all signatures valid" result
+    // cannot authorize a call without presenting a signature.
+    if count == 0 || count > MAX_BATCH_SIGNATURES {
         result.result = InstructionResult::PrecompileError;
         return result;
     }
@@ -503,6 +504,15 @@ mod tests {
             InstructionResult::PrecompileError,
             "C-1: expected PrecompileError for count > MAX_BATCH_SIGNATURES"
         );
+    }
+
+    #[test]
+    fn batch_verify_rejects_empty_batch() {
+        let input = 0u32.to_be_bytes();
+        let result = run_mldsa65_batch_verify(0, &input);
+
+        assert_eq!(result.result, InstructionResult::PrecompileError);
+        assert!(result.output.is_empty());
     }
 
     /// Helper: encode one batch item as [pk_len(4)][pubkey][msg_len(4)][msg][sig].

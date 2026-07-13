@@ -374,7 +374,7 @@ The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 pragma solidity ^0.8.24;
 
 library PQVerify {
-    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000004;
+    address constant PQ_PRECOMPILE = 0x0000000000000000000000000000000000000001;
 
     /// Verify a Dilithium3 signature. Returns true on valid.
     function verify(
