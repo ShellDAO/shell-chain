@@ -298,9 +298,7 @@ fn validate_custom_contract<S: KvStore + 'static>(
         v2_calldata,
     ) {
         Ok(output) => output,
-        Err(AaValidationError::ValidationContractRejected(msg))
-            if msg.starts_with("reverted:") || msg.starts_with("halted:") =>
-        {
+        Err(err) if should_fallback_to_v1(&err) => {
             let v1_calldata = encode_validate_transaction_v1_calldata(
                 &signed_tx.sender_signing_hash(),
                 &signed_tx.signature.data,
@@ -325,6 +323,14 @@ fn validate_custom_contract<S: KvStore + 'static>(
     }
 
     Ok(())
+}
+
+fn should_fallback_to_v1(error: &AaValidationError) -> bool {
+    matches!(
+        error,
+        AaValidationError::ValidationContractRejected(message)
+            if message.starts_with("reverted:")
+    )
 }
 
 fn call_custom_validation_contract<S: KvStore + 'static>(
@@ -1087,6 +1093,19 @@ mod tests {
         let mut invalid_value = [0u8; 32];
         invalid_value[31] = 2;
         assert_eq!(decode_abi_bool(&invalid_value), None);
+    }
+
+    #[test]
+    fn custom_validator_v1_fallback_rejects_v2_halts() {
+        assert!(should_fallback_to_v1(
+            &AaValidationError::ValidationContractRejected("reverted: 0x".into())
+        ));
+        assert!(!should_fallback_to_v1(
+            &AaValidationError::ValidationContractRejected("halted: OutOfGas".into())
+        ));
+        assert!(!should_fallback_to_v1(
+            &AaValidationError::ValidationContractExecution("database error".into())
+        ));
     }
 
     #[test]

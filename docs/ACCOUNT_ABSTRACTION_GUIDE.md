@@ -142,7 +142,8 @@ interface IAccountValidator {
 ```
 
 For compatibility with existing validators, the node falls back to the legacy
-V1 selector only when the V2 call reverts or halts:
+V1 selector only when the V2 call reverts. Execution halts such as out-of-gas
+remain validation failures and are never retried through the reduced V1 ABI:
 
 ```solidity
 function validateTransaction(
@@ -157,7 +158,7 @@ function validateTransaction(
 - **target:** the account address being validated
 - **gas cap:** `500_000`
 - **preferred input:** `validateTransactionV2(bytes32,bytes32,uint64,bytes32,uint256,uint64,uint64,uint64,bytes32,bytes32,bytes,bytes)`
-- **legacy fallback:** `validateTransaction(bytes32,bytes,bytes)` only after V2 reverts or halts
+- **legacy fallback:** `validateTransaction(bytes32,bytes,bytes)` only after V2 reverts
 - **execution model:** isolated validation dry-run against a world-state snapshot
 - **replay guard:** protocol nonce equality is still enforced before execution
 
