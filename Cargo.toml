@@ -28,6 +28,7 @@ version = "0.27.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ShellDAO/shell-chain"
+publish = false
 
 [workspace.dependencies]
 # --- primitives ---
