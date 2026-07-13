@@ -501,6 +501,21 @@ impl TxPool {
             });
         }
 
+        if let Some(head_hash) = chain_store.get_head_hash().map_err(MempoolError::Storage)? {
+            let head = chain_store
+                .get_header_by_hash(&head_hash)
+                .map_err(MempoolError::Storage)?
+                .ok_or_else(|| {
+                    MempoolError::InvalidTransaction("canonical head header is missing".into())
+                })?;
+            if tx.tx.gas_limit > head.gas_limit {
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "transaction gas limit {} exceeds block gas limit {}",
+                    tx.tx.gas_limit, head.gas_limit
+                )));
+            }
+        }
+
         if tx.tx.max_priority_fee_per_gas > tx.tx.max_fee_per_gas {
             return Err(MempoolError::InvalidTransaction(
                 "max priority fee per gas exceeds max fee per gas".into(),
@@ -772,7 +787,9 @@ fn replacement_fee_required(old_fee: u64, bump_pct: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shell_core::{AaBundle, InnerCall, PubkeyMode, Transaction, AA_BUNDLE_TX_TYPE};
+    use shell_core::{
+        AaBundle, Block, BlockHeader, InnerCall, PubkeyMode, Transaction, AA_BUNDLE_TX_TYPE,
+    };
     use shell_crypto::{DilithiumSigner, DilithiumVerifier, Signer};
     use shell_primitives::Bytes;
     use shell_storage::{ChainStore, KvStore, MemoryDb, StorageError, WorldState, WriteBatch};
@@ -1000,6 +1017,37 @@ mod tests {
         (ws, cs)
     }
 
+    fn set_head_with_gas_limit(cs: &ChainStore<MemoryDb>, gas_limit: u64) {
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: ShellHash::ZERO,
+                state_root: ShellHash::ZERO,
+                transactions_root: ShellHash::ZERO,
+                receipts_root: ShellHash::ZERO,
+                logs_bloom: Bytes::default(),
+                number: 0,
+                gas_limit,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Bytes::default(),
+                proposer: Address::ZERO,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: 0,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        cs.set_head(&hash).unwrap();
+    }
+
     fn insert_with_balance<S: KvStore + 'static>(
         pool: &TxPool,
         tx: SignedTransaction,
@@ -1089,6 +1137,24 @@ mod tests {
 
         let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
         assert!(matches!(err, MempoolError::ChainIdMismatch { .. }));
+    }
+
+    #[test]
+    fn reject_transaction_that_cannot_fit_in_a_block() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        set_head_with_gas_limit(&cs, 20_999);
+        let (tx, _pk) = make_signed_tx(0, 100);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message == "transaction gas limit 21000 exceeds block gas limit 20999"
+        ));
+        assert!(pool.is_empty());
     }
 
     #[test]
