@@ -1,5 +1,6 @@
 //! `shell-node genesis` — genesis file management utilities.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -41,12 +42,9 @@ pub fn genesis_add_alloc(
         .ok_or("genesis.alloc is not a JSON object")?
         .insert(addr_key.clone(), entry);
 
-    let out_path = output.unwrap_or_else(|| genesis_path.clone());
-    let new_json = serde_json::to_string_pretty(&doc)?;
-    std::fs::write(&out_path, &new_json)?;
+    write_json_doc(&genesis_path, output, &doc)?;
 
     eprintln!("✓ Alloc added: {addr_key} → {balance} wei");
-    eprintln!("  Written to: {}", out_path.display());
 
     Ok(())
 }
@@ -136,14 +134,62 @@ fn write_json_doc(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let out_path = output.unwrap_or_else(|| genesis_path.to_path_buf());
     let new_json = serde_json::to_string_pretty(doc)?;
-    std::fs::write(&out_path, &new_json)?;
+    write_file_atomic(&out_path, new_json.as_bytes())?;
     eprintln!("  Written to: {}", out_path.display());
+    Ok(())
+}
+
+fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+
+    temp.write_all(contents)?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_doc_replaces_existing_file_atomically() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        std::fs::write(&path, br#"{"chain_id": 1}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+
+        write_json_doc(&path, None, &serde_json::json!({"chain_id": 2})).unwrap();
+
+        let replacement_inode = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(replacement_inode, original_inode);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            serde_json::json!({"chain_id": 2})
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn validate_supply_rejects_oversized_genesis_before_parsing() {
