@@ -1,7 +1,29 @@
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use shell_primitives::{Address, ShellHash, U256};
+
+/// Maximum accepted size for a genesis JSON file.
+pub const MAX_GENESIS_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Read a genesis JSON file while bounding memory use at the file boundary.
+pub fn read_genesis_file(path: &Path) -> Result<String, GenesisError> {
+    let file = std::fs::File::open(path).map_err(|e| GenesisError::Io(e.to_string()))?;
+    let mut content = String::new();
+    file.take(MAX_GENESIS_FILE_SIZE + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| GenesisError::Io(e.to_string()))?;
+
+    if content.len() as u64 > MAX_GENESIS_FILE_SIZE {
+        return Err(GenesisError::Validation(format!(
+            "genesis file too large (max {MAX_GENESIS_FILE_SIZE} bytes)"
+        )));
+    }
+
+    Ok(content)
+}
 
 // ── NetworkType ───────────────────────────────────────────────────────────────
 
@@ -371,8 +393,8 @@ impl GenesisConfig {
     }
 
     /// Parse genesis configuration from a JSON file path.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, GenesisError> {
-        let content = std::fs::read_to_string(path).map_err(|e| GenesisError::Io(e.to_string()))?;
+    pub fn from_file(path: &Path) -> Result<Self, GenesisError> {
+        let content = read_genesis_file(path)?;
         Self::from_json(&content).map_err(|e| GenesisError::Parse(e.to_string()))
     }
 
@@ -588,6 +610,24 @@ pub enum GenesisError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_genesis_file_accepts_exact_size_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_GENESIS_FILE_SIZE).unwrap();
+
+        let content = read_genesis_file(file.path()).unwrap();
+        assert_eq!(content.len() as u64, MAX_GENESIS_FILE_SIZE);
+    }
+
+    #[test]
+    fn read_genesis_file_rejects_content_over_size_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_GENESIS_FILE_SIZE + 1).unwrap();
+
+        let error = read_genesis_file(file.path()).unwrap_err();
+        assert!(error.to_string().contains("genesis file too large"));
+    }
 
     fn sample_genesis_json() -> String {
         let authority = Address::from([0x01; 32]);

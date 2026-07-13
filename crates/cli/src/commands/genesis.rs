@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use shell_genesis::read_genesis_file;
 use shell_primitives::Address;
 
 /// Add (or update) an allocation entry in a genesis JSON file.
@@ -15,8 +16,7 @@ pub fn genesis_add_alloc(
     balance: String,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(&genesis_path)
-        .map_err(|e| format!("cannot read {}: {e}", genesis_path.display()))?;
+    let raw = read_genesis_file(&genesis_path)?;
 
     let mut doc: Value = serde_json::from_str(&raw)
         .map_err(|e| format!("invalid JSON in {}: {e}", genesis_path.display()))?;
@@ -116,18 +116,15 @@ pub fn genesis_set_validator_stake(
 }
 
 pub fn genesis_validate_supply(genesis_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(&genesis_path)
-        .map_err(|e| format!("cannot read {}: {e}", genesis_path.display()))?;
-    let genesis = shell_genesis::GenesisConfig::from_json(&raw)
-        .map_err(|e| format!("invalid genesis JSON: {e}"))?;
+    let genesis = shell_genesis::GenesisConfig::from_file(&genesis_path)
+        .map_err(|e| format!("invalid genesis file: {e}"))?;
     genesis.validate_economics()?;
     eprintln!("✓ Genesis economics and supply invariants are valid");
     Ok(())
 }
 
-fn read_json_doc(path: &PathBuf) -> Result<Value, Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+fn read_json_doc(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    let raw = read_genesis_file(path)?;
     serde_json::from_str(&raw)
         .map_err(|e| format!("invalid JSON in {}: {e}", path.display()).into())
 }
@@ -142,4 +139,25 @@ fn write_json_doc(
     std::fs::write(&out_path, &new_json)?;
     eprintln!("  Written to: {}", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_supply_rejects_oversized_genesis_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(shell_genesis::MAX_GENESIS_FILE_SIZE + 1)
+            .unwrap();
+
+        let error = genesis_validate_supply(path).unwrap_err();
+        assert!(
+            error.to_string().contains("genesis file too large"),
+            "unexpected error: {error}"
+        );
+    }
 }

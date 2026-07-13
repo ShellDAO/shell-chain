@@ -7,14 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use shell_crypto::DilithiumSigner;
 use shell_crypto::Signer;
-use shell_genesis::{initialize_genesis, AllocEntry, ConsensusConfig, GenesisConfig, NetworkType};
+use shell_genesis::{
+    initialize_genesis, AllocEntry, ConsensusConfig, GenesisConfig, NetworkType,
+    MAX_GENESIS_FILE_SIZE,
+};
 use shell_primitives::{Address, U256};
 use shell_storage::MemoryDb;
 
 use tracing::info;
 
-/// Maximum genesis file size: 10 MB (F-082).
-const MAX_GENESIS_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const DEV_AUTHORITY_INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000_000_000_000u128;
 
 /// Initialize a data directory with genesis block.

@@ -6064,6 +6064,7 @@ dependencies = [
  "shell-core",
  "shell-primitives",
  "shell-storage",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
