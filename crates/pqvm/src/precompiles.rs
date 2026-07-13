@@ -111,30 +111,33 @@ fn run_pq_precompile<CTX: ContextTr>(
     inputs: &CallInputs,
     context: &mut CTX,
 ) -> InterpreterResult {
-    let input = read_input(inputs, context);
+    // Hold the shared-memory guard through execution so precompiles can read
+    // calldata in place instead of cloning it into a temporary buffer.
+    let shared_input;
+    let input = match &inputs.input {
+        CallInput::SharedBuffer(range) => {
+            if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
+                shared_input = slice;
+                shared_input.as_ref()
+            } else {
+                &[]
+            }
+        }
+        CallInput::Bytes(bytes) => bytes.as_ref(),
+    };
+
     match *target {
-        PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify(inputs.gas_limit, &input),
-        PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => run_slhdsa_sha2_256f_verify(inputs.gas_limit, &input),
-        PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, &input),
-        PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, &input),
-        PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, &input),
-        PQ_ADDRESS_DERIVE_ADDR => run_pq_address_derive(inputs.gas_limit, &input),
+        PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify(inputs.gas_limit, input),
+        PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => run_slhdsa_sha2_256f_verify(inputs.gas_limit, input),
+        PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, input),
+        PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, input),
+        PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, input),
+        PQ_ADDRESS_DERIVE_ADDR => run_pq_address_derive(inputs.gas_limit, input),
         _ => InterpreterResult {
             result: InstructionResult::PrecompileError,
             gas: Gas::new(inputs.gas_limit),
             output: Bytes::new(),
         },
-    }
-}
-
-fn read_input<CTX: ContextTr>(inputs: &CallInputs, context: &mut CTX) -> Vec<u8> {
-    match &inputs.input {
-        CallInput::SharedBuffer(range) => context
-            .local()
-            .shared_memory_buffer_slice(range.clone())
-            .map(|slice| slice.as_ref().to_vec())
-            .unwrap_or_default(),
-        CallInput::Bytes(bytes) => bytes.0.to_vec(),
     }
 }
 
