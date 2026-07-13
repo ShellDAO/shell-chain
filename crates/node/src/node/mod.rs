@@ -99,6 +99,15 @@ fn canonical_mapping_retention(body_retention: u64, witness_retention: u64) -> u
         .saturating_add(1)
 }
 
+fn state_trie_prune_boundary(finalized_number: u64, keep_recent: u64) -> Option<u64> {
+    if finalized_number == 0 || keep_recent == 0 {
+        return None;
+    }
+
+    let boundary = retention_cutoff(finalized_number, keep_recent);
+    (boundary > 0).then_some(boundary)
+}
+
 /// A running shell-chain node.
 ///
 /// Orchestrates storage, consensus, EVM, mempool, network, and RPC
@@ -1167,7 +1176,7 @@ impl<S: KvStore + 'static> Node<S> {
                     "state root eligible for pruning"
                 );
                 if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
-                    prune_keep_below = Some(retention_cutoff(block_number, keep_recent));
+                    prune_keep_below = state_trie_prune_boundary(finalized_number, keep_recent);
                 }
             }
         }
@@ -5118,6 +5127,21 @@ mod tests {
     fn canonical_mapping_retention_preserves_archive_indexes() {
         assert_eq!(canonical_mapping_retention(0, 256), u64::MAX);
         assert_eq!(canonical_mapping_retention(512, 0), u64::MAX);
+    }
+
+    #[test]
+    fn state_trie_pruning_is_bounded_by_finalized_height() {
+        assert_eq!(state_trie_prune_boundary(0, 4), None);
+        assert_eq!(state_trie_prune_boundary(3, 4), None);
+        assert_eq!(state_trie_prune_boundary(8, 4), Some(5));
+
+        // A high unfinalized head must not move the pruning boundary.
+        let finalized = 8;
+        let unfinalized_head = 100;
+        assert_ne!(
+            state_trie_prune_boundary(finalized, 4),
+            Some(retention_cutoff(unfinalized_head, 4))
+        );
     }
 
     #[test]
