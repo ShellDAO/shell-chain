@@ -144,8 +144,9 @@ impl FilterRegistry {
             return;
         }
         let mut filters = self.filters.write();
+        remove_expired_filter(&mut filters, id, self.ttl_secs);
         if let Some(entry) = filters.get_mut(id) {
-            entry.last_poll_block = new_block;
+            entry.last_poll_block = entry.last_poll_block.max(new_block);
             entry.last_access = Instant::now();
         }
     }
@@ -375,6 +376,30 @@ mod tests {
         reg.update_last_poll(&id, 50);
         let (_, last_poll) = reg.get_filter_info(&id).unwrap();
         assert_eq!(last_poll, 50);
+    }
+
+    #[test]
+    fn update_last_poll_does_not_move_cursor_backwards() {
+        let reg = FilterRegistry::new();
+        let id = reg.new_filter(FilterKind::Block, 10).unwrap();
+
+        reg.update_last_poll(&id, 20);
+        reg.update_last_poll(&id, 15);
+
+        assert_eq!(reg.get_filter_info(&id).unwrap().1, 20);
+    }
+
+    #[test]
+    fn update_last_poll_does_not_revive_expired_filter() {
+        let reg = FilterRegistry::with_ttl(1);
+        let id = reg.new_filter(FilterKind::Block, 7).unwrap();
+        reg.filters.write().get_mut(&id).unwrap().last_access =
+            Instant::now() - Duration::from_secs(2);
+
+        reg.update_last_poll(&id, 8);
+
+        assert!(reg.get_filter_info(&id).is_none());
+        assert!(reg.is_empty());
     }
 
     #[test]
