@@ -431,10 +431,10 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
             "newHeads" => {
                 let rx = self.block_event_sender().subscribe();
                 let sink = pending.accept().await?;
-                let t = tracker.clone();
+                let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
+                    let _guard = forward_guard;
                     forward_new_heads(rx, sink).await;
-                    t.release_for_connection(conn_id);
                 });
                 slot_guard.disarm();
             }
@@ -449,10 +449,10 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     }
                 };
                 let sink = pending.accept().await?;
-                let t = tracker.clone();
+                let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
+                    let _guard = forward_guard;
                     forward_logs(rx, sink, filter).await;
-                    t.release_for_connection(conn_id);
                 });
                 slot_guard.disarm();
             }
@@ -468,20 +468,20 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                     }
                 };
                 let sink = pending.accept().await?;
-                let t = tracker.clone();
+                let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
+                    let _guard = forward_guard;
                     forward_pending_txs(rx, sink, full_txs).await;
-                    t.release_for_connection(conn_id);
                 });
                 slot_guard.disarm();
             }
             "syncing" => {
                 let rx = self.sync_event_sender().subscribe();
                 let sink = pending.accept().await?;
-                let t = tracker.clone();
+                let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
+                    let _guard = forward_guard;
                     forward_syncing(rx, sink).await;
-                    t.release_for_connection(conn_id);
                 });
                 slot_guard.disarm();
             }
@@ -546,7 +546,11 @@ async fn forward_new_heads(
 ) {
     let mut consecutive_lags: u32 = 0;
     loop {
-        match rx.recv().await {
+        let event = tokio::select! {
+            _ = sink.closed() => break,
+            event = rx.recv() => event,
+        };
+        match event {
             Ok(BlockEvent::NewBlock { header, .. }) => {
                 consecutive_lags = 0;
                 let value = header_to_json(&header);
@@ -578,7 +582,11 @@ async fn forward_logs(
 ) {
     let mut consecutive_lags: u32 = 0;
     loop {
-        match rx.recv().await {
+        let event = tokio::select! {
+            _ = sink.closed() => return,
+            event = rx.recv() => event,
+        };
+        match event {
             Ok(BlockEvent::NewBlock { header, receipts }) => {
                 consecutive_lags = 0;
                 let mut global_log_index: usize = 0;
@@ -630,7 +638,11 @@ async fn forward_pending_txs(
     }
     let mut consecutive_lags: u32 = 0;
     loop {
-        match rx.recv().await {
+        let event = tokio::select! {
+            _ = sink.closed() => break,
+            event = rx.recv() => event,
+        };
+        match event {
             Ok(tx_hash) => {
                 consecutive_lags = 0;
                 let value = serde_json::json!(tx_hash);
@@ -683,7 +695,11 @@ async fn forward_syncing(
     // Idle timeout: close subscription if no sync events arrive within 10 minutes.
     let idle_timeout = tokio::time::Duration::from_secs(600);
     loop {
-        match tokio::time::timeout(idle_timeout, rx.recv()).await {
+        let event = tokio::select! {
+            _ = sink.closed() => break,
+            event = tokio::time::timeout(idle_timeout, rx.recv()) => event,
+        };
+        match event {
             Ok(Ok(status)) => {
                 consecutive_lags = 0;
                 let value = sync_status_to_json(&status);

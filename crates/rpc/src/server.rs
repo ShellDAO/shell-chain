@@ -412,10 +412,11 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 #[cfg(test)]
 mod tests {
     use super::{start_rpc_server, RpcConfig};
-    use jsonrpsee::core::client::{ClientT, Error as ClientError};
+    use jsonrpsee::core::client::{ClientT, Error as ClientError, SubscriptionClientT};
     use jsonrpsee::core::params::BatchRequestBuilder;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+    use jsonrpsee::ws_client::WsClientBuilder;
     use shell_consensus::FinalityState;
     use shell_mempool::{MempoolConfig, TxPool};
     use shell_storage::{ChainStore, MemoryDb, WorldState};
@@ -547,5 +548,84 @@ mod tests {
         server.http_handle.stop().unwrap();
         server.http_handle.stopped().await;
         assert!(matches!(err, ClientError::ParseError(_)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_idle_subscriptions_release_global_capacity() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            max_connections: 128,
+            ws_addr: None,
+            rate_limit_per_sec: None,
+            api_namespaces: vec!["eth".into()],
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ws_url = format!("ws://{}", server.http_addr);
+
+        let mut clients = Vec::new();
+        let mut subscriptions = Vec::new();
+        for _ in 0..64 {
+            let client = WsClientBuilder::default().build(&ws_url).await.unwrap();
+            for _ in 0..16 {
+                subscriptions.push(
+                    client
+                        .subscribe::<serde_json::Value, _>(
+                            "eth_subscribe",
+                            rpc_params!["newHeads"],
+                            "eth_unsubscribe",
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            clients.push(client);
+        }
+
+        drop(subscriptions);
+        drop(clients);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let client = WsClientBuilder::default().build(&ws_url).await.unwrap();
+        let result = client
+            .subscribe::<serde_json::Value, _>(
+                "eth_subscribe",
+                rpc_params!["newHeads"],
+                "eth_unsubscribe",
+            )
+            .await;
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(
+            result.is_ok(),
+            "subscription capacity was not released: {result:?}"
+        );
     }
 }
