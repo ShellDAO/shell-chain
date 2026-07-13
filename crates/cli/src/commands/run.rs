@@ -259,6 +259,8 @@ fn repair_head_state_if_needed<S: KvStore + 'static>(
 
 /// Start the node: load genesis, initialize state, and run the event loop.
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let _: NetworkType = args.network.parse()?;
+
     // F-096: Canonicalize and validate data directory.
     let datadir = if args.datadir.exists() {
         args.datadir.canonicalize()?
@@ -458,7 +460,7 @@ async fn run_with_store<S: KvStore + 'static>(
         }
     }
 
-    let network_type: NetworkType = args.network.parse().unwrap_or_default();
+    let network_type: NetworkType = args.network.parse()?;
 
     // Load genesis config.
     let genesis_file = args.datadir.join("genesis.json");

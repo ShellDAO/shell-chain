@@ -103,21 +103,22 @@ impl NetworkType {
         }
     }
 
-    /// Parse from a string, defaulting to `Dev` for unknown values.
-    pub fn from_network_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "mainnet" => NetworkType::Mainnet,
-            "testnet" => NetworkType::Testnet,
-            _ => NetworkType::Dev,
+    /// Parse a supported network profile name.
+    pub fn from_network_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "dev" => Ok(NetworkType::Dev),
+            "testnet" => Ok(NetworkType::Testnet),
+            "mainnet" => Ok(NetworkType::Mainnet),
+            _ => Err("unsupported network profile; expected dev, testnet, or mainnet".into()),
         }
     }
 }
 
 impl std::str::FromStr for NetworkType {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from_network_str(s))
+        Self::from_network_str(s)
     }
 }
 
@@ -894,6 +895,19 @@ mod tests {
         assert_eq!(NetworkType::Dev.as_str(), "dev");
         assert_eq!(NetworkType::Testnet.as_str(), "testnet");
         assert_eq!(NetworkType::Mainnet.as_str(), "mainnet");
+    }
+
+    #[test]
+    fn network_type_rejects_unknown_profile() {
+        assert!("mianet".parse::<NetworkType>().is_err());
+    }
+
+    #[test]
+    fn network_type_parsing_remains_case_insensitive() {
+        assert_eq!(
+            "MAINNET".parse::<NetworkType>().unwrap(),
+            NetworkType::Mainnet
+        );
     }
 
     // ── F4: effective_block_time_secs + validate_network_consistency ──────────

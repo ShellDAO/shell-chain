@@ -29,6 +29,8 @@ pub fn init(
     chain_id: u64,
     network: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let network_type: NetworkType = network.parse()?;
+
     // F-096: Canonicalize data directory path.
     let datadir = if datadir.exists() {
         datadir.canonicalize()?
@@ -61,7 +63,6 @@ pub fn init(
             GenesisConfig::from_file(&path)?
         }
         None => {
-            let network_type: NetworkType = network.parse().unwrap_or_default();
             let block_time_secs = network_type.default_block_time_secs();
             info!(
                 "No genesis.json provided, generating {} genesis (block_time={}s)",
@@ -128,4 +129,20 @@ pub fn init(
     eprintln!("  Alloc accounts: {}", genesis_config.alloc.len());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_network_before_creating_datadir() {
+        let parent = tempfile::tempdir().unwrap();
+        let datadir = parent.path().join("chain-data");
+
+        let error = init(datadir.clone(), None, 1337, "mianet".into()).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported network profile"));
+        assert!(!datadir.exists());
+    }
 }
