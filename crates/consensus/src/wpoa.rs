@@ -13,7 +13,7 @@
 //! the existing `PoaEngine` logic.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use shell_core::{Block, BlockHeader};
@@ -82,6 +82,12 @@ pub struct WPoaEngine {
 }
 
 impl WPoaEngine {
+    fn view_change_state(&self) -> MutexGuard<'_, ViewChangeState> {
+        self.view_change_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Construct a `WPoaEngine` from a `WPoaConfig`.
     pub fn new(config: WPoaConfig, _verifier: Arc<dyn Verifier>) -> Self {
         let mut poa = config.poa;
@@ -178,10 +184,7 @@ impl WPoaEngine {
         total_weight: u64,
     ) -> bool {
         let validator_weights = self.validator_weights();
-        let mut state = self
-            .view_change_state
-            .lock()
-            .expect("view change state mutex poisoned");
+        let mut state = self.view_change_state();
 
         if msg.view != state.current_view {
             return false;
@@ -197,17 +200,11 @@ impl WPoaEngine {
     }
 
     fn reset_view_change_state(&mut self, now_ms: u64) {
-        self.view_change_state
-            .lock()
-            .expect("view change state mutex poisoned")
-            .reset_for_block(now_ms);
+        self.view_change_state().reset_for_block(now_ms);
     }
 
     fn current_view(&self) -> u64 {
-        self.view_change_state
-            .lock()
-            .expect("view change state mutex poisoned")
-            .current_view
+        self.view_change_state().current_view
     }
 
     fn base_weight_for(&self, authority: &Address) -> Option<u64> {
@@ -413,9 +410,7 @@ impl ConsensusEngine for WPoaEngine {
     }
 
     fn check_view_change_timeout(&self, now_ms: u64, block_time_ms: u64) -> bool {
-        self.view_change_state
-            .lock()
-            .expect("view change state mutex poisoned")
+        self.view_change_state()
             .check_timeout(now_ms, block_time_ms)
     }
 
@@ -620,5 +615,18 @@ mod tests {
 
         assert_eq!(e.current_view(), 0);
         assert!(!e.check_view_change_timeout(42 + VIEW_CHANGE_TIMEOUT_MS - 1, 1_000));
+    }
+
+    #[test]
+    fn poisoned_view_change_lock_does_not_halt_consensus() {
+        let mut e = engine(vec![addr(1)], vec![1]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = e.view_change_state.lock().unwrap();
+            panic!("poison view-change state for test");
+        }));
+
+        assert_eq!(e.current_view(), 0);
+        assert!(!e.check_view_change_timeout(1, 1_000));
+        e.note_block_progress(1);
     }
 }
