@@ -298,14 +298,23 @@ impl<'de> Visitor<'de> for ResponseVisitor {
         let Some(variant) = map.next_key::<String>()? else {
             return Ok(());
         };
-        map.next_value_seed(ResponsePayloadSeed {
-            is_block_response: variant == "BlockResponse" || variant == "BodyResponse",
-        })
+        let response_kind = match variant.as_str() {
+            "BlockResponse" => Some(ResponseKind::Block),
+            "BodyResponse" => Some(ResponseKind::Body),
+            _ => None,
+        };
+        map.next_value_seed(ResponsePayloadSeed { response_kind })
     }
 }
 
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    Block,
+    Body,
+}
+
 struct ResponsePayloadSeed {
-    is_block_response: bool,
+    response_kind: Option<ResponseKind>,
 }
 
 impl<'de> DeserializeSeed<'de> for ResponsePayloadSeed {
@@ -315,15 +324,17 @@ impl<'de> DeserializeSeed<'de> for ResponsePayloadSeed {
     where
         D: serde::Deserializer<'de>,
     {
-        if self.is_block_response {
-            deserializer.deserialize_map(ResponsePayloadVisitor)
+        if let Some(response_kind) = self.response_kind {
+            deserializer.deserialize_map(ResponsePayloadVisitor { response_kind })
         } else {
             deserializer.deserialize_any(IgnoredAny).map(|_| ())
         }
     }
 }
 
-struct ResponsePayloadVisitor;
+struct ResponsePayloadVisitor {
+    response_kind: ResponseKind,
+}
 
 impl<'de> Visitor<'de> for ResponsePayloadVisitor {
     type Value = ();
@@ -338,7 +349,15 @@ impl<'de> Visitor<'de> for ResponsePayloadVisitor {
     {
         while let Some(key) = map.next_key::<String>()? {
             if key == "blocks" {
-                map.next_value_seed(BlockArraySeed)?;
+                map.next_value_seed(BoundedResponseArraySeed {
+                    item_name: "blocks",
+                })?;
+            } else if key == "commit_certificates"
+                && matches!(self.response_kind, ResponseKind::Block)
+            {
+                map.next_value_seed(BoundedResponseArraySeed {
+                    item_name: "commit certificates",
+                })?;
             } else {
                 let _: IgnoredAny = map.next_value()?;
             }
@@ -347,26 +366,32 @@ impl<'de> Visitor<'de> for ResponsePayloadVisitor {
     }
 }
 
-struct BlockArraySeed;
+struct BoundedResponseArraySeed {
+    item_name: &'static str,
+}
 
-impl<'de> DeserializeSeed<'de> for BlockArraySeed {
+impl<'de> DeserializeSeed<'de> for BoundedResponseArraySeed {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_seq(BlockArrayVisitor)
+        deserializer.deserialize_seq(BoundedResponseArrayVisitor {
+            item_name: self.item_name,
+        })
     }
 }
 
-struct BlockArrayVisitor;
+struct BoundedResponseArrayVisitor {
+    item_name: &'static str,
+}
 
-impl<'de> Visitor<'de> for BlockArrayVisitor {
+impl<'de> Visitor<'de> for BoundedResponseArrayVisitor {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a bounded block array")
+        write!(formatter, "a bounded response {} array", self.item_name)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -378,7 +403,8 @@ impl<'de> Visitor<'de> for BlockArrayVisitor {
             count += 1;
             if count > MAX_RESPONSE_BLOCKS {
                 return Err(de::Error::custom(format!(
-                    "response contains more than {MAX_RESPONSE_BLOCKS} blocks"
+                    "response contains more than {MAX_RESPONSE_BLOCKS} {}",
+                    self.item_name
                 )));
             }
         }
@@ -766,6 +792,24 @@ mod tests {
 
         assert!(
             matches!(err, NetworkError::Serialization(message) if message.contains("more than 128 blocks"))
+        );
+    }
+
+    #[test]
+    fn deserialize_checked_rejects_oversized_commit_certificate_array_before_decode() {
+        let msg = NetworkMessage::BlockResponse {
+            blocks: vec![],
+            commit_certificates: (0..=MAX_RESPONSE_BLOCKS)
+                .map(|_| (ShellHash::default(), vec![]))
+                .collect(),
+            nonce: 0,
+        };
+        let json = serde_json::to_vec(&msg).unwrap();
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(
+            matches!(err, NetworkError::Serialization(message) if message.contains("more than 128 commit certificates"))
         );
     }
 
