@@ -514,6 +514,12 @@ impl TxPool {
                     tx.tx.gas_limit, head.gas_limit
                 )));
             }
+            if tx.tx.max_fee_per_gas < head.base_fee_per_gas {
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "max fee per gas ({}) below current base fee ({})",
+                    tx.tx.max_fee_per_gas, head.base_fee_per_gas
+                )));
+            }
         }
 
         if tx.tx.max_priority_fee_per_gas > tx.tx.max_fee_per_gas {
@@ -1017,7 +1023,7 @@ mod tests {
         (ws, cs)
     }
 
-    fn set_head_with_gas_limit(cs: &ChainStore<MemoryDb>, gas_limit: u64) {
+    fn set_head(cs: &ChainStore<MemoryDb>, gas_limit: u64, base_fee_per_gas: u64) {
         let block = Block {
             header: BlockHeader {
                 parent_hash: ShellHash::ZERO,
@@ -1032,7 +1038,7 @@ mod tests {
                 extra_data: Bytes::default(),
                 proposer: Address::ZERO,
                 sig_aggregate_proof: None,
-                base_fee_per_gas: 0,
+                base_fee_per_gas,
                 withdrawals_root: ShellHash::ZERO,
                 parent_beacon_block_root: ShellHash::ZERO,
                 blob_gas_used: 0,
@@ -1144,7 +1150,7 @@ mod tests {
         let pool = TxPool::new(make_config());
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
-        set_head_with_gas_limit(&cs, 20_999);
+        set_head(&cs, 20_999, 0);
         let (tx, _pk) = make_signed_tx(0, 100);
 
         let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
@@ -1153,6 +1159,24 @@ mod tests {
             err,
             MempoolError::InvalidTransaction(message)
                 if message == "transaction gas limit 21000 exceeds block gas limit 20999"
+        ));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn reject_transaction_below_current_base_fee() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        set_head(&cs, 30_000_000, 111);
+        let (tx, _pk) = make_signed_tx(0, 100);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message == "max fee per gas (110) below current base fee (111)"
         ));
         assert!(pool.is_empty());
     }

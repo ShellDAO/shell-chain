@@ -358,17 +358,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     /// On success, also forwards the transaction to the network broadcast channel
     /// (if one was provided) so peers can include it in their mempools.
     fn submit_tx(&self, signed_tx: SignedTransaction) -> Result<ShellHash, ErrorObjectOwned> {
-        // EIP-1559: warn (and reject) if max_fee below current base_fee.
-        if let Ok(Some(head)) = self.chain_store.get_head_block() {
-            let current_base_fee = head.header.base_fee_per_gas;
-            if current_base_fee > 0 && signed_tx.tx.max_fee_per_gas < current_base_fee {
-                return Err(server_error(format!(
-                    "max fee per gas ({}) below current base fee ({})",
-                    signed_tx.tx.max_fee_per_gas, current_base_fee
-                )));
-            }
-        }
-
         let chain_store = &self.chain_store;
         let mut ws = self.world_state.write();
 
