@@ -831,18 +831,32 @@ async fn handle_swarm_event(
                             );
                         return;
                     }
-                    // F-062: accept valid message so gossipsub propagates it.
+                    let acceptance = match try_forward_message_event(event_tx, peer, msg) {
+                        Ok(()) => gossipsub::MessageAcceptance::Accept,
+                        Err(MessageEventQueueError::Full) => {
+                            debug!(
+                                peer = %propagation_source,
+                                "Node event queue is full - ignoring validated message"
+                            );
+                            gossipsub::MessageAcceptance::Ignore
+                        }
+                        Err(MessageEventQueueError::Closed) => {
+                            debug!(
+                                peer = %propagation_source,
+                                "Node event queue is closed - ignoring validated message"
+                            );
+                            gossipsub::MessageAcceptance::Ignore
+                        }
+                    };
+                    // F-062: propagate only messages admitted to the node event queue.
                     swarm
                         .behaviour_mut()
                         .gossipsub
                         .report_message_validation_result(
                             &message_id,
                             &propagation_source,
-                            gossipsub::MessageAcceptance::Accept,
+                            acceptance,
                         );
-                    let _ = event_tx
-                        .send(NetworkEvent::MessageReceived { peer, message: msg })
-                        .await;
                 }
                 Err(e) => {
                     // F-062: reject invalid message — penalize sender.
@@ -1099,6 +1113,25 @@ fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
     }
 }
 
+fn try_forward_message_event(
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    peer: PeerId,
+    message: NetworkMessage,
+) -> Result<(), MessageEventQueueError> {
+    event_tx
+        .try_send(NetworkEvent::MessageReceived { peer, message })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => MessageEventQueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => MessageEventQueueError::Closed,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageEventQueueError {
+    Full,
+    Closed,
+}
+
 fn message_matches_topic(
     msg: &NetworkMessage,
     actual_topic: &gossipsub::TopicHash,
@@ -1234,6 +1267,25 @@ mod tests {
             &txs_topic,
             &attestation_topic,
             &proofs_topic,
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_message_forwarding_does_not_wait_on_a_full_queue() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let peer = PeerId::from("peer-a");
+
+        try_forward_message_event(&event_tx, peer.clone(), NetworkMessage::Ping).unwrap();
+        let error = try_forward_message_event(&event_tx, peer.clone(), NetworkMessage::Pong)
+            .expect_err("a full node event queue must reject without waiting");
+
+        assert_eq!(error, MessageEventQueueError::Full);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(NetworkEvent::MessageReceived {
+                peer: received_peer,
+                message: NetworkMessage::Ping,
+            }) if received_peer == peer
         ));
     }
 
