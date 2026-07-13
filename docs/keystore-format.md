@@ -120,7 +120,7 @@ dk = argon2id(
 The derived key `dk` is 32 bytes and is used directly as the XChaCha20-Poly1305 key.
 It is zeroed from memory immediately after use.
 
-**CLI defaults** (v0.27.0):
+**CLI defaults** (v0.27.1):
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|

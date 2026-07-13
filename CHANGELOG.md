@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-07-14 — Consensus and RPC correctness fixes
+
+### Fixed
+
+- Bound finality vote aggregation and advancement to the complete signed
+  attestation target metadata.
+- Kept RPC filter cursors monotonic while preserving expiration behavior.
+- Skipped underpriced mempool entries when assembling block candidates so
+  later eligible transactions remain available for inclusion.
+
 ## [0.27.0] — 2026-07-12 — Security and state-integrity hardening
 
 ### Changed
