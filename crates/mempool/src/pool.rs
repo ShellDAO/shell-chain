@@ -420,6 +420,27 @@ impl TxPool {
     /// nonce `N + 1` must not be returned before nonce `N`, even if `N + 1`
     /// pays a higher priority fee.
     pub fn pending_for_block(&self, limit: usize) -> Vec<SignedTransaction> {
+        self.pending_for_block_matching(limit, |_| true)
+    }
+
+    /// Collect transactions that can pay the next block's base fee while
+    /// preserving per-sender nonce contiguity.
+    ///
+    /// Underpriced sender heads are retained in the pool but do not consume the
+    /// result limit or allow later nonces from that sender to bypass them.
+    pub fn pending_for_block_at_base_fee(
+        &self,
+        limit: usize,
+        base_fee_per_gas: u64,
+    ) -> Vec<SignedTransaction> {
+        self.pending_for_block_matching(limit, |tx| tx.tx.max_fee_per_gas >= base_fee_per_gas)
+    }
+
+    fn pending_for_block_matching(
+        &self,
+        limit: usize,
+        is_eligible: impl Fn(&SignedTransaction) -> bool,
+    ) -> Vec<SignedTransaction> {
         let inner = self.inner.read();
         let mut selected = Vec::with_capacity(limit.min(inner.by_hash.len()));
         let mut ready: BTreeMap<PriorityKey, (Address, ShellHash)> = BTreeMap::new();
@@ -427,7 +448,9 @@ impl TxPool {
         for (sender, queue) in &inner.by_sender {
             if let Some((_nonce, hash)) = queue.first_key_value() {
                 if let Some(entry) = inner.by_hash.get(hash) {
-                    ready.insert(entry.priority_key, (*sender, *hash));
+                    if is_eligible(&entry.tx) {
+                        ready.insert(entry.priority_key, (*sender, *hash));
+                    }
                 }
             }
         }
@@ -449,7 +472,9 @@ impl TxPool {
                     {
                         if *queued_nonce == next_nonce {
                             if let Some(next_entry) = inner.by_hash.get(next_hash) {
-                                if next_entry.priority_key != priority_key {
+                                if next_entry.priority_key != priority_key
+                                    && is_eligible(&next_entry.tx)
+                                {
                                     ready.insert(next_entry.priority_key, (sender, *next_hash));
                                 }
                             }
@@ -914,6 +939,24 @@ mod tests {
         priority_fee: u64,
         value: U256,
     ) -> SignedTransaction {
+        make_signed_value_tx_with_fees(
+            signer,
+            pubkey,
+            nonce,
+            priority_fee + 10,
+            priority_fee,
+            value,
+        )
+    }
+
+    fn make_signed_value_tx_with_fees(
+        signer: &DilithiumSigner,
+        pubkey: &[u8],
+        nonce: u64,
+        max_fee: u64,
+        priority_fee: u64,
+        value: U256,
+    ) -> SignedTransaction {
         let from = test_address(pubkey);
         let tx = Transaction {
             chain_id: 42,
@@ -922,7 +965,7 @@ mod tests {
             value,
             data: Bytes::default(),
             gas_limit: 21_000,
-            max_fee_per_gas: priority_fee + 10,
+            max_fee_per_gas: max_fee,
             max_priority_fee_per_gas: priority_fee,
             access_list: None,
             tx_type: 2,
@@ -1605,6 +1648,54 @@ mod tests {
             block_view,
             vec![other_hash, sender_tx0_hash, sender_tx1_hash]
         );
+    }
+
+    #[test]
+    fn block_candidate_limit_does_not_count_underpriced_sender_heads() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        set_head(&cs, 30_000_000, 1);
+
+        let underpriced_signer = DilithiumSigner::generate();
+        let underpriced_pubkey = underpriced_signer.public_key().to_vec();
+        let underpriced = make_signed_value_tx_with_fees(
+            &underpriced_signer,
+            &underpriced_pubkey,
+            0,
+            100,
+            90,
+            U256::ZERO,
+        );
+        let underpriced_descendant = make_signed_value_tx_with_fees(
+            &underpriced_signer,
+            &underpriced_pubkey,
+            1,
+            200,
+            95,
+            U256::ZERO,
+        );
+
+        let eligible_signer = DilithiumSigner::generate();
+        let eligible_pubkey = eligible_signer.public_key().to_vec();
+        let eligible = make_signed_value_tx_with_fees(
+            &eligible_signer,
+            &eligible_pubkey,
+            0,
+            200,
+            10,
+            U256::ZERO,
+        );
+        let eligible_hash = eligible.hash();
+
+        insert_rich(&pool, underpriced, &verifier, &mut ws, &cs).unwrap();
+        insert_rich(&pool, underpriced_descendant, &verifier, &mut ws, &cs).unwrap();
+        insert_rich(&pool, eligible, &verifier, &mut ws, &cs).unwrap();
+
+        let candidates = pool.pending_for_block_at_base_fee(1, 150);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].hash(), eligible_hash);
     }
 
     #[test]

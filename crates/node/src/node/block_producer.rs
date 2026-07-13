@@ -45,21 +45,20 @@ impl<S: KvStore + 'static> Node<S> {
             finalized_hash,
         )?;
 
-        // Collect pending transactions from mempool.
-        let candidates = mem_pool.pending_for_block(max_txs);
+        // Calculate EIP-1559 base fee from parent block before selecting
+        // candidates so underpriced transactions do not consume the limit.
+        let base_fee = calculate_base_fee(
+            head.header.gas_used,
+            head.header.gas_limit,
+            head.header.base_fee_per_gas,
+        );
+        let candidates = mem_pool.pending_for_block(max_txs, base_fee);
 
         // Create an isolated EVM instance at the current state root.
         let (state_db, current_root) = block_store.isolated_state_db()?;
         let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
 
         let now = self.current_block_timestamp(head.header.timestamp);
-
-        // Calculate EIP-1559 base fee from parent block.
-        let base_fee = calculate_base_fee(
-            head.header.gas_used,
-            head.header.gas_limit,
-            head.header.base_fee_per_gas,
-        );
 
         // Build a preliminary header for EVM context.
         let mut header = BlockHeader {
