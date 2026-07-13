@@ -8,13 +8,14 @@
 
 #![no_main]
 
+use alloy_rlp::Decodable;
 use libfuzzer_sys::fuzz_target;
 use shell_core::{BlockHeader, SignedTransaction};
 
 fuzz_target!(|data: &[u8]| {
     // BlockHeader decode — must not panic on any input.
-    let _ = alloy_rlp::decode::<BlockHeader>(data);
+    let _ = BlockHeader::decode(&mut &data[..]);
 
     // SignedTransaction decode — must not panic on any input.
-    let _ = alloy_rlp::decode::<SignedTransaction>(data);
+    let _ = SignedTransaction::decode(&mut &data[..]);
 });

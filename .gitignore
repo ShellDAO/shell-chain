@@ -1,5 +1,8 @@
 # Build
 /target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 
 # IDE
 .vscode/

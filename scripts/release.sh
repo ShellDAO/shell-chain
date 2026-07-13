@@ -4,7 +4,7 @@
 # Automates the git tagging and release checklist for a new version.
 #
 # Usage: ./scripts/release.sh <version>
-#   e.g.  ./scripts/release.sh 0.13.0
+#   e.g.  ./scripts/release.sh 0.27.0
 #
 # Pre-conditions:
 #   - Working tree must be clean (no uncommitted changes)
@@ -29,7 +29,7 @@ fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
     echo "Usage: $0 <version>"
-    echo "  e.g. $0 0.13.0"
+    echo "  e.g. $0 0.27.0"
     exit 1
 fi
 
@@ -89,9 +89,13 @@ fi
 echo ""
 echo "── Fuzz targets ──"
 if [ -d fuzz ]; then
-    ok "fuzz/ directory present (${TAG} targets: fuzz_rlp, fuzz_rpc, fuzz_p2p_msg)"
+    if cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets; then
+        ok "Fuzz targets compile: fuzz_rlp, fuzz_rpc, fuzz_p2p_msg"
+    else
+        fail "Fuzz target check failed"
+    fi
 else
-    warn "fuzz/ directory not found — skipping fuzz check"
+    fail "fuzz/ directory not found"
 fi
 
 # ── Deny check ────────────────────────────────────────────────
@@ -102,10 +106,10 @@ if command -v cargo-deny &>/dev/null; then
     if cargo deny check; then
         ok "cargo deny check passed"
     else
-        warn "cargo deny check reported issues (see above)"
+        fail "cargo deny check reported issues (see above)"
     fi
 else
-    warn "cargo-deny not installed — skipping (install: cargo install cargo-deny)"
+    fail "cargo-deny not installed (install: cargo install cargo-deny)"
 fi
 
 # ── Cargo audit ──────────────────────────────────────────────
@@ -113,13 +117,13 @@ fi
 echo ""
 echo "── Security audit ──"
 if command -v cargo-audit &>/dev/null; then
-    if cargo audit; then
-        ok "cargo audit passed (no known vulnerabilities)"
+    if cargo audit && cargo audit --file fuzz/Cargo.lock; then
+        ok "cargo audit passed for workspace and fuzz dependencies"
     else
-        warn "cargo audit found advisories (review before tagging)"
+        fail "cargo audit found advisories (review before tagging)"
     fi
 else
-    warn "cargo-audit not installed — skipping (install: cargo install cargo-audit)"
+    fail "cargo-audit not installed (install: cargo install cargo-audit)"
 fi
 
 # ── Create and push tag ──────────────────────────────────────

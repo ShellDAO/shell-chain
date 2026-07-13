@@ -1,8 +1,14 @@
 [package]
 name = "shell-fuzz"
-version = "0.13.0"
+version = "0.27.0"
 edition = "2021"
+license = "MIT"
 publish = false
+
+[workspace]
+
+[patch.crates-io]
+ark-relations = { path = "../deps/ark-relations" }
 
 [lib]
 name = "shell_fuzz"
