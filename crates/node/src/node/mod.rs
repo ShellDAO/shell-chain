@@ -5857,6 +5857,9 @@ mod tests {
         // and its attestation entry is pruned by prune_below(1).
         // Verify finalization rather than raw attestation count.
         assert_eq!(node.finality.read().last_finalized_hash(), &block_hash);
+        let fork_choice = node.fork_choice.read();
+        assert_eq!(fork_choice.block_count(), 1);
+        assert_eq!(fork_choice.parent(&block_hash), Some(&ShellHash::ZERO));
     }
 
     #[test]
