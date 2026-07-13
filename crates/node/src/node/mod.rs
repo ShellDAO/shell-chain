@@ -898,12 +898,25 @@ impl<S: KvStore + 'static> Node<S> {
     fn preferred_fork_ahead(&self) -> Option<(ShellHash, u64, u64)> {
         let canonical_head = self.chain_store.get_head_block().ok().flatten()?;
         let canonical_number = canonical_head.number();
-        let fork_choice = self.fork_choice.read();
-        let preferred_hash = *fork_choice.head();
+        let (preferred_hash, preferred_number, attested_weight) = {
+            let fork_choice = self.fork_choice.read();
+            let preferred_hash = *fork_choice.head();
+            let score = fork_choice.score(&preferred_hash)?;
+            (preferred_hash, score.block_number, score.attested_weight)
+        };
         if preferred_hash == canonical_head.hash() {
             return None;
         }
-        let preferred_number = fork_choice.score(&preferred_hash)?.block_number;
+        let total_weight = self
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        if !FinalityState::has_weighted_quorum(attested_weight, total_weight) {
+            return None;
+        }
         (preferred_number > canonical_number).then_some((
             preferred_hash,
             preferred_number,
@@ -1671,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_fork_ahead_only_flags_higher_noncanonical_branch() {
+    fn preferred_fork_ahead_requires_quorum_for_noncanonical_branch() {
         let (node, _signer) = setup_node();
         store_genesis(&node);
         let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
@@ -1680,12 +1693,27 @@ mod tests {
 
         node.fork_choice
             .write()
-            .add_block(same_height_fork, ShellHash::ZERO, 0, 10, false);
+            .add_block(same_height_fork, ShellHash::ZERO, 0, 0, false);
         assert!(node.preferred_fork_ahead().is_none());
 
         node.fork_choice
             .write()
-            .add_block(ahead_fork, genesis_hash, 1, 11, false);
+            .add_block(ahead_fork, genesis_hash, 1, 0, false);
+        assert!(node.preferred_fork_ahead().is_none());
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let quorum_weight =
+            u64::try_from((u128::from(total_weight).saturating_mul(2) / 3).saturating_add(1))
+                .unwrap();
+        node.fork_choice
+            .write()
+            .update_attested_weight(&ahead_fork, quorum_weight);
         assert_eq!(node.preferred_fork_ahead(), Some((ahead_fork, 1, 0)));
     }
 
