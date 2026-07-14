@@ -1385,8 +1385,7 @@ fn set_guardians<S: KvStore + 'static>(
         ));
     }
 
-    let mut guardians: Vec<[u8; 20]> = Vec::with_capacity(array_len);
-    let caller_raw: [u8; 20] = caller.to_alloy().into();
+    let mut guardians: Vec<Address> = Vec::with_capacity(array_len);
     for i in 0..array_len {
         let word_start = elem_start.saturating_add(i.saturating_mul(32));
         let addr = decode_address(
@@ -1394,14 +1393,13 @@ fn set_guardians<S: KvStore + 'static>(
                 .get(word_start..word_start.saturating_add(32))
                 .ok_or_else(|| SystemContractError::AbiDecode("address OOB".into()))?,
         )?;
-        let raw: [u8; 20] = addr.to_alloy().into();
-        if raw == caller_raw {
+        if addr == *caller {
             return Err(SystemContractError::GuardianIsSelf);
         }
-        if guardians.contains(&raw) {
+        if guardians.contains(&addr) {
             return Err(SystemContractError::DuplicateGuardian);
         }
-        guardians.push(raw);
+        guardians.push(addr);
     }
 
     let config = GuardianConfig {
@@ -1485,8 +1483,7 @@ fn submit_recovery<S: KvStore + 'static>(
         .map_err(|e| SystemContractError::Storage(e.to_string()))?
         .ok_or(SystemContractError::NoGuardianConfig(account))?;
 
-    let caller_raw: [u8; 20] = caller.to_alloy().into();
-    if !config.guardians.contains(&caller_raw) {
+    if !config.guardians.contains(caller) {
         return Err(SystemContractError::NotAGuardian);
     }
 
@@ -1508,10 +1505,10 @@ fn submit_recovery<S: KvStore + 'static>(
     }
 
     // Reject duplicate vote from same guardian
-    if proposal.votes.contains(&caller_raw) {
+    if proposal.votes.contains(caller) {
         return Ok(()); // idempotent — already voted
     }
-    proposal.votes.push(caller_raw);
+    proposal.votes.push(*caller);
 
     // Check if threshold reached and maturity not yet set
     if proposal.maturity_block == 0 && proposal.votes.len() >= config.threshold as usize {
@@ -3613,6 +3610,54 @@ mod tests {
         assert_eq!(config.guardians.len(), 2);
         assert_eq!(config.threshold, 1);
         assert_eq!(config.timelock, 100);
+    }
+
+    #[test]
+    fn set_guardians_preserves_full_shell_addresses() {
+        let owner = Address::from([0x30; 32]);
+        let mut first_bytes = [0x31; 32];
+        let mut second_bytes = [0x32; 32];
+        second_bytes[12..].copy_from_slice(&first_bytes[12..]);
+        first_bytes[0] = 0x41;
+        second_bytes[0] = 0x42;
+        let first = Address::from(first_bytes);
+        let second = Address::from(second_bytes);
+        let (mut ws, cs) = setup_account_manager();
+
+        let calldata = encode_set_guardians_calldata(&[first, second], 1, 100);
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+
+        let config = cs.get_guardian_config(&owner).unwrap().unwrap();
+        assert_eq!(config.guardians, vec![first, second]);
+    }
+
+    #[test]
+    fn submit_recovery_rejects_truncated_guardian_collision() {
+        let owner = Address::from([0x40; 32]);
+        let mut guardian_bytes = [0x51; 32];
+        let mut attacker_bytes = guardian_bytes;
+        guardian_bytes[0] = 0x61;
+        attacker_bytes[0] = 0x62;
+        let guardian = Address::from(guardian_bytes);
+        let attacker = Address::from(attacker_bytes);
+        let (mut ws, cs) = setup_account_manager();
+
+        let calldata = encode_set_guardians_calldata(&[guardian], 1, 100);
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+
+        let calldata = encode_submit_recovery_calldata(&owner, b"new-pubkey", 1);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &attacker,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SystemContractError::NotAGuardian));
+        assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
     }
 
     #[test]

@@ -20,11 +20,33 @@ pub const MAX_GUARDIANS: usize = 5;
 /// Minimum timelock in blocks between recovery initiation and execution.
 pub const MIN_RECOVERY_TIMELOCK: u64 = 100;
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredGuardianAddress {
+    Native(Address),
+    Legacy([u8; 20]),
+}
+
+fn deserialize_guardian_addresses<'de, D>(deserializer: D) -> Result<Vec<Address>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Vec::<StoredGuardianAddress>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|address| match address {
+            StoredGuardianAddress::Native(address) => address,
+            StoredGuardianAddress::Legacy(address) => Address::from(address),
+        })
+        .collect())
+}
+
 /// Guardian set configuration stored per account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GuardianConfig {
     /// List of guardian addresses (1..=MAX_GUARDIANS).
-    pub guardians: Vec<[u8; 20]>,
+    #[serde(deserialize_with = "deserialize_guardian_addresses")]
+    pub guardians: Vec<Address>,
     /// Required number of guardian votes (1..=guardians.len()).
     pub threshold: u8,
     /// Minimum blocks between threshold-reach and execution.
@@ -39,7 +61,8 @@ pub struct RecoveryProposal {
     /// Algorithm ID of the new public key.
     pub new_algo: u8,
     /// Guardian addresses that have voted for this exact proposal.
-    pub votes: Vec<[u8; 20]>,
+    #[serde(deserialize_with = "deserialize_guardian_addresses")]
+    pub votes: Vec<Address>,
     /// Block number after which `executeRecovery` may be called.
     /// Zero means the threshold has not yet been reached.
     pub maturity_block: u64,
@@ -141,9 +164,9 @@ mod prefix {
     /// Address → tx_hash newest-first index:
     /// key = "ar/" + address(32) + inverted_block_number(8) + tx_index(4)
     pub const ADDR_TX_INDEX_REV: &[u8] = b"ar/";
-    /// Guardian config: key = "gc/" + address(20) → JSON-encoded GuardianConfig
+    /// Guardian config: key = "gc/" + address(32) → JSON-encoded GuardianConfig
     pub const GUARDIAN_CONFIG: &[u8] = b"gc/";
-    /// Active recovery proposal: key = "rp/" + address(20) → JSON-encoded RecoveryProposal
+    /// Active recovery proposal: key = "rp/" + address(32) → JSON-encoded RecoveryProposal
     pub const RECOVERY_PROPOSAL: &[u8] = b"rp/";
     pub const TOTAL_TX_COUNT: &[u8] = b"TOTAL_TX_COUNT";
     pub const TOTAL_GAS_USED: &[u8] = b"TOTAL_GAS_USED";
@@ -2731,6 +2754,36 @@ mod tests {
 
         let loaded = cs.get_pubkey(&addr).unwrap().unwrap();
         assert_eq!(loaded, vec![2; 200]);
+    }
+
+    #[test]
+    fn guardian_storage_preserves_native_addresses_and_reads_legacy_entries() {
+        let native = Address::from([0xabu8; 32]);
+        let config = GuardianConfig {
+            guardians: vec![native],
+            threshold: 1,
+            timelock: MIN_RECOVERY_TIMELOCK,
+        };
+        let encoded = serde_json::to_vec(&config).unwrap();
+        let decoded: GuardianConfig = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, config);
+
+        let legacy: GuardianConfig = serde_json::from_value(serde_json::json!({
+            "guardians": [vec![0xcdu8; 20]],
+            "threshold": 1,
+            "timelock": MIN_RECOVERY_TIMELOCK,
+        }))
+        .unwrap();
+        assert_eq!(legacy.guardians, vec![Address::from([0xcdu8; 20])]);
+
+        let legacy_proposal: RecoveryProposal = serde_json::from_value(serde_json::json!({
+            "new_pubkey": [1, 2, 3],
+            "new_algo": 1,
+            "votes": [vec![0xefu8; 20]],
+            "maturity_block": 100,
+        }))
+        .unwrap();
+        assert_eq!(legacy_proposal.votes, vec![Address::from([0xefu8; 20])]);
     }
 
     #[test]
