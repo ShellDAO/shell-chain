@@ -795,7 +795,7 @@ mod tests {
         let from = signer_address(&signer);
         fund_account(&mut ws, &from, U256::from(1_000_000));
 
-        let mut tx = simple_transfer(test_chain_id(), 0);
+        let mut tx = simple_transfer(test_chain_id(), u64::default());
         tx.gas_limit = 100; // way too low
         let signed = sign_tx(&signer, tx, true);
 

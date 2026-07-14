@@ -1216,7 +1216,7 @@ mod tests {
         let pool = TxPool::new(make_config());
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
-        let (mut tx, _pk) = make_signed_tx(0, 100);
+        let (mut tx, _pk) = make_signed_tx(u64::default(), 100);
         tx.tx.max_fee_per_blob_gas = Some(1_000_000);
 
         let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
