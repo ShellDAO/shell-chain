@@ -1647,7 +1647,11 @@ mod tests {
         let pool = TxPool::new(make_config());
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
-        let (tx, _) = make_signed_tx(0, 100);
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let nonce = ws.get_nonce(&sender).unwrap();
+        let tx = make_signed_tx_with_signer(&signer, &pubkey, nonce, 100);
         let hash = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
 
         let stored = Arc::clone(&pool.inner.read().by_hash.get(&hash).unwrap().tx);
