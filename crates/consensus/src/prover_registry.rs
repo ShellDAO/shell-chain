@@ -106,6 +106,7 @@ impl std::error::Error for RegistryError {}
 pub struct ProverRegistry {
     config: ProverRegistryConfig,
     provers: HashMap<Address, ProverRecord>,
+    decay_accounted_through: HashMap<Address, u64>,
 }
 
 impl ProverRegistry {
@@ -113,6 +114,7 @@ impl ProverRegistry {
         Self {
             config,
             provers: HashMap::new(),
+            decay_accounted_through: HashMap::new(),
         }
     }
 
@@ -142,6 +144,7 @@ impl ProverRegistry {
                 proofs_submitted: 0,
             },
         );
+        self.decay_accounted_through.insert(address, current_block);
         Ok(())
     }
 
@@ -150,6 +153,7 @@ impl ProverRegistry {
         self.provers
             .remove(address)
             .ok_or(RegistryError::NotRegistered)?;
+        self.decay_accounted_through.remove(address);
         Ok(())
     }
 
@@ -163,10 +167,18 @@ impl ProverRegistry {
             .provers
             .get_mut(address)
             .ok_or(RegistryError::NotRegistered)?;
-        record.proofs_submitted += 1;
-        record.last_active_block = current_block;
-        record.reputation = (record.reputation + self.config.reputation_per_proof)
-            .min(self.config.initial_reputation * 2);
+        record.proofs_submitted = record.proofs_submitted.saturating_add(1);
+        record.last_active_block = record.last_active_block.max(current_block);
+        let reputation_cap = self.config.initial_reputation.saturating_mul(2);
+        record.reputation = record
+            .reputation
+            .saturating_add(self.config.reputation_per_proof)
+            .min(reputation_cap);
+        let decay_baseline = self
+            .decay_accounted_through
+            .entry(*address)
+            .or_insert(current_block);
+        *decay_baseline = (*decay_baseline).max(current_block);
         Ok(())
     }
 
@@ -176,7 +188,7 @@ impl ProverRegistry {
             .provers
             .get_mut(address)
             .ok_or(RegistryError::NotRegistered)?;
-        record.reputation += penalty;
+        record.reputation = record.reputation.saturating_add(penalty);
         Ok(())
     }
 
@@ -189,10 +201,19 @@ impl ProverRegistry {
 
         let mut to_remove = Vec::new();
         for (addr, record) in self.provers.iter_mut() {
-            let inactive_blocks = current_block.saturating_sub(record.last_active_block);
+            let decay_baseline = self
+                .decay_accounted_through
+                .entry(*addr)
+                .or_insert(record.last_active_block);
+            let baseline = (*decay_baseline).max(record.last_active_block);
+            let inactive_blocks = current_block.saturating_sub(baseline);
             let periods = inactive_blocks / 100;
             if periods > 0 {
-                record.reputation += decay * periods as i64;
+                let decay_periods = i64::try_from(periods).unwrap_or(i64::MAX);
+                record.reputation = record
+                    .reputation
+                    .saturating_add(decay.saturating_mul(decay_periods));
+                *decay_baseline = baseline.saturating_add(periods.saturating_mul(100));
             }
             if record.reputation <= min_rep {
                 to_remove.push(*addr);
@@ -200,6 +221,7 @@ impl ProverRegistry {
         }
         for addr in to_remove {
             self.provers.remove(&addr);
+            self.decay_accounted_through.remove(&addr);
         }
     }
 
@@ -317,6 +339,17 @@ mod tests {
     }
 
     #[test]
+    fn advance_only_applies_new_inactivity_periods() {
+        let mut r = registry();
+        r.register(addr(1), 1_000, 0).unwrap();
+
+        r.advance(100);
+        r.advance(200);
+
+        assert_eq!(r.get(&addr(1)).unwrap().reputation, 98);
+    }
+
+    #[test]
     fn reputation_capped_at_double_initial() {
         let mut r = registry();
         r.register(addr(1), 1_000, 0).unwrap();
@@ -325,5 +358,38 @@ mod tests {
         }
         let rep = r.get(&addr(1)).unwrap().reputation;
         assert_eq!(rep, 200); // capped at 2 * initial (100)
+    }
+
+    #[test]
+    fn proof_accounting_saturates_at_numeric_limits() {
+        let mut r = ProverRegistry::new(ProverRegistryConfig {
+            initial_reputation: i64::MAX,
+            reputation_per_proof: i64::MAX,
+            ..ProverRegistryConfig::default()
+        });
+        r.register(addr(1), 1_000, 0).unwrap();
+        r.provers.get_mut(&addr(1)).unwrap().proofs_submitted = u64::MAX;
+
+        r.record_proof(&addr(1), 1).unwrap();
+
+        let record = r.get(&addr(1)).unwrap();
+        assert_eq!(record.proofs_submitted, u64::MAX);
+        assert_eq!(record.reputation, i64::MAX);
+    }
+
+    #[test]
+    fn penalties_and_decay_saturate_at_numeric_limits() {
+        let mut r = ProverRegistry::new(ProverRegistryConfig {
+            initial_reputation: i64::MAX,
+            min_reputation: i64::MIN,
+            decay_per_100_blocks: i64::MAX,
+            ..ProverRegistryConfig::default()
+        });
+        r.register(addr(1), 1_000, 0).unwrap();
+
+        r.penalize(&addr(1), i64::MAX).unwrap();
+        r.advance(u64::MAX);
+
+        assert_eq!(r.get(&addr(1)).unwrap().reputation, i64::MAX);
     }
 }

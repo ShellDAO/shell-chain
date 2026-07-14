@@ -24,6 +24,11 @@
 use shell_primitives::{Address, ShellHash};
 use std::collections::HashMap;
 
+fn increment_expired_claim(expired_claims: &mut HashMap<Address, u32>, prover: Address) {
+    let count = expired_claims.entry(prover).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
 /// Configuration for proof window management.
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
@@ -121,7 +126,7 @@ impl ProofWindowManager {
                 if current_block >= *expires_at_block {
                     // Claim has expired — release and re-claim.
                     let expired_claimer = *existing;
-                    *self.expired_claims.entry(expired_claimer).or_insert(0) += 1;
+                    increment_expired_claim(&mut self.expired_claims, expired_claimer);
                     let expires_at_block =
                         current_block.saturating_add(self.config.claim_timeout_blocks);
                     self.windows.insert(
@@ -171,7 +176,7 @@ impl ProofWindowManager {
                     });
                 }
                 if current_block > *expires_at_block {
-                    *self.expired_claims.entry(prover).or_insert(0) += 1;
+                    increment_expired_claim(&mut self.expired_claims, prover);
                     self.windows.insert(block_number, WindowState::Expired);
                     return Err(WindowError::WindowExpired { block_number });
                 }
@@ -216,7 +221,7 @@ impl ProofWindowManager {
             } = state
             {
                 if current_block > *expires_at_block {
-                    *self.expired_claims.entry(*claimer).or_insert(0) += 1;
+                    increment_expired_claim(&mut self.expired_claims, *claimer);
                     let block_number = *block_number;
                     let _ = block_number; // used for context
                     *state = WindowState::Expired;
@@ -415,6 +420,17 @@ mod tests {
             let _ = mgr.claim(i, addr(2), 25); // triggers expiry count for addr(1)
         }
         assert!(mgr.is_unreliable(&addr(1)));
+    }
+
+    #[test]
+    fn expired_claim_count_saturates_at_numeric_limit() {
+        let mut mgr = default_mgr();
+        mgr.expired_claims.insert(addr(1), u32::MAX);
+        mgr.claim(10, addr(1), 0).unwrap();
+
+        mgr.claim(10, addr(2), 25).unwrap();
+
+        assert_eq!(mgr.expired_claim_count(&addr(1)), u32::MAX);
     }
 
     #[test]
