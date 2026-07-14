@@ -63,6 +63,29 @@ pub struct ShellStateDb<S: KvStore + 'static> {
     pub(crate) address_registry: HashMap<EvmAddress, ShellAddress>,
 }
 
+/// Read-only bridge used by simulation and validation paths.
+///
+/// revm journals transaction changes internally during `transact`; because
+/// these callers never commit the result, borrowing the live state is enough
+/// to guarantee that simulated writes are discarded.
+pub(crate) struct ShellStateRefDb<'a, S: KvStore + 'static> {
+    world_state: &'a WorldState<S>,
+    chain_store: &'a ChainStore<S>,
+}
+
+impl<'a, S: KvStore + 'static> ShellStateRefDb<'a, S> {
+    pub(crate) fn new(world_state: &'a WorldState<S>, chain_store: &'a ChainStore<S>) -> Self {
+        Self {
+            world_state,
+            chain_store,
+        }
+    }
+
+    pub(crate) fn world_state(&self) -> &WorldState<S> {
+        self.world_state
+    }
+}
+
 impl<S: KvStore + 'static> ShellStateDb<S> {
     /// Create a new state database bridge.
     ///
@@ -186,6 +209,42 @@ impl<S: KvStore + 'static> Database for ShellStateDb<S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let shell_addr = self.resolve_address(&address);
+        let key = ShellHash::from(B256::from(index));
+        let value_hash = self.world_state.get_storage(&shell_addr, &key)?;
+        Ok(U256::from_be_bytes(*value_hash.as_bytes()))
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        match self.chain_store.get_block_by_number(number)? {
+            Some(block) => Ok(shell_hash_to_b256(&block.hash())),
+            None => Ok(B256::ZERO),
+        }
+    }
+}
+
+impl<S: KvStore + 'static> Database for ShellStateRefDb<'_, S> {
+    type Error = StateDbError;
+
+    fn basic(&mut self, address: EvmAddress) -> Result<Option<AccountInfo>, Self::Error> {
+        let shell_addr = ShellAddress::from(address);
+        Ok(self
+            .world_state
+            .get_account(&shell_addr)?
+            .map(|account| ShellStateDb::<S>::to_account_info(&account)))
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let hash = b256_to_shell_hash(&code_hash);
+        match self.chain_store.get_code(&hash)? {
+            Some(code) => {
+                Ok(Bytecode::new_raw_checked(code.into()).unwrap_or_else(|_| Bytecode::default()))
+            }
+            None => Ok(Bytecode::default()),
+        }
+    }
+
+    fn storage(&mut self, address: EvmAddress, index: U256) -> Result<U256, Self::Error> {
+        let shell_addr = ShellAddress::from(address);
         let key = ShellHash::from(B256::from(index));
         let value_hash = self.world_state.get_storage(&shell_addr, &key)?;
         Ok(U256::from_be_bytes(*value_hash.as_bytes()))

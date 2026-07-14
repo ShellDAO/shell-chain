@@ -17,7 +17,7 @@ use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 
 use crate::precompiles::ShellPrecompiles;
-use crate::state_db::{shell_hash_to_b256, ShellStateDb, StateDbError};
+use crate::state_db::{shell_hash_to_b256, ShellStateDb, ShellStateRefDb, StateDbError};
 use crate::tx_validation::verify_paymaster_signature;
 
 pub const VALIDATION_GAS_CAP: u64 = 500_000;
@@ -113,7 +113,7 @@ pub enum AaValidationError {
 
 pub fn validate_aa_tx<S: KvStore + 'static, V: Verifier>(
     signed_tx: &SignedTransaction,
-    world_state: &mut WorldState<S>,
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
     verifier: &V,
 ) -> Result<AaValidationOutcome, AaValidationError> {
@@ -277,7 +277,7 @@ fn resolve_pubkey(
 
 fn validate_custom_contract<S: KvStore + 'static>(
     signed_tx: &SignedTransaction,
-    world_state: &mut WorldState<S>,
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
     validation_code_hash: ShellHash,
     pubkey: &[u8],
@@ -335,16 +335,14 @@ fn should_fallback_to_v1(error: &AaValidationError) -> bool {
 
 fn call_custom_validation_contract<S: KvStore + 'static>(
     signed_tx: &SignedTransaction,
-    world_state: &mut WorldState<S>,
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
     validation_code_hash: ShellHash,
     calldata: Vec<u8>,
 ) -> Result<Vec<u8>, AaValidationError> {
-    let snapshot = world_state.snapshot()?;
-    let validation_chain_store = ChainStore::new(chain_store.store().clone());
     let state_db = ValidationStateDb::new(
-        snapshot,
-        validation_chain_store,
+        world_state,
+        chain_store,
         signed_tx.from,
         validation_code_hash,
     );
@@ -654,16 +652,16 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
 }
 
 ///
-/// The call runs against a world-state snapshot; the snapshot is discarded
-/// afterward so no state mutations persist even if the paymaster contract
-/// internally writes storage.
+/// revm journals writes inside the transaction result. The result is never
+/// committed, so the borrowed world state remains unchanged even if the
+/// paymaster contract internally writes storage.
 ///
 /// `calldata` here is the outer transaction's `tx.data` (the AaBundle RLP).
 fn call_paymaster_validate<S: KvStore + 'static>(
     signed_tx: &SignedTransaction,
     paymaster: &Address,
     context: &[u8],
-    world_state: &mut WorldState<S>,
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<(), AaValidationError> {
     let max_gas_cost = U256::from(signed_tx.tx.gas_limit)
@@ -677,9 +675,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         context,
     );
 
-    let snapshot = world_state.snapshot()?;
-    let paymaster_chain_store = ChainStore::new(chain_store.store().clone());
-    let state_db = ShellStateDb::new(snapshot, paymaster_chain_store);
+    let state_db = ShellStateRefDb::new(world_state, chain_store);
 
     let head = chain_store.get_head_block()?;
     let (number, timestamp, gas_limit, excess_blob_gas) = match head {
@@ -718,7 +714,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
     block_env.set_blob_excess_gas_and_price(excess_blob_gas, 3_338_477);
 
     let mut db = state_db;
-    let ctx: MainnetContext<&mut ShellStateDb<S>> = Context::new(&mut db, SpecId::CANCUN)
+    let ctx: MainnetContext<&mut ShellStateRefDb<'_, S>> = Context::new(&mut db, SpecId::CANCUN)
         .modify_block_chained(|b| *b = block_env)
         .modify_cfg_chained(|cfg: &mut CfgEnv| {
             cfg.chain_id = signed_tx.tx.chain_id;
@@ -847,28 +843,28 @@ fn encode_validate_paymaster_op_calldata(
     out
 }
 
-struct ValidationStateDb<S: KvStore + 'static> {
-    inner: ShellStateDb<S>,
+struct ValidationStateDb<'a, S: KvStore + 'static> {
+    inner: ShellStateRefDb<'a, S>,
     validation_target: Address,
     validation_code_hash: ShellHash,
 }
 
-impl<S: KvStore + 'static> ValidationStateDb<S> {
+impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
     fn new(
-        world_state: WorldState<S>,
-        chain_store: ChainStore<S>,
+        world_state: &'a WorldState<S>,
+        chain_store: &'a ChainStore<S>,
         validation_target: Address,
         validation_code_hash: ShellHash,
     ) -> Self {
         Self {
-            inner: ShellStateDb::new(world_state, chain_store),
+            inner: ShellStateRefDb::new(world_state, chain_store),
             validation_target,
             validation_code_hash,
         }
     }
 }
 
-impl<S: KvStore + 'static> Database for ValidationStateDb<S> {
+impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
     type Error = StateDbError;
 
     fn basic(
@@ -990,6 +986,14 @@ mod tests {
 
     fn validator_returns_false() -> Vec<u8> {
         vec![0x60, 0x00, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]
+    }
+
+    fn validator_stores_then_returns_true() -> Vec<u8> {
+        vec![
+            0x60, 0x01, 0x60, 0x00, 0x55, // sstore(0, 1)
+            0x60, 0x01, 0x60, 0x00, 0x52, // mstore(0, 1)
+            0x60, 0x20, 0x60, 0x00, 0xf3, // return(0, 32)
+        ]
     }
 
     fn read_abi_u64(word: &[u8]) -> u64 {
@@ -1116,7 +1120,7 @@ mod tests {
         fund_account(&mut ws, &from);
         let signed = sign_tx(&signer, base_tx(1337, 0), true);
 
-        let outcome = validate_aa_tx(&signed, &mut ws, &cs, &DilithiumVerifier).unwrap();
+        let outcome = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
@@ -1180,7 +1184,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = validate_aa_tx(&signed, &mut ws, &cs, &MultiVerifier).unwrap();
+        let outcome = validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).unwrap();
         assert_eq!(outcome.pubkey, root.public_key());
         assert!(outcome.should_register_pubkey);
     }
@@ -1194,7 +1198,7 @@ mod tests {
         cs.put_pubkey(&from, signer.public_key()).unwrap();
         let signed = sign_tx(&signer, base_tx(1337, 0), false);
 
-        let outcome = validate_aa_tx(&signed, &mut ws, &cs, &DilithiumVerifier).unwrap();
+        let outcome = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(!outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
@@ -1229,10 +1233,46 @@ mod tests {
             PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
         );
 
-        let outcome = validate_aa_tx(&signed, &mut ws, &cs, &DilithiumVerifier).unwrap();
+        let outcome = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
         assert!(outcome.pubkey.is_empty());
         assert!(!outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    #[test]
+    fn custom_validation_discards_journaled_storage_writes() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        let storage_key = ShellHash::ZERO;
+
+        let code = validator_stores_then_returns_true();
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        ws.set_account(
+            &from,
+            &Account {
+                pq_pubkey_hash: ShellHash::ZERO,
+                nonce: 0,
+                balance: U256::from(1_000_000u64),
+                validation_code_hash: Some(code_hash),
+                code_hash: None,
+                storage_root: ShellHash::ZERO,
+            },
+        )
+        .unwrap();
+
+        let signed = SignedTransaction::new(
+            from,
+            base_tx(1337, 0),
+            PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
+        );
+
+        validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
+        assert_eq!(
+            ws.get_storage(&from, &storage_key).unwrap(),
+            ShellHash::ZERO
+        );
     }
 
     #[test]
@@ -1263,7 +1303,7 @@ mod tests {
             PQSignature::new(SignatureType::MlDsa65, vec![0xbb; 64]),
         );
 
-        let err = validate_aa_tx(&signed, &mut ws, &cs, &DilithiumVerifier).unwrap_err();
+        let err = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap_err();
         assert!(matches!(
             err,
             AaValidationError::ValidationContractRejected(_)
