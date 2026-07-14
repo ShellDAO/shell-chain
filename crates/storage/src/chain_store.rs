@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use shell_core::{Block, BlockHeader, StrippedBlock, SystemTransaction, TransactionReceipt};
 use shell_primitives::{Address, ShellHash, U256};
 
-use crate::{KvStore, StorageError, WriteBatch};
+use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
 
 /// Persistent chain configuration (written once at genesis).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -918,15 +918,12 @@ impl<S: KvStore> ChainStore<S> {
         Ok(())
     }
 
-    /// Atomically commit all canonical block artifacts in one batch.
-    ///
-    /// This prevents partial storage visibility where only some of the block,
-    /// receipt, tx-index, canonical, or HEAD records are written.
-    pub fn commit_canonical_block(
+    /// Build the batch containing all canonical block artifacts.
+    fn canonical_block_batch(
         &self,
         block: &Block,
         receipts: Option<&[TransactionReceipt]>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<WriteBatch, StorageError> {
         let block_hash = block.hash();
         let mut batch = WriteBatch::new();
 
@@ -946,6 +943,20 @@ impl<S: KvStore> ChainStore<S> {
             block_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::HEAD_BLOCK.to_vec(), block_hash.as_bytes().to_vec());
+
+        Ok(batch)
+    }
+
+    /// Atomically commit all canonical block artifacts in one batch.
+    ///
+    /// This prevents partial storage visibility where only some of the block,
+    /// receipt, tx-index, canonical, or HEAD records are written.
+    pub fn commit_canonical_block(
+        &self,
+        block: &Block,
+        receipts: Option<&[TransactionReceipt]>,
+    ) -> Result<(), StorageError> {
+        let batch = self.canonical_block_batch(block, receipts)?;
 
         self.store.write_batch(batch)
     }
@@ -1728,6 +1739,18 @@ impl<S: KvStore> ChainStore<S> {
         } else {
             self.rebuild_chain_totals(block_number)
         }
+    }
+}
+
+impl<S: KvStore> ChainStore<OverlayStore<S>> {
+    /// Atomically commit overlay changes and canonical block artifacts to the base store.
+    pub fn commit_canonical_overlay(
+        &self,
+        block: &Block,
+        receipts: Option<&[TransactionReceipt]>,
+    ) -> Result<(), StorageError> {
+        let batch = self.canonical_block_batch(block, receipts)?;
+        self.store.commit_with_batch(batch)
     }
 }
 

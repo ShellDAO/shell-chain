@@ -744,12 +744,20 @@ impl<S: KvStore + 'static> Node<S> {
         // skip the check.
         self.verify_incoming_witness_root(&block)?;
 
-        import_store.commit()?;
+        let import_cs = ChainStore::new(import_store.clone());
+        for (address, pubkey) in &new_pubkeys {
+            // Execution may have changed the key through the account manager.
+            // Preserve that staged value instead of restoring the transaction's
+            // pre-execution embedded key.
+            if import_cs.get_pubkey(address)?.is_none() {
+                import_cs.put_pubkey(address, pubkey)?;
+            }
+        }
+        import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();
-        block_store.commit_canonical_block(&block, Some(receipts.as_slice()))?;
         algorithm_registry_rollback.commit();
         block_store.replace_world_state(committed_world_state);
         let settlement_hashes: Vec<ShellHash> = block
@@ -775,15 +783,6 @@ impl<S: KvStore + 'static> Node<S> {
         self.last_proposed_by
             .lock()
             .insert(block.header.proposer, block.number());
-        for (address, pubkey) in new_pubkeys {
-            // Execution may have changed the key through the account manager.
-            // Do not overwrite that canonical state with the transaction's
-            // pre-execution embedded key.
-            if self.chain_store.get_pubkey(&address)?.is_none() {
-                block_store.store_pubkey(&address, &pubkey)?;
-            }
-        }
-
         // L2 grace-window: flush any witnesses whose delete_at block has been reached.
         block_store.prune_grace_witnesses(block.number());
 

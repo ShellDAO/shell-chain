@@ -22,6 +22,14 @@ impl<S: KvStore> OverlayStore<S> {
 
     /// Atomically apply all pending changes to the base store.
     pub fn commit(&self) -> Result<(), StorageError> {
+        self.commit_with_batch(WriteBatch::new())
+    }
+
+    /// Atomically apply pending changes together with an additional batch.
+    ///
+    /// Additional operations are appended after overlay changes, so explicit
+    /// commit metadata wins if both batches contain the same key.
+    pub fn commit_with_batch(&self, additional: WriteBatch) -> Result<(), StorageError> {
         let mut changes = self
             .changes
             .write()
@@ -31,6 +39,12 @@ impl<S: KvStore> OverlayStore<S> {
             match value {
                 Some(value) => batch.put(key.clone(), value.clone()),
                 None => batch.delete(key.clone()),
+            }
+        }
+        for op in additional.ops() {
+            match op {
+                WriteBatchOp::Put { key, value } => batch.put(key.clone(), value.clone()),
+                WriteBatchOp::Delete { key } => batch.delete(key.clone()),
             }
         }
         self.base.write_batch(batch)?;
@@ -141,5 +155,25 @@ mod tests {
         assert_eq!(base.get(b"item/a").unwrap(), Some(b"new".to_vec()));
         assert_eq!(base.get(b"item/b").unwrap(), None);
         assert_eq!(base.get(b"item/c").unwrap(), Some(b"added".to_vec()));
+    }
+
+    #[test]
+    fn commit_with_batch_applies_overlay_and_metadata_atomically() {
+        let base = Arc::new(MemoryDb::new());
+        let overlay = OverlayStore::new(base.clone());
+        overlay.put(b"state/account", b"updated").unwrap();
+        overlay.put(b"HEAD", b"stale").unwrap();
+
+        let mut metadata = WriteBatch::new();
+        metadata.put(b"block/1".to_vec(), b"encoded".to_vec());
+        metadata.put(b"HEAD".to_vec(), b"canonical".to_vec());
+        overlay.commit_with_batch(metadata).unwrap();
+
+        assert_eq!(
+            base.get(b"state/account").unwrap(),
+            Some(b"updated".to_vec())
+        );
+        assert_eq!(base.get(b"block/1").unwrap(), Some(b"encoded".to_vec()));
+        assert_eq!(base.get(b"HEAD").unwrap(), Some(b"canonical".to_vec()));
     }
 }

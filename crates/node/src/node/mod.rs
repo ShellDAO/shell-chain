@@ -1367,7 +1367,7 @@ mod tests {
     use shell_mempool::MempoolConfig;
     use shell_primitives::U256;
     use shell_rpc::DevRpcControl;
-    use shell_storage::{MemoryDb, StorageError, WriteBatch};
+    use shell_storage::{MemoryDb, StorageError, WriteBatch, WriteBatchOp};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1389,6 +1389,7 @@ mod tests {
     struct FailingBatchDb {
         inner: MemoryDb,
         fail_next_batch: AtomicBool,
+        fail_head_batch: AtomicBool,
     }
 
     impl FailingBatchDb {
@@ -1396,11 +1397,16 @@ mod tests {
             Self {
                 inner: MemoryDb::new(),
                 fail_next_batch: AtomicBool::new(false),
+                fail_head_batch: AtomicBool::new(false),
             }
         }
 
         fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_head_batch(&self) {
+            self.fail_head_batch.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1424,6 +1430,15 @@ mod tests {
         fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
             if self.fail_next_batch.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected batch failure".into()));
+            }
+            if self.fail_head_batch.load(Ordering::SeqCst)
+                && batch.ops().iter().any(
+                    |op| matches!(op, WriteBatchOp::Put { key, .. } if key.as_slice() == b"HEAD"),
+                )
+            {
+                return Err(StorageError::Database(
+                    "injected canonical batch failure".into(),
+                ));
             }
             self.inner.write_batch(batch)
         }
@@ -4923,6 +4938,87 @@ mod tests {
         assert!(
             follower.chain_store.get_pubkey(&sender).unwrap().is_none(),
             "rejected imports must not persist account-manager side state"
+        );
+    }
+
+    #[test]
+    fn import_commit_failure_leaves_account_manager_side_state_unchanged() {
+        let (leader, proposer_signer) = setup_node();
+        store_genesis(&leader);
+        let proposer = leader.config.proposer_address.unwrap();
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let initial_balance = U256::from(1_000_000_000_000_000u64);
+        fund_account(&leader, &sender, initial_balance);
+        let new_pubkey = vec![0xAB; 1312];
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(shell_pqvm::account_manager_address()),
+            value: U256::ZERO,
+            data: Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                &new_pubkey,
+                tx_signer.sig_type().as_u8(),
+            )),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed =
+            SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
+        let verifier = MultiVerifier;
+        leader
+            .tx_pool
+            .insert(
+                signed,
+                &mut leader.world_state.write(),
+                leader.chain_store.as_ref(),
+                &verifier,
+            )
+            .unwrap();
+        let block = leader.produce_block(&proposer_signer, 100).unwrap();
+
+        let follower_db = Arc::new(FailingBatchDb::new());
+        let follower_cs = Arc::new(ChainStore::new(follower_db.clone()));
+        let follower_ws = Arc::new(RwLock::new(WorldState::new(follower_db.clone())));
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![proposer], 1),
+        )));
+        let follower = Node::new(
+            NodeConfig::dev(proposer),
+            follower_db.clone(),
+            follower_cs,
+            follower_ws,
+            Arc::new(TxPool::new(MempoolConfig {
+                chain_id: 1337,
+                ..MempoolConfig::default()
+            })),
+            consensus,
+        );
+        store_genesis(&follower);
+        fund_account(&follower, &sender, initial_balance);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        let root_before = current_state_root(&follower);
+        let head_before = follower.chain_store.get_head_hash().unwrap().unwrap();
+
+        follower_db.fail_head_batch();
+        let err = follower.import_block(block, &verifier).unwrap_err();
+        assert!(err.to_string().contains("injected canonical batch failure"));
+        assert_eq!(
+            follower.chain_store.get_head_hash().unwrap(),
+            Some(head_before)
+        );
+        assert_eq!(current_state_root(&follower), root_before);
+        assert!(
+            follower.chain_store.get_pubkey(&sender).unwrap().is_none(),
+            "failed canonical commits must not persist account-manager side state"
         );
     }
 
