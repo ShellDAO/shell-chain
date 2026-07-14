@@ -239,18 +239,10 @@ fn build_swarm_with_identity(
     // Build libp2p connection limits from config.
     let mut conn_limits = connection_limits::ConnectionLimits::default();
 
-    // Enforce max_peers as an upper bound on total established connections (F-070).
-    // When both max_peers and max_connections are set, use the stricter limit.
-    let effective_max_established = match (config.max_connections > 0, config.max_peers > 0) {
-        (true, true) => Some(std::cmp::min(
-            config.max_connections,
-            config.max_peers as u32,
-        )),
-        (true, false) => Some(config.max_connections),
-        (false, true) => Some(config.max_peers as u32),
-        (false, false) => None,
-    };
-    if let Some(limit) = effective_max_established {
+    // `max_connections` bounds connections, while PeerTracker separately bounds
+    // unique peers. Combining the two here would let duplicate connections consume
+    // peer slots and prevent the node from reaching its configured peer count.
+    if let Some(limit) = max_established_connection_limit(config) {
         conn_limits = conn_limits.with_max_established(Some(limit));
     }
 
@@ -537,6 +529,10 @@ fn build_swarm_with_identity(
     );
 
     Ok(swarm)
+}
+
+fn max_established_connection_limit(config: &NetworkConfig) -> Option<u32> {
+    (config.max_connections > 0).then_some(config.max_connections)
 }
 
 struct SwarmLoopConfig {
@@ -1802,6 +1798,28 @@ mod tests {
         assert_eq!(config.max_pending_incoming, 64);
         assert_eq!(config.max_pending_outgoing, 32);
         assert_eq!(config.max_established_per_peer, 3);
+    }
+
+    #[test]
+    fn total_connection_limit_is_independent_of_unique_peer_limit() {
+        let config = NetworkConfig {
+            max_connections: 100,
+            max_peers: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(max_established_connection_limit(&config), Some(100));
+    }
+
+    #[test]
+    fn zero_total_connection_limit_remains_unlimited() {
+        let config = NetworkConfig {
+            max_connections: 0,
+            max_peers: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(max_established_connection_limit(&config), None);
     }
 
     #[test]
