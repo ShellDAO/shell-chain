@@ -7,7 +7,7 @@ use revm::handler::instructions::EthInstructions;
 use revm::handler::{ExecuteEvm, MainnetContext};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::TxKind;
-use revm::state::AccountInfo;
+use revm::state::{AccountInfo, Bytecode};
 use shell_core::{InnerCall, SessionAuth, SignedTransaction};
 use shell_crypto::{
     infer_signature_type_from_address, is_algorithm_allowed, PQSignature, SignatureType, Verifier,
@@ -675,7 +675,13 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         context,
     );
 
-    let state_db = ShellStateRefDb::new(world_state, chain_store);
+    let wrapper_address = paymaster_validation_wrapper_address(paymaster);
+    let state_db = ValidationStateDb::with_inline_code(
+        world_state,
+        chain_store,
+        wrapper_address,
+        paymaster_validation_wrapper_code(paymaster),
+    );
 
     let head = chain_store.get_head_block()?;
     let (number, timestamp, gas_limit, excess_blob_gas) = match head {
@@ -693,7 +699,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         .gas_limit(PAYMASTER_VALIDATE_GAS_CAP)
         .max_fee_per_gas(0)
         .gas_priority_fee(Some(0))
-        .kind(TxKind::Call((*paymaster).into()))
+        .kind(TxKind::Call(wrapper_address.into()))
         .value(alloy_primitives::U256::ZERO)
         .data(AlBytes::from(calldata))
         .nonce(0)
@@ -714,7 +720,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
     block_env.set_blob_excess_gas_and_price(excess_blob_gas, 3_338_477);
 
     let mut db = state_db;
-    let ctx: MainnetContext<&mut ShellStateRefDb<'_, S>> = Context::new(&mut db, SpecId::CANCUN)
+    let ctx: MainnetContext<&mut ValidationStateDb<'_, S>> = Context::new(&mut db, SpecId::CANCUN)
         .modify_block_chained(|b| *b = block_env)
         .modify_cfg_chained(|cfg: &mut CfgEnv| {
             cfg.chain_id = signed_tx.tx.chain_id;
@@ -765,6 +771,32 @@ fn call_paymaster_validate<S: KvStore + 'static>(
             }
         }
     }
+}
+
+fn paymaster_validation_wrapper_address(paymaster: &Address) -> Address {
+    let mut bytes = [0xFF; 32];
+    if paymaster.to_alloy().as_slice() == &bytes[12..] {
+        bytes[31] = 0xFE;
+    }
+    Address::from(bytes)
+}
+
+/// Build a transient wrapper that forwards calldata with `STATICCALL` and
+/// propagates the target's return or revert data.
+fn paymaster_validation_wrapper_code(paymaster: &Address) -> Vec<u8> {
+    let mut code = vec![
+        0x36, 0x5F, 0x5F, 0x37, // calldatacopy(0, 0, calldatasize())
+        0x5F, 0x5F, 0x36, 0x5F, 0x73, // staticcall output/input arguments + PUSH20
+    ];
+    code.extend_from_slice(paymaster.to_alloy().as_slice());
+    code.extend_from_slice(&[
+        0x5A, 0xFA, // gas(), staticcall(...)
+        0x3D, 0x5F, 0x5F, 0x3E, // returndatacopy(0, 0, returndatasize())
+        0x60, 0x29, 0x57, // jump to success when STATICCALL returned true
+        0x3D, 0x5F, 0xFD, // revert(0, returndatasize())
+        0x5B, 0x3D, 0x5F, 0xF3, // success: return(0, returndatasize())
+    ]);
+    code
 }
 
 fn decode_abi_bool(bytes: &[u8]) -> Option<bool> {
@@ -847,6 +879,7 @@ struct ValidationStateDb<'a, S: KvStore + 'static> {
     inner: ShellStateRefDb<'a, S>,
     validation_target: Address,
     validation_code_hash: ShellHash,
+    inline_code: Option<Bytecode>,
 }
 
 impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
@@ -860,6 +893,25 @@ impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
             inner: ShellStateRefDb::new(world_state, chain_store),
             validation_target,
             validation_code_hash,
+            inline_code: None,
+        }
+    }
+
+    fn with_inline_code(
+        world_state: &'a WorldState<S>,
+        chain_store: &'a ChainStore<S>,
+        validation_target: Address,
+        code: Vec<u8>,
+    ) -> Self {
+        let validation_code_hash = keccak256(&code);
+        Self {
+            inner: ShellStateRefDb::new(world_state, chain_store),
+            validation_target,
+            validation_code_hash,
+            inline_code: Some(
+                Bytecode::new_raw_checked(code.into())
+                    .unwrap_or_else(|_| unreachable!("wrapper bytecode is valid")),
+            ),
         }
     }
 }
@@ -883,6 +935,9 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
                     .map_err(StateDbError::Storage)?
                     .map(|a| ShellStateDb::<S>::to_account_info(&a));
             }
+            if info.is_none() && self.inline_code.is_some() {
+                info = Some(AccountInfo::default());
+            }
             if let Some(ref mut account) = info {
                 account.code_hash = shell_hash_to_b256(&self.validation_code_hash);
                 account.code = None;
@@ -895,6 +950,11 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
         &mut self,
         code_hash: alloy_primitives::B256,
     ) -> Result<revm::state::Bytecode, Self::Error> {
+        if code_hash == shell_hash_to_b256(&self.validation_code_hash) {
+            if let Some(code) = &self.inline_code {
+                return Ok(code.clone());
+            }
+        }
         self.inner.code_by_hash(code_hash)
     }
 
@@ -1097,6 +1157,59 @@ mod tests {
         let mut invalid_value = [0u8; 32];
         invalid_value[31] = 2;
         assert_eq!(decode_abi_bool(&invalid_value), None);
+    }
+
+    fn install_paymaster(
+        ws: &mut WorldState<MemoryDb>,
+        cs: &ChainStore<MemoryDb>,
+        paymaster: Address,
+        code: Vec<u8>,
+    ) {
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        ws.set_account(
+            &paymaster,
+            &Account {
+                pq_pubkey_hash: ShellHash::ZERO,
+                nonce: 0,
+                balance: U256::ZERO,
+                validation_code_hash: None,
+                code_hash: Some(code_hash),
+                storage_root: ShellHash::ZERO,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn paymaster_validation_accepts_read_only_contract() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = Address::from([0x77; 20]);
+        install_paymaster(&mut ws, &cs, paymaster, validator_returns_true());
+        let signed = sign_tx(&signer, base_tx(1337, 0), true);
+
+        assert!(call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).is_ok());
+    }
+
+    #[test]
+    fn paymaster_validation_rejects_state_changes() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = Address::from([0x77; 20]);
+        install_paymaster(
+            &mut ws,
+            &cs,
+            paymaster,
+            validator_stores_then_returns_true(),
+        );
+        let signed = sign_tx(&signer, base_tx(1337, 0), true);
+
+        let error = call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).unwrap_err();
+
+        assert!(
+            matches!(error, AaValidationError::PaymasterValidationFailed(message) if message.starts_with("reverted:"))
+        );
     }
 
     #[test]
