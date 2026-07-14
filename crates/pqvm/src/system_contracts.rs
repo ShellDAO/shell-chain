@@ -1349,12 +1349,7 @@ fn set_guardians<S: KvStore + 'static>(
             .unwrap_or_else(|| unreachable!("params.len() >= 96")),
     )?;
 
-    // Decode address array at array_offset
-    if array_offset.saturating_add(32) > params.len() {
-        return Err(SystemContractError::AbiDecode(
-            "setGuardians: array offset out of bounds".into(),
-        ));
-    }
+    validate_dynamic_offset(array_offset, 96, params.len(), "setGuardians array")?;
     let array_len = decode_word_usize(
         params
             .get(array_offset..array_offset.saturating_add(32))
@@ -1448,12 +1443,7 @@ fn submit_recovery<S: KvStore + 'static>(
     // Validate algo
     SignatureType::from_u8(new_algo).ok_or(SystemContractError::InvalidAlgorithm(new_algo))?;
 
-    // Decode bytes payload
-    if bytes_offset.saturating_add(32) > params.len() {
-        return Err(SystemContractError::AbiDecode(
-            "submitRecovery: bytes offset OOB".into(),
-        ));
-    }
+    validate_dynamic_offset(bytes_offset, 96, params.len(), "submitRecovery bytes")?;
     let bytes_len = decode_word_usize(
         params
             .get(bytes_offset..bytes_offset.saturating_add(32))
@@ -1650,6 +1640,30 @@ fn decode_word_usize(word: &[u8]) -> Result<usize, SystemContractError> {
     Ok(u64::from_be_bytes(tail) as usize)
 }
 
+fn validate_dynamic_offset(
+    offset: usize,
+    head_len: usize,
+    input_len: usize,
+    field: &str,
+) -> Result<(), SystemContractError> {
+    if offset < head_len {
+        return Err(SystemContractError::AbiDecode(format!(
+            "{field} offset points into the static head"
+        )));
+    }
+    if !offset.is_multiple_of(32) {
+        return Err(SystemContractError::AbiDecode(format!(
+            "{field} offset is not 32-byte aligned"
+        )));
+    }
+    if offset.checked_add(32).is_none_or(|end| end > input_len) {
+        return Err(SystemContractError::AbiDecode(format!(
+            "{field} offset points beyond calldata"
+        )));
+    }
+    Ok(())
+}
+
 fn decode_hash(input: &[u8]) -> Result<ShellHash, SystemContractError> {
     if input.len() < 32 {
         return Err(SystemContractError::AbiDecode(format!(
@@ -1758,11 +1772,7 @@ fn decode_rotate_key_params(input: &[u8]) -> Result<(Vec<u8>, u8), SystemContrac
             .get(32..64)
             .unwrap_or_else(|| unreachable!("input.len() >= 64 checked above")),
     )?;
-    if offset.saturating_add(32) > input.len() {
-        return Err(SystemContractError::AbiDecode(
-            "bytes offset points beyond calldata".into(),
-        ));
-    }
+    validate_dynamic_offset(offset, 64, input.len(), "rotateKey bytes")?;
 
     let bytes_len = decode_word_usize(
         input
@@ -3210,6 +3220,67 @@ mod tests {
 
         assert!(matches!(
             decode_address_u64(&input),
+            Err(SystemContractError::AbiDecode(_))
+        ));
+    }
+
+    #[test]
+    fn rotate_key_rejects_dynamic_offset_into_static_head() {
+        let calldata = encode_rotate_key_calldata(&[0x42; 32], SignatureType::MlDsa65.as_u8());
+        let mut params = calldata[4..].to_vec();
+        params[..32].copy_from_slice(&encode_usize_word(32));
+
+        assert!(matches!(
+            decode_rotate_key_params(&params),
+            Err(SystemContractError::AbiDecode(_))
+        ));
+    }
+
+    #[test]
+    fn dynamic_offsets_must_be_word_aligned() {
+        assert!(matches!(
+            validate_dynamic_offset(65, 64, 128, "test bytes"),
+            Err(SystemContractError::AbiDecode(_))
+        ));
+    }
+
+    #[test]
+    fn set_guardians_rejects_dynamic_offset_into_static_head() {
+        let owner = Address::from([0x31; 20]);
+        let guardian = Address::from([0x32; 20]);
+        let (_ws, cs) = setup_account_manager();
+        let calldata = encode_set_guardians_calldata(&[guardian], 1, MIN_RECOVERY_TIMELOCK);
+        let mut params = calldata[4..].to_vec();
+        params[..32].copy_from_slice(&encode_usize_word(32));
+
+        assert!(matches!(
+            set_guardians(&owner, &params, &cs),
+            Err(SystemContractError::AbiDecode(_))
+        ));
+    }
+
+    #[test]
+    fn submit_recovery_rejects_dynamic_offset_into_static_head() {
+        let owner = Address::from([0x41; 20]);
+        let guardian = Address::from([0x42; 20]);
+        let other_guardian = Address::from([0x43; 20]);
+        let (_ws, cs) = setup_account_manager();
+        cs.put_guardian_config(
+            &owner,
+            &GuardianConfig {
+                guardians: vec![guardian, other_guardian],
+                threshold: 2,
+                timelock: MIN_RECOVERY_TIMELOCK,
+            },
+        )
+        .unwrap();
+        let calldata =
+            encode_submit_recovery_calldata(&owner, &[0x44; 32], SignatureType::MlDsa65.as_u8());
+        let mut params = calldata[4..].to_vec();
+        params[32..64].copy_from_slice(&encode_usize_word(64));
+
+        assert!(matches!(
+            submit_recovery(&guardian, &params, &cs),
             Err(SystemContractError::AbiDecode(_))
         ));
     }
