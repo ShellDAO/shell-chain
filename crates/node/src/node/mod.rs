@@ -246,6 +246,9 @@ const TX_REBROADCAST_INTERVAL_SECS: u64 = 10;
 const MAX_TX_REBROADCAST_PER_TICK: usize = 64;
 const TX_REBROADCAST_COOLDOWN_SECS: u64 = 60;
 
+const MAX_DEV_SNAPSHOTS: usize = 128;
+
+#[derive(Clone)]
 struct DevSnapshot {
     head_hash: ShellHash,
     head_number: u64,
@@ -260,7 +263,7 @@ struct DevSnapshot {
 struct DevState {
     next_block_timestamp: Option<u64>,
     next_snapshot_id: u64,
-    snapshots: BTreeMap<String, DevSnapshot>,
+    snapshots: BTreeMap<u64, DevSnapshot>,
 }
 
 type NodeStateDb<S> = ShellStateDb<S>;
@@ -1079,6 +1082,12 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn snapshot_inner(&self) -> Result<String, NodeError> {
+        if self.dev_state.read().snapshots.len() >= MAX_DEV_SNAPSHOTS {
+            return Err(NodeError::Startup(format!(
+                "dev snapshot limit reached ({MAX_DEV_SNAPSHOTS})"
+            )));
+        }
+
         let head = self
             .chain_store
             .get_head_block()?
@@ -1088,11 +1097,19 @@ impl<S: KvStore + 'static> Node<S> {
         let pending_txs = self.tx_pool.pending(self.tx_pool.len());
 
         let mut dev = self.dev_state.write();
-        let id = format!("0x{:x}", dev.next_snapshot_id);
-        dev.next_snapshot_id = dev.next_snapshot_id.saturating_add(1);
+        if dev.snapshots.len() >= MAX_DEV_SNAPSHOTS {
+            return Err(NodeError::Startup(format!(
+                "dev snapshot limit reached ({MAX_DEV_SNAPSHOTS})"
+            )));
+        }
+        let id = dev.next_snapshot_id;
+        dev.next_snapshot_id = dev
+            .next_snapshot_id
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Startup("dev snapshot ID space exhausted".into()))?;
         let next_block_timestamp = dev.next_block_timestamp;
         dev.snapshots.insert(
-            id.clone(),
+            id,
             DevSnapshot {
                 head_hash: head.hash(),
                 head_number: head.number(),
@@ -1104,23 +1121,23 @@ impl<S: KvStore + 'static> Node<S> {
                 next_block_timestamp,
             },
         );
-        Ok(id)
+        Ok(format!("0x{id:x}"))
     }
 
     fn revert_inner(&self, snapshot_id: &str) -> Result<bool, NodeError> {
+        let Some(snapshot_id) = snapshot_id.strip_prefix("0x") else {
+            return Ok(false);
+        };
+        if snapshot_id.is_empty() || snapshot_id.len() > 16 {
+            return Ok(false);
+        }
+        let Ok(snapshot_id) = u64::from_str_radix(snapshot_id, 16) else {
+            return Ok(false);
+        };
         let snapshot = {
             let dev = self.dev_state.read();
-            match dev.snapshots.get(snapshot_id) {
-                Some(s) => DevSnapshot {
-                    head_hash: s.head_hash,
-                    head_number: s.head_number,
-                    state_root: s.state_root,
-                    total_tx_count: s.total_tx_count,
-                    total_gas_used: s.total_gas_used,
-                    finalized_number: s.finalized_number,
-                    pending_txs: s.pending_txs.clone(),
-                    next_block_timestamp: s.next_block_timestamp,
-                },
+            match dev.snapshots.get(&snapshot_id) {
+                Some(s) => s.clone(),
                 None => return Ok(false),
             }
         };
@@ -1178,7 +1195,9 @@ impl<S: KvStore + 'static> Node<S> {
                 .insert(tx, &mut world_state, self.chain_store.as_ref(), &verifier);
         }
 
-        self.dev_state.write().next_block_timestamp = snapshot.next_block_timestamp;
+        let mut dev = self.dev_state.write();
+        dev.next_block_timestamp = snapshot.next_block_timestamp;
+        dev.snapshots.retain(|id, _| *id < snapshot_id);
 
         Ok(true)
     }
@@ -3254,6 +3273,47 @@ mod tests {
         let head_after_revert = node.chain_store.get_head_block().unwrap().unwrap();
         assert_eq!(head_after_revert.number(), 1);
         assert!(!node.revert("0xdeadbeef").unwrap());
+    }
+
+    #[test]
+    fn dev_rpc_snapshot_limit_bounds_retained_state() {
+        let (node, _) = setup_node();
+        store_genesis(&node);
+
+        for _ in 0..MAX_DEV_SNAPSHOTS {
+            node.snapshot().unwrap();
+        }
+
+        let err = node.snapshot().unwrap_err();
+        assert!(err.contains("dev snapshot limit reached"));
+        assert_eq!(node.dev_state.read().snapshots.len(), MAX_DEV_SNAPSHOTS);
+    }
+
+    #[test]
+    fn dev_rpc_revert_consumes_snapshot_and_newer_ids() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        *node.runtime_signer.write() = Some(Arc::new(signer));
+
+        let snapshot_1 = node.snapshot().unwrap();
+        node.mine_blocks(1).unwrap();
+        let snapshot_2 = node.snapshot().unwrap();
+        node.mine_blocks(1).unwrap();
+
+        assert!(node.revert(&snapshot_2).unwrap());
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            1
+        );
+        assert!(!node.revert(&snapshot_2).unwrap());
+
+        assert!(node.revert(&snapshot_1).unwrap());
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            0
+        );
+        assert!(!node.revert(&snapshot_1).unwrap());
+        assert!(node.dev_state.read().snapshots.is_empty());
     }
 
     #[test]

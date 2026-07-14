@@ -368,14 +368,16 @@ Increase the virtual clock used for future blocks.
 snapshot() → String
 ```
 
-Capture a snapshot of the current execution state.
+Capture a snapshot of the current execution state. A node retains at most
+128 active development snapshots.
 
 ### evm_revert
 ```
 revert(snapshot_id: String) → bool
 ```
 
-Revert to a previously captured snapshot.
+Revert to a previously captured snapshot. A successful revert consumes
+the selected snapshot and any snapshots created after it.
 
 
 ## shell_  namespace
