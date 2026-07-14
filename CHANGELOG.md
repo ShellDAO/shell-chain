@@ -803,8 +803,6 @@ All notable changes to this project will be documented in this file.
 - F-381: `PoaEngine::proposer_for_block` private field — bench uses inline modulo
 - F-382: Prometheus cache metrics deferred to M11
 
-## [Unreleased]
-
 ### Added
 - Native Account Abstraction guide covering `pq1...` addresses, validation layers, custom validator flow, and rollout boundaries
 

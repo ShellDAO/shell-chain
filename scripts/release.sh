@@ -9,7 +9,7 @@
 # Pre-conditions:
 #   - Working tree must be clean (no uncommitted changes)
 #   - Cargo.toml workspace version must match <version>
-#   - CHANGELOG.md must have a section for [<version>]
+#   - CHANGELOG.md must have one Unreleased section and one section for [<version>]
 #   - CI must be passing on HEAD
 set -euo pipefail
 
@@ -62,11 +62,23 @@ if [ "$CARGO_VERSION" != "$VERSION" ]; then
 fi
 ok "Cargo.toml version: ${CARGO_VERSION}"
 
-# 3. CHANGELOG has a release heading for this version
-if ! grep -Fq "## [${VERSION}]" CHANGELOG.md; then
-    fail "CHANGELOG.md does not contain a ## [${VERSION}] release heading"
+# 3. CHANGELOG has one Unreleased heading and one release heading for this version
+UNRELEASED_HEADING_COUNT=$(awk '$0 == "## [Unreleased]" { count++ } END { print count + 0 }' CHANGELOG.md)
+if [ "$UNRELEASED_HEADING_COUNT" -ne 1 ]; then
+    fail "CHANGELOG.md must contain exactly one ## [Unreleased] heading (found ${UNRELEASED_HEADING_COUNT})"
 fi
-ok "CHANGELOG.md has ## [${VERSION}] release heading"
+
+RELEASE_HEADING_COUNT=$(awk -v heading="## [${VERSION}]" '
+    index($0, heading) == 1 {
+        suffix = substr($0, length(heading) + 1, 1)
+        if (suffix == "" || suffix ~ /[[:space:]]/) count++
+    }
+    END { print count + 0 }
+' CHANGELOG.md)
+if [ "$RELEASE_HEADING_COUNT" -ne 1 ]; then
+    fail "CHANGELOG.md must contain exactly one ## [${VERSION}] release heading (found ${RELEASE_HEADING_COUNT})"
+fi
+ok "CHANGELOG.md has unique Unreleased and ## [${VERSION}] release headings"
 
 # 4. Tag does not already exist
 if git tag -l | grep -q "^${TAG}$"; then
@@ -143,7 +155,15 @@ fi
 echo ""
 echo "── Tagging ──"
 
-CHANGELOG_EXCERPT=$(awk "/\[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md | head -30)
+CHANGELOG_EXCERPT=$(awk -v heading="## [${VERSION}]" '
+    index($0, heading) == 1 {
+        suffix = substr($0, length(heading) + 1, 1)
+        if (suffix == "" || suffix ~ /[[:space:]]/) found = 1
+        next
+    }
+    found && /^## \[/ { exit }
+    found { print }
+' CHANGELOG.md | head -30)
 
 git tag -a "$TAG" -m "Release ${TAG}
 

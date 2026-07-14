@@ -42,13 +42,22 @@ assert_fails_with() {
     fi
 }
 
-fixture=$(make_fixture '## [0.27.1] - test release')
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
 assert_fails_with "$fixture" '0x27x1' "Version must be semver"
 
 touch "$fixture/untracked-release-input"
 assert_fails_with "$fixture" '0.27.1' "uncommitted or untracked files"
 
-fixture=$(make_fixture '[0.27.1]: https://example.invalid/release')
-assert_fails_with "$fixture" '0.27.1' "does not contain a ## [0.27.1] release heading"
+fixture=$(make_fixture $'## [Unreleased]\n\n[0.27.1]: https://example.invalid/release')
+assert_fails_with "$fixture" '0.27.1' "exactly one ## [0.27.1] release heading (found 0)"
+
+fixture=$(make_fixture '## [0.27.1] - test release')
+assert_fails_with "$fixture" '0.27.1' "exactly one ## [Unreleased] heading (found 0)"
+
+fixture=$(make_fixture $'## [Unreleased]\n\n## [Unreleased]\n\n## [0.27.1] - test release')
+assert_fails_with "$fixture" '0.27.1' "exactly one ## [Unreleased] heading (found 2)"
+
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - first\n\n## [0.27.1] - duplicate')
+assert_fails_with "$fixture" '0.27.1' "exactly one ## [0.27.1] release heading (found 2)"
 
 echo "release preflight tests passed"
