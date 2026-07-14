@@ -33,8 +33,8 @@ impl<S: KvStore + 'static> Node<S> {
 
         // F-087: Verify the attested block exists in our local chain store.
         // If unknown, log and skip — the block may arrive later via sync.
-        match self.chain_store.get_block_by_hash(&block_hash) {
-            Ok(Some(_)) => {}
+        let stored_block = match self.chain_store.get_block_by_hash(&block_hash) {
+            Ok(Some(block)) => block,
             Ok(None) => {
                 tracing::warn!(
                     %block_hash,
@@ -52,6 +52,17 @@ impl<S: KvStore + 'static> Node<S> {
                 );
                 return Ok(());
             }
+        };
+
+        // Bind the signed target metadata to the locally stored header. Without
+        // this check, one validator can poison this block hash's pending entry
+        // with a false height or parent before honest attestations arrive.
+        if block_number != stored_block.header.number
+            || attestation.parent_hash != stored_block.header.parent_hash
+        {
+            return Err(NodeError::Startup(format!(
+                "attestation target does not match stored block header for {block_hash}"
+            )));
         }
 
         // Reject cross-network attestations: chain_id must match our own.

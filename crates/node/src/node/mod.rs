@@ -6306,6 +6306,53 @@ mod tests {
     }
 
     #[test]
+    fn handle_attestation_rejects_target_metadata_mismatch() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+
+        let authority = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+
+        let block = node.produce_block(&signer, 100).unwrap();
+        let block_hash = block.hash();
+        let mismatched_targets = [
+            (ShellHash::from([0x55; 32]), block.header.number),
+            (block.header.parent_hash, block.header.number + 1),
+        ];
+
+        for (parent_hash, block_number) in mismatched_targets {
+            let signature = signer
+                .sign(&Attestation::signing_message(
+                    node.config.chain_id,
+                    &parent_hash,
+                    &block_hash,
+                    block_number,
+                    0,
+                ))
+                .unwrap();
+            let attestation = Attestation::new(
+                node.config.chain_id,
+                parent_hash,
+                block_hash,
+                block_number,
+                authority,
+                0,
+                signature.data,
+            );
+
+            let error = node
+                .handle_attestation(attestation, &MultiVerifier)
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("attestation target does not match stored block header"));
+        }
+        assert_eq!(node.finality.read().attestation_count(&block_hash), 0);
+        assert_eq!(node.finality.read().last_finalized_number(), 0);
+    }
+
+    #[test]
     fn handle_attestation_rejects_equivocation() {
         let (node, signer) = setup_node();
         store_genesis(&node);
