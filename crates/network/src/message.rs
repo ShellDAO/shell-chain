@@ -264,7 +264,40 @@ pub fn deserialize_checked(data: &[u8], limit: usize) -> Result<NetworkMessage, 
     let msg: NetworkMessage =
         serde_json::from_slice(data).map_err(|e| NetworkError::Serialization(e.to_string()))?;
     validate_message_size(data, msg.max_serialized_size())?;
+    msg.validate_semantics()?;
     Ok(msg)
+}
+
+impl NetworkMessage {
+    fn validate_semantics(&self) -> Result<(), NetworkError> {
+        match self {
+            Self::BlockRequest { count, .. } | Self::BodyRequest { count, .. }
+                if !(1..=MAX_RESPONSE_BLOCKS as u64).contains(count) =>
+            {
+                Err(NetworkError::Serialization(format!(
+                    "request count must be between 1 and {MAX_RESPONSE_BLOCKS}"
+                )))
+            }
+            Self::BlockResponse {
+                blocks,
+                commit_certificates,
+                ..
+            } if commit_certificates.len() > blocks.len() => Err(NetworkError::Serialization(
+                "commit certificate count exceeds block count".to_string(),
+            )),
+            Self::StorageCapability { profile, .. }
+                if !matches!(
+                    profile.to_ascii_lowercase().as_str(),
+                    "archive" | "full" | "pruned" | "rolling" | "light"
+                ) =>
+            {
+                Err(NetworkError::Serialization(
+                    "unknown storage capability profile".to_string(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn validate_response_block_count(data: &[u8]) -> Result<(), NetworkError> {
@@ -775,6 +808,69 @@ mod tests {
         let json = serde_json::to_vec(&msg).unwrap();
         let decoded = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap();
         assert!(matches!(decoded, NetworkMessage::Ping));
+    }
+
+    #[test]
+    fn deserialize_checked_rejects_out_of_range_sync_request_counts() {
+        for msg in [
+            NetworkMessage::BlockRequest {
+                start_number: 1,
+                count: 0,
+                nonce: 0,
+            },
+            NetworkMessage::BodyRequest {
+                start_number: 1,
+                count: MAX_RESPONSE_BLOCKS as u64 + 1,
+            },
+        ] {
+            let json = serde_json::to_vec(&msg).unwrap();
+            let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+            assert!(
+                matches!(err, NetworkError::Serialization(message) if message.contains("request count must be between"))
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_checked_rejects_excess_commit_certificates() {
+        let msg = NetworkMessage::BlockResponse {
+            blocks: vec![],
+            commit_certificates: vec![(ShellHash::default(), vec![])],
+            nonce: 0,
+        };
+        let json = serde_json::to_vec(&msg).unwrap();
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(
+            matches!(err, NetworkError::Serialization(message) if message.contains("certificate count exceeds block count"))
+        );
+    }
+
+    #[test]
+    fn deserialize_checked_rejects_unknown_storage_profile() {
+        let msg = NetworkMessage::StorageCapability {
+            profile: "untrusted-profile".to_string(),
+            oldest_body_block: 0,
+        };
+        let json = serde_json::to_vec(&msg).unwrap();
+
+        let err = deserialize_checked(&json, MAX_MESSAGE_SIZE).unwrap_err();
+
+        assert!(
+            matches!(err, NetworkError::Serialization(message) if message.contains("unknown storage capability profile"))
+        );
+    }
+
+    #[test]
+    fn deserialize_checked_accepts_storage_profile_alias_case_insensitively() {
+        let msg = NetworkMessage::StorageCapability {
+            profile: "Rolling".to_string(),
+            oldest_body_block: 10,
+        };
+        let json = serde_json::to_vec(&msg).unwrap();
+
+        assert!(deserialize_checked(&json, MAX_MESSAGE_SIZE).is_ok());
     }
 
     #[test]
