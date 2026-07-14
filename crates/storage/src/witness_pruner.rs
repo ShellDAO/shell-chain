@@ -21,6 +21,9 @@ use shell_primitives::ShellHash;
 /// Tuning: Mainnet should use 512 (≈17 minutes); testnet uses 256 for faster development cycles.
 pub const DEFAULT_WITNESS_RETENTION: u64 = 256;
 
+/// Maximum canonical block numbers examined by one prune pass.
+const MAX_WITNESS_PRUNE_BLOCKS_PER_PASS: u64 = 4_096;
+
 fn retention_cutoff(current_head: u64, retention_count: u64) -> u64 {
     current_head.saturating_sub(retention_count.saturating_sub(1))
 }
@@ -112,10 +115,18 @@ impl WitnessPruner {
             return Ok(WitnessPruneResult::default());
         }
 
+        // A restarted node reconstructs this in-memory cursor from zero. Bound
+        // each pass so a large finalized history cannot stall one block commit
+        // or allocate a history-sized deletion batch.
+        let pass_cutoff = cutoff.min(
+            self.pruned_below
+                .saturating_add(MAX_WITNESS_PRUNE_BLOCKS_PER_PASS),
+        );
+
         let mut result = WitnessPruneResult::default();
         let mut hashes_to_prune: Vec<ShellHash> = Vec::new();
 
-        for block_number in self.pruned_below..cutoff {
+        for block_number in self.pruned_below..pass_cutoff {
             // Resolve block hash from chain store (canonical mapping).
             match chain_store.get_block_hash_by_number(block_number)? {
                 Some(hash) => {
@@ -139,7 +150,7 @@ impl WitnessPruner {
         }
 
         witness_store.delete_bundles(&hashes_to_prune)?;
-        self.pruned_below = cutoff;
+        self.pruned_below = pass_cutoff;
         Ok(result)
     }
 
@@ -454,5 +465,21 @@ mod tests {
         for hash in hashes {
             assert!(!ws.has_bundle(&hash).unwrap());
         }
+    }
+
+    #[test]
+    fn prune_pass_caps_restart_backlog() {
+        let (_db, cs, ws) = make_store();
+        for number in 0..MAX_WITNESS_PRUNE_BLOCKS_PER_PASS {
+            store_block(&cs, number);
+        }
+
+        let mut pruner = WitnessPruner::new(1);
+        let result = pruner
+            .prune_before(MAX_WITNESS_PRUNE_BLOCKS_PER_PASS + 1, None, &cs, &ws)
+            .unwrap();
+
+        assert_eq!(result.not_found_count, MAX_WITNESS_PRUNE_BLOCKS_PER_PASS);
+        assert_eq!(pruner.pruned_below(), MAX_WITNESS_PRUNE_BLOCKS_PER_PASS);
     }
 }

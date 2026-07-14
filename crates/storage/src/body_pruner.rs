@@ -31,6 +31,9 @@ use shell_primitives::ShellHash;
 /// Default number of recent blocks whose bodies are always retained.
 pub const DEFAULT_BODY_RETENTION: u64 = 512;
 
+/// Maximum canonical block numbers examined by one prune pass.
+const MAX_BODY_PRUNE_BLOCKS_PER_PASS: u64 = 4_096;
+
 fn retention_cutoff(current_head: u64, retention_count: u64) -> u64 {
     current_head.saturating_sub(retention_count.saturating_sub(1))
 }
@@ -105,11 +108,18 @@ impl BodyPruner {
             return Ok(BodyPruneResult::default());
         }
 
+        // The cursor is intentionally in memory, so restart can leave a large
+        // backlog. Keep each commit-time pass bounded and catch up incrementally.
+        let pass_horizon = expiry_horizon.min(
+            self.pruned_below
+                .saturating_add(MAX_BODY_PRUNE_BLOCKS_PER_PASS),
+        );
+
         let mut result = BodyPruneResult::default();
         let start = self.pruned_below;
         let mut hashes_to_prune: Vec<ShellHash> = Vec::new();
 
-        for block_number in start..expiry_horizon {
+        for block_number in start..pass_horizon {
             result.blocks_checked = result.blocks_checked.saturating_add(1);
 
             // Resolve canonical hash for this block number.
@@ -132,7 +142,7 @@ impl BodyPruner {
         }
 
         chain_store.delete_bodies(&hashes_to_prune)?;
-        self.pruned_below = expiry_horizon;
+        self.pruned_below = pass_horizon;
         Ok(result)
     }
 
@@ -336,5 +346,17 @@ mod tests {
         for hash in hashes {
             assert!(cs.get_block_by_hash(&hash).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn prune_pass_caps_restart_backlog() {
+        let cs = setup_chain(MAX_BODY_PRUNE_BLOCKS_PER_PASS);
+        let mut pruner = BodyPruner::new(1);
+        let result = pruner
+            .prune_before(MAX_BODY_PRUNE_BLOCKS_PER_PASS + 1, &cs)
+            .unwrap();
+
+        assert_eq!(result.blocks_checked, MAX_BODY_PRUNE_BLOCKS_PER_PASS);
+        assert_eq!(pruner.pruned_below(), MAX_BODY_PRUNE_BLOCKS_PER_PASS);
     }
 }
