@@ -530,8 +530,10 @@ mod tests {
 
     #[test]
     fn kdf_deterministic_same_password_same_key() {
-        let password = b"deterministic-test";
-        let salt = [42u8; 32];
+        let mut password = [0u8; 32];
+        let mut salt = [0u8; 32];
+        rand::rng().fill_bytes(&mut password);
+        rand::rng().fill_bytes(&mut salt);
         let params = KdfParams {
             m_cost: 65536,
             t_cost: 3,
@@ -539,28 +541,32 @@ mod tests {
             salt: hex::encode(salt),
         };
 
-        let key1 = derive_key(password, &salt, &params).unwrap();
-        let key2 = derive_key(password, &salt, &params).unwrap();
+        let key1 = derive_key(&password, &salt, &params).unwrap();
+        let key2 = derive_key(&password, &salt, &params).unwrap();
         assert_eq!(
             key1, key2,
             "same password+salt must produce same derived key"
         );
 
-        // Different password must produce different key
-        let key3 = derive_key(b"different", &salt, &params).unwrap();
+        password[0] ^= 1;
+        let key3 = derive_key(&password, &salt, &params).unwrap();
         assert_ne!(key1, key3);
     }
 
     #[test]
     fn excessive_kdf_time_cost_is_rejected() {
+        let mut password = [0u8; 32];
+        let mut salt = [0u8; 32];
+        rand::rng().fill_bytes(&mut password);
+        rand::rng().fill_bytes(&mut salt);
         let params = KdfParams {
             m_cost: 8,
             t_cost: MAX_KDF_TIME_COST + 1,
             p_cost: 1,
-            salt: hex::encode([42u8; 32]),
+            salt: hex::encode(salt),
         };
 
-        let result = derive_key(b"password", &[42u8; 32], &params);
+        let result = derive_key(&password, &salt, &params);
 
         assert!(matches!(result, Err(KeystoreError::InvalidKey(_))));
     }
