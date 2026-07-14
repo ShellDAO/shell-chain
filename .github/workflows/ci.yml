@@ -59,9 +59,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: |
+          source scripts/supply-chain-tool-versions.sh
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: |
+          source scripts/supply-chain-tool-versions.sh
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
       - name: Deny check (licenses, bans, advisories)
         run: cargo deny check
       - name: Audit vulnerabilities

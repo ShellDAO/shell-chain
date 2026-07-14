@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
+source "$SCRIPT_DIR/supply-chain-tool-versions.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -103,13 +104,17 @@ fi
 echo ""
 echo "── Dependency audit ──"
 if command -v cargo-deny &>/dev/null; then
+    INSTALLED_DENY_VERSION=$(cargo deny --version | awk '{print $2}')
+    if [ "$INSTALLED_DENY_VERSION" != "$CARGO_DENY_VERSION" ]; then
+        fail "cargo-deny ${CARGO_DENY_VERSION} required, found ${INSTALLED_DENY_VERSION} (install: cargo install cargo-deny --version ${CARGO_DENY_VERSION} --locked)"
+    fi
     if cargo deny check; then
         ok "cargo deny check passed"
     else
         fail "cargo deny check reported issues (see above)"
     fi
 else
-    fail "cargo-deny not installed (install: cargo install cargo-deny)"
+    fail "cargo-deny not installed (install: cargo install cargo-deny --version ${CARGO_DENY_VERSION} --locked)"
 fi
 
 # ── Cargo audit ──────────────────────────────────────────────
@@ -117,13 +122,17 @@ fi
 echo ""
 echo "── Security audit ──"
 if command -v cargo-audit &>/dev/null; then
+    INSTALLED_AUDIT_VERSION=$(cargo audit --version | awk '{print $2}')
+    if [ "$INSTALLED_AUDIT_VERSION" != "$CARGO_AUDIT_VERSION" ]; then
+        fail "cargo-audit ${CARGO_AUDIT_VERSION} required, found ${INSTALLED_AUDIT_VERSION} (install: cargo install cargo-audit --version ${CARGO_AUDIT_VERSION} --locked)"
+    fi
     if cargo audit && cargo audit --file fuzz/Cargo.lock; then
         ok "cargo audit passed for workspace and fuzz dependencies"
     else
         fail "cargo audit found advisories (review before tagging)"
     fi
 else
-    fail "cargo-audit not installed (install: cargo install cargo-audit)"
+    fail "cargo-audit not installed (install: cargo install cargo-audit --version ${CARGO_AUDIT_VERSION} --locked)"
 fi
 
 # ── Create and push tag ──────────────────────────────────────
