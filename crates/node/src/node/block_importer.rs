@@ -365,6 +365,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.validate_stark_proof_source_binding(amendment)?;
         }
 
+        let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
         let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
@@ -707,6 +708,7 @@ impl<S: KvStore + 'static> Node<S> {
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();
         block_store.commit_canonical_block(&block, Some(receipts.as_slice()))?;
+        algorithm_registry_rollback.commit();
         block_store.replace_world_state(committed_world_state);
         let settlement_hashes: Vec<ShellHash> = block
             .system_transactions

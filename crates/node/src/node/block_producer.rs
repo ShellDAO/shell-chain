@@ -57,6 +57,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Create an isolated EVM instance at the current state root.
         let (state_db, current_root) = block_store.isolated_state_db()?;
         let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
+        let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
 
         let now = self.current_block_timestamp(head.header.timestamp);
 
@@ -485,6 +486,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
             return Err(err);
         }
+        algorithm_registry_rollback.commit();
 
         // Public keys become persistent only once their transactions are part
         // of the canonical block. Mempool admission must remain read-only so

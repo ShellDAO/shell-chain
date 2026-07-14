@@ -59,6 +59,30 @@ pub(crate) use challenge_lifecycle::{
 };
 pub(crate) use readiness::{ProductionReadiness, ProductionReadinessState};
 
+pub(crate) struct AlgorithmRegistryRollback {
+    snapshot: Option<AlgorithmRegistry>,
+}
+
+impl AlgorithmRegistryRollback {
+    pub(crate) fn new() -> Self {
+        Self {
+            snapshot: Some(AlgorithmRegistry::global().clone()),
+        }
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for AlgorithmRegistryRollback {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            *AlgorithmRegistry::global_mut() = snapshot;
+        }
+    }
+}
+
 pub(crate) use shell_stark_prover::{
     proof::SigBatchProof,
     prover::{compute_batch_root, verify_sig_batch, SigBatchEntry},
@@ -4708,6 +4732,100 @@ mod tests {
         assert!(
             follower.chain_store.get_pubkey(&sender).unwrap().is_none(),
             "rejected imports must not persist account-manager side state"
+        );
+    }
+
+    #[test]
+    fn rejected_governance_block_restores_algorithm_registry() {
+        struct RegistryReset(AlgorithmRegistry);
+
+        impl Drop for RegistryReset {
+            fn drop(&mut self) {
+                *AlgorithmRegistry::global_mut() = self.0.clone();
+            }
+        }
+
+        let _reset = RegistryReset(AlgorithmRegistry::global().clone());
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+
+        let (leader, proposer_signer) = setup_node();
+        let proposer = leader.config.proposer_address.unwrap();
+        leader
+            .world_state
+            .write()
+            .set_validators(&[proposer])
+            .unwrap();
+        let initial_balance = U256::from(1_000_000_000_000_000u64);
+        fund_account(&leader, &proposer, initial_balance);
+        store_consistent_genesis(&leader);
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(shell_pqvm::registry_address()),
+            value: U256::ZERO,
+            data: Bytes::from(shell_pqvm::encode_propose_algorithm_activation_calldata(
+                shell_crypto::SignatureType::SphincsSha2256f,
+                shell_pqvm::ALGO_GOVERNANCE_DELTA_MIN,
+                [0xA5; 32],
+            )),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let tx_hash = tx.signing_hash(proposer_signer.sig_type().as_u8());
+        let sig = proposer_signer
+            .sign(tx_hash.as_bytes())
+            .expect("sign failed");
+        let signed = SignedTransaction::with_pubkey(
+            proposer,
+            tx,
+            sig,
+            proposer_signer.public_key().to_vec(),
+        );
+        let verifier = MultiVerifier;
+        leader
+            .tx_pool
+            .insert(
+                signed,
+                &mut leader.world_state.write(),
+                leader.chain_store.as_ref(),
+                &verifier,
+            )
+            .unwrap();
+        let mut block = leader.produce_block(&proposer_signer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert!(
+            !AlgorithmRegistry::global().is_allowed(shell_crypto::SignatureType::SphincsSha2256f)
+        );
+
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+        block.header.state_root = ShellHash::ZERO;
+        block.proposer_seal = Some(
+            proposer_signer
+                .sign(block.header.hash().as_bytes())
+                .unwrap(),
+        );
+
+        let follower = setup_node_with_authority(proposer);
+        follower
+            .world_state
+            .write()
+            .set_validators(&[proposer])
+            .unwrap();
+        fund_account(&follower, &proposer, initial_balance);
+        store_consistent_genesis(&follower);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let err = follower.import_block(block, &verifier).unwrap_err();
+        assert!(err.to_string().contains("state root mismatch"));
+        assert!(
+            AlgorithmRegistry::global().is_allowed(shell_crypto::SignatureType::SphincsSha2256f),
+            "rejected imports must restore process-global algorithm status"
         );
     }
 
