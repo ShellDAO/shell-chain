@@ -535,6 +535,30 @@ impl<S: KvStore> ChainStore<S> {
         batch.delete(Self::addr_tx_rev_key(address, block_number, tx_index));
     }
 
+    fn append_delete_transaction_indexes(
+        batch: &mut WriteBatch,
+        block: &Block,
+        system_txs: &[SystemTransaction],
+    ) {
+        let block_number = block.number();
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let tx_hash = tx.hash();
+            let tx_index = i as u32;
+            batch.delete(Self::tx_index_key(&tx_hash));
+            Self::delete_addr_tx_index(batch, &tx.sender(), block_number, tx_index);
+            if let Some(to) = tx.tx.to {
+                if to != tx.sender() {
+                    Self::delete_addr_tx_index(batch, &to, block_number, tx_index);
+                }
+            }
+        }
+
+        for tx in system_txs {
+            batch.delete(Self::tx_index_key(&tx.hash()));
+            Self::delete_addr_tx_index(batch, &tx.to, block_number, tx.tx_index);
+        }
+    }
+
     /// Delete canonical transaction/address lookup indexes for a stored block.
     ///
     /// Block body/header, receipts, and system transaction payloads remain
@@ -546,25 +570,49 @@ impl<S: KvStore> ChainStore<S> {
         let Some(block) = self.get_block_by_hash(block_hash)? else {
             return Ok(());
         };
-        let block_number = block.number();
+        let mut batch = WriteBatch::new();
+        let system_txs = self.get_system_transactions(block_hash)?;
+        Self::append_delete_transaction_indexes(&mut batch, &block, &system_txs);
+
+        self.store.write_batch(batch)
+    }
+
+    /// Atomically switch canonical mappings, transaction indexes, and HEAD to
+    /// a prevalidated replacement chain.
+    pub fn commit_reorg(
+        &self,
+        old_chain: &[Block],
+        new_chain: &[Block],
+        stale_canonical_numbers: &[u64],
+        new_head: &ShellHash,
+    ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
 
-        for (i, tx) in block.transactions.iter().enumerate() {
-            let tx_hash = tx.hash();
-            let tx_index = i as u32;
-            batch.delete(Self::tx_index_key(&tx_hash));
-            Self::delete_addr_tx_index(&mut batch, &tx.sender(), block_number, tx_index);
-            if let Some(to) = tx.tx.to {
-                if to != tx.sender() {
-                    Self::delete_addr_tx_index(&mut batch, &to, block_number, tx_index);
-                }
-            }
+        for block in old_chain {
+            let block_hash = block.hash();
+            let system_txs = self.get_system_transactions(&block_hash)?;
+            Self::append_delete_transaction_indexes(&mut batch, block, &system_txs);
         }
 
-        for tx in self.get_system_transactions(block_hash)? {
-            batch.delete(Self::tx_index_key(&tx.hash()));
-            Self::delete_addr_tx_index(&mut batch, &tx.to, block_number, tx.tx_index);
+        for block in new_chain {
+            let block_hash = block.hash();
+            Self::append_transaction_indexes(&mut batch, block, &block_hash);
+            self.append_system_transactions(
+                &mut batch,
+                &block_hash,
+                block.number(),
+                &block.system_transactions,
+            )?;
+            batch.put(
+                Self::number_key(block.number()),
+                block_hash.as_bytes().to_vec(),
+            );
         }
+
+        for number in stale_canonical_numbers {
+            batch.delete(Self::number_key(*number));
+        }
+        batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
 
         self.store.write_batch(batch)
     }

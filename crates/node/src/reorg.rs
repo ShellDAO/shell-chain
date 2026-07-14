@@ -113,81 +113,61 @@ impl ReorgEngine {
         let mut ancestor_ws =
             WorldState::at_root(Arc::clone(store), &ancestor_block.header.state_root)?;
         ancestor_ws.validate()?;
-        let tip_state_root = match new_chain.last() {
-            Some(hash) => {
-                chain_store
-                    .get_block_by_hash(hash)?
-                    .ok_or_else(|| {
-                        NodeError::Startup(format!("new chain block not found: {:?}", hash))
-                    })?
-                    .header
-                    .state_root
-            }
-            None => ancestor_block.header.state_root,
-        };
+        let old_blocks = old_chain
+            .iter()
+            .map(|hash| {
+                chain_store.get_block_by_hash(hash)?.ok_or_else(|| {
+                    NodeError::Startup(format!("old chain block not found: {:?}", hash))
+                })
+            })
+            .collect::<Result<Vec<_>, NodeError>>()?;
+        let new_blocks = new_chain
+            .iter()
+            .map(|hash| {
+                chain_store.get_block_by_hash(hash)?.ok_or_else(|| {
+                    NodeError::Startup(format!("new chain block not found: {:?}", hash))
+                })
+            })
+            .collect::<Result<Vec<_>, NodeError>>()?;
+        let tip_state_root = new_blocks
+            .last()
+            .map(|block| block.header.state_root)
+            .unwrap_or(ancestor_block.header.state_root);
         let mut tip_ws = WorldState::at_root(Arc::clone(store), &tip_state_root)?;
         tip_ws.validate()?;
 
         // Step 1: Collect transactions from blocks being rolled back (newest first)
         let mut reverted_txs = Vec::new();
-        for hash in old_chain.iter().rev() {
-            if let Ok(Some(block)) = chain_store.get_block_by_hash(hash) {
-                reverted_txs.extend(block.transactions.clone());
-            }
+        for block in old_blocks.iter().rev() {
+            reverted_txs.extend(block.transactions.clone());
         }
 
-        // Step 2: Restore world state to the ancestor's state root
-        *world_state.write() = ancestor_ws;
+        let new_head = new_chain.last().copied().unwrap_or(ancestor_hash);
+        let new_tip_number = ancestor_number.saturating_add(new_chain.len() as u64);
+        let old_tip_number = ancestor_number.saturating_add(old_chain.len() as u64);
+        let stale_canonical_numbers = if old_tip_number > new_tip_number {
+            ((new_tip_number + 1)..=old_tip_number).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
-        info!(
-            state_root = ?ancestor_block.header.state_root,
-            "restored world state to ancestor"
-        );
-
-        // Step 3: Apply new chain blocks — restore world state per block.
-        // Full EVM re-execution is not performed here; instead we trust the
-        // stored state roots which were validated at block import time.
-        // The world state is set to the tip block's state root.
-
-        for hash in old_chain {
-            chain_store.delete_block_transaction_indexes(hash)?;
-        }
-
-        let mut applied = 0;
-        let mut new_head = ancestor_hash;
-        for hash in new_chain {
-            let block = chain_store.get_block_by_hash(hash)?.ok_or_else(|| {
-                NodeError::Startup(format!("new chain block not found: {:?}", hash))
-            })?;
-
-            chain_store.set_canonical(block.number(), hash)?;
-            chain_store.index_block_transactions(&block)?;
-            new_head = *hash;
-            applied += 1;
-        }
-
-        // F-084/F-090: Remove stale canonical mappings if old chain was longer
-        // than the new chain to prevent orphaned state.
-        if old_chain.len() > new_chain.len() {
-            let new_tip_number = ancestor_number + new_chain.len() as u64;
-            let old_tip_number = ancestor_number + old_chain.len() as u64;
-            for n in (new_tip_number + 1)..=old_tip_number {
-                chain_store.delete_canonical(n)?;
-            }
-        }
-
-        // Restore world state to the new chain tip's state root.
+        // Canonical mappings, indexes, and HEAD move together. Keep the live
+        // world state unchanged unless the storage transition commits.
+        chain_store.commit_reorg(
+            &old_blocks,
+            &new_blocks,
+            &stale_canonical_numbers,
+            &new_head,
+        )?;
         *world_state.write() = tip_ws;
 
-        // Step 4: Update head pointer
-        chain_store.set_head(&new_head)?;
+        info!(state_root = ?tip_state_root, "restored world state to reorg tip");
 
         // If aggregate counters are already initialized, refresh them against
         // the new canonical chain. Same-height reorgs otherwise leave
         // chain_totals_head unchanged while tx/gas totals still describe the
         // old canonical branch.
         if chain_store.get_chain_totals_head()?.is_some() {
-            let new_tip_number = ancestor_number.saturating_add(new_chain.len() as u64);
             chain_store.rebuild_chain_totals(new_tip_number)?;
         }
 
@@ -209,7 +189,7 @@ impl ReorgEngine {
             ancestor_number,
             ancestor_hash,
             rolled_back: old_chain.len(),
-            applied,
+            applied: new_chain.len(),
             reverted_txs,
             new_head,
         };
@@ -273,7 +253,49 @@ mod tests {
     use shell_core::{Block, BlockHeader, SignedTransaction, Transaction};
     use shell_crypto::{PQSignature, SignatureType};
     use shell_primitives::{Address, Bytes, U256};
-    use shell_storage::MemoryDb;
+    use shell_storage::{MemoryDb, StorageError, WriteBatch};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FailingBatchStore {
+        inner: MemoryDb,
+        fail_next_batch: AtomicBool,
+    }
+
+    impl FailingBatchStore {
+        fn fail_next_batch(&self) {
+            self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl KvStore for FailingBatchStore {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            if self.fail_next_batch.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected batch failure".into()));
+            }
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn make_hash(n: u8) -> ShellHash {
         let mut bytes = [0u8; 32];
@@ -320,6 +342,21 @@ mod tests {
         ShellHash,
     ) {
         let store = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(store.clone()));
+        let mut ws = WorldState::new(store.clone());
+        let empty_root = ws.state_root().unwrap();
+        let world_state = Arc::new(RwLock::new(ws));
+        (store, chain_store, world_state, empty_root)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn setup_failing_chain() -> (
+        Arc<FailingBatchStore>,
+        Arc<ChainStore<FailingBatchStore>>,
+        Arc<RwLock<WorldState<FailingBatchStore>>>,
+        ShellHash,
+    ) {
+        let store = Arc::new(FailingBatchStore::default());
         let chain_store = Arc::new(ChainStore::new(store.clone()));
         let mut ws = WorldState::new(store.clone());
         let empty_root = ws.state_root().unwrap();
@@ -500,6 +537,59 @@ mod tests {
 
         assert_eq!(result.applied, 2);
         assert_eq!(result.new_head, new_hash_7);
+    }
+
+    #[test]
+    fn test_reorg_storage_failure_preserves_canonical_state_and_indexes() {
+        let (store, chain_store, world_state, ancestor_root) = setup_failing_chain();
+        let ancestor = make_block(0, ShellHash::ZERO, ancestor_root);
+        let ancestor_hash = ancestor.hash();
+        chain_store.put_block(&ancestor).unwrap();
+        chain_store.set_canonical(0, &ancestor_hash).unwrap();
+
+        let sender = Address::from_public_key(b"funded-before-reorg", 0);
+        let old_root = {
+            let mut ws = world_state.write();
+            ws.set_balance(&sender, U256::from(7u64)).unwrap();
+            ws.state_root().unwrap()
+        };
+        let mut old_block = make_block(1, ancestor_hash, old_root);
+        old_block.transactions.push(make_tx());
+        let old_hash = old_block.hash();
+        let old_tx_hash = old_block.transactions[0].hash();
+        chain_store.put_block(&old_block).unwrap();
+        chain_store.set_canonical(1, &old_hash).unwrap();
+        chain_store.set_head(&old_hash).unwrap();
+
+        let mut new_block = make_block(1, ancestor_hash, ancestor_root);
+        new_block.header.timestamp += 1;
+        let new_hash = new_block.hash();
+        chain_store.put_side_fork_block(&new_block).unwrap();
+
+        store.fail_next_batch();
+        let err = ReorgEngine::execute(
+            &chain_store,
+            &world_state,
+            &store,
+            ancestor_hash,
+            0,
+            &[old_hash],
+            &[new_hash],
+            0,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected batch failure"));
+        assert_eq!(chain_store.get_head_hash().unwrap(), Some(old_hash));
+        assert_eq!(
+            chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(old_hash)
+        );
+        assert_eq!(
+            chain_store.get_tx_location(&old_tx_hash).unwrap(),
+            Some((old_hash, 0))
+        );
+        assert_eq!(world_state.write().state_root().unwrap(), old_root);
     }
 
     #[test]
