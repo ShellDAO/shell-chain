@@ -33,6 +33,9 @@ if [ -z "$VERSION" ]; then
     echo "  e.g. $0 0.27.1"
     exit 1
 fi
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    fail "Version must be semver without a leading 'v' (for example, 0.27.1 or 0.28.0-rc.1)"
+fi
 
 TAG="v${VERSION}"
 
@@ -46,9 +49,9 @@ echo ""
 
 echo "── Pre-flight checks ──"
 
-# 1. Working tree clean
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    fail "Working tree is not clean. Commit or stash changes before releasing."
+# 1. Working tree clean, including untracked files
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    fail "Working tree has uncommitted or untracked files. Commit or remove them before releasing."
 fi
 ok "Working tree is clean"
 
@@ -59,11 +62,11 @@ if [ "$CARGO_VERSION" != "$VERSION" ]; then
 fi
 ok "Cargo.toml version: ${CARGO_VERSION}"
 
-# 3. CHANGELOG has a section for this version
-if ! grep -q "\[${VERSION}\]" CHANGELOG.md; then
-    fail "CHANGELOG.md does not contain a [${VERSION}] section"
+# 3. CHANGELOG has a release heading for this version
+if ! grep -Fq "## [${VERSION}]" CHANGELOG.md; then
+    fail "CHANGELOG.md does not contain a ## [${VERSION}] release heading"
 fi
-ok "CHANGELOG.md has [${VERSION}] section"
+ok "CHANGELOG.md has ## [${VERSION}] release heading"
 
 # 4. Tag does not already exist
 if git tag -l | grep -q "^${TAG}$"; then
