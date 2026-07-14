@@ -82,8 +82,9 @@ impl<S: KvStore + 'static> Node<S> {
             witness_root: None,
         };
 
-        let mut included_txs: Vec<SignedTransaction> = Vec::with_capacity(256);
-        let mut receipts = Vec::with_capacity(256);
+        let candidate_capacity = candidates.len();
+        let mut included_txs: Vec<SignedTransaction> = Vec::with_capacity(candidate_capacity);
+        let mut receipts = Vec::with_capacity(candidate_capacity);
         let mut cumulative_gas: u64 = 0;
         let mut total_effective_fees = U256::ZERO;
 
@@ -221,7 +222,7 @@ impl<S: KvStore + 'static> Node<S> {
                         U256::from(result.gas_used).saturating_mul(U256::from(price)),
                     );
                     receipts.push(result.receipt);
-                    included_txs.push(tx.clone());
+                    included_txs.push(tx.as_ref().clone());
                 }
                 Err(e) => {
                     if let Err(rollback_err) = evm

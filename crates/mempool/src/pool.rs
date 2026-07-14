@@ -420,7 +420,19 @@ impl TxPool {
     /// nonce `N + 1` must not be returned before nonce `N`, even if `N + 1`
     /// pays a higher priority fee.
     pub fn pending_for_block(&self, limit: usize) -> Vec<SignedTransaction> {
-        self.pending_for_block_matching(limit, |_| true)
+        self.pending_for_block_shared(limit)
+            .into_iter()
+            .map(|tx| tx.as_ref().clone())
+            .collect()
+    }
+
+    /// Collect shared transaction handles for block production while preserving
+    /// per-sender nonce contiguity.
+    ///
+    /// This avoids copying signatures and calldata during candidate selection;
+    /// callers only need to clone transactions that are actually included.
+    pub fn pending_for_block_shared(&self, limit: usize) -> Vec<Arc<SignedTransaction>> {
+        self.pending_for_block_matching_shared(limit, |_| true)
     }
 
     /// Collect transactions that can pay the next block's base fee while
@@ -433,14 +445,28 @@ impl TxPool {
         limit: usize,
         base_fee_per_gas: u64,
     ) -> Vec<SignedTransaction> {
-        self.pending_for_block_matching(limit, |tx| tx.tx.max_fee_per_gas >= base_fee_per_gas)
+        self.pending_for_block_at_base_fee_shared(limit, base_fee_per_gas)
+            .into_iter()
+            .map(|tx| tx.as_ref().clone())
+            .collect()
     }
 
-    fn pending_for_block_matching(
+    /// Shared-handle variant of [`Self::pending_for_block_at_base_fee`].
+    pub fn pending_for_block_at_base_fee_shared(
+        &self,
+        limit: usize,
+        base_fee_per_gas: u64,
+    ) -> Vec<Arc<SignedTransaction>> {
+        self.pending_for_block_matching_shared(limit, |tx| {
+            tx.tx.max_fee_per_gas >= base_fee_per_gas
+        })
+    }
+
+    fn pending_for_block_matching_shared(
         &self,
         limit: usize,
         is_eligible: impl Fn(&SignedTransaction) -> bool,
-    ) -> Vec<SignedTransaction> {
+    ) -> Vec<Arc<SignedTransaction>> {
         let inner = self.inner.read();
         let mut selected = Vec::with_capacity(limit.min(inner.by_hash.len()));
         let mut ready: BTreeMap<PriorityKey, (Address, ShellHash)> = BTreeMap::new();
@@ -484,8 +510,7 @@ impl TxPool {
             }
         }
 
-        drop(inner);
-        selected.into_iter().map(|tx| tx.as_ref().clone()).collect()
+        selected
     }
 
     /// Collect all pending transaction hashes for a specific sender,
@@ -1615,6 +1640,21 @@ mod tests {
         assert_eq!(pending[0].tx.max_priority_fee_per_gas, 100);
         assert_eq!(pending[1].tx.max_priority_fee_per_gas, 50);
         assert_eq!(pending[2].tx.max_priority_fee_per_gas, 10);
+    }
+
+    #[test]
+    fn shared_block_candidates_reuse_pool_transaction_allocations() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let (tx, _) = make_signed_tx(0, 100);
+        let hash = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
+
+        let stored = Arc::clone(&pool.inner.read().by_hash.get(&hash).unwrap().tx);
+        let candidates = pool.pending_for_block_at_base_fee_shared(1, 0);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(Arc::ptr_eq(&stored, &candidates[0]));
     }
 
     #[test]
