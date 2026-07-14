@@ -82,10 +82,23 @@ fn bench_small_batch_with_conflict(c: &mut Criterion) {
     });
 }
 
+/// Benchmark wave planning over an already-built dense conflict graph.
+fn bench_dense_plan(c: &mut Criterion) {
+    let sched = scheduler();
+    let shared = Address::from([0x99; 20]);
+    let txs: Vec<SignedTransaction> = (0..128u64).map(|i| make_tx(i, shared)).collect();
+    let graph = sched.build_graph(&txs, &HeuristicRwSetExtractor);
+
+    c.bench_function("parallel/dense_plan_128", |b| {
+        b.iter(|| black_box(sched.plan_from_graph(black_box(&graph))))
+    });
+}
+
 criterion_group!(
     benches,
     bench_empty_batch,
     bench_small_batch_no_conflict,
-    bench_small_batch_with_conflict
+    bench_small_batch_with_conflict,
+    bench_dense_plan
 );
 criterion_main!(benches);

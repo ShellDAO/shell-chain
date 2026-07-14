@@ -7,6 +7,8 @@
 
 use rayon::prelude::*;
 use shell_core::SignedTransaction;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use crate::rwset::{ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};
 
@@ -106,11 +108,15 @@ pub struct ParallelExecutionPlan {
 #[derive(Debug, Clone)]
 pub struct ParallelScheduler {
     config: ParallelPqvmConfig,
+    worker_pool: Arc<OnceLock<rayon::ThreadPool>>,
 }
 
 impl ParallelScheduler {
     pub fn new(config: ParallelPqvmConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            worker_pool: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn config(&self) -> &ParallelPqvmConfig {
@@ -168,14 +174,22 @@ impl ParallelScheduler {
             };
         }
 
+        let mut conflicts_by_tx = vec![HashSet::new(); graph.rwsets.len()];
+        for conflict in &graph.conflicts {
+            if conflict.left < conflicts_by_tx.len() && conflict.right < conflicts_by_tx.len() {
+                conflicts_by_tx[conflict.left].insert(conflict.right);
+                conflicts_by_tx[conflict.right].insert(conflict.left);
+            }
+        }
+
         let mut waves: Vec<ExecutionWave> = Vec::new();
-        for tx_index in 0..graph.rwsets.len() {
+        for (tx_index, tx_conflicts) in conflicts_by_tx.iter().enumerate() {
             let can_join_last_wave = waves
                 .last()
                 .map(|wave| {
                     wave.tx_indices
                         .iter()
-                        .all(|existing| !graph.has_conflict(tx_index, *existing))
+                        .all(|existing| !tx_conflicts.contains(existing))
                 })
                 .unwrap_or(false);
 
@@ -215,16 +229,10 @@ impl ParallelScheduler {
         // This PoC helper assumes `execute_tx` is side-effect free with respect to
         // shared mutable state. Parallel waves may evaluate jobs concurrently and
         // only preserve deterministic ordering in the collected return values.
-        let worker_count = self.config.max_workers.max(1);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .build()
-            .unwrap_or_else(|_| unreachable!("thread pool creation should succeed"));
-
         let mut outputs = Vec::new();
         for wave in &plan.waves {
             if wave.parallelizable {
-                let wave_results = pool.install(|| {
+                let wave_results = self.worker_pool().install(|| {
                     wave.tx_indices
                         .par_iter()
                         .map(|index| {
@@ -249,6 +257,15 @@ impl ParallelScheduler {
         }
 
         Ok(outputs)
+    }
+
+    fn worker_pool(&self) -> &rayon::ThreadPool {
+        self.worker_pool.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(self.config.max_workers.max(1))
+                .build()
+                .unwrap_or_else(|_| unreachable!("thread pool creation should succeed"))
+        })
     }
 }
 
@@ -691,6 +708,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs, vec![1, 2]);
+    }
+
+    #[test]
+    fn execute_lazily_reuses_worker_pool() {
+        let txs = vec![
+            signed_tx(Address::from([0x61; 20]), 1, Vec::new()),
+            signed_tx(Address::from([0x62; 20]), 2, Vec::new()),
+        ];
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
+            enabled: true,
+            max_workers: 2,
+            ..ParallelPqvmConfig::default()
+        });
+
+        let serial_plan = ParallelExecutionPlan {
+            waves: vec![ExecutionWave {
+                tx_indices: vec![0],
+                parallelizable: false,
+            }],
+            fallback_serial: true,
+        };
+        scheduler
+            .execute(&txs, &serial_plan, |_| Ok::<(), ()>(()))
+            .unwrap();
+        assert!(scheduler.worker_pool.get().is_none());
+
+        let parallel_plan = ParallelExecutionPlan {
+            waves: vec![ExecutionWave {
+                tx_indices: vec![0, 1],
+                parallelizable: true,
+            }],
+            fallback_serial: false,
+        };
+        scheduler
+            .execute(&txs, &parallel_plan, |_| Ok::<(), ()>(()))
+            .unwrap();
+        let first_pool = scheduler.worker_pool() as *const rayon::ThreadPool;
+
+        scheduler
+            .execute(&txs, &parallel_plan, |_| Ok::<(), ()>(()))
+            .unwrap();
+        assert_eq!(
+            first_pool,
+            scheduler.worker_pool() as *const rayon::ThreadPool
+        );
     }
 
     #[test]
