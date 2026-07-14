@@ -1040,6 +1040,10 @@ mod tests {
         }
     }
 
+    fn nonce_from_signer(signer: &DilithiumSigner) -> u64 {
+        u64::from_le_bytes(signer.public_key()[..8].try_into().unwrap())
+    }
+
     fn validator_returns_true() -> Vec<u8> {
         vec![0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]
     }
@@ -1187,7 +1191,7 @@ mod tests {
         let (mut ws, cs) = setup_stores();
         let paymaster = Address::from([0x77; 20]);
         install_paymaster(&mut ws, &cs, paymaster, validator_returns_true());
-        let signed = sign_tx(&signer, base_tx(1337, 0), true);
+        let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
 
         assert!(call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).is_ok());
     }
@@ -1203,7 +1207,7 @@ mod tests {
             paymaster,
             validator_stores_then_returns_true(),
         );
-        let signed = sign_tx(&signer, base_tx(1337, 0), true);
+        let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
 
         let error = call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).unwrap_err();
 
