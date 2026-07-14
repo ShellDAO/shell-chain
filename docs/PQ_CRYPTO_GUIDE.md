@@ -176,6 +176,10 @@ The keystore file is a JSON document inspired by the Ethereum Web3 Secret Storag
 | `ciphertext` | `String` | Encrypted secret key (hex) |
 | `public_key` | `String` | Full public key (hex), used for verification |
 
+Keystore readers reject Argon2id settings above 131,072 KiB of memory, 10
+iterations, or parallelism 16 so imported files cannot request unbounded local
+work.
+
 ### Inspecting a keystore
 
 ```bash

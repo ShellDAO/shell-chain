@@ -4,12 +4,21 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer, SphincsSigner};
 use shell_primitives::Address;
 
-use crate::types::{CipherParams, EncryptedKey, KdfParams, KeystoreError};
+use crate::types::{
+    CipherParams, EncryptedKey, KdfParams, KeystoreError, MAX_KDF_MEMORY_KIB, MAX_KDF_PARALLELISM,
+    MAX_KDF_TIME_COST,
+};
+
+const MIN_SALT_HEX_LEN: usize = 16;
+const MAX_SALT_HEX_LEN: usize = 64;
+const NONCE_HEX_LEN: usize = 48;
+const MAX_CIPHERTEXT_HEX_LEN: usize = 8_192;
+const MAX_PUBLIC_KEY_HEX_LEN: usize = 4_096;
 
 /// Encrypt a Dilithium3 signer with a password.
 ///
@@ -30,17 +39,15 @@ pub fn encrypt(signer: &DilithiumSigner, password: &[u8]) -> Result<EncryptedKey
     };
 
     // Derive 32-byte encryption key from password.
-    let mut derived_key = derive_key(password, &salt, &kdf_params)?;
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &kdf_params)?);
 
     // Encrypt the secret key bytes.
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let plaintext: &[u8] = signer.secret_key_bytes();
 
     let ciphertext = cipher
         .encrypt((&nonce).into(), plaintext)
         .map_err(|e| KeystoreError::Encryption(e.to_string()))?;
-
-    derived_key.zeroize();
 
     let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
 
@@ -67,9 +74,8 @@ pub fn decrypt(
     encrypted: &EncryptedKey,
     password: &[u8],
 ) -> Result<DilithiumSigner, KeystoreError> {
-    let (mut secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
     let signer = DilithiumSigner::from_bytes(&public_key, &secret_key)?;
-    secret_key.zeroize();
     Ok(signer)
 }
 
@@ -90,16 +96,14 @@ pub fn encrypt_mldsa(signer: &MlDsaSigner, password: &[u8]) -> Result<EncryptedK
         salt: hex::encode(salt),
     };
 
-    let mut derived_key = derive_key(password, &salt, &kdf_params)?;
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &kdf_params)?);
 
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let plaintext: &[u8] = signer.secret_key_bytes();
 
     let ciphertext = cipher
         .encrypt((&nonce).into(), plaintext)
         .map_err(|e| KeystoreError::Encryption(e.to_string()))?;
-
-    derived_key.zeroize();
 
     let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
 
@@ -130,9 +134,8 @@ pub fn decrypt_mldsa(
         )));
     }
 
-    let (mut secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
     let signer = MlDsaSigner::from_bytes(&public_key, &secret_key)?;
-    secret_key.zeroize();
     Ok(signer)
 }
 
@@ -158,7 +161,9 @@ pub fn decrypt_any(
 fn raw_decrypt(
     encrypted: &EncryptedKey,
     password: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), KeystoreError> {
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), KeystoreError> {
+    validate_keystore_metadata(encrypted)?;
+
     let salt = hex::decode(&encrypted.kdf_params.salt)
         .map_err(|e| KeystoreError::InvalidKey(format!("bad salt hex: {e}")))?;
     let nonce_bytes = hex::decode(&encrypted.cipher_params.nonce)
@@ -175,23 +180,26 @@ fn raw_decrypt(
         )));
     }
 
-    let mut derived_key = derive_key(password, &salt, &encrypted.kdf_params)?;
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &encrypted.kdf_params)?);
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let nonce: [u8; 24] = nonce_bytes
         .try_into()
         .map_err(|_| KeystoreError::Decryption)?;
 
-    let secret_key = cipher
-        .decrypt((&nonce).into(), ciphertext.as_ref())
-        .map_err(|_| KeystoreError::Decryption)?;
+    let secret_key = Zeroizing::new(
+        cipher
+            .decrypt((&nonce).into(), ciphertext.as_ref())
+            .map_err(|_| KeystoreError::Decryption)?,
+    );
 
-    derived_key.zeroize();
     Ok((secret_key, public_key))
 }
 
 fn derive_key(password: &[u8], salt: &[u8], params: &KdfParams) -> Result<[u8; 32], KeystoreError> {
+    validate_kdf_params(params)?;
+
     let argon2_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
-        .map_err(|e| KeystoreError::Encryption(format!("argon2 params: {e}")))?;
+        .map_err(|e| KeystoreError::InvalidKey(format!("argon2 params: {e}")))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
 
@@ -201,6 +209,68 @@ fn derive_key(password: &[u8], salt: &[u8], params: &KdfParams) -> Result<[u8; 3
         .map_err(|e| KeystoreError::Encryption(format!("argon2 hash: {e}")))?;
 
     Ok(key)
+}
+
+fn validate_kdf_params(params: &KdfParams) -> Result<(), KeystoreError> {
+    if params.m_cost > MAX_KDF_MEMORY_KIB {
+        return Err(KeystoreError::InvalidKey(format!(
+            "argon2 memory cost {} KiB exceeds limit {MAX_KDF_MEMORY_KIB} KiB",
+            params.m_cost
+        )));
+    }
+    if params.t_cost > MAX_KDF_TIME_COST {
+        return Err(KeystoreError::InvalidKey(format!(
+            "argon2 time cost {} exceeds limit {MAX_KDF_TIME_COST}",
+            params.t_cost
+        )));
+    }
+    if params.p_cost > MAX_KDF_PARALLELISM {
+        return Err(KeystoreError::InvalidKey(format!(
+            "argon2 parallelism {} exceeds limit {MAX_KDF_PARALLELISM}",
+            params.p_cost
+        )));
+    }
+    Ok(())
+}
+
+fn validate_keystore_metadata(encrypted: &EncryptedKey) -> Result<(), KeystoreError> {
+    if encrypted.version != 1 {
+        return Err(KeystoreError::InvalidKey(format!(
+            "unsupported keystore version: {}",
+            encrypted.version
+        )));
+    }
+    if encrypted.kdf != "argon2id" {
+        return Err(KeystoreError::InvalidKey(format!(
+            "unsupported kdf: {}",
+            encrypted.kdf
+        )));
+    }
+    if encrypted.cipher != "xchacha20-poly1305" {
+        return Err(KeystoreError::InvalidKey(format!(
+            "unsupported cipher: {}",
+            encrypted.cipher
+        )));
+    }
+    if !(MIN_SALT_HEX_LEN..=MAX_SALT_HEX_LEN).contains(&encrypted.kdf_params.salt.len())
+        || !encrypted.kdf_params.salt.len().is_multiple_of(2)
+    {
+        return Err(KeystoreError::InvalidKey(format!(
+            "salt must be an even-length hex string of {MIN_SALT_HEX_LEN} to {MAX_SALT_HEX_LEN} characters"
+        )));
+    }
+    if encrypted.cipher_params.nonce.len() != NONCE_HEX_LEN {
+        return Err(KeystoreError::InvalidKey(format!(
+            "nonce must be {NONCE_HEX_LEN} hex characters"
+        )));
+    }
+    if encrypted.ciphertext.len() > MAX_CIPHERTEXT_HEX_LEN {
+        return Err(KeystoreError::InvalidKey("ciphertext is too large".into()));
+    }
+    if encrypted.public_key.len() > MAX_PUBLIC_KEY_HEX_LEN {
+        return Err(KeystoreError::InvalidKey("public key is too large".into()));
+    }
+    validate_kdf_params(&encrypted.kdf_params)
 }
 
 /// Encrypt a SPHINCS+-SHA2-256f-simple signer with a password.
@@ -224,16 +294,14 @@ pub fn encrypt_sphincs(
         salt: hex::encode(salt),
     };
 
-    let mut derived_key = derive_key(password, &salt, &kdf_params)?;
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &kdf_params)?);
 
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let plaintext: &[u8] = signer.secret_key_bytes();
 
     let ciphertext = cipher
         .encrypt((&nonce).into(), plaintext)
         .map_err(|e| KeystoreError::Encryption(e.to_string()))?;
-
-    derived_key.zeroize();
 
     let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
 
@@ -266,9 +334,8 @@ pub fn decrypt_sphincs(
         )));
     }
 
-    let (mut secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
     let signer = SphincsSigner::from_bytes(&public_key, &secret_key)?;
-    secret_key.zeroize();
     Ok(signer)
 }
 
@@ -294,13 +361,11 @@ pub fn encrypt_hd_seed(
         salt: hex::encode(salt),
     };
 
-    let mut derived_key = derive_key(password, &salt, &kdf_params)?;
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &kdf_params)?);
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let ciphertext = cipher
         .encrypt((&nonce).into(), seed.as_ref())
         .map_err(|e| KeystoreError::Encryption(e.to_string()))?;
-    derived_key.zeroize();
-
     Ok(EncryptedKey {
         version: 1,
         address: default_address.to_string(),
@@ -329,6 +394,8 @@ pub fn decrypt_hd_seed(
             encrypted.key_type
         )));
     }
+    validate_keystore_metadata(encrypted)?;
+
     let salt = hex::decode(&encrypted.kdf_params.salt)
         .map_err(|e| KeystoreError::InvalidKey(format!("bad salt hex: {e}")))?;
     let nonce_bytes = hex::decode(&encrypted.cipher_params.nonce)
@@ -343,16 +410,14 @@ pub fn decrypt_hd_seed(
         )));
     }
 
-    let mut derived_key = derive_key(password, &salt, &encrypted.kdf_params)?;
-    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let derived_key = Zeroizing::new(derive_key(password, &salt, &encrypted.kdf_params)?);
+    let cipher = XChaCha20Poly1305::new((&*derived_key).into());
     let nonce: [u8; 24] = nonce_bytes
         .try_into()
         .map_err(|_| KeystoreError::Decryption)?;
     let mut plaintext = cipher
         .decrypt((&nonce).into(), ciphertext.as_ref())
         .map_err(|_| KeystoreError::Decryption)?;
-    derived_key.zeroize();
-
     let seed_result: Result<[u8; 64], _> = plaintext.as_slice().try_into();
     plaintext.zeroize();
     let seed = seed_result
@@ -484,6 +549,101 @@ mod tests {
         // Different password must produce different key
         let key3 = derive_key(b"different", &salt, &params).unwrap();
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn excessive_kdf_time_cost_is_rejected() {
+        let params = KdfParams {
+            m_cost: 8,
+            t_cost: MAX_KDF_TIME_COST + 1,
+            p_cost: 1,
+            salt: hex::encode([42u8; 32]),
+        };
+
+        let result = derive_key(b"password", &[42u8; 32], &params);
+
+        assert!(matches!(result, Err(KeystoreError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn excessive_kdf_memory_and_parallelism_are_rejected() {
+        let params = KdfParams {
+            m_cost: MAX_KDF_MEMORY_KIB + 1,
+            ..KdfParams::default()
+        };
+        assert!(matches!(
+            validate_kdf_params(&params),
+            Err(KeystoreError::InvalidKey(_))
+        ));
+
+        let params = KdfParams {
+            p_cost: MAX_KDF_PARALLELISM + 1,
+            ..KdfParams::default()
+        };
+        assert!(matches!(
+            validate_kdf_params(&params),
+            Err(KeystoreError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_keystore_metadata_is_rejected() {
+        let mut encrypted = EncryptedKey {
+            version: 2,
+            address: String::new(),
+            key_type: "dilithium3".into(),
+            kdf: "argon2id".into(),
+            kdf_params: KdfParams::default(),
+            cipher: "xchacha20-poly1305".into(),
+            cipher_params: CipherParams {
+                nonce: String::new(),
+            },
+            ciphertext: String::new(),
+            public_key: String::new(),
+        };
+        assert!(matches!(
+            validate_keystore_metadata(&encrypted),
+            Err(KeystoreError::InvalidKey(_))
+        ));
+
+        encrypted.version = 1;
+        encrypted.kdf = "unknown".into();
+        assert!(matches!(
+            validate_keystore_metadata(&encrypted),
+            Err(KeystoreError::InvalidKey(_))
+        ));
+
+        encrypted.kdf = "argon2id".into();
+        encrypted.cipher = "unknown".into();
+        assert!(matches!(
+            validate_keystore_metadata(&encrypted),
+            Err(KeystoreError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_keystore_fields_are_rejected_before_decoding() {
+        let encrypted = EncryptedKey {
+            version: 1,
+            address: String::new(),
+            key_type: "dilithium3".into(),
+            kdf: "argon2id".into(),
+            kdf_params: KdfParams {
+                salt: "00".repeat(32),
+                ..KdfParams::default()
+            },
+            cipher: "xchacha20-poly1305".into(),
+            cipher_params: CipherParams {
+                nonce: "00".repeat(24),
+            },
+            ciphertext: "00".repeat(MAX_CIPHERTEXT_HEX_LEN / 2 + 1),
+            public_key: String::new(),
+        };
+
+        assert!(matches!(
+            validate_keystore_metadata(&encrypted),
+            Err(KeystoreError::InvalidKey(_))
+        ));
     }
 
     #[test]

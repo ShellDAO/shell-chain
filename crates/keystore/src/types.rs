@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum Argon2id memory accepted while opening a keystore (128 MiB).
+pub const MAX_KDF_MEMORY_KIB: u32 = 131_072;
+/// Maximum Argon2id iterations accepted while opening a keystore.
+pub const MAX_KDF_TIME_COST: u32 = 10;
+/// Maximum Argon2id parallelism accepted while opening a keystore.
+pub const MAX_KDF_PARALLELISM: u32 = 16;
+
 /// Errors returned by keystore operations.
 #[derive(Debug, thiserror::Error)]
 pub enum KeystoreError {

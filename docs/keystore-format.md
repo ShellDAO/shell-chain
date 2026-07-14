@@ -128,6 +128,11 @@ It is zeroed from memory immediately after use.
 | `t_cost` | 3 | Tunable |
 | `p_cost` | 4 | Matches typical core count |
 
+When opening a keystore, implementations must reject Argon2id parameters above
+131,072 KiB of memory, 10 iterations, or parallelism 16. These limits keep
+untrusted keystore files from requesting unbounded local work; the standard
+64 MiB profile and SDK-compatible profiles remain within the accepted range.
+
 The SDK may use different params (e.g. lower for test fixtures) — they are always stored in the
 file and re-read at decrypt time, so interoperability is preserved.
 

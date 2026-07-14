@@ -28,4 +28,7 @@ pub use crypto::{
     decrypt, decrypt_any, decrypt_hd_seed, decrypt_mldsa, decrypt_sphincs, encrypt,
     encrypt_hd_seed, encrypt_mldsa, encrypt_sphincs,
 };
-pub use types::{CipherParams, EncryptedKey, KdfParams, KeystoreError};
+pub use types::{
+    CipherParams, EncryptedKey, KdfParams, KeystoreError, MAX_KDF_MEMORY_KIB, MAX_KDF_PARALLELISM,
+    MAX_KDF_TIME_COST,
+};
