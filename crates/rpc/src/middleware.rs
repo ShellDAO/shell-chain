@@ -9,6 +9,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use http::{Request, Response, StatusCode};
+use jsonrpsee::server::middleware::rpc::RpcServiceT;
+use jsonrpsee::server::MethodResponse;
 use parking_lot::Mutex;
 use tower::{Layer, Service};
 
@@ -181,6 +183,72 @@ fn prune_rate_limit_buckets(buckets: &mut HashMap<String, RateLimiterState>) {
             .take(buckets.len().saturating_sub(MAX_RATE_LIMIT_BUCKETS - 1))
         {
             buckets.remove(&key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RpcRateLimitLayer — per-connection JSON-RPC request rate limiter
+// ---------------------------------------------------------------------------
+
+/// Rate-limits decoded JSON-RPC calls on both HTTP and WebSocket transports.
+///
+/// Tower HTTP middleware sees only the WebSocket upgrade request. jsonrpsee
+/// creates this RPC middleware service once per connection, so its state also
+/// covers every subsequent WebSocket message.
+#[derive(Clone)]
+pub struct RpcRateLimitLayer {
+    max_per_sec: Option<u32>,
+}
+
+impl RpcRateLimitLayer {
+    pub fn new(max_per_sec: Option<u32>) -> Self {
+        Self { max_per_sec }
+    }
+}
+
+impl<S> Layer<S> for RpcRateLimitLayer {
+    type Service = RpcRateLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RpcRateLimitService {
+            inner,
+            state: self
+                .max_per_sec
+                .map(|max| Arc::new(Mutex::new(RateLimiterState::new(max)))),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcRateLimitService<S> {
+    inner: S,
+    state: Option<Arc<Mutex<RateLimiterState>>>,
+}
+
+impl<'a, S> RpcServiceT<'a> for RpcRateLimitService<S>
+where
+    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+{
+    type Future = futures_util::future::Either<S::Future, std::future::Ready<MethodResponse>>;
+
+    fn call(&self, req: jsonrpsee::types::Request<'a>) -> Self::Future {
+        let allowed = self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.lock().check_and_record());
+        if allowed {
+            futures_util::future::Either::Left(self.inner.call(req))
+        } else {
+            let response = MethodResponse::error(
+                req.id,
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32005,
+                    "request rate limit exceeded",
+                    None::<()>,
+                ),
+            );
+            futures_util::future::Either::Right(std::future::ready(response))
         }
     }
 }

@@ -3,11 +3,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{BatchRequestConfig, Server, ServerHandle};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
-use crate::middleware::{ApiKeyLayer, RateLimitLayer};
+use crate::middleware::{ApiKeyLayer, RateLimitLayer, RpcRateLimitLayer};
 use crate::tls_proxy::{start_tls_proxy, TlsProxyHandle};
 
 const MAX_BATCH_REQUEST_LEN: u32 = 100;
@@ -292,6 +293,8 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         .layer(cors)
         .layer(ApiKeyLayer::new(config.api_key.clone()))
         .layer(RateLimitLayer::from_config(config.rate_limit_per_sec));
+    let rpc_middleware =
+        RpcServiceBuilder::new().layer(RpcRateLimitLayer::new(config.rate_limit_per_sec));
 
     // Conditionally merge RPC modules based on enabled namespaces.
     let ns = &config.api_namespaces;
@@ -342,6 +345,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         // Separate ports: HTTP-only + WS-only.
         let http_server = Server::builder()
             .set_http_middleware(middleware.clone())
+            .set_rpc_middleware(rpc_middleware.clone())
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
@@ -353,6 +357,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 
         let ws_server = Server::builder()
             .set_http_middleware(middleware)
+            .set_rpc_middleware(rpc_middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
@@ -382,6 +387,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         // Single port: both HTTP and WS on listen_addr (jsonrpsee default).
         let server = Server::builder()
             .set_http_middleware(middleware)
+            .set_rpc_middleware(rpc_middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
@@ -548,6 +554,64 @@ mod tests {
         server.http_handle.stop().unwrap();
         server.http_handle.stopped().await;
         assert!(matches!(err, ClientError::ParseError(_)));
+    }
+
+    #[tokio::test]
+    async fn websocket_requests_respect_per_connection_rate_limit() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            rate_limit_per_sec: Some(1),
+            api_namespaces: vec!["web3".into()],
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = WsClientBuilder::default()
+            .build(format!("ws://{}", server.http_addr))
+            .await
+            .unwrap();
+
+        let first = client
+            .request::<String, _>("web3_clientVersion", rpc_params![])
+            .await;
+        let second = client
+            .request::<String, _>("web3_clientVersion", rpc_params![])
+            .await;
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(first.is_ok());
+        assert!(
+            matches!(second, Err(ClientError::Call(ref err)) if err.code() == -32005),
+            "second WebSocket request was not rate limited: {second:?}"
+        );
     }
 
     #[tokio::test]
