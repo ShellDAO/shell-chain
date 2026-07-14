@@ -4614,6 +4614,104 @@ mod tests {
     }
 
     #[test]
+    fn rejected_account_manager_block_leaves_side_state_unchanged() {
+        let (leader, proposer_signer) = setup_node();
+        store_genesis(&leader);
+        let proposer = leader.config.proposer_address.unwrap();
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let initial_balance = U256::from(1_000_000_000_000_000u64);
+        fund_account(&leader, &sender, initial_balance);
+        let new_pubkey = vec![0xAB; 1312];
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(shell_pqvm::account_manager_address()),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                &new_pubkey,
+                tx_signer.sig_type().as_u8(),
+            )),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed =
+            SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
+        let verifier = MultiVerifier;
+        leader
+            .tx_pool
+            .insert(
+                signed,
+                &mut leader.world_state.write(),
+                leader.chain_store.as_ref(),
+                &verifier,
+            )
+            .unwrap();
+        let mut block = leader.produce_block(&proposer_signer, 100).unwrap();
+        block.header.state_root = ShellHash::ZERO;
+        block.proposer_seal = Some(
+            proposer_signer
+                .sign(block.header.hash().as_bytes())
+                .unwrap(),
+        );
+
+        let follower_db = Arc::new(MemoryDb::new());
+        let follower_cs = Arc::new(ChainStore::new(follower_db.clone()));
+        let follower_ws = Arc::new(RwLock::new(WorldState::new(follower_db.clone())));
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![proposer], 1),
+        )));
+        let follower = Node::new(
+            NodeConfig::dev(proposer),
+            follower_db,
+            follower_cs,
+            follower_ws,
+            Arc::new(TxPool::new(MempoolConfig {
+                chain_id: 1337,
+                ..MempoolConfig::default()
+            })),
+            consensus,
+        );
+        store_genesis(&follower);
+        fund_account(&follower, &sender, initial_balance);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let before_root = current_state_root(&follower);
+        let before_account = follower
+            .world_state
+            .read()
+            .get_account(&sender)
+            .unwrap()
+            .unwrap();
+        assert!(follower.chain_store.get_pubkey(&sender).unwrap().is_none());
+
+        let err = follower.import_block(block, &verifier).unwrap_err();
+        assert!(err.to_string().contains("state root mismatch"));
+        assert_eq!(current_state_root(&follower), before_root);
+        assert_eq!(
+            follower
+                .world_state
+                .read()
+                .get_account(&sender)
+                .unwrap()
+                .unwrap(),
+            before_account
+        );
+        assert!(
+            follower.chain_store.get_pubkey(&sender).unwrap().is_none(),
+            "rejected imports must not persist account-manager side state"
+        );
+    }
+
+    #[test]
     fn import_block_with_invalid_seal_rejected() {
         let (node, signer) = setup_node();
         store_genesis(&node);

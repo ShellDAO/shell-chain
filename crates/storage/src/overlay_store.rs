@@ -1,0 +1,145 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+
+use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
+
+/// A copy-on-write view over a key-value store.
+///
+/// Reads fall through to the base store while writes remain private until
+/// [`commit`](Self::commit) is called.
+pub struct OverlayStore<S: KvStore> {
+    base: Arc<S>,
+    changes: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+}
+
+impl<S: KvStore> OverlayStore<S> {
+    pub fn new(base: Arc<S>) -> Self {
+        Self {
+            base,
+            changes: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Atomically apply all pending changes to the base store.
+    pub fn commit(&self) -> Result<(), StorageError> {
+        let mut changes = self
+            .changes
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut batch = WriteBatch::new();
+        for (key, value) in changes.iter() {
+            match value {
+                Some(value) => batch.put(key.clone(), value.clone()),
+                None => batch.delete(key.clone()),
+            }
+        }
+        self.base.write_batch(batch)?;
+        changes.clear();
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn merged_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let mut entries: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.base.scan_prefix(prefix)?.into_iter().collect();
+        let changes = self
+            .changes
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for (key, value) in changes.iter().filter(|(key, _)| key.starts_with(prefix)) {
+            match value {
+                Some(value) => {
+                    entries.insert(key.clone(), value.clone());
+                }
+                None => {
+                    entries.remove(key);
+                }
+            }
+        }
+        Ok(entries.into_iter().collect())
+    }
+}
+
+impl<S: KvStore> KvStore for OverlayStore<S> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        if let Some(value) = self
+            .changes
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .get(key)
+        {
+            return Ok(value.clone());
+        }
+        self.base.get(key)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        self.changes
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .insert(key.to_vec(), Some(value.to_vec()));
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        self.changes
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .insert(key.to_vec(), None);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        let mut changes = self
+            .changes
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for op in batch.ops() {
+            match op {
+                WriteBatchOp::Put { key, value } => {
+                    changes.insert(key.clone(), Some(value.clone()));
+                }
+                WriteBatchOp::Delete { key } => {
+                    changes.insert(key.clone(), None);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        self.merged_scan(prefix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryDb;
+
+    #[test]
+    fn changes_are_private_until_commit() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"item/a", b"old").unwrap();
+        base.put(b"item/b", b"remove").unwrap();
+        let overlay = OverlayStore::new(base.clone());
+
+        overlay.put(b"item/a", b"new").unwrap();
+        overlay.delete(b"item/b").unwrap();
+        overlay.put(b"item/c", b"added").unwrap();
+
+        assert_eq!(overlay.get(b"item/a").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(overlay.get(b"item/b").unwrap(), None);
+        assert_eq!(base.get(b"item/a").unwrap(), Some(b"old".to_vec()));
+        assert_eq!(base.get(b"item/b").unwrap(), Some(b"remove".to_vec()));
+
+        overlay.commit().unwrap();
+        assert_eq!(base.get(b"item/a").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(base.get(b"item/b").unwrap(), None);
+        assert_eq!(base.get(b"item/c").unwrap(), Some(b"added".to_vec()));
+    }
+}

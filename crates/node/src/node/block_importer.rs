@@ -365,12 +365,13 @@ impl<S: KvStore + 'static> Node<S> {
             self.validate_stark_proof_source_binding(amendment)?;
         }
 
+        let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
             // Validate all transactions before execution (F-181):
             // security-critical checks (sig, algorithm, access list, pubkey)
             // are enforced during block import, not just mempool.
-            let import_cs = ChainStore::new(self.store.clone());
+            let import_cs = ChainStore::new(import_store.clone());
             let mut block_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
             // M5-C2: Batch verify all transaction signatures in parallel.
             // Resolve pubkeys and compute tx hashes, then dispatch to rayon.
@@ -451,7 +452,8 @@ impl<S: KvStore + 'static> Node<S> {
                     ))
                 })?;
 
-            let (state_db, _) = block_store.isolated_state_db()?;
+            let import_ws = WorldState::at_root(import_store.clone(), &current_root)?;
+            let state_db = ShellStateDb::new(import_ws, ChainStore::new(import_store.clone()));
             let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
 
             // Non-signature validation (chain-id, gas, sender binding).
@@ -557,10 +559,8 @@ impl<S: KvStore + 'static> Node<S> {
                             // AA dispatcher already mutated state_db.world_state
                             // in-place (with atomic rollback on inner failure).
                         } else if result.is_system_tx {
-                            self.sync_system_contract_state(
-                                evm.state_db_mut().world_state_mut(),
-                                &result.system_contract_effects,
-                            )?;
+                            // Native system contracts mutate the isolated world state directly.
+                            // The overlay keeps those changes private until block validation succeeds.
                         } else {
                             commit_pqvm_state(&result, evm.state_db_mut())?;
                         }
@@ -672,7 +672,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // Empty blocks still need to apply timelock activations before computing
             // state_root — a producer at this height will have already applied them.
-            let mut ws = WorldState::at_root(self.store.clone(), &current_root)
+            let mut ws = WorldState::at_root(import_store.clone(), &current_root)
                 .map_err(|e| NodeError::Startup(format!("world_state at root: {e}")))?;
             {
                 let mut registry = AlgorithmRegistry::global_mut();
@@ -700,6 +700,8 @@ impl<S: KvStore + 'static> Node<S> {
         // committed. Relying on a pre-existing stored bundle lets first import
         // skip the check.
         self.verify_incoming_witness_root(&block)?;
+
+        import_store.commit()?;
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
