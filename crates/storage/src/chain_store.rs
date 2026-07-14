@@ -104,16 +104,6 @@ fn encode_rlp_list<T: Encodable>(items: &[T]) -> Vec<u8> {
     buf
 }
 
-fn saturating_entry_len(key_len: usize, value_len: usize) -> u64 {
-    u64::try_from(key_len)
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
-}
-
-fn saturating_entry_bytes(key: &[u8], value: &[u8]) -> u64 {
-    saturating_entry_len(key.len(), value.len())
-}
-
 /// Decode a value from versioned storage format.
 ///
 /// Supports three formats based on the first byte:
@@ -250,14 +240,10 @@ impl<S: KvStore> ChainStore<S> {
     ///
     /// Scans the prefix and sums `key.len() + value.len()` for each entry.
     /// This is an O(n) operation and should only be called on low-frequency
-    /// paths (e.g., the 10-second metrics tick).  Returns `Ok(0)` for empty
-    /// prefixes; propagates storage errors.
+    /// paths. Backends can stream this calculation to keep peak memory bounded.
+    /// Returns `Ok(0)` for empty prefixes; propagates storage errors.
     pub fn approximate_prefix_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
-        let entries = self.store.scan_prefix(prefix)?;
-        let total = entries.iter().fold(0u64, |total, (k, v)| {
-            total.saturating_add(saturating_entry_bytes(k, v))
-        });
-        Ok(total)
+        self.store.prefix_size_bytes(prefix)
     }
 
     // ── Key helpers ────────────────────────────────────────────
@@ -2296,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn approximate_prefix_bytes_sums_entries_with_saturating_math() {
+    fn approximate_prefix_bytes_sums_matching_entries() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
 
@@ -2305,7 +2291,6 @@ mod tests {
         store.put(b"h/a", b"ignored").unwrap();
 
         assert_eq!(cs.approximate_prefix_bytes(b"b/").unwrap(), 12);
-        assert_eq!(saturating_entry_len(usize::MAX, usize::MAX), u64::MAX);
     }
 
     fn empty_block(number: u64) -> Block {

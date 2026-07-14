@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::kv_store::saturating_entry_len;
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 
 /// In-memory KV store for testing and lightweight use cases.
@@ -93,6 +94,19 @@ impl KvStore for MemoryDb {
             .collect();
         results.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(results)
+    }
+
+    fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(data.iter().filter(|(key, _)| key.starts_with(prefix)).fold(
+            0u64,
+            |total, (key, value)| {
+                total.saturating_add(saturating_entry_len(key.len(), value.len()))
+            },
+        ))
     }
 
     fn scan_prefix_after(

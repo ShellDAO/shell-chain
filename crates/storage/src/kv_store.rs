@@ -1,5 +1,11 @@
 use crate::StorageError;
 
+pub(crate) fn saturating_entry_len(key_len: usize, value_len: usize) -> u64 {
+    u64::try_from(key_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
+}
+
 /// Operation in a write batch.
 #[derive(Debug, Clone)]
 pub enum WriteBatchOp {
@@ -65,6 +71,19 @@ pub trait KvStore: Send + Sync {
     /// Results are sorted by key in ascending byte order.
     #[allow(clippy::type_complexity)]
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
+
+    /// Sum the byte lengths of keys and values matching `prefix`.
+    ///
+    /// Backends may override this to stream entries without materializing the
+    /// full prefix scan in memory.
+    fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
+        Ok(self
+            .scan_prefix(prefix)?
+            .iter()
+            .fold(0u64, |total, (key, value)| {
+                total.saturating_add(saturating_entry_len(key.len(), value.len()))
+            }))
+    }
 
     /// Scan keys with `prefix` after an optional exclusive key, stopping once
     /// `limit` entries have been collected. Results are sorted by ascending key.
@@ -231,5 +250,10 @@ mod tests {
         assert!(db.contains(b"present").unwrap());
         db.delete(b"present").unwrap();
         assert!(!db.contains(b"present").unwrap());
+    }
+
+    #[test]
+    fn entry_length_saturates() {
+        assert_eq!(saturating_entry_len(usize::MAX, usize::MAX), u64::MAX);
     }
 }

@@ -30,6 +30,7 @@ use rocksdb::{
     DBCompressionType, DBWithThreadMode, MultiThreaded, Options, WriteBatch as RocksWriteBatch,
 };
 
+use crate::kv_store::saturating_entry_len;
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 
 /// Column family names used by shell-chain.
@@ -403,6 +404,26 @@ impl KvStore for RocksDbStore {
         Ok(results)
     }
 
+    fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
+        let cf = self.cf();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange(prefix));
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            opts,
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+        let mut total = 0u64;
+        for item in iter {
+            let (key, value) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            total = total.saturating_add(saturating_entry_len(key.len(), value.len()));
+        }
+        Ok(total)
+    }
+
     fn scan_prefix_after(
         &self,
         prefix: &[u8],
@@ -496,6 +517,19 @@ mod tests {
         assert!(!s.contains(b"missing").unwrap());
         s.put(b"present", b"yes").unwrap();
         assert!(s.contains(b"present").unwrap());
+    }
+
+    #[test]
+    fn prefix_size_bytes_counts_only_matching_entries() {
+        let (_dir, stores) = open_temp();
+        let s = &stores.chain;
+
+        s.put(b"b/a", b"123").unwrap();
+        s.put(b"b/bb", b"45").unwrap();
+        s.put(b"h/a", b"ignored").unwrap();
+
+        assert_eq!(s.prefix_size_bytes(b"b/").unwrap(), 12);
+        assert_eq!(s.prefix_size_bytes(b"missing/").unwrap(), 0);
     }
 
     #[test]
