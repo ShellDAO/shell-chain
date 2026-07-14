@@ -1118,7 +1118,8 @@ mod tests {
         let (mut ws, cs) = setup_stores();
         let from = signer_address(&signer);
         fund_account(&mut ws, &from);
-        let signed = sign_tx(&signer, base_tx(1337, 0), true);
+        let account_nonce = ws.get_nonce(&from).unwrap();
+        let signed = sign_tx(&signer, base_tx(1337, account_nonce), true);
 
         let outcome = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
         assert_eq!(outcome.pubkey, signer.public_key());
@@ -1196,7 +1197,8 @@ mod tests {
         let from = signer_address(&signer);
         fund_account(&mut ws, &from);
         cs.put_pubkey(&from, signer.public_key()).unwrap();
-        let signed = sign_tx(&signer, base_tx(1337, 0), false);
+        let account_nonce = ws.get_nonce(&from).unwrap();
+        let signed = sign_tx(&signer, base_tx(1337, account_nonce), false);
 
         let outcome = validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
         assert_eq!(outcome.pubkey, signer.public_key());
@@ -1262,9 +1264,10 @@ mod tests {
         )
         .unwrap();
 
+        let account_nonce = ws.get_nonce(&from).unwrap();
         let signed = SignedTransaction::new(
             from,
-            base_tx(1337, 0),
+            base_tx(1337, account_nonce),
             PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
         );
 
