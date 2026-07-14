@@ -195,10 +195,8 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     }
 
     // 1c. Blob transaction validation (F-233)
-    if tx.tx_type == 3 {
-        if let Err(msg) = tx.validate_blob_tx() {
-            return Err(TxValidationError::InvalidBlobTx(msg.to_string()));
-        }
+    if let Err(msg) = tx.validate_blob_tx() {
+        return Err(TxValidationError::InvalidBlobTx(msg.to_string()));
     }
 
     // 1d. AA bundle structural + intrinsic gas pre-check (M2 native AA).
@@ -399,10 +397,8 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
     }
 
     // 2b. Blob transaction validation (F-233)
-    if tx.tx_type == 3 {
-        if let Err(msg) = tx.validate_blob_tx() {
-            return Err(TxValidationError::InvalidBlobTx(msg.to_string()));
-        }
+    if let Err(msg) = tx.validate_blob_tx() {
+        return Err(TxValidationError::InvalidBlobTx(msg.to_string()));
     }
 
     // 2c. AA bundle structural + intrinsic gas pre-check (M2 native AA).
@@ -921,6 +917,22 @@ mod tests {
         let verifier = DilithiumVerifier;
         let result = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
         assert!(matches!(result, Err(TxValidationError::NonceOverflow)));
+    }
+
+    #[test]
+    fn validate_rejects_blob_fields_on_non_blob_transaction() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::from(1_000_000));
+
+        let mut tx = simple_transfer(test_chain_id(), 0);
+        tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+        let signed = sign_tx(&signer, tx, true);
+
+        let verifier = DilithiumVerifier;
+        let result = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
+        assert!(matches!(result, Err(TxValidationError::InvalidBlobTx(_))));
     }
 
     #[test]

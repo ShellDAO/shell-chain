@@ -249,24 +249,33 @@ impl Transaction {
 
     /// Validate EIP-4844 blob transaction fields.
     /// Type 3 transactions must have 1..=6 blob hashes and a max_fee_per_blob_gas.
+    /// Other transaction types must not carry blob-only fields.
     pub fn validate_blob_tx(&self) -> Result<(), &'static str> {
-        if self.tx_type == 3 {
-            let hashes = self
-                .blob_versioned_hashes
-                .as_ref()
-                .ok_or("blob tx (type 3) must have blob_versioned_hashes")?;
-            if hashes.is_empty() {
-                return Err("blob tx must have at least 1 blob hash");
+        if self.tx_type != 3 {
+            if self.max_fee_per_blob_gas.is_some() {
+                return Err("non-blob tx cannot have max_fee_per_blob_gas");
             }
-            if hashes.len() > MAX_BLOB_HASHES_PER_TX {
-                return Err("blob tx exceeds maximum blob hash count (6)");
+            if self.blob_versioned_hashes.is_some() {
+                return Err("non-blob tx cannot have blob_versioned_hashes");
             }
-            if self.max_fee_per_blob_gas.is_none() {
-                return Err("blob tx must have max_fee_per_blob_gas");
-            }
-            if self.to.is_none() {
-                return Err("blob tx cannot be a contract creation");
-            }
+            return Ok(());
+        }
+
+        let hashes = self
+            .blob_versioned_hashes
+            .as_ref()
+            .ok_or("blob tx (type 3) must have blob_versioned_hashes")?;
+        if hashes.is_empty() {
+            return Err("blob tx must have at least 1 blob hash");
+        }
+        if hashes.len() > MAX_BLOB_HASHES_PER_TX {
+            return Err("blob tx exceeds maximum blob hash count (6)");
+        }
+        if self.max_fee_per_blob_gas.is_none() {
+            return Err("blob tx must have max_fee_per_blob_gas");
+        }
+        if self.to.is_none() {
+            return Err("blob tx cannot be a contract creation");
         }
         Ok(())
     }
@@ -2305,9 +2314,29 @@ mod tests {
     }
 
     #[test]
-    fn non_blob_tx_skips_validation() {
-        let tx = sample_tx(); // type 2
+    fn non_blob_tx_without_blob_fields_is_valid() {
+        let tx = sample_tx();
         assert!(tx.validate_blob_tx().is_ok());
+    }
+
+    #[test]
+    fn non_blob_tx_rejects_blob_fee() {
+        let mut tx = sample_tx();
+        tx.max_fee_per_blob_gas = Some(1_000_000);
+        assert_eq!(
+            tx.validate_blob_tx().unwrap_err(),
+            "non-blob tx cannot have max_fee_per_blob_gas"
+        );
+    }
+
+    #[test]
+    fn non_blob_tx_rejects_blob_hashes() {
+        let mut tx = sample_tx();
+        tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+        assert_eq!(
+            tx.validate_blob_tx().unwrap_err(),
+            "non-blob tx cannot have blob_versioned_hashes"
+        );
     }
 
     #[test]

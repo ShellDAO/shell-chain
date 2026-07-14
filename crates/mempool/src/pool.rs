@@ -592,10 +592,8 @@ impl TxPool {
         }
 
         // Blob transaction validation (F-233)
-        if tx.tx.tx_type == 3 {
-            if let Err(msg) = tx.tx.validate_blob_tx() {
-                return Err(MempoolError::InvalidTransaction(msg.to_string()));
-            }
+        if let Err(msg) = tx.tx.validate_blob_tx() {
+            return Err(MempoolError::InvalidTransaction(msg.to_string()));
         }
 
         // AA bundle structural pre-check (M2 native AA): consistency between
@@ -1211,6 +1209,24 @@ mod tests {
 
         let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
         assert!(matches!(err, MempoolError::ChainIdMismatch { .. }));
+    }
+
+    #[test]
+    fn reject_blob_fields_on_non_blob_transaction() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let (mut tx, _pk) = make_signed_tx(0, 100);
+        tx.tx.max_fee_per_blob_gas = Some(1_000_000);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message == "non-blob tx cannot have max_fee_per_blob_gas"
+        ));
+        assert!(pool.is_empty());
     }
 
     #[test]
