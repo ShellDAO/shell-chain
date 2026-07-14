@@ -1342,7 +1342,22 @@ mod tests {
     use shell_primitives::U256;
     use shell_rpc::DevRpcControl;
     use shell_storage::{MemoryDb, StorageError, WriteBatch};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn run_isolated(test_name: &str, marker: &str) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
+
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .status()
+            .expect("isolated test process must start");
+        assert!(status.success(), "isolated test process failed");
+        true
+    }
 
     #[derive(Debug, Default)]
     struct FailingBatchDb {
@@ -4737,6 +4752,13 @@ mod tests {
 
     #[test]
     fn rejected_governance_block_restores_algorithm_registry() {
+        const TEST_NAME: &str =
+            "node::tests::rejected_governance_block_restores_algorithm_registry";
+        const ISOLATED_MARKER: &str = "SHELL_TEST_ISOLATED_ALGORITHM_REGISTRY_ROLLBACK";
+        if run_isolated(TEST_NAME, ISOLATED_MARKER) {
+            return;
+        }
+
         struct RegistryReset(AlgorithmRegistry);
 
         impl Drop for RegistryReset {
