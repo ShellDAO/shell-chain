@@ -562,7 +562,13 @@ impl Decodable for SessionAuth {
         }
         let remaining = buf.len();
 
-        let session_pubkey = Bytes::from(alloy_rlp::Header::decode_bytes(buf, false)?.to_vec());
+        let session_pubkey_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if session_pubkey_raw.len() > MAX_SESSION_PUBKEY {
+            return Err(alloy_rlp::Error::Custom(
+                "session_auth: session_pubkey exceeds size limit",
+            ));
+        }
+        let session_pubkey = Bytes::from(session_pubkey_raw.to_vec());
         let session_algo = {
             let v: u64 = Decodable::decode(buf)?;
             if v > u8::MAX as u64 {
@@ -592,8 +598,20 @@ impl Decodable for SessionAuth {
         }
         let value_cap = U256::from_be_slice(value_bytes);
         let expiry_block: u64 = Decodable::decode(buf)?;
-        let root_signature = Bytes::from(alloy_rlp::Header::decode_bytes(buf, false)?.to_vec());
-        let session_signature = Bytes::from(alloy_rlp::Header::decode_bytes(buf, false)?.to_vec());
+        let root_signature_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if root_signature_raw.len() > MAX_SIGNATURE_BYTES {
+            return Err(alloy_rlp::Error::Custom(
+                "session_auth: root_signature exceeds size limit",
+            ));
+        }
+        let root_signature = Bytes::from(root_signature_raw.to_vec());
+        let session_signature_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if session_signature_raw.len() > MAX_SIGNATURE_BYTES {
+            return Err(alloy_rlp::Error::Custom(
+                "session_auth: session_signature exceeds size limit",
+            ));
+        }
+        let session_signature = Bytes::from(session_signature_raw.to_vec());
 
         let consumed = remaining.saturating_sub(buf.len());
         if consumed != header.payload_length {
@@ -697,6 +715,11 @@ impl Decodable for InnerCall {
         };
         let value = U256::decode(buf)?;
         let data = Bytes::decode(buf)?;
+        if data.len() > MAX_INNER_CALLDATA {
+            return Err(alloy_rlp::Error::Custom(
+                "inner call data exceeds size limit",
+            ));
+        }
         let gas_limit = u64::decode(buf)?;
 
         let consumed = remaining.saturating_sub(buf.len());
@@ -1071,6 +1094,11 @@ impl Decodable for AaBundle {
         let inner_end = crate::rlp_payload_end(inner_remaining, inner_header.payload_length)?;
         let mut inner_calls = Vec::new();
         while buf.len() > inner_end {
+            if inner_calls.len() == MAX_INNER_CALLS {
+                return Err(alloy_rlp::Error::Custom(
+                    "aa bundle exceeds maximum inner call count",
+                ));
+            }
             inner_calls.push(InnerCall::decode(buf)?);
         }
         if buf.len() != inner_end {
@@ -1098,6 +1126,11 @@ impl Decodable for AaBundle {
 
         // paymaster_signature (Phase 1)
         let sig_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if sig_raw.len() > MAX_SIGNATURE_BYTES {
+            return Err(alloy_rlp::Error::Custom(
+                "paymaster signature exceeds size limit",
+            ));
+        }
         let paymaster_signature = if sig_raw.is_empty() {
             None
         } else {
@@ -1106,6 +1139,11 @@ impl Decodable for AaBundle {
 
         // paymaster_context (Phase 2)
         let ctx_raw = alloy_rlp::Header::decode_bytes(buf, false)?;
+        if ctx_raw.len() > MAX_PAYMASTER_CONTEXT {
+            return Err(alloy_rlp::Error::Custom(
+                "paymaster context exceeds size limit",
+            ));
+        }
         let paymaster_context = if ctx_raw.is_empty() {
             None
         } else {
@@ -1654,10 +1692,14 @@ impl Decodable for Transaction {
         let tx_type = u8::decode(buf)?;
         let blob_fee_flag = u8::decode(buf)?;
         let blob_fee_raw = u64::decode(buf)?;
-        let max_fee_per_blob_gas = if blob_fee_flag == 1 {
-            Some(blob_fee_raw)
-        } else {
-            None
+        let max_fee_per_blob_gas = match blob_fee_flag {
+            0 => None,
+            1 => Some(blob_fee_raw),
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "invalid max_fee_per_blob_gas presence flag",
+                ));
+            }
         };
         let blob_versioned_hashes = Self::decode_blob_hashes(buf)?;
 
@@ -1759,6 +1801,11 @@ impl Transaction {
         let end = crate::rlp_payload_end(list_remaining, header.payload_length)?;
         let mut hashes = Vec::new();
         while buf.len() > end {
+            if hashes.len() == MAX_BLOB_HASHES_PER_TX {
+                return Err(alloy_rlp::Error::Custom(
+                    "blob transaction exceeds maximum blob hash count",
+                ));
+            }
             hashes.push(ShellHash::decode(buf)?);
         }
         if buf.len() != end {
@@ -1854,6 +1901,37 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         }
+    }
+
+    fn encode_transaction_with_blob_fee_flag(tx: &Transaction, flag: u8) -> Vec<u8> {
+        let mut payload = Vec::new();
+        tx.chain_id.encode(&mut payload);
+        tx.nonce.encode(&mut payload);
+        match &tx.to {
+            Some(addr) => addr.encode(&mut payload),
+            None => Bytes::new().encode(&mut payload),
+        }
+        tx.value.encode(&mut payload);
+        tx.data.encode(&mut payload);
+        tx.gas_limit.encode(&mut payload);
+        tx.max_fee_per_gas.encode(&mut payload);
+        tx.max_priority_fee_per_gas.encode(&mut payload);
+        tx.encode_access_list(&mut payload);
+        tx.tx_type.encode(&mut payload);
+        flag.encode(&mut payload);
+        tx.max_fee_per_blob_gas
+            .unwrap_or_default()
+            .encode(&mut payload);
+        tx.encode_blob_hashes(&mut payload);
+
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+        encoded
     }
 
     #[test]
@@ -2452,6 +2530,33 @@ mod tests {
     }
 
     #[test]
+    fn transaction_decode_rejects_invalid_blob_fee_presence_flag() {
+        let encoded = encode_transaction_with_blob_fee_flag(&sample_tx(), 2);
+        let err = Transaction::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid max_fee_per_blob_gas presence flag"));
+    }
+
+    #[test]
+    fn blob_hashes_decode_rejects_count_above_protocol_limit() {
+        let mut payload = Vec::new();
+        for index in 0..=MAX_BLOB_HASHES_PER_TX {
+            ShellHash::from([index as u8; 32]).encode(&mut payload);
+        }
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+
+        let err = Transaction::decode_blob_hashes(&mut encoded.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum blob hash count"));
+    }
+
+    #[test]
     fn tx_type2_eip1559_rlp_roundtrip() {
         let tx = Transaction {
             chain_id: 1337,
@@ -2960,6 +3065,77 @@ mod tests {
         bundle.encode(&mut buf);
         let decoded = AaBundle::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn aa_bundle_decode_rejects_inner_call_count_above_limit() {
+        let bundle = AaBundle {
+            inner_calls: (0..=MAX_INNER_CALLS)
+                .map(|index| sample_inner_call(index as u64))
+                .collect(),
+            ..Default::default()
+        };
+        let encoded = alloy_rlp::encode(&bundle);
+
+        let err = AaBundle::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum inner call count"));
+    }
+
+    #[test]
+    fn inner_call_decode_rejects_oversized_calldata() {
+        let mut call = sample_inner_call(1);
+        call.data = Bytes::from(vec![0; MAX_INNER_CALLDATA + 1]);
+        let encoded = alloy_rlp::encode(&call);
+
+        let err = InnerCall::decode(&mut encoded.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("data exceeds size limit"));
+    }
+
+    #[test]
+    fn session_auth_decode_rejects_oversized_variable_fields() {
+        let base = SessionAuth {
+            session_pubkey: Bytes::from(vec![1]),
+            session_algo: SignatureType::Dilithium3.as_u8(),
+            target: None,
+            value_cap: U256::ZERO,
+            expiry_block: 1,
+            root_signature: Bytes::from(vec![1]),
+            session_signature: Bytes::from(vec![1]),
+        };
+
+        let mut cases = Vec::new();
+        let mut oversized_pubkey = base.clone();
+        oversized_pubkey.session_pubkey = Bytes::from(vec![0; MAX_SESSION_PUBKEY + 1]);
+        cases.push(oversized_pubkey);
+        let mut oversized_root_signature = base.clone();
+        oversized_root_signature.root_signature = Bytes::from(vec![0; MAX_SIGNATURE_BYTES + 1]);
+        cases.push(oversized_root_signature);
+        let mut oversized_session_signature = base;
+        oversized_session_signature.session_signature =
+            Bytes::from(vec![0; MAX_SIGNATURE_BYTES + 1]);
+        cases.push(oversized_session_signature);
+
+        for auth in cases {
+            let encoded = alloy_rlp::encode(&auth);
+            assert!(SessionAuth::decode(&mut encoded.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn aa_bundle_decode_rejects_oversized_paymaster_fields() {
+        let mut signature_bundle = AaBundle {
+            inner_calls: vec![sample_inner_call(1)],
+            paymaster: Some(Address::from([0x77; 20])),
+            paymaster_signature: Some(Bytes::from(vec![0; MAX_SIGNATURE_BYTES + 1])),
+            ..Default::default()
+        };
+        let encoded = alloy_rlp::encode(&signature_bundle);
+        assert!(AaBundle::decode(&mut encoded.as_slice()).is_err());
+
+        signature_bundle.paymaster_signature = None;
+        signature_bundle.paymaster_context = Some(Bytes::from(vec![0; MAX_PAYMASTER_CONTEXT + 1]));
+        let encoded = alloy_rlp::encode(&signature_bundle);
+        assert!(AaBundle::decode(&mut encoded.as_slice()).is_err());
     }
 
     #[test]
