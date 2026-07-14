@@ -52,6 +52,9 @@ impl<S: KvStore + 'static> Node<S> {
             head.header.gas_limit,
             head.header.base_fee_per_gas,
         );
+        let excess_blob_gas =
+            calc_excess_blob_gas(head.header.excess_blob_gas, head.header.blob_gas_used);
+        let blob_base_fee = calc_blob_gas_price(excess_blob_gas);
         let candidates = mem_pool.pending_for_block(max_txs, base_fee);
 
         // Create an isolated EVM instance at the current state root.
@@ -79,7 +82,7 @@ impl<S: KvStore + 'static> Node<S> {
             withdrawals_root: ShellHash::ZERO,
             parent_beacon_block_root: ShellHash::ZERO,
             blob_gas_used: 0,
-            excess_blob_gas: 0,
+            excess_blob_gas,
             witness_root: None,
         };
 
@@ -110,6 +113,23 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // EIP-1559: skip transactions that cannot afford the base fee.
             if tx.tx.max_fee_per_gas < base_fee {
+                continue;
+            }
+            let tx_blob_gas = tx.tx.blob_gas();
+            let Some(next_blob_gas) =
+                checked_cumulative_blob_gas(header.blob_gas_used, tx_blob_gas)
+            else {
+                debug!(
+                    tx_hash = %tx.tx.hash(),
+                    tx_blob_gas,
+                    block_blob_gas = header.blob_gas_used,
+                    max_blob_gas = MAX_BLOB_GAS_PER_BLOCK,
+                    "produce_block: skipping tx that exceeds remaining block blob gas"
+                );
+                continue;
+            };
+            if tx.tx.tx_type == 3 && tx.tx.max_fee_per_blob_gas.unwrap_or_default() < blob_base_fee
+            {
                 continue;
             }
             // F-302: Re-validate before execution (algorithm restrictions may have
@@ -219,6 +239,7 @@ impl<S: KvStore + 'static> Node<S> {
                         continue;
                     };
                     cumulative_gas = next_cumulative_gas;
+                    header.blob_gas_used = next_blob_gas;
                     total_effective_fees = total_effective_fees.saturating_add(
                         U256::from(result.gas_used).saturating_mul(U256::from(price)),
                     );

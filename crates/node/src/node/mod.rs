@@ -26,8 +26,9 @@ pub(crate) use shell_consensus::{
     ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig, VIEW_CHANGE_TIMEOUT_MS,
 };
 pub(crate) use shell_core::{
-    calculate_base_fee, effective_gas_price, Account, Block, BlockHeader, SignedTransaction,
-    StrippedBlock, SystemTransaction, SystemTxKind, TransactionReceipt,
+    calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, Account,
+    Block, BlockHeader, SignedTransaction, StrippedBlock, SystemTransaction, SystemTxKind,
+    TransactionReceipt, MAX_BLOB_GAS_PER_BLOCK,
 };
 pub(crate) use shell_crypto::{
     AlgorithmRegistry, BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem,
@@ -106,6 +107,12 @@ fn checked_cumulative_block_gas(
     cumulative_gas
         .checked_add(gas_used)
         .filter(|next| *next <= block_gas_limit)
+}
+
+fn checked_cumulative_blob_gas(cumulative_blob_gas: u64, tx_blob_gas: u64) -> Option<u64> {
+    cumulative_blob_gas
+        .checked_add(tx_blob_gas)
+        .filter(|next| *next <= MAX_BLOB_GAS_PER_BLOCK)
 }
 
 fn next_block_request_start(head_number: u64) -> Option<u64> {
@@ -1427,6 +1434,25 @@ mod tests {
         assert_eq!(checked_cumulative_block_gas(20, 10, 30), Some(30));
         assert_eq!(checked_cumulative_block_gas(20, 11, 30), None);
         assert_eq!(checked_cumulative_block_gas(u64::MAX, 1, u64::MAX), None);
+    }
+
+    #[test]
+    fn checked_cumulative_blob_gas_enforces_block_limit() {
+        assert_eq!(
+            checked_cumulative_blob_gas(
+                shell_core::MAX_BLOB_GAS_PER_BLOCK - shell_core::BLOB_GAS_PER_BLOB,
+                shell_core::BLOB_GAS_PER_BLOB,
+            ),
+            Some(shell_core::MAX_BLOB_GAS_PER_BLOCK)
+        );
+        assert_eq!(
+            checked_cumulative_blob_gas(
+                shell_core::MAX_BLOB_GAS_PER_BLOCK,
+                shell_core::BLOB_GAS_PER_BLOB,
+            ),
+            None
+        );
+        assert_eq!(checked_cumulative_blob_gas(u64::MAX, 1), None);
     }
 
     fn signed_tx_with_gas_limit(gas_limit: u64) -> SignedTransaction {
@@ -3698,6 +3724,96 @@ mod tests {
 
         let head = node.chain_store.get_head_block().unwrap().unwrap();
         assert_eq!(head.number(), 1);
+    }
+
+    #[test]
+    fn import_block_rejects_empty_header_blob_gas_used_mismatch() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let state_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_001,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: shell_core::BLOB_GAS_PER_BLOB,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
+
+        let err = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            err.to_string().contains("blob_gas_used mismatch"),
+            "expected empty block blob_gas_used rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn import_block_rejects_invalid_excess_blob_gas() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let state_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_001,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 1,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
+
+        let err = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid excess_blob_gas"),
+            "expected excess_blob_gas rejection, got {err}"
+        );
     }
 
     #[test]

@@ -104,6 +104,14 @@ pub const MAX_ACCESS_LIST_ENTRIES: usize = 256;
 pub const MAX_ACCESS_LIST_STORAGE_KEYS: usize = 512;
 
 impl Transaction {
+    /// Blob gas carried by this transaction after structural validation.
+    pub fn blob_gas(&self) -> u64 {
+        self.blob_versioned_hashes
+            .as_ref()
+            .map(|hashes| (hashes.len() as u64).saturating_mul(crate::fee::BLOB_GAS_PER_BLOB))
+            .unwrap_or(0)
+    }
+
     /// RLP-encode the access list as a list of [address, [key, key, ...]].
     fn encode_access_list(&self, out: &mut dyn alloy_rlp::BufMut) {
         match &self.access_list {
@@ -2203,6 +2211,7 @@ mod tests {
             blob_versioned_hashes: Some(vec![ShellHash::ZERO]),
         };
         assert!(tx.validate_blob_tx().is_ok());
+        assert_eq!(tx.blob_gas(), crate::fee::BLOB_GAS_PER_BLOB);
     }
 
     #[test]

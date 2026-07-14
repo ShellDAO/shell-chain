@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::warn;
 
-use shell_core::SignedTransaction;
+use shell_core::{calc_blob_gas_price, calc_excess_blob_gas, SignedTransaction};
 use shell_crypto::Verifier;
 use shell_pqvm::{
     compute_intrinsic_gas, validate_aa_bundle_structure, validate_aa_tx, AaValidationError,
@@ -101,9 +101,7 @@ impl TxPool {
 
         // --- Balance floor check (F-020) ---
         let sender = tx.sender();
-        let gas_cost = U256::from(tx.tx.gas_limit)
-            .checked_mul(U256::from(tx.tx.max_fee_per_gas))
-            .unwrap_or(U256::MAX);
+        let gas_cost = max_gas_cost(&tx);
 
         // For AA bundles with a paymaster, gas is covered by the paymaster.
         // For all other transactions (including batch-only AA), the sender pays.
@@ -570,6 +568,18 @@ impl TxPool {
                     tx.tx.max_fee_per_gas, head.base_fee_per_gas
                 )));
             }
+            if tx.tx.tx_type == 3 {
+                let next_excess_blob_gas =
+                    calc_excess_blob_gas(head.excess_blob_gas, head.blob_gas_used);
+                let blob_base_fee = calc_blob_gas_price(next_excess_blob_gas);
+                if let Some(max_fee_per_blob_gas) = tx.tx.max_fee_per_blob_gas {
+                    if max_fee_per_blob_gas < blob_base_fee {
+                        return Err(MempoolError::InvalidTransaction(format!(
+                            "max fee per blob gas ({max_fee_per_blob_gas}) below current blob base fee ({blob_base_fee})",
+                        )));
+                    }
+                }
+            }
         }
 
         if tx.tx.max_priority_fee_per_gas > tx.tx.max_fee_per_gas {
@@ -779,9 +789,13 @@ fn gas_payer(tx: &SignedTransaction) -> Address {
 }
 
 fn max_gas_cost(tx: &SignedTransaction) -> U256 {
-    U256::from(tx.tx.gas_limit)
+    let execution_gas_cost = U256::from(tx.tx.gas_limit)
         .checked_mul(U256::from(tx.tx.max_fee_per_gas))
-        .unwrap_or(U256::MAX)
+        .unwrap_or(U256::MAX);
+    let blob_gas_cost = U256::from(tx.tx.blob_gas())
+        .checked_mul(U256::from(tx.tx.max_fee_per_blob_gas.unwrap_or_default()))
+        .unwrap_or(U256::MAX);
+    add_or_max(execution_gas_cost, blob_gas_cost)
 }
 
 fn add_or_max(left: U256, right: U256) -> U256 {
@@ -945,6 +959,28 @@ mod tests {
         (signed, pubkey)
     }
 
+    fn make_blob_tx(max_fee_per_blob_gas: u64) -> SignedTransaction {
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: u64::default(),
+            to: Some(test_address(b"recipient-placeholder-key-data-for-address")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 3,
+            max_fee_per_blob_gas: Some(max_fee_per_blob_gas),
+            blob_versioned_hashes: Some(vec![ShellHash::ZERO]),
+        };
+        let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+        SignedTransaction::with_pubkey(from, tx, sig, pubkey)
+    }
+
     /// Convenience: create a signed tx from an existing signer for multi-nonce tests.
     fn make_signed_tx_with_signer(
         signer: &DilithiumSigner,
@@ -1090,6 +1126,16 @@ mod tests {
     }
 
     fn set_head(cs: &ChainStore<MemoryDb>, gas_limit: u64, base_fee_per_gas: u64) {
+        set_head_with_blob_gas(cs, gas_limit, base_fee_per_gas, 0, 0);
+    }
+
+    fn set_head_with_blob_gas(
+        cs: &ChainStore<MemoryDb>,
+        gas_limit: u64,
+        base_fee_per_gas: u64,
+        blob_gas_used: u64,
+        excess_blob_gas: u64,
+    ) {
         let block = Block {
             header: BlockHeader {
                 parent_hash: ShellHash::ZERO,
@@ -1107,8 +1153,8 @@ mod tests {
                 base_fee_per_gas,
                 withdrawals_root: ShellHash::ZERO,
                 parent_beacon_block_root: ShellHash::ZERO,
-                blob_gas_used: 0,
-                excess_blob_gas: 0,
+                blob_gas_used,
+                excess_blob_gas,
                 witness_root: None,
             },
             transactions: vec![],
@@ -1262,6 +1308,45 @@ mod tests {
             MempoolError::InvalidTransaction(message)
                 if message == "max fee per gas (110) below current base fee (111)"
         ));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn reject_blob_transaction_below_next_block_blob_base_fee() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        set_head_with_blob_gas(
+            &cs,
+            30_000_000,
+            1,
+            shell_core::TARGET_BLOB_GAS_PER_BLOCK,
+            shell_core::BLOB_BASE_FEE_UPDATE_FRACTION,
+        );
+        let tx = make_blob_tx(shell_core::MIN_BLOB_BASE_FEE);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message.contains("below current blob base fee")
+        ));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn reject_blob_transaction_when_balance_only_covers_execution_gas() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let tx = make_blob_tx(10);
+        let execution_gas_cost = U256::from(tx.tx.gas_limit) * U256::from(tx.tx.max_fee_per_gas);
+
+        let err = insert_with_balance(&pool, tx, &verifier, &mut ws, &cs, execution_gas_cost)
+            .unwrap_err();
+
+        assert!(matches!(err, MempoolError::InsufficientBalance { .. }));
         assert!(pool.is_empty());
     }
 

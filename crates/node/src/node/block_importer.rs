@@ -267,6 +267,48 @@ impl<S: KvStore + 'static> Node<S> {
             )));
         }
 
+        let expected_excess_blob_gas =
+            calc_excess_blob_gas(parent.header.excess_blob_gas, parent.header.blob_gas_used);
+        if block.header.excess_blob_gas != expected_excess_blob_gas {
+            return Err(NodeError::Startup(format!(
+                "invalid excess_blob_gas: expected {expected_excess_blob_gas}, got {}",
+                block.header.excess_blob_gas,
+            )));
+        }
+
+        let mut expected_blob_gas_used = 0u64;
+        let blob_base_fee = calc_blob_gas_price(expected_excess_blob_gas);
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            expected_blob_gas_used =
+                checked_cumulative_blob_gas(expected_blob_gas_used, tx.tx.blob_gas()).ok_or_else(
+                    || {
+                        NodeError::Startup(format!(
+                            "block {} tx {} exceeds maximum blob gas {}",
+                            block.number(),
+                            idx,
+                            MAX_BLOB_GAS_PER_BLOCK,
+                        ))
+                    },
+                )?;
+            if tx.tx.tx_type == 3 && tx.tx.max_fee_per_blob_gas.unwrap_or_default() < blob_base_fee
+            {
+                return Err(NodeError::Startup(format!(
+                    "block {} tx {} max fee per blob gas is below blob base fee {}",
+                    block.number(),
+                    idx,
+                    blob_base_fee,
+                )));
+            }
+        }
+        if block.header.blob_gas_used != expected_blob_gas_used {
+            return Err(NodeError::Startup(format!(
+                "block {} blob_gas_used mismatch: expected {}, got {}",
+                block.number(),
+                expected_blob_gas_used,
+                block.header.blob_gas_used,
+            )));
+        }
+
         // C3: If the block carries a STARK aggregate proof, verify it.
         // A valid proof means the block producer correctly accumulated all
         // tx signature entries; this is belt-and-suspenders verification on top

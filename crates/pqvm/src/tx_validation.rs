@@ -5,7 +5,7 @@
 //! 2. **Address derivation check** — ensures `from` matches pubkey
 //! 3. **Pubkey hybrid registration** — registers pubkey on first use
 //! 4. **Nonce check** — tx.nonce must equal account.nonce
-//! 5. **Balance check** — sender must afford gas_limit × max_fee_per_gas + value
+//! 5. **Balance check** — sender must afford execution gas, blob gas, and value
 
 use crate::aa_validation::{validate_aa_tx, AaValidationError};
 use shell_core::{SignedTransaction, Transaction};
@@ -156,6 +156,14 @@ fn ensure_nonce_can_advance(nonce: u64) -> Result<(), TxValidationError> {
         .ok_or(TxValidationError::NonceOverflow)
 }
 
+fn max_transaction_gas_cost(tx: &Transaction) -> Option<U256> {
+    let execution_gas_cost =
+        U256::from(tx.gas_limit).checked_mul(U256::from(tx.max_fee_per_gas))?;
+    let blob_gas_cost = U256::from(tx.blob_gas())
+        .checked_mul(U256::from(tx.max_fee_per_blob_gas.unwrap_or_default()))?;
+    execution_gas_cost.checked_add(blob_gas_cost)
+}
+
 /// Validate a signed transaction before PQVM/revm execution.
 ///
 /// This function performs the full pre-execution validation pipeline:
@@ -168,7 +176,7 @@ fn ensure_nonce_can_advance(nonce: u64) -> Result<(), TxValidationError> {
 /// 5. **Signature verification** — PQ signature over tx hash
 /// 6. **Pubkey registration** — if first use, writes pubkey to ChainStore
 /// 7. **Nonce** — must equal account's current nonce
-/// 8. **Balance** — must afford `gas_limit * max_fee_per_gas + value`
+/// 8. **Balance** — must afford maximum execution gas, blob gas, and value
 ///
 /// Returns the resolved public key bytes on success (needed by the executor
 /// to know whether registration occurred).
@@ -233,7 +241,7 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     // inner calls.
     //
     // For all other paths: standard sender-pays balance check.
-    let max_gas_cost = U256::from(tx.gas_limit).checked_mul(U256::from(tx.max_fee_per_gas));
+    let max_gas_cost = max_transaction_gas_cost(tx);
 
     if let Some(bundle) = signed_tx.aa_bundle.as_ref() {
         if let Some(paymaster) = bundle.paymaster {
@@ -288,7 +296,7 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
         return Ok(pubkey);
     }
 
-    // 8 (legacy). Balance check: sender must afford gas_limit * max_fee_per_gas + value
+    // 8 (legacy). Balance check: sender must afford execution gas, blob gas, and value.
     //    Use checked arithmetic to prevent overflow panic (debug) / wrapping (release).
     let needed = match max_gas_cost.and_then(|c| c.checked_add(tx.value)) {
         Some(n) => n,
@@ -1062,6 +1070,31 @@ mod tests {
             Err(TxValidationError::InsufficientBalance { .. })
         ));
         assert_eq!(cs.get_pubkey(&from).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_blob_tx_balance_includes_blob_gas() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        let mut tx = simple_transfer(test_chain_id(), u64::default());
+        tx.tx_type = 3;
+        tx.max_fee_per_blob_gas = Some(10);
+        tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+        let execution_and_value = U256::from(tx.gas_limit)
+            .checked_mul(U256::from(tx.max_fee_per_gas))
+            .unwrap()
+            .checked_add(tx.value)
+            .unwrap();
+        fund_account(&mut ws, &from, execution_and_value);
+        let signed = sign_tx(&signer, tx, true);
+
+        let result = validate_tx(&signed, &mut ws, &cs, &DilithiumVerifier, test_chain_id());
+
+        assert!(matches!(
+            result,
+            Err(TxValidationError::InsufficientBalance { .. })
+        ));
     }
 
     #[test]

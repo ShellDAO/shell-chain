@@ -69,6 +69,12 @@ fn base_fee_delta(parent_base_fee: u64, gas_delta: u64, gas_target: u64) -> u64 
 /// EIP-4844: target blob gas per block (3 blobs × 131072 gas each).
 pub const TARGET_BLOB_GAS_PER_BLOCK: u64 = 393_216;
 
+/// EIP-4844: gas consumed by one blob.
+pub const BLOB_GAS_PER_BLOB: u64 = 131_072;
+
+/// EIP-4844: maximum blob gas per block (6 blobs).
+pub const MAX_BLOB_GAS_PER_BLOCK: u64 = 786_432;
+
 /// EIP-4844: minimum blob base fee (1 wei).
 pub const MIN_BLOB_BASE_FEE: u64 = 1;
 
