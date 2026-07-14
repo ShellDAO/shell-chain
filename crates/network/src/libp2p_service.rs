@@ -675,7 +675,7 @@ async fn swarm_loop(
                     &loop_config,
                     &mut peer_tracker,
                     &mut peer_ban_list,
-                ).await;
+                );
             }
             _ = kad_bootstrap_interval.tick() => {
                 if let Some(kad) = swarm.behaviour_mut().kademlia.as_mut() {
@@ -742,7 +742,7 @@ fn seed_and_dial_boot_node(
 }
 
 /// Process a single SwarmEvent, forwarding relevant data as NetworkEvents.
-async fn handle_swarm_event(
+fn handle_swarm_event(
     event: SwarmEvent<ShellBehaviourEvent>,
     swarm: &mut Swarm<ShellBehaviour>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -833,14 +833,14 @@ async fn handle_swarm_event(
                     }
                     let acceptance = match try_forward_message_event(event_tx, peer, msg) {
                         Ok(()) => gossipsub::MessageAcceptance::Accept,
-                        Err(MessageEventQueueError::Full) => {
+                        Err(EventQueueError::Full) => {
                             debug!(
                                 peer = %propagation_source,
                                 "Node event queue is full - ignoring validated message"
                             );
                             gossipsub::MessageAcceptance::Ignore
                         }
-                        Err(MessageEventQueueError::Closed) => {
+                        Err(EventQueueError::Closed) => {
                             debug!(
                                 peer = %propagation_source,
                                 "Node event queue is closed - ignoring validated message"
@@ -891,11 +891,17 @@ async fn handle_swarm_event(
             // Emit routing table size update.
             if let Some(kad) = swarm.behaviour_mut().kademlia.as_mut() {
                 let bucket_count: usize = kad.kbuckets().map(|b| b.num_entries()).sum();
-                let _ = event_tx
-                    .send(NetworkEvent::RoutingTableUpdated {
+                if let Err(error) = try_forward_event(
+                    event_tx,
+                    NetworkEvent::RoutingTableUpdated {
                         peer_count: bucket_count,
-                    })
-                    .await;
+                    },
+                ) {
+                    debug!(
+                        ?error,
+                        "node event queue unavailable - dropping routing update"
+                    );
+                }
             }
         }
         // Kademlia query progress.
@@ -1009,7 +1015,12 @@ async fn handle_swarm_event(
             // F-305: Enforce connection limit.
             match track_connection_established(peer_tracker, peer) {
                 Ok(Some(event)) => {
-                    let _ = event_tx.send(event).await;
+                    if let Err(error) = try_forward_event(event_tx, event) {
+                        debug!(
+                            ?error,
+                            "node event queue unavailable - dropping peer connection event"
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1025,7 +1036,12 @@ async fn handle_swarm_event(
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             let peer = PeerId(peer_id.to_string());
             if let Some(event) = track_connection_closed(peer_tracker, &peer) {
-                let _ = event_tx.send(event).await;
+                if let Err(error) = try_forward_event(event_tx, event) {
+                    debug!(
+                        ?error,
+                        "node event queue unavailable - dropping peer disconnection event"
+                    );
+                }
             }
             debug!("Disconnected from {peer_id}");
             update_peer_count(swarm, &loop_config.peer_count);
@@ -1117,17 +1133,22 @@ fn try_forward_message_event(
     event_tx: &mpsc::Sender<NetworkEvent>,
     peer: PeerId,
     message: NetworkMessage,
-) -> Result<(), MessageEventQueueError> {
-    event_tx
-        .try_send(NetworkEvent::MessageReceived { peer, message })
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => MessageEventQueueError::Full,
-            mpsc::error::TrySendError::Closed(_) => MessageEventQueueError::Closed,
-        })
+) -> Result<(), EventQueueError> {
+    try_forward_event(event_tx, NetworkEvent::MessageReceived { peer, message })
+}
+
+fn try_forward_event(
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    event: NetworkEvent,
+) -> Result<(), EventQueueError> {
+    event_tx.try_send(event).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => EventQueueError::Full,
+        mpsc::error::TrySendError::Closed(_) => EventQueueError::Closed,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageEventQueueError {
+enum EventQueueError {
     Full,
     Closed,
 }
@@ -1279,7 +1300,7 @@ mod tests {
         let error = try_forward_message_event(&event_tx, peer.clone(), NetworkMessage::Pong)
             .expect_err("a full node event queue must reject without waiting");
 
-        assert_eq!(error, MessageEventQueueError::Full);
+        assert_eq!(error, EventQueueError::Full);
         assert!(matches!(
             event_rx.recv().await,
             Some(NetworkEvent::MessageReceived {
@@ -1287,6 +1308,42 @@ mod tests {
                 message: NetworkMessage::Ping,
             }) if received_peer == peer
         ));
+    }
+
+    #[tokio::test]
+    async fn control_event_forwarding_does_not_wait_on_a_full_queue() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        try_forward_event(
+            &event_tx,
+            NetworkEvent::RoutingTableUpdated { peer_count: 1 },
+        )
+        .unwrap();
+        let error = try_forward_event(
+            &event_tx,
+            NetworkEvent::PeerConnected(PeerId::from("peer-b")),
+        )
+        .expect_err("a full node event queue must reject without waiting");
+
+        assert_eq!(error, EventQueueError::Full);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(NetworkEvent::RoutingTableUpdated { peer_count: 1 })
+        ));
+    }
+
+    #[test]
+    fn event_forwarding_reports_a_closed_queue() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+
+        let error = try_forward_event(
+            &event_tx,
+            NetworkEvent::PeerDisconnected(PeerId::from("peer-c")),
+        )
+        .expect_err("a closed node event queue must reject immediately");
+
+        assert_eq!(error, EventQueueError::Closed);
     }
 
     #[test]
