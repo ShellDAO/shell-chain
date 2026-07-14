@@ -530,10 +530,8 @@ mod tests {
 
     #[test]
     fn kdf_deterministic_same_password_same_key() {
-        let mut password = [0u8; 32];
-        let mut salt = [0u8; 32];
-        rand::rng().fill_bytes(&mut password);
-        rand::rng().fill_bytes(&mut salt);
+        let password = rand::random::<[u8; 32]>();
+        let salt = rand::random::<[u8; 32]>();
         let params = KdfParams {
             m_cost: 65536,
             t_cost: 3,
@@ -548,17 +546,15 @@ mod tests {
             "same password+salt must produce same derived key"
         );
 
-        password[0] ^= 1;
-        let key3 = derive_key(&password, &salt, &params).unwrap();
+        let different_password = rand::random::<[u8; 32]>();
+        let key3 = derive_key(&different_password, &salt, &params).unwrap();
         assert_ne!(key1, key3);
     }
 
     #[test]
     fn excessive_kdf_time_cost_is_rejected() {
-        let mut password = [0u8; 32];
-        let mut salt = [0u8; 32];
-        rand::rng().fill_bytes(&mut password);
-        rand::rng().fill_bytes(&mut salt);
+        let password = rand::random::<[u8; 32]>();
+        let salt = rand::random::<[u8; 32]>();
         let params = KdfParams {
             m_cost: 8,
             t_cost: MAX_KDF_TIME_COST + 1,
