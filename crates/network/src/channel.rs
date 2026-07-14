@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 use crate::config::NetworkConfig;
 use crate::error::NetworkError;
@@ -90,6 +90,7 @@ impl NetworkBus {
         let (event_tx, event_rx) = mpsc::channel(256);
         let bus_tx = self.tx.clone();
         let running = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(Notify::new());
         let max_msg_size = config.max_message_size;
         let connected_peer_count = Arc::new(AtomicUsize::new(0));
         self.peer_counts.register(&connected_peer_count);
@@ -97,10 +98,16 @@ impl NetworkBus {
         // Background task: convert broadcast messages into NetworkEvents.
         let my_id = peer_id.clone();
         let is_running = Arc::clone(&running);
+        let task_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut rx = rx;
             while is_running.load(Ordering::Relaxed) {
-                match rx.recv().await {
+                let received = tokio::select! {
+                    biased;
+                    _ = task_shutdown.notified() => break,
+                    received = rx.recv() => received,
+                };
+                match received {
                     Ok((sender, data)) => {
                         // Skip own messages.
                         if sender == my_id {
@@ -110,12 +117,19 @@ impl NetworkBus {
                         if let Ok(message) =
                             crate::message::deserialize_checked(&data, max_msg_size)
                         {
-                            let _ = event_tx
-                                .send(NetworkEvent::MessageReceived {
-                                    peer: sender,
-                                    message,
-                                })
-                                .await;
+                            let event = NetworkEvent::MessageReceived {
+                                peer: sender,
+                                message,
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = task_shutdown.notified() => break,
+                                result = event_tx.send(event) => {
+                                    if result.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -131,6 +145,7 @@ impl NetworkBus {
             bus_tx,
             event_rx,
             running,
+            shutdown,
             peer_counts: Arc::clone(&self.peer_counts),
             connected_peer_count,
             max_msg_size,
@@ -144,6 +159,7 @@ pub struct ChannelNetwork {
     bus_tx: broadcast::Sender<(PeerId, Vec<u8>)>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     running: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
     peer_counts: Arc<PeerCountState>,
     connected_peer_count: Arc<AtomicUsize>,
     max_msg_size: usize,
@@ -189,6 +205,7 @@ impl NetworkService for ChannelNetwork {
             .is_ok()
         {
             self.peer_counts.unregister();
+            self.shutdown.notify_one();
         }
         Ok(())
     }
@@ -202,6 +219,7 @@ impl Drop for ChannelNetwork {
             .is_ok()
         {
             self.peer_counts.unregister();
+            self.shutdown.notify_one();
         }
     }
 }
@@ -394,6 +412,51 @@ mod tests {
         drop(n3);
         assert_eq!(n1.peer_count().await, 0);
         assert_eq!(handle.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_event_stream_without_additional_traffic() {
+        let bus = NetworkBus::new(16);
+        let config = NetworkConfig::default();
+        let mut node = bus.join(&config);
+
+        tokio::task::yield_now().await;
+        node.shutdown().await.unwrap();
+
+        let event = timeout(Duration::from_millis(100), node.next_event())
+            .await
+            .expect("event stream remained open after shutdown");
+        assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_full_event_queue() {
+        let bus = NetworkBus::new(512);
+        let config = NetworkConfig::default();
+        let mut node = bus.join(&config);
+        let message = serde_json::to_vec(&NetworkMessage::Ping).unwrap();
+
+        for _ in 0..=256 {
+            bus.tx
+                .send((PeerId::from("external"), message.clone()))
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            while node.event_rx.len() < 256 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event queue did not fill");
+
+        node.shutdown().await.unwrap();
+        for _ in 0..256 {
+            assert!(node.next_event().await.is_some());
+        }
+        let event = timeout(Duration::from_millis(100), node.next_event())
+            .await
+            .expect("event stream remained open with a full queue after shutdown");
+        assert!(event.is_none());
     }
 
     #[tokio::test]
