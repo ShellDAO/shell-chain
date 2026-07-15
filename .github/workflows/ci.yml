@@ -33,6 +33,8 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - name: Check fuzz targets
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+      - name: Check transaction generator
+        run: cargo check --locked --manifest-path tools/tx-generator/Cargo.toml --all-targets
       - name: Lint production libp2p backend
         run: cargo clippy -p shell-network --features libp2p --all-targets -- -D warnings
       - name: RPC doc drift check
@@ -74,3 +76,5 @@ jobs:
         run: cargo audit
       - name: Audit fuzz dependencies
         run: cargo audit --file fuzz/Cargo.lock
+      - name: Audit transaction generator dependencies
+        run: cargo audit --file tools/tx-generator/Cargo.lock

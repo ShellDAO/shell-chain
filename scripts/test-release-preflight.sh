@@ -11,6 +11,10 @@ fail() {
     exit 1
 }
 
+if ! grep -Fq 'cargo audit --file tools/tx-generator/Cargo.lock' "$SCRIPT_DIR/release.sh"; then
+    fail "release audit does not cover the transaction generator lockfile"
+fi
+
 make_fixture() {
     local changelog=$1
     local fixture="$TMP_DIR/fixture"

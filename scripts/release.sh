@@ -141,8 +141,10 @@ if command -v cargo-audit &>/dev/null; then
     if [ "$INSTALLED_AUDIT_VERSION" != "$CARGO_AUDIT_VERSION" ]; then
         fail "cargo-audit ${CARGO_AUDIT_VERSION} required, found ${INSTALLED_AUDIT_VERSION} (install: cargo install cargo-audit --version ${CARGO_AUDIT_VERSION} --locked)"
     fi
-    if cargo audit && cargo audit --file fuzz/Cargo.lock; then
-        ok "cargo audit passed for workspace and fuzz dependencies"
+    if cargo audit \
+        && cargo audit --file fuzz/Cargo.lock \
+        && cargo audit --file tools/tx-generator/Cargo.lock; then
+        ok "cargo audit passed for workspace, fuzz, and transaction generator dependencies"
     else
         fail "cargo audit found advisories (review before tagging)"
     fi

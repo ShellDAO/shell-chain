@@ -5,6 +5,8 @@ name = "shell-tx-generator"
 version = "0.1.0"
 edition = "2021"
 description = "Testnet stress-testing transaction generator for Shell-Chain"
+license = "MIT"
+repository = "https://github.com/ShellDAO/shell-chain"
 publish = false
 
 [[bin]]
@@ -24,3 +26,8 @@ serde = { version = "1", features = ["derive"] }
 rand = "0.9"
 hex = "0.4"
 clap = { version = "4", features = ["derive"] }
+
+[patch.crates-io]
+# Keep the standalone soak-test workspace aligned with the root workspace's
+# audited transitive dependency overrides.
+ark-relations = { path = "../../deps/ark-relations" }
