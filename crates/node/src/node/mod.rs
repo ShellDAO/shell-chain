@@ -1284,18 +1284,11 @@ impl<S: KvStore + 'static> Node<S> {
         {
             let mut wpruner = self.witness_pruner.write();
             if !wpruner.is_archive() {
-                // Guard: never prune witnesses for blocks that have not yet been
-                // STARK-proved.  The frontier is the count of settled L1 sources,
-                // i.e. the first unproved block number.
-                let stark_frontier = self
-                    .settled_stark_sources
-                    .lock()
-                    .iter()
-                    .filter(|(l, _)| *l == 1)
-                    .count() as u64;
-                match wpruner.prune_before(
+                // Guard every canonical hash instead of inferring a frontier from
+                // the settled-set size: stale fork entries and gaps must fail closed.
+                match wpruner.prune_before_settled(
                     finalized_number,
-                    Some(stark_frontier),
+                    |hash| self.settled_stark_sources.lock().contains(&(1, *hash)),
                     &self.chain_store,
                     &self.witness_store,
                 ) {
@@ -5776,6 +5769,34 @@ mod tests {
         node.finality
             .write()
             .set_finalized_direct(3, finalized_hash);
+
+        node.produce_block(&signer, 0).unwrap();
+
+        assert_eq!(node.body_pruner.read().pruned_below(), 2);
+        assert_eq!(node.witness_pruner.read().pruned_below(), 0);
+    }
+
+    #[test]
+    fn witness_pruning_ignores_noncanonical_settled_sources() {
+        let (node, signer) = setup_node_with_retention(2, 2);
+        store_genesis(&node);
+
+        for _ in 0..5 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+
+        let finalized = node.chain_store.get_block_by_number(3).unwrap().unwrap();
+        node.chain_store.set_finalized_number(3).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(3, finalized.hash());
+
+        // Stale entries from an orphaned fork must not advance the canonical
+        // STARK frontier merely because their count matches eligible heights.
+        node.settled_stark_sources.lock().extend([
+            (1, ShellHash::from([0xA1; 32])),
+            (1, ShellHash::from([0xA2; 32])),
+        ]);
 
         node.produce_block(&signer, 0).unwrap();
 

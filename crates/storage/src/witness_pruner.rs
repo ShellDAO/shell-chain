@@ -102,7 +102,6 @@ impl WitnessPruner {
             return Ok(WitnessPruneResult::default());
         }
 
-        // Retention-based cutoff: blocks below this are old enough to prune.
         let retention_cutoff = retention_cutoff(current_head, self.retention_count);
 
         // STARK guard: never prune witnesses for blocks that haven't been proved yet.
@@ -110,6 +109,45 @@ impl WitnessPruner {
             .map(|frontier| retention_cutoff.min(frontier))
             .unwrap_or(retention_cutoff);
 
+        self.prune_to_cutoff(cutoff, chain_store, witness_store, |_, _| true)
+    }
+
+    /// Prune old finalized witnesses only while their canonical block hashes are
+    /// accepted by `is_settled`.
+    ///
+    /// Unlike a numeric frontier derived from the number of settlements, this
+    /// guard fails closed when the settled set contains stale fork hashes or a
+    /// gap in the canonical prefix.
+    pub fn prune_before_settled<S: KvStore, F>(
+        &mut self,
+        current_head: u64,
+        mut is_settled: F,
+        chain_store: &ChainStore<S>,
+        witness_store: &WitnessStore<S>,
+    ) -> Result<WitnessPruneResult, StorageError>
+    where
+        F: FnMut(&ShellHash) -> bool,
+    {
+        if self.is_archive() {
+            return Ok(WitnessPruneResult::default());
+        }
+
+        let cutoff = retention_cutoff(current_head, self.retention_count);
+        self.prune_to_cutoff(cutoff, chain_store, witness_store, |_, hash| {
+            is_settled(hash)
+        })
+    }
+
+    fn prune_to_cutoff<S: KvStore, F>(
+        &mut self,
+        cutoff: u64,
+        chain_store: &ChainStore<S>,
+        witness_store: &WitnessStore<S>,
+        mut may_prune: F,
+    ) -> Result<WitnessPruneResult, StorageError>
+    where
+        F: FnMut(u64, &ShellHash) -> bool,
+    {
         if cutoff <= self.pruned_below {
             // Nothing new to prune.
             return Ok(WitnessPruneResult::default());
@@ -125,11 +163,15 @@ impl WitnessPruner {
 
         let mut result = WitnessPruneResult::default();
         let mut hashes_to_prune: Vec<ShellHash> = Vec::new();
+        let mut advanced_to = self.pruned_below;
 
         for block_number in self.pruned_below..pass_cutoff {
             // Resolve block hash from chain store (canonical mapping).
             match chain_store.get_block_hash_by_number(block_number)? {
                 Some(hash) => {
+                    if !may_prune(block_number, &hash) {
+                        break;
+                    }
                     if witness_store.has_bundle(&hash)? {
                         hashes_to_prune.push(hash);
                         debug!(
@@ -140,6 +182,7 @@ impl WitnessPruner {
                     } else {
                         result.not_found_count = result.not_found_count.saturating_add(1);
                     }
+                    advanced_to = block_number.saturating_add(1);
                 }
                 None => {
                     return Err(StorageError::InvalidInput(format!(
@@ -150,7 +193,7 @@ impl WitnessPruner {
         }
 
         witness_store.delete_bundles(&hashes_to_prune)?;
-        self.pruned_below = pass_cutoff;
+        self.pruned_below = advanced_to;
         Ok(result)
     }
 
@@ -401,6 +444,30 @@ mod tests {
         }
         // Blocks 10..20 retained (STARK frontier protects them).
         for hash in hashes.iter().skip(10) {
+            assert!(ws.has_bundle(hash).unwrap());
+        }
+    }
+
+    #[test]
+    fn settled_hash_guard_stops_at_canonical_gap() {
+        let (_db, cs, ws) = make_store();
+        let hashes: Vec<ShellHash> = (0..6).map(|n| store_block(&cs, n)).collect();
+        for hash in &hashes {
+            store_bundle(&ws, hash);
+        }
+
+        let settled = [hashes[0], hashes[2]]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let mut pruner = WitnessPruner::new(2);
+        let result = pruner
+            .prune_before_settled(5, |hash| settled.contains(hash), &cs, &ws)
+            .unwrap();
+
+        assert_eq!(result.pruned_count, 1);
+        assert_eq!(pruner.pruned_below(), 1);
+        assert!(!ws.has_bundle(&hashes[0]).unwrap());
+        for hash in hashes.iter().skip(1) {
             assert!(ws.has_bundle(hash).unwrap());
         }
     }
