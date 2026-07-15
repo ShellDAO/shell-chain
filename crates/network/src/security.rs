@@ -10,6 +10,7 @@ use crate::error::NetworkError;
 use crate::message::PeerId;
 
 const MAX_TEMP_BAN_DURATION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+const MAX_PEER_BAN_RECORDS: usize = 16_384;
 
 // ---------------------------------------------------------------------------
 // F-070: Peer connection tracker
@@ -110,6 +111,7 @@ pub struct PeerBanList {
     records: HashMap<String, PeerRecord>,
     ban_threshold: u32,
     ban_duration: Duration,
+    max_records: usize,
 }
 
 impl PeerBanList {
@@ -118,10 +120,15 @@ impl PeerBanList {
     /// * `ban_threshold` — violations before a temporary ban is imposed (0 = disabled).
     /// * `ban_duration` — how long a ban lasts.
     pub fn new(ban_threshold: u32, ban_duration: Duration) -> Self {
+        Self::with_max_records(ban_threshold, ban_duration, MAX_PEER_BAN_RECORDS)
+    }
+
+    fn with_max_records(ban_threshold: u32, ban_duration: Duration, max_records: usize) -> Self {
         Self {
             records: HashMap::new(),
             ban_threshold,
             ban_duration,
+            max_records,
         }
     }
 
@@ -130,6 +137,22 @@ impl PeerBanList {
     pub fn record_violation(&mut self, peer: &PeerId) -> bool {
         let key = peer.0.clone();
         let now = Instant::now();
+        if !self.records.contains_key(&key) && self.records.len() >= self.max_records {
+            self.purge_expired();
+            if self.records.len() >= self.max_records {
+                let oldest_unbanned = self
+                    .records
+                    .iter()
+                    .filter(|(_, record)| record.banned_until.is_none())
+                    .min_by_key(|(_, record)| record.last_violation)
+                    .map(|(peer, _)| peer.clone());
+                if let Some(peer) = oldest_unbanned {
+                    self.records.remove(&peer);
+                } else {
+                    return false;
+                }
+            }
+        }
         let record = self.records.entry(key).or_insert(PeerRecord {
             violations: 0,
             banned_until: None,
@@ -484,5 +507,40 @@ mod tests {
         let bans = PeerBanList::new(5, Duration::from_secs(60));
         let peer = PeerId::from("clean");
         assert_eq!(bans.remaining_ban_secs(&peer), 0);
+    }
+
+    #[test]
+    fn record_capacity_evicts_oldest_unbanned_peer() {
+        let mut bans = PeerBanList::with_max_records(2, Duration::from_secs(60), 2);
+        let banned = PeerId::from("banned");
+        let oldest_unbanned = PeerId::from("oldest-unbanned");
+        let newest = PeerId::from("newest");
+
+        assert!(!bans.record_violation(&banned));
+        assert!(bans.record_violation(&banned));
+        assert!(!bans.record_violation(&oldest_unbanned));
+        assert!(!bans.record_violation(&newest));
+
+        assert_eq!(bans.tracked_count(), 2);
+        assert!(bans.is_banned(&banned));
+        assert_eq!(bans.violations(&oldest_unbanned), 0);
+        assert_eq!(bans.violations(&newest), 1);
+    }
+
+    #[test]
+    fn record_capacity_never_evicts_active_bans() {
+        let mut bans = PeerBanList::with_max_records(1, Duration::from_secs(60), 2);
+        let first = PeerId::from("first");
+        let second = PeerId::from("second");
+        let overflow = PeerId::from("overflow");
+
+        assert!(bans.record_violation(&first));
+        assert!(bans.record_violation(&second));
+        assert!(!bans.record_violation(&overflow));
+
+        assert_eq!(bans.tracked_count(), 2);
+        assert!(bans.is_banned(&first));
+        assert!(bans.is_banned(&second));
+        assert_eq!(bans.violations(&overflow), 0);
     }
 }
