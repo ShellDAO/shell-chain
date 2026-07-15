@@ -472,7 +472,7 @@ pub fn hex_bytes(data: &[u8]) -> String {
 
 /// Options accepted by `debug_traceTransaction` and `debug_traceBlockByNumber`.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TraceOptions {
     /// Tracer type (only "callTracer" is supported).
     #[serde(default)]

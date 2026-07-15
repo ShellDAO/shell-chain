@@ -6121,6 +6121,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_trace_transaction_rejects_unsupported_tracer() {
+        let handler = setup();
+        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
+
+        let err = DebugApiServer::trace_transaction(
+            &handler,
+            format!("0x{}", hex::encode(tx_hash.as_bytes())),
+            Some(serde_json::json!({ "tracer": "prestateTracer" })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert_eq!(
+            err.message(),
+            "unsupported tracer; only callTracer is supported"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_trace_transaction_rejects_unknown_options() {
+        let handler = setup();
+        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
+
+        let err = DebugApiServer::trace_transaction(
+            &handler,
+            format!("0x{}", hex::encode(tx_hash.as_bytes())),
+            Some(serde_json::json!({ "timeout": "5s" })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), "invalid trace options");
+    }
+
+    #[tokio::test]
     async fn debug_trace_block_by_number_rejects_invalid_options_as_invalid_params() {
         let handler = setup();
         store_block_with_tx(&handler, 0, true);

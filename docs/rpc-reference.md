@@ -313,6 +313,8 @@ trace_transaction(tx_hash: String, opts: Option<serde_json::Value>, ) â†’ serde_
 ```
 
 Traces the execution of a transaction, returning call frames.
+The optional tracer must be `callTracer`; unsupported or unknown options
+are rejected as invalid parameters.
 
 ### debug_traceBlockByNumber
 ```
@@ -320,6 +322,8 @@ trace_block_by_number(block_number: String, opts: Option<serde_json::Value>, ) â
 ```
 
 Traces all transactions in a block by number, returning an array of call traces.
+The optional tracer must be `callTracer`; unsupported or unknown options
+are rejected as invalid parameters.
 
 
 ## trace_  namespace

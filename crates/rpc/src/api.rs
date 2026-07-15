@@ -249,6 +249,8 @@ pub trait EthApi {
 #[rpc(server, namespace = "debug")]
 pub trait DebugApi {
     /// Traces the execution of a transaction, returning call frames.
+    /// The optional tracer must be `callTracer`; unsupported or unknown options
+    /// are rejected as invalid parameters.
     #[method(name = "traceTransaction")]
     async fn trace_transaction(
         &self,
@@ -257,6 +259,8 @@ pub trait DebugApi {
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
     /// Traces all transactions in a block by number, returning an array of call traces.
+    /// The optional tracer must be `callTracer`; unsupported or unknown options
+    /// are rejected as invalid parameters.
     #[method(name = "traceBlockByNumber")]
     async fn trace_block_by_number(
         &self,

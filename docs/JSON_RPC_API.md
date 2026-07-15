@@ -1338,7 +1338,7 @@ Replays a transaction and returns an execution trace.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Transaction hash |
-| 2 | `Object` | No | Trace options |
+| 2 | `Object` | No | Trace options. Only `tracer: "callTracer"` is supported; unknown options are rejected. |
 
 **Returns:**
 ```json
@@ -1374,7 +1374,7 @@ Traces all transactions in a block.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Block number (hex) or block tag |
-| 2 | `Object` | No | Trace options |
+| 2 | `Object` | No | Trace options. Only `tracer: "callTracer"` is supported; unknown options are rejected. |
 
 **Returns:** `Array` — Array of trace result objects (one per transaction).
 

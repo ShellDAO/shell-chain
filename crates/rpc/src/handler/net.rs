@@ -142,8 +142,17 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
 }
 
 fn parse_trace_options(opts: Option<serde_json::Value>) -> Result<TraceOptions, ErrorObjectOwned> {
-    opts.map(serde_json::from_value)
+    let opts: TraceOptions = opts
+        .map(serde_json::from_value)
         .transpose()
-        .map_err(|e| invalid_params_err(format!("invalid trace options: {e}")))
-        .map(|opts| opts.unwrap_or_default())
+        .map_err(|_| invalid_params_err("invalid trace options"))
+        .map(|opts| opts.unwrap_or_default())?;
+    if let Some(tracer) = opts.tracer.as_deref() {
+        if tracer != "callTracer" {
+            return Err(invalid_params_err(
+                "unsupported tracer; only callTracer is supported",
+            ));
+        }
+    }
+    Ok(opts)
 }
