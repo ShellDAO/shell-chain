@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use shell_crypto::PQSignature;
 use shell_primitives::{Address, ShellHash};
 
-use crate::transaction::{AaBundle, Transaction, AA_BUNDLE_PRESENCE_FLAG, AA_BUNDLE_TX_TYPE};
+use crate::transaction::{
+    AaBundle, PubkeyMode, SignedTransaction, Transaction, AA_BUNDLE_PRESENCE_FLAG,
+    AA_BUNDLE_TX_TYPE,
+};
 
 // ── StrippedTransaction ──────────────────────────────────────────────────────
 
@@ -208,23 +211,31 @@ impl TxWitness {
 
     /// Encode to RLP bytes.
     pub fn rlp_encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(self.length());
         self.encode(&mut buf);
         buf
     }
-}
 
-impl Encodable for TxWitness {
-    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let pk_bytes: &[u8] = self.pubkey.as_deref().unwrap_or(&[]);
-        let payload_len = self.signature.length() + pk_bytes.length();
+    fn encode_parts(
+        signature: &PQSignature,
+        pubkey: Option<&[u8]>,
+        out: &mut dyn alloy_rlp::BufMut,
+    ) {
+        let pk_bytes = pubkey.unwrap_or(&[]);
+        let payload_len = signature.length() + pk_bytes.length();
         let header = alloy_rlp::Header {
             list: true,
             payload_length: payload_len,
         };
         header.encode(out);
-        self.signature.encode(out);
+        signature.encode(out);
         pk_bytes.encode(out);
+    }
+}
+
+impl Encodable for TxWitness {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        Self::encode_parts(&self.signature, self.pubkey.as_deref(), out);
     }
 
     fn length(&self) -> usize {
@@ -309,21 +320,45 @@ impl WitnessBundle {
     /// Phase B2 will replace it with a proper Merkle trie compatible with
     /// the block header's `witness_root` field.
     pub fn compute_root(&self) -> ShellHash {
-        if self.witnesses.is_empty() {
+        Self::compute_root_from_parts(
+            self.witnesses
+                .iter()
+                .map(|w| (&w.signature, w.pubkey.as_deref())),
+            self.witnesses.len(),
+        )
+    }
+
+    /// Compute the witness commitment directly from full transactions without
+    /// cloning their signatures and embedded public keys into a temporary bundle.
+    pub fn compute_root_from_transactions(transactions: &[SignedTransaction]) -> ShellHash {
+        Self::compute_root_from_parts(
+            transactions.iter().map(|tx| {
+                let pubkey = match &tx.pubkey_mode {
+                    PubkeyMode::Embedded(pubkey) => Some(pubkey.as_slice()),
+                    PubkeyMode::Reference => None,
+                };
+                (&tx.signature, pubkey)
+            }),
+            transactions.len(),
+        )
+    }
+
+    fn compute_root_from_parts<'a, I>(parts: I, len: usize) -> ShellHash
+    where
+        I: IntoIterator<Item = (&'a PQSignature, Option<&'a [u8]>)>,
+    {
+        if len == 0 {
             return ShellHash::default();
         }
         use shell_primitives::keccak256;
-        let mut leaves: Vec<[u8; 32]> = self
-            .witnesses
-            .iter()
-            .map(|w| {
-                let encoded = w.rlp_encode();
-                let h = keccak256(&encoded);
-                // ShellHash wraps B256; extract raw 32 bytes via AsRef<[u8]>
-                let bytes: [u8; 32] = h.as_ref().try_into().expect("ShellHash is 32 bytes");
-                bytes
-            })
-            .collect();
+        let mut leaves = Vec::with_capacity(len);
+        let mut encoded = Vec::new();
+        for (signature, pubkey) in parts {
+            encoded.clear();
+            TxWitness::encode_parts(signature, pubkey, &mut encoded);
+            let hash = keccak256(&encoded);
+            leaves.push(*hash.as_bytes());
+        }
         // Pairwise Merkle fold
         while leaves.len() > 1 {
             let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
@@ -335,10 +370,11 @@ impl WitnessBundle {
                 } else {
                     left
                 };
-                let combined = [left, right].concat();
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&left);
+                combined[32..].copy_from_slice(&right);
                 let h = keccak256(&combined);
-                let bytes: [u8; 32] = h.as_ref().try_into().expect("ShellHash is 32 bytes");
-                next.push(bytes);
+                next.push(*h.as_bytes());
                 i += 2;
             }
             leaves = next;
@@ -605,6 +641,26 @@ mod tests {
         assert_eq!(root1, root2, "root must be deterministic");
         // Non-empty bundle root should differ from default (all-zeros)
         assert_ne!(root1, ShellHash::default());
+    }
+
+    #[test]
+    fn transaction_witness_root_matches_materialized_bundle() {
+        let from = Address::from([0xAA; 20]);
+        let (sig1, pk1) = dummy_sig_and_pk();
+        let (sig2, _) = dummy_sig_and_pk();
+        let transactions = vec![
+            SignedTransaction::with_pubkey(from, dummy_tx(), sig1.clone(), pk1.clone()),
+            SignedTransaction::new(from, dummy_tx(), sig2.clone()),
+        ];
+        let bundle = WitnessBundle::new(vec![
+            TxWitness::new_embedded(sig1, pk1),
+            TxWitness::new_reference(sig2),
+        ]);
+
+        assert_eq!(
+            WitnessBundle::compute_root_from_transactions(&transactions),
+            bundle.compute_root()
+        );
     }
 
     #[test]

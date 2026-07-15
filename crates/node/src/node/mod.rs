@@ -27,8 +27,8 @@ pub(crate) use shell_consensus::{
 };
 pub(crate) use shell_core::{
     calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, Account,
-    Block, BlockHeader, SignedTransaction, StrippedBlock, SystemTransaction, SystemTxKind,
-    TransactionReceipt, MAX_BLOB_GAS_PER_BLOCK,
+    Block, BlockHeader, SignedTransaction, SystemTransaction, SystemTxKind, TransactionReceipt,
+    WitnessBundle, MAX_BLOB_GAS_PER_BLOCK,
 };
 pub(crate) use shell_crypto::{
     AlgorithmRegistry, BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem,

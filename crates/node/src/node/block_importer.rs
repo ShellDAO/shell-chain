@@ -129,8 +129,7 @@ impl<S: KvStore + 'static> Node<S> {
         let Some(expected_root) = block.header.witness_root else {
             return Ok(());
         };
-        let (_, bundle) = StrippedBlock::split(block);
-        let computed = bundle.compute_root();
+        let computed = WitnessBundle::compute_root_from_transactions(&block.transactions);
         if computed != expected_root {
             return Err(NodeError::Startup(format!(
                 "block {} witness_root mismatch: header={:?}, computed={:?}",
