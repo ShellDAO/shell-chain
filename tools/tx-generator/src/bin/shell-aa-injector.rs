@@ -14,6 +14,8 @@ use shell_pqvm::{account_manager_address, encode_rotate_key_calldata};
 use shell_primitives::{Address, Bytes, U256};
 use shell_tx_generator::load_dev_authority;
 
+const MAX_RUN_DURATION_SECS: u64 = 365 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
     Mixed,
@@ -61,6 +63,16 @@ struct Cli {
     /// Funding amount used with `shell_setBalance`.
     #[arg(long, default_value = "0x3635c9adc5dea00000")]
     fund_amount: String,
+}
+
+fn validate_cli(cli: &Cli) -> Result<U256, String> {
+    if cli.duration > MAX_RUN_DURATION_SECS {
+        return Err(format!(
+            "--duration must not exceed {MAX_RUN_DURATION_SECS} seconds"
+        ));
+    }
+    U256::from_str_radix(cli.fund_amount.trim_start_matches("0x"), 16)
+        .map_err(|err| format!("invalid --fund-amount {}: {err}", cli.fund_amount))
 }
 
 struct ScenarioAccount {
@@ -623,7 +635,9 @@ async fn run_mixed_mode(
     req_id: &mut u64,
     stats: &mut Stats,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(cli.duration);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(cli.duration))
+        .expect("validated run duration must fit in Instant");
     let mut cycle = 0u64;
 
     while Instant::now() < deadline {
@@ -666,7 +680,9 @@ async fn run_attack_mode(
     req_id: &mut u64,
     stats: &mut Stats,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(cli.duration);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(cli.duration))
+        .expect("validated run duration must fit in Instant");
 
     while Instant::now() < deadline {
         let invalid_tx = build_transfer_tx(cli.chain_id, primary.nonce, recipient, 1_111);
@@ -803,6 +819,13 @@ fn print_summary(mode: Mode, stats: &Stats) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let fund_amount_u256 = match validate_cli(&cli) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    };
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -829,15 +852,6 @@ async fn main() {
     }
 
     let scenario_addresses = [primary.address, recipient.address, observer.address];
-    let fund_amount_u256 = match U256::from_str_radix(cli.fund_amount.trim_start_matches("0x"), 16)
-    {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!("invalid --fund-amount {}: {err}", cli.fund_amount);
-            std::process::exit(1);
-        }
-    };
-
     if let Some(path) = &cli.funding_key_file {
         let funder = match load_dev_authority(path) {
             Ok(funder) => funder,
@@ -1042,5 +1056,45 @@ async fn main() {
     print_summary(cli.mode, &stats);
     if stats.has_failures(cli.mode) {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unbounded_duration() {
+        let mut cli = cli();
+        cli.duration = u64::MAX;
+
+        assert_eq!(
+            validate_cli(&cli).unwrap_err(),
+            format!("--duration must not exceed {MAX_RUN_DURATION_SECS} seconds")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_fund_amount_before_generating_keys() {
+        let mut cli = cli();
+        cli.fund_amount = "not-hex".into();
+
+        assert!(validate_cli(&cli)
+            .unwrap_err()
+            .starts_with("invalid --fund-amount not-hex:"));
+    }
+
+    fn cli() -> Cli {
+        Cli {
+            rpc_url: "http://localhost:8545".into(),
+            fund_rpc_urls: Vec::new(),
+            funding_key_file: None,
+            mode: Mode::Attack,
+            duration: 3_600,
+            chain_id: 1_337,
+            interval_ms: 1_500,
+            duplicate_attempts: 3,
+            fund_amount: "0x1".into(),
+        }
     }
 }

@@ -17,6 +17,8 @@ use shell_crypto::{DilithiumSigner, Signer};
 use shell_primitives::{Address, Bytes, U256};
 use shell_tx_generator::load_dev_authority;
 
+const MAX_RUN_DURATION_SECS: u64 = 365 * 24 * 60 * 60;
+
 // ── CLI ──────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -56,6 +58,21 @@ struct Cli {
     /// Chain ID.
     #[arg(long, default_value_t = 1337)]
     chain_id: u64,
+}
+
+fn validate_cli(cli: &Cli) -> Result<(), String> {
+    if cli.num_accounts < 2 {
+        return Err("--accounts must be at least 2".into());
+    }
+    if cli.min_interval > cli.max_interval {
+        return Err("--min-interval must not exceed --max-interval".into());
+    }
+    if cli.duration > MAX_RUN_DURATION_SECS {
+        return Err(format!(
+            "--duration must not exceed {MAX_RUN_DURATION_SECS} seconds"
+        ));
+    }
+    Ok(())
 }
 
 // ── Account ──────────────────────────────────────────────────────────
@@ -593,6 +610,10 @@ const RESET: &str = "\x1b[0m";
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if let Err(err) = validate_cli(&cli) {
+        eprintln!("{err}");
+        std::process::exit(2);
+    }
 
     println!("\n{BOLD}{CYAN}═══ Shell-Chain Transaction Generator ═══{RESET}\n");
     println!("  RPC endpoint : {}", cli.rpc_url);
@@ -622,11 +643,6 @@ async fn main() {
         );
     }
     println!();
-
-    if accounts.len() < 2 {
-        eprintln!("{RED}Need at least 2 accounts for transfers.{RESET}");
-        std::process::exit(1);
-    }
 
     // ── 1b. Fund accounts via shell_setBalance ──────────────────────
     let client = reqwest::Client::builder()
@@ -829,8 +845,9 @@ async fn main() {
     let mut stats = Stats::default();
     let mut rng = rand::rng();
     let mut req_id: u64 = 1;
-    let deadline = Instant::now() + Duration::from_secs(cli.duration);
-
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(cli.duration))
+        .expect("validated run duration must fit in Instant");
     println!(
         "{BOLD}▸ Sending transactions for {}s …{RESET}\n",
         cli.duration
@@ -940,4 +957,55 @@ async fn main() {
         }
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli() -> Cli {
+        Cli {
+            rpc_url: "http://localhost:8545".into(),
+            fund_rpc_urls: Vec::new(),
+            funding_key_file: None,
+            num_accounts: 2,
+            duration: 60,
+            min_interval: 500,
+            max_interval: 3_000,
+            chain_id: 1_337,
+        }
+    }
+
+    #[test]
+    fn rejects_too_few_accounts_before_generating_keys() {
+        let mut cli = cli();
+        cli.num_accounts = 1;
+
+        assert_eq!(
+            validate_cli(&cli).unwrap_err(),
+            "--accounts must be at least 2"
+        );
+    }
+
+    #[test]
+    fn rejects_reversed_interval_range() {
+        let mut cli = cli();
+        cli.min_interval = 3_001;
+
+        assert_eq!(
+            validate_cli(&cli).unwrap_err(),
+            "--min-interval must not exceed --max-interval"
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_duration() {
+        let mut cli = cli();
+        cli.duration = u64::MAX;
+
+        assert_eq!(
+            validate_cli(&cli).unwrap_err(),
+            format!("--duration must not exceed {MAX_RUN_DURATION_SECS} seconds")
+        );
+    }
 }
