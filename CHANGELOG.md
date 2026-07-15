@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Bound proof-amendment gossip envelopes to the signed payload hash and source
   range end before applying witness-replacement retention behavior.
+- Retain expired grace-window witness deletions for retry when storage returns
+  a transient error instead of silently abandoning cleanup.
 
 ## [0.27.1] — 2026-07-14 — Consensus and RPC correctness fixes
 

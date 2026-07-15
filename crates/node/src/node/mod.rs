@@ -366,13 +366,18 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
         grace_map.retain(|hash, delete_at| {
             if current_head >= *delete_at {
                 match self.chain_store.delete_witness_bundle(hash) {
-                    Ok(()) => info!(
-                        block = *delete_at,
-                        "L2: grace-window expired, witness bundle deleted"
-                    ),
-                    Err(e) => warn!(block = *delete_at, "L2: grace-window delete failed: {e}"),
+                    Ok(()) => {
+                        info!(
+                            block = *delete_at,
+                            "L2: grace-window expired, witness bundle deleted"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        warn!(block = *delete_at, "L2: grace-window delete failed: {e}");
+                        true
+                    }
                 }
-                false
             } else {
                 true
             }
@@ -1383,6 +1388,7 @@ mod tests {
         inner: MemoryDb,
         fail_next_batch: AtomicBool,
         fail_head_batch: AtomicBool,
+        fail_next_delete: AtomicBool,
     }
 
     impl FailingBatchDb {
@@ -1391,6 +1397,7 @@ mod tests {
                 inner: MemoryDb::new(),
                 fail_next_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
+                fail_next_delete: AtomicBool::new(false),
             }
         }
 
@@ -1400,6 +1407,10 @@ mod tests {
 
         fn fail_head_batch(&self) {
             self.fail_head_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_delete(&self) {
+            self.fail_next_delete.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1413,6 +1424,9 @@ mod tests {
         }
 
         fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            if self.fail_next_delete.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected delete failure".into()));
+            }
             self.inner.delete(key)
         }
 
@@ -7165,6 +7179,33 @@ mod tests {
             node.chain_store.has_witness_bundle(&b1_hash).unwrap(),
             "witness bundle must survive grace window"
         );
+    }
+
+    #[test]
+    fn grace_window_witness_delete_retries_after_storage_failure() {
+        let (node, _signer, db) = setup_failing_batch_node();
+        let block_hash = ShellHash::from([0x42; 32]);
+        let bundle = shell_core::WitnessBundle {
+            witnesses: vec![shell_core::TxWitness::new_reference(
+                shell_crypto::PQSignature {
+                    sig_type: shell_crypto::SignatureType::Dilithium3,
+                    data: vec![0u8; 32],
+                },
+            )],
+        };
+        node.witness_store.put_bundle(&block_hash, &bundle).unwrap();
+        node.pending_grace_deletes.lock().insert(block_hash, 10);
+
+        db.fail_next_delete();
+        node.block_store().prune_grace_witnesses(10);
+
+        assert!(node.pending_grace_deletes.lock().contains_key(&block_hash));
+        assert!(node.chain_store.has_witness_bundle(&block_hash).unwrap());
+
+        node.block_store().prune_grace_witnesses(11);
+
+        assert!(!node.pending_grace_deletes.lock().contains_key(&block_hash));
+        assert!(!node.chain_store.has_witness_bundle(&block_hash).unwrap());
     }
 
     // ─── W.7: wPoA end-to-end test suite ──────────────────────────────────────
