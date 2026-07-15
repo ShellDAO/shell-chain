@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
   refresh its vulnerable `bytes` dependency.
 - Remove queued nonce descendants when block production permanently rejects a
   transaction, preserving contiguous sender queues and byte accounting.
+- Make the JSON-RPC response-body limit explicit and configurable across HTTP,
+  WebSocket, and combined listeners.
 
 ## [0.27.1] — 2026-07-14 — Consensus and RPC correctness fixes
 

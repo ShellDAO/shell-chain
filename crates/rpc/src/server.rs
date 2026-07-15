@@ -12,6 +12,7 @@ use crate::middleware::{ApiKeyLayer, RateLimitLayer, RpcRateLimitLayer};
 use crate::tls_proxy::{start_tls_proxy, TlsProxyHandle};
 
 const MAX_BATCH_REQUEST_LEN: u32 = 100;
+const DEFAULT_MAX_RESPONSE_BODY_SIZE: u32 = 10 * 1024 * 1024;
 
 use shell_consensus::{ConsensusEngine, FinalityState};
 use shell_core::SignedTransaction;
@@ -59,6 +60,8 @@ pub struct RpcConfig {
     pub allow_unsafe_dev_exposed: bool,
     /// Maximum request body size in bytes (default: 5 MB).
     pub max_request_body_size: u32,
+    /// Maximum response body size in bytes (default: 10 MB).
+    pub max_response_body_size: u32,
     /// Optional API key for Bearer token authentication.
     /// When set, every HTTP request must include `Authorization: Bearer <key>`.
     /// `None` disables authentication (open access).
@@ -78,6 +81,7 @@ impl Default for RpcConfig {
             api_namespaces: vec!["eth".into(), "net".into(), "web3".into(), "shell".into()],
             allow_unsafe_dev_exposed: false,
             max_request_body_size: 5 * 1024 * 1024,
+            max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
             api_key: None,
         }
     }
@@ -348,6 +352,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_rpc_middleware(rpc_middleware.clone())
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .max_response_body_size(config.max_response_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .http_only()
             .build(internal_http)
@@ -360,6 +365,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_rpc_middleware(rpc_middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .max_response_body_size(config.max_response_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .ws_only()
             .build(ws_listen)
@@ -390,6 +396,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             .set_rpc_middleware(rpc_middleware)
             .max_connections(config.max_connections)
             .max_request_body_size(config.max_request_body_size)
+            .max_response_body_size(config.max_response_body_size)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUEST_LEN))
             .build(internal_http)
             .await?;
@@ -432,6 +439,14 @@ mod tests {
     #[test]
     fn rpc_config_default_disallows_unsafe_dev_exposure() {
         assert!(!RpcConfig::default().allow_unsafe_dev_exposed);
+    }
+
+    #[test]
+    fn rpc_config_default_bounds_response_bodies() {
+        assert_eq!(
+            RpcConfig::default().max_response_body_size,
+            10 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -554,6 +569,59 @@ mod tests {
         server.http_handle.stop().unwrap();
         server.http_handle.stopped().await;
         assert!(matches!(err, ClientError::ParseError(_)));
+    }
+
+    #[tokio::test]
+    async fn server_enforces_configured_response_body_limit() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            api_namespaces: vec!["web3".into()],
+            max_response_body_size: 1,
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{}", server.http_addr))
+            .unwrap();
+
+        let result = client
+            .request::<String, _>("web3_clientVersion", rpc_params![])
+            .await;
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(
+            matches!(result, Err(ClientError::Call(ref err)) if err.code() == jsonrpsee::types::error::OVERSIZED_RESPONSE_CODE),
+            "oversized response was not rejected: {result:?}"
+        );
     }
 
     #[tokio::test]
