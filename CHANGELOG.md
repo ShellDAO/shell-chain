@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   range end before applying witness-replacement retention behavior.
 - Retain expired grace-window witness deletions for retry when storage returns
   a transient error instead of silently abandoning cleanup.
+- Audit the patched libp2p-yamux lockfile in CI and release preflight, and
+  refresh its vulnerable `bytes` dependency.
 
 ## [0.27.1] — 2026-07-14 — Consensus and RPC correctness fixes
 

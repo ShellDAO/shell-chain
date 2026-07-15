@@ -14,6 +14,9 @@ fail() {
 if ! grep -Fq 'cargo audit --file tools/tx-generator/Cargo.lock' "$SCRIPT_DIR/release.sh"; then
     fail "release audit does not cover the transaction generator lockfile"
 fi
+if ! grep -Fq 'cargo audit --file deps/libp2p-yamux/Cargo.lock' "$SCRIPT_DIR/release.sh"; then
+    fail "release audit does not cover the patched libp2p-yamux lockfile"
+fi
 
 make_fixture() {
     local changelog=$1

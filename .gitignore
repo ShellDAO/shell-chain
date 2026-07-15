@@ -1,5 +1,6 @@
 # Build
 /target/
+/deps/*/target/
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/

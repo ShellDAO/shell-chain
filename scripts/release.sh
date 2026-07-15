@@ -143,8 +143,9 @@ if command -v cargo-audit &>/dev/null; then
     fi
     if cargo audit \
         && cargo audit --file fuzz/Cargo.lock \
-        && cargo audit --file tools/tx-generator/Cargo.lock; then
-        ok "cargo audit passed for workspace, fuzz, and transaction generator dependencies"
+        && cargo audit --file tools/tx-generator/Cargo.lock \
+        && cargo audit --file deps/libp2p-yamux/Cargo.lock; then
+        ok "cargo audit passed for workspace, fuzz, transaction generator, and patched libp2p-yamux dependencies"
     else
         fail "cargo audit found advisories (review before tagging)"
     fi

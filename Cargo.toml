@@ -22,6 +22,10 @@ members = [
     "tools/multi-prover-test",
     "tools/rpc-docgen",
 ]
+exclude = [
+    "deps/ark-relations",
+    "deps/libp2p-yamux",
+]
 
 [workspace.package]
 version = "0.27.1"

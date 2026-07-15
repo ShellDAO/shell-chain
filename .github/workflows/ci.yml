@@ -78,3 +78,5 @@ jobs:
         run: cargo audit --file fuzz/Cargo.lock
       - name: Audit transaction generator dependencies
         run: cargo audit --file tools/tx-generator/Cargo.lock
+      - name: Audit patched libp2p-yamux dependencies
+        run: cargo audit --file deps/libp2p-yamux/Cargo.lock
