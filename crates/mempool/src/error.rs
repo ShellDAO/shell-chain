@@ -8,6 +8,9 @@ pub enum MempoolError {
     #[error("pool is full ({capacity} transactions)")]
     PoolFull { capacity: usize },
 
+    #[error("pool byte capacity exceeded ({capacity} bytes)")]
+    PoolBytesFull { capacity: usize },
+
     #[error("sender {sender} has too many pending transactions ({count})")]
     SenderQueueFull { sender: Address, count: usize },
 
@@ -61,6 +64,7 @@ impl MempoolError {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::PoolFull { .. } => "pool_full",
+            Self::PoolBytesFull { .. } => "pool_bytes_full",
             Self::SenderQueueFull { .. } => "sender_queue_full",
             Self::Duplicate { .. } => "duplicate",
             Self::ChainIdMismatch { .. } => "chain_id_mismatch",
@@ -144,6 +148,7 @@ mod tests {
         // Smoke-test that every variant returns a non-empty static label.
         let variants: &[MempoolError] = &[
             MempoolError::PoolFull { capacity: 1 },
+            MempoolError::PoolBytesFull { capacity: 1 },
             MempoolError::SenderQueueFull {
                 sender: Address::ZERO,
                 count: 1,
@@ -189,6 +194,12 @@ mod tests {
     fn pool_full_display() {
         let err = MempoolError::PoolFull { capacity: 4096 };
         assert_eq!(err.to_string(), "pool is full (4096 transactions)");
+    }
+
+    #[test]
+    fn pool_bytes_full_display() {
+        let err = MempoolError::PoolBytesFull { capacity: 1024 };
+        assert_eq!(err.to_string(), "pool byte capacity exceeded (1024 bytes)");
     }
 
     #[test]

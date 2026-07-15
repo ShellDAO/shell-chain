@@ -15,7 +15,7 @@ use shell_genesis::{
     NetworkType,
 };
 use shell_keystore::{decrypt_any, EncryptedKey};
-use shell_mempool::MempoolConfig;
+use shell_mempool::{MempoolConfig, DEFAULT_MAX_POOL_BYTES};
 use shell_network::{NetworkBus, NetworkConfig};
 use shell_node::config::{ConsensusEngineConfig, L2StarkMode, NodeConfig, NodeRole};
 use shell_node::pruning::StorageProfile;
@@ -59,6 +59,8 @@ pub struct RunArgs {
     pub max_idle_interval: u64,
     /// Maximum number of pending transactions in the mempool (default: 4096).
     pub mempool_max_size: Option<usize>,
+    /// Maximum aggregate serialized transaction bytes retained by the mempool.
+    pub mempool_max_bytes: Option<usize>,
     /// Minimum gas-price bump required to replace a pending transaction, in percent (default: 10).
     pub mempool_price_bump: Option<u64>,
     /// Account LRU cache size for the world-state trie, in MiB (default: 64).
@@ -610,6 +612,7 @@ async fn run_with_store<S: KvStore + 'static>(
         mempool: MempoolConfig {
             chain_id: genesis_config.chain_id,
             max_pool_size: args.mempool_max_size.unwrap_or(4096),
+            max_pool_bytes: args.mempool_max_bytes.unwrap_or(DEFAULT_MAX_POOL_BYTES),
             replacement_fee_bump_pct: args.mempool_price_bump.unwrap_or(10),
             ..MempoolConfig::default()
         },
@@ -889,6 +892,7 @@ mod tests {
             metrics_addr: "127.0.0.1:9090".into(),
             max_idle_interval: 60,
             mempool_max_size: None,
+            mempool_max_bytes: None,
             mempool_price_bump: None,
             state_cache_size_mb: None,
             parallel_pqvm: true,

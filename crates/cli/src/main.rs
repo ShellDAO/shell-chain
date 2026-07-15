@@ -187,6 +187,10 @@ enum Commands {
         #[arg(long)]
         mempool_max_size: Option<usize>,
 
+        /// Maximum aggregate serialized transaction bytes retained by the mempool.
+        #[arg(long)]
+        mempool_max_bytes: Option<usize>,
+
         /// Minimum gas-price bump (%) required to replace a pending transaction.
         #[arg(long)]
         mempool_price_bump: Option<u64>,
@@ -600,6 +604,7 @@ async fn main() {
             metrics_addr,
             max_idle_interval,
             mempool_max_size,
+            mempool_max_bytes,
             mempool_price_bump,
             state_cache_size_mb,
             parallel_pqvm,
@@ -772,6 +777,7 @@ async fn main() {
                 metrics_addr: effective_metrics_addr,
                 max_idle_interval,
                 mempool_max_size,
+                mempool_max_bytes,
                 mempool_price_bump,
                 state_cache_size_mb,
                 parallel_pqvm: effective_parallel_pqvm,

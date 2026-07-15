@@ -52,12 +52,15 @@ struct PoolInner {
     by_priority: BTreeMap<PriorityKey, ShellHash>,
     /// Monotonic counter for FIFO tie-breaking at equal fee levels.
     seq: u64,
+    /// Aggregate serialized size of all retained transactions.
+    total_bytes: usize,
 }
 
 /// Entry in the pool holding the transaction and metadata.
 struct PoolEntry {
     tx: Arc<SignedTransaction>,
     priority_key: PriorityKey,
+    serialized_size: usize,
 }
 
 /// Composite ordering key: higher fee first, then earlier arrival first.
@@ -79,6 +82,7 @@ impl TxPool {
                 by_sender: HashMap::new(),
                 by_priority: BTreeMap::new(),
                 seq: 0,
+                total_bytes: 0,
             }),
         }
     }
@@ -97,7 +101,7 @@ impl TxPool {
         verifier: &V,
     ) -> Result<ShellHash, MempoolError> {
         // --- Stateless checks (before acquiring lock) ---
-        self.validate_stateless(&tx, world_state, chain_store, verifier)?;
+        let tx_size = self.validate_stateless(&tx, world_state, chain_store, verifier)?;
 
         // --- Balance floor check (F-020) ---
         let sender = tx.sender();
@@ -242,6 +246,24 @@ impl TxPool {
             Some(hash) => vec![hash],
             None => Vec::new(),
         };
+        let evicted_bytes = evicted_hashes
+            .iter()
+            .filter_map(|hash| inner.by_hash.get(hash))
+            .fold(0usize, |total, entry| {
+                total.saturating_add(entry.serialized_size)
+            });
+        let projected_bytes = inner
+            .total_bytes
+            .saturating_sub(evicted_bytes)
+            .checked_add(tx_size)
+            .ok_or(MempoolError::PoolBytesFull {
+                capacity: self.config.max_pool_bytes,
+            })?;
+        if projected_bytes > self.config.max_pool_bytes {
+            return Err(MempoolError::PoolBytesFull {
+                capacity: self.config.max_pool_bytes,
+            });
+        }
         Self::ensure_pending_balance_available(&inner, &tx, world_state, &evicted_hashes)?;
 
         let Some(next_seq) = inner.seq.checked_add(1) else {
@@ -278,8 +300,10 @@ impl TxPool {
             PoolEntry {
                 tx: Arc::new(tx),
                 priority_key,
+                serialized_size: tx_size,
             },
         );
+        inner.total_bytes = projected_bytes;
 
         Ok(hash)
     }
@@ -361,6 +385,7 @@ impl TxPool {
         inner.by_sender.clear();
         inner.by_priority.clear();
         inner.seq = 0;
+        inner.total_bytes = 0;
     }
 
     /// Get a transaction by hash.
@@ -377,6 +402,11 @@ impl TxPool {
     /// Number of transactions currently in the pool.
     pub fn len(&self) -> usize {
         self.inner.read().by_hash.len()
+    }
+
+    /// Aggregate serialized size of transactions currently retained by the pool.
+    pub fn size_bytes(&self) -> usize {
+        self.inner.read().total_bytes
     }
 
     /// Whether the pool is empty.
@@ -540,7 +570,7 @@ impl TxPool {
         world_state: &mut WorldState<S>,
         chain_store: &ChainStore<S>,
         verifier: &V,
-    ) -> Result<(), MempoolError> {
+    ) -> Result<usize, MempoolError> {
         // Chain ID
         if tx.tx.chain_id != self.config.chain_id {
             return Err(MempoolError::ChainIdMismatch {
@@ -644,13 +674,14 @@ impl TxPool {
         }
 
         validate_aa_tx(tx, world_state, chain_store, verifier)
-            .map(|_| ())
-            .map_err(|err| map_aa_validation_error(tx, err))
+            .map_err(|err| map_aa_validation_error(tx, err))?;
+        Ok(tx_size)
     }
 
     /// Remove a single entry from all indexes. Caller holds write lock.
     fn remove_entry(inner: &mut PoolInner, hash: &ShellHash) -> bool {
         if let Some(entry) = inner.by_hash.remove(hash) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(entry.serialized_size);
             let sender = entry.tx.sender();
             let nonce = entry.tx.tx.nonce;
 
@@ -926,6 +957,7 @@ mod tests {
     fn make_config() -> MempoolConfig {
         MempoolConfig {
             max_pool_size: 10,
+            max_pool_bytes: 1024 * 1024,
             max_per_sender: 4,
             chain_id: 42,
             min_gas_price: 1,
@@ -2214,7 +2246,37 @@ mod tests {
         let pool = TxPool::new(make_config());
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
+        assert_eq!(pool.size_bytes(), 0);
         assert_eq!(pool.pending(10).len(), 0);
+    }
+
+    #[test]
+    fn aggregate_byte_limit_rejects_and_reclaims_capacity() {
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let (tx0, _) = make_signed_tx(0, 100);
+        let (tx1, _) = make_signed_tx(0, 101);
+        let tx0_size = serde_json::to_vec(&tx0).unwrap().len();
+        let tx1_size = serde_json::to_vec(&tx1).unwrap().len();
+        assert_eq!(tx0_size, tx1_size);
+        let pool = TxPool::new(MempoolConfig {
+            max_pool_bytes: tx0_size,
+            ..make_config()
+        });
+
+        let hash0 = insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.size_bytes(), tx0_size);
+
+        let err = insert_rich(&pool, tx1.clone(), &verifier, &mut ws, &cs).unwrap_err();
+        assert!(matches!(err, MempoolError::PoolBytesFull { .. }), "{err:?}");
+        assert_eq!(pool.size_bytes(), tx0_size);
+
+        assert!(pool.remove(&hash0));
+        assert_eq!(pool.size_bytes(), 0);
+        insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.size_bytes(), tx1_size);
+        pool.clear();
+        assert_eq!(pool.size_bytes(), 0);
     }
 
     // --- F-020: Balance check tests ---
@@ -2479,14 +2541,18 @@ mod tests {
         // Insert tx at nonce 0 with priority_fee=100
         let tx_old = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
         let old_hash = tx_old.hash();
+        let old_size = serde_json::to_vec(&tx_old).unwrap().len();
         insert_rich(&pool, tx_old, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.size_bytes(), old_size);
 
         // Replace with priority_fee=111 (>= 110% of 100)
         let tx_new = make_signed_tx_with_signer(&signer, &pubkey, 0, 111);
         let new_hash = tx_new.hash();
+        let new_size = serde_json::to_vec(&tx_new).unwrap().len();
         insert_rich(&pool, tx_new, &verifier, &mut ws, &cs).unwrap();
 
         assert_eq!(pool.len(), 1);
+        assert_eq!(pool.size_bytes(), new_size);
         assert!(!pool.contains(&old_hash));
         assert!(pool.contains(&new_hash));
     }

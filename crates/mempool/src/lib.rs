@@ -16,6 +16,6 @@ mod config;
 mod error;
 mod pool;
 
-pub use config::MempoolConfig;
+pub use config::{MempoolConfig, DEFAULT_MAX_POOL_BYTES};
 pub use error::MempoolError;
 pub use pool::{TxPool, MAX_TX_SIZE};
