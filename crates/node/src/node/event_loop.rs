@@ -26,6 +26,15 @@ fn stark_backlog_tail_extends(max_existing: Option<u64>, first_new_block: u64) -
     max_existing.and_then(|max| max.checked_add(1)) == Some(first_new_block)
 }
 
+fn proof_amendment_envelope_matches(
+    envelope_hash: ShellHash,
+    envelope_block: u64,
+    payload_hash: ShellHash,
+    payload_block: u64,
+) -> bool {
+    envelope_hash == payload_hash && envelope_block == payload_block
+}
+
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
@@ -1276,12 +1285,18 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     };
-                                    if amendment.block_hash != block_hash {
+                                    if !proof_amendment_envelope_matches(
+                                        block_hash,
+                                        block_number,
+                                        amendment.block_hash,
+                                        amendment.block_number,
+                                    ) {
                                         warn!(
-                                            block = block_number,
+                                            envelope_block = block_number,
                                             envelope_hash = %block_hash,
+                                            payload_block = amendment.block_number,
                                             payload_hash = %amendment.block_hash,
-                                            "proof amendment envelope hash does not match payload"
+                                            "proof amendment envelope does not match signed payload"
                                         );
                                         continue;
                                     }
@@ -1405,19 +1420,20 @@ impl<S: KvStore + 'static> Node<S> {
                                     self.pending_stark_settlements.lock().push(amendment.clone());
                                     // L2: delete covered witness bundles once proof is secured, unless grace window is active.
                                     let grace = self.config.pruning.proof_replacement_grace;
+                                    let source_end_block = amendment.block_number;
                                     let head = self.chain_store.get_head_block()
                                         .ok().flatten().map(|b| b.header.number).unwrap_or(0);
                                     for hash in covered_hashes {
-                                        if grace == 0 || head.saturating_sub(block_number) >= grace {
+                                        if grace == 0 || head.saturating_sub(source_end_block) >= grace {
                                             match self.chain_store.delete_witness_bundle(&hash) {
-                                                Ok(()) => info!(block = block_number, %hash, "L2: witness bundle deleted after proof replacement"),
-                                                Err(e) => warn!(block = block_number, %hash, "L2: failed to delete witness bundle: {e}"),
+                                                Ok(()) => info!(block = source_end_block, %hash, "L2: witness bundle deleted after proof replacement"),
+                                                Err(e) => warn!(block = source_end_block, %hash, "L2: failed to delete witness bundle: {e}"),
                                             }
                                         } else {
-                                            // Schedule deletion: delete once head reaches block_number + grace.
-                                            let delete_at = block_number.saturating_add(grace);
+                                            // Schedule deletion from the signed source-range end.
+                                            let delete_at = source_end_block.saturating_add(grace);
                                             self.pending_grace_deletes.lock().insert(hash, delete_at);
-                                            debug!(block = block_number, %hash, grace, head, delete_at, "L2: proof stored, within grace window — deletion scheduled");
+                                            debug!(block = source_end_block, %hash, grace, head, delete_at, "L2: proof stored, within grace window — deletion scheduled");
                                         }
                                     }
                                 }
@@ -2523,6 +2539,16 @@ mod cadence_tests {
         assert!(!stark_backlog_tail_extends(Some(41), 43));
         assert!(!stark_backlog_tail_extends(None, 0));
         assert!(!stark_backlog_tail_extends(Some(u64::MAX), u64::MAX));
+    }
+
+    #[test]
+    fn proof_amendment_envelope_binds_hash_and_block_number() {
+        let hash = ShellHash::from([0x11; 32]);
+        let other_hash = ShellHash::from([0x22; 32]);
+
+        assert!(proof_amendment_envelope_matches(hash, 7, hash, 7));
+        assert!(!proof_amendment_envelope_matches(hash, 7, other_hash, 7));
+        assert!(!proof_amendment_envelope_matches(hash, 6, hash, 7));
     }
 
     #[test]

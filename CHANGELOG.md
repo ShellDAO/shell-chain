@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound proof-amendment gossip envelopes to the signed payload hash and source
+  range end before applying witness-replacement retention behavior.
+
 ## [0.27.1] — 2026-07-14 — Consensus and RPC correctness fixes
 
 ### Fixed
