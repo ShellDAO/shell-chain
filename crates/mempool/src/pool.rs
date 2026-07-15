@@ -320,6 +320,20 @@ impl TxPool {
         removed
     }
 
+    /// Remove a transaction and all later nonces queued for the same sender.
+    ///
+    /// Use this when a transaction is permanently invalid. Its descendants
+    /// cannot execute until the missing nonce is replaced, so retaining them
+    /// would break the pool's contiguous sender-queue invariant.
+    pub fn remove_with_descendants(&self, hash: &ShellHash) -> usize {
+        let mut inner = self.inner.write();
+        let removed = Self::remove_entry_and_descendants(&mut inner, hash);
+        if inner.by_hash.is_empty() {
+            inner.seq = 0;
+        }
+        removed
+    }
+
     /// Remove a batch of transactions (e.g., after block inclusion).
     pub fn remove_batch(&self, hashes: &[ShellHash]) {
         let mut inner = self.inner.write();
@@ -1695,6 +1709,32 @@ mod tests {
         assert!(!pool.contains(&hash));
         assert_eq!(pool.len(), 0);
         assert!(!pool.remove(&hash)); // already gone
+    }
+
+    #[test]
+    fn remove_with_descendants_preserves_sender_queue_and_byte_accounting() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+
+        let tx0 = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let tx1 = make_signed_tx_with_signer(&signer, &pubkey, 1, 90);
+        let tx2 = make_signed_tx_with_signer(&signer, &pubkey, 2, 80);
+        let h0 = insert_rich(&pool, tx0, &verifier, &mut ws, &cs).unwrap();
+        let h1 = insert_rich(&pool, tx1, &verifier, &mut ws, &cs).unwrap();
+        let h2 = insert_rich(&pool, tx2, &verifier, &mut ws, &cs).unwrap();
+
+        assert_eq!(pool.remove_with_descendants(&h1), 2);
+        assert!(pool.contains(&h0));
+        assert!(!pool.contains(&h1));
+        assert!(!pool.contains(&h2));
+        assert_eq!(pool.sender_txs(&test_address(&pubkey)), vec![h0]);
+        assert_eq!(
+            pool.size_bytes(),
+            serde_json::to_vec(&pool.get(&h0).unwrap()).unwrap().len()
+        );
     }
 
     #[test]

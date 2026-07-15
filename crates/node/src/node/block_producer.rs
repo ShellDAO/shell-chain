@@ -202,11 +202,11 @@ impl<S: KvStore + 'static> Node<S> {
                                 "produce_block: skipping tx after state commit error"
                             );
                             if is_unrecoverable_executor_error(&e) {
-                                let removed = self.tx_pool.remove(&tx.hash());
+                                let removed = self.tx_pool.remove_with_descendants(&tx.hash());
                                 warn!(
                                     tx_hash = %tx.hash(),
                                     removed,
-                                    "produce_block: removed tx with unrecoverable state error from mempool"
+                                    "produce_block: removed tx and descendants with unrecoverable state error from mempool"
                                 );
                             }
                             continue;
@@ -268,11 +268,11 @@ impl<S: KvStore + 'static> Node<S> {
                         "produce_block: skipping tx after execution error"
                     );
                     if is_unrecoverable_executor_error(&e) {
-                        let removed = self.tx_pool.remove(&tx.hash());
+                        let removed = self.tx_pool.remove_with_descendants(&tx.hash());
                         warn!(
                             tx_hash = %tx.hash(),
                             removed,
-                            "produce_block: removed tx with unrecoverable state error from mempool"
+                            "produce_block: removed tx and descendants with unrecoverable state error from mempool"
                         );
                     }
                     continue;
