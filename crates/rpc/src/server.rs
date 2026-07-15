@@ -675,15 +675,23 @@ mod tests {
 
         drop(subscriptions);
         drop(clients);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let client = WsClientBuilder::default().build(&ws_url).await.unwrap();
-        let result = client
-            .subscribe::<serde_json::Value, _>(
-                "eth_subscribe",
-                rpc_params!["newHeads"],
-                "eth_unsubscribe",
-            )
-            .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let result = loop {
+            let result = client
+                .subscribe::<serde_json::Value, _>(
+                    "eth_subscribe",
+                    rpc_params!["newHeads"],
+                    "eth_unsubscribe",
+                )
+                .await;
+            let capacity_still_releasing =
+                matches!(&result, Err(ClientError::Call(err)) if err.code() == -32005);
+            if !capacity_still_releasing || tokio::time::Instant::now() >= deadline {
+                break result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
 
         server.http_handle.stop().unwrap();
         server.http_handle.stopped().await;

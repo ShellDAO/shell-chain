@@ -379,8 +379,7 @@ mod tests {
         let peer = PeerId::from("temp-ban");
 
         assert!(bans.record_violation(&peer)); // immediately banned
-                                               // With 0ms duration, the ban should already be expired.
-        std::thread::sleep(Duration::from_millis(1));
+        bans.records.get_mut(&peer.0).unwrap().banned_until = Some(Instant::now());
         assert!(!bans.is_banned(&peer));
         // Violations reset after expiry.
         assert_eq!(bans.violations(&peer), 0);
@@ -412,7 +411,7 @@ mod tests {
         let mut bans = PeerBanList::new(1, Duration::from_millis(0));
         let peer = PeerId::from("gone");
         bans.record_violation(&peer);
-        std::thread::sleep(Duration::from_millis(1));
+        bans.records.get_mut(&peer.0).unwrap().banned_until = Some(Instant::now());
         assert_eq!(bans.tracked_count(), 1);
         bans.purge_expired();
         assert_eq!(bans.tracked_count(), 0);

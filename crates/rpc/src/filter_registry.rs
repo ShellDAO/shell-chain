@@ -421,10 +421,10 @@ mod tests {
 
     #[test]
     fn cleanup_removes_expired_filters() {
-        let reg = FilterRegistry::with_ttl(0); // expire immediately
+        let reg = FilterRegistry::with_ttl(1);
         let id = reg.new_filter(FilterKind::Block, 0).unwrap();
-        // Sleep a tiny bit to ensure the filter is past the TTL
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        reg.filters.write().get_mut(&id).unwrap().last_access =
+            Instant::now() - Duration::from_secs(2);
         reg.cleanup_expired();
         assert_eq!(reg.len(), 0);
         assert!(!reg.uninstall(&id));
