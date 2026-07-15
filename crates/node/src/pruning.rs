@@ -296,6 +296,24 @@ pub struct StateTriePruneResult {
     pub skipped_roots: u64,
 }
 
+const STATE_TRIE_PRUNED_BELOW_KEY: &[u8] = b"STATE_TRIE_PRUNED_BELOW";
+const MAX_STATE_TRIE_PRUNE_BLOCKS_PER_PASS: u64 = 1_024;
+
+fn state_trie_pruned_below<S: KvStore>(store: &S) -> Result<u64, StorageError> {
+    match store.get(STATE_TRIE_PRUNED_BELOW_KEY)? {
+        Some(bytes) if bytes.len() == 8 => {
+            let encoded: [u8; 8] = bytes.try_into().map_err(|_| {
+                StorageError::Codec("invalid state-trie pruning cursor encoding".into())
+            })?;
+            Ok(u64::from_be_bytes(encoded))
+        }
+        Some(_) => Err(StorageError::Codec(
+            "invalid state-trie pruning cursor encoding".into(),
+        )),
+        None => Ok(0),
+    }
+}
+
 /// Delete hashed trie nodes for canonical state snapshots older than
 /// `keep_below_block`, while preserving any nodes still reachable from retained
 /// state roots.
@@ -329,11 +347,14 @@ pub fn prune_state_trie<S: KvStore + 'static>(
         retained_roots.insert(header.state_root);
     }
 
-    // Collect roots to evict: all blocks strictly below the retention boundary.
-    // In steady-state operation this window stays small because each block
-    // advances keep_below_block by 1; on first-run or catch-up it is bounded by
-    // the retention window size, not total chain height.
-    for block_number in 0..keep_below_block {
+    let pruned_below = state_trie_pruned_below(store.as_ref())?.min(keep_below_block);
+    let pass_end = pruned_below
+        .saturating_add(MAX_STATE_TRIE_PRUNE_BLOCKS_PER_PASS)
+        .min(keep_below_block);
+
+    // Collect only the next bounded range. The durable cursor makes steady-state
+    // passes O(newly-finalized blocks) and bounds first-run catch-up work.
+    for block_number in pruned_below..pass_end {
         let Some(block_hash) = chain_store.get_block_hash_by_number(block_number)? else {
             continue;
         };
@@ -366,6 +387,8 @@ pub fn prune_state_trie<S: KvStore + 'static>(
             result.skipped_roots = result.skipped_roots.saturating_add(1);
         }
     }
+
+    store.put(STATE_TRIE_PRUNED_BELOW_KEY, &pass_end.to_be_bytes())?;
 
     Ok(result)
 }
@@ -610,6 +633,35 @@ mod tests {
         assert_eq!(
             root_balance(&store, roots[2], addresses[2]).unwrap(),
             U256::from(3u64)
+        );
+    }
+
+    #[test]
+    fn state_trie_pruning_persists_progress_cursor() {
+        let (store, _, _) = populate_state_chain();
+
+        let first = prune_state_trie(Arc::clone(&store), 2, StorageProfile::Light).unwrap();
+        let second = prune_state_trie(Arc::clone(&store), 2, StorageProfile::Light).unwrap();
+
+        assert!(first.pruned_roots > 0);
+        assert_eq!(second, StateTriePruneResult::default());
+        assert_eq!(
+            store.get(STATE_TRIE_PRUNED_BELOW_KEY).unwrap(),
+            Some(2u64.to_be_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn state_trie_pruning_rejects_malformed_progress_cursor() {
+        let (store, roots, addresses) = populate_state_chain();
+        store.put(STATE_TRIE_PRUNED_BELOW_KEY, b"invalid").unwrap();
+
+        let result = prune_state_trie(Arc::clone(&store), 2, StorageProfile::Light);
+
+        assert!(matches!(result, Err(StorageError::Codec(_))));
+        assert_eq!(
+            root_balance(&store, roots[0], addresses[0]).unwrap(),
+            U256::from(1u64)
         );
     }
 
