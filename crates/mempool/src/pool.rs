@@ -2254,8 +2254,9 @@ mod tests {
     fn aggregate_byte_limit_rejects_and_reclaims_capacity() {
         let verifier = DilithiumVerifier;
         let (mut ws, cs) = setup_validation_ctx();
-        let (tx0, _) = make_signed_tx(0, 100);
-        let (tx1, _) = make_signed_tx(0, 101);
+        let nonce = u64::default();
+        let (tx0, _) = make_signed_tx(nonce, 100);
+        let (tx1, _) = make_signed_tx(nonce, 101);
         let tx0_size = serde_json::to_vec(&tx0).unwrap().len();
         let tx1_size = serde_json::to_vec(&tx1).unwrap().len();
         assert_eq!(tx0_size, tx1_size);
@@ -2537,16 +2538,17 @@ mod tests {
 
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
+        let nonce = u64::default();
 
         // Insert tx at nonce 0 with priority_fee=100
-        let tx_old = make_signed_tx_with_signer(&signer, &pubkey, 0, 100);
+        let tx_old = make_signed_tx_with_signer(&signer, &pubkey, nonce, 100);
         let old_hash = tx_old.hash();
         let old_size = serde_json::to_vec(&tx_old).unwrap().len();
         insert_rich(&pool, tx_old, &verifier, &mut ws, &cs).unwrap();
         assert_eq!(pool.size_bytes(), old_size);
 
         // Replace with priority_fee=111 (>= 110% of 100)
-        let tx_new = make_signed_tx_with_signer(&signer, &pubkey, 0, 111);
+        let tx_new = make_signed_tx_with_signer(&signer, &pubkey, nonce, 111);
         let new_hash = tx_new.hash();
         let new_size = serde_json::to_vec(&tx_new).unwrap().len();
         insert_rich(&pool, tx_new, &verifier, &mut ws, &cs).unwrap();
