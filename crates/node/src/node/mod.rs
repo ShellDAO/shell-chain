@@ -6569,6 +6569,89 @@ mod tests {
     }
 
     #[test]
+    fn import_side_fork_witness_root_mismatch_is_rejected() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
+        let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let mut side_fork = make_block_at_1(&node, &signer, Some(ShellHash::from([0xab; 32])));
+        side_fork.header.parent_hash = genesis_hash;
+        side_fork.header.extra_data = Bytes::from_static(b"side-fork");
+        side_fork.proposer_seal = Some(
+            signer
+                .sign(side_fork.header.hash().as_bytes())
+                .expect("sign side fork"),
+        );
+        let side_fork_hash = side_fork.hash();
+
+        let err = node.import_block(side_fork, &MultiVerifier).unwrap_err();
+        assert!(err.to_string().contains("witness_root mismatch"));
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&side_fork_hash)
+            .unwrap()
+            .is_none());
+        assert!(!node.fork_choice.read().contains(&side_fork_hash));
+    }
+
+    #[test]
+    fn import_side_fork_invalid_fee_and_blob_fields_are_rejected() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
+        let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let mut side_fork = make_block_at_1(&node, &signer, None);
+        side_fork.header.parent_hash = genesis_hash;
+        side_fork.header.base_fee_per_gas += 1;
+        side_fork.header.extra_data = Bytes::from_static(b"bad-base-fee");
+        side_fork.proposer_seal = Some(
+            signer
+                .sign(side_fork.header.hash().as_bytes())
+                .expect("sign side fork"),
+        );
+        let base_fee_hash = side_fork.hash();
+        let err = node
+            .import_block(side_fork.clone(), &MultiVerifier)
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid base_fee_per_gas"));
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&base_fee_hash)
+            .unwrap()
+            .is_none());
+
+        side_fork.header.base_fee_per_gas = shell_core::INITIAL_BASE_FEE;
+        side_fork.header.blob_gas_used = shell_core::BLOB_GAS_PER_BLOB;
+        side_fork.header.extra_data = Bytes::from_static(b"bad-blob-gas");
+        side_fork.proposer_seal = Some(
+            signer
+                .sign(side_fork.header.hash().as_bytes())
+                .expect("sign side fork"),
+        );
+        let blob_gas_hash = side_fork.hash();
+        let err = node.import_block(side_fork, &MultiVerifier).unwrap_err();
+        assert!(err.to_string().contains("blob_gas_used mismatch"));
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&blob_gas_hash)
+            .unwrap()
+            .is_none());
+        assert!(!node.fork_choice.read().contains(&blob_gas_hash));
+    }
+
+    #[test]
     fn import_block_witness_root_matches_bundle_succeeds() {
         let (node, signer) = setup_node();
         store_genesis(&node);

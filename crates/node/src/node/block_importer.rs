@@ -142,123 +142,11 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    /// Import and validate a block received from the network.
-    ///
-    /// Re-executes all transactions through the EVM on an isolated state
-    /// snapshot, verifies the imported state root, then atomically swaps the
-    /// live WorldState and stores the block.
-    ///
-    /// Fork detection: if the incoming block is at the same height as
-    /// the current head but with a different hash, it is treated as a
-    /// potential fork and skipped. If there is a gap (block number is
-    /// more than one ahead of head), missing blocks are requested.
-    pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
-        let block_store = self.block_store();
-        let consensus = self.consensus_manager();
-        let prover = self.prover_orchestrator();
-        let mem_pool = self.mem_pool();
-
-        let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
-
-        let incoming = block.number();
-        let incoming_hash = block.hash();
-        let canonical_hash_at_incoming = block_store.block_hash_by_number(incoming)?;
-        let finalized_number = consensus.finalized_number();
-        let transition = ChainStateMachine::classify_import(
-            head.number(),
-            head.hash(),
-            incoming,
-            incoming_hash,
-            block.header.parent_hash,
-            finalized_number,
-            canonical_hash_at_incoming,
-        )?;
-
-        // Fork detection: same height, different hash. Keep the side block so
-        // fork-choice/reorg can inspect it later instead of dropping evidence.
-        if transition == BlockImportTransition::SameHeightFork {
-            let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent)?;
-            if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
-                self.queue_signed_equivocation_if_valid(&existing, &block);
-            }
-            let remote_hash = incoming_hash;
-            block_store.put_side_fork_block(&block)?;
-            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
-            let side_forks = block_store.side_fork_count(incoming);
-            warn!(
-                number = incoming,
-                local_hash = %head.hash(),
-                %remote_hash,
-                side_forks,
-                "potential fork detected at same height; stored as side fork"
-            );
-            return Ok(());
-        }
-
-        // Duplicate or stale block — already have it. Must check BEFORE equivocation
-        // detection to avoid false-positive double-sign events from re-gossipped blocks.
-        if transition == BlockImportTransition::DuplicateOrStale {
-            debug!(
-                incoming,
-                head = head.number(),
-                "ignoring block at or below current head"
-            );
-            return Ok(());
-        }
-
-        // Height is next, but the block does not extend our current head.
-        // Keep it as a fork candidate instead of corrupting the canonical
-        // number->hash mapping with a disconnected block.
-        if transition == BlockImportTransition::NextHeightFork {
-            let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent)?;
-            let remote_hash = incoming_hash;
-            block_store.put_side_fork_block(&block)?;
-            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
-            let side_forks = block_store.side_fork_count(incoming);
-            warn!(
-                number = incoming,
-                expected_parent = %head.hash(),
-                got_parent = %block.header.parent_hash,
-                %remote_hash,
-                side_forks,
-                "fork block does not extend local head; stored as side fork"
-            );
-            return Ok(());
-        }
-
-        // I1: Equivocation detection — check if the incoming block's proposer has
-        // already produced a block at this height. Only fires for truly new blocks
-        // (incoming == expected), preventing false positives from stale gossip.
-        if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
-            if existing.hash() != block.hash() && existing.header.proposer == block.header.proposer
-            {
-                self.queue_signed_equivocation_if_valid(&existing, &block);
-            }
-        }
-
-        // Gap detection: block is too far ahead.
-        if let BlockImportTransition::Gap { incoming, expected } = transition {
-            warn!(
-                incoming,
-                expected,
-                gap = incoming - expected,
-                "block too far ahead, missing blocks need to be requested"
-            );
-            return Err(NodeError::GapDetected { incoming, expected });
-        }
-
-        // Verify consensus rules, including parent linkage, timestamp bounds,
-        // and proposer seal.
-        let parent = self.parent_for_import(&block)?;
-        self.verify_import_consensus(&block, &parent)?;
-
-        // Verify EIP-1559 base fee is correct.
+    fn verify_import_economics(&self, block: &Block, parent: &Block) -> Result<(), NodeError> {
         let expected_base_fee = calculate_base_fee(
-            head.header.gas_used,
-            head.header.gas_limit,
-            head.header.base_fee_per_gas,
+            parent.header.gas_used,
+            parent.header.gas_limit,
+            parent.header.base_fee_per_gas,
         );
         if block.header.base_fee_per_gas != expected_base_fee {
             return Err(NodeError::Startup(format!(
@@ -308,6 +196,127 @@ impl<S: KvStore + 'static> Node<S> {
                 block.header.blob_gas_used,
             )));
         }
+
+        Ok(())
+    }
+
+    /// Import and validate a block received from the network.
+    ///
+    /// Re-executes all transactions through the EVM on an isolated state
+    /// snapshot, verifies the imported state root, then atomically swaps the
+    /// live WorldState and stores the block.
+    ///
+    /// Fork detection: if the incoming block is at the same height as
+    /// the current head but with a different hash, it is treated as a
+    /// potential fork and skipped. If there is a gap (block number is
+    /// more than one ahead of head), missing blocks are requested.
+    pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
+        let block_store = self.block_store();
+        let consensus = self.consensus_manager();
+        let prover = self.prover_orchestrator();
+        let mem_pool = self.mem_pool();
+
+        let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
+
+        let incoming = block.number();
+        let incoming_hash = block.hash();
+        let canonical_hash_at_incoming = block_store.block_hash_by_number(incoming)?;
+        let finalized_number = consensus.finalized_number();
+        let transition = ChainStateMachine::classify_import(
+            head.number(),
+            head.hash(),
+            incoming,
+            incoming_hash,
+            block.header.parent_hash,
+            finalized_number,
+            canonical_hash_at_incoming,
+        )?;
+
+        // Fork detection: same height, different hash. Keep the side block so
+        // fork-choice/reorg can inspect it later instead of dropping evidence.
+        if transition == BlockImportTransition::SameHeightFork {
+            let parent = self.parent_for_import(&block)?;
+            self.verify_import_consensus(&block, &parent)?;
+            self.verify_import_economics(&block, &parent)?;
+            self.verify_incoming_witness_root(&block)?;
+            if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
+                self.queue_signed_equivocation_if_valid(&existing, &block);
+            }
+            let remote_hash = incoming_hash;
+            block_store.put_side_fork_block(&block)?;
+            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
+            let side_forks = block_store.side_fork_count(incoming);
+            warn!(
+                number = incoming,
+                local_hash = %head.hash(),
+                %remote_hash,
+                side_forks,
+                "potential fork detected at same height; stored as side fork"
+            );
+            return Ok(());
+        }
+
+        // Duplicate or stale block — already have it. Must check BEFORE equivocation
+        // detection to avoid false-positive double-sign events from re-gossipped blocks.
+        if transition == BlockImportTransition::DuplicateOrStale {
+            debug!(
+                incoming,
+                head = head.number(),
+                "ignoring block at or below current head"
+            );
+            return Ok(());
+        }
+
+        // Height is next, but the block does not extend our current head.
+        // Keep it as a fork candidate instead of corrupting the canonical
+        // number->hash mapping with a disconnected block.
+        if transition == BlockImportTransition::NextHeightFork {
+            let parent = self.parent_for_import(&block)?;
+            self.verify_import_consensus(&block, &parent)?;
+            self.verify_import_economics(&block, &parent)?;
+            self.verify_incoming_witness_root(&block)?;
+            let remote_hash = incoming_hash;
+            block_store.put_side_fork_block(&block)?;
+            consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
+            let side_forks = block_store.side_fork_count(incoming);
+            warn!(
+                number = incoming,
+                expected_parent = %head.hash(),
+                got_parent = %block.header.parent_hash,
+                %remote_hash,
+                side_forks,
+                "fork block does not extend local head; stored as side fork"
+            );
+            return Ok(());
+        }
+
+        // I1: Equivocation detection — check if the incoming block's proposer has
+        // already produced a block at this height. Only fires for truly new blocks
+        // (incoming == expected), preventing false positives from stale gossip.
+        if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
+            if existing.hash() != block.hash() && existing.header.proposer == block.header.proposer
+            {
+                self.queue_signed_equivocation_if_valid(&existing, &block);
+            }
+        }
+
+        // Gap detection: block is too far ahead.
+        if let BlockImportTransition::Gap { incoming, expected } = transition {
+            warn!(
+                incoming,
+                expected,
+                gap = incoming - expected,
+                "block too far ahead, missing blocks need to be requested"
+            );
+            return Err(NodeError::GapDetected { incoming, expected });
+        }
+
+        // Verify consensus rules, including parent linkage, timestamp bounds,
+        // and proposer seal.
+        let parent = self.parent_for_import(&block)?;
+        self.verify_import_consensus(&block, &parent)?;
+        self.verify_import_economics(&block, &parent)?;
+        self.verify_incoming_witness_root(&block)?;
 
         // C3: If the block carries a STARK aggregate proof, verify it.
         // A valid proof means the block producer correctly accumulated all
@@ -738,11 +747,6 @@ impl<S: KvStore + 'static> Node<S> {
                 imported_state_root
             )));
         }
-
-        // B5: Validate witness_root directly from the incoming block before it is
-        // committed. Relying on a pre-existing stored bundle lets first import
-        // skip the check.
-        self.verify_incoming_witness_root(&block)?;
 
         let import_cs = ChainStore::new(import_store.clone());
         for (address, pubkey) in &new_pubkeys {
