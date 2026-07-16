@@ -9,14 +9,20 @@ FIXTURE="$TMP_DIR/project with spaces"
 mkdir -p "$FIXTURE/scripts" "$FIXTURE/bin"
 cp "$SCRIPT_DIR/build-release-binary.sh" "$FIXTURE/scripts/"
 
+cat > "$FIXTURE/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_UNAME:-Darwin}"
+EOF
+chmod +x "$FIXTURE/bin/uname"
+
 cat > "$FIXTURE/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s' "$CARGO_ENCODED_RUSTFLAGS" > "$CAPTURE_DIR/flags"
 printf '%s\n' "$@" > "$CAPTURE_DIR/args"
 mkdir -p target/release
-printf '#!/usr/bin/env sh\nexit 0\n' > target/release/shell-node
-chmod +x target/release/shell-node
+printf '#!/usr/bin/env sh\nexit 0\n' > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+chmod +x "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
 EOF
 chmod +x "$FIXTURE/bin/cargo"
 
@@ -36,6 +42,10 @@ grep -Fxq -- "--remap-path-prefix=$TMP_DIR/home with spaces=/build-home" <<<"$FL
 grep -Fxq -- '--release' "$CAPTURE_DIR/args"
 grep -Fxq -- '--locked' "$CAPTURE_DIR/args"
 grep -Fxq 'rocksdb,libp2p' "$CAPTURE_DIR/args"
+
+FAKE_UNAME=MINGW64_NT FAKE_EXE_SUFFIX=.exe \
+HOME="$TMP_DIR/windows home" PATH="$FIXTURE/bin:$PATH" CAPTURE_DIR="$CAPTURE_DIR" \
+    "$FIXTURE/scripts/build-release-binary.sh"
 
 if RUSTFLAGS='--cfg unsupported' HOME="$TMP_DIR/home" PATH="$FIXTURE/bin:$PATH" \
     CAPTURE_DIR="$CAPTURE_DIR" "$FIXTURE/scripts/build-release-binary.sh" 2>/dev/null; then

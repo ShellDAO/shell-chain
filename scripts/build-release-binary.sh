@@ -26,15 +26,19 @@ export CARGO_ENCODED_RUSTFLAGS
 cd "$PROJECT_DIR"
 cargo build --release --locked -p shell-cli --features "rocksdb,libp2p"
 
-BINARY="$PROJECT_DIR/target/release/shell-node"
+BINARY_NAME="shell-node"
+case "$(uname -s)" in
+    CYGWIN* | MINGW* | MSYS*) BINARY_NAME+=".exe" ;;
+esac
+BINARY="$PROJECT_DIR/target/release/$BINARY_NAME"
 if [ ! -x "$BINARY" ]; then
-    echo "release binary not found: target/release/shell-node" >&2
+    echo "release binary not found: target/release/$BINARY_NAME" >&2
     exit 1
 fi
 
-if strings -a "$BINARY" | grep -Fq "$BUILD_HOME"; then
+if grep -aFq "$BUILD_HOME" "$BINARY"; then
     echo "release binary contains an unremapped build-home path" >&2
     exit 1
 fi
 
-echo "release binary: target/release/shell-node"
+echo "release binary: target/release/$BINARY_NAME"
