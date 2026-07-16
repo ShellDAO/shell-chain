@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+FIXTURE="$TMP_DIR/project with spaces"
+mkdir -p "$FIXTURE/scripts" "$FIXTURE/bin"
+cp "$SCRIPT_DIR/build-release-binary.sh" "$FIXTURE/scripts/"
+
+cat > "$FIXTURE/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$CARGO_ENCODED_RUSTFLAGS" > "$CAPTURE_DIR/flags"
+printf '%s\n' "$@" > "$CAPTURE_DIR/args"
+mkdir -p target/release
+printf '#!/usr/bin/env sh\nexit 0\n' > target/release/shell-node
+chmod +x target/release/shell-node
+EOF
+chmod +x "$FIXTURE/bin/cargo"
+
+CAPTURE_DIR="$TMP_DIR/capture"
+mkdir -p "$CAPTURE_DIR"
+HOME="$TMP_DIR/home with spaces" \
+PATH="$FIXTURE/bin:$PATH" \
+CAPTURE_DIR="$CAPTURE_DIR" \
+CARGO_ENCODED_RUSTFLAGS=$'--cfg\x1fexisting' \
+    "$FIXTURE/scripts/build-release-binary.sh"
+
+FLAGS=$(tr '\037' '\n' < "$CAPTURE_DIR/flags")
+grep -Fxq -- '--cfg' <<<"$FLAGS"
+grep -Fxq 'existing' <<<"$FLAGS"
+grep -Fxq -- "--remap-path-prefix=$FIXTURE=/source" <<<"$FLAGS"
+grep -Fxq -- "--remap-path-prefix=$TMP_DIR/home with spaces=/build-home" <<<"$FLAGS"
+grep -Fxq -- '--release' "$CAPTURE_DIR/args"
+grep -Fxq -- '--locked' "$CAPTURE_DIR/args"
+grep -Fxq 'rocksdb,libp2p' "$CAPTURE_DIR/args"
+
+if RUSTFLAGS='--cfg unsupported' HOME="$TMP_DIR/home" PATH="$FIXTURE/bin:$PATH" \
+    CAPTURE_DIR="$CAPTURE_DIR" "$FIXTURE/scripts/build-release-binary.sh" 2>/dev/null; then
+    echo "release build unexpectedly accepted ambiguous RUSTFLAGS" >&2
+    exit 1
+fi
+
+echo "release binary build tests passed"

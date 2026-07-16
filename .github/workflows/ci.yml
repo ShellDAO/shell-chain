@@ -26,6 +26,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Test release preflight checks
         run: scripts/test-release-preflight.sh
+      - name: Test release binary build wrapper
+        run: scripts/test-build-release-binary.sh
       - name: Check DefaultPQValidator artifacts
         run: scripts/default-pq-validator-artifacts.sh --check
       - name: Check workspace crates are private
