@@ -5,10 +5,10 @@
 | Version | Supported |
 |---------|-----------|
 | latest (`main`) | ✅ Active |
-| v0.24.x | ✅ Security fixes |
-| < v0.24.0 | ❌ End of life |
+| v0.27.x | ✅ Security fixes |
+| < v0.27.0 | ❌ End of life |
 
-**v0.24.x is the current supported release line.** `main` receives active development and security fixes; v0.24.x receives security-only backports. Users on versions older than v0.24.0 should upgrade before reporting issues against them.
+**v0.27.x is the current supported release line.** `main` receives active development and security fixes; v0.27.x receives security-only backports. Users on versions older than v0.27.0 should upgrade before reporting issues against them.
 
 ## Scope
 

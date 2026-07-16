@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep the published security support line, version badge, container example,
+  and fuzz manifest aligned with the workspace release version.
 - Bound proof-amendment gossip envelopes to the signed payload hash and source
   range end before applying witness-replacement retention behavior.
 - Retain expired grace-window witness deletions for retry when storage returns

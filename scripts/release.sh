@@ -62,6 +62,12 @@ if [ "$CARGO_VERSION" != "$VERSION" ]; then
 fi
 ok "Cargo.toml version: ${CARGO_VERSION}"
 
+if "$SCRIPT_DIR/check-release-metadata.sh"; then
+    ok "Public release metadata matches ${CARGO_VERSION}"
+else
+    fail "Public release metadata is stale"
+fi
+
 # 3. CHANGELOG has one Unreleased heading and one release heading for this version
 UNRELEASED_HEADING_COUNT=$(awk '$0 == "## [Unreleased]" { count++ } END { print count + 0 }' CHANGELOG.md)
 if [ "$UNRELEASED_HEADING_COUNT" -ne 1 ]; then
