@@ -86,8 +86,13 @@ if git tag -l | grep -q "^${TAG}$"; then
 fi
 ok "Tag '${TAG}' does not yet exist"
 
-# 5. On main or feat branch
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+# 5. On main or the matching release branch
+if ! BRANCH=$(git symbolic-ref --quiet --short HEAD); then
+    fail "Release must run from 'main' or 'release/v${VERSION}', not a detached HEAD"
+fi
+if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "release/v${VERSION}" ]; then
+    fail "Release must run from 'main' or 'release/v${VERSION}', found '${BRANCH}'"
+fi
 ok "Current branch: ${BRANCH}"
 
 # ── Format check ─────────────────────────────────────────────

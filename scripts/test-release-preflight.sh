@@ -27,7 +27,7 @@ make_fixture() {
     cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
     printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
     printf '%s\n' "$changelog" > "$fixture/CHANGELOG.md"
-    git -C "$fixture" init -q
+    git -C "$fixture" init -q -b main
     git -C "$fixture" config user.name "ShellDAO Release Test"
     git -C "$fixture" config user.email "release-test@shelldao.org"
     git -C "$fixture" add .
@@ -66,5 +66,17 @@ assert_fails_with "$fixture" '0.27.1' "exactly one ## [Unreleased] heading (foun
 
 fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - first\n\n## [0.27.1] - duplicate')
 assert_fails_with "$fixture" '0.27.1' "exactly one ## [0.27.1] release heading (found 2)"
+
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
+git -C "$fixture" switch -qc topic/release
+assert_fails_with "$fixture" '0.27.1' "must run from 'main' or 'release/v0.27.1'"
+
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
+git -C "$fixture" checkout -q --detach
+assert_fails_with "$fixture" '0.27.1' "must run from 'main' or 'release/v0.27.1'"
+
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
+git -C "$fixture" switch -qc release/v0.27.1
+assert_fails_with "$fixture" '0.27.1' "cargo fmt check failed"
 
 echo "release preflight tests passed"
