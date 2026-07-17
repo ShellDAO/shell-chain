@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_HOME="${HOME:?HOME must be set}"
+CARGO_HOME_PATH="${CARGO_HOME:-$BUILD_HOME/.cargo}"
 SEPARATOR=$'\x1f'
 
 if [ -n "${RUSTFLAGS:-}" ]; then
@@ -19,8 +20,9 @@ append_flag() {
     fi
 }
 
-append_flag "--remap-path-prefix=${PROJECT_DIR}=/source"
 append_flag "--remap-path-prefix=${BUILD_HOME}=/build-home"
+append_flag "--remap-path-prefix=${CARGO_HOME_PATH}=/cargo-home"
+append_flag "--remap-path-prefix=${PROJECT_DIR}=/source"
 export CARGO_ENCODED_RUSTFLAGS
 
 cd "$PROJECT_DIR"
@@ -36,9 +38,11 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-if grep -aFq "$BUILD_HOME" "$BINARY"; then
-    echo "release binary contains an unremapped build-home path" >&2
-    exit 1
-fi
+for path in "$BUILD_HOME" "$CARGO_HOME_PATH" "$PROJECT_DIR"; do
+    if grep -aFq "$path" "$BINARY"; then
+        echo "release binary contains an unremapped build path" >&2
+        exit 1
+    fi
+done
 
 echo "release binary: target/release/$BINARY_NAME"

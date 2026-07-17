@@ -29,6 +29,7 @@ chmod +x "$FIXTURE/bin/cargo"
 CAPTURE_DIR="$TMP_DIR/capture"
 mkdir -p "$CAPTURE_DIR"
 HOME="$TMP_DIR/home with spaces" \
+CARGO_HOME="$TMP_DIR/cargo home outside build home" \
 PATH="$FIXTURE/bin:$PATH" \
 CAPTURE_DIR="$CAPTURE_DIR" \
 CARGO_ENCODED_RUSTFLAGS=$'--cfg\x1fexisting' \
@@ -39,6 +40,7 @@ grep -Fxq -- '--cfg' <<<"$FLAGS"
 grep -Fxq 'existing' <<<"$FLAGS"
 grep -Fxq -- "--remap-path-prefix=$FIXTURE=/source" <<<"$FLAGS"
 grep -Fxq -- "--remap-path-prefix=$TMP_DIR/home with spaces=/build-home" <<<"$FLAGS"
+grep -Fxq -- "--remap-path-prefix=$TMP_DIR/cargo home outside build home=/cargo-home" <<<"$FLAGS"
 grep -Fxq -- '--release' "$CAPTURE_DIR/args"
 grep -Fxq -- '--locked' "$CAPTURE_DIR/args"
 grep -Fxq 'rocksdb,libp2p' "$CAPTURE_DIR/args"
