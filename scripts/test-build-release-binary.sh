@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+grep -Fxq 'RUN scripts/build-release-binary.sh' "$SCRIPT_DIR/../Dockerfile"
+
 FIXTURE="$TMP_DIR/project with spaces"
 mkdir -p "$FIXTURE/scripts" "$FIXTURE/bin"
 cp "$SCRIPT_DIR/build-release-binary.sh" "$FIXTURE/scripts/"

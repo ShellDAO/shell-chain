@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release -p shell-cli --features "rocksdb,libp2p"
+RUN scripts/build-release-binary.sh
 
 # Runtime image
 FROM debian:bookworm-slim
