@@ -23,7 +23,11 @@ set -euo pipefail
 printf '%s' "$CARGO_ENCODED_RUSTFLAGS" > "$CAPTURE_DIR/flags"
 printf '%s\n' "$@" > "$CAPTURE_DIR/args"
 mkdir -p target/release
-printf '#!/usr/bin/env sh\nexit 0\n' > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+if [ -n "${FAKE_BINARY_CONTENT:-}" ]; then
+    printf '%s' "$FAKE_BINARY_CONTENT" > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+else
+    printf '#!/usr/bin/env sh\nexit 0\n' > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+fi
 chmod +x "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
 EOF
 chmod +x "$FIXTURE/bin/cargo"
@@ -59,6 +63,15 @@ if grep -Fq -- '-Wl,-no_uuid' "$CAPTURE_DIR/args"; then
     echo "release build passed a Darwin linker flag on Windows" >&2
     exit 1
 fi
+
+LEAKED_HOME="$TMP_DIR/leaked build home"
+if LEAK_OUTPUT=$(FAKE_UNAME=Linux FAKE_BINARY_CONTENT="$LEAKED_HOME/private/source.rs" \
+    HOME="$LEAKED_HOME" PATH="$FIXTURE/bin:$PATH" CAPTURE_DIR="$CAPTURE_DIR" \
+    "$FIXTURE/scripts/build-release-binary.sh" 2>&1); then
+    echo "release build accepted a binary containing the build-home path" >&2
+    exit 1
+fi
+grep -Fq 'release binary contains an unremapped build path' <<<"$LEAK_OUTPUT"
 
 if RUSTFLAGS='--cfg unsupported' HOME="$TMP_DIR/home" PATH="$FIXTURE/bin:$PATH" \
     CAPTURE_DIR="$CAPTURE_DIR" "$FIXTURE/scripts/build-release-binary.sh" 2>/dev/null; then
