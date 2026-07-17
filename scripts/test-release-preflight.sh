@@ -32,7 +32,7 @@ make_fixture() {
     mkdir -p "$fixture/fuzz"
     printf '[package]\nname = "shell-fuzz"\nversion = "0.27.1"\n' > "$fixture/fuzz/Cargo.toml"
     printf '| v0.27.x | supported |\n| < v0.27.0 | end of life |\n\n**v0.27.x is the current supported release line.** v0.27.x receives security-only backports. Users older than v0.27.0 should upgrade.\n' > "$fixture/SECURITY.md"
-    printf 'version-0.27.1-green.svg\n' > "$fixture/README.md"
+    printf 'https://img.shields.io/badge/version-0.27.1-green.svg\n' > "$fixture/README.md"
     printf 'FROM example.invalid/base\n# ghcr.io/shelldao/shell-chain:v0.27.1\n' > "$fixture/Dockerfile"
     printf '%s\n' "$changelog" > "$fixture/CHANGELOG.md"
     git -C "$fixture" init -q -b main
@@ -57,8 +57,24 @@ assert_fails_with() {
     fi
 }
 
+assert_metadata_fails_with() {
+    local fixture=$1
+    local expected=$2
+    local output
+
+    if output=$("$fixture/scripts/check-release-metadata.sh" "$fixture" 2>&1); then
+        fail "release metadata check unexpectedly passed"
+    fi
+    if ! grep -Fq "$expected" <<<"$output"; then
+        fail "expected '$expected' in metadata output: $output"
+    fi
+}
+
 fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
 assert_fails_with "$fixture" '0x27x1' "Version must be semver"
+
+printf '| v0.24.x | stale support claim |\n' >> "$fixture/SECURITY.md"
+assert_metadata_fails_with "$fixture" "exactly one supported release row (found 2)"
 
 sed -i.bak 's/v0.27.x/v0.24.x/g' "$fixture/SECURITY.md"
 rm "$fixture/SECURITY.md.bak"

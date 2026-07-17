@@ -43,13 +43,30 @@ require_text() {
     fi
 }
 
+require_single_match() {
+    local file=$1
+    local pattern=$2
+    local description=$3
+    local count
+    count=$(awk -v pattern="$pattern" '$0 ~ pattern { count++ } END { print count + 0 }' \
+        "$ROOT_DIR/$file")
+    if [ "$count" -ne 1 ]; then
+        fail "$file must contain exactly one $description (found $count)"
+    fi
+}
+
 require_text SECURITY.md "| v${SERIES}.x |" "supported release series"
 require_text SECURITY.md "| < v${SERIES}.0 |" "end-of-life boundary"
 require_text SECURITY.md "**v${SERIES}.x is the current supported release line.**" "supported release statement"
 require_text SECURITY.md "v${SERIES}.x receives security-only backports" "security backport statement"
 require_text SECURITY.md "older than v${SERIES}.0" "upgrade boundary"
+require_single_match SECURITY.md '^[|] v[0-9]+[.][0-9]+[.]x [|]' "supported release row"
+require_single_match SECURITY.md '^[|] < v[0-9]+[.][0-9]+[.]0 [|]' "end-of-life row"
+require_single_match SECURITY.md 'is the current supported release line' "supported release statement"
 require_text README.md "version-${VERSION}-green.svg" "version badge"
+require_single_match README.md 'img[.]shields[.]io/badge/version-' "version badge"
 require_text Dockerfile "ghcr.io/shelldao/shell-chain:v${VERSION}" "container example version"
+require_single_match Dockerfile 'ghcr[.]io/shelldao/shell-chain:v' "container example"
 
 FUZZ_VERSION=$(toml_version "$ROOT_DIR/fuzz/Cargo.toml" "package.version")
 if [ "$FUZZ_VERSION" != "$VERSION" ]; then
