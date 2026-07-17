@@ -26,7 +26,11 @@ append_flag "--remap-path-prefix=${PROJECT_DIR}=/source"
 export CARGO_ENCODED_RUSTFLAGS
 
 cd "$PROJECT_DIR"
-cargo build --release --locked -p shell-cli --features "rocksdb,libp2p"
+BUILD_ARGS=(rustc --release --locked -p shell-cli --bin shell-node --features "rocksdb,libp2p")
+if [ "$(uname -s)" = "Darwin" ]; then
+    BUILD_ARGS+=(-- -Clink-arg=-Wl,-no_uuid)
+fi
+cargo "${BUILD_ARGS[@]}"
 
 BINARY_NAME="shell-node"
 case "$(uname -s)" in

@@ -45,11 +45,20 @@ grep -Fxq -- "--remap-path-prefix=$TMP_DIR/home with spaces=/build-home" <<<"$FL
 grep -Fxq -- "--remap-path-prefix=$TMP_DIR/cargo home outside build home=/cargo-home" <<<"$FLAGS"
 grep -Fxq -- '--release' "$CAPTURE_DIR/args"
 grep -Fxq -- '--locked' "$CAPTURE_DIR/args"
+grep -Fxq -- 'rustc' "$CAPTURE_DIR/args"
+grep -Fxq -- '--bin' "$CAPTURE_DIR/args"
+grep -Fxq -- 'shell-node' "$CAPTURE_DIR/args"
 grep -Fxq 'rocksdb,libp2p' "$CAPTURE_DIR/args"
+grep -Fxq -- '--' "$CAPTURE_DIR/args"
+grep -Fxq -- '-Clink-arg=-Wl,-no_uuid' "$CAPTURE_DIR/args"
 
 FAKE_UNAME=MINGW64_NT FAKE_EXE_SUFFIX=.exe \
 HOME="$TMP_DIR/windows home" PATH="$FIXTURE/bin:$PATH" CAPTURE_DIR="$CAPTURE_DIR" \
     "$FIXTURE/scripts/build-release-binary.sh"
+if grep -Fq -- '-Wl,-no_uuid' "$CAPTURE_DIR/args"; then
+    echo "release build passed a Darwin linker flag on Windows" >&2
+    exit 1
+fi
 
 if RUSTFLAGS='--cfg unsupported' HOME="$TMP_DIR/home" PATH="$FIXTURE/bin:$PATH" \
     CAPTURE_DIR="$CAPTURE_DIR" "$FIXTURE/scripts/build-release-binary.sh" 2>/dev/null; then
