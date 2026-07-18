@@ -6,6 +6,8 @@ use clap::Subcommand;
 use shell_keystore::EncryptedKey;
 use shell_primitives::Address;
 
+use crate::secure_file::read_sensitive_file;
+
 #[derive(Subcommand)]
 pub enum AccountCommand {
     /// List keystore addresses found in the data directory.
@@ -50,8 +52,9 @@ pub fn execute(cmd: AccountCommand) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 fn cmd_list(datadir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    if !datadir.exists() {
-        return Err(format!("data directory not found: {}", datadir.display()).into());
+    let datadir_meta = std::fs::symlink_metadata(&datadir)?;
+    if datadir_meta.file_type().is_symlink() || !datadir_meta.is_dir() {
+        return Err(format!("data path must be a real directory: {}", datadir.display()).into());
     }
 
     let mut found = 0u32;
@@ -60,7 +63,7 @@ fn cmd_list(datadir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(contents) = read_sensitive_file(&path) {
                 if let Ok(ek) = serde_json::from_str::<EncryptedKey>(&contents) {
                     let address = Address::parse(&ek.address).map_err(|e| {
                         format!("invalid keystore address in {}: {e}", path.display())
@@ -178,12 +181,36 @@ mod tests {
 
     #[test]
     fn list_empty_dir() {
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join("__test_empty_acct_dir__");
-        let _ = std::fs::create_dir(&dir);
-        let result = cmd_list(dir.clone());
-        let _ = std::fs::remove_dir(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let result = cmd_list(dir.path().to_path_buf());
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skips_symbolic_link_keystores() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let linked = dir.path().join("linked.json");
+        std::fs::write(
+            &target,
+            r#"{
+  "version": 1,
+  "address": "invalid",
+  "key_type": "dilithium3",
+  "public_key": "deadbeef",
+  "ciphertext": "00",
+  "cipher": "xchacha20-poly1305",
+  "kdf": "argon2id",
+  "kdf_params": {"m_cost": 65536, "t_cost": 3, "p_cost": 1, "salt": "00"},
+  "cipher_params": {"nonce": "00"}
+}"#,
+        )
+        .unwrap();
+        symlink(target, linked).unwrap();
+
+        assert!(cmd_list(dir.path().to_path_buf()).is_ok());
     }
 }

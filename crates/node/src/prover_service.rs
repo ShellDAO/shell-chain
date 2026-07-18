@@ -429,29 +429,24 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                         );
                     }
                     Ok(artifacts) => {
-                        let mut stored = 0usize;
-                        for (source_hash, artifact) in artifacts {
-                            match self.amendment_store.put_amendment(&source_hash, &artifact) {
-                                Ok(()) => {
-                                    stored += 1;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "ProverService: failed to store amendment for source {source_hash}: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        if stored > 0 {
-                            info!(
-                                "ProverService: proof amendment stored for range ending at block #{block_number} ({stored} source hashes)"
+                        let artifact_count = artifacts.len();
+                        match self.amendment_store.put_amendments_atomic(artifacts) {
+                            Ok(()) => {
+                                info!(
+                                    "ProverService: proof amendment stored for range ending at block #{block_number} ({artifact_count} source hashes)"
                             );
-                            if let Some(tx) = &self.amendment_tx {
-                                if tx.send(amendment).is_err() {
-                                    warn!(
+                                if let Some(tx) = &self.amendment_tx {
+                                    if tx.send(amendment).is_err() {
+                                        warn!(
                                         "ProverService: proof amendment broadcast channel closed for block #{block_number}"
                                     );
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "ProverService: failed to atomically store amendment range ending at block #{block_number}: {e}"
+                                );
                             }
                         }
                     }

@@ -35,7 +35,7 @@ pub enum MempoolError {
     #[error("insufficient balance: need {needed}, have {have}")]
     InsufficientBalance { needed: U256, have: U256 },
 
-    #[error("replacement fee too low: need >{required}, got {got}")]
+    #[error("replacement fee too low: need at least {required}, got {got}")]
     ReplacementFeeTooLow { got: u64, required: u64 },
 
     #[error("invalid signature: {0}")]
@@ -282,7 +282,10 @@ mod tests {
             got: 10,
             required: 20,
         };
-        assert!(err.to_string().contains("replacement fee too low"));
+        assert_eq!(
+            err.to_string(),
+            "replacement fee too low: need at least 20, got 10"
+        );
     }
 
     #[test]

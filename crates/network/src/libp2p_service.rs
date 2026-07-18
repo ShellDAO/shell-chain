@@ -1255,6 +1255,7 @@ mod tests {
             topic_kind_for_message(&NetworkMessage::BodyRequest {
                 start_number: 0,
                 count: 1,
+                nonce: 0,
             }),
             TopicKind::Blocks
         );

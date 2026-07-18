@@ -130,6 +130,16 @@ fn canonical_mapping_retention(body_retention: u64, witness_retention: u64) -> u
         .saturating_add(1)
 }
 
+fn canonical_mapping_prune_boundary(
+    finalized_number: u64,
+    body_pruned_below: u64,
+    witness_pruned_below: u64,
+) -> u64 {
+    finalized_number
+        .min(body_pruned_below)
+        .min(witness_pruned_below)
+}
+
 fn state_trie_prune_boundary(finalized_number: u64, keep_recent: u64) -> Option<u64> {
     if finalized_number == 0 || keep_recent == 0 {
         return None;
@@ -558,8 +568,8 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
         &self,
         target_peer: Option<&shell_network::PeerId>,
         limit: usize,
-    ) -> Vec<SignedTransaction> {
-        let txs = self.tx_pool.pending_for_block(limit);
+    ) -> Vec<Arc<SignedTransaction>> {
+        let txs = self.tx_pool.pending_for_block_shared(limit);
         if txs.is_empty() || target_peer.is_some() {
             return txs;
         }
@@ -568,7 +578,8 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
         let cooldown = std::time::Duration::from_secs(TX_REBROADCAST_COOLDOWN_SECS);
         let mut seen = self.tx_rebroadcast_seen.lock();
         seen.retain(|_, last_seen| now.duration_since(*last_seen) < cooldown);
-        txs.into_iter()
+        let selected = txs
+            .into_iter()
             .filter(|tx| {
                 let hash = tx.hash();
                 if seen
@@ -581,7 +592,9 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
                     true
                 }
             })
-            .collect()
+            .collect();
+        drop(seen);
+        selected
     }
 
     fn remove_committed_hashes(&self, tx_hashes: &[ShellHash]) -> usize {
@@ -593,6 +606,17 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
 
 struct NetworkInterface<'a, N: NetworkService + ?Sized> {
     inner: &'a mut N,
+}
+
+fn record_sync_request_result(
+    sent: bool,
+    nonce: u64,
+    sync_requested: &mut bool,
+    sync_request_nonce: &mut Option<u64>,
+) -> bool {
+    *sync_requested = sent;
+    *sync_request_nonce = sent.then_some(nonce);
+    sent
 }
 
 impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
@@ -1000,7 +1024,7 @@ impl<S: KvStore + 'static> Node<S> {
         sync_requested: &mut bool,
         sync_request_nonce: &mut Option<u64>,
         reason: &'static str,
-    ) {
+    ) -> bool {
         let head_number = self.head_number();
         info!(
             head = head_number,
@@ -1020,7 +1044,7 @@ impl<S: KvStore + 'static> Node<S> {
             );
             *sync_requested = false;
             *sync_request_nonce = None;
-            return;
+            return false;
         };
         let req = NetworkMessage::BlockRequest {
             start_number,
@@ -1032,11 +1056,13 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             network.broadcast(req).await
         };
-        if let Err(e) = send_result {
-            tracing::warn!(reason, error = %e, "failed to request missing blocks");
+        match send_result {
+            Ok(()) => record_sync_request_result(true, nonce, sync_requested, sync_request_nonce),
+            Err(e) => {
+                tracing::warn!(reason, error = %e, "failed to request missing blocks");
+                record_sync_request_result(false, nonce, sync_requested, sync_request_nonce)
+            }
         }
-        *sync_requested = true;
-        *sync_request_nonce = Some(nonce);
     }
 
     async fn rebroadcast_pending_transactions<N: NetworkService + ?Sized>(
@@ -1059,7 +1085,7 @@ impl<S: KvStore + 'static> Node<S> {
             "rebroadcasting pending transactions"
         );
         for tx in txs {
-            let msg = NetworkMessage::NewTransaction(Box::new(tx));
+            let msg = NetworkMessage::NewTransaction(Box::new(tx.as_ref().clone()));
             let result = if let Some(peer) = target_peer {
                 network.send_to_peer(peer, msg).await
             } else {
@@ -1260,31 +1286,6 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
-        // F-303: Drive StatePruner — register block and run periodic pruning.
-        {
-            let mut pruner = self.state_pruner.write();
-            pruner.register_block(block_number, state_root);
-            if finalized_number > 0 && pruner.should_prune(block_number) {
-                pruner.mark_prunable(finalized_number);
-                match pruner.prune(self.store.as_ref()) {
-                    Ok(result) => {
-                        if result.pruned_count > 0 {
-                            tracing::info!(
-                                pruned = result.pruned_count,
-                                protected = result.protected_count,
-                                block = block_number,
-                                finalized = finalized_number,
-                                "state pruner: removed old canonical mappings"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "state pruner: prune failed");
-                    }
-                }
-            }
-        }
-
         // D1: Drive WitnessPruner — prune old witness bundles after finality.
         {
             let mut wpruner = self.witness_pruner.write();
@@ -1331,6 +1332,41 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "body pruner: prune failed");
+                    }
+                }
+            }
+        }
+
+        // F-303: Drive StatePruner after dependent pruning so a successful body
+        // or witness pass can advance canonical mapping cleanup in this cycle.
+        {
+            // Canonical mappings are required to resume body and witness pruning.
+            // A delayed STARK settlement can hold the witness cursor behind the
+            // configured retention window, so never let mapping cleanup overtake
+            // either dependent pruner.
+            let canonical_prune_boundary = canonical_mapping_prune_boundary(
+                finalized_number,
+                self.body_pruner.read().pruned_below(),
+                self.witness_pruner.read().pruned_below(),
+            );
+            let mut pruner = self.state_pruner.write();
+            pruner.register_block(block_number, state_root);
+            if finalized_number > 0 && pruner.should_prune(block_number) {
+                pruner.mark_prunable(canonical_prune_boundary);
+                match pruner.prune(self.store.as_ref()) {
+                    Ok(result) => {
+                        if result.pruned_count > 0 {
+                            tracing::info!(
+                                pruned = result.pruned_count,
+                                protected = result.protected_count,
+                                block = block_number,
+                                finalized = finalized_number,
+                                "state pruner: removed old canonical mappings"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "state pruner: prune failed");
                     }
                 }
             }
@@ -1386,6 +1422,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FailingBatchDb {
         inner: MemoryDb,
+        fail_next_get: AtomicBool,
         fail_next_batch: AtomicBool,
         fail_head_batch: AtomicBool,
         fail_next_delete: AtomicBool,
@@ -1395,6 +1432,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 inner: MemoryDb::new(),
+                fail_next_get: AtomicBool::new(false),
                 fail_next_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
                 fail_next_delete: AtomicBool::new(false),
@@ -1403,6 +1441,10 @@ mod tests {
 
         fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_get(&self) {
+            self.fail_next_get.store(true, Ordering::SeqCst);
         }
 
         fn fail_head_batch(&self) {
@@ -1416,6 +1458,9 @@ mod tests {
 
     impl KvStore for FailingBatchDb {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected get failure".into()));
+            }
             self.inner.get(key)
         }
 
@@ -1768,11 +1813,65 @@ mod tests {
     }
 
     #[test]
+    fn periodic_rebroadcast_filters_shared_pool_transactions_before_cloning() {
+        let (node, _proposer_signer) = setup_node();
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0x56; 32]);
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE + 1,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&node, &tx_signer, sender, tx);
+
+        let stored = node.tx_pool.pending_for_block_shared(1);
+        let first = node.mem_pool().pending_for_rebroadcast(None, 1);
+        assert_eq!(first.len(), 1);
+        assert!(Arc::ptr_eq(&stored[0], &first[0]));
+        assert!(node.mem_pool().pending_for_rebroadcast(None, 1).is_empty());
+    }
+
+    #[test]
     fn sync_retry_delay_uses_backoff_after_threshold() {
         assert_eq!(Node::<MemoryDb>::sync_retry_delay_secs(0), 5);
         assert_eq!(Node::<MemoryDb>::sync_retry_delay_secs(2), 5);
         assert_eq!(Node::<MemoryDb>::sync_retry_delay_secs(3), 30);
         assert_eq!(Node::<MemoryDb>::sync_retry_delay_secs(10), 30);
+    }
+
+    #[test]
+    fn failed_sync_request_does_not_leave_an_in_flight_nonce() {
+        let mut sync_requested = true;
+        let mut sync_request_nonce = Some(7);
+
+        assert!(!record_sync_request_result(
+            false,
+            8,
+            &mut sync_requested,
+            &mut sync_request_nonce,
+        ));
+        assert!(!sync_requested);
+        assert_eq!(sync_request_nonce, None);
+
+        assert!(record_sync_request_result(
+            true,
+            9,
+            &mut sync_requested,
+            &mut sync_request_nonce,
+        ));
+        assert!(sync_requested);
+        assert_eq!(sync_request_nonce, Some(9));
     }
 
     #[test]
@@ -5651,6 +5750,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_mapping_pruning_waits_for_dependent_pruners() {
+        assert_eq!(canonical_mapping_prune_boundary(80, 80, 0), 0);
+        assert_eq!(canonical_mapping_prune_boundary(80, 40, 60), 40);
+        assert_eq!(canonical_mapping_prune_boundary(80, 90, 100), 80);
+
+        let store = Arc::new(MemoryDb::new());
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        let mut pruner = StatePruner::new(32);
+        for number in 0..100 {
+            let root = ShellHash::from([number as u8; 32]);
+            pruner.register_block(number, root);
+            chain_store.set_canonical(number, &root).unwrap();
+        }
+
+        pruner.mark_prunable(canonical_mapping_prune_boundary(80, 80, 0));
+        assert_eq!(pruner.prune(store.as_ref()).unwrap().pruned_count, 0);
+        assert!(chain_store.get_block_hash_by_number(0).unwrap().is_some());
+    }
+
+    #[test]
     fn state_trie_pruning_is_bounded_by_finalized_height() {
         assert_eq!(state_trie_prune_boundary(0, 4), None);
         assert_eq!(state_trie_prune_boundary(3, 4), None);
@@ -5766,6 +5885,47 @@ mod tests {
 
         assert_eq!(node.body_pruner.read().pruned_below(), 2);
         assert_eq!(node.witness_pruner.read().pruned_below(), 2);
+    }
+
+    #[test]
+    fn canonical_mapping_pruning_uses_current_dependency_cursors() {
+        let (node, signer) = setup_node_with_retention(2, 2);
+        *node.state_pruner.write() = StatePruner::new(32);
+        node.state_pruner.write().set_prune_interval(1);
+        store_genesis(&node);
+
+        for _ in 0..40 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+
+        let finalized = node.chain_store.get_block_by_number(35).unwrap().unwrap();
+        node.chain_store.set_finalized_number(35).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(35, finalized.hash());
+        for number in 0..34 {
+            let hash = node
+                .chain_store
+                .get_block_hash_by_number(number)
+                .unwrap()
+                .unwrap();
+            node.settled_stark_sources.lock().insert((1, hash));
+        }
+
+        assert!(node
+            .chain_store
+            .get_block_hash_by_number(1)
+            .unwrap()
+            .is_some());
+        node.produce_block(&signer, 0).unwrap();
+
+        assert_eq!(node.body_pruner.read().pruned_below(), 34);
+        assert_eq!(node.witness_pruner.read().pruned_below(), 34);
+        assert!(node
+            .chain_store
+            .get_block_hash_by_number(1)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -7206,6 +7366,29 @@ mod tests {
 
         assert!(!node.pending_grace_deletes.lock().contains_key(&block_hash));
         assert!(!node.chain_store.has_witness_bundle(&block_hash).unwrap());
+    }
+
+    #[test]
+    fn wpoa_view_change_propagates_head_lookup_failure() {
+        let (node, signer, db) = setup_failing_batch_node();
+        let authority = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+
+        let highest_qc_hash = *node.finality.read().last_finalized_hash();
+        let signing_message = ViewChangeMessage::signing_message(1337, 1, 0, &highest_qc_hash);
+        let signature = signer.sign(&signing_message).unwrap();
+        let msg = ViewChangeMessage::new(1337, 1, 0, highest_qc_hash, authority, signature.data);
+
+        db.fail_next_get();
+        let err = node
+            .handle_wpoa_view_change(msg, &MultiVerifier)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::Storage(StorageError::Database(message))
+                if message.contains("injected get failure")
+        ));
     }
 
     // ─── W.7: wPoA end-to-end test suite ──────────────────────────────────────

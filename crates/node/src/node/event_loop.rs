@@ -6,8 +6,20 @@ fn block_response_import_allowed(block_count: usize, commit_certificate_count: u
     block_count <= MAX_BLOCK_SYNC_RESPONSE_BLOCKS && commit_certificate_count <= block_count
 }
 
+fn block_response_matches_request(
+    sync_requested: bool,
+    expected_nonce: Option<u64>,
+    nonce: u64,
+) -> bool {
+    sync_requested && expected_nonce == Some(nonce)
+}
+
 fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
+}
+
+fn body_response_matches_request(expected_nonce: Option<u64>, nonce: u64) -> bool {
+    expected_nonce == Some(nonce)
 }
 
 fn bounded_request_numbers(
@@ -321,6 +333,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Track whether we are catching up so we don't spam requests.
         let mut sync_requested = false;
         let mut sync_request_nonce: Option<u64> = None;
+        let mut body_request_nonce: Option<u64> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
             || self.consensus.read().poa_config().authorities.len() == 1;
@@ -332,14 +345,15 @@ impl<S: KvStore + 'static> Node<S> {
             startup_sync_grace,
         );
         if startup_peers > 0 {
-            self.request_missing_blocks(
-                &network,
-                None,
-                &mut sync_requested,
-                &mut sync_request_nonce,
-                "initial-sync",
-            )
-            .await;
+            let _ = self
+                .request_missing_blocks(
+                    &network,
+                    None,
+                    &mut sync_requested,
+                    &mut sync_request_nonce,
+                    "initial-sync",
+                )
+                .await;
         }
 
         let rebuilt_stark_settlements = self.rebuild_settled_stark_sources_from_chain()?;
@@ -411,16 +425,22 @@ impl<S: KvStore + 'static> Node<S> {
                 let head = self.head_number();
                 if oldest > 0 {
                     // There are gaps — request bodies starting from the beginning.
-                    let _ = network
+                    let nonce = Self::wall_clock_millis();
+                    if network
                         .broadcast(NetworkMessage::BodyRequest {
                             start_number: 0,
                             count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                            nonce,
                         })
-                        .await;
-                    info!(
-                        oldest_available = oldest,
-                        head, "L4: kicked historical body back-fill startup scan"
-                    );
+                        .await
+                        .is_ok()
+                    {
+                        body_request_nonce = Some(nonce);
+                        info!(
+                            oldest_available = oldest,
+                            head, "L4: kicked historical body back-fill startup scan"
+                        );
+                    }
                 }
             }
         }
@@ -963,20 +983,22 @@ impl<S: KvStore + 'static> Node<S> {
                                             // Only request missing blocks on genuine gap,
                                             // NOT on invalid signatures or other errors (F-037).
                                             if !sync_requested {
-                                                self.request_missing_blocks(
+                                                if self.request_missing_blocks(
                                                     &network,
                                                     Some(&peer),
                                                     &mut sync_requested,
                                                     &mut sync_request_nonce,
                                                     "gap-detected",
                                                 )
-                                                .await;
-                                                production_readiness.note_sync_requested(
-                                                    self.head_number(),
-                                                    std::time::Instant::now(),
-                                                    catch_up_timeout,
-                                                    "gap-detected",
-                                                );
+                                                .await
+                                                {
+                                                    production_readiness.note_sync_requested(
+                                                        self.head_number(),
+                                                        std::time::Instant::now(),
+                                                        catch_up_timeout,
+                                                        "gap-detected",
+                                                    );
+                                                }
                                             } else {
                                                 debug!(
                                                     head = self.head_number(),
@@ -1071,6 +1093,18 @@ impl<S: KvStore + 'static> Node<S> {
                                     let _ = network.send_to_peer(&peer, resp).await;
                                 }
                                 NetworkMessage::BlockResponse { blocks, commit_certificates, nonce } => {
+                                    if !block_response_matches_request(
+                                        sync_requested,
+                                        sync_request_nonce,
+                                        nonce,
+                                    ) {
+                                        warn!(
+                                            %peer,
+                                            nonce,
+                                            "dropping unsolicited or stale BlockResponse"
+                                        );
+                                        continue;
+                                    }
                                     if !block_response_import_allowed(
                                         blocks.len(),
                                         commit_certificates.len(),
@@ -1531,7 +1565,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     self.peer_caps.record(peer.clone(), profile, oldest_body_block);
                                 }
                                 // L4: Peer requests block bodies for historical back-fill.
-                                NetworkMessage::BodyRequest { start_number, count } => {
+                                NetworkMessage::BodyRequest { start_number, count, nonce } => {
                                     debug!(%peer, start_number, count, "L4: received BodyRequest");
                                     let mut blocks = Vec::new();
                                     for n in bounded_request_numbers(
@@ -1555,7 +1589,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         let _ = network
                                             .send_to_peer(
                                                 &peer,
-                                                NetworkMessage::BodyResponse { blocks },
+                                                NetworkMessage::BodyResponse { blocks, nonce },
                                             )
                                             // Note: send_to_peer falls back to broadcast if the
                                             // transport does not support unicast addressing.
@@ -1563,7 +1597,15 @@ impl<S: KvStore + 'static> Node<S> {
                                     }
                                 }
                                 // L4: Receive block bodies from a peer as historical back-fill.
-                                NetworkMessage::BodyResponse { blocks } => {
+                                NetworkMessage::BodyResponse { blocks, nonce } => {
+                                    if !body_response_matches_request(body_request_nonce, nonce) {
+                                        warn!(
+                                            %peer,
+                                            nonce,
+                                            "L4: dropping unsolicited or stale BodyResponse"
+                                        );
+                                        continue;
+                                    }
                                     if !body_response_import_allowed(blocks.len()) {
                                         warn!(
                                             %peer,
@@ -1573,6 +1615,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         );
                                         continue;
                                     }
+                                    body_request_nonce = None;
                                     debug!(%peer, count = blocks.len(), "L4: received BodyResponse");
                                     let head_number = self.chain_store
                                         .get_head_block()
@@ -1632,15 +1675,22 @@ impl<S: KvStore + 'static> Node<S> {
                                     if let Some(next) = next_start {
                                         if next <= head_number {
                                             // More blocks needed — request next batch.
-                                            let _ = network
+                                            let next_nonce = Self::wall_clock_millis()
+                                                .max(nonce.saturating_add(1));
+                                            if network
                                                 .send_to_peer(
                                                     &peer,
                                                     NetworkMessage::BodyRequest {
                                                         start_number: next,
                                                         count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                                        nonce: next_nonce,
                                                     },
                                                 )
-                                                .await;
+                                                .await
+                                                .is_ok()
+                                            {
+                                                body_request_nonce = Some(next_nonce);
+                                            }
                                         } else {
                                             info!("L4: historical body back-fill complete");
                                         }
@@ -1695,20 +1745,22 @@ impl<S: KvStore + 'static> Node<S> {
                                 sync_retry_timer.reset_after(Duration::from_secs(
                                     SYNC_RETRY_BASE_INTERVAL_SECS,
                                 ));
-                                self.request_missing_blocks(
+                                if self.request_missing_blocks(
                                     &network,
                                     Some(&peer),
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
                                     "peer-connected",
                                 )
-                                .await;
-                                production_readiness.note_head_probe(
-                                    self.head_number(),
-                                    std::time::Instant::now(),
-                                    startup_sync_grace,
-                                    "peer-connected",
-                                );
+                                .await
+                                {
+                                    production_readiness.note_head_probe(
+                                        self.head_number(),
+                                        std::time::Instant::now(),
+                                        startup_sync_grace,
+                                        "peer-connected",
+                                    );
+                                }
                             } else {
                                 debug!(
                                     head = self.head_number(),
@@ -1748,20 +1800,22 @@ impl<S: KvStore + 'static> Node<S> {
                                 sync_retry_timer.reset_after(Duration::from_secs(
                                     SYNC_RETRY_BASE_INTERVAL_SECS,
                                 ));
-                                self.request_missing_blocks(
+                                if self.request_missing_blocks(
                                     &network,
                                     None,
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
                                     "routing-update",
                                 )
-                                .await;
-                                production_readiness.note_head_probe(
-                                    self.head_number(),
-                                    std::time::Instant::now(),
-                                    startup_sync_grace,
-                                    "routing-update",
-                                );
+                                .await
+                                {
+                                    production_readiness.note_head_probe(
+                                        self.head_number(),
+                                        std::time::Instant::now(),
+                                        startup_sync_grace,
+                                        "routing-update",
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -1867,7 +1921,7 @@ impl<S: KvStore + 'static> Node<S> {
                             ));
                             continue;
                         }
-                        self.request_missing_blocks(
+                        let request_sent = self.request_missing_blocks(
                             &network,
                             None,
                             &mut sync_requested,
@@ -1875,9 +1929,16 @@ impl<S: KvStore + 'static> Node<S> {
                             "sync-retry",
                         )
                         .await;
-                        sync_retry_attempts_without_progress =
-                            sync_retry_attempts_without_progress.saturating_add(1);
-                        if sync_retry_attempts_without_progress >= SYNC_RETRY_BACKOFF_THRESHOLD {
+                        if request_sent {
+                            sync_retry_attempts_without_progress =
+                                sync_retry_attempts_without_progress.saturating_add(1);
+                        } else {
+                            sync_retry_attempts_without_progress = 0;
+                        }
+                        if !request_sent
+                            || sync_retry_attempts_without_progress
+                                >= SYNC_RETRY_BACKOFF_THRESHOLD
+                        {
                             production_readiness.refresh(
                                 peers,
                                 sync_requested,
@@ -1894,20 +1955,22 @@ impl<S: KvStore + 'static> Node<S> {
                         // otherwise stay stale until a reconnect/routing event. Periodically
                         // ask peers for head+1 as a cheap head probe; an empty response clears
                         // the sync request without moving readiness out of Ready.
-                        self.request_missing_blocks(
+                        if self.request_missing_blocks(
                             &network,
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
                             "periodic-head-probe",
                         )
-                        .await;
-                        production_readiness.note_head_probe(
-                            self.head_number(),
-                            std::time::Instant::now(),
-                            startup_sync_grace,
-                            "periodic-head-probe",
-                        );
+                        .await
+                        {
+                            production_readiness.note_head_probe(
+                                self.head_number(),
+                                std::time::Instant::now(),
+                                startup_sync_grace,
+                                "periodic-head-probe",
+                            );
+                        }
                         sync_retry_attempts_without_progress = 0;
                         sync_retry_timer.reset_after(Duration::from_secs(
                             SYNC_RETRY_BASE_INTERVAL_SECS,
@@ -2505,6 +2568,13 @@ mod cadence_tests {
     }
 
     #[test]
+    fn body_response_requires_the_active_request_nonce() {
+        assert!(body_response_matches_request(Some(7), 7));
+        assert!(!body_response_matches_request(None, 7));
+        assert!(!body_response_matches_request(Some(8), 7));
+    }
+
+    #[test]
     fn bounded_request_numbers_includes_terminal_height() {
         let numbers: Vec<_> = bounded_request_numbers(u64::MAX, 4, 128).collect();
         assert_eq!(numbers, vec![u64::MAX]);
@@ -2567,5 +2637,13 @@ mod cadence_tests {
             0
         ));
         assert!(!block_response_import_allowed(1, 2));
+    }
+
+    #[test]
+    fn block_response_requires_the_active_request_nonce() {
+        assert!(block_response_matches_request(true, Some(7), 7));
+        assert!(!block_response_matches_request(false, Some(7), 7));
+        assert!(!block_response_matches_request(true, None, 7));
+        assert!(!block_response_matches_request(true, Some(8), 7));
     }
 }

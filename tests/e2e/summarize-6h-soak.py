@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import stat
 from pathlib import Path
 
 
@@ -17,6 +19,39 @@ TOTAL_RE = re.compile(r"^\s*Total sent\s*:\s*(\d+)\s*$")
 OK_RE = re.compile(r"^\s*Succeeded\s*:\s*(\d+)\s*$")
 FAIL_RE = re.compile(r"^\s*Failed\s*:\s*(\d+)\s*$")
 AVG_RE = re.compile(r"^\s*Avg latency\s*:\s*([0-9.]+)ms\s*$")
+MAX_LOG_BYTES = 16 * 1024 * 1024
+
+
+def validate_output_dir(output_dir: Path) -> None:
+    metadata = output_dir.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"output directory must be a real directory: {output_dir}")
+
+
+def read_log_lines(path: Path) -> list[str] | None:
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(path_metadata.st_mode):
+        raise ValueError(f"log path must be a regular file: {path}")
+    if path_metadata.st_size > MAX_LOG_BYTES:
+        raise ValueError(f"log file exceeds {MAX_LOG_BYTES} bytes: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as log_file:
+        opened_metadata = os.fstat(log_file.fileno())
+        if (
+            path_metadata.st_dev != opened_metadata.st_dev
+            or path_metadata.st_ino != opened_metadata.st_ino
+        ):
+            raise ValueError(f"log file changed while opening: {path}")
+        contents = log_file.read(MAX_LOG_BYTES + 1)
+
+    if len(contents) > MAX_LOG_BYTES:
+        raise ValueError(f"log file exceeds {MAX_LOG_BYTES} bytes: {path}")
+    return contents.decode("utf-8").splitlines()
 
 
 def parse_hex_int(value: str) -> int | None:
@@ -36,9 +71,10 @@ def parse_hex_int(value: str) -> int | None:
 def read_phase_results(output_dir: Path) -> list[dict[str, str]]:
     phases: list[dict[str, str]] = []
     orchestrator = output_dir / "orchestrator.log"
-    if not orchestrator.exists():
+    lines = read_log_lines(orchestrator)
+    if lines is None:
         return phases
-    for line in orchestrator.read_text().splitlines():
+    for line in lines:
         match = PHASE_END_RE.search(line)
         if match:
             phases.append(match.groupdict())
@@ -48,9 +84,10 @@ def read_phase_results(output_dir: Path) -> list[dict[str, str]]:
 def read_health(output_dir: Path) -> dict[str, object]:
     path = output_dir / "periodic-health.log"
     samples = []
-    if not path.exists():
+    lines = read_log_lines(path)
+    if lines is None:
         return {"samples": samples}
-    for line in path.read_text().splitlines():
+    for line in lines:
         match = HEALTH_RE.match(line.strip())
         if not match:
             continue
@@ -111,7 +148,10 @@ def read_tx_soak(output_dir: Path) -> dict[str, object]:
     for path in sorted(output_dir.glob("tx-soak-round-*.log")):
         sent = ok = fail = None
         avg_latency = None
-        for line in path.read_text().splitlines():
+        lines = read_log_lines(path)
+        if lines is None:
+            continue
+        for line in lines:
             if sent is None:
                 match = TOTAL_RE.match(line)
                 if match:
@@ -163,9 +203,10 @@ def read_tx_soak(output_dir: Path) -> dict[str, object]:
 
 def read_summary_kv(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
-    if not path.exists():
+    lines = read_log_lines(path)
+    if lines is None:
         return result
-    for line in path.read_text().splitlines():
+    for line in lines:
         match = SUMMARY_RE.match(line.strip())
         if match:
             result[match.group("key")] = match.group("value")
@@ -178,6 +219,7 @@ def main() -> None:
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
+    validate_output_dir(output_dir)
     phases = read_phase_results(output_dir)
     health = read_health(output_dir)
     tx_soak = read_tx_soak(output_dir)

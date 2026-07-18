@@ -1,0 +1,12 @@
+{
+  "name": "shell-default-pq-validator-artifacts",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned compiler toolchain for DefaultPQValidator artifacts",
+  "dependencies": {
+    "solc": "0.8.35"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  }
+}

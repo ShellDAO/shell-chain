@@ -358,15 +358,19 @@ impl LogFilter {
     }
 }
 
-fn parse_pending_tx_full_txs(
+fn validate_pending_tx_params(
     params: Option<&serde_json::Value>,
-) -> Result<bool, jsonrpsee::types::ErrorObjectOwned> {
+) -> Result<(), jsonrpsee::types::ErrorObjectOwned> {
     match params {
-        None => Ok(false),
-        Some(serde_json::Value::Bool(full_txs)) => Ok(*full_txs),
+        None | Some(serde_json::Value::Bool(false)) => Ok(()),
+        Some(serde_json::Value::Bool(true)) => Err(invalid_params_err(
+            "newPendingTransactions full transaction objects are not supported",
+        )),
         Some(serde_json::Value::Object(obj)) => match obj.get("includeTransactions") {
-            None => Ok(false),
-            Some(serde_json::Value::Bool(full_txs)) => Ok(*full_txs),
+            None | Some(serde_json::Value::Bool(false)) => Ok(()),
+            Some(serde_json::Value::Bool(true)) => Err(invalid_params_err(
+                "newPendingTransactions full transaction objects are not supported",
+            )),
             Some(_) => Err(invalid_params_err(
                 "newPendingTransactions includeTransactions must be boolean",
             )),
@@ -458,20 +462,15 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
             }
             "newPendingTransactions" => {
                 let rx = self.pending_tx_event_sender().subscribe();
-                // F-138: parse Geth-compatible parameter format.
-                // Accepts: true/false (bool) or {"includeTransactions": true} (object).
-                let full_txs = match parse_pending_tx_full_txs(params.as_ref()) {
-                    Ok(full_txs) => full_txs,
-                    Err(err) => {
-                        pending.reject(err).await;
-                        return Ok(());
-                    }
-                };
+                if let Err(err) = validate_pending_tx_params(params.as_ref()) {
+                    pending.reject(err).await;
+                    return Ok(());
+                }
                 let sink = pending.accept().await?;
                 let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
                     let _guard = forward_guard;
-                    forward_pending_txs(rx, sink, full_txs).await;
+                    forward_pending_txs(rx, sink).await;
                 });
                 slot_guard.disarm();
             }
@@ -625,17 +624,11 @@ async fn forward_logs(
     }
 }
 
-/// Forward pending transaction hashes (or full tx objects) to subscribers.
-/// When `full_txs` is true, sends full tx hash (full object support requires
-/// architectural changes to the broadcast channel type).
+/// Forward pending transaction hashes to subscribers.
 async fn forward_pending_txs(
     mut rx: broadcast::Receiver<ShellHash>,
     sink: jsonrpsee::SubscriptionSink,
-    full_txs: bool,
 ) {
-    if full_txs {
-        tracing::debug!("full_txs=true requested for newPendingTransactions; sending hashes only (full objects not yet supported)");
-    }
     let mut consecutive_lags: u32 = 0;
     loop {
         let event = tokio::select! {
@@ -1129,19 +1122,26 @@ mod tests {
     }
 
     #[test]
-    fn pending_tx_params_parse_geth_compatible_forms() {
-        assert!(!parse_pending_tx_full_txs(None).unwrap());
-        assert!(parse_pending_tx_full_txs(Some(&serde_json::json!(true))).unwrap());
-        assert!(!parse_pending_tx_full_txs(Some(&serde_json::json!(false))).unwrap());
-        assert!(
-            parse_pending_tx_full_txs(Some(&serde_json::json!({"includeTransactions": true})))
-                .unwrap()
-        );
-        assert!(!parse_pending_tx_full_txs(Some(
-            &serde_json::json!({"includeTransactions": false})
-        ))
-        .unwrap());
-        assert!(!parse_pending_tx_full_txs(Some(&serde_json::json!({}))).unwrap());
+    fn pending_tx_params_parse_hash_only_forms() {
+        validate_pending_tx_params(None).unwrap();
+        validate_pending_tx_params(Some(&serde_json::json!(false))).unwrap();
+        validate_pending_tx_params(Some(&serde_json::json!({"includeTransactions": false})))
+            .unwrap();
+        validate_pending_tx_params(Some(&serde_json::json!({}))).unwrap();
+    }
+
+    #[test]
+    fn pending_tx_params_reject_unsupported_full_transactions() {
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!({"includeTransactions": true}),
+        ] {
+            let err = validate_pending_tx_params(Some(&value)).unwrap_err();
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            assert!(err
+                .message()
+                .contains("full transaction objects are not supported"));
+        }
     }
 
     #[test]
@@ -1152,7 +1152,7 @@ mod tests {
             serde_json::json!([]),
             serde_json::json!({"includeTransactions": "true"}),
         ] {
-            let err = parse_pending_tx_full_txs(Some(&value)).unwrap_err();
+            let err = validate_pending_tx_params(Some(&value)).unwrap_err();
             assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
             assert!(err.message().contains("newPendingTransactions"));
         }

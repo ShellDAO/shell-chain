@@ -165,6 +165,7 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
                     NetworkMessage::BodyRequest {
                         start_number: start,
                         count: BODY_BACKFILL_BATCH_SIZE,
+                        nonce: 0,
                     },
                 );
                 SyncStatus::Started { gaps_found }
@@ -227,6 +228,7 @@ impl<S: KvStore + 'static> HistoricalBodySync<S> {
                         NetworkMessage::BodyRequest {
                             start_number: next_start,
                             count: BODY_BACKFILL_BATCH_SIZE,
+                            nonce: 0,
                         },
                     );
                     return;
@@ -445,6 +447,7 @@ mod tests {
             NetworkMessage::BodyRequest {
                 start_number,
                 count,
+                ..
             } => {
                 assert_eq!(*start_number, 1);
                 assert_eq!(*count, BODY_BACKFILL_BATCH_SIZE);

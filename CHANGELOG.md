@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Keep the published security support line, version badge, container example,
   and fuzz manifest aligned with the workspace release version.
+- Keep canonical block mappings until both body and witness pruning have
+  processed them, so delayed STARK settlements cannot strand retained data.
 - Release the consensus read lock before RPC validator stake lookups and reuse
   one world-state read guard for the full validator snapshot.
 - Bound proof-amendment gossip envelopes to the signed payload hash and source

@@ -99,6 +99,14 @@ fi
 if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "release/v${VERSION}" ]; then
     fail "Release must run from 'main' or 'release/v${VERSION}', found '${BRANCH}'"
 fi
+if [ "$BRANCH" = "release/v${VERSION}" ]; then
+    if ! git show-ref --verify --quiet refs/heads/main; then
+        fail "Release branch validation requires a local 'main' branch"
+    fi
+    if ! git merge-base --is-ancestor refs/heads/main HEAD; then
+        fail "Release branch 'release/v${VERSION}' must descend from 'main'"
+    fi
+fi
 ok "Current branch: ${BRANCH}"
 
 # ── Format check ─────────────────────────────────────────────

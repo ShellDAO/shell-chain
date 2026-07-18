@@ -662,9 +662,7 @@ impl<S: KvStore + 'static> Node<S> {
         // from incorrectly rotating proposer selection.
         let expected_block = self
             .chain_store
-            .get_head_block()
-            .ok()
-            .flatten()
+            .get_head_block()?
             .map(|b| ChainStateMachine::next_block_number(b.number()))
             .unwrap_or(Ok(1))?;
         if msg.block_number != expected_block {

@@ -146,6 +146,10 @@ array (`[]`) matches no logs at that position.
 < {"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x3","result":"0xabc123..."}}
 ```
 
+`newPendingTransactions` currently returns hashes only. Requests with
+`includeTransactions: true` are rejected because full transaction objects are
+not supported.
+
 ### eth_unsubscribe (WebSocket only)
 
 Cancel an active subscription.

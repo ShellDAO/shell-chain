@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SOLC_VERSION="0.8.35"
 readonly CONTRACT="contracts/DefaultPQValidator.sol"
 readonly ABI="contracts/DefaultPQValidator.abi.json"
 readonly RUNTIME="contracts/DefaultPQValidator.bin-runtime"
+readonly TOOL_DIR="tools/default-pq-validator-artifacts"
 
 mode="${1:---check}"
 if [[ "$mode" != "--check" && "$mode" != "--write" ]]; then
@@ -27,7 +27,10 @@ jq -Rs '{
   }
 }' "$CONTRACT" > "$tmp_dir/input.json"
 
-npx --yes "solc@${SOLC_VERSION}" --standard-json \
+npm ci --ignore-scripts --no-fund --prefix "$TOOL_DIR"
+npm audit --audit-level=high --prefix "$TOOL_DIR"
+
+node "$TOOL_DIR/node_modules/solc/solc.js" --standard-json \
   < "$tmp_dir/input.json" > "$tmp_dir/output.raw"
 
 # solc-js can print an SMT capability notice before its JSON document.

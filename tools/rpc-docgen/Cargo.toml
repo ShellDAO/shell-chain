@@ -10,3 +10,6 @@ description = "Generate docs/rpc-reference.md from crates/rpc/src/api.rs"
 [[bin]]
 name = "rpc-docgen"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
