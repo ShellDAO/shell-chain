@@ -1004,38 +1004,38 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             }));
         };
 
-        let engine = engine_lock.read();
-        let engine_name = match engine.engine_type() {
-            EngineType::PoA => "poa",
-            EngineType::WPoA => "wpoa",
-            EngineType::BFT => "bft",
+        let (engine_name, weights, poa_cfg) = {
+            let engine = engine_lock.read();
+            let engine_name = match engine.engine_type() {
+                EngineType::PoA => "poa",
+                EngineType::WPoA => "wpoa",
+                EngineType::BFT => "bft",
+            };
+            (
+                engine_name,
+                engine.validator_weights(),
+                engine.poa_config().clone(),
+            )
         };
 
-        // Build validator list with weights.
-        let weights = engine.validator_weights();
-        let staking_enabled = self
-            .world_state
-            .read()
-            .staking_enabled()
-            .map_err(internal_err)?;
-        let mut validators: Vec<serde_json::Value> = weights
-            .iter()
-            .map(|(addr, w)| {
-                let stake = self
-                    .world_state
-                    .read()
-                    .get_validator_stake(addr)
-                    .unwrap_or(U256::ZERO);
-                serde_json::json!({
-                    "address": format!("{addr}"),
-                    "weight": w,
-                    "stake": hex_u256(stake),
+        let (staking_enabled, mut validators) = {
+            let world_state = self.world_state.read();
+            let staking_enabled = world_state.staking_enabled().map_err(internal_err)?;
+            let validators: Vec<serde_json::Value> = weights
+                .iter()
+                .map(|(addr, w)| {
+                    let stake = world_state.get_validator_stake(addr).unwrap_or(U256::ZERO);
+                    serde_json::json!({
+                        "address": format!("{addr}"),
+                        "weight": w,
+                        "stake": hex_u256(stake),
+                    })
                 })
-            })
-            .collect();
+                .collect();
+            (staking_enabled, validators)
+        };
         validators.sort_by_key(|v| v["address"].as_str().unwrap_or("").to_string());
 
-        let poa_cfg = engine.poa_config();
         let epoch_length = poa_cfg.epoch_length;
         let (current_proposer, epoch, epoch_progress) = match head_number.checked_add(1) {
             Some(next_number) => {
