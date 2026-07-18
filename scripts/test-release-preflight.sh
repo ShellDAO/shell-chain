@@ -112,8 +112,14 @@ assert_fails_with "$fixture" '0.27.1' "cargo fmt check failed"
 fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
 git -C "$fixture" switch -q --orphan release/v0.27.1
 mkdir -p "$fixture/scripts"
-cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
+cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/check-release-metadata.sh" \
+    "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
 printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
+mkdir -p "$fixture/fuzz"
+printf '[package]\nname = "shell-fuzz"\nversion = "0.27.1"\n' > "$fixture/fuzz/Cargo.toml"
+printf '| v0.27.x | supported |\n| < v0.27.0 | end of life |\n\n**v0.27.x is the current supported release line.** v0.27.x receives security-only backports. Users older than v0.27.0 should upgrade.\n' > "$fixture/SECURITY.md"
+printf 'https://img.shields.io/badge/version-0.27.1-green.svg\n' > "$fixture/README.md"
+printf 'FROM example.invalid/base\n# ghcr.io/shelldao/shell-chain:v0.27.1\n' > "$fixture/Dockerfile"
 printf '## [Unreleased]\n\n## [0.27.1] - test release\n' > "$fixture/CHANGELOG.md"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm "unrelated release history"
