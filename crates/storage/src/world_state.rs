@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -11,11 +12,18 @@ use shell_primitives::{keccak256, Address, ShellHash, U256};
 
 use crate::{KvStore, MerkleTrie, StorageError, WriteBatch};
 
-/// Approximate byte-size of one RLP-encoded [`Account`].
-const ACCOUNT_SIZE_BYTES: usize = 100;
+/// Approximate resident size of one account-cache entry.
+///
+/// Besides the decoded account and address key, each LRU entry needs linked-list
+/// pointers and hash-table bookkeeping. Allocator overhead remains platform
+/// dependent, so this is intentionally an estimate rather than an exact limit.
+const ACCOUNT_CACHE_ENTRY_SIZE_BYTES: usize =
+    size_of::<Address>() + size_of::<Option<Account>>() + 4 * size_of::<usize>();
 
-/// Default account cache capacity (64 MiB / ACCOUNT_SIZE_BYTES).
-const DEFAULT_CACHE_CAPACITY_ACCOUNTS: usize = 64 * 1024 * 1024 / ACCOUNT_SIZE_BYTES;
+fn account_cache_capacity(cache_mb: usize) -> NonZeroUsize {
+    let budget_bytes = cache_mb.saturating_mul(1024).saturating_mul(1024);
+    NonZeroUsize::new(budget_bytes / ACCOUNT_CACHE_ENTRY_SIZE_BYTES).unwrap_or(NonZeroUsize::MIN)
+}
 
 /// Returns the system address used for the validator registry (0x0000…0001).
 pub fn validator_registry_addr() -> Address {
@@ -44,29 +52,28 @@ pub struct WorldState<S: KvStore + 'static> {
 }
 
 impl<S: KvStore + 'static> WorldState<S> {
+    fn with_trie_and_cache_capacity(
+        store: Arc<S>,
+        account_trie: MerkleTrie<S>,
+        cache_capacity: NonZeroUsize,
+    ) -> Self {
+        Self {
+            account_trie,
+            store,
+            account_cache: Mutex::new(LruCache::new(cache_capacity)),
+        }
+    }
+
     /// Create a new empty world state with the default 64 MiB account cache.
     pub fn new(store: Arc<S>) -> Self {
         Self::new_with_cache_mb(store, 64)
     }
 
     /// Create a new empty world state with the given account cache size in MiB.
+    /// A zero-sized budget retains one entry, the minimum supported by the LRU.
     pub fn new_with_cache_mb(store: Arc<S>, cache_mb: usize) -> Self {
-        let cap = NonZeroUsize::new(
-            cache_mb
-                .saturating_mul(1024)
-                .saturating_mul(1024)
-                .checked_div(ACCOUNT_SIZE_BYTES)
-                .unwrap_or(1),
-        )
-        .unwrap_or_else(|| {
-            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS)
-                .unwrap_or_else(|| unreachable!("DEFAULT_CACHE_CAPACITY_ACCOUNTS > 0"))
-        });
-        Self {
-            account_trie: MerkleTrie::new(Arc::clone(&store)),
-            store,
-            account_cache: Mutex::new(LruCache::new(cap)),
-        }
+        let trie = MerkleTrie::new(Arc::clone(&store));
+        Self::with_trie_and_cache_capacity(store, trie, account_cache_capacity(cache_mb))
     }
 
     /// Open world state at an existing state root with the default account cache.
@@ -81,22 +88,11 @@ impl<S: KvStore + 'static> WorldState<S> {
         cache_mb: usize,
     ) -> Result<Self, StorageError> {
         let trie = MerkleTrie::at_root(Arc::clone(&store), state_root.as_bytes())?;
-        let cap = NonZeroUsize::new(
-            cache_mb
-                .saturating_mul(1024)
-                .saturating_mul(1024)
-                .checked_div(ACCOUNT_SIZE_BYTES)
-                .unwrap_or(1),
-        )
-        .unwrap_or_else(|| {
-            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY_ACCOUNTS)
-                .unwrap_or_else(|| unreachable!("DEFAULT_CACHE_CAPACITY_ACCOUNTS > 0"))
-        });
-        Ok(Self {
-            account_trie: trie,
+        Ok(Self::with_trie_and_cache_capacity(
             store,
-            account_cache: Mutex::new(LruCache::new(cap)),
-        })
+            trie,
+            account_cache_capacity(cache_mb),
+        ))
     }
 
     /// Re-open the current world state at its latest root as an isolated snapshot.
@@ -106,11 +102,9 @@ impl<S: KvStore + 'static> WorldState<S> {
     pub fn snapshot(&mut self) -> Result<Self, StorageError> {
         let root = self.state_root()?;
         let cap = self.account_cache.lock().cap();
-        let cap_mb = cap
-            .get()
-            .saturating_mul(ACCOUNT_SIZE_BYTES)
-            .div_ceil(1_048_576);
-        Self::at_root_with_cache_mb(Arc::clone(&self.store), &root, cap_mb.max(1))
+        let store = Arc::clone(&self.store);
+        let trie = MerkleTrie::at_root(Arc::clone(&store), root.as_bytes())?;
+        Ok(Self::with_trie_and_cache_capacity(store, trie, cap))
     }
 
     /// Re-open this world state at the given historical root **in place**,
@@ -826,6 +820,27 @@ mod tests {
         let ws = WorldState::new(store);
         let addr = test_address(b"nobody");
         assert!(ws.get_account(&addr).unwrap().is_none());
+    }
+
+    #[test]
+    fn zero_cache_budget_keeps_only_the_minimum_entry() {
+        let mut ws = WorldState::new_with_cache_mb(test_store(), 0);
+
+        assert_eq!(ws.account_cache.lock().cap(), NonZeroUsize::MIN);
+        assert_eq!(
+            ws.snapshot().unwrap().account_cache.lock().cap(),
+            NonZeroUsize::MIN
+        );
+    }
+
+    #[test]
+    fn cache_capacity_accounts_for_decoded_entry_size() {
+        let ws = WorldState::new_with_cache_mb(test_store(), 1);
+
+        assert_eq!(
+            ws.account_cache.lock().cap().get(),
+            1024 * 1024 / ACCOUNT_CACHE_ENTRY_SIZE_BYTES
+        );
     }
 
     #[test]

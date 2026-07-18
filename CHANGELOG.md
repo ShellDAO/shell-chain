@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - Keep the published security support line, version badge, container example,
   and fuzz manifest aligned with the workspace release version.
+- Size the world-state account cache from decoded entry memory and honor a
+  zero-MiB budget with the minimum LRU capacity instead of the default cache.
+- Resolve custom-validator and contract-paymaster state reads against full
+  32-byte Shell addresses instead of lossy 20-byte EVM aliases.
+- Keep the reported libp2p peer count aligned with admitted unique peers so connections rejected by peer limits cannot transiently inflate RPC and sync readiness metrics.
 - Keep canonical block mappings until both body and witness pruning have
   processed them, so delayed STARK settlements cannot strand retained data.
 - Release the consensus read lock before RPC validator stake lookups and reuse

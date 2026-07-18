@@ -547,6 +547,14 @@ struct SwarmLoopConfig {
     peer_security: PeerSecurityConfig,
 }
 
+struct PeerCountResetGuard(Arc<AtomicUsize>);
+
+impl Drop for PeerCountResetGuard {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerSecurityConfig {
     max_peers: usize,
@@ -571,6 +579,7 @@ async fn swarm_loop(
     event_tx: mpsc::Sender<NetworkEvent>,
     loop_config: SwarmLoopConfig,
 ) {
+    let _peer_count_reset = PeerCountResetGuard(Arc::clone(&loop_config.peer_count));
     // F-305: Initialize peer tracking and ban list.
     let mut peer_tracker = crate::security::PeerTracker::new(loop_config.peer_security.max_peers);
     let mut peer_ban_list = crate::security::PeerBanList::new(
@@ -917,7 +926,6 @@ fn handle_swarm_event(
                 swarm.add_peer_address(peer_id, addr);
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
-            update_peer_count(swarm, &loop_config.peer_count);
         }
         // mDNS peer expired.
         SwarmEvent::Behaviour(ShellBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -928,7 +936,6 @@ fn handle_swarm_event(
                     .gossipsub
                     .remove_explicit_peer(&peer_id);
             }
-            update_peer_count(swarm, &loop_config.peer_count);
         }
         // Relay client events.
         SwarmEvent::Behaviour(ShellBehaviourEvent::RelayClient(event)) => {
@@ -1026,7 +1033,7 @@ fn handle_swarm_event(
                 }
             }
             debug!("Connected to {peer_id}");
-            update_peer_count(swarm, &loop_config.peer_count);
+            update_peer_count(peer_tracker, &loop_config.peer_count);
         }
         // Connection closed.
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -1040,7 +1047,7 @@ fn handle_swarm_event(
                 }
             }
             debug!("Disconnected from {peer_id}");
-            update_peer_count(swarm, &loop_config.peer_count);
+            update_peer_count(peer_tracker, &loop_config.peer_count);
         }
         // Outgoing connection failed — surface relay/NAT failures for debugging.
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1077,8 +1084,8 @@ fn track_connection_closed(
         .then(|| NetworkEvent::PeerDisconnected(peer.clone()))
 }
 
-fn update_peer_count(swarm: &Swarm<ShellBehaviour>, counter: &Arc<AtomicUsize>) {
-    counter.store(swarm.connected_peers().count(), Ordering::Relaxed);
+fn update_peer_count(peer_tracker: &crate::security::PeerTracker, counter: &Arc<AtomicUsize>) {
+    counter.store(peer_tracker.active_count(), Ordering::Relaxed);
 }
 
 /// Collect current peer scores from the GossipSub behaviour.
@@ -1478,12 +1485,29 @@ mod tests {
     #[test]
     fn rejected_connection_close_does_not_emit_disconnect() {
         let mut tracker = crate::security::PeerTracker::new(1);
+        let peer_count = Arc::new(AtomicUsize::new(0));
         let admitted = PeerId::from("admitted");
         let rejected = PeerId::from("rejected");
         track_connection_established(&mut tracker, admitted).unwrap();
+        update_peer_count(&tracker, &peer_count);
 
         assert!(track_connection_established(&mut tracker, rejected.clone()).is_err());
+        update_peer_count(&tracker, &peer_count);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
         assert!(track_connection_closed(&mut tracker, &rejected).is_none());
+        update_peer_count(&tracker, &peer_count);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn peer_count_resets_when_swarm_loop_stops() {
+        let peer_count = Arc::new(AtomicUsize::new(3));
+
+        {
+            let _guard = PeerCountResetGuard(Arc::clone(&peer_count));
+        }
+
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
