@@ -121,10 +121,9 @@ mod tests {
 
     #[test]
     fn export_keystore_json() {
-        let dir = std::env::temp_dir().join(format!("shell-wallet-export-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.json");
-        let dst = dir.join("dst.json");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.json");
+        let dst = dir.path().join("dst.json");
 
         std::fs::write(
             &src,
@@ -145,9 +144,5 @@ mod tests {
         let result = cmd_export(src.clone(), dst.clone());
         assert!(result.is_ok());
         assert!(dst.exists());
-
-        let _ = std::fs::remove_file(src);
-        let _ = std::fs::remove_file(dst);
-        let _ = std::fs::remove_dir(dir);
     }
 }

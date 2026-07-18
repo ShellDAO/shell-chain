@@ -944,25 +944,14 @@ mod tests {
 
     #[test]
     fn dev_authority_signer_is_persisted() {
-        let unique = format!(
-            "shell-cli-dev-authority-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(DEV_AUTHORITY_KEY_FILE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
 
         let signer1 = load_or_create_dev_signer(&path).unwrap();
         let signer2 = load_or_create_dev_signer(&path).unwrap();
 
         assert_eq!(signer1.public_key(), signer2.public_key());
         assert_eq!(signer1.secret_key_bytes(), signer2.secret_key_bytes());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
