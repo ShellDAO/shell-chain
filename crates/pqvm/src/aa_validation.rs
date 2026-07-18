@@ -680,6 +680,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         world_state,
         chain_store,
         wrapper_address,
+        *paymaster,
         paymaster_validation_wrapper_code(paymaster),
     );
 
@@ -878,6 +879,7 @@ fn encode_validate_paymaster_op_calldata(
 struct ValidationStateDb<'a, S: KvStore + 'static> {
     inner: ShellStateRefDb<'a, S>,
     validation_target: Address,
+    state_target: Address,
     validation_code_hash: ShellHash,
     inline_code: Option<Bytecode>,
 }
@@ -892,6 +894,7 @@ impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
         Self {
             inner: ShellStateRefDb::new(world_state, chain_store),
             validation_target,
+            state_target: validation_target,
             validation_code_hash,
             inline_code: None,
         }
@@ -901,12 +904,14 @@ impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
         world_state: &'a WorldState<S>,
         chain_store: &'a ChainStore<S>,
         validation_target: Address,
+        state_target: Address,
         code: Vec<u8>,
     ) -> Self {
         let validation_code_hash = keccak256(&code);
         Self {
             inner: ShellStateRefDb::new(world_state, chain_store),
             validation_target,
+            state_target,
             validation_code_hash,
             inline_code: Some(
                 Bytecode::new_raw_checked(code.into())
@@ -923,18 +928,23 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
         &mut self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
-        let mut info = self.inner.basic(address)?;
-        if address == self.validation_target.to_alloy() {
-            // If the inner lookup (which zero-pads to 32 bytes) didn't find the
-            // account, try again with the full 32-byte validation_target address.
-            if info.is_none() {
-                info = self
-                    .inner
-                    .world_state()
-                    .get_account(&self.validation_target)
-                    .map_err(StateDbError::Storage)?
-                    .map(|a| ShellStateDb::<S>::to_account_info(&a));
-            }
+        let is_validation_target = address == self.validation_target.to_alloy();
+        let mut info = if is_validation_target {
+            self.inner
+                .world_state()
+                .get_account(&self.validation_target)
+                .map_err(StateDbError::Storage)?
+                .map(|account| ShellStateDb::<S>::to_account_info(&account))
+        } else if address == self.state_target.to_alloy() {
+            self.inner
+                .world_state()
+                .get_account(&self.state_target)
+                .map_err(StateDbError::Storage)?
+                .map(|account| ShellStateDb::<S>::to_account_info(&account))
+        } else {
+            self.inner.basic(address)?
+        };
+        if is_validation_target {
             if info.is_none() && self.inline_code.is_some() {
                 info = Some(AccountInfo::default());
             }
@@ -963,6 +973,15 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
         address: alloy_primitives::Address,
         index: alloy_primitives::U256,
     ) -> Result<alloy_primitives::U256, Self::Error> {
+        if address == self.state_target.to_alloy() {
+            let key = ShellHash::from(alloy_primitives::B256::from(index));
+            let value = self
+                .inner
+                .world_state()
+                .get_storage(&self.state_target, &key)
+                .map_err(StateDbError::Storage)?;
+            return Ok(alloy_primitives::U256::from_be_bytes(*value.as_bytes()));
+        }
         self.inner.storage(address, index)
     }
 
@@ -1057,6 +1076,24 @@ mod tests {
             0x60, 0x01, 0x60, 0x00, 0x55, // sstore(0, 1)
             0x60, 0x01, 0x60, 0x00, 0x52, // mstore(0, 1)
             0x60, 0x20, 0x60, 0x00, 0xf3, // return(0, 32)
+        ]
+    }
+
+    fn validator_accepts_when_slot_zero_is_one() -> Vec<u8> {
+        vec![
+            0x5f, 0x54, // sload(0)
+            0x60, 0x01, 0x14, // eq(value, 1)
+            0x5f, 0x52, // mstore(0, accepted)
+            0x60, 0x20, 0x5f, 0xf3, // return(0, 32)
+        ]
+    }
+
+    fn validator_accepts_when_own_balance_is_one() -> Vec<u8> {
+        vec![
+            0x30, 0x31, // balance(address())
+            0x60, 0x01, 0x14, // eq(value, 1)
+            0x5f, 0x52, // mstore(0, accepted)
+            0x60, 0x20, 0x5f, 0xf3, // return(0, 32)
         ]
     }
 
@@ -1191,6 +1228,47 @@ mod tests {
         let (mut ws, cs) = setup_stores();
         let paymaster = Address::from([0x77; 20]);
         install_paymaster(&mut ws, &cs, paymaster, validator_returns_true());
+        let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
+
+        assert!(call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).is_ok());
+    }
+
+    #[test]
+    fn paymaster_validation_reads_full_shell_address_storage() {
+        let signer = DilithiumSigner::generate();
+        let paymaster_signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = signer_address(&paymaster_signer);
+        assert_ne!(paymaster, Address::from(paymaster.to_alloy()));
+        install_paymaster(
+            &mut ws,
+            &cs,
+            paymaster,
+            validator_accepts_when_slot_zero_is_one(),
+        );
+        let mut stored = [0u8; 32];
+        stored[31] = 1;
+        ws.set_storage(&paymaster, &ShellHash::ZERO, &ShellHash::from(stored))
+            .unwrap();
+        let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
+
+        assert!(call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).is_ok());
+    }
+
+    #[test]
+    fn paymaster_validation_reads_full_shell_address_balance() {
+        let signer = DilithiumSigner::generate();
+        let paymaster_signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = signer_address(&paymaster_signer);
+        assert_ne!(paymaster, Address::from(paymaster.to_alloy()));
+        install_paymaster(
+            &mut ws,
+            &cs,
+            paymaster,
+            validator_accepts_when_own_balance_is_one(),
+        );
+        ws.set_balance(&paymaster, U256::from(1u64)).unwrap();
         let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
 
         assert!(call_paymaster_validate(&signed, &paymaster, &[1], &ws, &cs).is_ok());
@@ -1393,6 +1471,75 @@ mod tests {
             ws.get_storage(&from, &storage_key).unwrap(),
             ShellHash::ZERO
         );
+    }
+
+    #[test]
+    fn custom_validation_reads_full_shell_address_storage() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        assert_ne!(from, Address::from(from.to_alloy()));
+
+        let code = validator_accepts_when_slot_zero_is_one();
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        ws.set_account(
+            &from,
+            &Account {
+                pq_pubkey_hash: ShellHash::ZERO,
+                nonce: 0,
+                balance: U256::from(1_000_000u64),
+                validation_code_hash: Some(code_hash),
+                code_hash: None,
+                storage_root: ShellHash::ZERO,
+            },
+        )
+        .unwrap();
+
+        let mut stored = [0u8; 32];
+        stored[31] = 1;
+        ws.set_storage(&from, &ShellHash::ZERO, &ShellHash::from(stored))
+            .unwrap();
+
+        let signed = SignedTransaction::new(
+            from,
+            base_tx(1337, 0),
+            PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
+        );
+
+        validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
+    }
+
+    #[test]
+    fn custom_validation_reads_full_shell_address_balance() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        assert_ne!(from, Address::from(from.to_alloy()));
+
+        let code = validator_accepts_when_own_balance_is_one();
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        ws.set_account(
+            &from,
+            &Account {
+                pq_pubkey_hash: ShellHash::ZERO,
+                nonce: 0,
+                balance: U256::from(1u64),
+                validation_code_hash: Some(code_hash),
+                code_hash: None,
+                storage_root: ShellHash::ZERO,
+            },
+        )
+        .unwrap();
+
+        let signed = SignedTransaction::new(
+            from,
+            base_tx(1337, 0),
+            PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
+        );
+
+        validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
     }
 
     #[test]
