@@ -15,6 +15,8 @@
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 
+use crate::secure_file::read_sensitive_file;
+
 /// Password source flags forwarded from the global `Cli` struct.
 #[derive(Clone, Debug, Default)]
 pub struct PasswordArgs {
@@ -41,7 +43,7 @@ pub fn resolve_password(
     args: &PasswordArgs,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(ref path) = args.password_file {
-        let content = std::fs::read_to_string(path)
+        let content = read_sensitive_file(path)
             .map_err(|e| format!("cannot read password file {}: {e}", path.display()))?;
         let password = content
             .lines()
@@ -235,6 +237,25 @@ mod tests {
             password_stdin: false,
             allow_env_password: false,
         };
+        assert!(resolve_password("", &args).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_file_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("password.txt");
+        let linked = dir.path().join("linked-password.txt");
+        std::fs::write(&target, "secret\n").unwrap();
+        symlink(target, &linked).unwrap();
+        let args = PasswordArgs {
+            password_file: Some(linked),
+            password_stdin: false,
+            allow_env_password: false,
+        };
+
         assert!(resolve_password("", &args).is_err());
     }
 }

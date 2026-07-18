@@ -13,6 +13,7 @@ use shell_crypto::hd::{
 use shell_keystore::{decrypt_hd_seed, encrypt_hd_seed, EncryptedKey};
 
 use crate::password::{resolve_new_password, resolve_password, PasswordArgs};
+use crate::secure_file::read_sensitive_file;
 use crate::secure_file::write_sensitive_file_new;
 
 pub enum PqHdCommand {
@@ -105,7 +106,7 @@ fn derive(
     let algo = parse_algo(&algo_str)?;
     let password = resolve_password("Enter keystore password: ", &password_args)?;
 
-    let json = std::fs::read_to_string(&keystore)?;
+    let json = read_sensitive_file(&keystore)?;
     let encrypted: EncryptedKey = serde_json::from_str(&json)?;
     let seed = decrypt_hd_seed(&encrypted, password.as_bytes())?;
 

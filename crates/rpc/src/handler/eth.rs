@@ -257,7 +257,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         hash: ShellHash,
     ) -> Result<Option<RpcTransaction>, ErrorObjectOwned> {
         // Check mempool first
-        if let Some(pending_tx) = self.tx_pool.get(&hash) {
+        if let Some(pending_tx) = self.tx_pool.get_shared(&hash) {
             return Ok(Some(tx_to_rpc(&pending_tx, None, None, None, None)));
         }
 
@@ -530,10 +530,13 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
 
     async fn gas_price(&self) -> Result<String, ErrorObjectOwned> {
         // Return the base fee from the latest block, or INITIAL_BASE_FEE if no blocks exist.
-        let base_fee = match self.chain_store.get_head_block() {
-            Ok(Some(head)) if head.header.base_fee_per_gas > 0 => head.header.base_fee_per_gas,
-            _ => shell_core::INITIAL_BASE_FEE,
-        };
+        let base_fee = self
+            .chain_store
+            .get_head_block()
+            .map_err(internal_err)?
+            .map(|head| head.header.base_fee_per_gas)
+            .filter(|fee| *fee > 0)
+            .unwrap_or(shell_core::INITIAL_BASE_FEE);
         Ok(hex_u64(base_fee))
     }
 
@@ -552,10 +555,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             Some(n) => n,
             None => {
                 // "latest" — get head block number
-                match self.chain_store.get_head_block() {
-                    Ok(Some(head)) => head.header.number,
-                    _ => 0,
-                }
+                self.chain_store
+                    .get_head_block()
+                    .map_err(internal_err)?
+                    .map(|head| head.header.number)
+                    .unwrap_or(0)
             }
         };
 
@@ -600,10 +604,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     };
                     gas_used_ratio.push(ratio);
                 }
-                _ => {
+                Ok(None) => {
                     base_fee_per_gas.push(hex_u64(0));
                     gas_used_ratio.push(0.0);
                 }
+                Err(error) => return Err(internal_err(error)),
             }
             if let (Some(reward), Some(percentiles)) = (&mut reward, reward_percentiles.as_ref()) {
                 reward.push(vec![hex_u64(0); percentiles.len()]);
@@ -611,7 +616,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         }
 
         // Append next block's predicted base fee (one more entry than gas_used_ratio).
-        if let Ok(Some(head)) = self.chain_store.get_block_by_number(latest) {
+        if let Some(head) = self
+            .chain_store
+            .get_block_by_number(latest)
+            .map_err(internal_err)?
+        {
             let next = shell_core::fee::calculate_base_fee(
                 head.header.gas_used,
                 head.header.gas_limit,
@@ -927,14 +936,15 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             let actual_to = capped_filter_poll_to(query_from, query_to);
 
             for block_num in query_from..=actual_to {
-                let block = match self
+                let block = self
                     .chain_store
                     .get_block_by_number(block_num)
                     .map_err(internal_err)?
-                {
-                    Some(b) => b,
-                    None => continue,
-                };
+                    .ok_or_else(|| {
+                        internal_err(format!(
+                            "canonical block {block_num} missing during log filter poll"
+                        ))
+                    })?;
 
                 if !filter.matches_bloom(block.header.logs_bloom.as_ref()) {
                     continue;
@@ -991,13 +1001,16 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             let mut hashes = Vec::new();
             let actual_to = capped_filter_poll_to(from, latest);
             for block_num in from..=actual_to {
-                if let Some(block) = self
+                let block = self
                     .chain_store
                     .get_block_by_number(block_num)
                     .map_err(internal_err)?
-                {
-                    hashes.push(block.hash());
-                }
+                    .ok_or_else(|| {
+                        internal_err(format!(
+                            "canonical block {block_num} missing during block filter poll"
+                        ))
+                    })?;
+                hashes.push(block.hash());
             }
 
             self.filter_registry.update_last_poll(&id, actual_to);

@@ -18,8 +18,11 @@
 //! Both subcommands print structured status to stderr and return a machine-readable
 //! JSON summary to stdout so they can be composed in shell scripts.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_CURRENT_FILE_BYTES: u64 = 1_024;
 
 /// Create a RocksDB checkpoint (offline backup) of the data directory.
 ///
@@ -86,8 +89,8 @@ pub fn create_backup(
 
 /// Restore the data directory from a RocksDB checkpoint.
 ///
-/// Renames the existing `<datadir>/db` to `<datadir>/db.bak.<timestamp>` before
-/// copying the backup into place, preserving the ability to manually roll back.
+/// Stages and validates the backup before renaming the existing `<datadir>/db`
+/// to `<datadir>/db.bak.<timestamp>` and atomically installing the staged copy.
 pub fn restore_backup(
     datadir: PathBuf,
     backup_path: PathBuf,
@@ -99,23 +102,62 @@ pub fn restore_backup(
     } else {
         return Err(format!("Backup path does not exist: {}", backup_path.display()).into());
     };
+    let source_meta = std::fs::symlink_metadata(&checkpoint_src)?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+        return Err(format!(
+            "Backup path must be a real directory: {}",
+            checkpoint_src.display()
+        )
+        .into());
+    }
 
+    std::fs::create_dir_all(&datadir)?;
+    let source_root = checkpoint_src.canonicalize()?;
+    let data_root = datadir.canonicalize()?;
+    if data_root.starts_with(&source_root) {
+        return Err(format!(
+            "Backup path must not contain data directory: {}",
+            checkpoint_src.display()
+        )
+        .into());
+    }
     let db_path = datadir.join("db");
+
+    // Fully stage and validate the backup before moving the live database.
+    // Keeping the staging directory under datadir makes the final rename
+    // atomic on the same filesystem.
+    let staging = tempfile::Builder::new()
+        .prefix(".db.restore-")
+        .tempdir_in(&datadir)?;
+    let staged_db = staging.path().join("db");
+    copy_dir_all(&source_root, &staged_db)?;
+    validate_checkpoint(&staged_db)?;
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Rename existing db to db.bak.<ts> for manual rollback.
-    if db_path.exists() {
-        let bak = datadir.join(format!("db.bak.{ts}"));
+    let backup = if db_path.exists() {
+        let bak = next_backup_path(&datadir, ts);
         std::fs::rename(&db_path, &bak)?;
         eprintln!("ℹ  Existing DB renamed to {}", bak.display());
-    }
+        Some(bak)
+    } else {
+        None
+    };
 
-    // Copy (or hard-link) checkpoint into db/.
-    copy_dir_all(&checkpoint_src, &db_path)?;
+    if let Err(install_error) = std::fs::rename(&staged_db, &db_path) {
+        if let Some(backup) = &backup {
+            if let Err(rollback_error) = std::fs::rename(backup, &db_path) {
+                return Err(format!(
+                    "failed to install restored database: {install_error}; failed to restore previous database: {rollback_error}"
+                )
+                .into());
+            }
+        }
+        return Err(format!("failed to install restored database: {install_error}").into());
+    }
 
     eprintln!("✓ Restore completed successfully");
     eprintln!("  Source:      {}", checkpoint_src.display());
@@ -138,18 +180,115 @@ pub fn restore_backup(
 
 /// Recursively copy a directory tree (used for restore).
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let source_meta = std::fs::symlink_metadata(src)?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("backup entry is not a real directory: {}", src.display()),
+        ));
+    }
+
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let dest = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "backup contains a symbolic link: {}",
+                    entry.path().display()
+                ),
+            ));
+        } else if ty.is_dir() {
             copy_dir_all(&entry.path(), &dest)?;
-        } else {
+        } else if ty.is_file() {
             std::fs::copy(entry.path(), dest)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "backup contains an unsupported entry: {}",
+                    entry.path().display()
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+fn validate_checkpoint(checkpoint: &std::path::Path) -> std::io::Result<()> {
+    let current_path = checkpoint.join("CURRENT");
+    let current_meta = std::fs::symlink_metadata(&current_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("backup checkpoint CURRENT file is unavailable: {error}"),
+        )
+    })?;
+    if current_meta.file_type().is_symlink() || !current_meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup checkpoint CURRENT entry must be a regular file",
+        ));
+    }
+
+    let mut current = Vec::new();
+    std::fs::File::open(&current_path)?
+        .take(MAX_CURRENT_FILE_BYTES + 1)
+        .read_to_end(&mut current)?;
+    if current.len() as u64 > MAX_CURRENT_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup checkpoint CURRENT file is too large",
+        ));
+    }
+
+    let manifest = std::str::from_utf8(&current)
+        .ok()
+        .and_then(|value| value.strip_suffix('\n'))
+        .filter(|value| {
+            value.strip_prefix("MANIFEST-").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "backup checkpoint CURRENT file is malformed",
+            )
+        })?;
+
+    let manifest_path = checkpoint.join(manifest);
+    let manifest_meta = std::fs::symlink_metadata(&manifest_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("backup checkpoint manifest is unavailable: {error}"),
+        )
+    })?;
+    if manifest_meta.file_type().is_symlink() || !manifest_meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup checkpoint manifest must be a regular file",
+        ));
+    }
+
+    Ok(())
+}
+
+fn next_backup_path(datadir: &std::path::Path, timestamp: u64) -> PathBuf {
+    let initial = datadir.join(format!("db.bak.{timestamp}"));
+    if !initial.exists() {
+        return initial;
+    }
+
+    for suffix in 1u32.. {
+        let candidate = datadir.join(format!("db.bak.{timestamp}.{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u32 backup suffix space exhausted")
 }
 
 /// Approximate size of a directory in bytes (best-effort).
@@ -166,4 +305,177 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_rejects_invalid_source_without_moving_live_database() {
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"live database").unwrap();
+
+        let invalid_backup = root.path().join("backup-file");
+        std::fs::write(&invalid_backup, b"not a directory").unwrap();
+
+        let error = restore_backup(datadir.clone(), invalid_backup).unwrap_err();
+
+        assert!(error.to_string().contains("real directory"));
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"live database"
+        );
+        assert_eq!(
+            std::fs::read_dir(datadir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("db.bak."))
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_backup_symlinks_without_moving_live_database() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"live database").unwrap();
+
+        let backup = root.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"outside data").unwrap();
+        symlink(&outside, backup.join("MANIFEST")).unwrap();
+
+        let error = restore_backup(datadir, backup).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"live database"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_source_containing_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"live database").unwrap();
+
+        let error = restore_backup(datadir.clone(), root.path().to_path_buf()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must not contain data directory"));
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"live database"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_non_checkpoint_directory_without_moving_live_database() {
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"live database").unwrap();
+
+        let backup = root.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("README"), b"not a RocksDB checkpoint").unwrap();
+
+        let error = restore_backup(datadir.clone(), backup).unwrap_err();
+
+        assert!(error.to_string().contains("CURRENT"));
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"live database"
+        );
+        assert_eq!(
+            std::fs::read_dir(datadir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("db.bak."))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn restore_rejects_malformed_current_without_moving_live_database() {
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"live database").unwrap();
+
+        let backup = root.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("CURRENT"), b"../outside\n").unwrap();
+        std::fs::write(root.path().join("outside"), b"not a manifest").unwrap();
+
+        let error = restore_backup(datadir.clone(), backup).unwrap_err();
+
+        assert!(error.to_string().contains("CURRENT file is malformed"));
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"live database"
+        );
+        assert_eq!(
+            std::fs::read_dir(datadir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("db.bak."))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn restore_stages_backup_before_replacing_live_database() {
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db_path = datadir.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("CURRENT"), b"old database").unwrap();
+
+        let backup = root.path().join("backup");
+        std::fs::create_dir_all(backup.join("nested")).unwrap();
+        std::fs::write(backup.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        std::fs::write(backup.join("MANIFEST-000001"), b"manifest").unwrap();
+        std::fs::write(backup.join("nested").join("MANIFEST"), b"manifest").unwrap();
+
+        restore_backup(datadir.clone(), backup).unwrap();
+
+        assert_eq!(
+            std::fs::read(db_path.join("CURRENT")).unwrap(),
+            b"MANIFEST-000001\n"
+        );
+        assert_eq!(
+            std::fs::read(db_path.join("nested").join("MANIFEST")).unwrap(),
+            b"manifest"
+        );
+        let backups: Vec<_> = std::fs::read_dir(datadir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("db.bak."))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(backups[0].path().join("CURRENT")).unwrap(),
+            b"old database"
+        );
+    }
 }

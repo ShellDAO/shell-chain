@@ -768,4 +768,76 @@ mod tests {
             "subscription capacity was not released: {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn rejected_full_pending_transaction_subscriptions_release_capacity() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            rate_limit_per_sec: None,
+            api_namespaces: vec!["eth".into()],
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = WsClientBuilder::default()
+            .build(format!("ws://{}", server.http_addr))
+            .await
+            .unwrap();
+
+        for _ in 0..17 {
+            let result = client
+                .subscribe::<serde_json::Value, _>(
+                    "eth_subscribe",
+                    rpc_params!["newPendingTransactions", true],
+                    "eth_unsubscribe",
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ClientError::Call(ref err)) if err.code() == -32602),
+                "full transaction subscription was not rejected as invalid params: {result:?}"
+            );
+        }
+
+        let valid = client
+            .subscribe::<serde_json::Value, _>(
+                "eth_subscribe",
+                rpc_params!["newPendingTransactions", false],
+                "eth_unsubscribe",
+            )
+            .await;
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(
+            valid.is_ok(),
+            "rejected subscriptions leaked per-connection capacity: {valid:?}"
+        );
+    }
 }

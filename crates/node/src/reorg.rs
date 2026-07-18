@@ -172,15 +172,9 @@ impl ReorgEngine {
         }
 
         // Step 5: Remove transactions that already exist in the new chain
-        let new_chain_tx_hashes: std::collections::HashSet<ShellHash> = new_chain
+        let new_chain_tx_hashes: std::collections::HashSet<ShellHash> = new_blocks
             .iter()
-            .filter_map(|h| chain_store.get_block_by_hash(h).ok().flatten())
-            .flat_map(|b| {
-                b.transactions
-                    .iter()
-                    .map(|tx| tx.hash())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|block| block.transactions.iter().map(|tx| tx.hash()))
             .collect();
 
         reverted_txs.retain(|tx| !new_chain_tx_hashes.contains(&tx.hash()));
@@ -260,16 +254,28 @@ mod tests {
     struct FailingBatchStore {
         inner: MemoryDb,
         fail_next_batch: AtomicBool,
+        fail_block_reads_after_next_batch: AtomicBool,
+        fail_block_reads: AtomicBool,
     }
 
     impl FailingBatchStore {
         fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
         }
+
+        fn fail_block_reads_after_next_batch(&self) {
+            self.fail_block_reads_after_next_batch
+                .store(true, Ordering::SeqCst);
+        }
     }
 
     impl KvStore for FailingBatchStore {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_block_reads.load(Ordering::SeqCst) && key.starts_with(b"b/") {
+                return Err(StorageError::Database(
+                    "injected post-commit block read failure".into(),
+                ));
+            }
             self.inner.get(key)
         }
 
@@ -289,7 +295,14 @@ mod tests {
             if self.fail_next_batch.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected batch failure".into()));
             }
-            self.inner.write_batch(batch)
+            self.inner.write_batch(batch)?;
+            if self
+                .fail_block_reads_after_next_batch
+                .swap(false, Ordering::SeqCst)
+            {
+                self.fail_block_reads.store(true, Ordering::SeqCst);
+            }
+            Ok(())
         }
 
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
@@ -742,6 +755,42 @@ mod tests {
 
         // TX exists in new chain, so it should be filtered from reverted
         assert_eq!(result.reverted_txs.len(), 0);
+    }
+
+    #[test]
+    fn test_reorg_filters_duplicate_txs_without_post_commit_block_reads() {
+        let (store, chain_store, world_state, root) = setup_failing_chain();
+
+        let ancestor = make_block(5, make_hash(0), root);
+        chain_store.put_block(&ancestor).unwrap();
+        let ancestor_hash = ancestor.hash();
+
+        let tx = make_tx();
+        let mut old_block = make_block(6, ancestor_hash, root);
+        old_block.transactions.push(tx.clone());
+        chain_store.put_block(&old_block).unwrap();
+        let old_hash = old_block.hash();
+
+        let mut new_block = make_block(6, ancestor_hash, root);
+        new_block.header.timestamp += 1;
+        new_block.transactions.push(tx);
+        chain_store.put_block(&new_block).unwrap();
+        let new_hash = new_block.hash();
+
+        store.fail_block_reads_after_next_batch();
+        let result = ReorgEngine::execute(
+            &chain_store,
+            &world_state,
+            &store,
+            ancestor_hash,
+            5,
+            &[old_hash],
+            &[new_hash],
+            0,
+        )
+        .unwrap();
+
+        assert!(result.reverted_txs.is_empty());
     }
 
     // ── Extended reorg tests ───────────────────────────────────────────

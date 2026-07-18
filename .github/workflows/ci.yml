@@ -30,11 +30,13 @@ jobs:
         run: scripts/test-build-release-binary.sh
       - name: Test CLI revision watch paths
         run: scripts/test-cli-git-hash-watch.sh
+      - name: Check Dockerfile base image pins
+        run: scripts/check-dockerfile-base-pins.sh
       - name: Check DefaultPQValidator artifacts
         run: scripts/default-pq-validator-artifacts.sh --check
       - name: Check workspace crates are private
         run: cargo metadata --no-deps --format-version 1 | jq -e 'all(.packages[]; .publish == [])'
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check fuzz targets
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
       - name: Check transaction generator

@@ -10,8 +10,9 @@
 //! from `crates/rpc/src/api.rs` to produce a stable markdown reference.
 
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -292,22 +293,41 @@ fn render(namespaces: &[Namespace]) -> String {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {
-    // Walk up from exe location to find Cargo.toml workspace
-    let exe = env::current_exe().expect("exe path");
-    let mut dir = exe.parent().expect("exe parent").to_path_buf();
-    loop {
-        if dir.join("Cargo.toml").exists() {
-            let content = fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
-            if content.contains("[workspace]") {
-                return dir;
-            }
-        }
-        if !dir.pop() {
-            break;
-        }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("rpc-docgen must remain under tools/rpc-docgen")
+        .to_path_buf()
+}
+
+fn write_generated(path: &Path, generated: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
+    let parent_meta = fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output parent must be a real directory",
+        ));
     }
-    // Fallback: cwd
-    env::current_dir().expect("cwd")
+
+    let temp_path = parent.join(format!(".rpc-reference.md.tmp-{}", process::id()));
+    let mut temp = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    let result = (|| {
+        temp.write_all(generated.as_bytes())?;
+        temp.sync_all()?;
+        drop(temp);
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn main() {
@@ -333,7 +353,7 @@ fn main() {
             process::exit(1);
         }
     } else {
-        fs::write(&out_path, &generated)
+        write_generated(&out_path, &generated)
             .unwrap_or_else(|e| panic!("Cannot write {}: {e}", out_path.display()));
         let method_count: usize = namespaces.iter().map(|n| n.methods.len()).sum();
         println!(
@@ -418,5 +438,37 @@ pub trait EthApi {
     fn simplifies_return_type() {
         let sig = "foo(&self) -> Result<String, jsonrpsee::types::ErrorObjectOwned>";
         assert!(simplify_return_type(sig).contains("→ String"));
+    }
+
+    #[test]
+    fn repo_root_is_bound_to_the_build_workspace() {
+        let root = repo_root();
+        assert_eq!(
+            root.join("tools/rpc-docgen"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+        );
+        assert!(root.join("crates/rpc/src/api.rs").is_file());
+        assert!(root.join("docs/rpc-reference.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_output_replaces_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.md");
+        let output = dir.path().join("rpc-reference.md");
+        fs::write(&target, "original").unwrap();
+        symlink(&target, &output).unwrap();
+
+        write_generated(&output, "generated").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&output).unwrap(), "generated");
+        assert!(!fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

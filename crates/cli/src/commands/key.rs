@@ -11,7 +11,7 @@ use shell_primitives::Address;
 use tracing::info;
 
 use crate::password::{resolve_new_password, resolve_password, PasswordArgs};
-use crate::secure_file::write_sensitive_file_new;
+use crate::secure_file::{read_sensitive_file, write_sensitive_file_new};
 
 /// Generate a new keypair and encrypt it to a keystore file.
 ///
@@ -66,7 +66,7 @@ pub fn key_generate(
 
 /// Display the address and public key from an existing keystore file.
 pub fn key_inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let json = std::fs::read_to_string(&path)?;
+    let json = read_sensitive_file(&path)?;
     let encrypted: EncryptedKey = serde_json::from_str(&json)?;
 
     // Derive canonical 0x address from the stored public key.
@@ -111,7 +111,7 @@ pub fn key_migrate(
     let password = resolve_password("Enter keystore password", password_args)?;
 
     eprintln!("Reading keystore: {}", input.display());
-    let json = std::fs::read_to_string(&input)?;
+    let json = read_sensitive_file(&input)?;
     let encrypted: EncryptedKey = serde_json::from_str(&json)?;
     let key_type = encrypted.key_type.clone();
 

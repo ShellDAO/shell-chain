@@ -133,9 +133,18 @@ pub enum NetworkMessage {
     /// Request missing block bodies (TX detail) for a range of block numbers.
     ///
     /// Used for historical body back-fill after a node upgrades its storage profile.
-    BodyRequest { start_number: u64, count: u64 },
+    BodyRequest {
+        start_number: u64,
+        count: u64,
+        #[serde(default)]
+        nonce: u64,
+    },
     /// Response carrying block bodies for a `BodyRequest`.
-    BodyResponse { blocks: Vec<Block> },
+    BodyResponse {
+        blocks: Vec<Block>,
+        #[serde(default)]
+        nonce: u64,
+    },
     /// W.5: wPoA consensus vote for a proposed block.
     ///
     /// Broadcast by each validator after receiving a proposed block.
@@ -821,6 +830,7 @@ mod tests {
             NetworkMessage::BodyRequest {
                 start_number: 1,
                 count: MAX_RESPONSE_BLOCKS as u64 + 1,
+                nonce: 0,
             },
         ] {
             let json = serde_json::to_vec(&msg).unwrap();
@@ -829,6 +839,23 @@ mod tests {
                 matches!(err, NetworkError::Serialization(message) if message.contains("request count must be between"))
             );
         }
+    }
+
+    #[test]
+    fn body_sync_nonces_default_for_legacy_messages() {
+        let request: NetworkMessage =
+            serde_json::from_str(r#"{"BodyRequest":{"start_number":1,"count":1}}"#).unwrap();
+        assert!(matches!(
+            request,
+            NetworkMessage::BodyRequest { nonce: 0, .. }
+        ));
+
+        let response: NetworkMessage =
+            serde_json::from_str(r#"{"BodyResponse":{"blocks":[]}}"#).unwrap();
+        assert!(matches!(
+            response,
+            NetworkMessage::BodyResponse { nonce: 0, .. }
+        ));
     }
 
     #[test]
@@ -1015,8 +1042,11 @@ mod tests {
         let ping = serde_json::to_vec(&NetworkMessage::Ping).unwrap();
         assert!(serialized_message_uses_sequence_scoped_id(&ping));
 
-        let body_response =
-            serde_json::to_vec(&NetworkMessage::BodyResponse { blocks: Vec::new() }).unwrap();
+        let body_response = serde_json::to_vec(&NetworkMessage::BodyResponse {
+            blocks: Vec::new(),
+            nonce: 0,
+        })
+        .unwrap();
         assert!(serialized_message_uses_sequence_scoped_id(&body_response));
 
         let tx = serde_json::to_vec(&NetworkMessage::NewTransaction(Box::new(test_signed_tx())))

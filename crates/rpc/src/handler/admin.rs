@@ -10,8 +10,7 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
         let block_height = self
             .chain_store
             .get_head_block()
-            .ok()
-            .flatten()
+            .map_err(internal_err)?
             .map(|b| b.header.number)
             .unwrap_or(0);
 

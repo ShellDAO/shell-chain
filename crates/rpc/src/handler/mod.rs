@@ -1266,13 +1266,79 @@ mod tests {
     use shell_core::{Block, BlockHeader, SystemTransaction, Transaction, TransactionReceipt};
     use shell_crypto::{DilithiumSigner, Signer};
     use shell_primitives::Bytes;
-    use shell_storage::{MemoryDb, ProofAmendmentStore, WitnessStore};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use shell_storage::{MemoryDb, ProofAmendmentStore, StorageError, WitnessStore, WriteBatch};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     #[derive(Default)]
     struct MockDevControl {
         mined: AtomicU64,
         increased: AtomicU64,
+    }
+
+    #[derive(Default)]
+    struct FailingGetStore(MemoryDb);
+
+    impl KvStore for FailingGetStore {
+        fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            Err(StorageError::Database("injected get failure".into()))
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.0.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.0.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.0.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            self.0.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.0.scan_prefix(prefix)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingCanonicalReadStore {
+        inner: MemoryDb,
+        fail_canonical_reads: AtomicBool,
+    }
+
+    impl KvStore for FailingCanonicalReadStore {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_canonical_reads.load(Ordering::Relaxed) && key.starts_with(b"n/") {
+                return Err(StorageError::Database(
+                    "injected canonical block read failure".into(),
+                ));
+            }
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            self.inner.write_batch(batch)
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
     }
 
     impl DevRpcControl for MockDevControl {
@@ -1298,8 +1364,7 @@ mod tests {
         }
     }
 
-    fn setup() -> RpcHandler<MemoryDb> {
-        let db = Arc::new(MemoryDb::new());
+    fn setup_with_store<S: KvStore + 'static>(db: Arc<S>) -> RpcHandler<S> {
         let chain_store = Arc::new(ChainStore::new(db.clone()));
         let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
         let tx_pool = Arc::new(TxPool::new(shell_mempool::MempoolConfig {
@@ -1319,6 +1384,10 @@ mod tests {
             finalized_number,
             finality,
         )
+    }
+
+    fn setup() -> RpcHandler<MemoryDb> {
+        setup_with_store(Arc::new(MemoryDb::new()))
     }
 
     fn test_address(seed: &[u8]) -> Address {
@@ -1891,6 +1960,56 @@ mod tests {
                 .contains("legacy address transaction pagination offset"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn address_transaction_endpoints_propagate_head_lookup_failures() {
+        let handler = setup_with_store(Arc::new(FailingGetStore::default()));
+        let address = test_address(b"head-lookup-failure");
+
+        let v2_err = ShellApiServer::get_transactions_by_address_v2(
+            &handler,
+            address,
+            Some(RpcAddressTransactionsV2Options::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(v2_err.code(), -32603);
+
+        let legacy_err =
+            ShellApiServer::get_transactions_by_address(&handler, address, None, None, None, None)
+                .await
+                .unwrap_err();
+        assert_eq!(legacy_err.code(), -32603);
+    }
+
+    #[tokio::test]
+    async fn admin_node_info_propagates_head_lookup_failures() {
+        let handler = setup_with_store(Arc::new(FailingGetStore::default()));
+
+        let err = AdminApiServer::node_info(&handler).await.unwrap_err();
+
+        assert_eq!(err.code(), -32603);
+    }
+
+    #[tokio::test]
+    async fn fee_endpoints_propagate_storage_failures() {
+        let handler = setup_with_store(Arc::new(FailingGetStore::default()));
+
+        let gas_price_err = EthApiServer::gas_price(&handler).await.unwrap_err();
+        assert_eq!(gas_price_err.code(), -32603);
+
+        let latest_history_err =
+            EthApiServer::fee_history(&handler, "0x1".into(), "latest".into(), None)
+                .await
+                .unwrap_err();
+        assert_eq!(latest_history_err.code(), -32603);
+
+        let explicit_history_err =
+            EthApiServer::fee_history(&handler, "0x1".into(), "0x0".into(), None)
+                .await
+                .unwrap_err();
+        assert_eq!(explicit_history_err.code(), -32603);
     }
 
     #[tokio::test]
@@ -4734,6 +4853,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_chain_stats_propagates_average_block_time_read_failures() {
+        let store = Arc::new(FailingCanonicalReadStore::default());
+        let handler = setup_with_store(store.clone());
+
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+
+        let mut block = genesis;
+        block.header.number = 1;
+        block.header.parent_hash = genesis_hash;
+        block.header.timestamp += 3;
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        store.fail_canonical_reads.store(true, Ordering::Relaxed);
+        let err = ShellApiServer::get_chain_stats(&handler).await.unwrap_err();
+
+        assert_eq!(err.code(), -32603);
+    }
+
+    #[tokio::test]
     async fn get_chain_stats_rebuilds_full_chain_totals() {
         let handler = setup();
 
@@ -5607,6 +5751,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_filter_preserves_cursor_across_canonical_gaps() {
+        let handler = setup();
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+        handler.chain_store.set_head(&genesis_hash).unwrap();
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+
+        let block1 = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash1 = block1.hash();
+        let block2 = Block {
+            header: BlockHeader {
+                parent_hash: hash1,
+                number: 2,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash2 = block2.hash();
+        handler.chain_store.put_block(&block2).unwrap();
+        handler.chain_store.set_canonical(2, &hash2).unwrap();
+        handler.chain_store.set_head(&hash2).unwrap();
+
+        let error = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32603);
+        assert_eq!(
+            handler
+                .filter_registry
+                .get_filter_info(&filter_id)
+                .unwrap()
+                .1,
+            0
+        );
+
+        handler.chain_store.put_block(&block1).unwrap();
+        handler.chain_store.set_canonical(1, &hash1).unwrap();
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        assert_eq!(changes, serde_json::json!([hash1, hash2]));
+    }
+
+    #[tokio::test]
     async fn block_filter_changes_are_range_capped() {
         let handler = setup();
 
@@ -5739,6 +5940,42 @@ mod tests {
         let arr = changes.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn log_filter_preserves_cursor_across_canonical_gaps() {
+        let handler = setup();
+        store_block_with_logs(&handler, 0, vec![vec![]]);
+        let address = Address::from([0xAB; 20]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"fromBlock":"0x0","address":"{}"}}"#, address))
+                .unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        let log = shell_core::Log::new(address, vec![], Bytes::new()).unwrap();
+        let hash2 = store_block_with_logs(&handler, 2, vec![vec![log]]);
+
+        let error = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32603);
+        assert_eq!(
+            handler
+                .filter_registry
+                .get_filter_info(&filter_id)
+                .unwrap()
+                .1,
+            0
+        );
+
+        store_block_with_logs(&handler, 1, vec![vec![]]);
+        handler.chain_store.set_head(&hash2).unwrap();
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["blockNumber"], "0x2");
     }
 
     #[tokio::test]

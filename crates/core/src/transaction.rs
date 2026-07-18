@@ -509,6 +509,61 @@ impl SessionAuth {
         blake3_hash(&preimage)
     }
 
+    fn signing_fields_len(&self) -> usize {
+        let pubkey_len = self.session_pubkey.as_ref().length();
+        let algo_len = (self.session_algo as u64).length();
+        let target_len = match &self.target {
+            Some(addr) => addr.length(),
+            None => 1,
+        };
+        let value_buf = self.value_cap.to_be_bytes::<32>();
+        let trimmed = value_buf
+            .iter()
+            .position(|&b| b != 0)
+            .map(|i| &value_buf[i..])
+            .unwrap_or(&value_buf[31..]);
+        pubkey_len
+            .saturating_add(algo_len)
+            .saturating_add(target_len)
+            .saturating_add(trimmed.length())
+            .saturating_add(self.expiry_block.length())
+    }
+
+    fn encode_for_signing(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.signing_fields_len(),
+        };
+        header.encode(out);
+        self.session_pubkey.as_ref().encode(out);
+        (self.session_algo as u64).encode(out);
+        match &self.target {
+            Some(addr) => addr.encode(out),
+            None => {
+                let empty: &[u8] = &[];
+                empty.encode(out);
+            }
+        }
+        let value_buf = self.value_cap.to_be_bytes::<32>();
+        let trimmed = value_buf
+            .iter()
+            .position(|&b| b != 0)
+            .map(|i| &value_buf[i..])
+            .unwrap_or(&value_buf[31..]);
+        trimmed.encode(out);
+        self.expiry_block.encode(out);
+    }
+
+    fn signing_length(&self) -> usize {
+        let payload = self.signing_fields_len();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload,
+        }
+        .length()
+        .saturating_add(payload)
+    }
+
     fn fields_len(&self) -> usize {
         let pubkey_len = self.session_pubkey.as_ref().length();
         let algo_len = (self.session_algo as u64).length();
@@ -960,9 +1015,9 @@ impl AaBundle {
 impl AaBundle {
     /// Length of the signing-form payload (excludes all signatures:
     /// `paymaster_signature`, `session_auth.root_signature`, and
-    /// `session_auth.session_signature`). `paymaster_context` is included
-    /// so the sender commits to the exact context being passed to the
-    /// contract paymaster.
+    /// `session_auth.session_signature`). `paymaster_context` and the
+    /// non-signature session authorization fields are included so the sender
+    /// commits to the exact delegated scope and contract context.
     ///
     /// Both sender batch hash and paymaster authorization hash hash the bundle
     /// in this signature-stripped form to avoid circular dependencies.
@@ -982,9 +1037,15 @@ impl AaBundle {
             Some(ctx) if !ctx.is_empty() => ctx.as_ref().length(),
             _ => 1,
         };
+        let session_len = self
+            .session_auth
+            .as_ref()
+            .map(SessionAuth::signing_length)
+            .unwrap_or(0);
         inner_list_len
             .saturating_add(paymaster_len)
             .saturating_add(ctx_len)
+            .saturating_add(session_len)
     }
 
     /// Encodes the bundle for signing-hash purposes (omits all signatures).
@@ -1017,6 +1078,9 @@ impl AaBundle {
                 let empty: &[u8] = &[];
                 empty.encode(out);
             }
+        }
+        if let Some(session_auth) = &self.session_auth {
+            session_auth.encode_for_signing(out);
         }
     }
 
@@ -3470,6 +3534,93 @@ mod tests {
             ]
         );
         assert_ne!(unrestricted.auth_hash(1337), zero_target.auth_hash(1337));
+    }
+
+    #[test]
+    fn session_bundle_signing_hash_binds_authorization_metadata() {
+        let tx = Transaction {
+            chain_id: 1,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let from = Address::from([0x42; 20]);
+        let signature = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
+        let auth = SessionAuth {
+            session_pubkey: Bytes::from(vec![0xA5; 32]),
+            session_algo: SignatureType::Dilithium3.as_u8(),
+            target: Some(Address::from([0x11; 32])),
+            value_cap: U256::from(1_000u64),
+            expiry_block: 42,
+            root_signature: Bytes::from(vec![0x01; 96]),
+            session_signature: Bytes::from(vec![0x02; 96]),
+        };
+        let signing_hash = |session_auth| {
+            SignedTransaction::with_aa_bundle(
+                from,
+                tx.clone(),
+                signature.clone(),
+                PubkeyMode::Reference,
+                AaBundle {
+                    inner_calls: vec![InnerCall {
+                        to: Some(Address::from([0x42; 32])),
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 21_000,
+                    }],
+                    session_auth: Some(session_auth),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .sender_signing_hash()
+        };
+        let expected = signing_hash(auth.clone());
+        assert_eq!(
+            expected.as_bytes(),
+            &[
+                0x40, 0x83, 0xd5, 0x07, 0x9c, 0x93, 0x81, 0xba, 0xe7, 0xe2, 0x84, 0x61, 0x73, 0x55,
+                0x9b, 0xf6, 0xa3, 0x5f, 0x43, 0x02, 0x97, 0xc8, 0xf4, 0x6b, 0x0f, 0x79, 0x8c, 0xab,
+                0xb9, 0x6a, 0xda, 0x3d,
+            ]
+        );
+
+        let mut variants = Vec::new();
+        let mut changed = auth.clone();
+        changed.session_pubkey = Bytes::from(vec![0xB6; 32]);
+        variants.push(changed);
+        let mut changed = auth.clone();
+        changed.session_algo = SignatureType::MlDsa65.as_u8();
+        variants.push(changed);
+        let mut changed = auth.clone();
+        changed.target = None;
+        variants.push(changed);
+        let mut changed = auth.clone();
+        changed.value_cap += U256::from(1u64);
+        variants.push(changed);
+        let mut changed = auth.clone();
+        changed.expiry_block += 1;
+        variants.push(changed);
+
+        for variant in variants {
+            assert_ne!(expected, signing_hash(variant));
+        }
+
+        let mut changed = auth.clone();
+        changed.root_signature = Bytes::from(vec![0x03; 96]);
+        assert_eq!(expected, signing_hash(changed));
+
+        let mut changed = auth;
+        changed.session_signature = Bytes::from(vec![0x04; 96]);
+        assert_eq!(expected, signing_hash(changed));
     }
 
     #[test]

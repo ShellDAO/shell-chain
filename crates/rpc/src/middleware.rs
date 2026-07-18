@@ -4,6 +4,7 @@
 //! can be composed with jsonrpsee's `set_http_middleware`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -59,11 +60,18 @@ impl RateLimiterState {
 const MAX_RATE_LIMIT_BUCKETS: usize = 16;
 const RATE_LIMIT_BUCKET_TTL: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RateLimitBucketKey {
+    Authenticated,
+    PublicPeer(IpAddr),
+    PublicUnknown,
+}
+
 /// Tower layer that enforces a global request rate limit (req/sec).
-/// Clone-compatible: all clones share the same `Arc<Mutex<RateLimiterState>>`.
+/// Clone-compatible: all clones share the same bounded bucket map.
 #[derive(Clone)]
 pub struct RateLimitLayer {
-    buckets: Arc<Mutex<HashMap<String, RateLimiterState>>>,
+    buckets: Arc<Mutex<HashMap<RateLimitBucketKey, RateLimiterState>>>,
     max_per_sec: u32,
 }
 
@@ -103,7 +111,7 @@ impl<S> Layer<S> for RateLimitLayer {
 #[derive(Clone)]
 pub struct RateLimitService<S> {
     inner: S,
-    buckets: Arc<Mutex<HashMap<String, RateLimiterState>>>,
+    buckets: Arc<Mutex<HashMap<RateLimitBucketKey, RateLimiterState>>>,
     max_per_sec: u32,
 }
 
@@ -129,11 +137,15 @@ where
         let bucket_key = rate_limit_bucket_key(&req);
         let allowed = {
             let mut buckets = self.buckets.lock();
-            prune_rate_limit_buckets(&mut buckets);
-            buckets
-                .entry(bucket_key)
-                .or_insert_with(|| RateLimiterState::new(self.max_per_sec))
-                .check_and_record()
+            if let Some(bucket) = buckets.get_mut(&bucket_key) {
+                bucket.check_and_record()
+            } else {
+                prune_rate_limit_buckets(&mut buckets);
+                buckets
+                    .entry(bucket_key)
+                    .or_insert_with(|| RateLimiterState::new(self.max_per_sec))
+                    .check_and_record()
+            }
         };
 
         if allowed {
@@ -146,7 +158,7 @@ where
     }
 }
 
-fn rate_limit_bucket_key<B>(req: &Request<B>) -> String {
+fn rate_limit_bucket_key<B>(req: &Request<B>) -> RateLimitBucketKey {
     if req
         .headers()
         .get(http::header::AUTHORIZATION)
@@ -155,35 +167,32 @@ fn rate_limit_bucket_key<B>(req: &Request<B>) -> String {
         .filter(|token| !token.is_empty())
         .is_some()
     {
-        "authenticated".to_string()
+        RateLimitBucketKey::Authenticated
     } else if let Some(peer) = req.extensions().get::<std::net::SocketAddr>() {
         // SocketAddr is supplied by the transport, unlike a client-controlled
         // forwarding header. Do not trust X-Forwarded-For in this layer.
-        format!("public:{}", peer.ip())
+        RateLimitBucketKey::PublicPeer(peer.ip())
     } else {
-        "public".to_string()
+        RateLimitBucketKey::PublicUnknown
     }
 }
 
-fn prune_rate_limit_buckets(buckets: &mut HashMap<String, RateLimiterState>) {
+fn prune_rate_limit_buckets(buckets: &mut HashMap<RateLimitBucketKey, RateLimiterState>) {
     if buckets.len() < MAX_RATE_LIMIT_BUCKETS {
         return;
     }
     let now = Instant::now();
     buckets
         .retain(|_, state| now.saturating_duration_since(state.last_seen) < RATE_LIMIT_BUCKET_TTL);
-    if buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
-        let mut keys_by_age: Vec<(String, Instant)> = buckets
+    while buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        let oldest_key = buckets
             .iter()
-            .map(|(key, state)| (key.clone(), state.last_seen))
-            .collect();
-        keys_by_age.sort_by_key(|(_, last_seen)| *last_seen);
-        for (key, _) in keys_by_age
-            .into_iter()
-            .take(buckets.len().saturating_sub(MAX_RATE_LIMIT_BUCKETS - 1))
-        {
-            buckets.remove(&key);
-        }
+            .min_by_key(|(_, state)| state.last_seen)
+            .map(|(key, _)| *key);
+        let Some(oldest_key) = oldest_key else {
+            break;
+        };
+        buckets.remove(&oldest_key);
     }
 }
 
@@ -266,13 +275,14 @@ where
 /// token when an API key is configured.
 #[derive(Clone)]
 pub struct ApiKeyLayer {
-    api_key: Option<Arc<str>>,
+    /// Complete expected Authorization header, prepared once at startup.
+    expected_authorization: Option<Arc<str>>,
 }
 
 impl ApiKeyLayer {
     pub fn new(api_key: Option<String>) -> Self {
         Self {
-            api_key: api_key.map(|k| Arc::from(k.as_str())),
+            expected_authorization: api_key.map(|key| Arc::from(format!("Bearer {key}"))),
         }
     }
 }
@@ -283,7 +293,7 @@ impl<S> Layer<S> for ApiKeyLayer {
     fn layer(&self, inner: S) -> Self::Service {
         ApiKeyService {
             inner,
-            api_key: self.api_key.clone(),
+            expected_authorization: self.expected_authorization.clone(),
         }
     }
 }
@@ -292,7 +302,7 @@ impl<S> Layer<S> for ApiKeyLayer {
 #[derive(Clone)]
 pub struct ApiKeyService<S> {
     inner: S,
-    api_key: Option<Arc<str>>,
+    expected_authorization: Option<Arc<str>>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for ApiKeyService<S>
@@ -314,15 +324,14 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        if let Some(ref key) = self.api_key {
-            let expected = format!("Bearer {key}");
-            let auth = req
+        if let Some(ref expected) = self.expected_authorization {
+            let authorized = req
                 .headers()
                 .get(http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == expected.as_ref());
 
-            if auth != expected {
+            if !authorized {
                 let mut resp = Response::new(ResBody::default());
                 *resp.status_mut() = StatusCode::UNAUTHORIZED;
                 return futures_util::future::Either::Right(std::future::ready(Ok(resp)));
@@ -487,7 +496,7 @@ mod tests {
             .unwrap_or(now);
         let mut buckets = HashMap::new();
         buckets.insert(
-            "future".to_string(),
+            RateLimitBucketKey::PublicUnknown,
             RateLimiterState {
                 max_per_sec: 1,
                 window_start: now,
@@ -497,7 +506,7 @@ mod tests {
         );
         for i in 0..MAX_RATE_LIMIT_BUCKETS {
             buckets.insert(
-                format!("stale-{i}"),
+                RateLimitBucketKey::PublicPeer(std::net::Ipv4Addr::from(i as u32).into()),
                 RateLimiterState {
                     max_per_sec: 1,
                     window_start: stale,
@@ -509,8 +518,76 @@ mod tests {
 
         prune_rate_limit_buckets(&mut buckets);
 
-        assert!(buckets.contains_key("future"));
+        assert!(buckets.contains_key(&RateLimitBucketKey::PublicUnknown));
         assert!(buckets.len() < MAX_RATE_LIMIT_BUCKETS);
+    }
+
+    #[test]
+    fn rate_limit_capacity_pruning_removes_oldest_bucket() {
+        let now = Instant::now();
+        let mut buckets = HashMap::new();
+        for i in 0..MAX_RATE_LIMIT_BUCKETS {
+            let last_seen = now
+                .checked_sub(Duration::from_secs((MAX_RATE_LIMIT_BUCKETS - i) as u64))
+                .unwrap_or(now);
+            buckets.insert(
+                RateLimitBucketKey::PublicPeer(std::net::Ipv4Addr::from(i as u32).into()),
+                RateLimiterState {
+                    max_per_sec: 1,
+                    window_start: last_seen,
+                    last_seen,
+                    count: 0,
+                },
+            );
+        }
+
+        prune_rate_limit_buckets(&mut buckets);
+
+        assert_eq!(buckets.len(), MAX_RATE_LIMIT_BUCKETS - 1);
+        assert!(!buckets.contains_key(&RateLimitBucketKey::PublicPeer(
+            std::net::Ipv4Addr::from(0).into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_capacity_pruning_runs_only_for_new_buckets() {
+        let layer = RateLimitLayer::new(10_000);
+        let now = Instant::now();
+        {
+            let mut buckets = layer.buckets.lock();
+            buckets.insert(
+                RateLimitBucketKey::PublicUnknown,
+                RateLimiterState {
+                    max_per_sec: 10_000,
+                    window_start: now,
+                    last_seen: now + Duration::from_secs(60),
+                    count: 0,
+                },
+            );
+            for i in 0..(MAX_RATE_LIMIT_BUCKETS - 1) {
+                buckets.insert(
+                    RateLimitBucketKey::PublicPeer(std::net::Ipv4Addr::from(i as u32).into()),
+                    RateLimiterState {
+                        max_per_sec: 10_000,
+                        window_start: now,
+                        last_seen: now,
+                        count: 0,
+                    },
+                );
+            }
+        }
+
+        let mut svc = layer.layer(OkService);
+        let response = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(layer.bucket_count(), MAX_RATE_LIMIT_BUCKETS);
     }
 
     #[tokio::test]
@@ -533,6 +610,22 @@ mod tests {
             .header(http::header::AUTHORIZATION, "Bearer wrong")
             .body(())
             .unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_rejects_non_ascii_header_values() {
+        let layer = ApiKeyLayer::new(Some("é".into()));
+        let mut svc = layer.layer(OkService);
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_bytes("Bearer é".as_bytes()).unwrap(),
+            )
+            .body(())
+            .unwrap();
+
         let resp = svc.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }

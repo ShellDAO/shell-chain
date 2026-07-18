@@ -3,7 +3,7 @@
 //! Sends transactions and makes read-only calls to a running shell-node
 //! via JSON-RPC.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use shell_core::{SignedTransaction, Transaction};
@@ -12,6 +12,7 @@ use shell_keystore::{decrypt_any, EncryptedKey};
 use shell_primitives::{Address, Bytes, U256};
 
 use crate::password::{resolve_password, PasswordArgs};
+use crate::secure_file::read_sensitive_file;
 
 #[derive(Subcommand)]
 pub enum TxCommand {
@@ -295,13 +296,13 @@ fn cmd_call(
 
 /// Load a keystore file and decrypt the signer.
 fn load_keystore(
-    path: &PathBuf,
+    path: &Path,
     password_args: &PasswordArgs,
 ) -> Result<Box<dyn Signer>, Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("keystore file not found: {}", path.display()).into());
     }
-    let json = std::fs::read_to_string(path)?;
+    let json = read_sensitive_file(path)?;
     let encrypted: EncryptedKey = serde_json::from_str(&json)?;
 
     let password = resolve_password("Enter keystore password: ", password_args)?;

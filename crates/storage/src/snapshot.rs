@@ -171,6 +171,7 @@ impl<W: Write> SnapshotWriter<W> {
 
     /// Write a key-value entry to the snapshot.
     pub fn write_entry(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        validate_entry_lengths(key.len(), value.len())?;
         let entry = SnapshotEntry {
             key: key.to_vec(),
             value: value.to_vec(),
@@ -417,12 +418,16 @@ fn trim_line_end(line: &[u8]) -> &[u8] {
 }
 
 fn validate_entry_size(entry: &SnapshotEntry) -> Result<(), StorageError> {
-    if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+    validate_entry_lengths(entry.key.len(), entry.value.len())
+}
+
+fn validate_entry_lengths(key_len: usize, value_len: usize) -> Result<(), StorageError> {
+    if key_len > MAX_SNAPSHOT_KEY_BYTES {
         return Err(StorageError::State(format!(
             "snapshot key exceeds maximum of {MAX_SNAPSHOT_KEY_BYTES} bytes"
         )));
     }
-    if entry.value.len() > MAX_SNAPSHOT_VALUE_BYTES {
+    if value_len > MAX_SNAPSHOT_VALUE_BYTES {
         return Err(StorageError::State(format!(
             "snapshot value exceeds maximum of {MAX_SNAPSHOT_VALUE_BYTES} bytes"
         )));
@@ -450,6 +455,22 @@ mod tests {
 
         assert_eq!(written_meta.data_size, 19);
         assert_eq!(saturating_entry_data_len(usize::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_writer_rejects_entries_the_reader_cannot_import() {
+        let mut buffer = Vec::new();
+        let mut writer = SnapshotWriter::new(Cursor::new(&mut buffer), test_metadata()).unwrap();
+
+        let oversized_key = vec![0; MAX_SNAPSHOT_KEY_BYTES + 1];
+        let err = writer.write_entry(&oversized_key, b"value").unwrap_err();
+        assert!(err.to_string().contains("snapshot key exceeds maximum"));
+        assert!(writer.writer.get_ref().is_empty());
+
+        let oversized_value = vec![0; MAX_SNAPSHOT_VALUE_BYTES + 1];
+        let err = writer.write_entry(b"key", &oversized_value).unwrap_err();
+        assert!(err.to_string().contains("snapshot value exceeds maximum"));
+        assert!(writer.writer.get_ref().is_empty());
     }
 
     #[test]

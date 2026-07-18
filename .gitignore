@@ -4,6 +4,8 @@
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
+__pycache__/
+*.py[cod]
 
 # IDE
 .vscode/
@@ -24,6 +26,7 @@ Thumbs.db
 *.log
 diff_m6b2.txt
 tools/tx-generator/target/
+tools/default-pq-validator-artifacts/node_modules/
 
 # Local debug scratch
 /debug-*.mjs

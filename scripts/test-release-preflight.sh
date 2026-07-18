@@ -79,4 +79,14 @@ fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
 git -C "$fixture" switch -qc release/v0.27.1
 assert_fails_with "$fixture" '0.27.1' "cargo fmt check failed"
 
+fixture=$(make_fixture $'## [Unreleased]\n\n## [0.27.1] - test release')
+git -C "$fixture" switch -q --orphan release/v0.27.1
+mkdir -p "$fixture/scripts"
+cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
+printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
+printf '## [Unreleased]\n\n## [0.27.1] - test release\n' > "$fixture/CHANGELOG.md"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm "unrelated release history"
+assert_fails_with "$fixture" '0.27.1' "must descend from 'main'"
+
 echo "release preflight tests passed"

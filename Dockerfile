@@ -7,7 +7,7 @@
 # Single-arch local build:
 #   docker build -t shell-node:latest .
 ARG TARGETPLATFORM
-FROM --platform=${TARGETPLATFORM:-linux/amd64} rust:1.93-bookworm AS builder
+FROM --platform=${TARGETPLATFORM:-linux/amd64} rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 
 # Install RocksDB build dependencies
 RUN apt-get update && apt-get install -y \
@@ -21,7 +21,7 @@ COPY . .
 RUN scripts/build-release-binary.sh
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update && apt-get install -y \
     ca-certificates curl jq \

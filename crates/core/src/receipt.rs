@@ -113,6 +113,9 @@ impl Decodable for TransactionReceipt {
         let block_number = u64::decode(buf)?;
         let tx_index = u32::decode(buf)?;
         let status = u8::decode(buf)?;
+        if status > 1 {
+            return Err(alloy_rlp::Error::Custom("receipt status must be 0 or 1"));
+        }
         let gas_used = u64::decode(buf)?;
         let cumulative_gas_used = u64::decode(buf)?;
 
@@ -257,6 +260,27 @@ mod tests {
         receipt.encode(&mut buf);
         let decoded = TransactionReceipt::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(receipt, decoded);
+    }
+
+    #[test]
+    fn receipt_rlp_rejects_non_binary_status() {
+        let receipt = TransactionReceipt {
+            tx_hash: keccak256(b"non-binary-status"),
+            block_number: 1,
+            tx_index: 0,
+            status: 2,
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            contract_address: None,
+            logs_bloom: Bytes::new(),
+            logs: vec![],
+        };
+        let mut buf = Vec::new();
+        receipt.encode(&mut buf);
+
+        let err = TransactionReceipt::decode(&mut buf.as_slice()).unwrap_err();
+
+        assert!(err.to_string().contains("receipt status must be 0 or 1"));
     }
 
     #[test]

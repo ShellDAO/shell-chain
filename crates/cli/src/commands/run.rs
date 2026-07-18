@@ -26,6 +26,7 @@ use shell_storage::{ChainStore, KvStore, MemoryDb, WorldState};
 use tracing::{error, info, warn};
 
 use crate::password::{resolve_password, PasswordArgs};
+use crate::secure_file::{read_sensitive_file, write_sensitive_file_new};
 
 /// Aggregated CLI arguments for the `run` subcommand.
 pub struct RunArgs {
@@ -130,15 +131,26 @@ fn validate_role_authority(
     Ok(())
 }
 
+fn decode_dev_signer(json: &str) -> Result<DilithiumSigner, Box<dyn std::error::Error>> {
+    let stored: DevAuthorityKeyFile = serde_json::from_str(json)?;
+    let public_key = hex::decode(stored.public_key.trim_start_matches("0x"))?;
+    let secret_key = hex::decode(stored.secret_key.trim_start_matches("0x"))?;
+    Ok(DilithiumSigner::from_bytes(&public_key, &secret_key)?)
+}
+
+fn load_dev_signer(path: &Path) -> Result<DilithiumSigner, Box<dyn std::error::Error>> {
+    decode_dev_signer(&read_sensitive_file(path)?)
+}
+
 fn load_or_create_dev_signer(path: &Path) -> Result<DilithiumSigner, Box<dyn std::error::Error>> {
-    if path.exists() {
-        let json = std::fs::read_to_string(path)?;
-        let stored: DevAuthorityKeyFile = serde_json::from_str(&json)?;
-        let public_key = hex::decode(stored.public_key.trim_start_matches("0x"))?;
-        let secret_key = hex::decode(stored.secret_key.trim_start_matches("0x"))?;
-        let signer = DilithiumSigner::from_bytes(&public_key, &secret_key)?;
-        info!("Loaded persisted dev authority key from {}", path.display());
-        return Ok(signer);
+    match read_sensitive_file(path) {
+        Ok(json) => {
+            let signer = decode_dev_signer(&json)?;
+            info!("Loaded persisted dev authority key from {}", path.display());
+            return Ok(signer);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let signer = DilithiumSigner::generate();
@@ -147,19 +159,21 @@ fn load_or_create_dev_signer(path: &Path) -> Result<DilithiumSigner, Box<dyn std
         secret_key: format!("0x{}", hex::encode(signer.secret_key_bytes().as_slice())),
     };
     let json = serde_json::to_string_pretty(&stored)?;
-    {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts.open(path)?;
-        file.write_all(json.as_bytes())?;
+    match write_sensitive_file_new(path, json) {
+        Ok(()) => {
+            info!("Persisted dev authority key to {}", path.display());
+            Ok(signer)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let signer = load_dev_signer(path)?;
+            info!(
+                "Loaded concurrently persisted dev authority key from {}",
+                path.display()
+            );
+            Ok(signer)
+        }
+        Err(error) => Err(error.into()),
     }
-    info!("Persisted dev authority key to {}", path.display());
-    Ok(signer)
 }
 
 fn validate_state_root<S: KvStore + 'static>(
@@ -338,7 +352,7 @@ async fn run_with_store<S: KvStore + 'static>(
                 }
             }
             info!("Loading keystore from {}", path.display());
-            let json = std::fs::read_to_string(&path)?;
+            let json = read_sensitive_file(&path)?;
             let encrypted: EncryptedKey = serde_json::from_str(&json)?;
             let unlocked_address = Address::parse(&encrypted.address)
                 .map_err(|e| format!("invalid keystore address '{}': {e}", encrypted.address))?;
@@ -952,6 +966,35 @@ mod tests {
 
         assert_eq!(signer1.public_key(), signer2.public_key());
         assert_eq!(signer1.secret_key_bytes(), signer2.secret_key_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_authority_signer_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        let linked = dir.path().join(DEV_AUTHORITY_KEY_FILE);
+        load_or_create_dev_signer(&target).unwrap();
+        symlink(target, &linked).unwrap();
+
+        let error = match load_or_create_dev_signer(&linked) {
+            Ok(_) => panic!("symbolic-link authority key must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn dev_authority_signer_does_not_replace_invalid_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
+        std::fs::write(&path, b"not a key").unwrap();
+
+        assert!(load_or_create_dev_signer(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a key");
     }
 
     #[test]

@@ -10,8 +10,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use shell_core::BlockHeader;
 use shell_primitives::ShellHash;
 
+use crate::chain_store::decode_versioned;
 use crate::{KvStore, StorageError, WriteBatch};
 
 /// Minimum allowed retention count (safety floor).
@@ -28,6 +30,9 @@ const DEFAULT_PRUNE_INTERVAL: u64 = 256;
 /// can operate on the same store without importing `ChainStore`.
 const CANONICAL_PREFIX: &[u8] = b"n/";
 
+/// Key prefix used by [`ChainStore`](crate::ChainStore) for block headers.
+const HEADER_PREFIX: &[u8] = b"h/";
+
 fn retention_cutoff(highest_block: u64, retention_count: u64) -> u64 {
     highest_block.saturating_sub(retention_count.saturating_sub(1))
 }
@@ -43,6 +48,14 @@ pub struct PruneResult {
 
 /// Maximum entries in block_roots before evicting oldest (F-304).
 const MAX_BLOCK_ROOTS: usize = 10_000;
+
+fn canonical_block_number(key: &[u8]) -> Result<u64, StorageError> {
+    let number_bytes = key
+        .strip_prefix(CANONICAL_PREFIX)
+        .and_then(|suffix| <[u8; 8]>::try_from(suffix).ok())
+        .ok_or_else(|| StorageError::Codec("invalid canonical mapping key".into()))?;
+    Ok(u64::from_be_bytes(number_bytes))
+}
 
 /// Tracks active state roots and performs lazy pruning of canonical mappings.
 ///
@@ -158,28 +171,80 @@ impl StatePruner {
 
         // Effective cutoff: the stricter of prunable_below and retention_cutoff.
         let cutoff = self.prunable_below.min(retention_cutoff);
+        if cutoff == 0 {
+            return Ok(PruneResult {
+                pruned_count: 0,
+                protected_count: 0,
+            });
+        }
 
-        // Collect block numbers eligible for pruning (below the cutoff).
-        let eligible: Vec<u64> = self.block_roots.range(..cutoff).map(|(&n, _)| n).collect();
+        // Scan persisted canonical mappings so entries evicted from the bounded
+        // root tracker remain discoverable. Each pass is capped to bound memory
+        // and batch size; later passes resume naturally from mappings that remain.
+        let tracked_to_remove: Vec<u64> = self
+            .block_roots
+            .range(..cutoff)
+            .filter_map(|(&block_number, root)| {
+                (!self.active_roots.contains(root)).then_some(block_number)
+            })
+            .collect();
 
         let mut pruned_count: u64 = 0;
         let mut protected_count: u64 = 0;
         let mut batch = WriteBatch::new();
+        let mut after = None;
 
-        for block_number in &eligible {
-            let root = self.block_roots.get(block_number).cloned();
-            if let Some(ref r) = root {
-                if self.active_roots.contains(r) {
+        'pages: loop {
+            let mappings =
+                store.scan_prefix_after(CANONICAL_PREFIX, after.as_deref(), MAX_BLOCK_ROOTS)?;
+            let page_len = mappings.len();
+            if page_len == 0 {
+                break;
+            }
+
+            for (key, block_hash_bytes) in mappings {
+                let block_number = canonical_block_number(&key)?;
+                if block_number >= cutoff {
+                    break 'pages;
+                }
+                after = Some(key.clone());
+
+                let root = match self.block_roots.get(&block_number).copied() {
+                    Some(root) => root,
+                    None => {
+                        let block_hash = ShellHash::try_from_slice(&block_hash_bytes)
+                            .map_err(|e| StorageError::Codec(e.to_string()))?;
+                        let header_key = [HEADER_PREFIX, block_hash.as_bytes()].concat();
+                        let header_bytes = store.get(&header_key)?.ok_or_else(|| {
+                            StorageError::Codec(format!(
+                                "canonical block {block_number} is missing its header"
+                            ))
+                        })?;
+                        let header: BlockHeader = decode_versioned(&header_bytes)?;
+                        if header.number != block_number {
+                            return Err(StorageError::Codec(format!(
+                                "canonical block {block_number} header reports block {}",
+                                header.number
+                            )));
+                        }
+                        header.state_root
+                    }
+                };
+
+                if self.active_roots.contains(&root) {
                     protected_count = protected_count.saturating_add(1);
                     continue;
                 }
-            }
 
-            // Build the canonical mapping key: b"n/" ++ block_number (big-endian).
-            let key = [CANONICAL_PREFIX, &block_number.to_be_bytes()].concat();
-            if store.get(&key)?.is_some() {
                 batch.delete(key);
                 pruned_count = pruned_count.saturating_add(1);
+                if batch.len() >= MAX_BLOCK_ROOTS {
+                    break 'pages;
+                }
+            }
+
+            if page_len < MAX_BLOCK_ROOTS {
+                break;
             }
         }
 
@@ -188,12 +253,8 @@ impl StatePruner {
         }
 
         // Remove pruned entries from the in-memory tracker.
-        for block_number in &eligible {
-            let root = self.block_roots.get(block_number);
-            let is_protected = root.is_some_and(|r| self.active_roots.contains(r));
-            if !is_protected {
-                self.block_roots.remove(block_number);
-            }
+        for block_number in tracked_to_remove {
+            self.block_roots.remove(&block_number);
         }
 
         Ok(PruneResult {
@@ -249,7 +310,39 @@ impl StatePruner {
 mod tests {
     use super::*;
     use crate::MemoryDb;
+    use alloy_rlp::Encodable;
+    use shell_core::BlockHeader;
     use std::sync::Arc;
+
+    struct FailingBatchStore<'a> {
+        inner: &'a MemoryDb,
+    }
+
+    impl KvStore for FailingBatchStore<'_> {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.put(key, value)
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn write_batch(&self, _batch: WriteBatch) -> Result<(), StorageError> {
+            Err(StorageError::Database("injected batch failure".into()))
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            self.inner.scan_prefix(prefix)
+        }
+    }
 
     fn dummy_root(n: u8) -> ShellHash {
         ShellHash::from([n; 32])
@@ -258,6 +351,18 @@ mod tests {
     /// Build a canonical mapping key matching ChainStore format.
     fn canonical_key(block_number: u64) -> Vec<u8> {
         [CANONICAL_PREFIX, &block_number.to_be_bytes()].concat()
+    }
+
+    fn store_header(store: &MemoryDb, block_number: u64, block_hash: ShellHash, root: ShellHash) {
+        let header = BlockHeader {
+            number: block_number,
+            state_root: root,
+            ..Default::default()
+        };
+        let mut encoded = vec![0x02];
+        header.encode(&mut encoded);
+        let key = [HEADER_PREFIX, block_hash.as_bytes()].concat();
+        store.put(&key, &encoded).unwrap();
     }
 
     /// Populate the store with canonical mappings for the given block range
@@ -536,6 +641,77 @@ mod tests {
         assert_eq!(result.protected_count, 0);
         assert!(!pruner.is_tracked(10));
         assert_eq!(pruner.tracked_block_count(), 32);
+    }
+
+    #[test]
+    fn prune_revisits_mappings_evicted_from_root_tracker() {
+        let store = Arc::new(MemoryDb::new());
+        let mut pruner = StatePruner::new(32);
+
+        for block_number in 0u64..20_001 {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[24..].copy_from_slice(&block_number.to_be_bytes());
+            let block_hash = ShellHash::from(hash_bytes);
+            setup_block(&mut pruner, &store, block_number, block_hash);
+            store_header(&store, block_number, block_hash, block_hash);
+        }
+        assert_eq!(pruner.tracked_block_count(), MAX_BLOCK_ROOTS);
+        assert!(!pruner.is_tracked(0));
+        assert!(store.get(&canonical_key(0)).unwrap().is_some());
+
+        pruner.mark_prunable(20_001);
+        let first = pruner.prune(&*store).unwrap();
+        let second = pruner.prune(&*store).unwrap();
+
+        assert_eq!(first.pruned_count, 10_000);
+        assert_eq!(second.pruned_count, 9_969);
+        assert!(store.get(&canonical_key(0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_preserves_evicted_genesis_and_active_roots() {
+        let store = Arc::new(MemoryDb::new());
+        let mut pruner = StatePruner::new(32);
+        let mut genesis_bytes = [0xA1; 32];
+        genesis_bytes[31] = 0x01;
+        let genesis = ShellHash::from(genesis_bytes);
+        let mut active_bytes = [0xB2; 32];
+        active_bytes[31] = 0x02;
+        let active = ShellHash::from(active_bytes);
+
+        pruner.set_genesis_root(genesis);
+        pruner.mark_active(active);
+        setup_block(&mut pruner, &store, 0, genesis);
+        setup_block(&mut pruner, &store, 1, active);
+        setup_blocks(&mut pruner, &store, 2..10_002);
+        store_header(&store, 0, genesis, genesis);
+        store_header(&store, 1, active, active);
+        assert!(!pruner.is_tracked(0));
+        assert!(!pruner.is_tracked(1));
+
+        pruner.mark_prunable(10_002);
+        let result = pruner.prune(&*store).unwrap();
+
+        assert_eq!(result.protected_count, 2);
+        assert!(store.get(&canonical_key(0)).unwrap().is_some());
+        assert!(store.get(&canonical_key(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_batch_does_not_advance_cleanup_progress() {
+        let store = MemoryDb::new();
+        let mut pruner = StatePruner::new(32);
+        setup_blocks(&mut pruner, &store, 0..100);
+        pruner.mark_prunable(80);
+        let failing = FailingBatchStore { inner: &store };
+
+        let err = pruner.prune(&failing).unwrap_err();
+
+        assert!(matches!(err, StorageError::Database(_)));
+        assert_eq!(pruner.tracked_block_count(), 100);
+        for n in 0..68 {
+            assert!(store.get(&canonical_key(n)).unwrap().is_some());
+        }
     }
 
     // ── should_prune interval ──────────────────────────────────
