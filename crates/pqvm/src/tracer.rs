@@ -87,19 +87,27 @@ pub fn decode_revert_reason(output: &[u8]) -> Option<String> {
     if output.get(0..4) != Some(&[0x08, 0xc3, 0x79, 0xa0]) {
         return None;
     }
-    // Read string length from offset 36..68
-    let len_bytes = output.get(36..68)?;
-    let b28 = len_bytes.get(28).copied().unwrap_or(0);
-    let b29 = len_bytes.get(29).copied().unwrap_or(0);
-    let b30 = len_bytes.get(30).copied().unwrap_or(0);
-    let b31 = len_bytes.get(31).copied().unwrap_or(0);
-    let len = u32::from_be_bytes([b28, b29, b30, b31]) as usize;
 
-    if output.len() < 68usize.saturating_add(len) {
+    // Error(string) has one dynamic argument, so its canonical offset is 32.
+    let offset_bytes = output.get(4..36)?;
+    if offset_bytes.get(..31)?.iter().any(|byte| *byte != 0) || offset_bytes.get(31) != Some(&32) {
         return None;
     }
 
-    String::from_utf8(output.get(68..68usize.saturating_add(len))?.to_vec()).ok()
+    // Reject ABI lengths that cannot be represented on this platform.
+    let len_bytes = output.get(36..68)?;
+    let usize_start = len_bytes.len().checked_sub(std::mem::size_of::<usize>())?;
+    if len_bytes.get(..usize_start)?.iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let len = usize::from_be_bytes(len_bytes.get(usize_start..)?.try_into().ok()?);
+
+    let data_end = 68usize.checked_add(len)?;
+    if output.len() < data_end {
+        return None;
+    }
+
+    String::from_utf8(output.get(68..data_end)?.to_vec()).ok()
 }
 
 #[cfg(test)]
@@ -198,6 +206,25 @@ mod tests {
     #[test]
     fn test_decode_revert_reason_wrong_selector() {
         let data = vec![0xFF; 68];
+        assert_eq!(decode_revert_reason(&data), None);
+    }
+
+    #[test]
+    fn test_decode_revert_reason_rejects_noncanonical_offset() {
+        let mut data = vec![0u8; 68];
+        data[..4].copy_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
+        data[35] = 0x40;
+
+        assert_eq!(decode_revert_reason(&data), None);
+    }
+
+    #[test]
+    fn test_decode_revert_reason_rejects_unrepresentable_length() {
+        let mut data = vec![0u8; 68];
+        data[..4].copy_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
+        data[35] = 0x20;
+        data[36] = 1;
+
         assert_eq!(decode_revert_reason(&data), None);
     }
 
