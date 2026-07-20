@@ -229,6 +229,17 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_revert_reason_rejects_overflowing_data_end() {
+        let mut data = vec![0u8; 68];
+        data[..4].copy_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
+        data[35] = 0x20;
+        let usize_start = 68 - std::mem::size_of::<usize>();
+        data[usize_start..68].fill(0xff);
+
+        assert_eq!(decode_revert_reason(&data), None);
+    }
+
+    #[test]
     fn test_empty_calls_not_serialized() {
         let frame = CallFrame::new(
             "CALL",
