@@ -23,7 +23,7 @@ listen_addr = "0.0.0.0:9000"   # default
 |------|--------|-------------|
 | `/metrics` | GET | Prometheus text exposition (v0.0.4) |
 | `/health` / `/healthz` | GET | Liveness probe — always 200 when process is up |
-| `/ready` / `/readyz` | GET | Readiness probe — 503 until first block imported |
+| `/ready` / `/readyz` | GET | Readiness probe — 503 while syncing or while the production gate is closed |
 
 #### `/healthz` response
 
@@ -33,7 +33,8 @@ listen_addr = "0.0.0.0:9000"   # default
   "version": "0.27.1",
   "block_height": 12345,
   "peer_count": 4,
-  "syncing": false
+  "syncing": false,
+  "production_ready": true
 }
 ```
 
@@ -48,6 +49,10 @@ listen_addr = "0.0.0.0:9000"   # default
 ```json
 { "ready": false, "reason": "node has not imported any blocks yet" }
 ```
+
+The not-ready reason also distinguishes an active block sync from a closed
+consensus production gate. Alert when `shell_production_ready == 0` persists
+on a validator with connected peers.
 
 ---
 
@@ -70,6 +75,8 @@ All metrics are prefixed `shell_`.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `shell_peer_count` | Gauge | — | Connected libp2p peers |
+| `shell_syncing` | Gauge | — | `1` while a block synchronization request is in flight |
+| `shell_production_ready` | Gauge | — | `1` when the consensus readiness gate permits block production |
 
 ### Consensus (PoA / wPoA)
 

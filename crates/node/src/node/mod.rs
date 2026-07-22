@@ -619,6 +619,10 @@ fn record_sync_request_result(
     sent
 }
 
+fn stable_sync_request_nonce(active: Option<u64>, generated: u64) -> u64 {
+    active.unwrap_or(generated)
+}
+
 impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
     fn new(inner: &'a mut N) -> Self {
         Self { inner }
@@ -1032,10 +1036,14 @@ impl<S: KvStore + 'static> Node<S> {
             peer = target_peer.map(|p| p.0.as_str()).unwrap_or("broadcast"),
             "requesting blocks from peer"
         );
-        let nonce = SystemTime::now()
+        let generated_nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+        // Keep one nonce for the complete retry lifecycle. Replacing it before a
+        // delayed response is processed makes every valid response look stale and
+        // can leave the production readiness gate closed indefinitely under load.
+        let nonce = stable_sync_request_nonce(*sync_request_nonce, generated_nonce);
         let Some(start_number) = next_block_request_start(head_number) else {
             tracing::warn!(
                 head = head_number,
@@ -1872,6 +1880,12 @@ mod tests {
         ));
         assert!(sync_requested);
         assert_eq!(sync_request_nonce, Some(9));
+    }
+
+    #[test]
+    fn sync_retry_reuses_active_nonce_until_request_finishes() {
+        assert_eq!(stable_sync_request_nonce(Some(7), 8), 7);
+        assert_eq!(stable_sync_request_nonce(None, 8), 8);
     }
 
     #[test]

@@ -217,7 +217,7 @@ curl http://localhost:9090/health
 **Response (200 OK):**
 
 ```json
-{"status":"ok","version":"0.27.1","block_height":1234}
+{"status":"ok","version":"0.27.1","block_height":1234,"syncing":false,"production_ready":true}
 ```
 
 The node is considered alive if the process is running and can respond to HTTP requests.
@@ -239,10 +239,13 @@ curl http://localhost:9090/ready
 **Response (503 Service Unavailable) — Not Ready:**
 
 ```json
-{"ready":false,"reason":"no blocks produced yet"}
+{"ready":false,"reason":"block synchronization is in progress"}
 ```
 
-The node reports not-ready if it has not yet imported or produced any blocks. This prevents routing traffic to nodes that are still syncing.
+The node reports not-ready until it has imported a block, while block sync is
+active, and whenever the consensus production gate is closed. This prevents
+routing traffic to a validator that is alive but unable to participate in
+block production.
 
 ### Using with Docker Compose
 
@@ -601,6 +604,11 @@ RPC CORS, and bootnodes. Keep RPC on loopback unless it is protected by a
 firewall or reverse proxy. Use a separate larger host for proof work, then set
 `SHELL_NODE_ROLE=validator-prover` or `SHELL_NODE_ROLE=prover` and
 `SHELL_ENABLE_STARK_AGGREGATION=true`.
+
+Do not run multiple validator-prover processes on a 2 GiB host. On small
+multi-validator test hosts, keep every validator in the `validator` role,
+disable STARK aggregation, and monitor both `shell_production_ready` and host
+memory/I/O pressure. Proof generation belongs on a separately sized prover.
 
 ---
 

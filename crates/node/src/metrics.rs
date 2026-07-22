@@ -24,6 +24,10 @@ pub struct Metrics {
     pub finality_lag_blocks: IntGauge,
     /// Number of connected peers.
     pub peer_count: IntGauge,
+    /// Whether a block synchronization request is currently in flight.
+    pub syncing: IntGauge,
+    /// Whether the consensus readiness gate currently permits block production.
+    pub production_ready: IntGauge,
     /// Number of pending transactions in the mempool.
     pub tx_pool_size: IntGauge,
     /// Block production latency in seconds.
@@ -116,6 +120,14 @@ impl Metrics {
         ))?;
         let peer_count =
             IntGauge::with_opts(Opts::new("shell_peer_count", "Number of connected peers"))?;
+        let syncing = IntGauge::with_opts(Opts::new(
+            "shell_syncing",
+            "Whether a block synchronization request is currently in flight",
+        ))?;
+        let production_ready = IntGauge::with_opts(Opts::new(
+            "shell_production_ready",
+            "Whether the consensus readiness gate permits block production",
+        ))?;
         let tx_pool_size = IntGauge::with_opts(Opts::new(
             "shell_tx_pool_size",
             "Number of pending transactions",
@@ -240,6 +252,8 @@ impl Metrics {
         registry.register(Box::new(last_finalized_number.clone()))?;
         registry.register(Box::new(finality_lag_blocks.clone()))?;
         registry.register(Box::new(peer_count.clone()))?;
+        registry.register(Box::new(syncing.clone()))?;
+        registry.register(Box::new(production_ready.clone()))?;
         registry.register(Box::new(tx_pool_size.clone()))?;
         registry.register(Box::new(block_production_ms.clone()))?;
         registry.register(Box::new(blocks_imported.clone()))?;
@@ -270,6 +284,8 @@ impl Metrics {
             last_finalized_number,
             finality_lag_blocks,
             peer_count,
+            syncing,
+            production_ready,
             tx_pool_size,
             block_production_ms,
             blocks_imported,
@@ -426,21 +442,30 @@ fn handle_request<B>(
                 "version": env!("CARGO_PKG_VERSION"),
                 "block_height": metrics.block_height.get(),
                 "peer_count": metrics.peer_count.get(),
-                "syncing": false,
+                "syncing": metrics.syncing.get() != 0,
+                "production_ready": metrics.production_ready.get() != 0,
             });
             json_response(StatusCode::OK, body)
         }
         // `/ready` and `/readyz` are equivalent (Kubernetes-style).
         (&Method::GET, "/ready") | (&Method::GET, "/readyz") => {
             let block_height = metrics.block_height.get();
-            if block_height > 0 {
+            let syncing = metrics.syncing.get() != 0;
+            let production_ready = metrics.production_ready.get() != 0;
+            if block_height > 0 && !syncing && production_ready {
                 json_response(StatusCode::OK, serde_json::json!({ "ready": true }))
             } else {
                 json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     serde_json::json!({
                         "ready": false,
-                        "reason": "node has not imported any blocks yet",
+                        "reason": if block_height == 0 {
+                            "node has not imported any blocks yet"
+                        } else if syncing {
+                            "block synchronization is in progress"
+                        } else {
+                            "block production readiness gate is closed"
+                        },
                     }),
                 )
             }
@@ -513,6 +538,8 @@ mod tests {
         assert_eq!(m.last_finalized_number.get(), 0);
         assert_eq!(m.finality_lag_blocks.get(), 0);
         assert_eq!(m.peer_count.get(), 0);
+        assert_eq!(m.syncing.get(), 0);
+        assert_eq!(m.production_ready.get(), 0);
         assert_eq!(m.tx_pool_size.get(), 0);
         assert_eq!(m.blocks_imported.get(), 0);
         assert_eq!(m.txs_received.get(), 0);
@@ -546,6 +573,8 @@ mod tests {
             output.contains("shell_peer_count"),
             "should contain peer_count metric"
         );
+        assert!(output.contains("shell_syncing"));
+        assert!(output.contains("shell_production_ready"));
         assert!(
             output.contains("shell_tx_pool_size"),
             "should contain tx_pool_size metric"
@@ -574,6 +603,7 @@ mod tests {
         assert_eq!(body["block_height"], 12345);
         assert_eq!(body["peer_count"], 3);
         assert_eq!(body["syncing"], false);
+        assert_eq!(body["production_ready"], false);
         assert!(body["version"].is_string(), "version should be a string");
     }
 
@@ -581,6 +611,7 @@ mod tests {
     async fn ready_returns_true_when_blocks_imported() {
         let m = Arc::new(Metrics::new().expect("metrics init"));
         m.block_height.set(1);
+        m.production_ready.set(1);
 
         let resp = handle_request(get("/ready"), &m);
         assert_eq!(resp.status(), StatusCode::OK);
@@ -602,9 +633,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_returns_503_while_syncing() {
+        let m = Arc::new(Metrics::new().expect("metrics init"));
+        m.block_height.set(10);
+        m.production_ready.set(1);
+        m.syncing.set(1);
+
+        let resp = handle_request(get("/ready"), &m);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["reason"], "block synchronization is in progress");
+    }
+
+    #[tokio::test]
+    async fn ready_returns_503_when_production_gate_is_closed() {
+        let m = Arc::new(Metrics::new().expect("metrics init"));
+        m.block_height.set(10);
+
+        let resp = handle_request(get("/ready"), &m);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["reason"], "block production readiness gate is closed");
+    }
+
+    #[tokio::test]
     async fn ready_does_not_require_peers() {
         let m = Arc::new(Metrics::new().expect("metrics init"));
         m.block_height.set(10);
+        m.production_ready.set(1);
         assert_eq!(m.peer_count.get(), 0);
 
         let resp = handle_request(get("/ready"), &m);
@@ -729,6 +785,7 @@ mod tests {
     async fn readyz_alias_returns_same_as_ready() {
         let m = Arc::new(Metrics::new().expect("metrics init"));
         m.block_height.set(3);
+        m.production_ready.set(1);
 
         let resp = handle_request(get("/readyz"), &m);
         assert_eq!(resp.status(), StatusCode::OK);

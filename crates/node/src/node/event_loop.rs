@@ -14,6 +14,13 @@ fn block_response_matches_request(
     sync_requested && expected_nonce == Some(nonce)
 }
 
+fn matching_empty_block_response_exhausts_request(
+    response_matches_sync: bool,
+    response_is_empty: bool,
+) -> bool {
+    response_matches_sync && response_is_empty
+}
+
 fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
@@ -446,6 +453,13 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         loop {
+            self.metrics.syncing.set(i64::from(
+                sync_requested && !production_readiness.can_produce(),
+            ));
+            self.metrics
+                .production_ready
+                .set(i64::from(production_readiness.can_produce()));
+
             tokio::select! {
                 Some(amendment) = prover_amendment_rx.recv() => {
                     if amendment.layer > 1 {
@@ -1124,6 +1138,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         "received BlockResponse, importing blocks"
                                     );
                                     let response_matches_sync = sync_request_nonce == Some(nonce);
+                                    let response_is_empty = blocks.is_empty();
                                     let verifier = MultiVerifier;
                                     let mut last_ok: Option<u64> = None;
                                     let certs: HashMap<ShellHash, Vec<u8>> =
@@ -1265,24 +1280,14 @@ impl<S: KvStore + 'static> Node<S> {
                                         // response to our current sync request proves this request
                                         // is exhausted; unrelated broadcast responses must not
                                         // clear the gate.
-                                        if response_matches_sync {
+                                        if matching_empty_block_response_exhausts_request(
+                                            response_matches_sync,
+                                            response_is_empty,
+                                        ) {
                                             sync_request_nonce = None;
-                                            if production_readiness.state()
-                                                == ProductionReadinessState::CatchingUp
-                                            {
-                                                sync_requested = true;
-                                                production_readiness.refresh(
-                                                    network.peer_count().await,
-                                                    sync_requested,
-                                                    self.head_number(),
-                                                    std::time::Instant::now(),
-                                                );
-                                                sync_retry_attempts_without_progress = 0;
-                                            } else {
-                                                sync_requested = false;
-                                                production_readiness.note_sync_idle();
-                                                sync_retry_attempts_without_progress = 0;
-                                            }
+                                            sync_requested = false;
+                                            production_readiness.note_sync_idle();
+                                            sync_retry_attempts_without_progress = 0;
                                         }
                                         sync_retry_timer.reset_after(Duration::from_secs(
                                             SYNC_RETRY_BASE_INTERVAL_SECS,
@@ -1955,22 +1960,14 @@ impl<S: KvStore + 'static> Node<S> {
                         // otherwise stay stale until a reconnect/routing event. Periodically
                         // ask peers for head+1 as a cheap head probe; an empty response clears
                         // the sync request without moving readiness out of Ready.
-                        if self.request_missing_blocks(
+                        let _ = self.request_missing_blocks(
                             &network,
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
                             "periodic-head-probe",
                         )
-                        .await
-                        {
-                            production_readiness.note_head_probe(
-                                self.head_number(),
-                                std::time::Instant::now(),
-                                startup_sync_grace,
-                                "periodic-head-probe",
-                            );
-                        }
+                        .await;
                         sync_retry_attempts_without_progress = 0;
                         sync_retry_timer.reset_after(Duration::from_secs(
                             SYNC_RETRY_BASE_INTERVAL_SECS,
@@ -2645,5 +2642,12 @@ mod cadence_tests {
         assert!(!block_response_matches_request(false, Some(7), 7));
         assert!(!block_response_matches_request(true, None, 7));
         assert!(!block_response_matches_request(true, Some(8), 7));
+    }
+
+    #[test]
+    fn matching_empty_block_response_exhausts_sync_request() {
+        assert!(matching_empty_block_response_exhausts_request(true, true));
+        assert!(!matching_empty_block_response_exhausts_request(false, true));
+        assert!(!matching_empty_block_response_exhausts_request(true, false));
     }
 }
