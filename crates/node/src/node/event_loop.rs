@@ -340,6 +340,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Track whether we are catching up so we don't spam requests.
         let mut sync_requested = false;
         let mut sync_request_nonce: Option<u64> = None;
+        let mut sync_request_start: Option<u64> = None;
         let mut body_request_nonce: Option<u64> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
@@ -358,6 +359,7 @@ impl<S: KvStore + 'static> Node<S> {
                     None,
                     &mut sync_requested,
                     &mut sync_request_nonce,
+                    &mut sync_request_start,
                     "initial-sync",
                 )
                 .await;
@@ -897,6 +899,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             {
                                                 sync_requested = false;
                                                 sync_request_nonce = None;
+                                                sync_request_start = None;
                                             }
                                             sync_retry_attempts_without_progress = 0;
                                             sync_retry_timer.reset_after(Duration::from_secs(
@@ -1002,6 +1005,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                     Some(&peer),
                                                     &mut sync_requested,
                                                     &mut sync_request_nonce,
+                                                    &mut sync_request_start,
                                                     "gap-detected",
                                                 )
                                                 .await
@@ -1214,6 +1218,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         if peers == 0 {
                                             sync_requested = false;
                                             sync_request_nonce = None;
+                                            sync_request_start = None;
                                             production_readiness.refresh(
                                                 peers,
                                                 sync_requested,
@@ -1231,6 +1236,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         else {
                                             sync_requested = false;
                                             sync_request_nonce = None;
+                                            sync_request_start = None;
                                             production_readiness.refresh(
                                                 peers,
                                                 sync_requested,
@@ -1255,6 +1261,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         let _ = network.send_to_peer(&peer, req).await;
                                         sync_requested = true;
                                         sync_request_nonce = Some(nonce);
+                                        sync_request_start = Some(next_start);
                                         if response_matches_sync {
                                             production_readiness.note_sync_requested(
                                                 self.head_number(),
@@ -1285,6 +1292,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             response_is_empty,
                                         ) {
                                             sync_request_nonce = None;
+                                            sync_request_start = None;
                                             sync_requested = false;
                                             production_readiness.note_sync_idle();
                                             sync_retry_attempts_without_progress = 0;
@@ -1755,6 +1763,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     Some(&peer),
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
+                                    &mut sync_request_start,
                                     "peer-connected",
                                 )
                                 .await
@@ -1786,6 +1795,7 @@ impl<S: KvStore + 'static> Node<S> {
                             if network.peer_count().await == 0 {
                                 sync_requested = false;
                                 sync_request_nonce = None;
+                                sync_request_start = None;
                                 sync_retry_attempts_without_progress = 0;
                                 production_readiness.refresh(
                                     0,
@@ -1810,6 +1820,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     None,
                                     &mut sync_requested,
                                     &mut sync_request_nonce,
+                                    &mut sync_request_start,
                                     "routing-update",
                                 )
                                 .await
@@ -1914,6 +1925,7 @@ impl<S: KvStore + 'static> Node<S> {
                             );
                             sync_requested = false;
                             sync_request_nonce = None;
+                            sync_request_start = None;
                             sync_retry_attempts_without_progress = 0;
                             production_readiness.refresh(
                                 peers,
@@ -1931,6 +1943,7 @@ impl<S: KvStore + 'static> Node<S> {
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
+                            &mut sync_request_start,
                             "sync-retry",
                         )
                         .await;
@@ -1965,6 +1978,7 @@ impl<S: KvStore + 'static> Node<S> {
                             None,
                             &mut sync_requested,
                             &mut sync_request_nonce,
+                            &mut sync_request_start,
                             "periodic-head-probe",
                         )
                         .await;
