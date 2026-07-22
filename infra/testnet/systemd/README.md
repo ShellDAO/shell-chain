@@ -16,6 +16,22 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now shell-node
 ```
 
+Multi-validator hosts can also install the bounded liveness watchdog:
+
+```bash
+sudo install -m 0755 shell-cluster-watchdog.sh /usr/local/bin/shell-cluster-watchdog.sh
+sudo install -m 0644 shell-cluster-watchdog.service /etc/systemd/system/shell-cluster-watchdog.service
+sudo install -m 0644 shell-cluster-watchdog.timer /etc/systemd/system/shell-cluster-watchdog.timer
+sudo install -m 0644 shell-cluster-watchdog.env.example /etc/default/shell-cluster-watchdog
+sudo systemctl daemon-reload
+sudo systemctl enable --now shell-cluster-watchdog.timer
+```
+
+The watchdog requires sustained production unavailability before taking action,
+never restarts while a reachable node reports active synchronization, and
+restarts only one validator per recovery interval. Order services from lowest
+to highest voting weight in the environment file.
+
 Operational defaults:
 
 - `SHELL_NODE_ROLE=validator`
@@ -31,6 +47,7 @@ Operational defaults:
   validator with the other validators' public P2P addresses so recovery does not
   depend on one node restarting first.
 - systemd `MemoryMax=1900M`, `CPUQuota=90%`, low IO priority, and slow restart
+- optional cluster watchdog with synchronization-aware, sequential recovery
 
 Use a separate larger instance for proving. On that host set
 `SHELL_NODE_ROLE=validator-prover` or `SHELL_NODE_ROLE=prover`, set

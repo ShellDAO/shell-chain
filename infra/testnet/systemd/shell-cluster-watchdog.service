@@ -1,0 +1,13 @@
+[Unit]
+Description=Shell Chain cluster liveness watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/shell-cluster-watchdog
+ExecStart=/usr/local/bin/shell-cluster-watchdog.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+StateDirectory=shell-chain/watchdog
+StateDirectoryMode=0750

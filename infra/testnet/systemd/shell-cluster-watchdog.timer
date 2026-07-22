@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Shell Chain cluster liveness every minute
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
