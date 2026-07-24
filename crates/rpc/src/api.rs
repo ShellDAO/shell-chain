@@ -219,7 +219,10 @@ pub trait EthApi {
     #[method(name = "newBlockFilter")]
     async fn new_block_filter(&self) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Returns changes since the last poll for the given filter.
+    /// Returns changes since the last poll for the given filter. After a chain
+    /// reorganization, log filters return matching orphaned logs with
+    /// `removed: true` before replacement-chain logs, while block filters
+    /// return canonical replacement block hashes.
     #[method(name = "getFilterChanges")]
     async fn get_filter_changes(
         &self,

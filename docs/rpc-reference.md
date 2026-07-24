@@ -281,7 +281,10 @@ Creates a block filter that tracks new block hashes.
 get_filter_changes(id: String, ) → serde_json::Value
 ```
 
-Returns changes since the last poll for the given filter.
+Returns changes since the last poll for the given filter. After a chain
+reorganization, log filters return matching orphaned logs with
+`removed: true` before replacement-chain logs, while block filters
+return canonical replacement block hashes.
 
 ### eth_getFilterLogs
 ```

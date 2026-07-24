@@ -2,10 +2,6 @@ use super::*;
 
 const MAX_FEE_HISTORY_REWARD_PERCENTILES: usize = 100;
 
-fn capped_filter_poll_to(from: u64, latest: u64) -> u64 {
-    latest.min(from.saturating_add(MAX_BLOCK_RANGE.saturating_sub(1)))
-}
-
 fn rpc_logs_from_core(logs: Vec<shell_core::Log>) -> Vec<RpcLog> {
     logs.into_iter()
         .map(|log| {
@@ -17,6 +13,150 @@ fn rpc_logs_from_core(logs: Vec<shell_core::Log>) -> Vec<RpcLog> {
             }
         })
         .collect()
+}
+
+struct FilterReorg {
+    ancestor: FilterCursor,
+    /// Old canonical blocks ordered from the previous tip back toward the ancestor.
+    removed_blocks: Vec<(u64, ShellHash)>,
+}
+
+fn find_filter_reorg<S: KvStore + 'static>(
+    chain_store: &ChainStore<S>,
+    cursor: FilterCursor,
+    latest: u64,
+) -> Result<Option<FilterReorg>, ErrorObjectOwned> {
+    let Some(mut old_hash) = cursor.block_hash else {
+        return Ok(None);
+    };
+
+    let canonical_at_cursor = if cursor.block_number <= latest {
+        chain_store
+            .get_block_hash_by_number(cursor.block_number)
+            .map_err(internal_err)?
+    } else {
+        None
+    };
+    if canonical_at_cursor == Some(old_hash) {
+        return Ok(None);
+    }
+
+    let mut old_number = cursor.block_number;
+    let mut removed_blocks = Vec::new();
+    loop {
+        let canonical_hash = if old_number <= latest {
+            chain_store
+                .get_block_hash_by_number(old_number)
+                .map_err(internal_err)?
+        } else {
+            None
+        };
+        if canonical_hash == Some(old_hash) {
+            return Ok(Some(FilterReorg {
+                ancestor: FilterCursor {
+                    block_number: old_number,
+                    block_hash: Some(old_hash),
+                },
+                removed_blocks,
+            }));
+        }
+
+        if removed_blocks.len() >= MAX_BLOCK_RANGE as usize {
+            return Err(limit_exceeded(format!(
+                "filter reorganization exceeds the {MAX_BLOCK_RANGE}-block poll limit"
+            )));
+        }
+
+        let old_header = chain_store
+            .get_header_by_hash(&old_hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| {
+                internal_err(format!(
+                    "previous canonical header {old_hash} is unavailable during filter poll"
+                ))
+            })?;
+        if old_header.number != old_number {
+            return Err(internal_err(format!(
+                "previous canonical header {old_hash} has height {}, expected {old_number}",
+                old_header.number
+            )));
+        }
+
+        removed_blocks.push((old_number, old_hash));
+        if old_number == 0 {
+            return Err(internal_err(
+                "filter cursor has no common ancestor with the canonical chain",
+            ));
+        }
+        old_number -= 1;
+        old_hash = old_header.parent_hash;
+    }
+}
+
+fn append_filter_logs<S: KvStore + 'static>(
+    chain_store: &ChainStore<S>,
+    filter: &crate::filter::LogFilter,
+    block_number: u64,
+    block_hash: ShellHash,
+    removed: bool,
+    results: &mut Vec<RpcLogWithMeta>,
+) -> Result<(), ErrorObjectOwned> {
+    let header = chain_store
+        .get_header_by_hash(&block_hash)
+        .map_err(internal_err)?
+        .ok_or_else(|| {
+            internal_err(format!(
+                "block header {block_hash} missing during log filter poll"
+            ))
+        })?;
+    if header.number != block_number {
+        return Err(internal_err(format!(
+            "block header {block_hash} has height {}, expected {block_number}",
+            header.number
+        )));
+    }
+    if !filter.matches_bloom(header.logs_bloom.as_ref()) {
+        return Ok(());
+    }
+
+    let receipts = chain_store
+        .get_receipts(&block_hash)
+        .map_err(internal_err)?;
+    let receipts = match receipts {
+        Some(receipts) => receipts,
+        None if removed => {
+            return Err(internal_err(format!(
+                "receipts for removed block {block_hash} are unavailable during filter poll"
+            )));
+        }
+        None => Vec::new(),
+    };
+    let mut global_log_index: u64 = 0;
+    for (tx_idx, receipt) in receipts.into_iter().enumerate() {
+        let tx_hash = receipt.tx_hash;
+        for log in receipt.logs {
+            if filter.matches_log(&log) {
+                if results.len() >= MAX_LOG_RESULTS {
+                    return Err(limit_exceeded(format!(
+                        "filter poll returned more than {MAX_LOG_RESULTS} logs; narrow the filter"
+                    )));
+                }
+                results.push(RpcLogWithMeta {
+                    address: log.address,
+                    topics: log.topics,
+                    data: hex_bytes(log.data.as_ref()),
+                    block_number: hex_u64(block_number),
+                    block_hash,
+                    transaction_hash: tx_hash,
+                    transaction_index: hex_u64(tx_idx as u64),
+                    log_index: hex_u64(global_log_index),
+                    removed,
+                });
+            }
+            global_log_index += 1;
+        }
+    }
+    Ok(())
 }
 
 #[jsonrpsee::core::async_trait]
@@ -868,7 +1008,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
 
     async fn new_filter(&self, mut filter: RawLogFilter) -> Result<String, ErrorObjectOwned> {
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
-        let latest = head.map(|b| b.number()).unwrap_or(0);
+        let latest = head.as_ref().map(|b| b.number()).unwrap_or(0);
+        let head_hash = head.as_ref().map(Block::hash);
         // F-125: resolve from_block at creation time so get_filter_logs
         // does not re-scan from block 0 on every call.
         if filter.from_block.is_none() {
@@ -881,139 +1022,141 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             .map_err(invalid_params)?;
         let id = self
             .filter_registry
-            .new_filter(FilterKind::Log(filter), latest)
+            .new_filter_at(FilterKind::Log(filter), latest, head_hash)
             .ok_or_else(|| internal_err("filter limit reached"))?;
         Ok(id)
     }
 
     async fn new_block_filter(&self) -> Result<String, ErrorObjectOwned> {
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
-        let latest = head.map(|b| b.number()).unwrap_or(0);
+        let latest = head.as_ref().map(|b| b.number()).unwrap_or(0);
+        let head_hash = head.as_ref().map(Block::hash);
         let id = self
             .filter_registry
-            .new_filter(FilterKind::Block, latest)
+            .new_filter_at(FilterKind::Block, latest, head_hash)
             .ok_or_else(|| internal_err("filter limit reached"))?;
         Ok(id)
     }
 
     async fn get_filter_changes(&self, id: String) -> Result<serde_json::Value, ErrorObjectOwned> {
-        // Determine filter type and last polled block.
-        let (is_log, last_poll_block) = self
+        let (is_log, cursor) = self
             .filter_registry
-            .get_filter_info(&id)
+            .get_filter_cursor(&id)
             .ok_or_else(|| not_found("filter not found"))?;
 
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
-        let latest = head.map(|b| b.number()).unwrap_or(0);
+        let latest = head.as_ref().map(|b| b.number()).unwrap_or(0);
+        let reorg = find_filter_reorg(&self.chain_store, cursor, latest)?;
+        let (base_cursor, removed_blocks) = match reorg {
+            Some(reorg) => (reorg.ancestor, reorg.removed_blocks),
+            None => (cursor, Vec::new()),
+        };
+        let remaining_blocks = MAX_BLOCK_RANGE.saturating_sub(removed_blocks.len() as u64);
+        let canonical_from = base_cursor
+            .block_number
+            .checked_add(1)
+            .filter(|from| remaining_blocks > 0 && *from <= latest);
+        let canonical_to = canonical_from
+            .map(|from| latest.min(from.saturating_add(remaining_blocks.saturating_sub(1))));
+        let mut new_cursor = base_cursor;
 
         if is_log {
-            // Log filter: query logs from (last_poll_block + 1) to latest.
-            let Some(from) = last_poll_block.checked_add(1) else {
-                self.filter_registry.update_last_poll(&id, latest);
-                return Ok(serde_json::json!([]));
-            };
-            if from > latest {
-                self.filter_registry.update_last_poll(&id, latest);
-                return Ok(serde_json::json!([]));
-            }
-
-            // Retrieve the original filter criteria.
             let raw = self
                 .filter_registry
                 .get_log_filter(&id)
                 .ok_or_else(|| not_found("filter not found"))?;
+            let removed_to_block_is_unbounded = matches!(
+                raw.to_block.as_deref(),
+                None | Some("latest") | Some("pending")
+            );
             let finalized = *self.finalized_number.read();
             let filter = raw.into_filter(latest, finalized).map_err(internal_err)?;
-
-            let query_from = from.max(filter.from_block.unwrap_or(from));
-            let query_to = latest.min(filter.to_block.unwrap_or(latest));
-            if query_from > query_to {
-                self.filter_registry.update_last_poll(&id, latest);
-                return Ok(serde_json::json!([]));
-            }
-
+            let removed_to_block = if removed_to_block_is_unbounded {
+                u64::MAX
+            } else {
+                filter.to_block.unwrap_or(latest)
+            };
             let mut results = Vec::new();
-            let actual_to = capped_filter_poll_to(query_from, query_to);
 
-            for block_num in query_from..=actual_to {
-                let block = self
-                    .chain_store
-                    .get_block_by_number(block_num)
-                    .map_err(internal_err)?
-                    .ok_or_else(|| {
-                        internal_err(format!(
-                            "canonical block {block_num} missing during log filter poll"
-                        ))
-                    })?;
-
-                if !filter.matches_bloom(block.header.logs_bloom.as_ref()) {
-                    continue;
-                }
-
-                let block_hash = block.hash();
-                let receipts = self
-                    .chain_store
-                    .get_receipts(&block_hash)
-                    .map_err(internal_err)?
-                    .unwrap_or_default();
-
-                let mut global_log_index: u64 = 0;
-                for (tx_idx, receipt) in receipts.into_iter().enumerate() {
-                    let tx_hash = receipt.tx_hash;
-                    for log in receipt.logs {
-                        if filter.matches_log(&log) {
-                            if results.len() >= MAX_LOG_RESULTS {
-                                return Err(limit_exceeded(format!(
-                                    "filter poll returned more than {MAX_LOG_RESULTS} logs; narrow the filter"
-                                )));
-                            }
-                            let data = hex_bytes(log.data.as_ref());
-                            results.push(RpcLogWithMeta {
-                                address: log.address,
-                                topics: log.topics,
-                                data,
-                                block_number: hex_u64(block_num),
-                                block_hash,
-                                transaction_hash: tx_hash,
-                                transaction_index: hex_u64(tx_idx as u64),
-                                log_index: hex_u64(global_log_index),
-                                removed: false,
-                            });
-                        }
-                        global_log_index += 1;
-                    }
+            for (block_number, block_hash) in removed_blocks {
+                if block_number >= filter.from_block.unwrap_or(0)
+                    && block_number <= removed_to_block
+                {
+                    append_filter_logs(
+                        &self.chain_store,
+                        &filter,
+                        block_number,
+                        block_hash,
+                        true,
+                        &mut results,
+                    )?;
                 }
             }
 
-            self.filter_registry.update_last_poll(&id, actual_to);
+            if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
+                for block_number in from..=to {
+                    let block = self
+                        .chain_store
+                        .get_block_by_number(block_number)
+                        .map_err(internal_err)?
+                        .ok_or_else(|| {
+                            internal_err(format!(
+                                "canonical block {block_number} missing during log filter poll"
+                            ))
+                        })?;
+                    let block_hash = block.hash();
+                    if block_number >= filter.from_block.unwrap_or(0)
+                        && block_number <= filter.to_block.unwrap_or(latest)
+                    {
+                        append_filter_logs(
+                            &self.chain_store,
+                            &filter,
+                            block_number,
+                            block_hash,
+                            false,
+                            &mut results,
+                        )?;
+                    }
+                    new_cursor = FilterCursor {
+                        block_number,
+                        block_hash: Some(block_hash),
+                    };
+                }
+            }
+
+            if !self.filter_registry.update_cursor(&id, cursor, new_cursor) {
+                return Err(internal_err(
+                    "filter cursor changed during poll; retry the request",
+                ));
+            }
             Ok(serde_json::to_value(&results).unwrap_or(serde_json::json!([])))
         } else {
-            // Block filter: collect hashes of blocks since last poll.
-            let Some(from) = last_poll_block.checked_add(1) else {
-                self.filter_registry.update_last_poll(&id, latest);
-                return Ok(serde_json::json!([]));
-            };
-            if from > latest {
-                self.filter_registry.update_last_poll(&id, latest);
-                return Ok(serde_json::json!([]));
-            }
-
             let mut hashes = Vec::new();
-            let actual_to = capped_filter_poll_to(from, latest);
-            for block_num in from..=actual_to {
-                let block = self
-                    .chain_store
-                    .get_block_by_number(block_num)
-                    .map_err(internal_err)?
-                    .ok_or_else(|| {
-                        internal_err(format!(
-                            "canonical block {block_num} missing during block filter poll"
-                        ))
-                    })?;
-                hashes.push(block.hash());
+            if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
+                for block_number in from..=to {
+                    let block = self
+                        .chain_store
+                        .get_block_by_number(block_number)
+                        .map_err(internal_err)?
+                        .ok_or_else(|| {
+                            internal_err(format!(
+                                "canonical block {block_number} missing during block filter poll"
+                            ))
+                        })?;
+                    let block_hash = block.hash();
+                    hashes.push(block_hash);
+                    new_cursor = FilterCursor {
+                        block_number,
+                        block_hash: Some(block_hash),
+                    };
+                }
             }
 
-            self.filter_registry.update_last_poll(&id, actual_to);
+            if !self.filter_registry.update_cursor(&id, cursor, new_cursor) {
+                return Err(internal_err(
+                    "filter cursor changed during poll; retry the request",
+                ));
+            }
             Ok(serde_json::to_value(&hashes).unwrap_or(serde_json::json!([])))
         }
     }

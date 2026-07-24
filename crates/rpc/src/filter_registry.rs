@@ -48,8 +48,17 @@ pub struct FilterEntry {
     pub kind: FilterKind,
     /// Block number at filter creation (or last successful poll).
     pub last_poll_block: u64,
+    /// Canonical block hash at `last_poll_block`, when a head exists.
+    pub last_poll_hash: Option<ShellHash>,
     /// Last access time for TTL-based expiry.
     pub last_access: Instant,
+}
+
+/// Canonical position delivered by the last successful filter poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterCursor {
+    pub block_number: u64,
+    pub block_hash: Option<ShellHash>,
 }
 
 /// Thread-safe registry of active filters.
@@ -87,13 +96,24 @@ impl FilterRegistry {
     /// Install a new filter and return its hex-encoded ID.
     /// Returns `None` if the maximum filter count has been reached.
     pub fn new_filter(&self, kind: FilterKind, current_block: u64) -> Option<String> {
-        self.new_filter_with_id_generator(kind, current_block, random_filter_id)
+        self.new_filter_at(kind, current_block, None)
+    }
+
+    /// Install a new filter at an exact canonical position.
+    pub fn new_filter_at(
+        &self,
+        kind: FilterKind,
+        current_block: u64,
+        current_hash: Option<ShellHash>,
+    ) -> Option<String> {
+        self.new_filter_with_id_generator(kind, current_block, current_hash, random_filter_id)
     }
 
     fn new_filter_with_id_generator<F>(
         &self,
         kind: FilterKind,
         current_block: u64,
+        current_hash: Option<ShellHash>,
         mut next_id: F,
     ) -> Option<String>
     where
@@ -114,6 +134,7 @@ impl FilterRegistry {
             let entry = FilterEntry {
                 kind,
                 last_poll_block: current_block,
+                last_poll_hash: current_hash,
                 last_access: Instant::now(),
             };
             filters.insert(id.clone(), entry);
@@ -127,6 +148,14 @@ impl FilterRegistry {
     /// Returns `None` if the filter does not exist.
     /// Updates the last access timestamp.
     pub fn get_filter_info(&self, id: &str) -> Option<(bool, u64)> {
+        self.get_filter_cursor(id)
+            .map(|(is_log, cursor)| (is_log, cursor.block_number))
+    }
+
+    /// Get the filter kind and exact canonical cursor.
+    /// Returns `None` if the filter does not exist.
+    /// Updates the last access timestamp.
+    pub fn get_filter_cursor(&self, id: &str) -> Option<(bool, FilterCursor)> {
         if !is_valid_filter_id(id) {
             return None;
         }
@@ -135,7 +164,13 @@ impl FilterRegistry {
         let entry = filters.get_mut(id)?;
         entry.last_access = Instant::now();
         let is_log = matches!(entry.kind, FilterKind::Log(_));
-        Some((is_log, entry.last_poll_block))
+        Some((
+            is_log,
+            FilterCursor {
+                block_number: entry.last_poll_block,
+                block_hash: entry.last_poll_hash,
+            },
+        ))
     }
 
     /// Update the last_poll_block for a filter after a successful poll.
@@ -146,9 +181,36 @@ impl FilterRegistry {
         let mut filters = self.filters.write();
         remove_expired_filter(&mut filters, id, self.ttl_secs);
         if let Some(entry) = filters.get_mut(id) {
-            entry.last_poll_block = entry.last_poll_block.max(new_block);
+            if new_block > entry.last_poll_block {
+                entry.last_poll_block = new_block;
+                entry.last_poll_hash = None;
+            }
             entry.last_access = Instant::now();
         }
+    }
+
+    /// Replace the canonical cursor after a successful poll.
+    ///
+    /// Returns `false` when another poll changed the cursor or the filter
+    /// expired while results were being constructed.
+    pub fn update_cursor(&self, id: &str, expected: FilterCursor, cursor: FilterCursor) -> bool {
+        if !is_valid_filter_id(id) {
+            return false;
+        }
+        let mut filters = self.filters.write();
+        remove_expired_filter(&mut filters, id, self.ttl_secs);
+        if let Some(entry) = filters.get_mut(id) {
+            if entry.last_poll_block != expected.block_number
+                || entry.last_poll_hash != expected.block_hash
+            {
+                return false;
+            }
+            entry.last_poll_block = cursor.block_number;
+            entry.last_poll_hash = cursor.block_hash;
+            entry.last_access = Instant::now();
+            return true;
+        }
+        false
     }
 
     /// Check if a filter exists and whether it is a log filter.
@@ -283,7 +345,7 @@ mod tests {
         let mut ids = [duplicate.clone(), unique.clone()].into_iter();
 
         let id = reg
-            .new_filter_with_id_generator(FilterKind::Block, 2, || ids.next().unwrap())
+            .new_filter_with_id_generator(FilterKind::Block, 2, None, || ids.next().unwrap())
             .unwrap();
 
         assert_eq!(id, unique);
@@ -297,7 +359,7 @@ mod tests {
         let reg = FilterRegistry::new();
         let duplicate = reg.new_filter(FilterKind::Block, 1).unwrap();
 
-        let id = reg.new_filter_with_id_generator(FilterKind::Block, 2, || duplicate.clone());
+        let id = reg.new_filter_with_id_generator(FilterKind::Block, 2, None, || duplicate.clone());
 
         assert!(id.is_none());
         assert_eq!(reg.len(), 1);
@@ -316,6 +378,7 @@ mod tests {
                     FilterEntry {
                         kind: FilterKind::Block,
                         last_poll_block: i as u64,
+                        last_poll_hash: None,
                         last_access: expired_at,
                     },
                 );
@@ -392,6 +455,89 @@ mod tests {
         reg.update_last_poll(&id, 15);
 
         assert_eq!(reg.get_filter_info(&id).unwrap().1, 20);
+    }
+
+    #[test]
+    fn exact_cursor_tracks_hash_and_can_move_to_reorg_ancestor() {
+        let reg = FilterRegistry::new();
+        let old_hash = ShellHash::from_slice(&[0x11; 32]);
+        let ancestor_hash = ShellHash::from_slice(&[0x22; 32]);
+        let id = reg
+            .new_filter_at(FilterKind::Block, 20, Some(old_hash))
+            .unwrap();
+
+        assert_eq!(
+            reg.get_filter_cursor(&id).unwrap().1,
+            FilterCursor {
+                block_number: 20,
+                block_hash: Some(old_hash),
+            }
+        );
+
+        assert!(reg.update_cursor(
+            &id,
+            FilterCursor {
+                block_number: 20,
+                block_hash: Some(old_hash),
+            },
+            FilterCursor {
+                block_number: 15,
+                block_hash: Some(ancestor_hash),
+            },
+        ));
+
+        assert_eq!(
+            reg.get_filter_cursor(&id).unwrap().1,
+            FilterCursor {
+                block_number: 15,
+                block_hash: Some(ancestor_hash),
+            }
+        );
+    }
+
+    #[test]
+    fn number_only_cursor_update_clears_stale_hash() {
+        let reg = FilterRegistry::new();
+        let old_hash = ShellHash::from_slice(&[0x33; 32]);
+        let id = reg
+            .new_filter_at(FilterKind::Block, 7, Some(old_hash))
+            .unwrap();
+
+        reg.update_last_poll(&id, 8);
+
+        assert_eq!(
+            reg.get_filter_cursor(&id).unwrap().1,
+            FilterCursor {
+                block_number: 8,
+                block_hash: None,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_cursor_update_rejects_stale_poll() {
+        let reg = FilterRegistry::new();
+        let hash = ShellHash::from_slice(&[0x44; 32]);
+        let id = reg.new_filter_at(FilterKind::Block, 7, Some(hash)).unwrap();
+
+        assert!(!reg.update_cursor(
+            &id,
+            FilterCursor {
+                block_number: 6,
+                block_hash: Some(hash),
+            },
+            FilterCursor {
+                block_number: 8,
+                block_hash: Some(ShellHash::from_slice(&[0x55; 32])),
+            },
+        ));
+        assert_eq!(
+            reg.get_filter_cursor(&id).unwrap().1,
+            FilterCursor {
+                block_number: 7,
+                block_hash: Some(hash),
+            }
+        );
     }
 
     #[test]
@@ -472,6 +618,7 @@ mod tests {
             FilterEntry {
                 kind: FilterKind::Block,
                 last_poll_block: 0,
+                last_poll_hash: None,
                 last_access: Instant::now() + std::time::Duration::from_secs(60),
             },
         );

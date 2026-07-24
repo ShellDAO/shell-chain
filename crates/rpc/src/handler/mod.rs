@@ -29,7 +29,7 @@ pub(crate) use crate::error::{
     not_found, server_error,
 };
 pub(crate) use crate::filter::{RawLogFilter, MAX_BLOCK_RANGE, MAX_LOG_RESULTS};
-pub(crate) use crate::filter_registry::{FilterKind, FilterRegistry};
+pub(crate) use crate::filter_registry::{FilterCursor, FilterKind, FilterRegistry};
 pub(crate) use crate::subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
 pub(crate) use crate::types::*;
 
@@ -3879,6 +3879,16 @@ mod tests {
         number: u64,
         logs_per_receipt: Vec<Vec<shell_core::Log>>,
     ) -> ShellHash {
+        store_block_with_logs_on_parent(handler, number, ShellHash::default(), 0, logs_per_receipt)
+    }
+
+    fn store_block_with_logs_on_parent(
+        handler: &RpcHandler<MemoryDb>,
+        number: u64,
+        parent_hash: ShellHash,
+        branch_marker: u8,
+        logs_per_receipt: Vec<Vec<shell_core::Log>>,
+    ) -> ShellHash {
         let bloom = shell_pqvm::bloom::logs_bloom(
             &logs_per_receipt
                 .iter()
@@ -3889,7 +3899,7 @@ mod tests {
 
         let block = Block {
             header: BlockHeader {
-                parent_hash: ShellHash::default(),
+                parent_hash,
                 state_root: ShellHash::default(),
                 transactions_root: ShellHash::default(),
                 receipts_root: ShellHash::default(),
@@ -3898,7 +3908,11 @@ mod tests {
                 gas_limit: 30_000_000,
                 gas_used: 21_000 * logs_per_receipt.len() as u64,
                 timestamp: 1_700_000_000 + number,
-                extra_data: Bytes::default(),
+                extra_data: if branch_marker == 0 {
+                    Bytes::default()
+                } else {
+                    Bytes::from(vec![branch_marker])
+                },
                 proposer: test_address(b"proposer-key-data"),
                 sig_aggregate_proof: None,
                 base_fee_per_gas: 0,
@@ -5751,6 +5765,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_filter_returns_same_height_replacement_hash() {
+        let handler = setup();
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+
+        let old_hash = store_block_with_logs_on_parent(&handler, 1, genesis_hash, 1, vec![vec![]]);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id.clone())
+                .await
+                .unwrap(),
+            serde_json::json!([old_hash])
+        );
+
+        let replacement_hash =
+            store_block_with_logs_on_parent(&handler, 1, genesis_hash, 2, vec![vec![]]);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id.clone())
+                .await
+                .unwrap(),
+            serde_json::json!([replacement_hash])
+        );
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn block_filter_returns_deep_reorg_replacement_hashes() {
+        let handler = setup();
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+
+        let common_hash =
+            store_block_with_logs_on_parent(&handler, 1, genesis_hash, 1, vec![vec![]]);
+        let old_hash_2 = store_block_with_logs_on_parent(&handler, 2, common_hash, 1, vec![vec![]]);
+        let old_hash_3 = store_block_with_logs_on_parent(&handler, 3, old_hash_2, 1, vec![vec![]]);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id.clone())
+                .await
+                .unwrap(),
+            serde_json::json!([common_hash, old_hash_2, old_hash_3])
+        );
+
+        let replacement_hash_2 =
+            store_block_with_logs_on_parent(&handler, 2, common_hash, 2, vec![vec![]]);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id.clone())
+                .await
+                .unwrap(),
+            serde_json::json!([replacement_hash_2])
+        );
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn block_filter_preserves_cursor_across_canonical_gaps() {
         let handler = setup();
         let genesis = make_genesis_block();
@@ -5940,6 +6017,116 @@ mod tests {
         let arr = changes.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn log_filter_returns_removed_and_same_height_replacement_logs() {
+        let handler = setup();
+        let address = Address::from([0xA1; 20]);
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"fromBlock":"0x0","address":"{}"}}"#, address))
+                .unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        let old_log = shell_core::Log::new(address, vec![], Bytes::from_static(b"old")).unwrap();
+        let old_hash =
+            store_block_with_logs_on_parent(&handler, 1, genesis_hash, 1, vec![vec![old_log]]);
+        let first = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(first[0]["blockHash"], serde_json::json!(old_hash));
+        assert_eq!(first[0]["removed"], false);
+
+        let replacement_log =
+            shell_core::Log::new(address, vec![], Bytes::from_static(b"new")).unwrap();
+        let replacement_hash = store_block_with_logs_on_parent(
+            &handler,
+            1,
+            genesis_hash,
+            2,
+            vec![vec![replacement_log]],
+        );
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(old_hash));
+        assert_eq!(logs[0]["removed"], true);
+        assert_eq!(logs[1]["blockHash"], serde_json::json!(replacement_hash));
+        assert_eq!(logs[1]["removed"], false);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn log_filter_returns_removed_and_deep_reorg_replacement_logs() {
+        let handler = setup();
+        let address = Address::from([0xA2; 20]);
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"fromBlock":"0x0","address":"{}"}}"#, address))
+                .unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+        let make_log = |data: &'static [u8]| {
+            shell_core::Log::new(address, vec![], Bytes::from_static(data)).unwrap()
+        };
+
+        let common_hash = store_block_with_logs_on_parent(
+            &handler,
+            1,
+            genesis_hash,
+            1,
+            vec![vec![make_log(b"common")]],
+        );
+        let old_hash_2 = store_block_with_logs_on_parent(
+            &handler,
+            2,
+            common_hash,
+            1,
+            vec![vec![make_log(b"old-2")]],
+        );
+        let old_hash_3 = store_block_with_logs_on_parent(
+            &handler,
+            3,
+            old_hash_2,
+            1,
+            vec![vec![make_log(b"old-3")]],
+        );
+        let first = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.as_array().unwrap().len(), 3);
+
+        let replacement_hash_2 = store_block_with_logs_on_parent(
+            &handler,
+            2,
+            common_hash,
+            2,
+            vec![vec![make_log(b"new-2")]],
+        );
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(old_hash_3));
+        assert_eq!(logs[0]["removed"], true);
+        assert_eq!(logs[1]["blockHash"], serde_json::json!(old_hash_2));
+        assert_eq!(logs[1]["removed"], true);
+        assert_eq!(logs[2]["blockHash"], serde_json::json!(replacement_hash_2));
+        assert_eq!(logs[2]["removed"], false);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]

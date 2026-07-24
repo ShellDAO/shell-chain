@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Make polling log and block filters reorg-aware, returning removed logs and
+  canonical replacement results before advancing their cursors.
 - Keep pending-balance reservation checks linear when pool-capacity eviction
   removes a sender's nonce descendants.
 - Reject side-fork blocks with empty, invalid, unresolved, or sender-mismatched

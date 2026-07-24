@@ -359,7 +359,7 @@ pub struct RpcLogWithMeta {
     pub transaction_hash: ShellHash,
     pub transaction_index: String,
     pub log_index: String,
-    /// Always `false` for a non-reorg chain.
+    /// `true` when a previously delivered log was removed by a reorganization.
     pub removed: bool,
 }
 

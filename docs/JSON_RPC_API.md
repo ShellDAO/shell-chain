@@ -677,14 +677,18 @@ Creates a poll-based block filter.
 
 ### eth_getFilterChanges
 
-Returns changes since last poll for a filter.
+Returns changes since last poll for a filter. If the canonical chain is
+reorganized, log filters first return matching orphaned logs with
+`removed: true`, followed by matching logs from the replacement chain. Block
+filters return the canonical replacement block hashes.
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Filter ID |
 
-**Returns:** `Array` — Logs (for log filters) or block hashes (for block filters).
+**Returns:** `Array` — Logs (for log filters) or block hashes (for block
+filters). Logs from orphaned blocks have `removed: true`.
 
 ---
 
