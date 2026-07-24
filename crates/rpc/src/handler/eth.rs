@@ -1059,6 +1059,35 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let canonical_to = canonical_from
             .map(|from| latest.min(from.saturating_add(remaining_blocks.saturating_sub(1))));
         let mut new_cursor = base_cursor;
+        let mut canonical_blocks = Vec::new();
+        let mut expected_parent = base_cursor.block_hash;
+        if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
+            for block_number in from..=to {
+                let block = self
+                    .chain_store
+                    .get_block_by_number(block_number)
+                    .map_err(internal_err)?
+                    .ok_or_else(|| {
+                        internal_err(format!(
+                            "canonical block {block_number} missing during filter poll"
+                        ))
+                    })?;
+                if let Some(expected_parent) = expected_parent {
+                    if block.header.parent_hash != expected_parent {
+                        return Err(internal_err(format!(
+                            "canonical block {block_number} changed during filter poll"
+                        )));
+                    }
+                }
+                let block_hash = block.hash();
+                canonical_blocks.push((block_number, block_hash));
+                expected_parent = Some(block_hash);
+                new_cursor = FilterCursor {
+                    block_number,
+                    block_hash: Some(block_hash),
+                };
+            }
+        }
 
         if is_log {
             let raw = self
@@ -1093,34 +1122,18 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 }
             }
 
-            if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
-                for block_number in from..=to {
-                    let block = self
-                        .chain_store
-                        .get_block_by_number(block_number)
-                        .map_err(internal_err)?
-                        .ok_or_else(|| {
-                            internal_err(format!(
-                                "canonical block {block_number} missing during log filter poll"
-                            ))
-                        })?;
-                    let block_hash = block.hash();
-                    if block_number >= filter.from_block.unwrap_or(0)
-                        && block_number <= filter.to_block.unwrap_or(latest)
-                    {
-                        append_filter_logs(
-                            &self.chain_store,
-                            &filter,
-                            block_number,
-                            block_hash,
-                            false,
-                            &mut results,
-                        )?;
-                    }
-                    new_cursor = FilterCursor {
+            for (block_number, block_hash) in canonical_blocks {
+                if block_number >= filter.from_block.unwrap_or(0)
+                    && block_number <= filter.to_block.unwrap_or(latest)
+                {
+                    append_filter_logs(
+                        &self.chain_store,
+                        &filter,
                         block_number,
-                        block_hash: Some(block_hash),
-                    };
+                        block_hash,
+                        false,
+                        &mut results,
+                    )?;
                 }
             }
 
@@ -1131,26 +1144,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             }
             Ok(serde_json::to_value(&results).unwrap_or(serde_json::json!([])))
         } else {
-            let mut hashes = Vec::new();
-            if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
-                for block_number in from..=to {
-                    let block = self
-                        .chain_store
-                        .get_block_by_number(block_number)
-                        .map_err(internal_err)?
-                        .ok_or_else(|| {
-                            internal_err(format!(
-                                "canonical block {block_number} missing during block filter poll"
-                            ))
-                        })?;
-                    let block_hash = block.hash();
-                    hashes.push(block_hash);
-                    new_cursor = FilterCursor {
-                        block_number,
-                        block_hash: Some(block_hash),
-                    };
-                }
-            }
+            let hashes = canonical_blocks
+                .into_iter()
+                .map(|(_, block_hash)| block_hash)
+                .collect::<Vec<_>>();
 
             if !self.filter_registry.update_cursor(&id, cursor, new_cursor) {
                 return Err(internal_err(

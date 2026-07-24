@@ -3879,7 +3879,16 @@ mod tests {
         number: u64,
         logs_per_receipt: Vec<Vec<shell_core::Log>>,
     ) -> ShellHash {
-        store_block_with_logs_on_parent(handler, number, ShellHash::default(), 0, logs_per_receipt)
+        let parent_hash = number
+            .checked_sub(1)
+            .and_then(|parent_number| {
+                handler
+                    .chain_store
+                    .get_block_hash_by_number(parent_number)
+                    .unwrap()
+            })
+            .unwrap_or_default();
+        store_block_with_logs_on_parent(handler, number, parent_hash, 0, logs_per_receipt)
     }
 
     fn store_block_with_logs_on_parent(
@@ -5885,6 +5894,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_filter_rejects_noncontiguous_canonical_snapshot() {
+        let handler = setup();
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+
+        let hash1 = store_block_with_logs_on_parent(&handler, 1, genesis_hash, 1, vec![vec![]]);
+        store_block_with_logs_on_parent(
+            &handler,
+            2,
+            ShellHash::from_slice(&[0x99; 32]),
+            1,
+            vec![vec![]],
+        );
+
+        let error = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32603);
+        assert_eq!(
+            handler
+                .filter_registry
+                .get_filter_cursor(&filter_id)
+                .unwrap()
+                .1,
+            FilterCursor {
+                block_number: 0,
+                block_hash: Some(genesis_hash),
+            }
+        );
+
+        let hash2 = store_block_with_logs_on_parent(&handler, 2, hash1, 2, vec![vec![]]);
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([hash1, hash2])
+        );
+    }
+
+    #[tokio::test]
     async fn block_filter_changes_are_range_capped() {
         let handler = setup();
 
@@ -6132,15 +6181,26 @@ mod tests {
     #[tokio::test]
     async fn log_filter_preserves_cursor_across_canonical_gaps() {
         let handler = setup();
-        store_block_with_logs(&handler, 0, vec![vec![]]);
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
         let address = Address::from([0xAB; 20]);
         let raw: RawLogFilter =
             serde_json::from_str(&format!(r#"{{"fromBlock":"0x0","address":"{}"}}"#, address))
                 .unwrap();
         let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
 
+        let block1 = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash1 = block1.hash();
         let log = shell_core::Log::new(address, vec![], Bytes::new()).unwrap();
-        let hash2 = store_block_with_logs(&handler, 2, vec![vec![log]]);
+        let hash2 = store_block_with_logs_on_parent(&handler, 2, hash1, 1, vec![vec![log]]);
 
         let error = EthApiServer::get_filter_changes(&handler, filter_id.clone())
             .await
@@ -6155,7 +6215,8 @@ mod tests {
             0
         );
 
-        store_block_with_logs(&handler, 1, vec![vec![]]);
+        handler.chain_store.put_block(&block1).unwrap();
+        handler.chain_store.set_canonical(1, &hash1).unwrap();
         handler.chain_store.set_head(&hash2).unwrap();
         let changes = EthApiServer::get_filter_changes(&handler, filter_id)
             .await
