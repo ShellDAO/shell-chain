@@ -29,6 +29,12 @@ const VALIDATE_PAYMASTER_OP_SIGNATURE: &[u8] = b"validatePaymasterOp(address,byt
 const VALIDATE_TRANSACTION_SIGNATURE: &[u8] = b"validateTransactionV2(bytes32,bytes32,uint64,bytes32,uint256,uint64,uint64,uint64,bytes32,bytes32,bytes,bytes)";
 const VALIDATE_TRANSACTION_V1_SIGNATURE: &[u8] = b"validateTransaction(bytes32,bytes,bytes)";
 
+fn validation_block_number(head_number: Option<u64>) -> u64 {
+    head_number
+        .map(|number| number.saturating_add(1))
+        .unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub struct AaValidationOutcome {
     pub pubkey: Vec<u8>,
@@ -359,7 +365,7 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
     let head = chain_store.get_head_block()?;
     let (number, timestamp, gas_limit, excess_blob_gas) = match head {
         Some(block) => (
-            block.header.number,
+            validation_block_number(Some(block.header.number)),
             block.header.timestamp,
             block.header.gas_limit,
             block.header.excess_blob_gas,
@@ -575,10 +581,8 @@ fn validate_session_auth<S: KvStore + 'static, V: Verifier>(
     // execute in the next block. Check the candidate height rather than the
     // stored head height to avoid admitting an authorization at its exclusive
     // expiry boundary.
-    let validation_block = chain_store
-        .get_head_block()?
-        .map(|b| b.header.number.saturating_add(1))
-        .unwrap_or(0);
+    let validation_block =
+        validation_block_number(chain_store.get_head_block()?.map(|b| b.header.number));
     if session_auth.expiry_block <= validation_block {
         return Err(AaValidationError::SessionKeyExpired {
             expiry_block: session_auth.expiry_block,
@@ -699,7 +703,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
     let head = chain_store.get_head_block()?;
     let (number, timestamp, gas_limit, excess_blob_gas) = match head {
         Some(block) => (
-            block.header.number,
+            validation_block_number(Some(block.header.number)),
             block.header.timestamp,
             block.header.gas_limit,
             block.header.excess_blob_gas,
@@ -1110,6 +1114,30 @@ mod tests {
         ]
     }
 
+    fn validator_accepts_at_block_number(number: u8) -> Vec<u8> {
+        vec![
+            0x43, // number
+            0x60, number, 0x14, // eq(number, expected)
+            0x5f, 0x52, // mstore(0, accepted)
+            0x60, 0x20, 0x5f, 0xf3, // return(0, 32)
+        ]
+    }
+
+    fn set_head_number(cs: &ChainStore<MemoryDb>, number: u64) {
+        let head = Block {
+            header: BlockHeader {
+                number,
+                gas_limit: VALIDATION_GAS_CAP,
+                ..BlockHeader::default()
+            },
+            transactions: Vec::new(),
+            system_transactions: Vec::new(),
+            proposer_seal: None,
+        };
+        cs.put_block(&head).unwrap();
+        cs.set_head(&head.hash()).unwrap();
+    }
+
     fn read_abi_u64(word: &[u8]) -> u64 {
         u64::from_be_bytes(word[24..32].try_into().unwrap())
     }
@@ -1344,6 +1372,24 @@ mod tests {
     }
 
     #[test]
+    fn paymaster_validation_uses_candidate_block_number() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = Address::from([0x77; 20]);
+        install_paymaster(
+            &mut ws,
+            &cs,
+            paymaster,
+            validator_accepts_at_block_number(10),
+        );
+        set_head_number(&cs, 9);
+        let signed = sign_tx(&signer, base_tx(1337, nonce_from_signer(&signer)), true);
+        let bundle = test_contract_paymaster_bundle(paymaster);
+
+        call_paymaster_validate(&signed, &bundle, &paymaster, &[1], &ws, &cs).unwrap();
+    }
+
+    #[test]
     fn paymaster_validation_rejects_state_changes() {
         let signer = DilithiumSigner::generate();
         let (mut ws, cs) = setup_stores();
@@ -1455,17 +1501,7 @@ mod tests {
         assert_eq!(outcome.pubkey, root.public_key());
         assert!(outcome.should_register_pubkey);
 
-        let head = Block {
-            header: BlockHeader {
-                number: 9,
-                ..BlockHeader::default()
-            },
-            transactions: Vec::new(),
-            system_transactions: Vec::new(),
-            proposer_seal: None,
-        };
-        cs.put_block(&head).unwrap();
-        cs.set_head(&head.hash()).unwrap();
+        set_head_number(&cs, 9);
 
         let err = validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).unwrap_err();
         assert!(matches!(
@@ -1526,6 +1562,36 @@ mod tests {
         assert!(outcome.pubkey.is_empty());
         assert!(!outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    #[test]
+    fn custom_validation_uses_candidate_block_number() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        let code = validator_accepts_at_block_number(10);
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        ws.set_account(
+            &from,
+            &Account {
+                pq_pubkey_hash: ShellHash::ZERO,
+                nonce: 0,
+                balance: U256::from(1_000_000u64),
+                validation_code_hash: Some(code_hash),
+                code_hash: None,
+                storage_root: ShellHash::ZERO,
+            },
+        )
+        .unwrap();
+        set_head_number(&cs, 9);
+        let signed = SignedTransaction::new(
+            from,
+            base_tx(1337, 0),
+            PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
+        );
+
+        validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).unwrap();
     }
 
     #[test]
