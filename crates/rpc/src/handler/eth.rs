@@ -124,7 +124,7 @@ fn append_filter_logs<S: KvStore + 'static>(
         .map_err(internal_err)?
     {
         Some(receipts) => receipts,
-        None if header.logs_bloom.iter().all(|byte| *byte == 0) => Vec::new(),
+        None if header.logs_bloom.as_ref().iter().all(|byte| *byte == 0) => Vec::new(),
         None => {
             return Err(internal_err(format!(
                 "receipts for block {block_hash} are unavailable during filter poll"
