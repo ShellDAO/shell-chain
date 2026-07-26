@@ -657,6 +657,12 @@ mod tests {
         (ws, cs)
     }
 
+    fn valid_blob_hash() -> ShellHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = shell_core::BLOB_VERSIONED_HASH_VERSION_KZG;
+        ShellHash::from(bytes)
+    }
+
     fn fund_account(ws: &mut WorldState<MemoryDb>, addr: &Address, balance: U256) {
         use shell_core::Account;
         let account = Account {
@@ -1173,7 +1179,7 @@ mod tests {
         let mut tx = simple_transfer(test_chain_id(), u64::default());
         tx.tx_type = 3;
         tx.max_fee_per_blob_gas = Some(10);
-        tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+        tx.blob_versioned_hashes = Some(vec![valid_blob_hash()]);
         let execution_and_value = U256::from(tx.gas_limit)
             .checked_mul(U256::from(tx.max_fee_per_gas))
             .unwrap()
@@ -1187,6 +1193,34 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxValidationError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_blob_tx_rejects_unsupported_hash_version() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::MAX);
+        let mut tx = simple_transfer(test_chain_id(), u64::default());
+        tx.tx_type = 3;
+        tx.max_fee_per_blob_gas = Some(10);
+        tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+        let signed = sign_tx(&signer, tx, true);
+
+        let result = validate_tx(&signed, &mut ws, &cs, &DilithiumVerifier, test_chain_id());
+        assert!(matches!(
+            result,
+            Err(TxValidationError::InvalidBlobTx(message))
+                if message == "blob tx has unsupported versioned hash version"
+        ));
+
+        let result =
+            validate_tx_for_import(&signed, &mut ws, &cs, &DilithiumVerifier, test_chain_id());
+        assert!(matches!(
+            result,
+            Err(TxValidationError::InvalidBlobTx(message))
+                if message == "blob tx has unsupported versioned hash version"
         ));
     }
 
