@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 /// Higher score = preferred chain. Compared lexicographically by fields in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockScore {
-    /// Whether this block is on the finalized chain (1 = yes, 0 = no).
-    /// Finalized chains always win.
+    /// Whether this block is on or extends the finalized chain (1 = yes, 0 = no).
+    /// Finalized-compatible chains always win.
     pub is_finalized: u8,
     /// Total attesting weight this block has received.
     pub attested_weight: u64,
@@ -46,6 +46,8 @@ pub struct ForkChoice {
     parent_map: HashMap<ShellHash, ShellHash>,
     /// Maps block hash to its score.
     scores: HashMap<ShellHash, BlockScore>,
+    /// Latest finalized checkpoint used to reject incompatible forks.
+    finalized_root: Option<ShellHash>,
     /// Current canonical head.
     head: ShellHash,
     /// Current head score.
@@ -69,6 +71,7 @@ impl ForkChoice {
         Self {
             parent_map,
             scores,
+            finalized_root: None,
             head: genesis_hash,
             head_score: score,
         }
@@ -84,16 +87,15 @@ impl ForkChoice {
         attested_weight: u64,
         is_on_finalized_chain: bool,
     ) -> bool {
-        let parent_is_on_finalized_chain = self
-            .scores
-            .get(&parent_hash)
-            .is_some_and(|score| score.is_finalized == 1);
+        let is_finalized = match self.finalized_root {
+            Some(_) => self
+                .scores
+                .get(&parent_hash)
+                .is_some_and(|score| score.is_finalized == 1),
+            None => is_on_finalized_chain,
+        };
         let score = BlockScore {
-            is_finalized: if is_on_finalized_chain || parent_is_on_finalized_chain {
-                1
-            } else {
-                0
-            },
+            is_finalized: u8::from(is_finalized),
             attested_weight,
             block_number,
             block_hash,
@@ -135,12 +137,24 @@ impl ForkChoice {
         if !self.scores.contains_key(block_hash) {
             return false;
         }
+        if let Some(finalized_root) = self.finalized_root {
+            if finalized_root != *block_hash
+                && self.chain_between(block_hash, &finalized_root).is_empty()
+            {
+                return false;
+            }
+        }
 
         let old_head = self.head;
         let mut children: HashMap<ShellHash, Vec<ShellHash>> = HashMap::new();
         for (child, parent) in &self.parent_map {
             children.entry(*parent).or_default().push(*child);
         }
+
+        for score in self.scores.values_mut() {
+            score.is_finalized = 0;
+        }
+        self.finalized_root = Some(*block_hash);
 
         let mut descendants = vec![*block_hash];
         let mut marked = HashSet::new();
@@ -382,6 +396,19 @@ mod tests {
     }
 
     #[test]
+    fn finality_excludes_incompatible_forks() {
+        let mut fc = ForkChoice::new(hash(0));
+        fc.add_block(hash(1), hash(0), 1, 0, false);
+        fc.add_block(hash(2), hash(1), 2, 0, false);
+        fc.add_block(hash(3), hash(0), 1, 10, true);
+
+        assert!(fc.mark_finalized(&hash(1)));
+        assert_eq!(fc.score(&hash(2)).unwrap().is_finalized, 1);
+        assert_eq!(fc.score(&hash(3)).unwrap().is_finalized, 0);
+        assert_eq!(fc.head(), &hash(2));
+    }
+
+    #[test]
     fn descendants_added_after_finality_inherit_finalized_chain_status() {
         let mut fc = ForkChoice::new(hash(0));
         fc.add_block(hash(1), hash(0), 1, 0, false);
@@ -389,6 +416,10 @@ mod tests {
 
         assert!(fc.add_block(hash(2), hash(1), 2, 0, false));
         assert_eq!(fc.score(&hash(2)).unwrap().is_finalized, 1);
+        assert_eq!(fc.head(), &hash(2));
+
+        fc.add_block(hash(3), hash(0), 1, 100, true);
+        assert_eq!(fc.score(&hash(3)).unwrap().is_finalized, 0);
         assert_eq!(fc.head(), &hash(2));
     }
 
