@@ -119,15 +119,18 @@ fn append_filter_logs<S: KvStore + 'static>(
         return Ok(());
     }
 
-    let receipts = chain_store
+    let receipts = match chain_store
         .get_receipts(&block_hash)
         .map_err(internal_err)?
-        .ok_or_else(|| {
-            internal_err(format!(
+    {
+        Some(receipts) => receipts,
+        None if header.logs_bloom.iter().all(|byte| *byte == 0) => Vec::new(),
+        None => {
+            return Err(internal_err(format!(
                 "receipts for block {block_hash} are unavailable during filter poll"
-            ))
-        })?;
-    let mut global_log_index: u64 = 0;
+            )));
+        }
+    };    let mut global_log_index: u64 = 0;
     for (tx_idx, receipt) in receipts.into_iter().enumerate() {
         let tx_hash = receipt.tx_hash;
         for log in receipt.logs {
