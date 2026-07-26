@@ -1,6 +1,6 @@
 # Shell Node CLI Reference
 
-> `shell-node` v0.27.2 — post-quantum blockchain node (ML-DSA-65 primary, Dilithium3 legacy-compatible)
+> `shell-node` v0.27.3 — post-quantum blockchain node (ML-DSA-65 primary, Dilithium3 legacy-compatible)
 
 ---
 

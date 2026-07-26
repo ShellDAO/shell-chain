@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
+
 ### Fixed
 
 - Saturate blob base fees at the supported numeric maximum while preserving

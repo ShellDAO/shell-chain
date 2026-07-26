@@ -1,6 +1,6 @@
 [package]
 name = "shell-fuzz"
-version = "0.27.2"
+version = "0.27.3"
 edition = "2021"
 license = "MIT"
 publish = false
