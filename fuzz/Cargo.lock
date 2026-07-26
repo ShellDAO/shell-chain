@@ -3270,7 +3270,7 @@ dependencies = [
 
 [[package]]
 name = "shell-consensus"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "serde",
@@ -3295,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "shell-crypto"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "bip39",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "shell-fuzz"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "libfuzzer-sys",
@@ -3328,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "shell-mempool"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "parking_lot",
  "serde_json",
@@ -3343,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "shell-pqvm"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-primitives",
  "blake3",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "shell-primitives"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "shell-rpc"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "shell-stark-prover"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "blake3",
  "serde",
@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "shell-storage"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "base64",

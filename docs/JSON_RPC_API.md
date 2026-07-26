@@ -798,7 +798,7 @@ Returns the client identifier string.
 
 **Parameters:** None
 
-**Returns:** `String` — `"shell-chain/0.27.1"`.
+**Returns:** `String` — `"shell-chain/0.27.2"`.
 
 ```bash
 curl -s http://localhost:8545 \
@@ -807,7 +807,7 @@ curl -s http://localhost:8545 \
 ```
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":"shell-chain/0.27.1"}
+{"jsonrpc":"2.0","id":1,"result":"shell-chain/0.27.2"}
 ```
 
 ---
@@ -1029,7 +1029,7 @@ Returns node status information.
 **Returns:**
 ```json
 {
-  "version": "ShellChain/v0.27.1/rust",
+  "version": "ShellChain/v0.27.2/rust",
   "chainId": 1337,
   "blockHeight": 42,
   "peerCount": 0,

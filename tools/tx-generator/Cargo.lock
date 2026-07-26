@@ -3525,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "serde",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "shell-crypto"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "bip39",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "shell-pqvm"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-primitives",
  "blake3",
@@ -3578,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "shell-primitives"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "shell-storage"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "alloy-rlp",
  "base64",

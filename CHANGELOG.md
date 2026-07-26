@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.2] — 2026-07-26 — Finality safety and correctness hardening
+
 ### Fixed
 
 - Stop fixed-range log filters at their resolved `toBlock` instead of advancing

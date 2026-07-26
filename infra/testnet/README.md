@@ -24,7 +24,7 @@ mkdir -p keys
 # … copy node1.key, node2.key, node3.key here
 
 # 3. Set environment
-export SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.27.1
+export SHELL_IMAGE=ghcr.io/shelldao/shell-chain:0.27.2
 export NODE1_KEY_PATH=./keys/node1.key
 export NODE2_KEY_PATH=./keys/node2.key
 export NODE3_KEY_PATH=./keys/node3.key
