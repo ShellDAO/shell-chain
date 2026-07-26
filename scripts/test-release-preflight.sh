@@ -29,6 +29,9 @@ fi
 if ! grep -Fq 'check-release-lockfile.sh' "$SCRIPT_DIR/release.sh"; then
     fail "release preflight does not verify the workspace lockfile"
 fi
+if ! grep -Fq 'check-release-lineage.sh' "$SCRIPT_DIR/release.sh"; then
+    fail "release preflight does not verify current canonical main ancestry"
+fi
 if ! grep -Fq 'git push "$RELEASE_REMOTE" "$TAG"' "$SCRIPT_DIR/release.sh"; then
     fail "release tag push does not use the validated remote"
 fi
@@ -105,6 +108,38 @@ if ! grep -Fq "has no push URL" <<<"$REMOTE_OUTPUT"; then
     fail "missing push URL rejection was not specific: $REMOTE_OUTPUT"
 fi
 
+LINEAGE_REMOTE="$TMP_DIR/lineage-remote.git"
+LINEAGE_FIXTURE="$TMP_DIR/lineage-fixture"
+git init -q --bare "$LINEAGE_REMOTE"
+git init -q -b main "$LINEAGE_FIXTURE"
+git -C "$LINEAGE_FIXTURE" config user.name "ShellDAO Release Test"
+git -C "$LINEAGE_FIXTURE" config user.email "release-test@shelldao.org"
+printf 'base\n' > "$LINEAGE_FIXTURE/history"
+git -C "$LINEAGE_FIXTURE" add history
+git -C "$LINEAGE_FIXTURE" commit -qm "base"
+git -C "$LINEAGE_FIXTURE" remote add canonical "$LINEAGE_REMOTE"
+git -C "$LINEAGE_FIXTURE" push -q -u canonical main
+git -C "$LINEAGE_FIXTURE" switch -qc release/v0.27.1
+(cd "$LINEAGE_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-lineage.sh" canonical HEAD >/dev/null)
+
+git -C "$LINEAGE_FIXTURE" switch -q main
+printf 'advanced\n' >> "$LINEAGE_FIXTURE/history"
+git -C "$LINEAGE_FIXTURE" commit -qam "advance main"
+git -C "$LINEAGE_FIXTURE" push -q canonical main
+git -C "$LINEAGE_FIXTURE" switch -q release/v0.27.1
+if LINEAGE_OUTPUT=$(cd "$LINEAGE_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-lineage.sh" canonical HEAD 2>&1); then
+    fail "release lineage check unexpectedly accepted a stale release branch"
+fi
+if ! grep -Fq "does not descend from current 'canonical/main'" <<<"$LINEAGE_OUTPUT"; then
+    fail "stale release branch rejection was not specific: $LINEAGE_OUTPUT"
+fi
+
+git -C "$LINEAGE_FIXTURE" merge -q --ff-only main
+(cd "$LINEAGE_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-lineage.sh" canonical HEAD >/dev/null)
+
 CHECK_SHA=1111111111111111111111111111111111111111
 FAKE_GH="$TMP_DIR/fake-gh"
 cat > "$FAKE_GH" <<'EOF'
@@ -166,6 +201,7 @@ make_fixture() {
     mkdir -p "$fixture/scripts"
     cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/changelog-excerpt.sh" \
         "$SCRIPT_DIR/check-release-ci.sh" \
+        "$SCRIPT_DIR/check-release-lineage.sh" \
         "$SCRIPT_DIR/check-release-lockfile.sh" \
         "$SCRIPT_DIR/check-release-remote.sh" \
         "$SCRIPT_DIR/check-release-metadata.sh" \
@@ -257,6 +293,7 @@ git -C "$fixture" switch -q --orphan release/v0.27.1
 mkdir -p "$fixture/scripts"
 cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/changelog-excerpt.sh" \
     "$SCRIPT_DIR/check-release-ci.sh" \
+    "$SCRIPT_DIR/check-release-lineage.sh" \
     "$SCRIPT_DIR/check-release-lockfile.sh" \
     "$SCRIPT_DIR/check-release-remote.sh" \
     "$SCRIPT_DIR/check-release-metadata.sh" \
