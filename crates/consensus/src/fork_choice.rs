@@ -287,12 +287,14 @@ impl ForkChoice {
         }
 
         self.scores.retain(|hash, _| protected.contains(hash));
+        for score in self.scores.values_mut() {
+            score.is_finalized = 1;
+        }
         self.parent_map.retain(|hash, _| protected.contains(hash));
         self.parent_map.insert(finalized_hash, ShellHash::ZERO);
+        self.finalized_root = Some(finalized_hash);
 
-        if !protected.contains(&self.head) {
-            self.recalculate_head();
-        }
+        self.recalculate_head();
     }
 
     /// Number of tracked blocks.
@@ -409,6 +411,21 @@ mod tests {
     }
 
     #[test]
+    fn finality_cannot_move_to_an_incompatible_fork() {
+        let mut fc = ForkChoice::new(hash(0));
+        fc.add_block(hash(1), hash(0), 1, 0, false);
+        fc.add_block(hash(2), hash(1), 2, 0, false);
+        fc.add_block(hash(3), hash(0), 1, 100, false);
+
+        fc.mark_finalized(&hash(1));
+        fc.mark_finalized(&hash(2));
+        assert!(!fc.mark_finalized(&hash(3)));
+        assert_eq!(fc.score(&hash(2)).unwrap().is_finalized, 1);
+        assert_eq!(fc.score(&hash(3)).unwrap().is_finalized, 0);
+        assert_eq!(fc.head(), &hash(2));
+    }
+
+    #[test]
     fn descendants_added_after_finality_inherit_finalized_chain_status() {
         let mut fc = ForkChoice::new(hash(0));
         fc.add_block(hash(1), hash(0), 1, 0, false);
@@ -492,12 +509,12 @@ mod tests {
     }
 
     #[test]
-    fn prune_uses_latest_finalized_height_when_older_block_is_head() {
+    fn prune_keeps_latest_finalized_block_as_head() {
         let mut fc = ForkChoice::new(hash(0));
         fc.add_block(hash(1), hash(0), 1, 100, true);
         fc.add_block(hash(2), hash(1), 2, 67, false);
         fc.mark_finalized(&hash(2));
-        assert_eq!(fc.head(), &hash(1));
+        assert_eq!(fc.head(), &hash(2));
 
         fc.prune_below(2);
 
