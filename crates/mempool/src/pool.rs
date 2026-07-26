@@ -1088,6 +1088,8 @@ mod tests {
         max_fee_per_blob_gas: u64,
     ) -> SignedTransaction {
         let from = test_address(pubkey);
+        let mut blob_hash = [0u8; 32];
+        blob_hash[0] = shell_core::BLOB_VERSIONED_HASH_VERSION_KZG;
         let tx = Transaction {
             chain_id: 42,
             nonce: u64::default(),
@@ -1100,7 +1102,7 @@ mod tests {
             access_list: None,
             tx_type: 3,
             max_fee_per_blob_gas: Some(max_fee_per_blob_gas),
-            blob_versioned_hashes: Some(vec![ShellHash::ZERO]),
+            blob_versioned_hashes: Some(vec![ShellHash::from(blob_hash)]),
         };
         let sig = signer.sign(tx.hash().as_bytes()).unwrap();
         SignedTransaction::with_pubkey(from, tx, sig, pubkey.to_vec())
@@ -1401,6 +1403,24 @@ mod tests {
             err,
             MempoolError::InvalidTransaction(message)
                 if message == "non-blob tx cannot have max_fee_per_blob_gas"
+        ));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn reject_blob_transaction_with_unsupported_hash_version() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let mut tx = make_blob_tx(1_000_000);
+        tx.tx.blob_versioned_hashes = Some(vec![ShellHash::ZERO]);
+
+        let err = insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            MempoolError::InvalidTransaction(message)
+                if message == "blob tx has unsupported versioned hash version"
         ));
         assert!(pool.is_empty());
     }

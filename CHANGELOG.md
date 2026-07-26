@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject blob transactions whose versioned hashes do not use the EIP-4844 KZG
+  version byte.
+
 ## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
 
 ### Fixed

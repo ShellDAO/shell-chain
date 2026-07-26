@@ -15,6 +15,8 @@ pub struct AccessListItem {
 
 /// EIP-4844: maximum number of blob hashes per transaction.
 pub const MAX_BLOB_HASHES_PER_TX: usize = 6;
+/// EIP-4844 version byte for KZG commitment hashes.
+pub const BLOB_VERSIONED_HASH_VERSION_KZG: u8 = 0x01;
 
 /// An unsigned transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +286,12 @@ impl Transaction {
         }
         if self.to.is_none() {
             return Err("blob tx cannot be a contract creation");
+        }
+        if hashes
+            .iter()
+            .any(|hash| hash.as_bytes()[0] != BLOB_VERSIONED_HASH_VERSION_KZG)
+        {
+            return Err("blob tx has unsupported versioned hash version");
         }
         Ok(())
     }
@@ -1987,6 +1995,12 @@ impl Decodable for SignedTransaction {
 mod tests {
     use super::*;
 
+    fn valid_blob_hash() -> ShellHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = BLOB_VERSIONED_HASH_VERSION_KZG;
+        ShellHash::from(bytes)
+    }
+
     fn sample_tx() -> Transaction {
         Transaction {
             chain_id: 1337,
@@ -2292,10 +2306,32 @@ mod tests {
             access_list: None,
             tx_type: 3,
             max_fee_per_blob_gas: Some(1_000_000),
-            blob_versioned_hashes: Some(vec![ShellHash::ZERO]),
+            blob_versioned_hashes: Some(vec![valid_blob_hash()]),
         };
         assert!(tx.validate_blob_tx().is_ok());
         assert_eq!(tx.blob_gas(), crate::fee::BLOB_GAS_PER_BLOB);
+    }
+
+    #[test]
+    fn blob_tx_rejects_unsupported_hash_version() {
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(Address::from([0x01; 20])),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 20,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 3,
+            max_fee_per_blob_gas: Some(1_000_000),
+            blob_versioned_hashes: Some(vec![ShellHash::ZERO]),
+        };
+        assert_eq!(
+            tx.validate_blob_tx().unwrap_err(),
+            "blob tx has unsupported versioned hash version"
+        );
     }
 
     #[test]
@@ -2490,7 +2526,7 @@ mod tests {
 
     #[test]
     fn blob_tx_max_six_hashes_ok() {
-        let hashes = vec![ShellHash::ZERO; 6];
+        let hashes = vec![valid_blob_hash(); 6];
         let tx = Transaction {
             chain_id: 1337,
             nonce: 0,
