@@ -22,7 +22,7 @@
 //!             └─ log "historical sync complete" when caught up
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -64,6 +64,7 @@ struct PeerCapabilityRecord {
 #[derive(Debug, Default)]
 struct PeerCapabilityState {
     records: HashMap<PeerId, PeerCapabilityRecord>,
+    update_order: BTreeMap<u64, PeerId>,
     next_sequence: u64,
 }
 
@@ -95,17 +96,20 @@ impl PeerCapabilityTracker {
     pub fn record(&self, peer: PeerId, profile: String, oldest_body_block: u64) {
         let mut state = self.inner.lock();
         if !state.records.contains_key(&peer) && state.records.len() >= self.max_records {
-            if let Some(oldest) = state
-                .records
-                .iter()
-                .min_by_key(|(_, record)| record.update_sequence)
-                .map(|(peer, _)| peer.clone())
-            {
+            if let Some((_, oldest)) = state.update_order.pop_first() {
                 state.records.remove(&oldest);
             }
         }
         let update_sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
+        if let Some(previous_sequence) = state
+            .records
+            .get(&peer)
+            .map(|record| record.update_sequence)
+        {
+            state.update_order.remove(&previous_sequence);
+        }
+        state.update_order.insert(update_sequence, peer.clone());
         state.records.insert(
             peer,
             PeerCapabilityRecord {
@@ -120,7 +124,10 @@ impl PeerCapabilityTracker {
 
     /// Remove a peer (on disconnect).
     pub fn remove(&self, peer: &PeerId) {
-        self.inner.lock().records.remove(peer);
+        let mut state = self.inner.lock();
+        if let Some(record) = state.records.remove(peer) {
+            state.update_order.remove(&record.update_sequence);
+        }
     }
 
     /// Return the best peer for back-filling bodies starting at `from_block`.
@@ -148,6 +155,11 @@ impl PeerCapabilityTracker {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().records.len()
+    }
+
+    #[cfg(test)]
+    fn update_order_len(&self) -> usize {
+        self.inner.lock().update_order.len()
     }
 }
 
@@ -433,6 +445,7 @@ mod tests {
         tracker.record(PeerId("a".into()), "full".into(), 0);
         tracker.remove(&PeerId("a".into()));
         assert!(tracker.best_peer_for_block(0).is_none());
+        assert_eq!(tracker.update_order_len(), 0);
     }
 
     #[test]
@@ -443,6 +456,7 @@ mod tests {
         tracker.record(PeerId("newest".into()), "light".into(), 0);
 
         assert_eq!(tracker.len(), 2);
+        assert_eq!(tracker.update_order_len(), 2);
         assert_eq!(tracker.best_peer_for_block(0), Some(PeerId("newer".into())));
     }
 
@@ -455,10 +469,26 @@ mod tests {
         tracker.record(PeerId("new".into()), "light".into(), 0);
 
         assert_eq!(tracker.len(), 2);
+        assert_eq!(tracker.update_order_len(), 2);
         assert_eq!(
             tracker.best_peer_for_block(0),
             Some(PeerId("refreshed".into()))
         );
+    }
+
+    #[test]
+    fn tracker_updates_keep_eviction_index_bounded() {
+        let tracker = PeerCapabilityTracker::with_max_records(2);
+        for oldest_body_block in 0..100 {
+            tracker.record(
+                PeerId("repeated".into()),
+                "archive".into(),
+                oldest_body_block,
+            );
+        }
+
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.update_order_len(), 1);
     }
 
     fn numbered_block(number: u64) -> Block {
