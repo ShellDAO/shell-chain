@@ -175,6 +175,12 @@ struct PendingDirectMessages {
     max_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectMessageAdmission {
+    Send,
+    Drop,
+}
+
 impl PendingDirectMessages {
     fn new(max_messages: usize, max_bytes: usize) -> Self {
         Self {
@@ -211,6 +217,17 @@ impl PendingDirectMessages {
         let message = self.messages.remove(request_id)?;
         self.bytes = self.bytes.saturating_sub(message.data.len());
         Some(message)
+    }
+}
+
+fn direct_message_admission(
+    pending: &PendingDirectMessages,
+    data_len: usize,
+) -> DirectMessageAdmission {
+    if pending.can_accept(data_len) {
+        DirectMessageAdmission::Send
+    } else {
+        DirectMessageAdmission::Drop
     }
 }
 
@@ -846,32 +863,22 @@ async fn swarm_loop(
                             );
                         } else {
                             let data: Arc<[u8]> = data.into();
-                            if pending_direct_messages.can_accept(data.len()) {
-                                let request_id = swarm
-                                    .behaviour_mut()
-                                    .direct_message
-                                    .send_request(&peer, Arc::clone(&data));
-                                pending_direct_messages.insert(
-                                    request_id,
-                                    PendingDirectMessage { topic, data },
-                                );
-                            } else {
-                                let ident = match topic {
-                                    TopicKind::Blocks => loop_config.blocks_topic.clone(),
-                                    TopicKind::Transactions => loop_config.txs_topic.clone(),
-                                    TopicKind::Attestation => loop_config.attestation_topic.clone(),
-                                    TopicKind::Proofs => loop_config.proofs_topic.clone(),
-                                };
-                                warn!(
-                                    %peer,
-                                    "direct message pending limit reached; using gossip fallback"
-                                );
-                                if let Err(error) = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(ident, data.to_vec())
-                                {
-                                    debug!(%peer, %error, "direct message overload fallback failed");
+                            match direct_message_admission(&pending_direct_messages, data.len()) {
+                                DirectMessageAdmission::Send => {
+                                    let request_id = swarm
+                                        .behaviour_mut()
+                                        .direct_message
+                                        .send_request(&peer, Arc::clone(&data));
+                                    pending_direct_messages.insert(
+                                        request_id,
+                                        PendingDirectMessage { topic, data },
+                                    );
+                                }
+                                DirectMessageAdmission::Drop => {
+                                    warn!(
+                                        %peer,
+                                        "direct message pending limit reached; dropping peer-targeted message"
+                                    );
                                 }
                             }
                         }
@@ -1737,6 +1744,16 @@ mod tests {
         pending.remove(&first_id).unwrap();
         assert_eq!(pending.bytes, 3);
         assert!(pending.can_accept(4));
+    }
+
+    #[test]
+    fn direct_message_overload_drops_instead_of_broadcasting() {
+        let pending = PendingDirectMessages::new(0, 0);
+
+        assert_eq!(
+            direct_message_admission(&pending, 1),
+            DirectMessageAdmission::Drop
+        );
     }
 
     #[test]
