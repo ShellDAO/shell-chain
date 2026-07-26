@@ -6069,6 +6069,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_filter_preserves_cursor_when_matching_block_receipts_are_missing() {
+        let handler = setup();
+        let address = Address::from([0xE1; 20]);
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"address":"{}"}}"#, address)).unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        let log = shell_core::Log::new(address, vec![], Bytes::new()).unwrap();
+        let bloom = shell_pqvm::bloom::logs_bloom(std::slice::from_ref(&log));
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                logs_bloom: Bytes::copy_from_slice(&bloom),
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let block_hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &block_hash).unwrap();
+        handler.chain_store.set_head(&block_hash).unwrap();
+
+        let error = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32603);
+        assert_eq!(
+            handler
+                .filter_registry
+                .get_filter_cursor(&filter_id)
+                .unwrap()
+                .1,
+            FilterCursor {
+                block_number: 0,
+                block_hash: Some(genesis_hash),
+            }
+        );
+
+        let receipt = TransactionReceipt {
+            tx_hash: ShellHash::from_slice(&[0xA1; 32]),
+            block_number: 1,
+            tx_index: 0,
+            status: 1,
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            contract_address: None,
+            logs_bloom: Bytes::copy_from_slice(&bloom),
+            logs: vec![log],
+        };
+        handler
+            .chain_store
+            .put_receipts(&block_hash, &[receipt])
+            .unwrap();
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(block_hash));
+    }
+
+    #[tokio::test]
     async fn log_filter_returns_removed_and_same_height_replacement_logs() {
         let handler = setup();
         let address = Address::from([0xA1; 20]);
