@@ -951,11 +951,27 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
 
             let block_hash = block.hash();
 
-            let receipts = self
+            let receipts = match self
                 .chain_store
                 .get_receipts(&block_hash)
                 .map_err(internal_err)?
-                .unwrap_or_default();
+            {
+                Some(receipts) => receipts,
+                None if block
+                    .header
+                    .logs_bloom
+                    .as_ref()
+                    .iter()
+                    .all(|byte| *byte == 0) =>
+                {
+                    Vec::new()
+                }
+                None => {
+                    return Err(internal_err(format!(
+                        "receipts for block {block_hash} are unavailable during log query"
+                    )));
+                }
+            };
 
             // F-073: track bloom false positives — count results before this block.
             let results_before = results.len();

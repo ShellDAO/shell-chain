@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Reject blob transactions whose versioned hashes do not use the EIP-4844 KZG
   version byte.
+- Return an internal error from `eth_getLogs` when a matching canonical block
+  has a non-zero log bloom but its receipts are unavailable.
 
 ## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
 

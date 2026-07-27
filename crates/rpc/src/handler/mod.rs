@@ -3965,6 +3965,52 @@ mod tests {
         hash
     }
 
+    fn store_block_without_receipts(
+        handler: &RpcHandler<MemoryDb>,
+        number: u64,
+        logs_bloom: Bytes,
+    ) -> ShellHash {
+        let parent_hash = number
+            .checked_sub(1)
+            .and_then(|parent_number| {
+                handler
+                    .chain_store
+                    .get_block_hash_by_number(parent_number)
+                    .unwrap()
+            })
+            .unwrap_or_default();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash,
+                state_root: ShellHash::default(),
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom,
+                number,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_000 + number,
+                extra_data: Bytes::default(),
+                proposer: test_address(b"proposer-key-data"),
+                sig_aggregate_proof: None,
+                base_fee_per_gas: 0,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(number, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        hash
+    }
+
     #[tokio::test]
     async fn get_logs_empty_range_returns_empty() {
         let handler = setup();
@@ -3980,6 +4026,42 @@ mod tests {
         let raw: crate::filter::RawLogFilter =
             serde_json::from_str(r#"{"fromBlock":"0x0","toBlock":"0x0"}"#).unwrap();
         let result = EthApiServer::get_logs(&handler, raw).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_logs_rejects_missing_receipts_for_matching_nonzero_bloom() {
+        let handler = setup();
+        let target = Address::from([0xAA; 20]);
+        let log = shell_core::Log::new(target, vec![], Bytes::new()).unwrap();
+        let bloom = shell_pqvm::bloom::logs_bloom(&[log]);
+        let block_hash = store_block_without_receipts(&handler, 0, Bytes::copy_from_slice(&bloom));
+        assert!(handler
+            .chain_store
+            .get_receipts(&block_hash)
+            .unwrap()
+            .is_none());
+        let raw: crate::filter::RawLogFilter = serde_json::from_str(&format!(
+            r#"{{"fromBlock":"0x0","toBlock":"0x0","address":"{}"}}"#,
+            target,
+        ))
+        .unwrap();
+
+        let err = EthApiServer::get_logs(&handler, raw).await.unwrap_err();
+
+        assert_eq!(err.code(), -32603);
+        assert_eq!(err.message(), "Internal server error");
+    }
+
+    #[tokio::test]
+    async fn get_logs_allows_missing_receipts_for_zero_bloom() {
+        let handler = setup();
+        store_block_without_receipts(&handler, 0, Bytes::from(vec![0; BLOOM_SIZE]));
+        let raw: crate::filter::RawLogFilter =
+            serde_json::from_str(r#"{"fromBlock":"0x0","toBlock":"0x0"}"#).unwrap();
+
+        let result = EthApiServer::get_logs(&handler, raw).await.unwrap();
+
         assert!(result.is_empty());
     }
 
