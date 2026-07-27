@@ -5,7 +5,7 @@ use shell_e2e::*;
 
 use shell_primitives::{Address, ShellHash, U256};
 use shell_rpc::api::EthApiServer;
-use shell_storage::{ChainStore, MemoryDb, SnapshotMetadata};
+use shell_storage::{ChainConfig, ChainStore, MemoryDb, SnapshotMetadata};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -184,6 +184,12 @@ async fn snapshot_export_import_roundtrip() {
     store_block(&env, &block1);
 
     let genesis_hash = genesis.hash();
+    env.chain_store
+        .put_chain_config(&ChainConfig {
+            chain_id: TEST_CHAIN_ID,
+            genesis_hash,
+        })
+        .unwrap();
 
     // Export snapshot
     let metadata = SnapshotMetadata::new(TEST_CHAIN_ID, 1, block1.hash(), state_root, genesis_hash);
