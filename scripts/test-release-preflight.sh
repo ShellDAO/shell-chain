@@ -159,7 +159,10 @@ write_check_runs() {
   "check_runs": [
     {"name":"Check & Lint","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}},
     {"name":"Test","head_sha":"$test_sha","status":"$test_status","conclusion":$test_conclusion,"app":{"slug":"$test_app","owner":{"login":"$test_app_owner"}}},
-    {"name":"Supply Chain Security","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}}
+    {"name":"Supply Chain Security","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}},
+    {"name":"Analyze (actions)","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}},
+    {"name":"Analyze (python)","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}},
+    {"name":"Analyze (rust)","head_sha":"$CHECK_SHA","status":"completed","conclusion":"success","app":{"slug":"github-actions","owner":{"login":"github"}}}
   ]
 }
 EOF
@@ -180,6 +183,21 @@ assert_ci_fails_with() {
 write_check_runs completed '"success"'
 GH_BIN="$FAKE_GH" CHECK_RUNS_FIXTURE="$TMP_DIR/check-runs.json" \
     "$SCRIPT_DIR/check-release-ci.sh" "$CHECK_SHA" >/dev/null
+
+python3 - "$TMP_DIR/check-runs.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    payload = json.load(source)
+payload["check_runs"] = [
+    run for run in payload["check_runs"] if run["name"] != "Analyze (rust)"
+]
+with open(path, "w", encoding="utf-8") as destination:
+    json.dump(payload, destination)
+PY
+assert_ci_fails_with "required check 'Analyze (rust)' is missing"
 
 write_check_runs in_progress null
 assert_ci_fails_with "required check 'Test' has not succeeded"

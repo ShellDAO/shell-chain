@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Require successful exact-commit CodeQL analyses for GitHub Actions, Python,
+  and Rust before creating a release tag.
 - Reject aggregate pending balance reservations that exceed the U256 balance
   range.
 - Reject blob transactions whose versioned hashes do not use the EIP-4844 KZG

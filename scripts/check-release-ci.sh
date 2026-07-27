@@ -30,7 +30,14 @@ import json
 import sys
 
 commit, path = sys.argv[1:]
-required = ("Check & Lint", "Test", "Supply Chain Security")
+required = (
+    "Check & Lint",
+    "Test",
+    "Supply Chain Security",
+    "Analyze (actions)",
+    "Analyze (python)",
+    "Analyze (rust)",
+)
 
 try:
     with open(path, encoding="utf-8") as source:
