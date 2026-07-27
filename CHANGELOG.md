@@ -4,8 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Index pending sender and paymaster balance reservations so transaction
+  admission no longer scans the full mempool.
+
 ### Fixed
 
+- Reject aggregate pending balance reservations that exceed the U256 balance
+  range.
 - Reject blob transactions whose versioned hashes do not use the EIP-4844 KZG
   version byte.
 - Return an internal error from `eth_getLogs` when a matching canonical block

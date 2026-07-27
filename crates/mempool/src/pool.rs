@@ -54,6 +54,50 @@ struct PoolInner {
     seq: u64,
     /// Aggregate serialized size of all retained transactions.
     total_bytes: usize,
+    /// Aggregate balance reserved by retained transactions for each sender or
+    /// paymaster. This keeps admission checks independent of total pool size.
+    reserved_by_account: HashMap<Address, ReservationTotal>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReservationTotal {
+    /// Aggregate modulo 2^256.
+    low: U256,
+    /// Carry count retained so removals recover the exact aggregate.
+    overflow_units: u64,
+}
+
+impl ReservationTotal {
+    fn add(self, cost: U256) -> Self {
+        let (low, overflowed) = self.low.overflowing_add(cost);
+        Self {
+            low,
+            overflow_units: self.overflow_units.saturating_add(u64::from(overflowed)),
+        }
+    }
+
+    fn subtract(self, cost: U256) -> Self {
+        let (low, borrowed) = self.low.overflowing_sub(cost);
+        if borrowed && self.overflow_units == 0 {
+            return Self::default();
+        }
+        Self {
+            low,
+            overflow_units: self.overflow_units.saturating_sub(u64::from(borrowed)),
+        }
+    }
+
+    fn saturating_u256(self) -> U256 {
+        if self.overflow_units == 0 {
+            self.low
+        } else {
+            U256::MAX
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.overflow_units == 0 && self.low == U256::ZERO
+    }
 }
 
 /// Entry in the pool holding the transaction and metadata.
@@ -83,6 +127,7 @@ impl TxPool {
                 by_priority: BTreeMap::new(),
                 seq: 0,
                 total_bytes: 0,
+                reserved_by_account: HashMap::new(),
             }),
         }
     }
@@ -314,6 +359,7 @@ impl TxPool {
             .entry(sender)
             .or_default()
             .insert(nonce, hash);
+        Self::add_reservations(&mut inner, &tx);
         inner.by_hash.insert(
             hash,
             PoolEntry {
@@ -419,6 +465,7 @@ impl TxPool {
         inner.by_priority.clear();
         inner.seq = 0;
         inner.total_bytes = 0;
+        inner.reserved_by_account.clear();
     }
 
     /// Get a transaction by hash.
@@ -765,6 +812,7 @@ impl TxPool {
     fn remove_entry(inner: &mut PoolInner, hash: &ShellHash) -> bool {
         if let Some(entry) = inner.by_hash.remove(hash) {
             inner.total_bytes = inner.total_bytes.saturating_sub(entry.serialized_size);
+            Self::remove_reservations(inner, &entry.tx);
             let sender = entry.tx.sender();
             let nonce = entry.tx.tx.nonce;
 
@@ -837,60 +885,89 @@ impl TxPool {
         world_state: &WorldState<S>,
         excluded_hashes: &HashSet<ShellHash>,
     ) -> Result<(), MempoolError> {
-        for account in Self::reservation_accounts(tx) {
-            let incoming = Self::reserved_cost_for(tx, &account);
+        for (account, incoming) in Self::reservation_costs(tx) {
             if incoming == U256::ZERO {
                 continue;
             }
 
-            let pending = inner
-                .by_hash
-                .iter()
-                .filter(|(hash, _entry)| !excluded_hashes.contains(hash))
-                .map(|(_hash, entry)| Self::reserved_cost_for(&entry.tx, &account))
-                .fold(U256::ZERO, add_or_max);
-            let needed = add_or_max(pending, incoming);
+            let needed_total =
+                Self::reserved_total_excluding(inner, &account, excluded_hashes).add(incoming);
+            let needed = needed_total.saturating_u256();
             let have = world_state
                 .get_balance(&account)
                 .map_err(MempoolError::Storage)?;
-            if have < needed {
+            if needed_total.overflow_units > 0 || have < needed {
                 return Err(MempoolError::InsufficientBalance { needed, have });
             }
         }
         Ok(())
     }
 
-    fn reservation_accounts(tx: &SignedTransaction) -> Vec<Address> {
+    fn reservation_costs(tx: &SignedTransaction) -> [(Address, U256); 2] {
         let sender = tx.sender();
         let gas_payer = gas_payer(tx);
         if gas_payer == sender {
-            vec![sender]
+            [
+                (sender, add_or_max(max_gas_cost(tx), tx.tx.value)),
+                (sender, U256::ZERO),
+            ]
         } else {
-            vec![sender, gas_payer]
+            [(sender, tx.tx.value), (gas_payer, max_gas_cost(tx))]
         }
     }
 
-    fn reserved_cost_for(tx: &SignedTransaction, account: &Address) -> U256 {
-        let sender = tx.sender();
-        let gas_payer = gas_payer(tx);
-        let gas_cost = max_gas_cost(tx);
+    fn reservation_cost_for(tx: &SignedTransaction, account: &Address) -> U256 {
+        Self::reservation_costs(tx)
+            .into_iter()
+            .filter(|(reserved_account, _cost)| reserved_account == account)
+            .map(|(_account, cost)| cost)
+            .fold(U256::ZERO, add_or_max)
+    }
 
-        if gas_payer == sender {
-            return if *account == sender {
-                add_or_max(gas_cost, tx.tx.value)
+    fn add_reservations(inner: &mut PoolInner, tx: &SignedTransaction) {
+        for (account, cost) in Self::reservation_costs(tx) {
+            if cost == U256::ZERO {
+                continue;
+            }
+            let total = inner.reserved_by_account.entry(account).or_default();
+            *total = total.add(cost);
+        }
+    }
+
+    fn remove_reservations(inner: &mut PoolInner, tx: &SignedTransaction) {
+        for (account, cost) in Self::reservation_costs(tx) {
+            if cost == U256::ZERO {
+                continue;
+            }
+            let remove_account = if let Some(total) = inner.reserved_by_account.get_mut(&account) {
+                *total = total.subtract(cost);
+                total.is_zero()
             } else {
-                U256::ZERO
+                false
             };
+            if remove_account {
+                inner.reserved_by_account.remove(&account);
+            }
         }
+    }
 
-        let mut cost = U256::ZERO;
-        if *account == gas_payer {
-            cost = add_or_max(cost, gas_cost);
+    fn reserved_total_excluding(
+        inner: &PoolInner,
+        account: &Address,
+        excluded_hashes: &HashSet<ShellHash>,
+    ) -> ReservationTotal {
+        let mut total = inner
+            .reserved_by_account
+            .get(account)
+            .copied()
+            .unwrap_or_default();
+        for entry in excluded_hashes
+            .iter()
+            .filter_map(|hash| inner.by_hash.get(hash))
+        {
+            total = total.subtract(Self::reservation_cost_for(&entry.tx, account));
         }
-        if *account == sender {
-            cost = add_or_max(cost, tx.tx.value);
-        }
-        cost
+        total
     }
 }
 
@@ -1323,6 +1400,25 @@ mod tests {
         cs: &ChainStore<S>,
     ) -> Result<ShellHash, MempoolError> {
         insert_with_balance(pool, tx, verifier, ws, cs, U256::ZERO)
+    }
+
+    fn indexed_reservation(pool: &TxPool, account: &Address) -> Option<ReservationTotal> {
+        pool.inner.read().reserved_by_account.get(account).copied()
+    }
+
+    #[test]
+    fn reservation_total_preserves_overflow_across_removal() {
+        let total = ReservationTotal::default()
+            .add(U256::MAX)
+            .add(U256::from(1u64));
+        assert_eq!(total.low, U256::ZERO);
+        assert_eq!(total.overflow_units, 1);
+
+        let total = total.subtract(U256::from(1u64));
+        assert_eq!(total.low, U256::MAX);
+        assert_eq!(total.overflow_units, 0);
+
+        assert!(total.subtract(U256::MAX).is_zero());
     }
 
     #[test]
@@ -2521,6 +2617,42 @@ mod tests {
     }
 
     #[test]
+    fn reservation_index_tracks_insert_remove_and_clear() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = test_address(&pubkey);
+        let tx0 = make_signed_value_tx_with_signer(&signer, &pubkey, 0, 50, U256::from(1_000u64));
+        let tx1 = make_signed_value_tx_with_signer(&signer, &pubkey, 1, 50, U256::from(2_000u64));
+        let hash0 = tx0.hash();
+        let cost0 = add_or_max(max_gas_cost(&tx0), tx0.tx.value);
+        let cost1 = add_or_max(max_gas_cost(&tx1), tx1.tx.value);
+        let total = cost0.checked_add(cost1).unwrap();
+
+        insert_with_balance(&pool, tx0, &verifier, &mut ws, &cs, total).unwrap();
+        assert_eq!(
+            indexed_reservation(&pool, &sender).map(ReservationTotal::saturating_u256),
+            Some(cost0)
+        );
+
+        insert_with_balance(&pool, tx1, &verifier, &mut ws, &cs, total).unwrap();
+        let reserved = indexed_reservation(&pool, &sender).unwrap();
+        assert_eq!(reserved.saturating_u256(), total);
+        assert_eq!(reserved.overflow_units, 0);
+
+        assert!(pool.remove(&hash0));
+        assert_eq!(
+            indexed_reservation(&pool, &sender).map(ReservationTotal::saturating_u256),
+            Some(cost1)
+        );
+
+        pool.clear();
+        assert!(indexed_reservation(&pool, &sender).is_none());
+    }
+
+    #[test]
     fn reject_pending_sender_balance_oversubscription() {
         let pool = TxPool::new(make_config());
         let verifier = DilithiumVerifier;
@@ -2593,6 +2725,18 @@ mod tests {
 
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&hash));
+        assert_eq!(
+            indexed_reservation(&pool, &sender).map(ReservationTotal::saturating_u256),
+            Some(value)
+        );
+        assert_eq!(
+            indexed_reservation(&pool, &paymaster).map(ReservationTotal::saturating_u256),
+            Some(gas_budget)
+        );
+
+        assert!(pool.remove(&hash));
+        assert!(indexed_reservation(&pool, &sender).is_none());
+        assert!(indexed_reservation(&pool, &paymaster).is_none());
     }
 
     #[test]
