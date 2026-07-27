@@ -5973,20 +5973,29 @@ mod tests {
         // Spawn the event loop in a background task.
         let handle = tokio::spawn(async move { node_clone.run(signer, &mut network).await });
 
-        // Wait for at least 3 blocks to be produced (~3s with 1s block_time).
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let observed_height = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match node.chain_store.get_head_block() {
+                    Ok(Some(head)) if head.number() >= 3 => break Ok(head.number()),
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await;
 
         // Shut down the node.
         node.shutdown();
         let result = handle.await.expect("task panicked");
         assert!(result.is_ok(), "run() returned error: {:?}", result.err());
 
-        // Verify blocks were produced.
-        let head = node.chain_store.get_head_block().unwrap().unwrap();
+        let observed_height = observed_height
+            .expect("timed out waiting for three blocks")
+            .expect("failed to read the canonical head");
         assert!(
-            head.number() >= 3,
+            observed_height >= 3,
             "expected at least 3 blocks, got {}",
-            head.number()
+            observed_height
         );
     }
 
