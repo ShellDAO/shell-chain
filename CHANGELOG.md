@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
   body-pruned finalized blocks do not reset the in-memory checkpoint hash.
 - Reject snapshot exports whose chain identity does not match the persisted
   chain configuration.
+- Reject historical body responses that do not start at the requested block.
 
 ## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
 

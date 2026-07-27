@@ -25,8 +25,20 @@ fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
 
-fn body_response_matches_request(expected_nonce: Option<u64>, nonce: u64) -> bool {
-    expected_nonce == Some(nonce)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyRequestState {
+    nonce: u64,
+    start_number: u64,
+}
+
+fn body_response_matches_request(
+    expected: Option<BodyRequestState>,
+    nonce: u64,
+    first_block_number: Option<u64>,
+) -> bool {
+    expected.is_some_and(|request| {
+        request.nonce == nonce && first_block_number == Some(request.start_number)
+    })
 }
 
 fn bounded_request_numbers(
@@ -356,7 +368,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut sync_requested = false;
         let mut sync_request_nonce: Option<u64> = None;
         let mut sync_request_start: Option<u64> = None;
-        let mut body_request_nonce: Option<u64> = None;
+        let mut body_request: Option<BodyRequestState> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
             || self.consensus.read().poa_config().authorities.len() == 1;
@@ -460,7 +472,10 @@ impl<S: KvStore + 'static> Node<S> {
                         .await
                         .is_ok()
                     {
-                        body_request_nonce = Some(nonce);
+                        body_request = Some(BodyRequestState {
+                            nonce,
+                            start_number: 0,
+                        });
                         info!(
                             oldest_available = oldest,
                             head, "L4: kicked historical body back-fill startup scan"
@@ -1641,11 +1656,17 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                                 // L4: Receive block bodies from a peer as historical back-fill.
                                 NetworkMessage::BodyResponse { blocks, nonce } => {
-                                    if !body_response_matches_request(body_request_nonce, nonce) {
+                                    let first_block_number =
+                                        blocks.first().map(|block| block.header.number);
+                                    if !body_response_matches_request(
+                                        body_request,
+                                        nonce,
+                                        first_block_number,
+                                    ) {
                                         warn!(
                                             %peer,
                                             nonce,
-                                            "L4: dropping unsolicited or stale BodyResponse"
+                                            "L4: dropping unsolicited, stale, or misaligned BodyResponse"
                                         );
                                         continue;
                                     }
@@ -1658,7 +1679,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         );
                                         continue;
                                     }
-                                    body_request_nonce = None;
+                                    body_request = None;
                                     debug!(%peer, count = blocks.len(), "L4: received BodyResponse");
                                     let head_number = self.chain_store
                                         .get_head_block()
@@ -1732,7 +1753,10 @@ impl<S: KvStore + 'static> Node<S> {
                                                 .await
                                                 .is_ok()
                                             {
-                                                body_request_nonce = Some(next_nonce);
+                                                body_request = Some(BodyRequestState {
+                                                    nonce: next_nonce,
+                                                    start_number: next,
+                                                });
                                             }
                                         } else {
                                             info!("L4: historical body back-fill complete");
@@ -2609,10 +2633,17 @@ mod cadence_tests {
     }
 
     #[test]
-    fn body_response_requires_the_active_request_nonce() {
-        assert!(body_response_matches_request(Some(7), 7));
-        assert!(!body_response_matches_request(None, 7));
-        assert!(!body_response_matches_request(Some(8), 7));
+    fn body_response_requires_the_active_request_nonce_and_start() {
+        let request = Some(BodyRequestState {
+            nonce: 7,
+            start_number: 42,
+        });
+
+        assert!(body_response_matches_request(request, 7, Some(42)));
+        assert!(!body_response_matches_request(None, 7, Some(42)));
+        assert!(!body_response_matches_request(request, 8, Some(42)));
+        assert!(!body_response_matches_request(request, 7, Some(43)));
+        assert!(!body_response_matches_request(request, 7, None));
     }
 
     #[test]
