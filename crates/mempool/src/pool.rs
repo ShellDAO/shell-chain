@@ -2624,8 +2624,22 @@ mod tests {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let sender = test_address(&pubkey);
-        let tx0 = make_signed_value_tx_with_signer(&signer, &pubkey, 0, 50, U256::from(1_000u64));
-        let tx1 = make_signed_value_tx_with_signer(&signer, &pubkey, 1, 50, U256::from(2_000u64));
+        let first_nonce = u64::default();
+        let second_nonce = first_nonce.checked_add(1).unwrap();
+        let tx0 = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            first_nonce,
+            50,
+            U256::from(1_000u64),
+        );
+        let tx1 = make_signed_value_tx_with_signer(
+            &signer,
+            &pubkey,
+            second_nonce,
+            50,
+            U256::from(2_000u64),
+        );
         let hash0 = tx0.hash();
         let cost0 = add_or_max(max_gas_cost(&tx0), tx0.tx.value);
         let cost1 = add_or_max(max_gas_cost(&tx1), tx1.tx.value);
