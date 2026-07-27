@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject headless genesis snapshots before they can replace stored chain data
+  or clear the published chain head.
 - Reject commit certificates for missing, height-mismatched, or noncanonical
   blocks before advancing finality.
 - Resolve log-filter `fromBlock` tags when the filter is created so later polls

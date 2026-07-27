@@ -1551,44 +1551,39 @@ impl<S: KvStore> ChainStore<S> {
             }
         }
 
-        if let Some(head_hash) = head_hash {
-            if canonical_head_hash != Some(head_hash) {
-                return Err(StorageError::State(
-                    "snapshot canonical head mapping does not match HEAD".into(),
-                ));
-            }
+        let head_hash = head_hash
+            .ok_or_else(|| StorageError::State("snapshot is missing the canonical head".into()))?;
+        if canonical_head_hash != Some(head_hash) {
+            return Err(StorageError::State(
+                "snapshot canonical head mapping does not match HEAD".into(),
+            ));
         }
 
         // Resolve the head header in a separate pass so snapshot record order
         // cannot affect validation.
         let mut head_header = None;
-        if let Some(head_hash) = head_hash {
-            let head_header_key = Self::header_key(&head_hash);
-            snap_reader.rewind()?;
-            while let Some(entry) = snap_reader.next_entry()? {
-                if entry.key == head_header_key {
-                    if head_header.is_some() {
-                        return Err(StorageError::State(
-                            "snapshot contains multiple canonical head headers".into(),
-                        ));
-                    }
-                    head_header = Some(decode_versioned::<BlockHeader>(&entry.value)?);
+        let head_header_key = Self::header_key(&head_hash);
+        snap_reader.rewind()?;
+        while let Some(entry) = snap_reader.next_entry()? {
+            if entry.key == head_header_key {
+                if head_header.is_some() {
+                    return Err(StorageError::State(
+                        "snapshot contains multiple canonical head headers".into(),
+                    ));
                 }
+                head_header = Some(decode_versioned::<BlockHeader>(&entry.value)?);
             }
         }
 
-        if let Some(head) = head_header {
-            if head.number != metadata.block_number
-                || head.hash() != metadata.block_hash
-                || head.state_root != metadata.state_root
-            {
-                return Err(StorageError::State(
-                    "snapshot head metadata does not match the stored head header".into(),
-                ));
-            }
-        } else if metadata.block_number != 0 {
+        let head = head_header.ok_or_else(|| {
+            StorageError::State("snapshot is missing the canonical head header".into())
+        })?;
+        if head.number != metadata.block_number
+            || head.hash() != metadata.block_hash
+            || head.state_root != metadata.state_root
+        {
             return Err(StorageError::State(
-                "snapshot is missing the canonical head header".into(),
+                "snapshot head metadata does not match the stored head header".into(),
             ));
         }
 
@@ -1623,7 +1618,7 @@ impl<S: KvStore> ChainStore<S> {
             self.store.write_batch(batch)?;
         }
 
-        if head_hash.is_some() && metadata.state_root != ShellHash::ZERO {
+        if metadata.state_root != ShellHash::ZERO {
             if self.store.get(metadata.state_root.as_bytes())?.is_none() {
                 return Err(StorageError::State(
                     "snapshot head state root is unavailable or corrupt: root node is missing"
@@ -3245,19 +3240,36 @@ mod tests {
     fn test_import_snapshot_restores_data() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(store.clone());
+        let block = empty_block(0);
+        let block_hash = block.hash();
 
         // Create snapshot with entries
         let meta = crate::SnapshotMetadata::new(
             1337,
-            0,
-            ShellHash::default(),
-            ShellHash::default(),
+            block.number(),
+            block_hash,
+            block.header.state_root,
             ShellHash::default(),
         );
         let mut buf = Vec::new();
         {
             let mut writer =
                 crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, block_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&block_hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(block.number()),
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
             writer.write_entry(b"test-key-1", b"value-1").unwrap();
             writer.write_entry(b"test-key-2", b"value-2").unwrap();
             writer.finalize().unwrap();
@@ -3267,7 +3279,7 @@ mod tests {
         let imported_meta = cs
             .import_snapshot(std::io::Cursor::new(&buf), 1337, &ShellHash::default())
             .unwrap();
-        assert_eq!(imported_meta.entry_count, 2);
+        assert_eq!(imported_meta.entry_count, 5);
 
         // Verify data was written
         assert_eq!(store.get(b"test-key-1").unwrap(), Some(b"value-1".to_vec()));
@@ -3275,14 +3287,11 @@ mod tests {
     }
 
     #[test]
-    fn test_import_snapshot_clears_absent_chain_progress() {
+    fn test_import_snapshot_rejects_missing_genesis_head_before_writes() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
-        cs.set_head(&ShellHash::from([0xAA; 32])).unwrap();
-        cs.set_finalized_number(9).unwrap();
-        cs.set_total_tx_count(10).unwrap();
-        cs.set_total_gas_used(U256::from(11)).unwrap();
-        cs.set_chain_totals_head(9).unwrap();
+        let old_head = ShellHash::from([0xAA; 32]);
+        cs.set_head(&old_head).unwrap();
 
         let meta = crate::SnapshotMetadata::new(
             1337,
@@ -3295,6 +3304,57 @@ mod tests {
         {
             let mut writer =
                 crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing the canonical head"));
+        assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
+        assert!(store.get(b"untrusted-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_import_snapshot_clears_absent_optional_chain_progress() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        cs.set_head(&ShellHash::from([0xAA; 32])).unwrap();
+        cs.set_finalized_number(9).unwrap();
+        cs.set_total_tx_count(10).unwrap();
+        cs.set_total_gas_used(U256::from(11)).unwrap();
+        cs.set_chain_totals_head(9).unwrap();
+        let block = empty_block(0);
+        let block_hash = block.hash();
+
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            block.number(),
+            block_hash,
+            block.header.state_root,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, block_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&block_hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(block.number()),
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
             writer.write_entry(b"snapshot-key", b"value").unwrap();
             writer.finalize().unwrap();
         }
@@ -3302,7 +3362,7 @@ mod tests {
         cs.import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
             .unwrap();
 
-        assert_eq!(cs.get_head_hash().unwrap(), None);
+        assert_eq!(cs.get_head_hash().unwrap(), Some(block_hash));
         assert_eq!(cs.get_finalized_number().unwrap(), None);
         assert_eq!(cs.get_total_tx_count().unwrap(), 0);
         assert_eq!(cs.get_total_gas_used().unwrap(), U256::ZERO);
