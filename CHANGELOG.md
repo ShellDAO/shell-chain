@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject sender-paid transactions whose maximum gas cost plus transferred value
+  exceeds the U256 balance range.
 - Reject algorithm-activation proposals when the canonical head cannot be read,
   instead of validating their timelock against a fallback genesis height.
 - Require successful exact-commit CodeQL analyses for GitHub Actions, Python,

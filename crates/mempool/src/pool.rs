@@ -185,7 +185,15 @@ impl TxPool {
             }
         } else {
             // Non-paymaster path: sender covers both gas and value.
-            let needed = gas_cost.checked_add(tx.tx.value).unwrap_or(U256::MAX);
+            let needed = match gas_cost.checked_add(tx.tx.value) {
+                Some(needed) => needed,
+                None => {
+                    return Err(MempoolError::InsufficientBalance {
+                        needed: U256::MAX,
+                        have: sender_balance,
+                    });
+                }
+            };
             if sender_balance < needed {
                 return Err(MempoolError::InsufficientBalance {
                     needed,
@@ -2614,6 +2622,30 @@ mod tests {
             U256::from(21_000u64 * 110),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reject_single_transaction_cost_overflow() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let tx = make_signed_value_tx_with_signer(&signer, &pubkey, u64::default(), 100, U256::MAX);
+        let hash = tx.hash();
+
+        let err = insert_with_balance(&pool, tx, &verifier, &mut ws, &cs, U256::MAX)
+            .expect_err("gas plus value above U256::MAX must be rejected");
+
+        assert!(matches!(
+            err,
+            MempoolError::InsufficientBalance {
+                needed: U256::MAX,
+                have: U256::MAX
+            }
+        ));
+        assert!(pool.is_empty());
+        assert!(!pool.contains(&hash));
     }
 
     #[test]
