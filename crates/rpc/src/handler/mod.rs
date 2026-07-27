@@ -6151,6 +6151,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_filter_resolves_latest_from_block_at_creation() {
+        let handler = setup();
+        let address = Address::from([0xE2; 20]);
+        let log = || shell_core::Log::new(address, vec![], Bytes::new()).unwrap();
+        store_block_with_logs(&handler, 0, vec![vec![]]);
+
+        let raw: RawLogFilter = serde_json::from_str(&format!(
+            r#"{{"fromBlock":"latest","address":"{}"}}"#,
+            address
+        ))
+        .unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        store_block_with_logs(&handler, 1, vec![vec![log()]]);
+        store_block_with_logs(&handler, 2, vec![vec![log()]]);
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0]["blockNumber"], "0x1");
+        assert_eq!(logs[1]["blockNumber"], "0x2");
+    }
+
+    #[tokio::test]
     async fn log_filter_preserves_cursor_when_matching_block_receipts_are_missing() {
         let handler = setup();
         let address = Address::from([0xE1; 20]);

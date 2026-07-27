@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Resolve log-filter `fromBlock` tags when the filter is created so later polls
+  cannot skip matching blocks.
 - Reject sender-paid transactions whose maximum gas cost plus transferred value
   exceeds the U256 balance range.
 - Reject algorithm-activation proposals when the canonical head cannot be read,

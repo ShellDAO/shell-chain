@@ -1026,16 +1026,14 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
         let latest = head.as_ref().map(|b| b.number()).unwrap_or(0);
         let head_hash = head.as_ref().map(Block::hash);
-        // F-125: resolve from_block at creation time so get_filter_logs
-        // does not re-scan from block 0 on every call.
-        if filter.from_block.is_none() {
-            filter.from_block = Some(format!("0x{:x}", latest));
-        }
         let finalized = *self.finalized_number.read();
-        filter
+        let resolved = filter
             .clone()
             .into_filter(latest, finalized)
             .map_err(invalid_params)?;
+        // Resolve fromBlock at creation so dynamic tags cannot skip blocks
+        // between polls and get_filter_logs has a stable lower bound.
+        filter.from_block = Some(format!("0x{:x}", resolved.from_block.unwrap_or(latest)));
         let id = self
             .filter_registry
             .new_filter_at(FilterKind::Log(filter), latest, head_hash)
