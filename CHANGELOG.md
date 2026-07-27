@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 - Reject snapshot exports whose chain identity does not match the persisted
   chain configuration.
 - Reject historical body responses that do not start at the requested block.
+- Respect custom-validator and session-key signature policies during block
+  import and side-fork validation.
 
 ## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
 

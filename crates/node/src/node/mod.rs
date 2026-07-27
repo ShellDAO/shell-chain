@@ -1535,7 +1535,7 @@ mod tests {
     use shell_core::{
         AaBundle, InnerCall, PubkeyMode, SessionAuth, Transaction, AA_BUNDLE_TX_TYPE,
     };
-    use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer};
+    use shell_crypto::{DilithiumSigner, MlDsaSigner, SignatureType, Signer};
     use shell_mempool::MempoolConfig;
     use shell_primitives::U256;
     use shell_rpc::DevRpcControl;
@@ -1901,6 +1901,30 @@ mod tests {
         ws.set_account(addr, &account).unwrap();
     }
 
+    fn install_accepting_custom_validator<S: KvStore + 'static>(
+        node: &Node<S>,
+        addr: &Address,
+        balance: U256,
+    ) {
+        let code = vec![0x60, 0x01, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xF3];
+        let code_hash = shell_primitives::keccak256(&code);
+        node.chain_store.put_code(&code_hash, &code).unwrap();
+        node.world_state
+            .write()
+            .set_account(
+                addr,
+                &shell_core::Account {
+                    pq_pubkey_hash: ShellHash::ZERO,
+                    nonce: 0,
+                    balance,
+                    validation_code_hash: Some(code_hash),
+                    code_hash: None,
+                    storage_root: ShellHash::ZERO,
+                },
+            )
+            .unwrap();
+    }
+
     fn counter_runtime() -> Vec<u8> {
         let incr_sel = shell_primitives::keccak256(b"increment()");
         let get_sel = shell_primitives::keccak256(b"get()");
@@ -1967,6 +1991,79 @@ mod tests {
     fn current_state_root<S: KvStore + 'static>(node: &Node<S>) -> ShellHash {
         let mut ws = node.world_state.write();
         ws.state_root().unwrap()
+    }
+
+    #[test]
+    fn import_block_accepts_custom_validator_owned_signature_policy() {
+        let (leader, proposer_signer) = setup_node();
+        let proposer = leader.config.proposer_address.unwrap();
+        leader.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let sender = Address::from([0x41; 32]);
+        let balance = U256::from(100_000_000_000_000u64);
+        install_accepting_custom_validator(&leader, &sender, balance);
+        store_consistent_genesis(&leader);
+        let signed = SignedTransaction::new(
+            sender,
+            Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(Address::from([0x42; 32])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 50_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+            PQSignature::new(SignatureType::MlDsa65, Vec::new()),
+        );
+        {
+            let mut world_state = leader.world_state.write();
+            leader
+                .tx_pool
+                .insert(
+                    signed,
+                    &mut world_state,
+                    leader.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+        }
+        let block = leader.produce_block(&proposer_signer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+
+        let follower = setup_node_with_authority(proposer);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        install_accepting_custom_validator(&follower, &sender, balance);
+        store_consistent_genesis(&follower);
+
+        follower
+            .import_block(block.clone(), &MultiVerifier)
+            .unwrap();
+
+        assert_eq!(follower.world_state.read().get_nonce(&sender).unwrap(), 1);
+
+        let mut side_fork = block;
+        side_fork.header.extra_data = Bytes::from_static(b"custom-validator-side-fork");
+        side_fork.header.witness_root = None;
+        side_fork.proposer_seal = Some(
+            proposer_signer
+                .sign(side_fork.header.hash().as_bytes())
+                .unwrap(),
+        );
+        let side_fork_hash = side_fork.hash();
+
+        leader.import_block(side_fork, &MultiVerifier).unwrap();
+
+        assert!(leader
+            .chain_store
+            .get_block_by_hash(&side_fork_hash)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -7535,13 +7632,13 @@ mod tests {
     #[test]
     fn import_side_fork_with_invalid_transaction_signatures_is_rejected() {
         let (node, proposer_signer) = setup_node();
-        store_genesis(&node);
         let proposer = node.config.proposer_address.unwrap();
         node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
         let tx = make_embedded_tx(&tx_signer, sender, tx_signer.public_key().to_vec(), 0, 1);
         {
             let mut world_state = node.world_state.write();
@@ -7583,6 +7680,8 @@ mod tests {
             assert!(
                 message.contains("empty signature")
                     || message.contains("batch sig verification failed")
+                    || message.contains("signature verification failed")
+                    || message.contains("address mismatch")
                     || message.contains("does not match resolved pubkey address"),
                 "unexpected rejection for {label} signature: {message}"
             );
@@ -7598,7 +7697,6 @@ mod tests {
     #[test]
     fn import_side_fork_accepts_valid_session_key_signature() {
         let (node, proposer_signer) = setup_node();
-        store_genesis(&node);
         let proposer = node.config.proposer_address.unwrap();
         node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
@@ -7606,6 +7704,7 @@ mod tests {
         let session = DilithiumSigner::generate();
         let sender = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
 
         let recipient = Address::from([0x45; 20]);
         let transaction = Transaction {
@@ -7684,6 +7783,15 @@ mod tests {
         }
 
         let canonical = node.produce_block(&proposer_signer, 100).unwrap();
+        let follower = setup_node_with_authority(proposer);
+        fund_account(&follower, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&follower);
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        follower
+            .import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+
         let mut side_fork = canonical.clone();
         side_fork.header.extra_data = Bytes::from_static(b"session-side-fork");
         side_fork.header.witness_root = None;

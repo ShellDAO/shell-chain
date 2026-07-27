@@ -17,6 +17,61 @@ fn tx_for_import_validation<'a>(
     Cow::Owned(resolved)
 }
 
+fn batch_signing_pubkey(
+    block_number: u64,
+    tx: &SignedTransaction,
+    root_pubkey: &[u8],
+) -> Result<Vec<u8>, NodeError> {
+    if tx.signature.data.is_empty() {
+        return Err(NodeError::Startup(format!(
+            "block {} tx {} has empty signature",
+            block_number,
+            tx.hash()
+        )));
+    }
+
+    let Some(session_auth) = tx
+        .aa_bundle()
+        .and_then(|bundle| bundle.session_auth.as_ref())
+    else {
+        return Ok(root_pubkey.to_vec());
+    };
+
+    if infer_signature_type_from_address(root_pubkey, &tx.from).is_none() {
+        return Err(NodeError::Startup(format!(
+            "block {} tx {} sender {} does not match resolved root pubkey",
+            block_number,
+            tx.hash(),
+            tx.from,
+        )));
+    }
+    if tx.signature.sig_type.as_u8() != session_auth.session_algo
+        || tx.signature.data.as_slice() != session_auth.session_signature.as_ref()
+    {
+        return Err(NodeError::Startup(format!(
+            "block {} tx {} session signature does not match outer signature",
+            block_number,
+            tx.hash(),
+        )));
+    }
+    let auth_hash = session_auth.auth_hash(tx.tx.chain_id);
+    let root_valid = ALLOWED_ALGORITHMS.iter().copied().any(|algorithm| {
+        let signature = PQSignature::new(algorithm, session_auth.root_signature.as_ref().to_vec());
+        MultiVerifier
+            .verify(root_pubkey, auth_hash.as_bytes(), &signature)
+            .unwrap_or(false)
+    });
+    if !root_valid {
+        return Err(NodeError::Startup(format!(
+            "block {} tx {} session root signature is invalid",
+            block_number,
+            tx.hash(),
+        )));
+    }
+
+    Ok(session_auth.session_pubkey.as_ref().to_vec())
+}
+
 impl<S: KvStore + 'static> Node<S> {
     fn wall_clock_secs_for_import() -> u64 {
         SystemTime::now()
@@ -181,113 +236,58 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    fn verify_side_fork_transaction_signatures(&self, block: &Block) -> Result<(), NodeError> {
-        let mut block_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
-        let mut signing_pubkeys = Vec::with_capacity(block.transactions.len());
+    fn validate_side_fork_transactions(
+        &self,
+        block: &Block,
+        parent: &Block,
+    ) -> Result<(), NodeError> {
+        let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        let import_cs = ChainStore::new(import_store.clone());
+        import_cs.set_head(&parent.hash())?;
+        let mut world_state = WorldState::at_root(import_store, &parent.header.state_root)?;
+        let verifier = MultiVerifier;
+        let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
+        let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
 
         for tx in &block.transactions {
-            if tx.signature.data.is_empty() {
-                return Err(NodeError::Startup(format!(
-                    "block {} tx {} has empty signature",
-                    block.number(),
-                    tx.hash()
-                )));
-            }
-
-            let pubkey = match &tx.pubkey_mode {
-                shell_core::PubkeyMode::Embedded(pubkey) => {
-                    block_pubkeys
-                        .entry(tx.from)
-                        .or_insert_with(|| pubkey.clone());
-                    pubkey.clone()
-                }
-                shell_core::PubkeyMode::Reference => {
-                    if let Some(pubkey) = block_pubkeys.get(&tx.from) {
-                        pubkey.clone()
-                    } else {
-                        self.chain_store.get_pubkey(&tx.from)?.ok_or_else(|| {
-                            NodeError::Startup(format!(
-                                "block {} tx {} uses Reference pubkey mode but sender {} has no registered or earlier embedded pubkey",
-                                block.number(),
-                                tx.hash(),
-                                tx.from
-                            ))
-                        })?
-                    }
-                }
+            let tx_for_validation = tx_for_import_validation(tx, &validation_pubkeys);
+            let expected_nonce = match validation_nonces.get(&tx.from) {
+                Some(next_nonce) => *next_nonce,
+                None => world_state.get_nonce(&tx.from)?,
             };
-            let signing_pubkey = if let Some(session_auth) = tx
-                .aa_bundle()
-                .and_then(|bundle| bundle.session_auth.as_ref())
-            {
-                if infer_signature_type_from_address(&pubkey, &tx.from).is_none() {
-                    return Err(NodeError::Startup(format!(
-                        "block {} tx {} sender {} does not match resolved root pubkey",
-                        block.number(),
-                        tx.hash(),
-                        tx.from,
-                    )));
-                }
-                if tx.signature.sig_type.as_u8() != session_auth.session_algo
-                    || tx.signature.data.as_slice() != session_auth.session_signature.as_ref()
-                {
-                    return Err(NodeError::Startup(format!(
-                        "block {} tx {} session signature does not match outer signature",
-                        block.number(),
-                        tx.hash(),
-                    )));
-                }
-                let auth_hash = session_auth.auth_hash(tx.tx.chain_id);
-                let root_valid = ALLOWED_ALGORITHMS.iter().copied().any(|algorithm| {
-                    let signature =
-                        PQSignature::new(algorithm, session_auth.root_signature.as_ref().to_vec());
-                    MultiVerifier
-                        .verify(&pubkey, auth_hash.as_bytes(), &signature)
-                        .unwrap_or(false)
-                });
-                if !root_valid {
-                    return Err(NodeError::Startup(format!(
-                        "block {} tx {} session root signature is invalid",
-                        block.number(),
-                        tx.hash(),
-                    )));
-                }
-                session_auth.session_pubkey.as_ref().to_vec()
-            } else {
-                let derived = Address::from_public_key(&pubkey, tx.signature.sig_type.as_u8());
-                if derived != tx.from {
-                    return Err(NodeError::Startup(format!(
-                        "block {} tx {} sender {} does not match resolved pubkey address {}",
-                        block.number(),
-                        tx.hash(),
-                        tx.from,
-                        derived
-                    )));
-                }
-                pubkey.clone()
-            };
-            signing_pubkeys.push(signing_pubkey);
-        }
 
-        let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let verify_items: Vec<VerifyItem> = block
-            .transactions
-            .iter()
-            .enumerate()
-            .map(|(index, tx)| VerifyItem {
-                pubkey: &signing_pubkeys[index],
-                message: tx_hashes[index].as_bytes(),
-                signature: &tx.signature,
-            })
-            .collect();
-        MultiVerifier
-            .verify_batch_all(&verify_items)
+            validate_tx_for_import_with_expected_nonce(
+                tx_for_validation.as_ref(),
+                &mut world_state,
+                &import_cs,
+                &verifier,
+                self.config.chain_id,
+                expected_nonce,
+            )
             .map_err(|error| {
                 NodeError::Startup(format!(
-                    "block {} batch sig verification failed: {error}",
-                    block.number(),
+                    "block {} side-fork tx validation failed: {error}",
+                    block.number()
                 ))
-            })
+            })?;
+
+            let next_nonce = expected_nonce.checked_add(1).ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "block {} side-fork tx validation exhausted nonce space for {}",
+                    block.number(),
+                    tx.from
+                ))
+            })?;
+            validation_nonces.insert(tx.from, next_nonce);
+
+            if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
+                validation_pubkeys
+                    .entry(tx.from)
+                    .or_insert_with(|| pubkey.clone());
+            }
+        }
+
+        Ok(())
     }
 
     fn verify_import_economics(&self, block: &Block, parent: &Block) -> Result<(), NodeError> {
@@ -387,7 +387,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.verify_import_consensus(&block, &parent)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
-            self.verify_side_fork_transaction_signatures(&block)?;
+            self.validate_side_fork_transactions(&block, &parent)?;
             if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
                 self.queue_signed_equivocation_if_valid(&existing, &block);
             }
@@ -424,7 +424,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.verify_import_consensus(&block, &parent)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
-            self.verify_side_fork_transaction_signatures(&block)?;
+            self.validate_side_fork_transactions(&block, &parent)?;
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
@@ -576,20 +576,25 @@ impl<S: KvStore + 'static> Node<S> {
             // are enforced during block import, not just mempool.
             let import_cs = ChainStore::new(import_store.clone());
             let mut block_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
-            // M5-C2: Batch verify all transaction signatures in parallel.
-            // Resolve pubkeys and compute tx hashes, then dispatch to rayon.
+            // M5-C2: Batch verify built-in and session-key signatures in
+            // parallel. Custom validators own their signature policy and are
+            // executed in the read-only validation pass below.
             let batch_verifier = MultiVerifier;
+            let signature_state = WorldState::at_root(import_store.clone(), &current_root)?;
             let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-            let mut resolved_pks: Vec<Vec<u8>> = Vec::with_capacity(block.transactions.len());
+            let mut signing_pubkeys: Vec<Option<Vec<u8>>> =
+                Vec::with_capacity(block.transactions.len());
             for tx in &block.transactions {
-                if tx.signature.data.is_empty() {
-                    return Err(NodeError::Startup(format!(
-                        "block {} tx {} has empty signature",
-                        block.number(),
-                        tx.hash()
-                    )));
+                let uses_custom_validator = signature_state
+                    .get_account(&tx.from)?
+                    .and_then(|account| account.validation_code_hash)
+                    .is_some();
+                if uses_custom_validator {
+                    signing_pubkeys.push(None);
+                    continue;
                 }
-                let pk = match &tx.pubkey_mode {
+
+                let root_pubkey = match &tx.pubkey_mode {
                     shell_core::PubkeyMode::Embedded(pk) => {
                         block_pubkeys.entry(tx.from).or_insert_with(|| pk.clone());
                         if import_cs
@@ -626,26 +631,24 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                     }
                 };
-                resolved_pks.push(pk);
+                signing_pubkeys.push(Some(batch_signing_pubkey(
+                    block.number(),
+                    tx,
+                    &root_pubkey,
+                )?));
             }
             let verify_items: Vec<VerifyItem> = block
                 .transactions
                 .iter()
                 .enumerate()
-                .map(|(i, tx)| VerifyItem {
-                    pubkey: &resolved_pks[i],
-                    message: tx_hashes[i].as_bytes(),
-                    signature: &tx.signature,
+                .filter_map(|(index, tx)| {
+                    signing_pubkeys[index].as_deref().map(|pubkey| VerifyItem {
+                        pubkey,
+                        message: tx_hashes[index].as_bytes(),
+                        signature: &tx.signature,
+                    })
                 })
                 .collect();
-            if verify_items.len() != block.transactions.len() {
-                return Err(NodeError::Startup(format!(
-                    "block {} signature verification coverage mismatch: {} verify items for {} transactions",
-                    block.number(),
-                    verify_items.len(),
-                    block.transactions.len()
-                )));
-            }
             batch_verifier
                 .verify_batch_all(&verify_items)
                 .map_err(|e| {
@@ -659,9 +662,10 @@ impl<S: KvStore + 'static> Node<S> {
             let state_db = ShellStateDb::new(import_ws, ChainStore::new(import_store.clone()));
             let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
 
-            // Non-signature validation (chain-id, gas, sender binding).
-            // Uses PreVerified to skip redundant individual
-            // sig checks — signatures were already batch-verified above.
+            // Complete transaction-policy validation (chain-id, gas, sender
+            // binding, AA restrictions, and custom validation contracts).
+            // Uses PreVerified only for built-in signature checks already
+            // covered by the batch pass above; custom validators still execute.
             //
             // IMPORTANT: validate_tx_for_import is READ-ONLY — it does NOT register
             // pubkeys (unlike validate_tx used in the mempool path). Pubkey registration
