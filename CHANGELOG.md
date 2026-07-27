@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject commit certificates for missing, height-mismatched, or noncanonical
+  blocks before advancing finality.
 - Resolve log-filter `fromBlock` tags when the filter is created so later polls
   cannot skip matching blocks.
 - Reject sender-paid transactions whose maximum gas cost plus transferred value

@@ -587,6 +587,47 @@ impl<S: KvStore + 'static> Node<S> {
         block_hash: ShellHash,
         cert: &[u8],
     ) -> bool {
+        let canonical_hash = match self.chain_store.get_block_hash_by_number(block_number) {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                warn!(block_number, %block_hash, "FF.7: certificate target is not canonical");
+                return false;
+            }
+            Err(e) => {
+                warn!(block_number, %block_hash, error = %e, "FF.7: failed to resolve canonical certificate target");
+                return false;
+            }
+        };
+        if canonical_hash != block_hash {
+            warn!(
+                block_number,
+                %block_hash,
+                %canonical_hash,
+                "FF.7: certificate target does not match canonical block"
+            );
+            return false;
+        }
+        match self.chain_store.get_header_by_hash(&block_hash) {
+            Ok(Some(header)) if header.number == block_number => {}
+            Ok(Some(header)) => {
+                warn!(
+                    block_number,
+                    %block_hash,
+                    stored_number = header.number,
+                    "FF.7: certificate target height does not match stored header"
+                );
+                return false;
+            }
+            Ok(None) => {
+                warn!(block_number, %block_hash, "FF.7: certificate target header is missing");
+                return false;
+            }
+            Err(e) => {
+                warn!(block_number, %block_hash, error = %e, "FF.7: failed to load certificate target header");
+                return false;
+            }
+        }
+
         let Some(signatures) = Self::decode_commit_certificate(cert) else {
             warn!(block_number, %block_hash, "FF.7: invalid commit certificate encoding");
             return false;

@@ -9074,9 +9074,9 @@ mod tests {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
             node.register_authority_pubkey(authority, signer.public_key().to_vec());
-            store_genesis_wpoa(&node);
+            let genesis_hash = store_genesis_wpoa(&node);
 
-            let block_hash = hash(88);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
             let real_sig = signer.sign(block_hash.as_bytes()).unwrap();
             let mut quorum_signatures = HashMap::new();
             quorum_signatures.insert(
@@ -9126,7 +9126,8 @@ mod tests {
                 node.register_authority_pubkey(*authority, signer.public_key().to_vec());
             }
 
-            let block_hash = hash(89);
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
             let quorum_signatures = authorities
                 .iter()
                 .zip(&signers)
@@ -9150,6 +9151,8 @@ mod tests {
         fn fast_finalize_rejects_zero_total_validator_weight() {
             let (node, _) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
             {
                 let mut consensus = node.consensus.write();
                 consensus.poa_config_mut().slash_weight_bps = 10_000;
@@ -9157,7 +9160,6 @@ mod tests {
                 assert_eq!(consensus.validator_weights().get(&authority), Some(&0));
             }
 
-            let block_hash = hash(90);
             let cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::new()).unwrap();
 
             assert!(!node.fast_finalize_with_certificate(1, block_hash, &cert));
@@ -9170,11 +9172,46 @@ mod tests {
         }
 
         #[test]
+        fn fast_finalize_rejects_noncanonical_target() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+            let canonical_hash = store_next_wpoa_block(&node, genesis_hash);
+            let mut side_block = node
+                .chain_store
+                .get_block_by_hash(&canonical_hash)
+                .unwrap()
+                .unwrap();
+            side_block.header.timestamp += 1;
+            let side_hash = side_block.hash();
+            node.chain_store.put_block(&side_block).unwrap();
+
+            let quorum_signatures =
+                HashMap::from([(authority, signer.sign(side_hash.as_bytes()).unwrap())]);
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&quorum_signatures).unwrap();
+
+            assert!(!node.fast_finalize_with_certificate(1, side_hash, &cert));
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
+            assert!(node
+                .chain_store
+                .get_commit_certificate(&side_hash)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                node.chain_store.get_block_hash_by_number(1).unwrap(),
+                Some(canonical_hash)
+            );
+        }
+
+        #[test]
         fn fast_finalize_does_not_advance_volatile_state_on_atomic_write_failure() {
             let (node, signer, db) = setup_failing_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
             node.register_authority_pubkey(authority, signer.public_key().to_vec());
-            let block_hash = hash(91);
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
             let quorum_signatures =
                 HashMap::from([(authority, signer.sign(block_hash.as_bytes()).unwrap())]);
             let cert =
