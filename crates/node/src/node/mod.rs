@@ -732,10 +732,9 @@ impl<S: KvStore + 'static> Node<S> {
                 .unwrap_or(0);
             if stored > 0 {
                 let hash = chain_store
-                    .get_block_by_number(stored)
+                    .get_block_hash_by_number(stored)
                     .ok()
                     .flatten()
-                    .map(|b| b.hash())
                     .unwrap_or(ShellHash::ZERO);
                 (stored, hash)
             } else {
@@ -3582,6 +3581,67 @@ mod tests {
         assert_eq!(restarted.metrics.block_height.get(), 1);
         assert_eq!(restarted.metrics.last_finalized_number.get(), 1);
         assert_eq!(restarted.metrics.finality_lag_blocks.get(), 0);
+    }
+
+    #[test]
+    fn node_recovers_finalized_hash_after_finalized_body_is_pruned() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let finalized = node.produce_block(&signer, 100).unwrap();
+        let finalized_hash = finalized.hash();
+        node.produce_block(&signer, 100).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(finalized.number(), finalized_hash);
+        node.chain_store
+            .set_finalized_number(finalized.number())
+            .unwrap();
+        node.chain_store.delete_bodies(&[finalized_hash]).unwrap();
+        assert!(node
+            .chain_store
+            .get_block_by_number(finalized.number())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            node.chain_store
+                .get_block_hash_by_number(finalized.number())
+                .unwrap(),
+            Some(finalized_hash)
+        );
+
+        let db = node.store.clone();
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+        let authority = node.config.proposer_address.unwrap();
+        let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![authority], 1),
+        )));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig {
+            chain_id: 1337,
+            ..MempoolConfig::default()
+        }));
+
+        let restarted = Node::new(
+            NodeConfig::dev(authority),
+            db,
+            chain_store,
+            world_state,
+            tx_pool,
+            consensus,
+        );
+
+        assert_eq!(
+            restarted.finality.read().last_finalized_number(),
+            finalized.number()
+        );
+        assert_eq!(
+            restarted.finality.read().last_finalized_hash(),
+            &finalized_hash
+        );
+        assert_eq!(
+            restarted.metrics.last_finalized_number.get(),
+            finalized.number() as i64
+        );
     }
 
     #[test]

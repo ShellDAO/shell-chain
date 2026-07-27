@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   version byte.
 - Return an internal error from `eth_getLogs` when a matching canonical block
   has a non-zero log bloom but its receipts are unavailable.
+- Recover the persisted finalized hash from canonical indexes after restart so
+  body-pruned finalized blocks do not reset the in-memory checkpoint hash.
 
 ## [0.27.3] — 2026-07-26 — Blob fee arithmetic hardening
 
