@@ -1442,6 +1442,12 @@ impl<S: KvStore> ChainStore<S> {
                 "snapshot metadata must describe the current canonical head".into(),
             ));
         }
+        let chain_config = self.get_chain_config()?.ok_or_else(|| {
+            StorageError::State(
+                "cannot export a snapshot without a stored chain configuration".into(),
+            )
+        })?;
+        metadata.validate_compatibility(chain_config.chain_id, &chain_config.genesis_hash)?;
 
         let mut snap_writer = crate::SnapshotWriter::new(writer, metadata)?;
         for (key, value) in self.store.scan_all()? {
@@ -3925,6 +3931,11 @@ mod tests {
 
         let b0 = empty_block(0);
         put_canonical(&cs, &b0);
+        cs.put_chain_config(&ChainConfig {
+            chain_id: 1337,
+            genesis_hash: b0.hash(),
+        })
+        .unwrap();
 
         // Export snapshot referencing block 0.
         let meta =
@@ -3960,6 +3971,72 @@ mod tests {
         assert!(error
             .to_string()
             .contains("metadata must describe the current canonical head"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_export_snapshot_rejects_mismatched_chain_identity() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store.clone());
+        let genesis = empty_block(0);
+        put_canonical(&cs, &genesis);
+        cs.put_chain_config(&ChainConfig {
+            chain_id: 1337,
+            genesis_hash: genesis.hash(),
+        })
+        .unwrap();
+
+        let mismatched = [
+            crate::SnapshotMetadata::new(
+                9999,
+                0,
+                genesis.hash(),
+                genesis.header.state_root,
+                genesis.hash(),
+            ),
+            crate::SnapshotMetadata::new(
+                1337,
+                0,
+                genesis.hash(),
+                genesis.header.state_root,
+                ShellHash::from([0x44; 32]),
+            ),
+        ];
+
+        for metadata in mismatched {
+            let mut buf = Vec::new();
+            let error = cs
+                .export_snapshot(metadata, std::io::Cursor::new(&mut buf))
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("mismatch"),
+                "unexpected error: {error}"
+            );
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_export_snapshot_requires_stored_chain_config() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store.clone());
+        let genesis = empty_block(0);
+        put_canonical(&cs, &genesis);
+        let metadata = crate::SnapshotMetadata::new(
+            1337,
+            0,
+            genesis.hash(),
+            genesis.header.state_root,
+            genesis.hash(),
+        );
+        let mut buf = Vec::new();
+
+        let error = cs
+            .export_snapshot(metadata, std::io::Cursor::new(&mut buf))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stored chain configuration"));
         assert!(buf.is_empty());
     }
 
