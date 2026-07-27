@@ -849,10 +849,14 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     // Validate timelock: activation_height >= current_height + ALGO_GOVERNANCE_DELTA_MIN.
     // SAFETY: SLH-DSA emergency path (WP §6.7) is a TODO; requires threading sig_type
     // through execute_system_contract_call.
-    let current_height = chain_store
-        .and_then(|cs| cs.get_head_block().ok().flatten())
-        .map(|b| b.header.number)
-        .unwrap_or(0);
+    let current_height = match chain_store {
+        Some(chain_store) => chain_store
+            .get_head_block()
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            .map(|block| block.header.number)
+            .unwrap_or(0),
+        None => 0,
+    };
     let min_activation = current_height.saturating_add(ALGO_GOVERNANCE_DELTA_MIN);
     if activation_height < min_activation {
         return Err(SystemContractError::InvalidActivationHeight(
@@ -2308,17 +2312,19 @@ mod tests {
     };
 
     #[derive(Debug)]
-    struct FailingWriteStore {
+    struct FailingStore {
         inner: MemoryDb,
+        fail_head_reads: AtomicBool,
         fail_writes: AtomicBool,
         write_count: AtomicUsize,
         fail_on_write: AtomicUsize,
     }
 
-    impl Default for FailingWriteStore {
+    impl Default for FailingStore {
         fn default() -> Self {
             Self {
                 inner: MemoryDb::new(),
+                fail_head_reads: AtomicBool::new(false),
                 fail_writes: AtomicBool::new(false),
                 write_count: AtomicUsize::new(0),
                 fail_on_write: AtomicUsize::new(usize::MAX),
@@ -2326,7 +2332,11 @@ mod tests {
         }
     }
 
-    impl FailingWriteStore {
+    impl FailingStore {
+        fn fail_head_reads(&self) {
+            self.fail_head_reads.store(true, Ordering::SeqCst);
+        }
+
         fn fail_writes(&self) {
             self.fail_writes.store(true, Ordering::SeqCst);
         }
@@ -2347,8 +2357,11 @@ mod tests {
         }
     }
 
-    impl KvStore for FailingWriteStore {
+    impl KvStore for FailingStore {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if key == b"HEAD" && self.fail_head_reads.load(Ordering::SeqCst) {
+                return Err(StorageError::Database("injected head read failure".into()));
+            }
             self.inner.get(key)
         }
 
@@ -2932,7 +2945,7 @@ mod tests {
 
     #[test]
     fn process_pending_activations_keeps_registry_pending_when_storage_fails() {
-        let store = Arc::new(FailingWriteStore::default());
+        let store = Arc::new(FailingStore::default());
         let mut ws = WorldState::new(Arc::clone(&store));
         let mut registry = AlgorithmRegistry::default();
         let algo = SignatureType::MlDsa65;
@@ -2957,7 +2970,7 @@ mod tests {
 
     #[test]
     fn process_pending_activations_enables_none_when_a_later_write_fails() {
-        let store = Arc::new(FailingWriteStore::default());
+        let store = Arc::new(FailingStore::default());
         let mut ws = WorldState::new(Arc::clone(&store));
         let mut registry = AlgorithmRegistry::default();
         let activation_height = 100;
@@ -3004,6 +3017,53 @@ mod tests {
         assert!(
             matches!(err, SystemContractError::InvalidActivationHeight(_, _)),
             "expected InvalidActivationHeight, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn propose_algorithm_activation_rejects_head_read_failure() {
+        let validator = Address::from([0x01; 20]);
+        let store = Arc::new(FailingStore::default());
+        let mut ws = WorldState::new(Arc::clone(&store));
+        ws.set_validators(&[validator]).unwrap();
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        let mut registry = AlgorithmRegistry::default();
+        registry.deprecate(SignatureType::MlDsa65);
+        let calldata = encode_propose_algorithm_activation_calldata(
+            SignatureType::MlDsa65,
+            ALGO_GOVERNANCE_DELTA_MIN + 1,
+            [0xAB; 32],
+        );
+        store.fail_head_reads();
+
+        let err = execute_validator_registry_with_registry(
+            &validator,
+            &calldata,
+            &mut ws,
+            Some(&chain_store),
+            &mut registry,
+        )
+        .expect_err("head read failure must reject governance execution");
+
+        assert!(
+            matches!(err, SystemContractError::Storage(ref message) if message.contains("injected head read failure")),
+            "expected head storage failure, got {err:?}"
+        );
+        assert_eq!(
+            registry
+                .get_all_entries()
+                .iter()
+                .find(|entry| entry.algo == SignatureType::MlDsa65)
+                .map(|entry| entry.status),
+            Some(AlgorithmStatus::Deprecated)
+        );
+        assert_eq!(
+            ws.get_storage(
+                &registry_address(),
+                &algorithm_status_key(SignatureType::MlDsa65)
+            )
+            .unwrap(),
+            ShellHash::ZERO
         );
     }
 
