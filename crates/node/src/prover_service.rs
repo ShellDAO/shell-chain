@@ -638,29 +638,23 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_handle_stops_service_loop() {
-        let (service, backlog) = make_service();
+        let (service, _backlog) = make_service();
         let handle = service.start();
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let abort_handle = handle
+            .join_handle
+            .as_ref()
+            .expect("started service must own its task")
+            .abort_handle();
+
         drop(handle);
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        {
-            let mut backlog = backlog.lock();
-            backlog.push(ProofTask::new([9u8; 32], 9, vec![]));
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-        let backlog = backlog.lock();
-        assert_eq!(
-            backlog.len(),
-            1,
-            "dropped handle must stop the service task"
-        );
-        assert_eq!(
-            backlog.total_completed(),
-            0,
-            "dropped handle must not leave the async prover loop running"
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped handle must stop the service task");
     }
 
     #[tokio::test]
