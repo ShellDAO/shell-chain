@@ -115,7 +115,7 @@ Shell-Chain adds three post-quantum opcodes not present in the standard EVM:
 |--------|-----|-----|-------------|
 | `PQVERIFY` | `0xB0` | 46,000 (ML-DSA-65) | Verify a PQ signature on-chain |
 | `PQHASH` | `0xB1` | `30 + 6 × ⌈len/32⌉` | BLAKE3 hash of input data |
-| `PQADDR` | `0xB2` | 200 | Derive a 32-byte address from algo_id + pubkey |
+| `PQADDR` | `0xB2` | `200 + 6 × ⌈pk_len/32⌉` | Derive a 32-byte address from algo_id + pubkey |
 
 The runtime installs all three opcodes in the PQVM interpreter. `PQADDR`
 uses stack input `algo_id, pk_ptr, pk_len, out_ptr`, reads the public key from
@@ -355,7 +355,7 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 | `0x0000000000000000000000000000000000000003` | ML-DSA-65 batch verify | `12,000 × sig_count` |
 | `0x0000000000000000000000000000000000000004` | BLAKE3-256 hash | `30 + 6 × ⌈len/32⌉` |
 | `0x0000000000000000000000000000000000000005` | BLAKE3-512 hash | `30 + 6 × ⌈len/32⌉` |
-| `0x0000000000000000000000000000000000000006` | PQ address derive | flat `200` |
+| `0x0000000000000000000000000000000000000006` | PQ address derive | `200 + 6 × ⌈pubkey_len/32⌉` |
 
 The verify precompile uses the ML-DSA-65/Dilithium-compatible wire format below.
 

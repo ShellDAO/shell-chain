@@ -46,7 +46,9 @@ pub const PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG: u64 = 12_000;
 pub const MAX_BATCH_SIGNATURES: u32 = 256;
 pub const BLAKE3_BASE_GAS: u64 = 30;
 pub const BLAKE3_WORD_GAS: u64 = 6;
-pub const PQ_ADDRESS_DERIVE_GAS: u64 = 200;
+pub const PQ_ADDRESS_DERIVE_BASE_GAS: u64 = 200;
+/// Legacy name for the PQ address derivation base gas.
+pub const PQ_ADDRESS_DERIVE_GAS: u64 = PQ_ADDRESS_DERIVE_BASE_GAS;
 
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
@@ -232,7 +234,8 @@ fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
 fn run_pq_address_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     let mut result = base_result(gas_limit);
-    if !charge_gas(&mut result, PQ_ADDRESS_DERIVE_GAS) {
+    let pubkey_len = input.len().saturating_sub(1);
+    if !charge_gas(&mut result, pq_address_derive_gas(pubkey_len)) {
         return result;
     }
 
@@ -247,6 +250,11 @@ fn run_pq_address_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
 
     result.output = Bytes::copy_from_slice(&address);
     result
+}
+
+pub(crate) fn pq_address_derive_gas(pubkey_len: usize) -> u64 {
+    let words = (pubkey_len as u64).div_ceil(32);
+    PQ_ADDRESS_DERIVE_BASE_GAS.saturating_add(BLAKE3_WORD_GAS.saturating_mul(words))
 }
 
 pub(crate) fn derive_pq_address(algo_id: u8, pubkey: &[u8]) -> Option<[u8; 32]> {
@@ -399,7 +407,7 @@ mod tests {
         let mut input = vec![SignatureType::MlDsa65.as_u8()];
         input.extend_from_slice(&pubkey);
 
-        let output = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS, &input);
+        let output = run_pq_address_derive(pq_address_derive_gas(pubkey.len()), &input);
         let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
         assert_eq!(output.result, InstructionResult::Return);
         assert_eq!(output.output.as_ref(), expected.as_bytes());
@@ -407,15 +415,35 @@ mod tests {
 
     #[test]
     fn pq_address_derive_precompile_rejects_unknown_algorithm() {
-        let result = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS, &[0xFF, 0x11]);
+        let result = run_pq_address_derive(pq_address_derive_gas(1), &[0xFF, 0x11]);
         assert_eq!(result.result, InstructionResult::PrecompileError);
         assert!(result.output.is_empty());
     }
 
     #[test]
     fn pq_address_derive_precompile_charges_gas_before_parsing() {
-        let result = run_pq_address_derive(PQ_ADDRESS_DERIVE_GAS - 1, &[0x01, 0x11]);
+        let result = run_pq_address_derive(PQ_ADDRESS_DERIVE_BASE_GAS - 1, &[0x01, 0x11]);
         assert_eq!(result.result, InstructionResult::PrecompileOOG);
+    }
+
+    #[test]
+    fn pq_address_derive_precompile_charges_for_every_pubkey_word() {
+        let input = vec![SignatureType::MlDsa65.as_u8(); 1 + 64];
+        let required_gas = pq_address_derive_gas(64);
+
+        let result = run_pq_address_derive(required_gas - 1, &input);
+        assert_eq!(result.result, InstructionResult::PrecompileOOG);
+
+        let result = run_pq_address_derive(required_gas, &input);
+        assert_eq!(result.result, InstructionResult::Return);
+    }
+
+    #[test]
+    fn pq_address_derive_gas_rounds_pubkey_length_to_words() {
+        assert_eq!(pq_address_derive_gas(0), PQ_ADDRESS_DERIVE_BASE_GAS);
+        assert_eq!(pq_address_derive_gas(1), PQ_ADDRESS_DERIVE_BASE_GAS + 6);
+        assert_eq!(pq_address_derive_gas(32), PQ_ADDRESS_DERIVE_BASE_GAS + 6);
+        assert_eq!(pq_address_derive_gas(33), PQ_ADDRESS_DERIVE_BASE_GAS + 12);
     }
 
     #[test]

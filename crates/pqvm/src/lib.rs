@@ -34,8 +34,9 @@ pub use parallel::{
 };
 pub use pqvm_opcodes::{OPCODE_PQADDR, OPCODE_PQHASH, OPCODE_PQVERIFY};
 pub use precompiles::{
-    ShellPrecompiles, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDRESS_DERIVE_GAS,
-    PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
+    ShellPrecompiles, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDRESS_DERIVE_BASE_GAS,
+    PQ_ADDRESS_DERIVE_GAS, PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG, PQ_MLDSA65_VERIFY_GAS,
+    PQ_SLHDSA_VERIFY_GAS,
 };
 pub use rwset::{HeuristicRwSetExtractor, ReadWriteSetExtractor, TxAccessPath, TxReadWriteSet};
 pub use state_db::{ShellStateDb, StateDbError};

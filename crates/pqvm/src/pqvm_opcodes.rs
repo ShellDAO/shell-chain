@@ -20,7 +20,7 @@
 //! |----------|----------------------------------------------------------|
 //! | PQVERIFY | 46 000 (ML-DSA-65 / Dilithium3) / 2 300 000 (SLH-DSA)  |
 //! | PQHASH   | 30 + 6 × ⌈len/32⌉                                       |
-//! | PQADDR   | 200                                                      |
+//! | PQADDR   | 200 + 6 × ⌈pk_len/32⌉                                  |
 
 use alloy_primitives::U256;
 use revm::handler::instructions::EthInstructions;
@@ -31,7 +31,7 @@ use revm::interpreter::{
 use shell_crypto::{verify_signature, SignatureType};
 
 use crate::precompiles::{
-    derive_pq_address, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS, PQ_ADDRESS_DERIVE_GAS,
+    derive_pq_address, pq_address_derive_gas, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS,
     PQ_MLDSA65_VERIFY_GAS, PQ_SLHDSA_VERIFY_GAS,
 };
 
@@ -343,7 +343,7 @@ pub fn pq_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 /// and writes the 32-byte address to `out_ptr`. Unknown `algo_id` values write
 /// the zero address after charging gas so contracts can branch on the result.
 ///
-/// Gas: `200`.
+/// Gas: `200 + 6 × ceil(pk_len/32)`.
 pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     let Some(out_ptr_u256) = context.interpreter.stack.pop() else {
         context.interpreter.halt_underflow();
@@ -362,16 +362,19 @@ pub fn pq_addr<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
         return;
     };
 
-    if !context.interpreter.gas.record_cost(PQ_ADDRESS_DERIVE_GAS) {
-        context.interpreter.halt_oog();
-        return;
-    }
-
     let algo_id = u256_to_algo_id(algo_id_u256);
     let pk_len = match u256_to_usize(context.interpreter, pk_len_u256) {
         Some(v) => v,
         None => return,
     };
+    if !context
+        .interpreter
+        .gas
+        .record_cost(pq_address_derive_gas(pk_len))
+    {
+        context.interpreter.halt_oog();
+        return;
+    }
     let pk_ptr = match u256_to_usize(context.interpreter, pk_ptr_u256) {
         Some(v) => v,
         None => return,
