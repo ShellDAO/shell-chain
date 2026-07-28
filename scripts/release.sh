@@ -205,6 +205,12 @@ else
     fail "Release commit is stale relative to the canonical main branch"
 fi
 
+if "$SCRIPT_DIR/check-release-tag.sh" "$RELEASE_REMOTE" "$TAG"; then
+    ok "Release tag is available locally and remotely"
+else
+    fail "Release tag already exists or could not be verified"
+fi
+
 CHANGELOG_EXCERPT=$("$SCRIPT_DIR/changelog-excerpt.sh" CHANGELOG.md "$VERSION" 30)
 
 git tag -a "$TAG" -m "Release ${TAG}

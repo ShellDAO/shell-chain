@@ -57,6 +57,9 @@ fi
 if ! grep -Fq 'check-release-lineage.sh' "$SCRIPT_DIR/release.sh"; then
     fail "release preflight does not verify current canonical main ancestry"
 fi
+if ! grep -Fq 'check-release-tag.sh' "$SCRIPT_DIR/release.sh"; then
+    fail "release preflight does not verify remote tag availability"
+fi
 if ! grep -Fq 'git push "$RELEASE_REMOTE" "$TAG"' "$SCRIPT_DIR/release.sh"; then
     fail "release tag push does not use the validated remote"
 fi
@@ -131,6 +134,50 @@ if REMOTE_OUTPUT=$(cd "$REMOTE_FIXTURE" && \
 fi
 if ! grep -Fq "has no push URL" <<<"$REMOTE_OUTPUT"; then
     fail "missing push URL rejection was not specific: $REMOTE_OUTPUT"
+fi
+
+TAG_REMOTE="$TMP_DIR/tag-remote.git"
+TAG_FIXTURE="$TMP_DIR/tag-fixture"
+TAG_CHECKOUT="$TMP_DIR/tag-checkout"
+git init -q --bare "$TAG_REMOTE"
+git init -q -b main "$TAG_FIXTURE"
+git -C "$TAG_FIXTURE" config user.name "ShellDAO Release Test"
+git -C "$TAG_FIXTURE" config user.email "release-test@shelldao.org"
+printf 'release\n' > "$TAG_FIXTURE/history"
+git -C "$TAG_FIXTURE" add history
+git -C "$TAG_FIXTURE" commit -qm "release base"
+git -C "$TAG_FIXTURE" remote add canonical "$TAG_REMOTE"
+git -C "$TAG_FIXTURE" push -q -u canonical main
+git -C "$TAG_REMOTE" symbolic-ref HEAD refs/heads/main
+git -C "$TAG_FIXTURE" tag -a v0.27.10 -m "prefix fixture"
+git -C "$TAG_FIXTURE" push -q canonical v0.27.10
+(cd "$TAG_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-tag.sh" canonical v0.27.1 >/dev/null)
+git -C "$TAG_FIXTURE" tag -a v0.27.2 -m "local release"
+if TAG_OUTPUT=$(cd "$TAG_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-tag.sh" canonical v0.27.2 2>&1); then
+    fail "release tag check unexpectedly accepted an existing local tag"
+fi
+if ! grep -Fq "already exists locally" <<<"$TAG_OUTPUT"; then
+    fail "existing local tag rejection was not specific: $TAG_OUTPUT"
+fi
+git -C "$TAG_FIXTURE" tag -a v0.27.1 -m "existing release"
+git -C "$TAG_FIXTURE" push -q canonical v0.27.1
+git clone -q --no-tags "$TAG_REMOTE" "$TAG_CHECKOUT"
+if TAG_OUTPUT=$(cd "$TAG_CHECKOUT" && \
+    "$SCRIPT_DIR/check-release-tag.sh" origin v0.27.1 2>&1); then
+    fail "release tag check unexpectedly accepted an existing remote tag"
+fi
+if ! grep -Fq "already exists on remote 'origin'" <<<"$TAG_OUTPUT"; then
+    fail "existing remote tag rejection was not specific: $TAG_OUTPUT"
+fi
+git -C "$TAG_CHECKOUT" remote add unavailable "$TMP_DIR/missing-tag-remote.git"
+if TAG_OUTPUT=$(cd "$TAG_CHECKOUT" && \
+    "$SCRIPT_DIR/check-release-tag.sh" unavailable v0.27.2 2>&1); then
+    fail "release tag check unexpectedly accepted an unavailable remote"
+fi
+if ! grep -Fq "could not verify tag 'v0.27.2'" <<<"$TAG_OUTPUT"; then
+    fail "unavailable remote rejection was not specific: $TAG_OUTPUT"
 fi
 
 LINEAGE_REMOTE="$TMP_DIR/lineage-remote.git"
@@ -247,6 +294,7 @@ make_fixture() {
         "$SCRIPT_DIR/check-release-lineage.sh" \
         "$SCRIPT_DIR/check-release-lockfile.sh" \
         "$SCRIPT_DIR/check-release-remote.sh" \
+        "$SCRIPT_DIR/check-release-tag.sh" \
         "$SCRIPT_DIR/check-release-metadata.sh" \
         "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
     printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
@@ -339,6 +387,7 @@ cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/changelog-excerpt.sh" \
     "$SCRIPT_DIR/check-release-lineage.sh" \
     "$SCRIPT_DIR/check-release-lockfile.sh" \
     "$SCRIPT_DIR/check-release-remote.sh" \
+    "$SCRIPT_DIR/check-release-tag.sh" \
     "$SCRIPT_DIR/check-release-metadata.sh" \
     "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
 printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"

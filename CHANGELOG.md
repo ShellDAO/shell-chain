@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject release cuts when the exact tag already exists on the canonical remote,
+  before creating a conflicting local tag.
 - Stop retaining expired mDNS discoveries as dialable peer addresses.
 - Reject headless genesis snapshots before they can replace stored chain data
   or clear the published chain head.
