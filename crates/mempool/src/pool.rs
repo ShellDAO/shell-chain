@@ -445,14 +445,14 @@ impl TxPool {
             .collect();
 
         let mut inner = self.inner.write();
-        let stale_hashes: Vec<ShellHash> = inner
-            .by_hash
+        let stale_hashes: Vec<ShellHash> = canonical_nonces
             .iter()
-            .filter_map(|(hash, entry)| {
-                canonical_nonces
-                    .get(&entry.tx.from)
-                    .is_some_and(|nonce| entry.tx.tx.nonce < *nonce)
-                    .then_some(*hash)
+            .flat_map(|(sender, canonical_nonce)| {
+                inner
+                    .by_sender
+                    .get(sender)
+                    .into_iter()
+                    .flat_map(move |queue| queue.range(..*canonical_nonce).map(|(_, hash)| *hash))
             })
             .collect();
         let pruned = stale_hashes.len();
