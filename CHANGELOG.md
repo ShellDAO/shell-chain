@@ -15,6 +15,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Require owners to cancel an active guardian recovery before replacing its
+  guardian configuration, preventing votes under the old configuration from
+  remaining executable.
 - Preserve AA inner-call balance effects during sponsored-gas settlement so
   self-transfers and value received by paymasters are not discarded.
 - Keep an mDNS peer explicit in GossipSub until all of its discovered addresses

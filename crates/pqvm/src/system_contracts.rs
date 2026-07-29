@@ -1419,6 +1419,13 @@ fn set_guardians<S: KvStore + 'static>(
         threshold,
         timelock,
     };
+    if chain_store
+        .get_recovery_proposal(caller)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .is_some()
+    {
+        return Err(SystemContractError::RecoveryAlreadyActive);
+    }
     chain_store
         .put_guardian_config(caller, &config)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -4010,6 +4017,54 @@ mod tests {
             err,
             SystemContractError::InvalidGuardianCount(5, 6)
         ));
+    }
+
+    #[test]
+    fn set_guardians_requires_active_recovery_cancellation() {
+        let owner = Address::from([0x37; 20]);
+        let old_guardian = Address::from([0x38; 20]);
+        let new_guardian = Address::from([0x39; 20]);
+        let (mut ws, cs) = setup_account_manager();
+
+        let calldata = encode_set_guardians_calldata(&[old_guardian], 1, 100);
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+
+        let calldata = encode_submit_recovery_calldata(&owner, b"new-pubkey", 1);
+        execute_system_contract_call(
+            &account_manager_address(),
+            &old_guardian,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+
+        let calldata = encode_set_guardians_calldata(&[new_guardian], 1, 100);
+        let err = execute_system_contract_call(
+            &account_manager_address(),
+            &owner,
+            &calldata,
+            &mut ws,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SystemContractError::RecoveryAlreadyActive));
+        assert_eq!(
+            cs.get_guardian_config(&owner).unwrap().unwrap().guardians,
+            vec![old_guardian]
+        );
+
+        let calldata = encode_cancel_recovery_calldata(&owner);
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+        let calldata = encode_set_guardians_calldata(&[new_guardian], 1, 100);
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+        assert_eq!(
+            cs.get_guardian_config(&owner).unwrap().unwrap().guardians,
+            vec![new_guardian]
+        );
     }
 
     #[test]

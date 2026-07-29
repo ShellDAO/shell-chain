@@ -148,8 +148,8 @@ interface IAccountManager {
     function rotateKey(bytes calldata pubkey, uint8 algo) external;
 
     /// Configure guardian-based account recovery.
-    function setGuardians(address[] calldata guardians, uint8 thresholdPct, uint64 timelockSecs) external;
-    function submitRecovery(address target, bytes calldata signature, uint8 algo) external;
+    function setGuardians(address[] calldata guardians, uint8 threshold, uint64 timelockBlocks) external;
+    function submitRecovery(address target, bytes calldata newPubkey, uint8 algo) external;
     function executeRecovery(address target) external;
     function cancelRecovery(address target) external;
 
@@ -175,6 +175,11 @@ interface IAccountManager {
 | `submitRecovery(address,bytes,uint8)` | computed at compile time | guardian only |
 | `executeRecovery(address)` | computed at compile time | anyone (after timelock) |
 | `cancelRecovery(address)` | computed at compile time | self only |
+
+Guardian thresholds are vote counts, not percentages, and timelocks are measured
+in blocks. An account with an active recovery proposal must call
+`cancelRecovery` before replacing its guardian configuration so votes collected
+under the old configuration cannot remain executable.
 
 ### Key rotation example
 
