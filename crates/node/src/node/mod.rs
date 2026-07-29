@@ -169,6 +169,17 @@ fn state_trie_prune_boundary(finalized_number: u64, keep_recent: u64) -> Option<
     (boundary > 0).then_some(boundary)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ForkAdoptionPlan {
+    preferred_hash: ShellHash,
+    preferred_number: u64,
+    canonical_number: u64,
+    ancestor_hash: ShellHash,
+    ancestor_number: u64,
+    old_chain: Vec<ShellHash>,
+    new_chain: Vec<ShellHash>,
+}
+
 /// A running shell-chain node.
 ///
 /// Orchestrates storage, consensus, EVM, mempool, network, and RPC
@@ -1069,16 +1080,40 @@ impl<S: KvStore + 'static> Node<S> {
             .filter(|weight| *weight > 0)
     }
 
-    fn preferred_fork_ahead(&self) -> Option<(ShellHash, u64, u64)> {
+    fn preferred_fork_plan(&self) -> Option<ForkAdoptionPlan> {
         let canonical_head = self.chain_store.get_head_block().ok().flatten()?;
         let canonical_number = canonical_head.number();
-        let (preferred_hash, preferred_number, attested_weight) = {
+        let canonical_hash = canonical_head.hash();
+        let (
+            preferred_hash,
+            preferred_number,
+            attested_weight,
+            ancestor_hash,
+            old_chain,
+            new_chain,
+        ) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
             let score = fork_choice.score(&preferred_hash)?;
-            (preferred_hash, score.block_number, score.attested_weight)
+            if preferred_hash == canonical_hash || score.block_number <= canonical_number {
+                return None;
+            }
+            let ancestor_hash =
+                fork_choice.find_common_ancestor(&canonical_hash, &preferred_hash)?;
+            (
+                preferred_hash,
+                score.block_number,
+                score.attested_weight,
+                ancestor_hash,
+                fork_choice.chain_between(&canonical_hash, &ancestor_hash),
+                fork_choice.chain_between(&preferred_hash, &ancestor_hash),
+            )
         };
-        if preferred_hash == canonical_head.hash() {
+        if new_chain.is_empty() {
+            return None;
+        }
+        let ancestor_number = preferred_number.checked_sub(u64::try_from(new_chain.len()).ok()?)?;
+        if canonical_number.checked_sub(ancestor_number)? != u64::try_from(old_chain.len()).ok()? {
             return None;
         }
         let total_weight = self
@@ -1091,11 +1126,30 @@ impl<S: KvStore + 'static> Node<S> {
         if !FinalityState::has_weighted_quorum(attested_weight, total_weight) {
             return None;
         }
-        (preferred_number > canonical_number).then_some((
+        let (finalized_number, finalized_hash) = {
+            let finality = self.finality.read();
+            (
+                finality.last_finalized_number(),
+                *finality.last_finalized_hash(),
+            )
+        };
+        if ancestor_number < finalized_number
+            || (finalized_number > 0
+                && ancestor_number == finalized_number
+                && ancestor_hash != finalized_hash)
+        {
+            return None;
+        }
+
+        Some(ForkAdoptionPlan {
             preferred_hash,
             preferred_number,
             canonical_number,
-        ))
+            ancestor_hash,
+            ancestor_number,
+            old_chain,
+            new_chain,
+        })
     }
 
     fn sync_retry_delay_secs(attempts_without_progress: u32) -> u64 {
@@ -2272,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_fork_ahead_requires_quorum_for_noncanonical_branch() {
+    fn preferred_fork_plan_requires_quorum_for_noncanonical_branch() {
         let (node, _signer) = setup_node();
         store_genesis(&node);
         let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
@@ -2282,12 +2336,12 @@ mod tests {
         node.fork_choice
             .write()
             .add_block(same_height_fork, ShellHash::ZERO, 0, 0, false);
-        assert!(node.preferred_fork_ahead().is_none());
+        assert!(node.preferred_fork_plan().is_none());
 
         node.fork_choice
             .write()
             .add_block(ahead_fork, genesis_hash, 1, 0, false);
-        assert!(node.preferred_fork_ahead().is_none());
+        assert!(node.preferred_fork_plan().is_none());
 
         let total_weight = node
             .consensus
@@ -2302,7 +2356,21 @@ mod tests {
         node.fork_choice
             .write()
             .update_attested_weight(&ahead_fork, quorum_weight);
-        assert_eq!(node.preferred_fork_ahead(), Some((ahead_fork, 1, 0)));
+        assert_eq!(
+            node.preferred_fork_plan(),
+            Some(ForkAdoptionPlan {
+                preferred_hash: ahead_fork,
+                preferred_number: 1,
+                canonical_number: 0,
+                ancestor_hash: genesis_hash,
+                ancestor_number: 0,
+                old_chain: vec![],
+                new_chain: vec![ahead_fork],
+            })
+        );
+
+        node.finality.write().set_finalized_direct(1, ahead_fork);
+        assert!(node.preferred_fork_plan().is_none());
     }
 
     fn dummy_proof_amendment(

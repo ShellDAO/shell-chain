@@ -611,13 +611,15 @@ impl<S: KvStore + 'static> Node<S> {
                             );
                             continue;
                         }
-                        if let Some((preferred_hash, preferred_number, canonical_number)) =
-                            self.preferred_fork_ahead()
-                        {
+                        if let Some(plan) = self.preferred_fork_plan() {
                             debug!(
-                                %preferred_hash,
-                                preferred_number,
-                                canonical_number,
+                                preferred_hash = %plan.preferred_hash,
+                                preferred_number = plan.preferred_number,
+                                canonical_number = plan.canonical_number,
+                                ancestor_hash = %plan.ancestor_hash,
+                                ancestor_number = plan.ancestor_number,
+                                rollback = plan.old_chain.len(),
+                                apply = plan.new_chain.len(),
                                 "block production paused because fork-choice prefers an ahead non-canonical branch"
                             );
                             continue;
