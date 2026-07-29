@@ -1247,7 +1247,7 @@ impl<S: KvStore + 'static> Node<S> {
             .ok_or(NodeError::NoGenesis)?;
         let (total_tx_count, total_gas_used) = self.chain_store.get_chain_totals(head.number())?;
         let finalized_number = self.chain_store.get_finalized_number()?.unwrap_or(0);
-        let pending_txs = self.tx_pool.pending(self.tx_pool.len());
+        let pending_txs = self.tx_pool.pending_for_block(self.tx_pool.len());
 
         let mut dev = self.dev_state.write();
         if dev.snapshots.len() >= MAX_DEV_SNAPSHOTS {
@@ -3901,6 +3901,57 @@ mod tests {
         let head_after_revert = node.chain_store.get_head_block().unwrap().unwrap();
         assert_eq!(head_after_revert.number(), 1);
         assert!(!node.revert("0xdeadbeef").unwrap());
+    }
+
+    #[test]
+    fn dev_rpc_snapshot_restores_same_sender_nonce_chain() {
+        let (node, _) = setup_node();
+
+        let tx_signer = DilithiumSigner::generate();
+        let pubkey = tx_signer.public_key().to_vec();
+        let sender = Address::from_public_key(&pubkey, tx_signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
+
+        let make_tx = |nonce, priority_fee| {
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce,
+                to: Some(Address::ZERO),
+                value: U256::ZERO,
+                data: shell_primitives::Bytes::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE + priority_fee,
+                max_priority_fee_per_gas: priority_fee,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signing_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+            let signature = tx_signer.sign(signing_hash.as_bytes()).unwrap();
+            SignedTransaction::with_pubkey(sender, tx, signature, pubkey.clone())
+        };
+        let tx0 = make_tx(0, 1);
+        let tx1 = make_tx(1, 2);
+        let hash0 = tx0.hash();
+        let hash1 = tx1.hash();
+        let verifier = MultiVerifier;
+        {
+            let mut world_state = node.world_state.write();
+            node.tx_pool
+                .insert(tx0, &mut world_state, node.chain_store.as_ref(), &verifier)
+                .unwrap();
+            node.tx_pool
+                .insert(tx1, &mut world_state, node.chain_store.as_ref(), &verifier)
+                .unwrap();
+        }
+
+        let snapshot_id = node.snapshot().unwrap();
+        node.tx_pool.clear();
+        assert!(node.revert(&snapshot_id).unwrap());
+
+        assert_eq!(node.tx_pool.sender_txs(&sender), vec![hash0, hash1]);
     }
 
     #[test]
