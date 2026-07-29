@@ -3763,7 +3763,8 @@ mod tests {
             data: PBytes::new(),
             gas_limit: 50_000,
         }];
-        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+        let nonce = get_nonce(&mut evm, &sender);
+        let signed = make_aa_signed(sender, nonce, 200_000, 10, inner_calls, None);
 
         let sender_pre = get_balance(&mut evm, &sender);
         let res = evm
@@ -3889,7 +3890,8 @@ mod tests {
             data: PBytes::new(),
             gas_limit: 50_000,
         }];
-        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+        let nonce = get_nonce(&mut evm, &sender);
+        let signed = make_aa_signed(sender, nonce, 200_000, 10, inner_calls, Some(paymaster));
 
         let sender_pre = get_balance(&mut evm, &sender);
         let paymaster_pre = get_balance(&mut evm, &paymaster);
