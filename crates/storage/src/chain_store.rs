@@ -575,6 +575,17 @@ impl<S: KvStore> ChainStore<S> {
         stale_canonical_numbers: &[u64],
         new_head: &ShellHash,
     ) -> Result<(), StorageError> {
+        let batch = self.reorg_batch(old_chain, new_chain, stale_canonical_numbers, new_head)?;
+        self.store.write_batch(batch)
+    }
+
+    fn reorg_batch(
+        &self,
+        old_chain: &[Block],
+        new_chain: &[Block],
+        stale_canonical_numbers: &[u64],
+        new_head: &ShellHash,
+    ) -> Result<WriteBatch, StorageError> {
         let mut batch = WriteBatch::new();
 
         for block in old_chain {
@@ -603,7 +614,7 @@ impl<S: KvStore> ChainStore<S> {
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
 
-        self.store.write_batch(batch)
+        Ok(batch)
     }
 
     /// Mark a block number → hash mapping in the canonical chain index.
@@ -1907,6 +1918,29 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         receipts: Option<&[TransactionReceipt]>,
     ) -> Result<(), StorageError> {
         let batch = self.canonical_block_batch(block, receipts)?;
+        self.store.commit_with_batch(batch)
+    }
+
+    /// Atomically commit replayed state and canonical reorganization artifacts.
+    pub fn commit_reorg_overlay(
+        &self,
+        old_chain: &[Block],
+        new_chain: &[Block],
+        stale_canonical_numbers: &[u64],
+        new_chain_receipts: &[Vec<TransactionReceipt>],
+        new_head: &ShellHash,
+    ) -> Result<(), StorageError> {
+        if new_chain.len() != new_chain_receipts.len() {
+            return Err(StorageError::Database(
+                "reorg block and receipt counts do not match".into(),
+            ));
+        }
+
+        let mut batch =
+            self.reorg_batch(old_chain, new_chain, stale_canonical_numbers, new_head)?;
+        for (block, receipts) in new_chain.iter().zip(new_chain_receipts) {
+            batch.put(Self::receipts_key(&block.hash()), encode_rlp_list(receipts));
+        }
         self.store.commit_with_batch(batch)
     }
 }
@@ -4773,6 +4807,73 @@ mod tests {
         assert!(cs.get_block_by_number(block.number()).unwrap().is_none());
         assert!(cs.get_receipts(&hash).unwrap().is_none());
         assert!(cs.get_tx_location(&tx_hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn commit_reorg_overlay_publishes_state_receipts_and_head_atomically() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let old_block = empty_block(1);
+        let mut new_block = empty_block(1);
+        new_block.header.timestamp = 1;
+        let old_hash = old_block.hash();
+        let new_hash = new_block.hash();
+        base_cs.commit_canonical_block(&old_block, None).unwrap();
+
+        let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
+        overlay.put(b"replayed-state", b"present").unwrap();
+        let overlay_cs = ChainStore::new(Arc::clone(&overlay));
+        overlay_cs
+            .commit_reorg_overlay(
+                std::slice::from_ref(&old_block),
+                std::slice::from_ref(&new_block),
+                &[],
+                &[vec![]],
+                &new_hash,
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.get(b"replayed-state").unwrap(),
+            Some(b"present".to_vec())
+        );
+        assert_eq!(base_cs.get_head_hash().unwrap(), Some(new_hash));
+        assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(new_hash));
+        assert_eq!(base_cs.get_receipts(&new_hash).unwrap(), Some(vec![]));
+        assert_ne!(old_hash, new_hash);
+    }
+
+    #[test]
+    fn commit_reorg_overlay_failure_preserves_state_and_canonical_metadata() {
+        let db = Arc::new(FailingBatchStore::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let old_block = empty_block(1);
+        let mut new_block = empty_block(1);
+        new_block.header.timestamp = 1;
+        let old_hash = old_block.hash();
+        let new_hash = new_block.hash();
+        base_cs.commit_canonical_block(&old_block, None).unwrap();
+
+        let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
+        overlay.put(b"replayed-state", b"present").unwrap();
+        let overlay_cs = ChainStore::new(overlay);
+        db.fail_next_batch();
+
+        let error = overlay_cs
+            .commit_reorg_overlay(
+                std::slice::from_ref(&old_block),
+                std::slice::from_ref(&new_block),
+                &[],
+                &[vec![]],
+                &new_hash,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected batch failure"));
+        assert_eq!(db.get(b"replayed-state").unwrap(), None);
+        assert_eq!(base_cs.get_head_hash().unwrap(), Some(old_hash));
+        assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(old_hash));
+        assert_eq!(base_cs.get_receipts(&new_hash).unwrap(), None);
     }
 
     #[test]

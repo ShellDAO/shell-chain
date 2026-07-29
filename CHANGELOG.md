@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   head receives the required GitHub Actions, Python, and Rust security checks.
 - Index pending sender and paymaster balance reservations so transaction
   admission no longer scans the full mempool.
+- Commit replayed state, receipts, canonical indexes, and the replacement head
+  in one atomic storage transition during branch adoption.
 
 ### Fixed
 
