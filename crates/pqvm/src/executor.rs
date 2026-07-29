@@ -347,6 +347,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
         let max_fee = U256::from(tx.max_fee_per_gas);
+        // Inner calls run as EIP-1559 transactions against a zero-base-fee
+        // block, so revm debits the sender at this effective price.
+        let revm_gas_price = U256::from(tx.max_fee_per_gas.min(tx.max_priority_fee_per_gas));
         let is_sponsored = payer != sender;
         let declared_value = tx.value;
         let Some(inner_value_sum) = bundle.checked_inner_value_sum() else {
@@ -448,7 +451,6 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         block_env.set_blob_excess_gas_and_price(header.excess_blob_gas, 3_338_477);
 
         let mut total_gas_used: u64 = 0;
-        let mut successful_values_sum: U256 = U256::ZERO;
         let mut all_logs: Vec<shell_core::Log> = Vec::new();
         let mut atomic_failure = false;
         let mut last_revert_data: Vec<u8> = Vec::new();
@@ -500,8 +502,8 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             };
 
             let exec_result = result_and_state.result;
-            let state = result_and_state.state;
-            let inner_gas = exec_result.gas().spent();
+            let mut state = result_and_state.state;
+            let inner_gas = exec_result.gas().used();
             total_gas_used = total_gas_used.saturating_add(inner_gas);
 
             match &exec_result {
@@ -515,13 +517,43 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                             all_logs.push(l);
                         }
                     }
-                    successful_values_sum = successful_values_sum
-                        .checked_add(inner.value)
-                        .ok_or_else(|| {
-                            ExecutorError::Revm(
-                                "aa bundle successful value sum overflows U256".into(),
-                            )
-                        })?;
+                    // revm charges and reimburses the caller around each inner
+                    // transaction. Remove that accounting artifact before
+                    // committing so only the inner call's actual balance
+                    // effects remain; AA settlement charges the payer once.
+                    let sender_state = state.get_mut(&sender.to_alloy()).ok_or_else(|| {
+                        ExecutorError::Revm("aa bundle inner execution omitted sender state".into())
+                    })?;
+                    let original_balance = sender_state.original_info.balance;
+                    let max_revm_gas_debit =
+                        U256::from(inner.gas_limit).saturating_mul(revm_gas_price);
+                    let reimbursement = U256::from(inner.gas_limit.saturating_sub(inner_gas))
+                        .saturating_mul(revm_gas_price);
+                    let fee_only_post = original_balance
+                        .saturating_sub(max_revm_gas_debit)
+                        .max(inner.value)
+                        .saturating_add(reimbursement);
+                    sender_state.info.balance = if fee_only_post >= original_balance {
+                        sender_state
+                            .info
+                            .balance
+                            .checked_sub(fee_only_post - original_balance)
+                            .ok_or_else(|| {
+                                ExecutorError::Revm(
+                                    "aa bundle sender fee reconciliation underflows U256".into(),
+                                )
+                            })?
+                    } else {
+                        sender_state
+                            .info
+                            .balance
+                            .checked_add(original_balance - fee_only_post)
+                            .ok_or_else(|| {
+                                ExecutorError::Revm(
+                                    "aa bundle sender fee reconciliation overflows U256".into(),
+                                )
+                            })?
+                    };
                     // Build a minimal result for commit_pqvm_state; no PQ addresses in AA
                     // inner calls (they use EVM-canonical addresses), no nonce advance here
                     // as outer tx handles it.
@@ -550,16 +582,31 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         }
 
         // ── Settlement ─────────────────────────────────────────
-        // Override whatever revm did to sender/payer balances and force them to
-        // the canonical post-bundle values. This neutralizes revm's per-inner
-        // gas debits (which land on the caller = sender), and applies our AA
-        // gas policy (payer covers gas, sender covers inner values).
+        let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
+
+        // Reserve the AA gas charge after successful execution. An inner call
+        // may mutate the payer's balance, but it may not spend the gas reserve.
+        if !atomic_failure {
+            let post_payer_balance = self
+                .state_db
+                .world_state()
+                .get_account(&payer)?
+                .map(|account| account.balance)
+                .unwrap_or(U256::ZERO);
+            if post_payer_balance < gas_cost {
+                atomic_failure = true;
+                last_revert_data = b"aa: payer spent reserved gas during execution".to_vec();
+            }
+        }
+
+        // revm applies every successful inner call directly to live state. On
+        // success, preserve those balance deltas and charge the AA payer at the
+        // outer transaction's max fee.
         if atomic_failure {
             // Wipe all inner-call state mutations.
             self.state_db
                 .world_state_mut()
                 .rollback_to_root(&pre_root)?;
-            let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
             // Charge payer for actual gas used only; clamp at balance.
             let charge = gas_cost.min(payer_pre_bal);
             let mut p_acct = self
@@ -601,13 +648,8 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     .set_account(&sender, &s_acct)?;
             }
         } else {
-            // Success: force canonical balances & nonce.
-            let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
-
-            // Load (post-inner) account states so we preserve any storage_root
-            // / code_hash changes (e.g., if sender or payer is a contract that
-            // emitted state during an inner call — unlikely for EOAs but we
-            // preserve it regardless).
+            // Load post-inner account states so balance, storage, and code
+            // changes made by inner calls survive settlement.
             let mut s_acct = self
                 .state_db
                 .world_state()
@@ -634,9 +676,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         code_hash: None,
                         storage_root: ShellHash::ZERO,
                     });
-                s_acct.balance = sender_pre_bal.saturating_sub(successful_values_sum);
                 s_acct.nonce = sender_nonce_after;
-                p_acct.balance = payer_pre_bal.saturating_sub(gas_cost);
+                p_acct.balance = p_acct.balance.checked_sub(gas_cost).ok_or_else(|| {
+                    ExecutorError::Revm("aa bundle payer gas reserve underflow".into())
+                })?;
                 self.state_db
                     .world_state_mut()
                     .set_account(&sender, &s_acct)?;
@@ -644,9 +687,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     .world_state_mut()
                     .set_account(&payer, &p_acct)?;
             } else {
-                s_acct.balance = sender_pre_bal
-                    .saturating_sub(successful_values_sum)
-                    .saturating_sub(gas_cost);
+                s_acct.balance = s_acct.balance.checked_sub(gas_cost).ok_or_else(|| {
+                    ExecutorError::Revm("aa bundle payer gas reserve underflow".into())
+                })?;
                 s_acct.nonce = sender_nonce_after;
                 self.state_db
                     .world_state_mut()
@@ -3706,6 +3749,37 @@ mod tests {
     }
 
     #[test]
+    fn execute_aa_bundle_self_transfer_preserves_sender_value() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+
+        let inner_calls = vec![InnerCall {
+            to: Some(sender),
+            value: U256::from(5u64),
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+
+        let sender_pre = get_balance(&mut evm, &sender);
+        let res = evm
+            .execute_aa_bundle(&signed, &sample_header(), 0, 0)
+            .unwrap();
+        let sender_post = get_balance(&mut evm, &sender);
+
+        assert_eq!(res.receipt.status, 1);
+        assert_eq!(
+            sender_pre - sender_post,
+            U256::from(res.gas_used).saturating_mul(U256::from(10u64)),
+            "a self-transfer must not burn the transferred value"
+        );
+    }
+
+    #[test]
     fn execute_aa_bundle_atomic_revert_on_inner_failure() {
         use shell_core::InnerCall;
         use shell_primitives::Bytes as PBytes;
@@ -3795,6 +3869,42 @@ mod tests {
             "paymaster charge should not exceed gas_limit * max_fee"
         );
         assert_eq!(get_nonce(&mut evm, &sender), 1);
+    }
+
+    #[test]
+    fn execute_aa_bundle_preserves_value_received_by_paymaster() {
+        use shell_core::InnerCall;
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let paymaster = ShellAddress::from([0x77; 20]);
+        fund_account(&mut evm, &sender, U256::from(10u64));
+        fund_account(&mut evm, &paymaster, U256::from(10_000_000u64));
+
+        let transferred = U256::from(5u64);
+        let inner_calls = vec![InnerCall {
+            to: Some(paymaster),
+            value: transferred,
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, Some(paymaster));
+
+        let sender_pre = get_balance(&mut evm, &sender);
+        let paymaster_pre = get_balance(&mut evm, &paymaster);
+        let res = evm
+            .execute_aa_bundle(&signed, &sample_header(), 0, 0)
+            .unwrap();
+        let gas_cost = U256::from(res.gas_used).saturating_mul(U256::from(10u64));
+
+        assert_eq!(res.receipt.status, 1);
+        assert_eq!(sender_pre - get_balance(&mut evm, &sender), transferred);
+        assert_eq!(
+            get_balance(&mut evm, &paymaster),
+            paymaster_pre + transferred - gas_cost,
+            "settlement must preserve value received by the paymaster"
+        );
     }
 
     #[test]

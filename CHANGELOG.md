@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve AA inner-call balance effects during sponsored-gas settlement so
+  self-transfers and value received by paymasters are not discarded.
 - Keep an mDNS peer explicit in GossipSub until all of its discovered addresses
   have expired.
 - Reject checkpoint snapshots with a missing or mismatched canonical head body
