@@ -3707,7 +3707,7 @@ mod tests {
             .get_account(addr)
             .unwrap()
             .map(|a| a.nonce)
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     #[test]
