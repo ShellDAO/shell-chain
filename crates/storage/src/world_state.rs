@@ -121,8 +121,8 @@ impl<S: KvStore + 'static> WorldState<S> {
         Ok(())
     }
 
-    fn account_key(address: &Address) -> Vec<u8> {
-        keccak256(address.as_bytes()).as_bytes().to_vec()
+    fn account_key(address: &Address) -> ShellHash {
+        keccak256(address.as_bytes())
     }
 
     /// Retrieve an account by address. Returns `None` if the account does not exist.
@@ -135,7 +135,7 @@ impl<S: KvStore + 'static> WorldState<S> {
         }
         // Slow path: trie lookup.
         let key = Self::account_key(address);
-        let result = match self.account_trie.get(&key)? {
+        let result = match self.account_trie.get(key.as_bytes())? {
             Some(data) => {
                 let account = Account::decode(&mut &data[..])
                     .map_err(|e| StorageError::Codec(e.to_string()))?;
@@ -156,7 +156,7 @@ impl<S: KvStore + 'static> WorldState<S> {
         let key = Self::account_key(address);
         let mut buf = Vec::new();
         account.encode(&mut buf);
-        self.account_trie.insert(&key, &buf)?;
+        self.account_trie.insert(key.as_bytes(), &buf)?;
         self.account_cache
             .lock()
             .put(*address, Some(account.clone()));

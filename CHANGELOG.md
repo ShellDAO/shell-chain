@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Avoid allocating account-trie keys on world-state cache misses and writes.
 - Run advanced CodeQL analysis for fork-based pull requests so every proposed
   head receives the required GitHub Actions, Python, and Rust security checks.
 - Index pending sender and paymaster balance reservations so transaction
