@@ -6109,9 +6109,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborting_event_loop_stops_background_prover_tasks() {
+    async fn aborting_event_loop_drops_background_prover_service() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::net::SocketAddr;
+        use std::time::Duration;
 
         let (mut node, signer) = setup_node();
         node.config.node_role = crate::config::NodeRole::ValidatorProver;
@@ -6125,13 +6126,21 @@ mod tests {
         let mut network = bus.join(&NetworkConfig::default());
 
         let node = Arc::new(node);
+        let backlog_refs_before_run = Arc::strong_count(&node.proof_backlog);
         let signer = Arc::new(signer) as Arc<dyn Signer>;
         let handle = tokio::spawn({
             let node = Arc::clone(&node);
             async move { node.run(signer, &mut network).await }
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&node.proof_backlog) <= backlog_refs_before_run {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prover service did not acquire the proof backlog");
+
         handle.abort();
         let err = handle
             .await
@@ -6141,26 +6150,13 @@ mod tests {
             "expected cancelled join error, got {err}"
         );
 
-        let completed_before = {
-            let mut backlog = node.proof_backlog.lock();
-            let _ = backlog.drain();
-            let completed_before = backlog.total_completed();
-            backlog.push(ProofTask::new([7u8; 32], 7, vec![]));
-            completed_before
-        };
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        let backlog = node.proof_backlog.lock();
-        assert_eq!(
-            backlog.len(),
-            1,
-            "aborted run must not leave prover tasks running"
-        );
-        assert_eq!(
-            backlog.total_completed(),
-            completed_before,
-            "aborted run must not drain backlog after lifecycle owner is dropped"
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&node.proof_backlog) != backlog_refs_before_run {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted event loop retained the prover service");
     }
 
     #[test]
