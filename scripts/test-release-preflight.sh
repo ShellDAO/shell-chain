@@ -60,6 +60,9 @@ fi
 if ! grep -Fq 'check-release-tag.sh' "$SCRIPT_DIR/release.sh"; then
     fail "release preflight does not verify remote tag availability"
 fi
+if ! grep -Fq '"$SCRIPT_DIR/build-release-binary.sh"' "$SCRIPT_DIR/release.sh"; then
+    fail "release preflight does not build the production binary before tagging"
+fi
 if ! grep -Fq 'git push "$RELEASE_REMOTE" "$TAG"' "$SCRIPT_DIR/release.sh"; then
     fail "release tag push does not use the validated remote"
 fi

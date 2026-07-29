@@ -141,6 +141,16 @@ else
     fail "Hosted CI is missing, pending, or failing on HEAD"
 fi
 
+# ── Production binary ───────────────────────────────────────
+
+echo ""
+echo "── Production binary ──"
+if "$SCRIPT_DIR/build-release-binary.sh"; then
+    ok "Production release binary built and passed path-remapping checks"
+else
+    fail "Production release binary build failed"
+fi
+
 # ── Fuzz target syntax check ──────────────────────────────────
 
 echo ""
@@ -228,7 +238,7 @@ if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
     echo "Next steps:"
     echo "  1. Create a GitHub Release at https://github.com/ShellDAO/shell-chain/releases/new?tag=${TAG}"
     echo "  2. Add CHANGELOG excerpt to the release body"
-    echo "  3. Build each platform with scripts/build-release-binary.sh and attach the binaries"
+    echo "  3. Build the remaining platforms with scripts/build-release-binary.sh and attach the binaries"
     echo "  4. Publish Docker image: docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/shelldao/shell-chain:${TAG} --push ."
 else
     warn "Tag created locally but NOT pushed. Run: git push ${RELEASE_REMOTE} ${TAG}"
