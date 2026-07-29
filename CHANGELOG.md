@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep idle `syncing` subscriptions active until the client unsubscribes or
+  disconnects instead of expiring healthy WebSocket sessions.
 - Require owners to cancel an active guardian recovery before replacing its
   guardian configuration, preventing votes under the old configuration from
   remaining executable.

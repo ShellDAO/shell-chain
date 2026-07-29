@@ -840,4 +840,75 @@ mod tests {
             "rejected subscriptions leaked per-connection capacity: {valid:?}"
         );
     }
+
+    #[tokio::test]
+    async fn syncing_subscription_remains_open_while_idle() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            rate_limit_per_sec: None,
+            api_namespaces: vec!["eth".into()],
+            ..RpcConfig::default()
+        };
+
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = WsClientBuilder::default()
+            .build(format!("ws://{}", server.http_addr))
+            .await
+            .unwrap();
+        let mut subscriptions = Vec::new();
+        for _ in 0..16 {
+            subscriptions.push(
+                client
+                    .subscribe::<serde_json::Value, _>(
+                        "eth_subscribe",
+                        rpc_params!["syncing"],
+                        "eth_unsubscribe",
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let extra = client
+            .subscribe::<serde_json::Value, _>(
+                "eth_subscribe",
+                rpc_params!["syncing"],
+                "eth_unsubscribe",
+            )
+            .await;
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(
+            matches!(extra, Err(ClientError::Call(ref err)) if err.code() == -32005),
+            "idle syncing subscriptions released their active slots: {extra:?}"
+        );
+    }
 }
