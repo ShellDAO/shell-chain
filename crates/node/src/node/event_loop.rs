@@ -668,6 +668,25 @@ impl<S: KvStore + 'static> Node<S> {
                                 match self.adopt_state_neutral_preferred_fork(plan) {
                                     Ok(()) => fork_adoption_retry.reset(),
                                     Err(error) => {
+                                        if let NodeError::InvalidFork {
+                                            block_hash,
+                                            reason,
+                                        } = &error
+                                        {
+                                            if self
+                                                .fork_choice
+                                                .write()
+                                                .remove_subtree(block_hash)
+                                            {
+                                                fork_adoption_retry.reset();
+                                                tracing::error!(
+                                                    rejected_block = %block_hash,
+                                                    %reason,
+                                                    "removed terminally invalid preferred-fork subtree"
+                                                );
+                                                continue;
+                                            }
+                                        }
                                         let retry_delay = fork_adoption_retry.record_failure(
                                             preferred_head,
                                             adoption_attempted_at,

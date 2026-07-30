@@ -2700,6 +2700,87 @@ mod tests {
     }
 
     #[test]
+    fn terminally_invalid_preferred_fork_can_be_removed() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let canonical = make_block_at_1(&node, &signer, None);
+        let canonical_hash = canonical.hash();
+        node.import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+
+        let mut side_one = canonical;
+        side_one.header.timestamp += 1;
+        side_one.header.base_fee_per_gas = side_one.header.base_fee_per_gas.saturating_add(1);
+        side_one.proposer_seal = Some(
+            signer
+                .sign(side_one.header.hash().as_bytes())
+                .expect("sign invalid side block"),
+        );
+        let side_one_hash = side_one.hash();
+        node.chain_store.put_side_fork_block(&side_one).unwrap();
+        node.fork_choice.write().add_block(
+            side_one_hash,
+            side_one.header.parent_hash,
+            side_one.number(),
+            0,
+            false,
+        );
+
+        let mut side_two = side_one.clone();
+        side_two.header.parent_hash = side_one_hash;
+        side_two.header.number = 2;
+        side_two.header.timestamp += 1;
+        side_two.proposer_seal = Some(
+            signer
+                .sign(side_two.header.hash().as_bytes())
+                .expect("sign invalid side-fork child"),
+        );
+        let side_two_hash = side_two.hash();
+        node.chain_store.put_side_fork_block(&side_two).unwrap();
+        node.fork_choice.write().add_block(
+            side_two_hash,
+            side_one_hash,
+            side_two.number(),
+            0,
+            false,
+        );
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("invalid side fork should become preferred before revalidation");
+
+        let error = node.adopt_state_neutral_preferred_fork(plan).unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeError::InvalidFork {
+                block_hash,
+                ..
+            } if block_hash == side_one_hash
+        ));
+        assert!(node.fork_choice.write().remove_subtree(&side_one_hash));
+        assert!(node.preferred_fork_plan().unwrap().is_none());
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(canonical_hash)
+        );
+    }
+
+    #[test]
     fn fork_adoption_reverts_only_transactions_absent_from_preferred_chain() {
         let (node, signer) = setup_node();
         store_genesis(&node);

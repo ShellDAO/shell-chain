@@ -73,6 +73,13 @@ fn batch_signing_pubkey(
 }
 
 impl<S: KvStore + 'static> Node<S> {
+    fn invalid_fork(block_hash: ShellHash, error: impl std::fmt::Display) -> NodeError {
+        NodeError::InvalidFork {
+            block_hash,
+            reason: error.to_string(),
+        }
+    }
+
     fn wall_clock_secs_for_import() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -474,10 +481,13 @@ impl<S: KvStore + 'static> Node<S> {
                 && plan.ancestor_number == finalized_number
                 && plan.ancestor_hash != finalized_hash)
         {
-            return Err(NodeError::Startup(format!(
+            return Err(NodeError::InvalidFork {
+                block_hash: plan.preferred_hash,
+                reason: format!(
                 "preferred fork {} crosses finalized block #{finalized_number} ({finalized_hash})",
                 plan.preferred_hash
-            )));
+                ),
+            });
         }
 
         let ancestor = self
@@ -510,10 +520,15 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut parent = ancestor;
         for block in &plan.new_chain {
-            self.verify_import_consensus(block, &parent)?;
-            self.verify_import_economics(block, &parent)?;
-            self.verify_incoming_witness_root(block)?;
-            self.verify_import_sig_aggregate_proof(block)?;
+            let block_hash = block.hash();
+            self.verify_import_consensus(block, &parent)
+                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+            self.verify_import_economics(block, &parent)
+                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+            self.verify_incoming_witness_root(block)
+                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+            self.verify_import_sig_aggregate_proof(block)
+                .map_err(|error| Self::invalid_fork(block_hash, error))?;
             self.ensure_state_neutral_fork_block(
                 block,
                 ancestor_state_root,
@@ -522,9 +537,10 @@ impl<S: KvStore + 'static> Node<S> {
             parent = block.clone();
         }
         if parent.hash() != plan.preferred_hash || parent.number() != plan.preferred_number {
-            return Err(NodeError::Startup(
-                "preferred-fork plan does not terminate at the selected head".into(),
-            ));
+            return Err(NodeError::InvalidFork {
+                block_hash: plan.preferred_hash,
+                reason: "preferred-fork plan does not terminate at the selected head".into(),
+            });
         }
 
         let mut state = WorldState::at_root(self.store.clone(), &ancestor_state_root)?;

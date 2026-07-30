@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
   retrying immediately when fork choice selects a different head.
 - Reconcile the mempool after fork adoption by removing newly canonical
   transactions and reinserting valid reverted transactions in nonce order.
+- Remove terminally invalid preferred-fork subtrees from fork choice so
+  production can resume, while retaining backoff for transient failures.
 
 ### Fixed
 

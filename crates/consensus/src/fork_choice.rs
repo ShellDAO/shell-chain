@@ -297,6 +297,46 @@ impl ForkChoice {
         self.recalculate_head();
     }
 
+    /// Remove a terminally invalid block and every descendant from fork choice.
+    ///
+    /// Genesis and the finalized root are protected so validation failures
+    /// cannot erase the trusted base of the fork-choice tree.
+    pub fn remove_subtree(&mut self, root: &ShellHash) -> bool {
+        if self.finalized_root == Some(*root)
+            || self.parent_map.get(root) == Some(&ShellHash::ZERO)
+            || !self.scores.contains_key(root)
+        {
+            return false;
+        }
+
+        let mut children: HashMap<ShellHash, Vec<ShellHash>> = HashMap::new();
+        for (child, parent) in &self.parent_map {
+            children.entry(*parent).or_default().push(*child);
+        }
+
+        let mut removed = HashSet::new();
+        let mut pending = vec![*root];
+        while let Some(parent) = pending.pop() {
+            if !removed.insert(parent) {
+                continue;
+            }
+            if let Some(child_hashes) = children.get(&parent) {
+                pending.extend(child_hashes);
+            }
+        }
+        if self
+            .finalized_root
+            .is_some_and(|finalized| removed.contains(&finalized))
+        {
+            return false;
+        }
+
+        self.scores.retain(|hash, _| !removed.contains(hash));
+        self.parent_map.retain(|hash, _| !removed.contains(hash));
+        self.recalculate_head();
+        true
+    }
+
     /// Number of tracked blocks.
     pub fn block_count(&self) -> usize {
         self.scores.len()
@@ -395,6 +435,35 @@ mod tests {
         assert_eq!(fc.score(&hash(1)).unwrap().is_finalized, 1);
         assert_eq!(fc.score(&hash(2)).unwrap().is_finalized, 1);
         assert_eq!(fc.head(), &hash(2));
+    }
+
+    #[test]
+    fn remove_subtree_rejects_invalid_head_and_descendants() {
+        let mut fc = ForkChoice::new(hash(0));
+        fc.add_block(hash(1), hash(0), 1, 0, true);
+        fc.add_block(hash(2), hash(1), 2, 0, true);
+        fc.add_block(hash(3), hash(0), 1, 10, true);
+        fc.add_block(hash(4), hash(3), 2, 10, true);
+        assert_eq!(fc.head(), &hash(4));
+
+        assert!(fc.remove_subtree(&hash(3)));
+
+        assert_eq!(fc.head(), &hash(2));
+        assert!(!fc.contains(&hash(3)));
+        assert!(!fc.contains(&hash(4)));
+        assert_eq!(fc.block_count(), 3);
+    }
+
+    #[test]
+    fn remove_subtree_preserves_genesis_and_finalized_root() {
+        let mut fc = ForkChoice::new(hash(0));
+        fc.add_block(hash(1), hash(0), 1, 0, true);
+        fc.mark_finalized(&hash(1));
+
+        assert!(!fc.remove_subtree(&hash(0)));
+        assert!(!fc.remove_subtree(&hash(1)));
+        assert_eq!(fc.head(), &hash(1));
+        assert_eq!(fc.block_count(), 2);
     }
 
     #[test]
