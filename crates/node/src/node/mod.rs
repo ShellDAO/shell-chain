@@ -178,6 +178,27 @@ struct ForkAdoptionPlan {
     ancestor_number: u64,
     old_chain: Vec<Block>,
     new_chain: Vec<Block>,
+    reverted_txs: Vec<SignedTransaction>,
+}
+
+fn unique_reverted_transactions(
+    old_chain: &[Block],
+    new_chain: &[Block],
+) -> Vec<SignedTransaction> {
+    let adopted_hashes: HashSet<ShellHash> = new_chain
+        .iter()
+        .flat_map(|block| block.transactions.iter().map(SignedTransaction::hash))
+        .collect();
+    let mut reverted_hashes = HashSet::new();
+    old_chain
+        .iter()
+        .flat_map(|block| block.transactions.iter())
+        .filter(|tx| {
+            let hash = tx.hash();
+            !adopted_hashes.contains(&hash) && reverted_hashes.insert(hash)
+        })
+        .cloned()
+        .collect()
 }
 
 /// A running shell-chain node.
@@ -1234,6 +1255,7 @@ impl<S: KvStore + 'static> Node<S> {
             &new_hashes,
             false,
         )?;
+        let reverted_txs = unique_reverted_transactions(&old_chain, &new_chain);
 
         Ok(Some(ForkAdoptionPlan {
             preferred_hash,
@@ -1243,6 +1265,7 @@ impl<S: KvStore + 'static> Node<S> {
             ancestor_number,
             old_chain,
             new_chain,
+            reverted_txs,
         }))
     }
 
@@ -2465,6 +2488,7 @@ mod tests {
                 ancestor_number: 0,
                 old_chain: vec![],
                 new_chain: vec![ahead_block],
+                reverted_txs: vec![],
             })
         );
 
@@ -2473,6 +2497,22 @@ mod tests {
         assert!(finalized_error
             .to_string()
             .contains("crosses finalized block"));
+    }
+
+    #[test]
+    fn fork_adoption_reverts_only_transactions_absent_from_preferred_chain() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let old_only = signed_tx_with_gas_limit(21_000);
+        let retained = signed_tx_with_gas_limit(22_000);
+        let mut old_block = make_block_at_1(&node, &signer, None);
+        old_block.transactions = vec![old_only.clone(), retained.clone(), old_only.clone()];
+        let mut new_block = make_block_at_1(&node, &signer, None);
+        new_block.transactions = vec![retained];
+
+        let reverted = unique_reverted_transactions(&[old_block], &[new_block]);
+
+        assert_eq!(reverted, vec![old_only]);
     }
 
     fn dummy_proof_amendment(

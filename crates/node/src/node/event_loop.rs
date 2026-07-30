@@ -621,6 +621,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     ancestor_number = plan.ancestor_number,
                                     rollback = plan.old_chain.len(),
                                     apply = plan.new_chain.len(),
+                                    reverted_transactions = plan.reverted_txs.len(),
                                     "block production paused because fork-choice prefers an ahead non-canonical branch"
                                 );
                                 continue;
