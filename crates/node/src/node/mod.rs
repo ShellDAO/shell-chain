@@ -7954,6 +7954,42 @@ mod tests {
     }
 
     #[test]
+    fn import_side_fork_invalid_sig_aggregate_proof_is_rejected() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            signer.public_key().to_vec(),
+        );
+        let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let mut side_fork = make_block_at_1(&node, &signer, None);
+        side_fork.header.parent_hash = genesis_hash;
+        side_fork.header.extra_data = Bytes::from_static(b"invalid-aggregate-proof");
+        side_fork.header.sig_aggregate_proof = Some(Bytes::from_static(b"not-json"));
+        side_fork.proposer_seal = Some(
+            signer
+                .sign(side_fork.header.hash().as_bytes())
+                .expect("sign side fork"),
+        );
+        let side_fork_hash = side_fork.hash();
+
+        let error = node.import_block(side_fork, &MultiVerifier).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("STARK aggregate proof deserialization failed"));
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&side_fork_hash)
+            .unwrap()
+            .is_none());
+        assert!(!node.fork_choice.read().contains(&side_fork_hash));
+    }
+
+    #[test]
     fn import_side_fork_invalid_fee_and_blob_fields_are_rejected() {
         let (node, signer) = setup_node();
         store_genesis(&node);

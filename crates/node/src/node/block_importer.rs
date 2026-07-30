@@ -213,6 +213,42 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    fn verify_import_sig_aggregate_proof(&self, block: &Block) -> Result<(), NodeError> {
+        let Some(proof_bytes) = &block.header.sig_aggregate_proof else {
+            return Ok(());
+        };
+        let sig_proof =
+            match shell_stark_prover::proof::SigBatchProof::from_json(proof_bytes.as_ref()) {
+                Ok(sig_proof) => sig_proof,
+                Err(error) => {
+                    return Err(NodeError::Startup(format!(
+                        "block {} STARK aggregate proof deserialization failed: {error}",
+                        block.number()
+                    )));
+                }
+            };
+        if sig_proof.has_proof() {
+            verify_sig_batch(&sig_proof).map_err(|error| {
+                NodeError::Startup(format!(
+                    "block {} STARK aggregate proof verification failed: {error}",
+                    block.number()
+                ))
+            })?;
+            debug!(
+                block = block.number(),
+                n_sigs = sig_proof.n_sigs,
+                "C3: STARK aggregate proof verified"
+            );
+        } else {
+            debug!(
+                block = block.number(),
+                n_sigs = sig_proof.n_sigs,
+                "C3: commitment-only sig_aggregate_proof accepted; full proof pending ProofAmendment"
+            );
+        }
+        Ok(())
+    }
+
     fn verify_import_logs_bloom(
         &self,
         block: &Block,
@@ -387,6 +423,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.verify_import_consensus(&block, &parent)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
+            self.verify_import_sig_aggregate_proof(&block)?;
             self.validate_side_fork_transactions(&block, &parent)?;
             if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
                 self.queue_signed_equivocation_if_valid(&existing, &block);
@@ -424,6 +461,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.verify_import_consensus(&block, &parent)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
+            self.verify_import_sig_aggregate_proof(&block)?;
             self.validate_side_fork_transactions(&block, &parent)?;
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
@@ -467,44 +505,7 @@ impl<S: KvStore + 'static> Node<S> {
         self.verify_import_consensus(&block, &parent)?;
         self.verify_import_economics(&block, &parent)?;
         self.verify_incoming_witness_root(&block)?;
-
-        // C3: If the block carries a STARK aggregate proof, verify it.
-        // A valid proof means the block producer correctly accumulated all
-        // tx signature entries; this is belt-and-suspenders verification on top
-        // of the existing individual sig checks below.
-        // Commitment-only payloads (no proof_bytes) are accepted as-is; full
-        // STARK verification happens when a ProofAmendment is gossiped.
-        if let Some(proof_bytes) = &block.header.sig_aggregate_proof {
-            match shell_stark_prover::proof::SigBatchProof::from_json(proof_bytes.as_ref()) {
-                Ok(sig_proof) => {
-                    if sig_proof.has_proof() {
-                        if let Err(e) = verify_sig_batch(&sig_proof) {
-                            return Err(NodeError::Startup(format!(
-                                "block {} STARK aggregate proof verification failed: {e}",
-                                block.number()
-                            )));
-                        }
-                        debug!(
-                            block = block.number(),
-                            n_sigs = sig_proof.n_sigs,
-                            "C3: STARK aggregate proof verified"
-                        );
-                    } else {
-                        debug!(
-                            block = block.number(),
-                            n_sigs = sig_proof.n_sigs,
-                            "C3: commitment-only sig_aggregate_proof accepted; full proof pending ProofAmendment"
-                        );
-                    }
-                }
-                Err(e) => {
-                    return Err(NodeError::Startup(format!(
-                        "block {} STARK aggregate proof deserialization failed: {e}",
-                        block.number()
-                    )));
-                }
-            }
-        }
+        self.verify_import_sig_aggregate_proof(&block)?;
 
         let current_root = block_store.current_state_root()?;
 

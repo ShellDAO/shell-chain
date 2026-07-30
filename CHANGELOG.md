@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject side-fork blocks with malformed or invalid STARK aggregate proofs
+  before persisting them or registering them with fork choice.
 - Keep idle `syncing` subscriptions active until the client unsubscribes or
   disconnects instead of expiring healthy WebSocket sessions.
 - Require owners to cancel an active guardian recovery before replacing its
