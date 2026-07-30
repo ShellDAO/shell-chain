@@ -2500,6 +2500,178 @@ mod tests {
     }
 
     #[test]
+    fn quorum_preferred_state_neutral_fork_is_adopted_atomically() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        let ancestor_root = current_state_root(&node);
+
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+
+        let mut side_one = canonical.clone();
+        side_one.header.timestamp += 1;
+        side_one.proposer_seal = Some(
+            signer
+                .sign(side_one.header.hash().as_bytes())
+                .expect("sign side block"),
+        );
+        let side_one_hash = side_one.hash();
+        node.import_block(side_one.clone(), &MultiVerifier).unwrap();
+
+        let mut side_two = side_one.clone();
+        side_two.header.parent_hash = side_one_hash;
+        side_two.header.number = 2;
+        side_two.header.timestamp += 1;
+        side_two.header.base_fee_per_gas = calculate_base_fee(
+            side_one.header.gas_used,
+            side_one.header.gas_limit,
+            side_one.header.base_fee_per_gas,
+        );
+        side_two.proposer_seal = Some(
+            signer
+                .sign(side_two.header.hash().as_bytes())
+                .expect("sign side-fork child"),
+        );
+        let side_two_hash = side_two.hash();
+        node.import_block(side_two.clone(), &MultiVerifier).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("side fork should become preferred");
+        assert_eq!(plan.old_chain, vec![canonical]);
+        assert_eq!(plan.new_chain, vec![side_one.clone(), side_two.clone()]);
+
+        node.adopt_state_neutral_preferred_fork(plan).unwrap();
+
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(side_one_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(2).unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_receipts(&side_one_hash).unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            node.chain_store.get_receipts(&side_two_hash).unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(current_state_root(&node), ancestor_root);
+        assert!(node.preferred_fork_plan().unwrap().is_none());
+    }
+
+    #[test]
+    fn stateful_preferred_fork_is_rejected_before_canonical_mutation() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let canonical = make_block_at_1(&node, &signer, None);
+        let canonical_hash = canonical.hash();
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let mut side_one = make_block_at_1(&node, &signer, None);
+        side_one.header.parent_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        side_one.header.timestamp += 1;
+        side_one.header.state_root = ShellHash::from([0x99; 32]);
+        side_one.proposer_seal = Some(
+            signer
+                .sign(side_one.header.hash().as_bytes())
+                .expect("sign stateful side block"),
+        );
+        let side_one_hash = side_one.hash();
+        node.chain_store.put_side_fork_block(&side_one).unwrap();
+        node.fork_choice.write().add_block(
+            side_one_hash,
+            side_one.header.parent_hash,
+            side_one.number(),
+            0,
+            false,
+        );
+
+        let mut side_two = side_one.clone();
+        side_two.header.parent_hash = side_one_hash;
+        side_two.header.number = 2;
+        side_two.header.timestamp += 1;
+        side_two.header.base_fee_per_gas = calculate_base_fee(
+            side_one.header.gas_used,
+            side_one.header.gas_limit,
+            side_one.header.base_fee_per_gas,
+        );
+        side_two.proposer_seal = Some(
+            signer
+                .sign(side_two.header.hash().as_bytes())
+                .expect("sign stateful side-fork child"),
+        );
+        let side_two_hash = side_two.hash();
+        node.chain_store.put_side_fork_block(&side_two).unwrap();
+        node.fork_choice.write().add_block(
+            side_two_hash,
+            side_one_hash,
+            side_two.number(),
+            0,
+            false,
+        );
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("stateful side fork should become preferred");
+
+        let error = node.adopt_state_neutral_preferred_fork(plan).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires deterministic state replay"));
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(canonical_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(canonical_hash)
+        );
+        assert_eq!(node.chain_store.get_block_hash_by_number(2).unwrap(), None);
+    }
+
+    #[test]
     fn fork_adoption_reverts_only_transactions_absent_from_preferred_chain() {
         let (node, signer) = setup_node();
         store_genesis(&node);

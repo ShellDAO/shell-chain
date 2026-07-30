@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
   admission no longer scans the full mempool.
 - Commit replayed state, receipts, canonical indexes, and the replacement head
   in one atomic storage transition during branch adoption.
+- Adopt quorum-preferred forks atomically when both branches are state-neutral,
+  while keeping production paused for branches that still require replay.
 
 ### Fixed
 

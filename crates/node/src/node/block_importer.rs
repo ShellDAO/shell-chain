@@ -384,6 +384,176 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    fn ensure_state_neutral_fork_block(
+        &self,
+        block: &Block,
+        ancestor_state_root: ShellHash,
+        segment: &str,
+    ) -> Result<(), NodeError> {
+        if !block.transactions.is_empty()
+            || !block.system_transactions.is_empty()
+            || block.header.gas_used != 0
+            || block.header.state_root != ancestor_state_root
+            || block.header.transactions_root != ShellHash::ZERO
+            || block.header.receipts_root != ShellHash::ZERO
+            || !Self::decode_system_extra(&block.header.extra_data)?.is_empty()
+        {
+            return Err(NodeError::Startup(format!(
+                "{segment} block {} requires deterministic state replay before adoption",
+                block.number()
+            )));
+        }
+        self.verify_import_logs_bloom(block, &[])
+    }
+
+    pub(super) fn adopt_state_neutral_preferred_fork(
+        &self,
+        plan: ForkAdoptionPlan,
+    ) -> Result<(), NodeError> {
+        let current_head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        if current_head.number() != plan.canonical_number
+            || current_head.hash()
+                != plan
+                    .old_chain
+                    .last()
+                    .map(Block::hash)
+                    .unwrap_or(plan.ancestor_hash)
+        {
+            return Err(NodeError::Startup(
+                "preferred-fork plan is stale relative to the canonical head".into(),
+            ));
+        }
+        if *self.fork_choice.read().head() != plan.preferred_hash {
+            return Err(NodeError::Startup(
+                "preferred-fork plan is stale relative to fork choice".into(),
+            ));
+        }
+
+        let (finalized_number, finalized_hash) = {
+            let finality = self.finality.read();
+            (
+                finality.last_finalized_number(),
+                *finality.last_finalized_hash(),
+            )
+        };
+        if plan.ancestor_number < finalized_number
+            || (finalized_number > 0
+                && plan.ancestor_number == finalized_number
+                && plan.ancestor_hash != finalized_hash)
+        {
+            return Err(NodeError::Startup(format!(
+                "preferred fork {} crosses finalized block #{finalized_number} ({finalized_hash})",
+                plan.preferred_hash
+            )));
+        }
+
+        let ancestor = self
+            .chain_store
+            .get_block_by_hash(&plan.ancestor_hash)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "preferred-fork ancestor block not found: {}",
+                    plan.ancestor_hash
+                ))
+            })?;
+        if ancestor.number() != plan.ancestor_number
+            || self
+                .chain_store
+                .get_block_hash_by_number(plan.ancestor_number)?
+                != Some(plan.ancestor_hash)
+        {
+            return Err(NodeError::Startup(
+                "preferred-fork ancestor is no longer canonical".into(),
+            ));
+        }
+        let ancestor_state_root = ancestor.header.state_root;
+        for block in &plan.old_chain {
+            self.ensure_state_neutral_fork_block(
+                block,
+                ancestor_state_root,
+                "canonical rollback segment",
+            )?;
+        }
+
+        let mut parent = ancestor;
+        for block in &plan.new_chain {
+            self.verify_import_consensus(block, &parent)?;
+            self.verify_import_economics(block, &parent)?;
+            self.verify_incoming_witness_root(block)?;
+            self.verify_import_sig_aggregate_proof(block)?;
+            self.ensure_state_neutral_fork_block(
+                block,
+                ancestor_state_root,
+                "preferred fork segment",
+            )?;
+            parent = block.clone();
+        }
+        if parent.hash() != plan.preferred_hash || parent.number() != plan.preferred_number {
+            return Err(NodeError::Startup(
+                "preferred-fork plan does not terminate at the selected head".into(),
+            ));
+        }
+
+        let mut state = WorldState::at_root(self.store.clone(), &ancestor_state_root)?;
+        state.validate()?;
+        let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        let overlay_chain_store = ChainStore::new(overlay);
+        let stale_canonical_numbers = if plan.canonical_number > plan.preferred_number {
+            (plan.preferred_number + 1..=plan.canonical_number).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let receipts = vec![Vec::new(); plan.new_chain.len()];
+        overlay_chain_store.commit_reorg_overlay(
+            &plan.old_chain,
+            &plan.new_chain,
+            &stale_canonical_numbers,
+            &receipts,
+            &plan.preferred_hash,
+        )?;
+
+        self.block_store().replace_world_state(state);
+        match self.chain_store.get_chain_totals_head() {
+            Ok(Some(_)) => {
+                if let Err(error) = self.chain_store.rebuild_chain_totals(plan.preferred_number) {
+                    warn!(
+                        preferred_number = plan.preferred_number,
+                        %error,
+                        "failed to rebuild canonical totals after state-neutral fork adoption"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    preferred_number = plan.preferred_number,
+                    %error,
+                    "failed to inspect canonical totals after state-neutral fork adoption"
+                );
+            }
+        }
+        for block in &plan.new_chain {
+            self.record_canonical_state_root(block.number(), block.header.state_root);
+            self.last_proposed_by
+                .lock()
+                .insert(block.header.proposer, block.number());
+        }
+
+        info!(
+            preferred_hash = %plan.preferred_hash,
+            preferred_number = plan.preferred_number,
+            ancestor_hash = %plan.ancestor_hash,
+            ancestor_number = plan.ancestor_number,
+            rollback = plan.old_chain.len(),
+            apply = plan.new_chain.len(),
+            "adopted quorum-preferred state-neutral fork"
+        );
+        Ok(())
+    }
+
     /// Import and validate a block received from the network.
     ///
     /// Re-executes all transactions through the EVM on an isolated state
