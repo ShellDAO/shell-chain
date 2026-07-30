@@ -2591,8 +2591,9 @@ mod tests {
         fund_account(&node, &sender, U256::from(1_000_000_000_000_000u64));
         store_consistent_genesis(&node);
 
-        let tx0 = make_embedded_tx(&signer, sender, pubkey.clone(), 0, 1);
-        let tx1 = make_embedded_tx(&signer, sender, pubkey, 1, 2);
+        let mut nonces = node.world_state.read().get_nonce(&sender).unwrap()..;
+        let tx0 = make_embedded_tx(&signer, sender, pubkey.clone(), nonces.next().unwrap(), 1);
+        let tx1 = make_embedded_tx(&signer, sender, pubkey, nonces.next().unwrap(), 2);
         let hash0 = tx0.hash();
         let hash1 = tx1.hash();
 
