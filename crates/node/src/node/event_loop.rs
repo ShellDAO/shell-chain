@@ -1,6 +1,50 @@
 use super::*;
 
 const MAX_BLOCK_SYNC_RESPONSE_BLOCKS: usize = 128;
+const FORK_ADOPTION_RETRY_BASE_SECS: u64 = 5;
+const FORK_ADOPTION_RETRY_MAX_SECS: u64 = 30;
+
+#[derive(Debug, Default)]
+struct ForkAdoptionRetry {
+    preferred_head: Option<ShellHash>,
+    attempts: u32,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl ForkAdoptionRetry {
+    fn permits(&mut self, preferred_head: ShellHash, now: std::time::Instant) -> bool {
+        if self.preferred_head != Some(preferred_head) {
+            self.preferred_head = Some(preferred_head);
+            self.attempts = 0;
+            self.retry_at = None;
+            return true;
+        }
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn record_failure(
+        &mut self,
+        preferred_head: ShellHash,
+        now: std::time::Instant,
+    ) -> std::time::Duration {
+        if self.preferred_head != Some(preferred_head) {
+            self.preferred_head = Some(preferred_head);
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        let exponent = self.attempts.saturating_sub(1).min(3);
+        let seconds = FORK_ADOPTION_RETRY_BASE_SECS
+            .saturating_mul(1u64 << exponent)
+            .min(FORK_ADOPTION_RETRY_MAX_SECS);
+        let delay = std::time::Duration::from_secs(seconds);
+        self.retry_at = Some(now + delay);
+        delay
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
 
 fn block_response_import_allowed(block_count: usize, commit_certificate_count: usize) -> bool {
     block_count <= MAX_BLOCK_SYNC_RESPONSE_BLOCKS && commit_certificate_count <= block_count
@@ -354,6 +398,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut tx_rebroadcast_timer = interval(Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut sync_retry_attempts_without_progress = 0u32;
+        let mut fork_adoption_retry = ForkAdoptionRetry::default();
         let startup_sync_grace = Self::startup_sync_grace(self.config.block_time_ms);
         let catch_up_timeout = Self::catch_up_timeout(self.config.block_time_ms);
 
@@ -613,20 +658,45 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                         match self.preferred_fork_plan() {
                             Ok(Some(plan)) => {
-                                if let Err(error) =
-                                    self.adopt_state_neutral_preferred_fork(plan)
+                                let preferred_head = plan.preferred_hash;
+                                let adoption_attempted_at = std::time::Instant::now();
+                                if !fork_adoption_retry
+                                    .permits(preferred_head, adoption_attempted_at)
                                 {
-                                    tracing::error!(
-                                        %error,
-                                        "block production paused because preferred-fork adoption failed"
-                                    );
+                                    continue;
+                                }
+                                match self.adopt_state_neutral_preferred_fork(plan) {
+                                    Ok(()) => fork_adoption_retry.reset(),
+                                    Err(error) => {
+                                        let retry_delay = fork_adoption_retry.record_failure(
+                                            preferred_head,
+                                            adoption_attempted_at,
+                                        );
+                                        tracing::error!(
+                                            %error,
+                                            retry_after_secs = retry_delay.as_secs(),
+                                            "block production paused because preferred-fork adoption failed"
+                                        );
+                                    }
                                 }
                                 continue;
                             }
-                            Ok(None) => {}
+                            Ok(None) => fork_adoption_retry.reset(),
                             Err(error) => {
+                                let preferred_head = *self.fork_choice.read().head();
+                                let adoption_attempted_at = std::time::Instant::now();
+                                if !fork_adoption_retry
+                                    .permits(preferred_head, adoption_attempted_at)
+                                {
+                                    continue;
+                                }
+                                let retry_delay = fork_adoption_retry.record_failure(
+                                    preferred_head,
+                                    adoption_attempted_at,
+                                );
                                 tracing::error!(
                                     %error,
+                                    retry_after_secs = retry_delay.as_secs(),
                                     "block production paused because preferred-fork planning failed"
                                 );
                                 continue;
@@ -2666,6 +2736,53 @@ mod cadence_tests {
     fn bounded_request_numbers_stops_at_height_overflow() {
         let numbers: Vec<_> = bounded_request_numbers(u64::MAX - 1, 4, 128).collect();
         assert_eq!(numbers, vec![u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
+    fn fork_adoption_retry_backs_off_and_caps_delay() {
+        let head = ShellHash::from([0x11; 32]);
+        let start = std::time::Instant::now();
+        let mut retry = ForkAdoptionRetry::default();
+
+        assert!(retry.permits(head, start));
+        assert_eq!(
+            retry.record_failure(head, start),
+            std::time::Duration::from_secs(5)
+        );
+        assert!(!retry.permits(head, start + std::time::Duration::from_secs(4)));
+        assert!(retry.permits(head, start + std::time::Duration::from_secs(5)));
+
+        assert_eq!(
+            retry.record_failure(head, start),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            retry.record_failure(head, start),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            retry.record_failure(head, start),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            retry.record_failure(head, start),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn fork_adoption_retry_allows_changed_head_immediately() {
+        let first_head = ShellHash::from([0x11; 32]);
+        let next_head = ShellHash::from([0x22; 32]);
+        let start = std::time::Instant::now();
+        let mut retry = ForkAdoptionRetry::default();
+
+        retry.record_failure(first_head, start);
+
+        assert!(retry.permits(next_head, start));
+        assert_eq!(retry.preferred_head, Some(next_head));
+        assert_eq!(retry.attempts, 0);
+        assert_eq!(retry.retry_at, None);
     }
 
     #[test]

@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
   in one atomic storage transition during branch adoption.
 - Adopt quorum-preferred forks atomically when both branches are state-neutral,
   while keeping production paused for branches that still require replay.
+- Back off repeated preferred-fork adoption attempts up to 30 seconds, while
+  retrying immediately when fork choice selects a different head.
 
 ### Fixed
 
