@@ -406,6 +406,36 @@ impl<S: KvStore + 'static> Node<S> {
         self.verify_import_logs_bloom(block, &[])
     }
 
+    pub(super) fn reinsert_reverted_transactions(
+        &self,
+        reverted_txs: &[SignedTransaction],
+    ) -> (usize, usize) {
+        let mut inserted = 0usize;
+        let mut rejected = 0usize;
+        let mut world_state = self.world_state.write();
+
+        for tx in reverted_txs {
+            match self.tx_pool.insert(
+                tx.clone(),
+                &mut world_state,
+                self.chain_store.as_ref(),
+                &MultiVerifier,
+            ) {
+                Ok(_) => inserted = inserted.saturating_add(1),
+                Err(error) => {
+                    rejected = rejected.saturating_add(1);
+                    warn!(
+                        tx_hash = %tx.hash(),
+                        error_kind = error.kind_str(),
+                        "rejected reverted transaction during fork adoption"
+                    );
+                }
+            }
+        }
+
+        (inserted, rejected)
+    }
+
     pub(super) fn adopt_state_neutral_preferred_fork(
         &self,
         plan: ForkAdoptionPlan,
@@ -516,6 +546,13 @@ impl<S: KvStore + 'static> Node<S> {
         )?;
 
         self.block_store().replace_world_state(state);
+        let adopted_tx_hashes = plan
+            .new_chain
+            .iter()
+            .flat_map(|block| block.transactions.iter().map(SignedTransaction::hash))
+            .collect::<Vec<_>>();
+        let pruned = self.mem_pool().remove_committed_hashes(&adopted_tx_hashes);
+        let (reinserted, rejected) = self.reinsert_reverted_transactions(&plan.reverted_txs);
         match self.chain_store.get_chain_totals_head() {
             Ok(Some(_)) => {
                 if let Err(error) = self.chain_store.rebuild_chain_totals(plan.preferred_number) {
@@ -549,6 +586,9 @@ impl<S: KvStore + 'static> Node<S> {
             ancestor_number = plan.ancestor_number,
             rollback = plan.old_chain.len(),
             apply = plan.new_chain.len(),
+            mempool_pruned = pruned,
+            mempool_reinserted = reinserted,
+            mempool_rejected = rejected,
             "adopted quorum-preferred state-neutral fork"
         );
         Ok(())

@@ -2583,6 +2583,33 @@ mod tests {
     }
 
     #[test]
+    fn reverted_transactions_are_reinserted_in_nonce_order() {
+        let (node, _) = setup_node();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let sender = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(1_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+
+        let tx0 = make_embedded_tx(&signer, sender, pubkey.clone(), 0, 1);
+        let tx1 = make_embedded_tx(&signer, sender, pubkey, 1, 2);
+        let hash0 = tx0.hash();
+        let hash1 = tx1.hash();
+
+        let (inserted, rejected) = node.reinsert_reverted_transactions(&[tx0.clone(), tx0, tx1]);
+
+        assert_eq!((inserted, rejected), (2, 1));
+        assert_eq!(
+            node.tx_pool
+                .pending_for_block(2)
+                .iter()
+                .map(SignedTransaction::hash)
+                .collect::<Vec<_>>(),
+            vec![hash0, hash1]
+        );
+    }
+
+    #[test]
     fn stateful_preferred_fork_is_rejected_before_canonical_mutation() {
         let (node, signer) = setup_node();
         store_consistent_genesis(&node);

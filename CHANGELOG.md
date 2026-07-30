@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
   while keeping production paused for branches that still require replay.
 - Back off repeated preferred-fork adoption attempts up to 30 seconds, while
   retrying immediately when fork choice selects a different head.
+- Reconcile the mempool after fork adoption by removing newly canonical
+  transactions and reinserting valid reverted transactions in nonce order.
 
 ### Fixed
 
