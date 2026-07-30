@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file.
   transactions and reinserting valid reverted transactions in nonce order.
 - Remove terminally invalid preferred-fork subtrees from fork choice so
   production can resume, while retaining backoff for transient failures.
+- Reconstruct signature-algorithm policy from the common ancestor state before
+  validating a preferred branch, with rollback when adoption fails.
 
 ### Fixed
 

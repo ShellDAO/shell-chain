@@ -29,7 +29,7 @@
 //! | AccountManager | `cancelRecovery(address)` | account owner |
 
 use shell_core::Account;
-use shell_crypto::{AlgorithmRegistry, AlgorithmStatus, SignatureType};
+use shell_crypto::{AlgorithmRegistry, AlgorithmStatus, SignatureType, ALLOWED_ALGORITHMS};
 use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
 use shell_storage::{
     ChainStore, GuardianConfig, KvStore, RecoveryProposal, WorldState, MAX_GUARDIANS,
@@ -1195,6 +1195,63 @@ fn encode_u64_as_hash(value: u64) -> ShellHash {
 
 fn decode_u64_from_hash(hash: &ShellHash) -> u64 {
     u64::from_be_bytes(hash.as_bytes()[24..32].try_into().unwrap_or([0u8; 8]))
+}
+
+/// Reconstruct the signature-algorithm registry represented by a world-state root.
+pub fn load_algorithm_registry<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+) -> Result<AlgorithmRegistry, SystemContractError> {
+    let mut registry = AlgorithmRegistry::default();
+    for algo in ALLOWED_ALGORITHMS.iter().copied() {
+        let status_hash = world_state
+            .get_storage(&registry_address(), &algorithm_status_key(algo))
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+        if status_hash == ShellHash::ZERO {
+            continue;
+        }
+        let status = match status_hash.as_bytes() {
+            bytes if bytes[..31].iter().any(|byte| *byte != 0) => {
+                return Err(SystemContractError::AbiDecode(format!(
+                    "invalid persisted status for signature algorithm {}",
+                    algo.as_u8()
+                )));
+            }
+            bytes => match bytes[31] {
+                1 => AlgorithmStatus::Active,
+                2 => AlgorithmStatus::Deprecated,
+                3 => AlgorithmStatus::PendingActivation,
+                _ => {
+                    return Err(SystemContractError::AbiDecode(format!(
+                        "invalid persisted status for signature algorithm {}",
+                        algo.as_u8()
+                    )));
+                }
+            },
+        };
+        let activation_height = decode_u64_from_hash(
+            &world_state
+                .get_storage(&registry_address(), &algorithm_activation_height_key(algo))
+                .map_err(|error| SystemContractError::Storage(error.to_string()))?,
+        );
+        let verifier_hash = world_state
+            .get_storage(&registry_address(), &algorithm_verifier_hash_key(algo))
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?
+            .as_bytes()
+            .to_owned();
+        let has_spec = activation_height > 0 || verifier_hash != [0u8; 32];
+        if has_spec {
+            registry.propose_activation_with_spec(algo, activation_height, verifier_hash);
+        }
+        match status {
+            AlgorithmStatus::Active => registry.activate(algo),
+            AlgorithmStatus::Deprecated => registry.deprecate(algo),
+            AlgorithmStatus::PendingActivation if !has_spec => {
+                registry.propose_activation(algo);
+            }
+            AlgorithmStatus::PendingActivation => {}
+        }
+    }
+    Ok(registry)
 }
 
 /// Process algorithm activations whose timelock has elapsed.
@@ -2903,6 +2960,73 @@ mod tests {
             .unwrap(),
             encode_algorithm_status(AlgorithmStatus::PendingActivation)
         );
+    }
+
+    #[test]
+    fn load_algorithm_registry_restores_world_state_policy() {
+        let mut ws = setup_with_validators(&[Address::from([0x01; 20])]);
+        let activation_height = ALGO_GOVERNANCE_DELTA_MIN + 1;
+        let verifier_hash = ShellHash::from([0xAB; 32]);
+        store_algorithm_status(
+            &mut ws,
+            SignatureType::MlDsa65,
+            AlgorithmStatus::PendingActivation,
+        )
+        .unwrap();
+        ws.set_storage(
+            &registry_address(),
+            &algorithm_activation_height_key(SignatureType::MlDsa65),
+            &encode_u64_as_hash(activation_height),
+        )
+        .unwrap();
+        ws.set_storage(
+            &registry_address(),
+            &algorithm_verifier_hash_key(SignatureType::MlDsa65),
+            &verifier_hash,
+        )
+        .unwrap();
+        store_algorithm_status(
+            &mut ws,
+            SignatureType::SphincsSha2256f,
+            AlgorithmStatus::Deprecated,
+        )
+        .unwrap();
+
+        let registry = load_algorithm_registry(&ws).unwrap();
+        let mldsa = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.algo == SignatureType::MlDsa65)
+            .unwrap();
+        let sphincs = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.algo == SignatureType::SphincsSha2256f)
+            .unwrap();
+        let mldsa_spec = mldsa.spec.as_ref().unwrap();
+
+        assert_eq!(mldsa.status, AlgorithmStatus::PendingActivation);
+        assert_eq!(
+            mldsa_spec.verifier_hash,
+            verifier_hash.as_bytes().to_owned()
+        );
+        assert_eq!(mldsa_spec.activation_height, activation_height);
+        assert_eq!(sphincs.status, AlgorithmStatus::Deprecated);
+    }
+
+    #[test]
+    fn load_algorithm_registry_rejects_noncanonical_status() {
+        let mut ws = setup_with_validators(&[Address::from([0x01; 20])]);
+        ws.set_storage(
+            &registry_address(),
+            &algorithm_status_key(SignatureType::MlDsa65),
+            &ShellHash::from([0xFF; 32]),
+        )
+        .unwrap();
+
+        let error = load_algorithm_registry(&ws).unwrap_err();
+
+        assert!(matches!(error, SystemContractError::AbiDecode(_)));
     }
 
     #[test]

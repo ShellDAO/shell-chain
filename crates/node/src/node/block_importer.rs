@@ -518,6 +518,16 @@ impl<S: KvStore + 'static> Node<S> {
             )?;
         }
 
+        let mut state = WorldState::at_root(self.store.clone(), &ancestor_state_root)?;
+        state.validate()?;
+        let ancestor_registry = load_algorithm_registry(&state).map_err(|error| {
+            NodeError::Startup(format!(
+                "failed to load algorithm registry at preferred-fork ancestor: {error}"
+            ))
+        })?;
+        let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
+        *AlgorithmRegistry::global_mut() = ancestor_registry;
+
         let mut parent = ancestor;
         for block in &plan.new_chain {
             let block_hash = block.hash();
@@ -543,8 +553,6 @@ impl<S: KvStore + 'static> Node<S> {
             });
         }
 
-        let mut state = WorldState::at_root(self.store.clone(), &ancestor_state_root)?;
-        state.validate()?;
         let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
         let overlay_chain_store = ChainStore::new(overlay);
         let stale_canonical_numbers = if plan.canonical_number > plan.preferred_number {
@@ -560,6 +568,7 @@ impl<S: KvStore + 'static> Node<S> {
             &receipts,
             &plan.preferred_hash,
         )?;
+        algorithm_registry_rollback.commit();
 
         self.block_store().replace_world_state(state);
         let adopted_tx_hashes = plan

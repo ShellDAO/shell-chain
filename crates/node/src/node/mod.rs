@@ -37,8 +37,8 @@ pub(crate) use shell_crypto::{
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};
 pub(crate) use shell_pqvm::{
-    commit_pqvm_state, process_pending_activations, validate_tx_for_import,
-    validate_tx_for_import_with_expected_nonce, ShellPqvm, ShellStateDb,
+    commit_pqvm_state, load_algorithm_registry, process_pending_activations,
+    validate_tx_for_import, validate_tx_for_import_with_expected_nonce, ShellPqvm, ShellStateDb,
 };
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
