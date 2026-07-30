@@ -611,18 +611,28 @@ impl<S: KvStore + 'static> Node<S> {
                             );
                             continue;
                         }
-                        if let Some(plan) = self.preferred_fork_plan() {
-                            debug!(
-                                preferred_hash = %plan.preferred_hash,
-                                preferred_number = plan.preferred_number,
-                                canonical_number = plan.canonical_number,
-                                ancestor_hash = %plan.ancestor_hash,
-                                ancestor_number = plan.ancestor_number,
-                                rollback = plan.old_chain.len(),
-                                apply = plan.new_chain.len(),
-                                "block production paused because fork-choice prefers an ahead non-canonical branch"
-                            );
-                            continue;
+                        match self.preferred_fork_plan() {
+                            Ok(Some(plan)) => {
+                                debug!(
+                                    preferred_hash = %plan.preferred_hash,
+                                    preferred_number = plan.preferred_number,
+                                    canonical_number = plan.canonical_number,
+                                    ancestor_hash = %plan.ancestor_hash,
+                                    ancestor_number = plan.ancestor_number,
+                                    rollback = plan.old_chain.len(),
+                                    apply = plan.new_chain.len(),
+                                    "block production paused because fork-choice prefers an ahead non-canonical branch"
+                                );
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "block production paused because preferred-fork planning failed"
+                                );
+                                continue;
+                            }
                         }
 
                         let head = match self.chain_store.get_head_block() {

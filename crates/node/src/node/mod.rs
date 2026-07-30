@@ -1080,8 +1080,53 @@ impl<S: KvStore + 'static> Node<S> {
             .filter(|weight| *weight > 0)
     }
 
-    fn preferred_fork_plan(&self) -> Option<ForkAdoptionPlan> {
-        let canonical_head = self.chain_store.get_head_block().ok().flatten()?;
+    fn validate_fork_segment(
+        &self,
+        label: &str,
+        ancestor_hash: ShellHash,
+        ancestor_number: u64,
+        hashes: &[ShellHash],
+        require_canonical: bool,
+    ) -> Result<(), NodeError> {
+        let mut expected_parent = ancestor_hash;
+        for (index, hash) in hashes.iter().enumerate() {
+            let offset = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    NodeError::Startup(format!("{label} length overflows block height"))
+                })?;
+            let expected_number = ancestor_number.checked_add(offset).ok_or_else(|| {
+                NodeError::Startup(format!("{label} height overflows block number space"))
+            })?;
+            let block = self
+                .chain_store
+                .get_block_by_hash(hash)?
+                .ok_or_else(|| NodeError::Startup(format!("{label} block not found: {hash}")))?;
+            if block.number() != expected_number || block.header.parent_hash != expected_parent {
+                return Err(NodeError::Startup(format!(
+                    "{label} continuity broken at {hash}: expected #{expected_number} with parent {expected_parent}, got #{} with parent {}",
+                    block.number(),
+                    block.header.parent_hash,
+                )));
+            }
+            if require_canonical
+                && self.chain_store.get_block_hash_by_number(expected_number)? != Some(*hash)
+            {
+                return Err(NodeError::Startup(format!(
+                    "{label} block {hash} is not canonical at #{expected_number}"
+                )));
+            }
+            expected_parent = *hash;
+        }
+        Ok(())
+    }
+
+    fn preferred_fork_plan(&self) -> Result<Option<ForkAdoptionPlan>, NodeError> {
+        let canonical_head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
         let canonical_number = canonical_head.number();
         let canonical_hash = canonical_head.hash();
         let (
@@ -1094,12 +1139,21 @@ impl<S: KvStore + 'static> Node<S> {
         ) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
-            let score = fork_choice.score(&preferred_hash)?;
+            let score = fork_choice.score(&preferred_hash).ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "fork-choice preferred block {preferred_hash} has no score"
+                ))
+            })?;
             if preferred_hash == canonical_hash || score.block_number <= canonical_number {
-                return None;
+                return Ok(None);
             }
-            let ancestor_hash =
-                fork_choice.find_common_ancestor(&canonical_hash, &preferred_hash)?;
+            let ancestor_hash = fork_choice
+                .find_common_ancestor(&canonical_hash, &preferred_hash)
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "fork-choice preferred block {preferred_hash} has no common ancestor with canonical head {canonical_hash}"
+                    ))
+                })?;
             (
                 preferred_hash,
                 score.block_number,
@@ -1110,11 +1164,23 @@ impl<S: KvStore + 'static> Node<S> {
             )
         };
         if new_chain.is_empty() {
-            return None;
+            return Err(NodeError::Startup(format!(
+                "fork-choice path from ancestor {ancestor_hash} to preferred block {preferred_hash} is empty"
+            )));
         }
-        let ancestor_number = preferred_number.checked_sub(u64::try_from(new_chain.len()).ok()?)?;
-        if canonical_number.checked_sub(ancestor_number)? != u64::try_from(old_chain.len()).ok()? {
-            return None;
+        let new_chain_len = u64::try_from(new_chain.len()).map_err(|_| {
+            NodeError::Startup("preferred fork length overflows block number space".into())
+        })?;
+        let old_chain_len = u64::try_from(old_chain.len()).map_err(|_| {
+            NodeError::Startup("canonical rollback length overflows block number space".into())
+        })?;
+        let ancestor_number = preferred_number.checked_sub(new_chain_len).ok_or_else(|| {
+            NodeError::Startup("preferred fork length exceeds preferred block number".into())
+        })?;
+        if canonical_number.checked_sub(ancestor_number) != Some(old_chain_len) {
+            return Err(NodeError::Startup(format!(
+                "fork-choice paths disagree on common ancestor {ancestor_hash} at #{ancestor_number}"
+            )));
         }
         let total_weight = self
             .consensus
@@ -1124,7 +1190,7 @@ impl<S: KvStore + 'static> Node<S> {
             .copied()
             .fold(0u64, u64::saturating_add);
         if !FinalityState::has_weighted_quorum(attested_weight, total_weight) {
-            return None;
+            return Ok(None);
         }
         let (finalized_number, finalized_hash) = {
             let finality = self.finality.read();
@@ -1138,10 +1204,32 @@ impl<S: KvStore + 'static> Node<S> {
                 && ancestor_number == finalized_number
                 && ancestor_hash != finalized_hash)
         {
-            return None;
+            return Err(NodeError::Startup(format!(
+                "preferred fork {preferred_hash} crosses finalized block #{finalized_number} ({finalized_hash})"
+            )));
         }
 
-        Some(ForkAdoptionPlan {
+        if self.chain_store.get_block_hash_by_number(ancestor_number)? != Some(ancestor_hash) {
+            return Err(NodeError::Startup(format!(
+                "fork ancestor {ancestor_hash} is not canonical at #{ancestor_number}"
+            )));
+        }
+        self.validate_fork_segment(
+            "canonical rollback segment",
+            ancestor_hash,
+            ancestor_number,
+            &old_chain,
+            true,
+        )?;
+        self.validate_fork_segment(
+            "preferred fork segment",
+            ancestor_hash,
+            ancestor_number,
+            &new_chain,
+            false,
+        )?;
+
+        Ok(Some(ForkAdoptionPlan {
             preferred_hash,
             preferred_number,
             canonical_number,
@@ -1149,7 +1237,7 @@ impl<S: KvStore + 'static> Node<S> {
             ancestor_number,
             old_chain,
             new_chain,
-        })
+        }))
     }
 
     fn sync_retry_delay_secs(attempts_without_progress: u32) -> u64 {
@@ -2327,21 +2415,22 @@ mod tests {
 
     #[test]
     fn preferred_fork_plan_requires_quorum_for_noncanonical_branch() {
-        let (node, _signer) = setup_node();
+        let (node, signer) = setup_node();
         store_genesis(&node);
         let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
         let same_height_fork = ShellHash::from_slice(&[0x21; 32]);
-        let ahead_fork = ShellHash::from_slice(&[0x22; 32]);
+        let ahead_block = make_block_at_1(&node, &signer, None);
+        let ahead_fork = ahead_block.hash();
 
         node.fork_choice
             .write()
             .add_block(same_height_fork, ShellHash::ZERO, 0, 0, false);
-        assert!(node.preferred_fork_plan().is_none());
+        assert!(node.preferred_fork_plan().unwrap().is_none());
 
         node.fork_choice
             .write()
             .add_block(ahead_fork, genesis_hash, 1, 0, false);
-        assert!(node.preferred_fork_plan().is_none());
+        assert!(node.preferred_fork_plan().unwrap().is_none());
 
         let total_weight = node
             .consensus
@@ -2356,8 +2445,12 @@ mod tests {
         node.fork_choice
             .write()
             .update_attested_weight(&ahead_fork, quorum_weight);
+        let missing_block = node.preferred_fork_plan().unwrap_err();
+        assert!(missing_block.to_string().contains("block not found"));
+
+        node.chain_store.put_side_fork_block(&ahead_block).unwrap();
         assert_eq!(
-            node.preferred_fork_plan(),
+            node.preferred_fork_plan().unwrap(),
             Some(ForkAdoptionPlan {
                 preferred_hash: ahead_fork,
                 preferred_number: 1,
@@ -2370,7 +2463,10 @@ mod tests {
         );
 
         node.finality.write().set_finalized_direct(1, ahead_fork);
-        assert!(node.preferred_fork_plan().is_none());
+        let finalized_error = node.preferred_fork_plan().unwrap_err();
+        assert!(finalized_error
+            .to_string()
+            .contains("crosses finalized block"));
     }
 
     fn dummy_proof_amendment(
