@@ -176,8 +176,8 @@ struct ForkAdoptionPlan {
     canonical_number: u64,
     ancestor_hash: ShellHash,
     ancestor_number: u64,
-    old_chain: Vec<ShellHash>,
-    new_chain: Vec<ShellHash>,
+    old_chain: Vec<Block>,
+    new_chain: Vec<Block>,
 }
 
 /// A running shell-chain node.
@@ -1080,14 +1080,15 @@ impl<S: KvStore + 'static> Node<S> {
             .filter(|weight| *weight > 0)
     }
 
-    fn validate_fork_segment(
+    fn load_fork_segment(
         &self,
         label: &str,
         ancestor_hash: ShellHash,
         ancestor_number: u64,
         hashes: &[ShellHash],
         require_canonical: bool,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Vec<Block>, NodeError> {
+        let mut blocks = Vec::with_capacity(hashes.len());
         let mut expected_parent = ancestor_hash;
         for (index, hash) in hashes.iter().enumerate() {
             let offset = u64::try_from(index)
@@ -1103,9 +1104,13 @@ impl<S: KvStore + 'static> Node<S> {
                 .chain_store
                 .get_block_by_hash(hash)?
                 .ok_or_else(|| NodeError::Startup(format!("{label} block not found: {hash}")))?;
-            if block.number() != expected_number || block.header.parent_hash != expected_parent {
+            if block.hash() != *hash
+                || block.number() != expected_number
+                || block.header.parent_hash != expected_parent
+            {
                 return Err(NodeError::Startup(format!(
-                    "{label} continuity broken at {hash}: expected #{expected_number} with parent {expected_parent}, got #{} with parent {}",
+                    "{label} continuity broken at {hash}: expected hash {hash}, #{expected_number} with parent {expected_parent}, got hash {}, #{} with parent {}",
+                    block.hash(),
                     block.number(),
                     block.header.parent_hash,
                 )));
@@ -1118,8 +1123,9 @@ impl<S: KvStore + 'static> Node<S> {
                 )));
             }
             expected_parent = *hash;
+            blocks.push(block);
         }
-        Ok(())
+        Ok(blocks)
     }
 
     fn preferred_fork_plan(&self) -> Result<Option<ForkAdoptionPlan>, NodeError> {
@@ -1134,8 +1140,8 @@ impl<S: KvStore + 'static> Node<S> {
             preferred_number,
             attested_weight,
             ancestor_hash,
-            old_chain,
-            new_chain,
+            old_hashes,
+            new_hashes,
         ) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
@@ -1163,15 +1169,15 @@ impl<S: KvStore + 'static> Node<S> {
                 fork_choice.chain_between(&preferred_hash, &ancestor_hash),
             )
         };
-        if new_chain.is_empty() {
+        if new_hashes.is_empty() {
             return Err(NodeError::Startup(format!(
                 "fork-choice path from ancestor {ancestor_hash} to preferred block {preferred_hash} is empty"
             )));
         }
-        let new_chain_len = u64::try_from(new_chain.len()).map_err(|_| {
+        let new_chain_len = u64::try_from(new_hashes.len()).map_err(|_| {
             NodeError::Startup("preferred fork length overflows block number space".into())
         })?;
-        let old_chain_len = u64::try_from(old_chain.len()).map_err(|_| {
+        let old_chain_len = u64::try_from(old_hashes.len()).map_err(|_| {
             NodeError::Startup("canonical rollback length overflows block number space".into())
         })?;
         let ancestor_number = preferred_number.checked_sub(new_chain_len).ok_or_else(|| {
@@ -1214,18 +1220,18 @@ impl<S: KvStore + 'static> Node<S> {
                 "fork ancestor {ancestor_hash} is not canonical at #{ancestor_number}"
             )));
         }
-        self.validate_fork_segment(
+        let old_chain = self.load_fork_segment(
             "canonical rollback segment",
             ancestor_hash,
             ancestor_number,
-            &old_chain,
+            &old_hashes,
             true,
         )?;
-        self.validate_fork_segment(
+        let new_chain = self.load_fork_segment(
             "preferred fork segment",
             ancestor_hash,
             ancestor_number,
-            &new_chain,
+            &new_hashes,
             false,
         )?;
 
@@ -2458,7 +2464,7 @@ mod tests {
                 ancestor_hash: genesis_hash,
                 ancestor_number: 0,
                 old_chain: vec![],
-                new_chain: vec![ahead_fork],
+                new_chain: vec![ahead_block],
             })
         );
 
