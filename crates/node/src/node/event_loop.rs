@@ -547,6 +547,9 @@ impl<S: KvStore + 'static> Node<S> {
                     if production_readiness.can_produce()
                         && self.pending_stark_settlements.lock().len()
                             < MAX_PENDING_STARK_SETTLEMENTS => {
+                    self.proof_backlog
+                        .lock()
+                        .complete_in_flight(amendment.layer, &amendment.covered_hashes());
                     if amendment.layer > 1 {
                         self.metrics.stark_l2_proofs_generated.inc();
                     } else {

@@ -168,6 +168,10 @@ pub struct ProofBacklog {
     pending: VecDeque<ProofTask>,
     /// (layer, source_hash) reference counts — enables O(1) `contains_source`.
     source_index: HashMap<(u32, ShellHash), usize>,
+    /// Sources removed from the queue while the prover is computing or handing
+    /// off their amendment. They remain reserved so frontier seeding cannot
+    /// enqueue the same canonical range concurrently.
+    in_flight_sources: HashMap<(u32, ShellHash), usize>,
     /// Per-layer sorted block-number counts — enables O(log n) frontier lookups.
     layer_blocks: BTreeMap<u32, BTreeMap<u64, usize>>,
     /// Depth at which [`is_above_threshold`] returns `true`.
@@ -193,6 +197,7 @@ impl ProofBacklog {
         Self {
             pending: VecDeque::new(),
             source_index: HashMap::new(),
+            in_flight_sources: HashMap::new(),
             layer_blocks: BTreeMap::new(),
             watermark_threshold,
             total_enqueued: 0,
@@ -289,7 +294,26 @@ impl ProofBacklog {
     ///
     /// O(1) — backed by an internal reference-counted hash index.
     pub fn contains_source(&self, layer: u32, source_hash: &ShellHash) -> bool {
-        self.source_index.contains_key(&(layer, *source_hash))
+        let key = (layer, *source_hash);
+        self.source_index.contains_key(&key) || self.in_flight_sources.contains_key(&key)
+    }
+
+    /// Pop a proof range and reserve all of its sources until handoff finishes.
+    pub fn pop_contiguous_for_proving(
+        &mut self,
+        max_sources: usize,
+        min_l1_entries: usize,
+    ) -> Option<ProofTask> {
+        let task = self.pop_contiguous_with_min_entries(max_sources, min_l1_entries)?;
+        self.reserve_in_flight(&task);
+        Some(task)
+    }
+
+    /// Release source reservations after proof failure or event-loop handoff.
+    pub fn complete_in_flight(&mut self, layer: u32, source_hashes: &[ShellHash]) {
+        for source_hash in source_hashes {
+            Self::decrement_hash_count(&mut self.in_flight_sources, &(layer, *source_hash));
+        }
     }
 
     /// Pop the next task from the front of the queue (FIFO).
@@ -622,6 +646,22 @@ impl ProofBacklog {
         }
     }
 
+    fn reserve_in_flight(&mut self, task: &ProofTask) {
+        if task.source_hashes.is_empty() {
+            *self
+                .in_flight_sources
+                .entry((task.layer, ShellHash::from(task.block_hash)))
+                .or_default() += 1;
+        } else {
+            for source_hash in &task.source_hashes {
+                *self
+                    .in_flight_sources
+                    .entry((task.layer, *source_hash))
+                    .or_default() += 1;
+            }
+        }
+    }
+
     fn decrement_hash_count<K: Eq + std::hash::Hash>(counts: &mut HashMap<K, usize>, key: &K) {
         let should_remove = counts.get_mut(key).is_some_and(|count| {
             debug_assert!(*count > 0);
@@ -768,6 +808,26 @@ mod tests {
         assert_eq!(replacement.block_number, 10);
         assert_eq!(replacement.block_hash, [2u8; 32]);
         assert_eq!(b.pop().expect("tip task").block_number, 100);
+        assert_index_consistency(&b);
+    }
+
+    #[test]
+    fn proving_pop_reserves_sources_until_handoff_completes() {
+        let mut b = ProofBacklog::new();
+        let source = ShellHash::from([10u8; 32]);
+        b.push(make_task(10));
+
+        let task = b.pop_contiguous_for_proving(1, 0).expect("proof task");
+        assert!(b.is_empty());
+        assert!(b.contains_source(1, &source));
+
+        b.insert_ordered_batch(vec![make_task(10)]);
+        assert!(b.is_empty(), "reserved source must not be re-enqueued");
+
+        b.complete_in_flight(task.layer, &task.source_hashes);
+        assert!(!b.contains_source(1, &source));
+        b.insert_ordered_batch(vec![make_task(10)]);
+        assert_eq!(b.len(), 1);
         assert_index_consistency(&b);
     }
 

@@ -239,15 +239,11 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     // For now, pop from front (sequential) — LatestFirst
                     // reordering requires a more complex priority queue and is
                     // deferred to a future optimization pass.
-                    backlog.pop_contiguous_with_min_entries(
-                        DEFAULT_MAX_L1_RANGE_SOURCES,
-                        MIN_L1_STARK_TXS,
-                    )
+                    backlog
+                        .pop_contiguous_for_proving(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
                 } else {
-                    backlog.pop_contiguous_with_min_entries(
-                        DEFAULT_MAX_L1_RANGE_SOURCES,
-                        MIN_L1_STARK_TXS,
-                    )
+                    backlog
+                        .pop_contiguous_for_proving(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
                 }
             };
 
@@ -325,7 +321,18 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     }
                 }
                 Some(task) => {
-                    self.process_task(task, Some(&mut shutdown_rx)).await;
+                    let layer = task.layer;
+                    let source_hashes = if task.source_hashes.is_empty() {
+                        vec![ShellHash::from(task.block_hash)]
+                    } else {
+                        task.source_hashes.clone()
+                    };
+                    let handed_off = self.process_task(task, Some(&mut shutdown_rx)).await;
+                    if !handed_off {
+                        self.backlog
+                            .lock()
+                            .complete_in_flight(layer, &source_hashes);
+                    }
                 }
             }
         }
@@ -337,7 +344,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         &self,
         task: ProofTask,
         mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
-    ) {
+    ) -> bool {
         let block_hash = task.block_hash;
         let block_number = task.block_number;
         debug!(
@@ -367,7 +374,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                  ({} source hashes) — waiting for non-empty successor",
                 source_hashes.len()
             );
-            return;
+            return false;
         }
 
         // Run the CPU-intensive proof generation on a blocking thread so the
@@ -375,6 +382,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         // is not hard-cancelable via JoinHandle::abort.
         let proof_result = tokio::task::spawn_blocking(move || prove_sig_batch(&entries)).await;
 
+        let mut handed_off = false;
         match proof_result {
             Err(join_err) => {
                 error!("ProverService: proof task panicked for block #{block_number}: {join_err}");
@@ -410,13 +418,13 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     error!(
                         "ProverService: refusing to persist unauthenticated amendment for block #{block_number}"
                     );
-                    return;
+                    return false;
                 };
                 if let Err(e) = amendment.sign_prover_authentication(signer) {
                     error!(
                         "ProverService: failed to authenticate amendment for block #{block_number}: {e}"
                     );
-                    return;
+                    return false;
                 }
                 if amendment.prover != self.prover_address {
                     error!(
@@ -424,7 +432,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                         signer = %amendment.prover,
                         "ProverService: configured prover address does not match signer for block #{block_number}"
                     );
-                    return;
+                    return false;
                 }
 
                 // Serialize and persist the amendment artifacts.
@@ -454,6 +462,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                         warn!(
                                             "ProverService: proof amendment channel closed or shutting down for block #{block_number}"
                                         );
+                                    } else {
+                                        handed_off = true;
                                     }
                                 }
                             }
@@ -467,6 +477,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 }
             }
         }
+        handed_off
     }
 
     /// Handle an L2 recursive aggregation task.
