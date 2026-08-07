@@ -3770,7 +3770,8 @@ mod tests {
             data: PBytes::new(),
             gas_limit: 50_000,
         }];
-        let mut signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+        let nonce = get_nonce(&mut evm, &sender);
+        let mut signed = make_aa_signed(sender, nonce, 200_000, 10, inner_calls, None);
         signed.aa_bundle.as_mut().unwrap().session_auth = Some(SessionAuth {
             session_pubkey: PBytes::from(vec![1]),
             session_algo: SignatureType::Dilithium3.as_u8(),

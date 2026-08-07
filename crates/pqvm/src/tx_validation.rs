@@ -1402,13 +1402,14 @@ mod tests {
     #[test]
     fn aa_outer_envelope_does_not_pay_contract_creation_intrinsic_gas() {
         let signer = make_signer();
+        let account_sequence = fixture_account_sequence(&signer_address(&signer));
         let bundle = AaBundle {
             inner_calls: vec![inner(0, 50_000)],
             ..Default::default()
         };
         let signed = sign_aa(
             &signer,
-            aa_outer_tx(test_chain_id(), 0, 71_000, 0),
+            aa_outer_tx(test_chain_id(), account_sequence, 71_000, 0),
             bundle,
             true,
         );
