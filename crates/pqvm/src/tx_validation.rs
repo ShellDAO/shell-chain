@@ -213,7 +213,7 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     ensure_nonce_can_advance(tx.nonce)?;
 
     // 2. Intrinsic gas check
-    let intrinsic = total_intrinsic_gas(tx, aa_extra_gas)?;
+    let intrinsic = total_intrinsic_gas(signed_tx, aa_extra_gas)?;
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -415,7 +415,7 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
     ensure_nonce_can_advance(tx.nonce)?;
 
     // 3. Intrinsic gas
-    let intrinsic = total_intrinsic_gas(tx, aa_extra_gas)?;
+    let intrinsic = total_intrinsic_gas(signed_tx, aa_extra_gas)?;
     if tx.gas_limit < intrinsic {
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
@@ -541,8 +541,16 @@ pub fn validate_aa_bundle_structure(
     Ok(combined as u64)
 }
 
-fn total_intrinsic_gas(tx: &Transaction, aa_extra_gas: u64) -> Result<u64, TxValidationError> {
-    compute_intrinsic_gas(tx.data.as_ref(), tx.is_contract_creation(), &tx.access_list)
+fn total_intrinsic_gas(
+    signed_tx: &SignedTransaction,
+    aa_extra_gas: u64,
+) -> Result<u64, TxValidationError> {
+    let tx = &signed_tx.tx;
+    // An AA envelope does not execute `Transaction::to`; creation is expressed
+    // by an inner call whose `to` is absent. Do not charge the outer envelope a
+    // contract-creation surcharge merely because its unused `to` is absent.
+    let is_create = tx.is_contract_creation() && !signed_tx.is_aa_bundle();
+    compute_intrinsic_gas(tx.data.as_ref(), is_create, &tx.access_list)
         .checked_add(aa_extra_gas)
         .ok_or(TxValidationError::GasTooLow(tx.gas_limit))
 }
@@ -1389,6 +1397,25 @@ mod tests {
         let signer = make_signer();
         let signed = sign_tx(&signer, simple_transfer(test_chain_id(), 0), false);
         assert_eq!(validate_aa_bundle_structure(&signed).unwrap(), 0);
+    }
+
+    #[test]
+    fn aa_outer_envelope_does_not_pay_contract_creation_intrinsic_gas() {
+        let signer = make_signer();
+        let bundle = AaBundle {
+            inner_calls: vec![inner(0, 50_000)],
+            ..Default::default()
+        };
+        let signed = sign_aa(
+            &signer,
+            aa_outer_tx(test_chain_id(), 0, 71_000, 0),
+            bundle,
+            true,
+        );
+        let aa_extra_gas = validate_aa_bundle_structure(&signed).unwrap();
+
+        assert_eq!(aa_extra_gas, 50_000);
+        assert_eq!(total_intrinsic_gas(&signed, aa_extra_gas).unwrap(), 71_000);
     }
 
     #[test]

@@ -450,7 +450,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         };
         block_env.set_blob_excess_gas_and_price(header.excess_blob_gas, 3_338_477);
 
-        let mut total_gas_used: u64 = 0;
+        // Charge the outer AA envelope and policy work in addition to revm's
+        // per-inner execution gas. The validation path reserves this same
+        // intrinsic amount, so actual usage remains within the outer limit.
+        let mut total_gas_used =
+            crate::tx_validation::compute_intrinsic_gas(tx.data.as_ref(), false, &tx.access_list)
+                .checked_add(bundle.intrinsic_gas_surcharge())
+                .ok_or_else(|| ExecutorError::Revm("aa bundle intrinsic gas overflow".into()))?;
         let mut all_logs: Vec<shell_core::Log> = Vec::new();
         let mut atomic_failure = false;
         let mut last_revert_data: Vec<u8> = Vec::new();
@@ -3746,6 +3752,49 @@ mod tests {
         assert_eq!(get_nonce(&mut evm, &sender), 1);
         assert_eq!(res.receipt.status, 1);
         assert!(res.gas_used > 0, "gas_used should be non-zero");
+    }
+
+    #[test]
+    fn execute_aa_bundle_charges_outer_and_session_intrinsic_gas() {
+        use shell_core::{InnerCall, SessionAuth};
+        use shell_primitives::Bytes as PBytes;
+
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 20]);
+        let recipient = ShellAddress::from([0xAA; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+
+        let inner_calls = vec![InnerCall {
+            to: Some(recipient),
+            value: U256::ZERO,
+            data: PBytes::new(),
+            gas_limit: 50_000,
+        }];
+        let mut signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
+        signed.aa_bundle.as_mut().unwrap().session_auth = Some(SessionAuth {
+            session_pubkey: PBytes::from(vec![1]),
+            session_algo: SignatureType::Dilithium3.as_u8(),
+            target: None,
+            value_cap: U256::ZERO,
+            expiry_block: 2,
+            root_signature: PBytes::from(vec![1]),
+            session_signature: PBytes::from(vec![1]),
+        });
+        let session_surcharge = signed.aa_bundle().unwrap().intrinsic_gas_surcharge();
+        let sender_pre = get_balance(&mut evm, &sender);
+
+        let result = evm
+            .execute_aa_bundle(&signed, &sample_header(), 0, 0)
+            .unwrap();
+
+        let expected_gas = 21_000 + 21_000 + session_surcharge;
+        assert_eq!(result.gas_used, expected_gas);
+        assert_eq!(result.receipt.gas_used, expected_gas);
+        assert_eq!(result.receipt.cumulative_gas_used, expected_gas);
+        assert_eq!(
+            sender_pre - get_balance(&mut evm, &sender),
+            U256::from(expected_gas).saturating_mul(U256::from(10u64))
+        );
     }
 
     #[test]
