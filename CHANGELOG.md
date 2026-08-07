@@ -38,6 +38,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Revalidate persisted STARK amendments before startup recovery, discard
+  malformed or unauthenticated artifacts, and regenerate their proof tasks
+  instead of repeatedly blocking the settlement window.
 - Accept a rotated wPoA proposer during historical block sync only with a
   verified commit certificate and after the deterministic view-change timeout,
   so restarted validators can synchronize safely after a valid view change.

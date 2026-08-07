@@ -2430,6 +2430,7 @@ impl<S: KvStore + 'static> Node<S> {
         // `queued` after tasks.retain() removes covered source blocks.
         let mut pending_covered_sum = 0usize;
         let mut tasks = Vec::new();
+        let mut rejected_stored_payloads = std::collections::HashSet::new();
         // Scan past max_blocks until the backlog contains enough source entries
         // to satisfy the L1 minimum (MIN_L1_STARK_TXS). Without this, a chain
         // with a long 0-tx prefix (e.g. pre-tx-worker genesis) would seed only
@@ -2539,45 +2540,98 @@ impl<S: KvStore + 'static> Node<S> {
                 continue;
             }
             if let Some(bytes) = self.amendment_store.get_amendment(&hash)? {
-                if let Ok(amendment) = ProofAmendment::from_json(&bytes) {
-                    if self.validate_stark_amendment_ordering(&amendment).is_ok() {
-                        let covered_hashes = amendment.covered_hashes();
-                        let covered_count = covered_hashes.len().max(1);
-                        let start = amendment.range_start_block().unwrap_or(0);
-                        if self.pending_stark_settlements.lock().len()
-                            >= MAX_PENDING_STARK_SETTLEMENTS
-                        {
-                            debug!(
-                                block = amendment.block_number,
-                                start_block = start,
-                                "STARK seeding paused at settlement admission limit"
-                            );
-                            break;
+                let payload_hash = shell_primitives::blake3_hash(&bytes);
+                if rejected_stored_payloads.contains(&payload_hash) {
+                    self.amendment_store.delete_amendment(&hash)?;
+                } else {
+                    match ProofAmendment::from_json(&bytes) {
+                        Ok(amendment) => {
+                            let covered_hashes = amendment.covered_hashes();
+                            let recovered_is_valid = self
+                                .validate_stark_amendment_authentication(&amendment)
+                                .and_then(|()| self.validate_stark_amendment_ordering(&amendment))
+                                .and_then(|()| {
+                                    let original_size =
+                                        amendment.original_size.ok_or_else(|| {
+                                            NodeError::Startup(
+                                                "stored STARK amendment is missing original_size"
+                                                    .into(),
+                                            )
+                                        })?;
+                                    if amendment.is_compression_valid_for(original_size) {
+                                        Ok(())
+                                    } else {
+                                        Err(NodeError::Startup(
+                                            "stored STARK amendment fails compression policy"
+                                                .into(),
+                                        ))
+                                    }
+                                })
+                                .and_then(|()| {
+                                    self.validate_stark_proof_source_binding(&amendment)
+                                });
+                            if let Err(error) = recovered_is_valid {
+                                self.metrics.stark_settlements_rejected.inc();
+                                warn!(
+                                    block = amendment.block_number,
+                                    layer = amendment.layer,
+                                    %error,
+                                    "discarding invalid stored STARK amendment during recovery"
+                                );
+                                rejected_stored_payloads.insert(payload_hash);
+                                self.amendment_store.delete_amendment(&hash)?;
+                                // Continue with this canonical source so a fresh proof
+                                // task replaces the invalid persisted artifact.
+                            } else {
+                                let covered_count = covered_hashes.len().max(1);
+                                let start = amendment.range_start_block().unwrap_or(0);
+                                if self.pending_stark_settlements.lock().len()
+                                    >= MAX_PENDING_STARK_SETTLEMENTS
+                                {
+                                    debug!(
+                                        block = amendment.block_number,
+                                        start_block = start,
+                                        "STARK seeding paused at settlement admission limit"
+                                    );
+                                    break;
+                                }
+                                info!(
+                                    block = amendment.block_number,
+                                    start_block = start,
+                                    sources = covered_count,
+                                    n_sigs = amendment.proof.n_sigs,
+                                    "STARK seeding: existing amendment passes ordering; skipping covered range"
+                                );
+                                // Remove any source blocks already queued in `tasks` that
+                                // are covered by this amendment. Without this, the source
+                                // blocks inserted before we reach the end block create a
+                                // gap in the contiguous backlog run, causing
+                                // `pop_contiguous_with_min_entries` to return None.
+                                let covered_set: std::collections::HashSet<_> =
+                                    covered_hashes.into_iter().collect();
+                                tasks.retain(|t: &ProofTask| {
+                                    !t.source_hashes.iter().any(|s| covered_set.contains(s))
+                                });
+                                // Recompute seeded_entries from the retained tasks.
+                                seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
+                                // Recompute queued: retained regular tasks + all pending covered blocks.
+                                pending_covered_sum =
+                                    pending_covered_sum.saturating_add(covered_count);
+                                queued = tasks.len().saturating_add(pending_covered_sum);
+                                self.pending_stark_settlements.lock().push(amendment);
+                                continue;
+                            }
                         }
-                        info!(
-                            block = amendment.block_number,
-                            start_block = start,
-                            sources = covered_count,
-                            n_sigs = amendment.proof.n_sigs,
-                            "STARK seeding: existing amendment passes ordering; skipping covered range"
-                        );
-                        // Remove any source blocks already queued in `tasks` that
-                        // are covered by this amendment. Without this, the source
-                        // blocks inserted before we reach the end block create a
-                        // gap in the contiguous backlog run, causing
-                        // `pop_contiguous_with_min_entries` to return None.
-                        let covered_set: std::collections::HashSet<_> =
-                            covered_hashes.into_iter().collect();
-                        tasks.retain(|t: &ProofTask| {
-                            !t.source_hashes.iter().any(|s| covered_set.contains(s))
-                        });
-                        // Recompute seeded_entries from the retained tasks.
-                        seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
-                        // Recompute queued: retained regular tasks + all pending covered blocks.
-                        pending_covered_sum = pending_covered_sum.saturating_add(covered_count);
-                        queued = tasks.len().saturating_add(pending_covered_sum);
-                        self.pending_stark_settlements.lock().push(amendment);
-                        continue;
+                        Err(error) => {
+                            self.metrics.stark_settlements_rejected.inc();
+                            warn!(
+                                %hash,
+                                %error,
+                                "discarding malformed stored STARK amendment during recovery"
+                            );
+                            rejected_stored_payloads.insert(payload_hash);
+                            self.amendment_store.delete_amendment(&hash)?;
+                        }
                     }
                 }
             }

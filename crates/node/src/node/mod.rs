@@ -9212,6 +9212,41 @@ mod tests {
     }
 
     #[test]
+    fn stark_frontier_recovery_discards_unauthenticated_stored_amendment() {
+        let (node, _proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis must be canonical");
+        let mut invalid = dummy_proof_amendment(1, 1_000, 400);
+        invalid.block_hash = genesis_hash;
+        invalid.block_number = 0;
+        invalid.start_block = Some(0);
+        invalid.source_hashes = vec![genesis_hash];
+        let payload = invalid.to_json().unwrap();
+        node.amendment_store
+            .put_amendment(&genesis_hash, &payload)
+            .unwrap();
+
+        assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 1);
+
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        assert!(node
+            .amendment_store
+            .get_amendment(&genesis_hash)
+            .unwrap()
+            .is_none());
+        let backlog = node.proof_backlog.lock();
+        let task = backlog
+            .peek()
+            .expect("invalid stored amendment must be replaced with a proof task");
+        assert_eq!(task.block_number, 0);
+        assert_eq!(task.source_hashes, vec![genesis_hash]);
+    }
+
+    #[test]
     fn stark_source_original_size_uses_fallback_for_pruned_stub_block() {
         let (node, proposer_signer) = setup_stark_node();
         store_genesis(&node);
