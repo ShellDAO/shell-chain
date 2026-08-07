@@ -26,8 +26,8 @@ pub(crate) use shell_consensus::{
     ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig, VIEW_CHANGE_TIMEOUT_MS,
 };
 pub(crate) use shell_core::{
-    calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, Account,
-    Block, BlockHeader, SignedTransaction, SystemTransaction, SystemTxKind, TransactionReceipt,
+    calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, Block,
+    BlockHeader, SignedTransaction, SystemTransaction, SystemTxKind, TransactionReceipt,
     WitnessBundle, MAX_BLOB_GAS_PER_BLOCK,
 };
 pub(crate) use shell_crypto::{
@@ -45,8 +45,8 @@ pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_rpc::DevRpcControl;
 pub(crate) use shell_storage::{
     validator_registry_addr, BodyPruner, ChainStore, KvStore, L2AggregationJob, L2InputIndex,
-    L2JobStatus, L2JobStore, ProofAmendmentStore, SettledSourceIndex, StatePruner, WitnessPruner,
-    WitnessStore, WorldState,
+    L2JobStatus, L2JobStore, OverlayStore, ProofAmendmentStore, SettledSourceIndex, StatePruner,
+    WitnessPruner, WitnessStore, WorldState,
 };
 
 pub(crate) use crate::config::NodeConfig;
@@ -329,10 +329,7 @@ struct DevState {
     snapshots: BTreeMap<u64, DevSnapshot>,
 }
 
-type NodeStateDb<S> = ShellStateDb<S>;
-
 struct BlockStoreBoundary<'a, S: KvStore + 'static> {
-    store: &'a Arc<S>,
     chain_store: &'a Arc<ChainStore<S>>,
     world_state: &'a Arc<RwLock<WorldState<S>>>,
     pending_grace_deletes: &'a parking_lot::Mutex<HashMap<ShellHash, u64>>,
@@ -363,37 +360,9 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
         Ok(ws.state_root()?)
     }
 
-    fn isolated_state_db(&self) -> Result<(NodeStateDb<S>, ShellHash), NodeError> {
-        let current_root = self.current_state_root()?;
-        let ws = WorldState::at_root(self.store.clone(), &current_root)?;
-        let cs = ChainStore::new(self.store.clone());
-        Ok((ShellStateDb::new(ws, cs), current_root))
-    }
-
-    fn rollback_world_state(&self, root: &ShellHash) -> Result<(), NodeError> {
-        let mut ws = self.world_state.write();
-        ws.rollback_to_root(root)?;
-        Ok(())
-    }
-
     fn replace_world_state(&self, committed_world_state: WorldState<S>) {
         let mut live_ws = self.world_state.write();
         *live_ws = committed_world_state;
-    }
-
-    fn add_balance(&self, address: &Address, balance: U256) -> Result<(), NodeError> {
-        let mut ws = self.world_state.write();
-        ws.add_balance(address, balance)?;
-        Ok(())
-    }
-
-    fn commit_canonical_block(
-        &self,
-        block: &Block,
-        receipts: Option<&[TransactionReceipt]>,
-    ) -> Result<(), NodeError> {
-        self.chain_store.commit_canonical_block(block, receipts)?;
-        Ok(())
     }
 
     fn put_side_fork_block(&self, block: &Block) -> Result<(), NodeError> {
@@ -406,11 +375,6 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
             .get_side_fork_hashes(block_number)
             .map(|hashes| hashes.len())
             .unwrap_or(0)
-    }
-
-    fn store_pubkey(&self, address: &Address, pubkey: &[u8]) -> Result<(), NodeError> {
-        self.chain_store.put_pubkey(address, pubkey)?;
-        Ok(())
     }
 
     fn update_chain_totals(
@@ -907,7 +871,6 @@ impl<S: KvStore + 'static> Node<S> {
 
     fn block_store(&self) -> BlockStoreBoundary<'_, S> {
         BlockStoreBoundary {
-            store: &self.store,
             chain_store: &self.chain_store,
             world_state: &self.world_state,
             pending_grace_deletes: &self.pending_grace_deletes,
@@ -1021,54 +984,37 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or(0)
     }
 
-    fn sync_system_contract_state(
-        &self,
-        local_ws: &mut WorldState<S>,
+    fn validate_system_contract_effects<T: KvStore + 'static>(
+        local_ws: &WorldState<T>,
         effects: &shell_pqvm::SystemContractEffects,
     ) -> Result<(), NodeError> {
-        let registry_account = if effects.validator_set_changed {
+        if effects.validator_set_changed {
             let validators = local_ws.get_validators()?;
             if validators.is_empty() {
                 return Err(NodeError::Startup(
                     "system tx produced empty validator set".into(),
                 ));
             }
-            if validators.len() > WorldState::<S>::MAX_VALIDATORS {
+            if validators.len() > WorldState::<T>::MAX_VALIDATORS {
                 return Err(NodeError::Startup(format!(
                     "system tx produced validator set of size {} exceeding max {}",
                     validators.len(),
-                    WorldState::<S>::MAX_VALIDATORS,
+                    WorldState::<T>::MAX_VALIDATORS,
                 )));
             }
-            let registry = validator_registry_addr();
-            Some(local_ws.get_account(&registry)?.ok_or_else(|| {
-                NodeError::Startup("system tx removed validator registry account".into())
-            })?)
-        } else {
-            None
-        };
-
-        let mut updated_accounts: Vec<(Address, Account)> =
-            Vec::with_capacity(effects.updated_accounts.len());
+            if local_ws.get_account(&validator_registry_addr())?.is_none() {
+                return Err(NodeError::Startup(
+                    "system tx removed validator registry account".into(),
+                ));
+            }
+        }
         for address in &effects.updated_accounts {
-            let account = local_ws.get_account(address)?.ok_or_else(|| {
-                NodeError::Startup(format!("system tx updated missing account {address}"))
-            })?;
-            updated_accounts.push((*address, account));
+            if local_ws.get_account(address)?.is_none() {
+                return Err(NodeError::Startup(format!(
+                    "system tx updated missing account {address}"
+                )));
+            }
         }
-
-        if registry_account.is_none() && updated_accounts.is_empty() {
-            return Ok(());
-        }
-
-        let mut ws = self.world_state.write();
-        if let Some(account) = registry_account {
-            ws.set_account(&validator_registry_addr(), &account)?;
-        }
-        for (address, account) in updated_accounts {
-            ws.set_account(&address, &account)?;
-        }
-
         Ok(())
     }
 
@@ -1767,7 +1713,7 @@ mod tests {
     use shell_rpc::DevRpcControl;
     use shell_storage::{MemoryDb, StorageError, WriteBatch, WriteBatchOp};
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct AuthorityLockCheckingVerifier {
         authorities: Arc<RwLock<HashMap<Address, Vec<u8>>>>,
@@ -1811,8 +1757,6 @@ mod tests {
         inner: MemoryDb,
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
-        put_count: AtomicUsize,
-        fail_on_put: AtomicUsize,
         fail_next_batch: AtomicBool,
         fail_head_batch: AtomicBool,
         fail_next_delete: AtomicBool,
@@ -1824,8 +1768,6 @@ mod tests {
                 inner: MemoryDb::new(),
                 fail_next_get: AtomicBool::new(false),
                 fail_next_put: AtomicBool::new(false),
-                put_count: AtomicUsize::new(0),
-                fail_on_put: AtomicUsize::new(usize::MAX),
                 fail_next_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
                 fail_next_delete: AtomicBool::new(false),
@@ -1842,11 +1784,6 @@ mod tests {
 
         fn fail_next_put(&self) {
             self.fail_next_put.store(true, Ordering::SeqCst);
-        }
-
-        fn fail_on_put(&self, put_number: usize) {
-            self.put_count.store(0, Ordering::SeqCst);
-            self.fail_on_put.store(put_number, Ordering::SeqCst);
         }
 
         fn fail_head_batch(&self) {
@@ -1867,10 +1804,7 @@ mod tests {
         }
 
         fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-            let put_number = self.put_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if self.fail_next_put.swap(false, Ordering::SeqCst)
-                || put_number == self.fail_on_put.load(Ordering::SeqCst)
-            {
+            if self.fail_next_put.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected put failure".into()));
             }
             self.inner.put(key, value)
@@ -5061,6 +4995,59 @@ mod tests {
     }
 
     #[test]
+    fn produce_block_commit_failure_does_not_persist_key_rotation() {
+        let (node, proposer_signer, failing_db) = setup_failing_batch_node();
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let initial_balance = U256::from(1_000_000_000_000_000u64);
+        fund_account(&node, &sender, initial_balance);
+        node.chain_store
+            .put_pubkey(&sender, tx_signer.public_key())
+            .unwrap();
+        store_consistent_genesis(&node);
+
+        let original_pubkey = tx_signer.public_key().to_vec();
+        let rotated_pubkey = vec![0xAB; 1312];
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(shell_pqvm::account_manager_address()),
+            value: U256::ZERO,
+            data: Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                &rotated_pubkey,
+                tx_signer.sig_type().as_u8(),
+            )),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&node, &tx_signer, sender, tx);
+        let root_before = current_state_root(&node);
+
+        failing_db.fail_next_batch();
+        let error = node.produce_block(&proposer_signer, 100).unwrap_err();
+
+        assert!(matches!(error, NodeError::Storage(_)));
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            0
+        );
+        assert_eq!(current_state_root(&node), root_before);
+        assert_eq!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(original_pubkey)
+        );
+        assert_ne!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(rotated_pubkey)
+        );
+    }
+
+    #[test]
     fn import_block() {
         let (node, signer) = setup_node();
         store_genesis(&node);
@@ -6475,11 +6462,11 @@ mod tests {
         store_consistent_genesis(&node);
         let canonical_root = node.world_state.write().state_root().unwrap();
         let canonical_head = node.chain_store.get_head_hash().unwrap();
-        db.fail_on_put(2);
+        db.fail_next_batch();
 
         let err = node.produce_block(&signer, 100).unwrap_err();
 
-        assert!(err.to_string().contains("injected put failure"));
+        assert!(err.to_string().contains("injected batch failure"));
         assert_eq!(
             node.world_state.write().state_root().unwrap(),
             canonical_root,

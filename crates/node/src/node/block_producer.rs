@@ -61,8 +61,12 @@ impl<S: KvStore + 'static> Node<S> {
         let candidate_limit = if max_txs == 0 { 0 } else { usize::MAX };
         let candidates = mem_pool.pending_for_block(candidate_limit, base_fee, blob_base_fee);
 
-        // Create an isolated EVM instance at the current state root.
-        let (state_db, current_root) = block_store.isolated_state_db()?;
+        // Keep trie writes and address-keyed execution metadata private until
+        // the block and its receipts can be published in the same batch.
+        let current_root = block_store.current_state_root()?;
+        let execution_store = Arc::new(OverlayStore::new(self.store.clone()));
+        let execution_state = WorldState::at_root(execution_store.clone(), &current_root)?;
+        let state_db = ShellStateDb::new(execution_state, ChainStore::new(execution_store.clone()));
         let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
         let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
 
@@ -99,7 +103,7 @@ impl<S: KvStore + 'static> Node<S> {
         // F-302: Create the ChainStore wrapper once and reuse it for all per-tx
         // re-validations. ChainStore is a thin Arc-clone wrapper, so creating it
         // inside the loop was an unnecessary per-iteration allocation.
-        let import_cs = ChainStore::new(self.store.clone());
+        let import_cs = ChainStore::new(execution_store);
 
         for tx in &candidates {
             if included_txs.len() >= max_txs {
@@ -174,16 +178,13 @@ impl<S: KvStore + 'static> Node<S> {
                         base_fee,
                     );
                     if is_aa {
-                        // AA dispatcher already mutated evm.state_db.world_state
-                        // in place (including atomic rollback on failure). Mirror
-                        // to the node's persistent world_state by reopening it at
-                        // the post-bundle root. Both world_states share the same
-                        // KV-backed trie store, so this is a constant-time op.
-                        let new_root = evm.state_db_mut().world_state_mut().state_root()?;
-                        block_store.rollback_world_state(&new_root)?;
+                        // The AA dispatcher already mutated the isolated block
+                        // state in place, including atomic rollback on failure.
                     } else if result.is_system_tx {
-                        self.sync_system_contract_state(
-                            evm.state_db_mut().world_state_mut(),
+                        // Native system-contract effects are already staged in
+                        // the isolated world and chain stores.
+                        Self::validate_system_contract_effects(
+                            evm.state_db().world_state(),
                             &result.system_contract_effects,
                         )?;
                     } else {
@@ -246,6 +247,14 @@ impl<S: KvStore + 'static> Node<S> {
                         );
                         continue;
                     };
+                    if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
+                        // Execution may have rotated this key through the
+                        // account manager. Preserve that staged value instead
+                        // of restoring the transaction's signing key.
+                        if import_cs.get_pubkey(&tx.from)?.is_none() {
+                            import_cs.put_pubkey(&tx.from, pubkey)?;
+                        }
+                    }
                     cumulative_gas = next_cumulative_gas;
                     header.blob_gas_used = next_blob_gas;
                     total_effective_fees = total_effective_fees.saturating_add(
@@ -290,20 +299,13 @@ impl<S: KvStore + 'static> Node<S> {
 
         header.gas_used = cumulative_gas;
 
-        // The EVM executes against an isolated WorldState opened at the parent
-        // root. Normal transaction commits must not be applied a second time to
-        // the live WorldState: both handles share the same trie KV store, and a
-        // second write from the old storage root can race with nodes removed by
-        // the first persistent trie update. Re-open the live state at the
-        // isolated post-transaction root once instead.
-        let post_tx_root = evm.state_db_mut().world_state_mut().state_root()?;
-        block_store.rollback_world_state(&post_tx_root)?;
-
         let mut system_txs = Vec::new();
         // Block producer receives 100% of effective gas fees.
         let producer_reward = total_effective_fees;
         if !included_txs.is_empty() && producer_reward > U256::ZERO {
-            block_store.add_balance(&proposer_addr, producer_reward)?;
+            evm.state_db_mut()
+                .world_state_mut()
+                .add_balance(&proposer_addr, producer_reward)?;
             let tx_index = included_txs.len() as u32;
             let reward_tx = SystemTransaction::block_gas_reward(
                 self.config.chain_id,
@@ -402,7 +404,9 @@ impl<S: KvStore + 'static> Node<S> {
                     continue;
                 }
             };
-            block_store.add_balance(&reward_tx.to, reward_tx.value)?;
+            evm.state_db_mut()
+                .world_state_mut()
+                .add_balance(&reward_tx.to, reward_tx.value)?;
             receipts.push(TransactionReceipt {
                 tx_hash: reward_tx.hash(),
                 block_number: next_number,
@@ -432,27 +436,21 @@ impl<S: KvStore + 'static> Node<S> {
         // Apply algorithm activations whose timelock has elapsed (WP §6.5).
         // Must run BEFORE state_root so activations are committed to the Merkle root.
         let activation_result = {
-            let mut ws = self.world_state.write();
             let mut registry = AlgorithmRegistry::global_mut();
-            apply_pending_activations(header.number, &mut *ws, &mut registry, "production")
+            apply_pending_activations(
+                header.number,
+                evm.state_db_mut().world_state_mut(),
+                &mut registry,
+                "production",
+            )
         };
         if let Err(err) = activation_result {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
-            if let Err(rollback_err) = block_store.rollback_world_state(&current_root) {
-                warn!(
-                    error = %rollback_err,
-                    target_root = %current_root,
-                    "produce_block: failed to roll back world state after activation error"
-                );
-            }
             return Err(err);
         }
 
         // Compute state root from the updated world state (includes any activations above).
-        {
-            let mut ws = self.world_state.write();
-            header.state_root = ws.state_root()?;
-        }
+        header.state_root = evm.state_db_mut().world_state_mut().state_root()?;
 
         let mut block = Block {
             header,
@@ -512,29 +510,14 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             None
         };
-        if let Err(err) = block_store.commit_canonical_block(&block, Some(receipts.as_slice())) {
+        if let Err(err) = import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice())) {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
-            if let Err(rollback_err) = block_store.rollback_world_state(&current_root) {
-                warn!(
-                    error = %rollback_err,
-                    target_root = %current_root,
-                    "produce_block: failed to roll back world state after storage commit error"
-                );
-            }
-            return Err(err);
+            return Err(err.into());
         }
         algorithm_registry_rollback.commit();
-
-        // Public keys become persistent only once their transactions are part
-        // of the canonical block. Mempool admission must remain read-only so
-        // transactions that are dropped or evicted cannot grow chain storage.
-        for tx in &block.transactions {
-            if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
-                if self.chain_store.get_pubkey(&tx.from)?.is_none() {
-                    block_store.store_pubkey(&tx.from, pubkey)?;
-                }
-            }
-        }
+        let committed_world_state =
+            WorldState::at_root(self.store.clone(), &block.header.state_root)?;
+        block_store.replace_world_state(committed_world_state);
 
         if let Some((task, block_num, original_size)) = pending_proof_task {
             prover.queue_task(task);
