@@ -38,6 +38,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep historical STARK frontier tasks ordered ahead of live tip tasks and
+  retain sparse frontier ranges instead of skipping them into proofs that
+  canonical settlement must reject.
 - Revalidate persisted STARK amendments before startup recovery, discard
   malformed or unauthenticated artifacts, and regenerate their proof tasks
   instead of repeatedly blocking the settlement window.

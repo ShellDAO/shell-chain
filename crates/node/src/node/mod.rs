@@ -294,13 +294,6 @@ pub struct Node<S: KvStore + 'static> {
     /// Updated on every block import/production; used for offline-slash detection
     /// at epoch boundaries (white paper §5.4 — wPoA offline enforcement).
     pub(crate) last_proposed_by: parking_lot::Mutex<HashMap<Address, u64>>,
-    /// Drain frontier: the highest gap-at-block seen across all prover drain
-    /// operations in this process lifetime.  Shared with ProverService so the
-    /// seeding function can skip blocks that were already drained (and therefore
-    /// can never accumulate enough entries to form a valid proof on their own).
-    /// This prevents the drain-reseed infinite loop where drained sparse blocks
-    /// are immediately re-inserted at the backlog front by the seeder.
-    pub(crate) stark_drain_frontier: Arc<std::sync::atomic::AtomicU64>,
     /// Set after startup synchronization completes so imported catch-up blocks
     /// cannot fill the proof backlog or trigger proof gossip prematurely.
     prover_ready: std::sync::atomic::AtomicBool,
@@ -884,7 +877,6 @@ impl<S: KvStore + 'static> Node<S> {
             )),
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
             last_proposed_by: parking_lot::Mutex::new(HashMap::new()),
-            stark_drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prover_ready: std::sync::atomic::AtomicBool::new(false),
             proof_rate_limiter: parking_lot::Mutex::new(ProofRateLimiter::new(RateLimiterConfig {
                 initial_tokens: MAX_PENDING_STARK_SETTLEMENTS as u64,

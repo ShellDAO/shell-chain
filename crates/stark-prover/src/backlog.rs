@@ -214,6 +214,77 @@ impl ProofBacklog {
         self.total_enqueued += 1;
     }
 
+    /// Insert a sorted batch before the first later task from the same layer.
+    ///
+    /// Frontier recovery uses this to fill historical gaps while live tip tasks
+    /// are already queued. Appending relative to the global queue maximum would
+    /// leave the recovered range behind the tip and make the apparent gap look
+    /// permanent to the prover.
+    pub fn insert_ordered_batch(&mut self, mut tasks: Vec<ProofTask>) {
+        if tasks.is_empty() {
+            return;
+        }
+
+        let layer = tasks[0].layer;
+        debug_assert!(tasks.iter().all(|task| task.layer == layer));
+        tasks.sort_by_key(|task| task.block_number);
+        tasks.dedup_by_key(|task| task.block_number);
+        tasks.retain(|task| {
+            if task.source_hashes.is_empty() {
+                !self.contains_source(task.layer, &ShellHash::from(task.block_hash))
+            } else {
+                !task
+                    .source_hashes
+                    .iter()
+                    .any(|source| self.contains_source(task.layer, source))
+            }
+        });
+        if tasks.is_empty() {
+            return;
+        }
+
+        let mut incoming = tasks.into_iter().peekable();
+        let existing = std::mem::take(&mut self.pending);
+        let mut rebuilt = VecDeque::with_capacity(existing.len() + incoming.len());
+
+        for queued in existing {
+            if queued.layer == layer {
+                while incoming
+                    .peek()
+                    .is_some_and(|task| task.block_number < queued.block_number)
+                {
+                    let task = incoming.next().expect("peeked incoming task");
+                    self.index_add(&task);
+                    self.total_enqueued += 1;
+                    rebuilt.push_back(task);
+                }
+                if incoming
+                    .peek()
+                    .is_some_and(|task| task.block_number == queued.block_number)
+                {
+                    // A canonical reorg may replace an already-queued source at
+                    // the same height. Prefer the freshly seeded canonical task.
+                    self.index_remove(&queued);
+                    self.total_completed += 1;
+                    let task = incoming.next().expect("peeked replacement task");
+                    self.index_add(&task);
+                    self.total_enqueued += 1;
+                    rebuilt.push_back(task);
+                    continue;
+                }
+            }
+
+            rebuilt.push_back(queued);
+        }
+
+        for task in incoming {
+            self.index_add(&task);
+            self.total_enqueued += 1;
+            rebuilt.push_back(task);
+        }
+        self.pending = rebuilt;
+    }
+
     /// Returns true when a pending task already covers `source_hash` at `layer`.
     ///
     /// O(1) — backed by an internal reference-counted hash index.
@@ -659,6 +730,48 @@ mod tests {
     }
 
     #[test]
+    fn ordered_batch_fills_gap_before_live_tip() {
+        let mut b = ProofBacklog::new();
+        b.push(make_task(10));
+        b.push(make_task(100));
+
+        b.insert_ordered_batch(vec![make_task(12), make_task(11)]);
+
+        let blocks: Vec<_> = std::iter::from_fn(|| b.pop().map(|task| task.block_number)).collect();
+        assert_eq!(blocks, vec![10, 11, 12, 100]);
+        assert_index_consistency(&b);
+    }
+
+    #[test]
+    fn ordered_batch_skips_sources_already_queued() {
+        let mut b = ProofBacklog::new();
+        b.push(make_task(10));
+        b.push(make_task(100));
+
+        b.insert_ordered_batch(vec![make_task(10), make_task(11)]);
+
+        assert_eq!(b.len(), 3);
+        let blocks: Vec<_> = std::iter::from_fn(|| b.pop().map(|task| task.block_number)).collect();
+        assert_eq!(blocks, vec![10, 11, 100]);
+        assert_index_consistency(&b);
+    }
+
+    #[test]
+    fn ordered_batch_replaces_stale_task_at_same_height() {
+        let mut b = ProofBacklog::new();
+        b.push(ProofTask::new([1u8; 32], 10, vec![]));
+        b.push(make_task(100));
+
+        b.insert_ordered_batch(vec![ProofTask::new([2u8; 32], 10, vec![])]);
+
+        let replacement = b.pop().expect("replacement task");
+        assert_eq!(replacement.block_number, 10);
+        assert_eq!(replacement.block_hash, [2u8; 32]);
+        assert_eq!(b.pop().expect("tip task").block_number, 100);
+        assert_index_consistency(&b);
+    }
+
+    #[test]
     fn contains_source_detects_pending_source_hash() {
         let mut b = ProofBacklog::new();
         let hash = ShellHash::from([7u8; 32]);
@@ -868,7 +981,7 @@ mod tests {
                 gap_at_block: 3,
                 contiguous_take: 2,
             }),
-            "gaps found after scanning past max_sources must be drainable"
+            "gaps found after scanning past max_sources must be reported"
         );
     }
 

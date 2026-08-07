@@ -101,10 +101,6 @@ fn next_block_sync_request_start(last_imported: u64) -> Option<u64> {
     last_imported.checked_add(1)
 }
 
-fn stark_backlog_tail_extends(max_existing: Option<u64>, first_new_block: u64) -> bool {
-    max_existing.and_then(|max| max.checked_add(1)) == Some(first_new_block)
-}
-
 fn proof_amendment_envelope_matches(
     envelope_hash: ShellHash,
     envelope_block: u64,
@@ -466,7 +462,6 @@ impl<S: KvStore + 'static> Node<S> {
             .with_signer(Arc::clone(&signer))
             .with_amendment_sender(prover_amendment_tx)
             .with_readiness(prover_readiness_rx)
-            .with_drain_frontier(Arc::clone(&self.stark_drain_frontier))
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
             task_lifecycle.attach_prover_service(handle);
@@ -2494,19 +2489,10 @@ impl<S: KvStore + 'static> Node<S> {
         // The inner loop's contains_source() check deduplicates overlap with
         // blocks already in the backlog or settled.
         //
-        // Also clamp to the drain frontier: if the prover drained tasks before a
-        // permanent gap, we must not re-seed those blocks — they can never
-        // accumulate enough entries to form a valid proof and would cause a
-        // drain-reseed infinite loop.
-        let drain_floor = self
-            .stark_drain_frontier
-            .load(std::sync::atomic::Ordering::Acquire);
-        let scan_start = contiguous_pending_end
-            .saturating_sub(16)  // small lookback for safety
-            .max(drain_floor);
+        let scan_start = contiguous_pending_end.saturating_sub(16);
         info!(
             settled_l1_count,
-            contiguous_pending_end, drain_floor, scan_start, head, "STARK seeding: scan parameters"
+            contiguous_pending_end, scan_start, head, "STARK seeding: scan parameters"
         );
 
         for number in scan_start..=head {
@@ -2657,7 +2643,6 @@ impl<S: KvStore + 'static> Node<S> {
             let tasks_first = tasks.first().map(|t| t.block_number).unwrap_or(0);
             let tasks_last = tasks.last().map(|t| t.block_number).unwrap_or(0);
             let mut backlog = self.proof_backlog.lock();
-            let first_new_block = tasks[0].block_number;
             let layer = tasks[0].layer;
             let min_existing = backlog.min_block_number_for_layer(layer);
             let max_existing = backlog.max_block_number_for_layer(layer);
@@ -2671,41 +2656,11 @@ impl<S: KvStore + 'static> Node<S> {
                 "STARK seeding: inserting tasks into backlog"
             );
 
-            // Case 1: backlog is empty, or new tasks are at/before the existing
-            // minimum → insert at the front so the prover processes the lowest
-            // numbered block next (priority frontier catch-up).
-            if min_existing.is_none_or(|min| first_new_block <= min) {
-                for task in tasks.into_iter().rev() {
-                    if !task
-                        .source_hashes
-                        .iter()
-                        .any(|source| backlog.contains_source(task.layer, source))
-                    {
-                        backlog.push_front(task);
-                    }
-                }
-            } else if stark_backlog_tail_extends(max_existing, first_new_block) {
-                // Case 2: new tasks start immediately after the backlog tail →
-                // append to the back. This is contiguous extension: the prover
-                // will process the existing window first, then pick up these
-                // blocks without any ordering inversion. Crucially, this is
-                // what breaks the deadlock when blocks 1-1024 are all empty
-                // and block 1025+ contains the first transactions: the
-                // pop_contiguous extension scan can see block 1025 at
-                // pending[1024] and extend the window past max_sources.
-                for task in tasks.into_iter() {
-                    if !task
-                        .source_hashes
-                        .iter()
-                        .any(|source| backlog.contains_source(task.layer, source))
-                    {
-                        backlog.push(task);
-                    }
-                }
-            }
-            // Case 3: new tasks jump the frontier (first_new_block > min + gap)
-            // → skip this seeding pass; the next prover iteration will advance
-            // the frontier and re-seed correctly.
+            // Insert before any already-queued live tip tasks. A global-tail
+            // append test cannot fill a historical hole once tip blocks are in
+            // the queue and previously caused the prover to misclassify that
+            // recoverable hole as a permanent canonical gap.
+            backlog.insert_ordered_batch(tasks);
         }
         Ok(queued)
     }
@@ -3036,14 +2991,6 @@ mod cadence_tests {
     #[test]
     fn next_block_sync_request_start_stops_at_terminal_height() {
         assert_eq!(next_block_sync_request_start(u64::MAX), None);
-    }
-
-    #[test]
-    fn stark_backlog_tail_extends_stops_at_terminal_height() {
-        assert!(stark_backlog_tail_extends(Some(41), 42));
-        assert!(!stark_backlog_tail_extends(Some(41), 43));
-        assert!(!stark_backlog_tail_extends(None, 0));
-        assert!(!stark_backlog_tail_extends(Some(u64::MAX), u64::MAX));
     }
 
     #[test]
