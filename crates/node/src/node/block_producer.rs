@@ -556,7 +556,8 @@ impl<S: KvStore + 'static> Node<S> {
             block.number(),
             self.config.pruning.proof_replacement_grace,
         );
-        block_store.prune_grace_witnesses(block.number());
+        let finalized_number = self.finality.read().last_finalized_number();
+        block_store.prune_grace_witnesses(finalized_number);
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.

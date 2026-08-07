@@ -422,11 +422,11 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
         }
     }
 
-    fn prune_grace_witnesses(&self, current_head: u64) {
+    fn prune_grace_witnesses(&self, finalized_height: u64) {
         let mut grace_map = self.pending_grace_deletes.lock();
         let candidates: Vec<_> = grace_map
             .iter()
-            .filter_map(|(hash, delete_at)| (current_head >= *delete_at).then_some(*hash))
+            .filter_map(|(hash, delete_at)| (finalized_height >= *delete_at).then_some(*hash))
             .collect();
         if candidates.is_empty() {
             return;
@@ -457,14 +457,13 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
                 }
                 info!(
                     count = due.len(),
-                    block = current_head,
-                    "L2: grace-window expired, witness bundles deleted"
+                    finalized_height, "L2: grace-window expired, witness bundles deleted"
                 );
             }
             Err(error) => {
                 warn!(
                     count = due.len(),
-                    block = current_head,
+                    finalized_height,
                     %error,
                     "L2: grace-window witness batch delete failed"
                 );
@@ -9628,6 +9627,33 @@ mod tests {
             "block body (tx detail) must survive witness deletion"
         );
         assert_eq!(retrieved.unwrap().number(), block.number());
+    }
+
+    #[test]
+    fn unfinalized_stark_settlement_retains_witness_bundle_grace_zero() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+        let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
+        node.pending_stark_settlements.lock().push(amendment);
+
+        let settlement_block = node.produce_block(&signer, 100).unwrap();
+
+        assert_eq!(node.finality.read().last_finalized_number(), 0);
+        assert!(node.chain_store.has_witness_bundle(&hashes[0]).unwrap());
+
+        node.finality
+            .write()
+            .set_finalized_direct(settlement_block.number(), settlement_block.hash());
+        node.block_store()
+            .prune_grace_witnesses(settlement_block.number());
+
+        assert!(!node.chain_store.has_witness_bundle(&hashes[0]).unwrap());
     }
 
     /// The grace window starts at canonical settlement inclusion, not at the

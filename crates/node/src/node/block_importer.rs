@@ -964,7 +964,7 @@ impl<S: KvStore + 'static> Node<S> {
                 self.config.pruning.proof_replacement_grace,
             );
         }
-        block_store.prune_grace_witnesses(plan.preferred_number);
+        block_store.prune_grace_witnesses(finalized_number);
         let adopted_tx_hashes = plan
             .new_chain
             .iter()
@@ -1586,7 +1586,8 @@ impl<S: KvStore + 'static> Node<S> {
             block.number(),
             self.config.pruning.proof_replacement_grace,
         );
-        block_store.prune_grace_witnesses(block.number());
+        let finalized_number = self.finality.read().last_finalized_number();
+        block_store.prune_grace_witnesses(finalized_number);
 
         // Remove any included transactions from our mempool.
         let tx_hashes: Vec<ShellHash> = block.transactions.iter().map(|tx| tx.hash()).collect();

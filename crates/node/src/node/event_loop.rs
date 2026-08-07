@@ -2310,7 +2310,8 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         }
-        self.block_store().prune_grace_witnesses(head);
+        let finalized_number = self.finality.read().last_finalized_number();
+        self.block_store().prune_grace_witnesses(finalized_number);
 
         // ── Step 2: reconcile the persistent `ss/` index ─────────────────────
         // Remove stale entries that no longer exist on the canonical chain.
