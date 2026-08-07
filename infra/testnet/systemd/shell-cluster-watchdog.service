@@ -9,5 +9,7 @@ ExecStart=/usr/local/bin/shell-cluster-watchdog.sh
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ReadWritePaths=-/etc/default
 StateDirectory=shell-chain/watchdog
 StateDirectoryMode=0750
+TimeoutStartSec=300

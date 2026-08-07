@@ -7,14 +7,47 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/bin"
+touch "$tmp/missing-env"
 
 cat >"$tmp/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 endpoint="${*: -1}"
+if [[ -s "${WATCHDOG_TEST_RESTARTED:-/dev/null}" ]]; then
+  restarted=1
+else
+  restarted=0
+fi
 case "$endpoint" in
-  http://ready/health) printf '%s\n' '{"production_ready":true,"syncing":false}' ;;
-  http://unready/health) printf '%s\n' '{"production_ready":false,"syncing":false}' ;;
-  http://syncing/health) printf '%s\n' '{"production_ready":false,"syncing":true}' ;;
+  http://ready/health)
+    printf '%s\n' '{"block_height":10,"production_ready":true,"syncing":false}'
+    ;;
+  http://other/health)
+    printf '%s\n' '{"block_height":11,"production_ready":true,"syncing":false}'
+    ;;
+  http://unready/health)
+    if (( restarted == 1 )); then
+      printf '%s\n' '{"block_height":10,"production_ready":true,"syncing":false}'
+    else
+      printf '%s\n' '{"block_height":10,"production_ready":false,"syncing":false}'
+    fi
+    ;;
+  http://syncing/health)
+    if (( restarted == 1 )); then
+      printf '%s\n' '{"block_height":10,"production_ready":true,"syncing":false}'
+    else
+      printf '%s\n' '{"block_height":10,"production_ready":false,"syncing":true}'
+    fi
+    ;;
+  http://missing/health)
+    if (( restarted == 1 )); then
+      printf '%s\n' '{"block_height":10,"production_ready":true,"syncing":false}'
+    else
+      exit 22
+    fi
+    ;;
+  */metrics)
+    printf '%s\n' "${WATCHDOG_TEST_METRICS:-shell_block_height 10}"
+    ;;
   *) exit 22 ;;
 esac
 EOF
@@ -29,41 +62,60 @@ if [[ "$1" == "is-active" ]]; then
   esac
   exit 0
 fi
+if [[ "$1" == "restart" || "$1" == "start" ]]; then
+  printf '%s\n' "$*" >"$WATCHDOG_TEST_RESTARTED"
+fi
 EOF
 
-cat >"$tmp/bin/logger" <<'EOF'
+for command in logger flock sleep chmod chown; do
+  cat >"$tmp/bin/$command" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
+done
 
-cat >"$tmp/bin/flock" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-
-chmod +x "$tmp/bin/curl" "$tmp/bin/systemctl" "$tmp/bin/logger" "$tmp/bin/flock"
+chmod +x "$tmp/bin/"*
 
 run_watchdog() {
   local endpoints="$1" services="$2" state_dir="$3" actions="$4"
-  local inactive="${5:-}" conflicting="${6:-}"
+  local inactive="${5:-}" conflicting="${6:-}" env_file="${7:-$tmp/missing-env}"
+  local metrics="${8:-shell_block_height 10}"
+  local restarted="$state_dir/restarted"
+  mkdir -p "$state_dir"
+  rm -f "$restarted"
   PATH="$tmp/bin:$PATH" \
     WATCHDOG_TEST_ACTIONS="$actions" \
     WATCHDOG_TEST_INACTIVE="$inactive" \
+    WATCHDOG_TEST_METRICS="$metrics" \
+    WATCHDOG_TEST_RESTARTED="$restarted" \
     SHELL_WATCHDOG_ENDPOINTS="$endpoints" \
     SHELL_WATCHDOG_SERVICES="$services" \
     SHELL_WATCHDOG_FAILURE_THRESHOLD=1 \
     SHELL_WATCHDOG_INACTIVE_FAILURE_THRESHOLD=1 \
+    SHELL_WATCHDOG_STALL_THRESHOLD=5 \
     SHELL_WATCHDOG_CONFLICTING_SERVICES="$conflicting" \
     SHELL_WATCHDOG_STATE_DIR="$state_dir" \
+    SHELL_STARK_GUARD_SERVICE="${services%%,*}" \
+    SHELL_STARK_GUARD_ENV_FILE="$env_file" \
+    SHELL_STARK_MAX_PENDING=2 \
+    SHELL_STARK_MAX_REJECTIONS_PER_INTERVAL=4 \
+    SHELL_WATCHDOG_TX_SERVICE=tx-worker.service \
+    SHELL_WATCHDOG_QUIESCE_SECONDS=1 \
+    SHELL_WATCHDOG_RESTART_READY_TIMEOUT=2 \
     bash "$watchdog"
 }
 
 actions="$tmp/actions"
 run_watchdog "http://ready,http://ready" "ready-a.service,ready-b.service" "$tmp/all-ready" "$actions"
-[[ ! -e "$actions" ]]
+if grep -Eq '^(start|restart|stop) ' "$actions"; then
+  echo "watchdog changed services while every validator was ready" >&2
+  exit 1
+fi
 
 run_watchdog "http://ready,http://missing" "ready.service,unreachable.service" "$tmp/one-unreachable" "$actions"
 grep -qx 'restart unreachable.service' "$actions"
+grep -qx 'stop tx-worker.service' "$actions"
+grep -qx 'start tx-worker.service' "$actions"
 if grep -qx 'restart ready.service' "$actions"; then
   echo "watchdog restarted a production-ready service" >&2
   exit 1
@@ -95,5 +147,66 @@ run_watchdog \
   "" \
   "legacy.service"
 grep -qx 'stop legacy.service' "$actions"
+
+healthy_env="$tmp/healthy-stark.env"
+cat >"$healthy_env" <<'EOF'
+SHELL_NODE_ROLE=validator-prover
+SHELL_ENABLE_STARK_AGGREGATION=true
+EOF
+: >"$actions"
+healthy_metrics=$'shell_block_height 10\nshell_stark_pending_settlements 2\nshell_stark_proofs_generated_total 100\nshell_stark_settlements_accepted_total 1\nshell_stark_settlements_rejected_total 0'
+run_watchdog \
+  "http://ready,http://ready" \
+  "prover.service,validator.service" \
+  "$tmp/healthy-stark" \
+  "$actions" \
+  "" \
+  "" \
+  "$healthy_env" \
+  "$healthy_metrics"
+grep -qx 'SHELL_NODE_ROLE=validator-prover' "$healthy_env"
+grep -qx 'SHELL_ENABLE_STARK_AGGREGATION=true' "$healthy_env"
+if grep -Eq '^(start|restart|stop) ' "$actions"; then
+  echo "watchdog treated independent STARK counters as an in-flight gauge" >&2
+  exit 1
+fi
+
+tripped_env="$tmp/tripped-stark.env"
+cp "$healthy_env" "$tripped_env"
+: >"$actions"
+pending_metrics=$'shell_block_height 10\nshell_stark_pending_settlements 3\nshell_stark_settlements_rejected_total 0'
+run_watchdog \
+  "http://ready,http://ready" \
+  "prover.service,validator.service" \
+  "$tmp/tripped-stark" \
+  "$actions" \
+  "" \
+  "" \
+  "$tripped_env" \
+  "$pending_metrics"
+grep -qx 'SHELL_NODE_ROLE=validator' "$tripped_env"
+grep -qx 'SHELL_ENABLE_STARK_AGGREGATION=false' "$tripped_env"
+grep -qx 'stop tx-worker.service' "$actions"
+grep -qx 'restart prover.service' "$actions"
+grep -qx 'start tx-worker.service' "$actions"
+
+deferred_env="$tmp/deferred-stark.env"
+cp "$healthy_env" "$deferred_env"
+: >"$actions"
+run_watchdog \
+  "http://ready,http://other" \
+  "prover.service,validator.service" \
+  "$tmp/deferred-stark" \
+  "$actions" \
+  "" \
+  "" \
+  "$deferred_env" \
+  "$pending_metrics"
+grep -qx 'SHELL_NODE_ROLE=validator-prover' "$deferred_env"
+grep -qx 'SHELL_ENABLE_STARK_AGGREGATION=true' "$deferred_env"
+if grep -Eq '^(start|restart|stop) ' "$actions"; then
+  echo "watchdog changed services before validator heights converged" >&2
+  exit 1
+fi
 
 printf '%s\n' "shell cluster watchdog tests passed"

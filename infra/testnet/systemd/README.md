@@ -30,11 +30,21 @@ sudo systemctl enable --now shell-cluster-watchdog.timer
 The watchdog requires every configured validator to report production readiness,
 waits for sustained unavailability before taking action, never restarts while a
 reachable managed node reports active synchronization, and restarts only an
-unready validator per recovery interval. Inactive services use a shorter failure
-threshold and cannot be hidden by an unrelated process responding on the same
-health endpoint. Order services from lowest to highest voting weight in the
-environment file. Set `SHELL_WATCHDOG_CONFLICTING_SERVICES` only for legacy or
-mutually exclusive units that must never run beside the managed validators.
+unready validator per recovery interval. Before a restart it pauses the configured
+transaction worker, verifies that reachable validators have converged to the same
+height, and resumes traffic only after the target is production-ready. The exit
+trap also resumes the worker if recovery is interrupted. Inactive services use a
+shorter failure threshold and cannot be hidden by an unrelated process responding
+on the same health endpoint. Order services from lowest to highest voting weight
+in the environment file. Set `SHELL_WATCHDOG_CONFLICTING_SERVICES` only for legacy
+or mutually exclusive units that must never run beside the managed validators.
+
+When a validator-prover is configured, the STARK circuit breaker disables proving
+after an excessive pending-settlement gauge or rejection delta. It intentionally
+does not subtract generated and accepted counters: those counters are local to a
+process and do not represent an in-flight queue during historical catch-up. The
+watchdog preserves the previous environment file with a timestamp before changing
+the role and uses the same guarded restart path.
 
 Operational defaults:
 
@@ -51,7 +61,8 @@ Operational defaults:
   validator with the other validators' public P2P addresses so recovery does not
   depend on one node restarting first.
 - systemd `MemoryMax=1900M`, `CPUQuota=90%`, low IO priority, and slow restart
-- optional cluster watchdog with synchronization-aware, sequential recovery
+- optional cluster watchdog with synchronization-aware, traffic-quiesced,
+  sequential recovery and a STARK prover circuit breaker
 
 Use a separate larger instance for proving. On that host set
 `SHELL_NODE_ROLE=validator-prover` or `SHELL_NODE_ROLE=prover`, set
