@@ -70,6 +70,17 @@ fn matching_empty_block_response_exhausts_request(
     response_matches_sync && response_is_empty
 }
 
+fn block_event_receipts<S: KvStore + 'static>(
+    chain_store: &ChainStore<S>,
+    block_hash: ShellHash,
+) -> Result<Vec<TransactionReceipt>, NodeError> {
+    chain_store.get_receipts(&block_hash)?.ok_or_else(|| {
+        NodeError::Startup(format!(
+            "receipts missing while publishing canonical block event {block_hash}"
+        ))
+    })
+}
+
 fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
@@ -887,12 +898,7 @@ impl<S: KvStore + 'static> Node<S> {
 
                                 // Notify eth_subscribe listeners.
                                 let block_hash = block.hash();
-                                let receipts = self
-                                    .chain_store
-                                    .get_receipts(&block_hash)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_default();
+                                let receipts = block_event_receipts(&self.chain_store, block_hash)?;
                                 if block_event_tx.send(BlockEvent::NewBlock {
                                     header: block.header.clone(),
                                     receipts,
@@ -1088,12 +1094,8 @@ impl<S: KvStore + 'static> Node<S> {
                                             self.slash_timed_out_challenges(imported_number);
 
                                             // Notify eth_subscribe listeners.
-                                            let receipts = self
-                                                .chain_store
-                                                .get_receipts(&saved_hash)
-                                                .ok()
-                                                .flatten()
-                                                .unwrap_or_default();
+                                            let receipts =
+                                                block_event_receipts(&self.chain_store, saved_hash)?;
                                             if block_event_tx.send(BlockEvent::NewBlock {
                                                 header: saved_header.clone(),
                                                 receipts,
@@ -1389,12 +1391,8 @@ impl<S: KvStore + 'static> Node<S> {
                                                 }
 
                                                 // Notify eth_subscribe listeners.
-                                                let receipts = self
-                                                    .chain_store
-                                                    .get_receipts(&bhash)
-                                                    .ok()
-                                                    .flatten()
-                                                    .unwrap_or_default();
+                                                let receipts =
+                                                    block_event_receipts(&self.chain_store, bhash)?;
                                                 if block_event_tx.send(BlockEvent::NewBlock {
                                                     header: hdr,
                                                     receipts,
@@ -2884,6 +2882,29 @@ fn track_body_response_sequence(
 mod cadence_tests {
     use super::*;
     use shell_storage::MemoryDb;
+    use std::sync::Arc;
+
+    #[test]
+    fn block_events_require_persisted_receipts() {
+        let chain_store = ChainStore::new(Arc::new(MemoryDb::new()));
+        let block_hash = ShellHash::from([0x42; 32]);
+
+        let error = block_event_receipts(&chain_store, block_hash).unwrap_err();
+
+        assert!(matches!(error, NodeError::Startup(_)));
+        assert!(error.to_string().contains(&block_hash.to_string()));
+    }
+
+    #[test]
+    fn block_events_preserve_legitimate_empty_receipts() {
+        let chain_store = ChainStore::new(Arc::new(MemoryDb::new()));
+        let block_hash = ShellHash::from([0x24; 32]);
+        chain_store.put_receipts(&block_hash, &[]).unwrap();
+
+        let receipts = block_event_receipts(&chain_store, block_hash).unwrap();
+
+        assert!(receipts.is_empty());
+    }
 
     #[test]
     fn block_time_elapsed_requires_global_parent_timestamp_gap() {
