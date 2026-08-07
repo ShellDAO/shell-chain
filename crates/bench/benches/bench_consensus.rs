@@ -62,22 +62,29 @@ fn bench_poa_sign(c: &mut Criterion) {
 }
 
 fn bench_poa_proposer_selection(c: &mut Criterion) {
-    // Simulate round-robin proposer selection for 10 validators.
-    let validators: Vec<Address> = (0u8..10)
+    let validators: Vec<Address> = (0u64..1_000)
         .map(|i| {
             let mut bytes = [0u8; 20];
-            bytes[19] = i;
+            bytes[12..].copy_from_slice(&i.to_be_bytes());
             Address::from(bytes)
         })
         .collect();
+    let config = PoaConfig::new(validators.clone(), 2).with_weights(vec![100; validators.len()]);
+    let mut engine = PoaEngine::new(config.clone());
+    engine.slash_authority(&validators[0]);
 
     let mut group = c.benchmark_group("poa");
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("proposer_for_block", |b| {
-        let count = validators.len() as u64;
+    group.bench_function("weighted_proposer_for_block_1000", |b| {
         b.iter(|| {
-            let _proposer = validators[(black_box(1000_u64) % count) as usize];
+            config.proposer_for_block(black_box(1_000_u64));
+        })
+    });
+
+    group.bench_function("weighted_engine_is_proposer_1000", |b| {
+        b.iter(|| {
+            engine.is_proposer(black_box(1_000_u64), black_box(&validators[500]));
         })
     });
 

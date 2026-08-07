@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Make weighted proposer selection linear in the validator count and allocation-free.
 - Account for the outer envelope and session-verification intrinsic gas in AA
   receipts and fee settlement, without treating the unused outer destination
   as a contract-creation request.

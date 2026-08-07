@@ -139,18 +139,13 @@ impl PoaConfig {
             return Address::default();
         }
 
-        // Normalise: replace zero weights with 1 so no authority is excluded.
-        let weights: Vec<u64> = self
-            .authority_weights
-            .iter()
-            .map(|&w| w.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT))
-            .collect();
-
         // Sum with overflow check; saturate to u64::MAX if weights are extreme (prevents
         // wraparound that would cause biased selection or division-by-zero risks).
-        let total_weight: u64 = weights
+        let total_weight: u64 = self
+            .authority_weights
             .iter()
-            .try_fold(0u64, |acc, &w| acc.checked_add(w))
+            .map(|&weight| weight.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT))
+            .try_fold(0u64, |acc, weight| acc.checked_add(weight))
             .unwrap_or(u64::MAX);
 
         // Deterministic seed from block number.
@@ -160,8 +155,9 @@ impl PoaConfig {
         let ticket = seed_u64 % total_weight;
 
         let mut cumulative: u64 = 0;
-        for (i, &w) in weights.iter().enumerate() {
-            cumulative = cumulative.saturating_add(w);
+        for (i, &weight) in self.authority_weights.iter().enumerate() {
+            cumulative =
+                cumulative.saturating_add(weight.clamp(1, shell_primitives::MAX_VALIDATOR_WEIGHT));
             if ticket < cumulative {
                 return self.authorities[i];
             }
@@ -216,27 +212,37 @@ impl PoaEngine {
         &mut self.config
     }
 
+    fn base_weight_at(&self, index: usize) -> u64 {
+        self.config
+            .authority_weights
+            .get(index)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     fn base_weight_for(&self, authority: &Address) -> Option<u64> {
         let idx = self
             .config
             .authorities
             .iter()
             .position(|candidate| candidate == authority)?;
-        Some(
-            self.config
-                .authority_weights
-                .get(idx)
-                .copied()
-                .unwrap_or(1)
-                .max(1),
-        )
+        Some(self.base_weight_at(idx))
+    }
+
+    fn effective_weight_at(&self, index: usize) -> u64 {
+        let authority = self.config.authorities[index];
+        let reduction = self.slash_weights.get(&authority).copied().unwrap_or(0);
+        self.base_weight_at(index).saturating_sub(reduction)
     }
 
     fn effective_weight_for(&self, authority: &Address) -> Option<u64> {
-        self.base_weight_for(authority).map(|base_weight| {
-            let reduction = self.slash_weights.get(authority).copied().unwrap_or(0);
-            base_weight.saturating_sub(reduction)
-        })
+        let index = self
+            .config
+            .authorities
+            .iter()
+            .position(|candidate| candidate == authority)?;
+        Some(self.effective_weight_at(index))
     }
 
     /// Determine the expected proposer for `block_number` after applying current
@@ -246,17 +252,17 @@ impl PoaEngine {
             return Address::default();
         }
 
-        let active: Vec<(Address, u64)> = self
-            .config
-            .authorities
-            .iter()
-            .filter_map(|authority| {
-                let weight = self.effective_weight_for(authority).unwrap_or(0);
-                (weight > 0).then_some((*authority, weight))
-            })
-            .collect();
+        let mut active_count = 0usize;
+        let mut total_weight = 0u64;
+        for index in 0..self.config.authorities.len() {
+            let weight = self.effective_weight_at(index);
+            if weight > 0 {
+                active_count = active_count.saturating_add(1);
+                total_weight = total_weight.saturating_add(weight);
+            }
+        }
 
-        if active.is_empty() {
+        if active_count == 0 {
             return Address::default();
         }
 
@@ -265,38 +271,44 @@ impl PoaEngine {
                 (block_number
                     .checked_rem(self.config.epoch_length)
                     .unwrap_or(0) as usize)
-                    .checked_rem(active.len())
+                    .checked_rem(active_count)
                     .unwrap_or(0)
             } else {
                 (block_number as usize)
-                    .checked_rem(active.len())
+                    .checked_rem(active_count)
                     .unwrap_or(0)
             };
-            return active[idx].0;
+            return self
+                .config
+                .authorities
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.effective_weight_at(*index) > 0)
+                .nth(idx)
+                .map(|(_, authority)| *authority)
+                .unwrap_or_default();
         }
 
-        let total_weight: u64 = active
-            .iter()
-            .map(|(_, w)| *w)
-            .try_fold(0u64, |acc, w| acc.checked_add(w))
-            .unwrap_or(u64::MAX);
         let seed_bytes = keccak256(&block_number.to_le_bytes());
         let seed_u64 =
             u64::from_le_bytes(seed_bytes.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
         let ticket = seed_u64 % total_weight;
 
         let mut cumulative = 0u64;
-        for (authority, weight) in &active {
-            cumulative = cumulative.saturating_add(*weight);
+        let mut last_active = Address::default();
+        for (index, authority) in self.config.authorities.iter().enumerate() {
+            let weight = self.effective_weight_at(index);
+            if weight == 0 {
+                continue;
+            }
+            last_active = *authority;
+            cumulative = cumulative.saturating_add(weight);
             if ticket < cumulative {
                 return *authority;
             }
         }
 
-        active
-            .last()
-            .map(|(authority, _)| *authority)
-            .unwrap_or_default()
+        last_active
     }
 
     /// Slash an authority for equivocation.
@@ -473,12 +485,8 @@ impl ConsensusEngine for PoaEngine {
         self.config
             .authorities
             .iter()
-            .map(|authority| {
-                (
-                    *authority,
-                    self.effective_weight_for(authority).unwrap_or_default(),
-                )
-            })
+            .enumerate()
+            .map(|(index, authority)| (*authority, self.effective_weight_at(index)))
             .collect()
     }
 }
