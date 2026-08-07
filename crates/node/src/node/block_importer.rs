@@ -925,6 +925,9 @@ impl<S: KvStore + 'static> Node<S> {
         )?;
         algorithm_registry_rollback.commit();
 
+        self.prover_orchestrator()
+            .rewind_settled_frontiers(plan.ancestor_number);
+
         state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
         self.block_store().replace_world_state(state);
         for (block, block_settlements) in plan.new_chain.iter().zip(settlements) {

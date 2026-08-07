@@ -552,6 +552,13 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
         }
     }
 
+    fn rewind_settled_frontiers(&self, canonical_ancestor: u64) {
+        let first_replaced_block = canonical_ancestor.saturating_add(1);
+        for frontier in self.settled_stark_frontiers.lock().values_mut() {
+            *frontier = (*frontier).min(first_replaced_block);
+        }
+    }
+
     fn record_settled_sources(&self, amendments: &[ProofAmendment]) {
         self.settled_stark_sources
             .lock()
@@ -2549,6 +2556,7 @@ mod tests {
         let canonical = make_block_at_1(&node, &signer, None);
         node.import_block(canonical.clone(), &MultiVerifier)
             .unwrap();
+        node.settled_stark_frontiers.lock().insert(1, 2);
 
         let mut side_one = canonical.clone();
         side_one.header.timestamp += 1;
@@ -2618,6 +2626,10 @@ mod tests {
             Some(vec![])
         );
         assert_eq!(current_state_root(&node), ancestor_root);
+        assert_eq!(
+            node.settled_stark_frontiers.lock().get(&1).copied(),
+            Some(1)
+        );
         assert!(node.preferred_fork_plan().unwrap().is_none());
     }
 
