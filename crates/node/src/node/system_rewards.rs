@@ -747,8 +747,7 @@ impl<S: KvStore + 'static> Node<S> {
                 )));
             }
 
-            let current_layer =
-                self.compression_layer_for_source(source_hash, overlay_layers, Some(amendment))?;
+            let current_layer = self.compression_layer_for_source(source_hash, overlay_layers)?;
             if current_layer >= amendment.layer {
                 return Err(NodeError::Startup(format!(
                     "STARK amendment overlaps block #{number} already compressed at layer {current_layer}"
@@ -765,7 +764,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let expected_start =
-            self.first_canonical_block_below_layer(amendment.layer, overlay_layers, amendment)?;
+            self.first_canonical_block_below_layer(amendment.layer, overlay_layers)?;
         if start_block != expected_start {
             return Err(NodeError::Startup(format!(
                 "STARK L{} amendment must start at frontier #{expected_start}, got #{start_block}",
@@ -776,11 +775,10 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    fn first_canonical_block_below_layer(
+    pub(crate) fn first_canonical_block_below_layer(
         &self,
         layer: u32,
         overlay_layers: &HashMap<ShellHash, u32>,
-        subject: &ProofAmendment,
     ) -> Result<u64, NodeError> {
         let head = self
             .chain_store
@@ -788,34 +786,28 @@ impl<S: KvStore + 'static> Node<S> {
             .map(|block| block.number())
             .unwrap_or(0);
 
-        // Fast-path: estimate the frontier to avoid an O(n) scan from genesis.
-        //
-        // The number of L1-settled sources in `settled_stark_sources` ≈ the block
-        // number of the canonical settlement frontier (one source per canonical block
-        // from genesis in normal operation).  The overlay contains pending-but-unsettled
-        // sources that have already passed validation and are queued for inclusion.
-        //
-        // Combined count - small lookback ≈ the first unsettled block, so we only
-        // need to scan a handful of blocks rather than the entire chain.
-        let settled_count = {
-            let lock = self.settled_stark_sources.lock();
-            lock.iter().filter(|(l, _)| *l == layer).count() as u64
-        };
-        let overlay_count = overlay_layers.values().filter(|&&l| l >= layer).count() as u64;
-        let scan_start = settled_count
-            .saturating_add(overlay_count)
-            .saturating_sub(16); // small lookback to guard against gaps
-
-        for number in scan_start..=head {
+        // Counts are not a frontier: old chains and reorg recovery can contain
+        // settled hashes after an earlier gap. Start from the cached contiguous
+        // frontier and advance only across canonical settled or pending sources.
+        let mut number = self
+            .settled_stark_frontiers
+            .lock()
+            .get(&layer)
+            .copied()
+            .unwrap_or(0);
+        while number <= head {
             let Some(hash) = self.chain_store.get_block_hash_by_number(number)? else {
+                number = number.saturating_add(1);
                 continue;
             };
             if !self.is_stark_compression_source(&hash, overlay_layers)? {
+                number = number.saturating_add(1);
                 continue;
             }
-            if self.compression_layer_for_source(&hash, overlay_layers, Some(subject))? < layer {
+            if self.compression_layer_for_source(&hash, overlay_layers)? < layer {
                 return Ok(number);
             }
+            number = number.saturating_add(1);
         }
         Ok(head.saturating_add(1))
     }
@@ -824,7 +816,6 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         source_hash: &ShellHash,
         overlay_layers: &HashMap<ShellHash, u32>,
-        subject: Option<&ProofAmendment>,
     ) -> Result<u32, NodeError> {
         if let Some(layer) = overlay_layers.get(source_hash) {
             return Ok(*layer);
@@ -841,7 +832,6 @@ impl<S: KvStore + 'static> Node<S> {
         if settled_layer > 0 {
             return Ok(settled_layer);
         }
-        let _ = subject;
         Ok(0)
     }
 

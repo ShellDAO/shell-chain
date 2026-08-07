@@ -2440,13 +2440,20 @@ impl<S: KvStore + 'static> Node<S> {
         settled.extend(canonical);
         drop(settled);
 
-        let l1_count = self
-            .settled_stark_sources
+        self.settled_stark_frontiers.lock().clear();
+        let empty_overlay = std::collections::HashMap::new();
+        for layer in 1..=3 {
+            let frontier = self.first_canonical_block_below_layer(layer, &empty_overlay)?;
+            self.settled_stark_frontiers.lock().insert(layer, frontier);
+        }
+
+        let l1_frontier = self
+            .settled_stark_frontiers
             .lock()
-            .iter()
-            .filter(|(l, _)| *l == 1)
-            .count() as i64;
-        let lag = (head as i64 + 1).saturating_sub(l1_count).max(0);
+            .get(&1)
+            .copied()
+            .unwrap_or(0) as i64;
+        let lag = (head as i64 + 1).saturating_sub(l1_frontier).max(0);
         self.metrics.stark_frontier_lag.set(lag);
 
         if removed > 0 {
@@ -2494,59 +2501,29 @@ impl<S: KvStore + 'static> Node<S> {
             .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4);
         let mut seeded_entries = 0usize;
 
-        // Fast-path: compute an approximate scan start block so we skip over
-        // already-settled blocks without issuing a DB read per block.
-        //
-        // * Settled L1 source count ≈ frontier block number (sources are
-        //   sequential, one per canonical block from genesis).
-        // * We also check the highest block_number in pending_stark_settlements
-        //   so that we start seeding after the already-proved-but-unsettled range.
-        //
-        // A small lookback (16 blocks) guards against off-by-one or gap cases.
-        let settled_l1_count = self
-            .settled_stark_sources
-            .lock()
-            .iter()
-            .filter(|(l, _)| *l == 1)
-            .count() as u64;
-        // Compute the *contiguous* pending frontier: how far L1 pending amendments
-        // extend from the settled frontier WITHOUT gaps.  Using the raw
-        // `pending_max_block` would cause scan_start to jump past gap-pending proofs
-        // (proofs generated for tip blocks before the historical gap is filled),
-        // making the prover repeatedly generate tip proofs that fail ordering —
-        // a rejection-counter spin-loop.
-        let contiguous_pending_end = {
+        let pending_overlay = {
             let pending = self.pending_stark_settlements.lock();
-            let mut ranges: Vec<(u64, u64)> = pending
+            pending
                 .iter()
                 .filter(|a| a.layer == 1)
-                .filter_map(|a| {
-                    let start = a.range_start_block()?;
-                    Some((start, a.block_number))
+                .flat_map(|amendment| {
+                    amendment
+                        .covered_hashes()
+                        .into_iter()
+                        .map(move |hash| (hash, amendment.layer))
                 })
-                .collect();
-            // Sort by range start so we can walk the chain in order.
-            ranges.sort_by_key(|(start, _)| *start);
-            let mut frontier = settled_l1_count;
-            for (start, end) in &ranges {
-                if *start <= frontier {
-                    // This amendment overlaps or immediately follows the current frontier.
-                    frontier = frontier.max(end.saturating_add(1));
-                } else {
-                    // Gap found — stop extending; don't jump past it.
-                    break;
-                }
-            }
-            frontier
+                .collect::<std::collections::HashMap<_, _>>()
         };
-        // Anchor scan at the contiguous frontier (settled + gapless pending),
-        // NOT at backlog_max_block or raw pending_max_block.
-        // The inner loop's contains_source() check deduplicates overlap with
-        // blocks already in the backlog or settled.
-        //
+        let settled_frontier = self
+            .settled_stark_frontiers
+            .lock()
+            .get(&1)
+            .copied()
+            .unwrap_or(0);
+        let contiguous_pending_end = self.first_canonical_block_below_layer(1, &pending_overlay)?;
         let scan_start = contiguous_pending_end.saturating_sub(16);
         info!(
-            settled_l1_count,
+            settled_frontier,
             contiguous_pending_end, scan_start, head, "STARK seeding: scan parameters"
         );
 

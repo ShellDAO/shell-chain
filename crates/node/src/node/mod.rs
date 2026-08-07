@@ -254,6 +254,11 @@ pub struct Node<S: KvStore + 'static> {
     /// In-memory guard against duplicate STARK reward settlement in the current
     /// process lifetime. The block-committed settlement remains authoritative.
     settled_stark_sources: parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
+    /// First canonical block not yet settled at each compression layer.
+    ///
+    /// This is a monotonic runtime cache. Canonical rebuilds reset it after a
+    /// reorg; normal settlement commits only advance it.
+    settled_stark_frontiers: parking_lot::Mutex<HashMap<u32, u64>>,
     /// I1: Queue of equivocation proofs discovered during import_block, to be broadcast
     /// in the next event loop iteration (import_block is sync; network sends are async).
     equivocation_queue: parking_lot::Mutex<Vec<EquivocationProof>>,
@@ -511,6 +516,8 @@ struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
     proof_backlog: &'a Arc<parking_lot::Mutex<ProofBacklog>>,
     pending_stark_settlements: &'a Arc<parking_lot::Mutex<Vec<ProofAmendment>>>,
     settled_stark_sources: &'a parking_lot::Mutex<HashSet<(u32, ShellHash)>>,
+    settled_stark_frontiers: &'a parking_lot::Mutex<HashMap<u32, u64>>,
+    chain_store: &'a Arc<ChainStore<S>>,
     settled_source_index: &'a SettledSourceIndex<S>,
     l2_input_index: &'a L2InputIndex<S>,
     metrics: &'a Arc<Metrics>,
@@ -561,6 +568,21 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
             // Record the final source of each L1 amendment as a canonical L2 input.
             if amendment.layer == 1 {
                 let _ = self.l2_input_index.put(&amendment.block_hash);
+            }
+        }
+        let touched_layers = amendments
+            .iter()
+            .map(|amendment| amendment.layer)
+            .collect::<HashSet<_>>();
+        let settled = self.settled_stark_sources.lock();
+        let mut frontiers = self.settled_stark_frontiers.lock();
+        for layer in touched_layers {
+            let frontier = frontiers.entry(layer).or_insert(0);
+            while let Ok(Some(hash)) = self.chain_store.get_block_hash_by_number(*frontier) {
+                if !(layer..=3).any(|candidate| settled.contains(&(candidate, hash))) {
+                    break;
+                }
+                *frontier = frontier.saturating_add(1);
             }
         }
     }
@@ -850,6 +872,7 @@ impl<S: KvStore + 'static> Node<S> {
             aggregation_scheduler,
             pending_stark_settlements: Arc::new(parking_lot::Mutex::new(Vec::new())),
             settled_stark_sources: parking_lot::Mutex::new(HashSet::new()),
+            settled_stark_frontiers: parking_lot::Mutex::new(HashMap::new()),
             equivocation_queue: parking_lot::Mutex::new(Vec::new()),
             finality: Arc::new(RwLock::new(finality_state)),
             fork_choice: Arc::new(RwLock::new(fork_choice)),
@@ -920,6 +943,8 @@ impl<S: KvStore + 'static> Node<S> {
             proof_backlog: &self.proof_backlog,
             pending_stark_settlements: &self.pending_stark_settlements,
             settled_stark_sources: &self.settled_stark_sources,
+            settled_stark_frontiers: &self.settled_stark_frontiers,
+            chain_store: &self.chain_store,
             settled_source_index: &self.settled_source_index,
             l2_input_index: &self.l2_input_index,
             metrics: &self.metrics,
@@ -9188,6 +9213,39 @@ mod tests {
         assert!(task.entries.is_empty());
         assert_eq!(task.original_size, Some(0));
         assert_eq!(task.source_hashes.len(), 1);
+    }
+
+    #[test]
+    fn stark_frontier_backlog_uses_contiguous_frontier_not_settled_count() {
+        let (node, proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+        let hashes = produce_witnessed_blocks(&node, &proposer_signer, 80);
+        while node.proof_backlog.lock().pop().is_some() {}
+
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let gap_number = 10u64;
+        node.settled_stark_sources
+            .lock()
+            .extend(std::iter::once((1, genesis_hash)).chain(
+                hashes.iter().enumerate().filter_map(|(index, hash)| {
+                    let number = index as u64 + 1;
+                    (number != gap_number).then_some((1, *hash))
+                }),
+            ));
+        let frontier = node
+            .first_canonical_block_below_layer(1, &HashMap::new())
+            .unwrap();
+        assert_eq!(frontier, gap_number);
+        node.settled_stark_frontiers.lock().insert(1, frontier);
+
+        assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 1);
+        let backlog = node.proof_backlog.lock();
+        let task = backlog.peek().expect("frontier gap should be queued");
+        assert_eq!(task.block_number, gap_number);
     }
 
     #[test]
