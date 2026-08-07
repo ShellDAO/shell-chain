@@ -12,6 +12,7 @@ set -euo pipefail
 : "${SHELL_STARK_GUARD_ENV_FILE:=/etc/default/shell-node2}"
 : "${SHELL_STARK_MAX_PENDING:=2}"
 : "${SHELL_STARK_MAX_REJECTIONS_PER_INTERVAL:=4}"
+: "${SHELL_STARK_UNREACHABLE_THRESHOLD:=3}"
 : "${SHELL_WATCHDOG_TX_SERVICE:=tx-worker.service}"
 : "${SHELL_WATCHDOG_QUIESCE_SECONDS:=5}"
 : "${SHELL_WATCHDOG_RESTART_READY_TIMEOUT:=180}"
@@ -28,6 +29,7 @@ for value in "$SHELL_WATCHDOG_FAILURE_THRESHOLD" \
   "$SHELL_WATCHDOG_STALL_THRESHOLD" \
   "$SHELL_STARK_MAX_PENDING" \
   "$SHELL_STARK_MAX_REJECTIONS_PER_INTERVAL" \
+  "$SHELL_STARK_UNREACHABLE_THRESHOLD" \
   "$SHELL_WATCHDOG_QUIESCE_SECONDS" \
   "$SHELL_WATCHDOG_RESTART_READY_TIMEOUT"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
@@ -50,6 +52,7 @@ height_file="$SHELL_WATCHDOG_STATE_DIR/last-block-height"
 stall_file="$SHELL_WATCHDOG_STATE_DIR/stalled-checks"
 rejected_file="$SHELL_WATCHDOG_STATE_DIR/stark-rejected-total"
 stark_enabled_file="$SHELL_WATCHDOG_STATE_DIR/stark-enabled-last"
+stark_unreachable_file="$SHELL_WATCHDOG_STATE_DIR/stark-unreachable-checks"
 tx_resume_required=0
 
 read_state() {
@@ -191,6 +194,7 @@ trip_stark_circuit() {
   restart_service_guarded "$SHELL_STARK_GUARD_SERVICE" restart || return 1
   write_state "$stall_file" 0
   write_state "$failure_file" 0
+  write_state "$stark_unreachable_file" 0
   return 0
 }
 
@@ -210,6 +214,7 @@ inactive_count=0
 max_height=0
 max_pending=0
 max_rejected=0
+guard_reachable=0
 ready=()
 active=()
 
@@ -226,6 +231,7 @@ for ((index = 0; index < ${#endpoints[@]}; index += 1)); do
   metrics="$(curl --fail --silent --show-error --max-time 5 "${endpoint%/}/metrics" 2>/dev/null || true)"
   if [[ -n "$health" ]]; then
     ((reachable_count += 1))
+    [[ "$service" == "$SHELL_STARK_GUARD_SERVICE" ]] && guard_reachable=1
   fi
   if (( active[index] == 1 )) && [[ "$health" == *'"production_ready":true'* ]]; then
     ((ready_count += 1))
@@ -258,6 +264,14 @@ fi
 write_state "$rejected_file" "$max_rejected"
 write_state "$stark_enabled_file" "$stark_enabled"
 
+stark_unreachable_checks=0
+if (( stark_enabled == 1 && guard_reachable == 0 )) \
+  && systemctl is-active --quiet "$SHELL_STARK_GUARD_SERVICE"; then
+  stark_unreachable_checks="$(read_state "$stark_unreachable_file" 0)"
+  ((stark_unreachable_checks += 1))
+fi
+write_state "$stark_unreachable_file" "$stark_unreachable_checks"
+
 last_height="$(read_state "$height_file" 0)"
 stalled="$(read_state "$stall_file" 0)"
 if (( max_height > last_height )); then
@@ -272,6 +286,11 @@ fi
 # Generated and accepted are independent process-local counters, not an
 # in-flight gauge. During canonical catch-up, proof generation can legitimately
 # run ahead while the bounded settlement queue remains healthy.
+if (( stark_enabled == 1 && stark_unreachable_checks >= SHELL_STARK_UNREACHABLE_THRESHOLD )); then
+  trip_stark_circuit \
+    "guarded prover endpoint was unreachable for ${stark_unreachable_checks} watchdog intervals" \
+    && exit 0
+fi
 if (( stark_enabled == 1 && max_pending > SHELL_STARK_MAX_PENDING )); then
   trip_stark_circuit "pending settlements ${max_pending} exceeded limit ${SHELL_STARK_MAX_PENDING}" && exit 0
 fi

@@ -40,7 +40,8 @@ in the environment file. Set `SHELL_WATCHDOG_CONFLICTING_SERVICES` only for lega
 or mutually exclusive units that must never run beside the managed validators.
 
 When a validator-prover is configured, the STARK circuit breaker disables proving
-after an excessive pending-settlement gauge or rejection delta. It intentionally
+after an excessive pending-settlement gauge, rejection delta, or consecutive
+guarded-endpoint failures. It intentionally
 does not subtract generated and accepted counters: those counters are local to a
 process and do not represent an in-flight queue during historical catch-up. The
 watchdog preserves the previous environment file with a timestamp before changing
