@@ -10343,6 +10343,39 @@ mod tests {
         }
 
         #[test]
+        fn wpoa_vote_advances_fork_choice_finality() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
+            let side_hash = hash(89);
+            {
+                let mut fork_choice = node.fork_choice.write();
+                *fork_choice = ForkChoice::new(genesis_hash);
+                fork_choice.add_block(block_hash, genesis_hash, 1, 0, false);
+                fork_choice.add_block(side_hash, genesis_hash, 1, 1, false);
+            }
+            let mut round = WPoaRound::new(1, 0, node.consensus.read().validator_weights());
+            let _ = round.on_block_proposed(block_hash, authority);
+            *node.wpoa_round.lock() = Some(round);
+
+            let certificate = node.handle_wpoa_vote(
+                authority,
+                block_hash,
+                1,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            );
+
+            assert!(certificate.is_some());
+            let fork_choice = node.fork_choice.read();
+            assert_eq!(fork_choice.head(), &block_hash);
+            assert_eq!(fork_choice.parent(&block_hash), Some(&ShellHash::ZERO));
+            assert_eq!(fork_choice.score(&block_hash).unwrap().is_finalized, 1);
+            assert!(!fork_choice.contains(&side_hash));
+        }
+
+        #[test]
         fn wpoa_vote_persists_certificate_for_already_finalized_block() {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();
@@ -10748,6 +10781,33 @@ mod tests {
                 .get_commit_certificate(&block_hash)
                 .unwrap()
                 .is_some());
+        }
+
+        #[test]
+        fn fast_finalize_advances_fork_choice_finality() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
+            let side_hash = hash(90);
+            {
+                let mut fork_choice = node.fork_choice.write();
+                *fork_choice = ForkChoice::new(genesis_hash);
+                fork_choice.add_block(block_hash, genesis_hash, 1, 0, false);
+                fork_choice.add_block(side_hash, genesis_hash, 1, 1, false);
+            }
+            let quorum_signatures =
+                HashMap::from([(authority, signer.sign(block_hash.as_bytes()).unwrap())]);
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&quorum_signatures).unwrap();
+
+            assert!(node.fast_finalize_with_certificate(1, block_hash, &cert));
+
+            let fork_choice = node.fork_choice.read();
+            assert_eq!(fork_choice.head(), &block_hash);
+            assert_eq!(fork_choice.parent(&block_hash), Some(&ShellHash::ZERO));
+            assert_eq!(fork_choice.score(&block_hash).unwrap().is_finalized, 1);
+            assert!(!fork_choice.contains(&side_hash));
         }
 
         #[test]

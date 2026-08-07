@@ -170,13 +170,28 @@ impl<S: KvStore + 'static> Node<S> {
                 hash = %block_hash,
                 "block finalized"
             );
-            // F-088: Prune fork choice data for old blocks to prevent unbounded growth.
-            let mut fc = self.fork_choice.write();
-            fc.mark_finalized(&block_hash);
-            fc.prune_below(block_number);
+            self.advance_fork_choice_finality(block_number, block_hash);
         }
 
         Ok(())
+    }
+
+    fn advance_fork_choice_finality(&self, block_number: u64, block_hash: ShellHash) {
+        let mut fork_choice = self.fork_choice.write();
+        fork_choice.mark_finalized(&block_hash);
+        if fork_choice
+            .score(&block_hash)
+            .is_some_and(|score| score.is_finalized == 1)
+        {
+            // F-088: Prune old and incompatible branches after every finality path.
+            fork_choice.prune_below(block_number);
+        } else {
+            warn!(
+                block_number,
+                %block_hash,
+                "finalized block is missing from fork choice"
+            );
+        }
     }
 
     /// Create and return an attestation for a block (called after producing/importing a block).
@@ -490,6 +505,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                             };
                             if advanced {
+                                self.advance_fork_choice_finality(block_number, block_hash);
                                 let current_head = self
                                     .chain_store
                                     .get_head_block()
@@ -745,6 +761,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
         };
         if advanced {
+            self.advance_fork_choice_finality(block_number, block_hash);
             let current_head = self
                 .chain_store
                 .get_head_block()
