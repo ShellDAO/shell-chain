@@ -2544,21 +2544,14 @@ impl<S: KvStore + 'static> Node<S> {
                 if rejected_stored_payloads.contains(&payload_hash) {
                     self.amendment_store.delete_amendment(&hash)?;
                 } else {
-                    match ProofAmendment::from_json(&bytes) {
+                    match self.load_stored_stark_amendment_for_recovery(hash, number, &bytes) {
                         Ok(amendment) => {
                             let covered_hashes = amendment.covered_hashes();
                             let recovered_is_valid = self
                                 .validate_stark_amendment_authentication(&amendment)
                                 .and_then(|()| self.validate_stark_amendment_ordering(&amendment))
                                 .and_then(|()| {
-                                    let original_size =
-                                        amendment.original_size.ok_or_else(|| {
-                                            NodeError::Startup(
-                                                "stored STARK amendment is missing original_size"
-                                                    .into(),
-                                            )
-                                        })?;
-                                    if amendment.is_compression_valid_for(original_size) {
+                                    if amendment.has_valid_embedded_compression() {
                                         Ok(())
                                     } else {
                                         Err(NodeError::Startup(
@@ -2579,7 +2572,9 @@ impl<S: KvStore + 'static> Node<S> {
                                     "discarding invalid stored STARK amendment during recovery"
                                 );
                                 rejected_stored_payloads.insert(payload_hash);
-                                self.amendment_store.delete_amendment(&hash)?;
+                                for source_hash in covered_hashes {
+                                    self.amendment_store.delete_amendment(&source_hash)?;
+                                }
                                 // Continue with this canonical source so a fresh proof
                                 // task replaces the invalid persisted artifact.
                             } else {
@@ -2715,6 +2710,78 @@ impl<S: KvStore + 'static> Node<S> {
             // the frontier and re-seed correctly.
         }
         Ok(queued)
+    }
+
+    fn load_stored_stark_amendment_for_recovery(
+        &self,
+        source_hash: ShellHash,
+        source_block: u64,
+        bytes: &[u8],
+    ) -> Result<ProofAmendment, NodeError> {
+        match StoredProofArtifact::from_json(bytes).map_err(|error| {
+            NodeError::Startup(format!("malformed stored STARK artifact: {error}"))
+        })? {
+            StoredProofArtifact::Amendment(amendment) => {
+                if amendment.block_hash != source_hash {
+                    return Err(NodeError::Startup(format!(
+                        "stored STARK amendment target {} does not match storage key {source_hash}",
+                        amendment.block_hash
+                    )));
+                }
+                Ok(amendment)
+            }
+            StoredProofArtifact::Pointer(pointer) => {
+                if pointer.source_hash != source_hash
+                    || pointer.source_block != source_block
+                    || pointer.start_block > source_block
+                    || pointer.end_block < source_block
+                    || pointer.end_block != pointer.target_block
+                {
+                    return Err(NodeError::Startup(
+                        "stored STARK proof pointer metadata does not match its canonical source"
+                            .into(),
+                    ));
+                }
+                let target_bytes = self
+                    .amendment_store
+                    .get_amendment(&pointer.target_hash)?
+                    .ok_or_else(|| {
+                        NodeError::Startup(format!(
+                            "stored STARK proof pointer target {} is missing",
+                            pointer.target_hash
+                        ))
+                    })?;
+                let StoredProofArtifact::Amendment(amendment) =
+                    StoredProofArtifact::from_json(&target_bytes).map_err(|error| {
+                        NodeError::Startup(format!(
+                            "stored STARK proof pointer target is malformed: {error}"
+                        ))
+                    })?
+                else {
+                    return Err(NodeError::Startup(
+                        "stored STARK proof pointer target is not a full amendment".into(),
+                    ));
+                };
+                let covered_index = source_block
+                    .checked_sub(pointer.start_block)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(|| {
+                        NodeError::Startup("stored STARK proof pointer range overflows".into())
+                    })?;
+                if amendment.block_hash != pointer.target_hash
+                    || amendment.block_number != pointer.target_block
+                    || amendment.range_start_block() != Some(pointer.start_block)
+                    || amendment.layer != pointer.layer
+                    || amendment.settlement_tx_hash != pointer.settlement_tx_hash
+                    || amendment.covered_hashes().get(covered_index) != Some(&source_hash)
+                {
+                    return Err(NodeError::Startup(
+                        "stored STARK proof pointer does not match its target amendment".into(),
+                    ));
+                }
+                Ok(amendment)
+            }
+        }
     }
 
     fn wall_clock_millis() -> u64 {
