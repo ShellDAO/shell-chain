@@ -168,6 +168,8 @@ mod prefix {
     pub const RECOVERY_PROPOSAL: &[u8] = b"rp/";
     /// Undo journal for address-keyed metadata changed by a canonical block.
     pub const ADDRESS_METADATA_UNDO: &[u8] = b"mu/";
+    pub const ADDRESS_METADATA_UNDO_PRUNED_FINALIZED: &[u8] =
+        b"ADDRESS_METADATA_UNDO_PRUNED_FINALIZED";
     pub const TOTAL_TX_COUNT: &[u8] = b"TOTAL_TX_COUNT";
     pub const TOTAL_GAS_USED: &[u8] = b"TOTAL_GAS_USED";
     pub const TOTALS_HEAD: &[u8] = b"TOTALS_HEAD";
@@ -1506,6 +1508,8 @@ impl<S: KvStore> ChainStore<S> {
         let canonical_head_key = Self::number_key(metadata.block_number);
         let mut canonical_head_hash = None;
         let mut snapshot_chain_config = None;
+        let mut snapshot_finalized_number = None;
+        let mut snapshot_metadata_undo_pruned_finalized = None;
         let mut progress_keys = std::collections::HashSet::new();
         while let Some(entry) = snap_reader.next_entry()? {
             if entry.key == prefix::HEAD_BLOCK {
@@ -1524,6 +1528,7 @@ impl<S: KvStore> ChainStore<S> {
             } else if matches!(
                 entry.key.as_slice(),
                 prefix::FINALIZED_NUMBER
+                    | prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED
                     | prefix::TOTAL_TX_COUNT
                     | prefix::TOTAL_GAS_USED
                     | prefix::TOTALS_HEAD
@@ -1542,6 +1547,21 @@ impl<S: KvStore> ChainStore<S> {
                     return Err(StorageError::State(
                         "snapshot chain progress metadata has invalid length".into(),
                     ));
+                }
+                if entry.key == prefix::FINALIZED_NUMBER {
+                    let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
+                        StorageError::State(
+                            "snapshot chain progress metadata has invalid length".into(),
+                        )
+                    })?;
+                    snapshot_finalized_number = Some(u64::from_be_bytes(encoded));
+                } else if entry.key == prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED {
+                    let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
+                        StorageError::State(
+                            "snapshot chain progress metadata has invalid length".into(),
+                        )
+                    })?;
+                    snapshot_metadata_undo_pruned_finalized = Some(u64::from_be_bytes(encoded));
                 }
             } else if entry.key == canonical_head_key {
                 if entry.value.len() != 32 {
@@ -1573,6 +1593,14 @@ impl<S: KvStore> ChainStore<S> {
                 }
                 snapshot_chain_config = Some(config);
             }
+        }
+
+        if snapshot_metadata_undo_pruned_finalized.unwrap_or(0)
+            > snapshot_finalized_number.unwrap_or(0)
+        {
+            return Err(StorageError::State(
+                "snapshot address metadata undo pruning cursor exceeds finalized height".into(),
+            ));
         }
 
         let head_hash = head_hash
@@ -1638,6 +1666,7 @@ impl<S: KvStore> ChainStore<S> {
                 entry.key.as_slice(),
                 prefix::HEAD_BLOCK
                     | prefix::FINALIZED_NUMBER
+                    | prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED
                     | prefix::TOTAL_TX_COUNT
                     | prefix::TOTAL_GAS_USED
                     | prefix::TOTALS_HEAD
@@ -1683,6 +1712,7 @@ impl<S: KvStore> ChainStore<S> {
         for key in [
             prefix::HEAD_BLOCK,
             prefix::FINALIZED_NUMBER,
+            prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
             prefix::TOTAL_TX_COUNT,
             prefix::TOTAL_GAS_USED,
             prefix::TOTALS_HEAD,
@@ -1722,6 +1752,75 @@ impl<S: KvStore> ChainStore<S> {
             )),
             None => Ok(None),
         }
+    }
+
+    /// Delete address-metadata undo journals that can no longer be used by a
+    /// valid reorganization because their blocks are finalized.
+    ///
+    /// Journals are keyed by block hash, so pruning validates the corresponding
+    /// header before deleting all eligible entries in one atomic batch.
+    pub fn prune_finalized_address_metadata_undo(
+        &self,
+        finalized_number: u64,
+    ) -> Result<u64, StorageError> {
+        let pruned_finalized = match self
+            .store
+            .get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)?
+        {
+            Some(bytes) if bytes.len() == 8 => {
+                let encoded: [u8; 8] = bytes.try_into().map_err(|_| {
+                    StorageError::Codec(
+                        "invalid address metadata undo pruning cursor encoding".into(),
+                    )
+                })?;
+                u64::from_be_bytes(encoded)
+            }
+            Some(_) => {
+                return Err(StorageError::Codec(
+                    "invalid address metadata undo pruning cursor encoding".into(),
+                ))
+            }
+            None => 0,
+        };
+        if pruned_finalized >= finalized_number {
+            if pruned_finalized == finalized_number {
+                return Ok(0);
+            }
+            return Err(StorageError::State(format!(
+                "address metadata undo pruning cursor {pruned_finalized} exceeds finalized height {finalized_number}"
+            )));
+        }
+
+        let mut batch = WriteBatch::new();
+        let mut pruned = 0u64;
+
+        for (key, _) in self.store.scan_prefix(prefix::ADDRESS_METADATA_UNDO)? {
+            let raw_hash = key
+                .strip_prefix(prefix::ADDRESS_METADATA_UNDO)
+                .filter(|bytes| bytes.len() == 32)
+                .ok_or_else(|| {
+                    StorageError::Codec("invalid address metadata undo journal key".into())
+                })?;
+            let block_hash = ShellHash::try_from_slice(raw_hash)
+                .map_err(|error| StorageError::Codec(error.to_string()))?;
+            let header = self.get_header_by_hash(&block_hash)?.ok_or_else(|| {
+                StorageError::Database(format!(
+                    "address metadata undo journal header unavailable for block {block_hash}"
+                ))
+            })?;
+
+            if header.number <= finalized_number {
+                batch.delete(key);
+                pruned = pruned.saturating_add(1);
+            }
+        }
+
+        batch.put(
+            prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED.to_vec(),
+            finalized_number.to_be_bytes().to_vec(),
+        );
+        self.store.write_batch(batch)?;
+        Ok(pruned)
     }
 
     /// Store a commit certificate sidecar for a finalized block.
@@ -3481,6 +3580,12 @@ mod tests {
         let cs = ChainStore::new(Arc::clone(&store));
         cs.set_head(&ShellHash::from([0xAA; 32])).unwrap();
         cs.set_finalized_number(9).unwrap();
+        store
+            .put(
+                prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
+                &9u64.to_be_bytes(),
+            )
+            .unwrap();
         cs.set_total_tx_count(10).unwrap();
         cs.set_total_gas_used(U256::from(11)).unwrap();
         cs.set_chain_totals_head(9).unwrap();
@@ -3523,6 +3628,10 @@ mod tests {
 
         assert_eq!(cs.get_head_hash().unwrap(), Some(block_hash));
         assert_eq!(cs.get_finalized_number().unwrap(), None);
+        assert!(store
+            .get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)
+            .unwrap()
+            .is_none());
         assert_eq!(cs.get_total_tx_count().unwrap(), 0);
         assert_eq!(cs.get_total_gas_used().unwrap(), U256::ZERO);
         assert_eq!(cs.get_chain_totals_head().unwrap(), None);
@@ -3561,6 +3670,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("duplicate chain progress metadata"));
+        assert!(store.get(b"untrusted-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_undo_cursor_beyond_finality_before_writes() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            0,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(prefix::FINALIZED_NUMBER, &1u64.to_be_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
+                    &2u64.to_be_bytes(),
+                )
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cursor exceeds finalized height"));
         assert!(store.get(b"untrusted-key").unwrap().is_none());
     }
 
@@ -5043,6 +5190,108 @@ mod tests {
         overlay_cs
             .restore_address_metadata(std::slice::from_ref(&block))
             .unwrap();
+    }
+
+    #[test]
+    fn finalized_address_metadata_undo_journals_are_pruned_at_boundary() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let blocks = [empty_block(1), empty_block(2), empty_block(3)];
+
+        for block in &blocks {
+            let overlay_cs = ChainStore::new(Arc::new(OverlayStore::new(Arc::clone(&db))));
+            overlay_cs.commit_canonical_overlay(block, None).unwrap();
+        }
+
+        assert_eq!(base_cs.prune_finalized_address_metadata_undo(2).unwrap(), 2);
+        assert_eq!(base_cs.prune_finalized_address_metadata_undo(2).unwrap(), 0);
+        assert_eq!(
+            db.get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)
+                .unwrap(),
+            Some(2u64.to_be_bytes().to_vec())
+        );
+        assert!(db
+            .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                &blocks[0].hash()
+            ))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                &blocks[1].hash()
+            ))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                &blocks[2].hash()
+            ))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn address_metadata_undo_pruning_rejects_malformed_cursor() {
+        let db = Arc::new(MemoryDb::new());
+        db.put(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED, b"bad")
+            .unwrap();
+        let base_cs = ChainStore::new(db);
+
+        let error = base_cs
+            .prune_finalized_address_metadata_undo(1)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid address metadata undo pruning cursor"));
+    }
+
+    #[test]
+    fn address_metadata_undo_pruning_rejects_cursor_beyond_finality() {
+        let db = Arc::new(MemoryDb::new());
+        db.put(
+            prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
+            &2u64.to_be_bytes(),
+        )
+        .unwrap();
+        let base_cs = ChainStore::new(db);
+
+        let error = base_cs
+            .prune_finalized_address_metadata_undo(1)
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds finalized height"));
+    }
+
+    #[test]
+    fn address_metadata_undo_pruning_is_atomic_on_missing_header() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let valid_block = empty_block(1);
+        let overlay_cs = ChainStore::new(Arc::new(OverlayStore::new(Arc::clone(&db))));
+        overlay_cs
+            .commit_canonical_overlay(&valid_block, None)
+            .unwrap();
+
+        let missing_hash = ShellHash::from([0xA5; 32]);
+        db.put(
+            &ChainStore::<MemoryDb>::address_metadata_undo_key(&missing_hash),
+            b"[]",
+        )
+        .unwrap();
+
+        let error = base_cs
+            .prune_finalized_address_metadata_undo(1)
+            .unwrap_err();
+        assert!(error.to_string().contains("header unavailable"));
+        assert!(db
+            .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                &valid_block.hash()
+            ))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

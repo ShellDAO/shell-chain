@@ -1492,6 +1492,27 @@ impl<S: KvStore + 'static> Node<S> {
         }
         .max(self.finality.read().last_finalized_number());
 
+        match self
+            .chain_store
+            .prune_finalized_address_metadata_undo(finalized_number)
+        {
+            Ok(pruned) if pruned > 0 => {
+                tracing::debug!(
+                    pruned,
+                    finalized = finalized_number,
+                    "pruned finalized address metadata undo journals"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    finalized = finalized_number,
+                    "address metadata undo journal pruning failed"
+                );
+            }
+        }
+
         {
             let mut tracker = self.state_root_tracker.write();
             if let Some(evicted) = tracker.record(block_number, state_root) {
