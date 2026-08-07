@@ -148,6 +148,12 @@ impl alloy_rlp::Decodable for PQSignature {
         let sig_type = SignatureType::from_u8(sig_type_u8)
             .ok_or(alloy_rlp::Error::Custom("unknown signature type"))?;
         let data = alloy_rlp::Header::decode_bytes(&mut payload, false)?.to_vec();
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: header.payload_length.saturating_sub(payload.len()),
+            });
+        }
         *buf = buf
             .get(header.payload_length..)
             .unwrap_or_else(|| unreachable!("RLP header payload_length validated by decode"));
@@ -234,6 +240,29 @@ mod tests {
 
         let decoded = PQSignature::decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(decoded, valid);
+    }
+
+    #[test]
+    fn rlp_decode_rejects_trailing_signature_fields() {
+        use alloy_rlp::{Decodable, Encodable};
+
+        let signature = PQSignature::new(SignatureType::Dilithium3, vec![0u8; 32]);
+        let trailing = 1u8;
+        let payload_length = signature.fields_len() + trailing.length();
+        let mut encoded = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(&mut encoded);
+        signature.sig_type.as_u8().encode(&mut encoded);
+        signature.data.as_slice().encode(&mut encoded);
+        trailing.encode(&mut encoded);
+
+        assert!(matches!(
+            PQSignature::decode(&mut encoded.as_slice()),
+            Err(alloy_rlp::Error::ListLengthMismatch { .. })
+        ));
     }
 
     #[test]
