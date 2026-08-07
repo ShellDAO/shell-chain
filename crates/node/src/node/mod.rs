@@ -9414,6 +9414,8 @@ mod tests {
             .get_amendment(&genesis_hash)
             .unwrap()
             .is_none());
+        assert_eq!(node.metrics.stark_settlements_rejected.get(), 0);
+        assert_eq!(node.metrics.stark_recovery_artifacts_rejected.get(), 1);
         let backlog = node.proof_backlog.lock();
         let task = backlog
             .peek()

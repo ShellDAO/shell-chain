@@ -2606,7 +2606,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     self.validate_stark_proof_source_binding(&amendment)
                                 });
                             if let Err(error) = recovered_is_valid {
-                                self.metrics.stark_settlements_rejected.inc();
+                                self.metrics.stark_recovery_artifacts_rejected.inc();
                                 warn!(
                                     block = amendment.block_number,
                                     layer = amendment.layer,

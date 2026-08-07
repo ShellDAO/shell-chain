@@ -67,6 +67,8 @@ pub struct Metrics {
     pub stark_settlements_accepted: IntCounter,
     /// Number of STARK amendments rejected during validation.
     pub stark_settlements_rejected: IntCounter,
+    /// Invalid persisted proof artifacts discarded during frontier recovery.
+    pub stark_recovery_artifacts_rejected: IntCounter,
     /// Current frontier lag: how many L0 blocks are not yet settled at L1.
     pub stark_frontier_lag: IntGauge,
     // -----------------------------------------------------------------------
@@ -213,6 +215,10 @@ impl Metrics {
             "shell_stark_settlements_rejected_total",
             "Number of STARK amendments rejected during validation",
         ))?;
+        let stark_recovery_artifacts_rejected = IntCounter::with_opts(Opts::new(
+            "shell_stark_recovery_artifacts_rejected_total",
+            "Invalid persisted proof artifacts discarded during frontier recovery",
+        ))?;
         let stark_frontier_lag = IntGauge::with_opts(Opts::new(
             "shell_stark_frontier_lag",
             "Current frontier lag: how many L0 blocks are not yet settled at L1",
@@ -284,6 +290,7 @@ impl Metrics {
         registry.register(Box::new(stark_equivocations_detected.clone()))?;
         registry.register(Box::new(stark_settlements_accepted.clone()))?;
         registry.register(Box::new(stark_settlements_rejected.clone()))?;
+        registry.register(Box::new(stark_recovery_artifacts_rejected.clone()))?;
         registry.register(Box::new(stark_frontier_lag.clone()))?;
         registry.register(Box::new(stark_l2_pending_inputs.clone()))?;
         registry.register(Box::new(stark_l2_ready_jobs.clone()))?;
@@ -318,6 +325,7 @@ impl Metrics {
             stark_equivocations_detected,
             stark_settlements_accepted,
             stark_settlements_rejected,
+            stark_recovery_artifacts_rejected,
             stark_frontier_lag,
             stark_l2_pending_inputs,
             stark_l2_ready_jobs,
