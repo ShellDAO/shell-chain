@@ -231,7 +231,10 @@ for ((index = 0; index < ${#endpoints[@]}; index += 1)); do
   metrics="$(curl --fail --silent --show-error --max-time 5 "${endpoint%/}/metrics" 2>/dev/null || true)"
   if [[ -n "$health" ]]; then
     ((reachable_count += 1))
-    [[ "$service" == "$SHELL_STARK_GUARD_SERVICE" ]] && guard_reachable=1
+  fi
+  if [[ "$service" == "$SHELL_STARK_GUARD_SERVICE" \
+    && -n "$health" && -n "$metrics" ]]; then
+    guard_reachable=1
   fi
   if (( active[index] == 1 )) && [[ "$health" == *'"production_ready":true'* ]]; then
     ((ready_count += 1))

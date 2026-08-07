@@ -45,6 +45,12 @@ case "$endpoint" in
       exit 22
     fi
     ;;
+  http://metrics-missing/health)
+    printf '%s\n' '{"block_height":10,"production_ready":true,"syncing":false}'
+    ;;
+  http://metrics-missing/metrics)
+    exit 22
+    ;;
   */metrics)
     printf '%s\n' "${WATCHDOG_TEST_METRICS:-shell_block_height 10}"
     ;;
@@ -223,6 +229,27 @@ grep -qx 'SHELL_ENABLE_STARK_AGGREGATION=false' "$unreachable_env"
 grep -qx 'restart prover.service' "$actions"
 grep -qx 'stop tx-worker.service' "$actions"
 grep -qx 'start tx-worker.service' "$actions"
+
+metrics_unreachable_env="$tmp/metrics-unreachable-stark.env"
+cp "$healthy_env" "$metrics_unreachable_env"
+: >"$actions"
+for _ in 1 2 3; do
+  run_watchdog \
+    "http://metrics-missing,http://ready" \
+    "prover.service,validator.service" \
+    "$tmp/metrics-unreachable-stark" \
+    "$actions" \
+    "" \
+    "" \
+    "$metrics_unreachable_env" \
+    $'shell_block_height 10' \
+    "" \
+    15 \
+    3
+done
+grep -qx 'SHELL_NODE_ROLE=validator' "$metrics_unreachable_env"
+grep -qx 'SHELL_ENABLE_STARK_AGGREGATION=false' "$metrics_unreachable_env"
+grep -qx 'restart prover.service' "$actions"
 
 deferred_env="$tmp/deferred-stark.env"
 cp "$healthy_env" "$deferred_env"
