@@ -917,7 +917,11 @@ impl<S: KvStore + 'static> Node<S> {
                 .cancel_settled_witness_deletes(&reverted_settlements);
         }
 
-        if self.chain_store.get_chain_totals_head()?.is_some() {
+        if self
+            .chain_store
+            .get_chain_totals_head()?
+            .is_some_and(|totals_head| totals_head != finalized_number)
+        {
             self.chain_store.rebuild_chain_totals(finalized_number)?;
         }
         let reverted_txs = unique_reverted_transactions(&old_chain, &[]);

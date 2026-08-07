@@ -628,8 +628,89 @@ impl<S: KvStore> ChainStore<S> {
             batch.delete(Self::number_key(*number));
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        self.append_reorg_totals(&mut batch, old_chain, new_chain, new_head)?;
 
         Ok(batch)
+    }
+
+    fn append_reorg_totals(
+        &self,
+        batch: &mut WriteBatch,
+        old_chain: &[Block],
+        new_chain: &[Block],
+        new_head: &ShellHash,
+    ) -> Result<(), StorageError> {
+        let Some(old_tip_number) = old_chain.last().map(Block::number) else {
+            return Ok(());
+        };
+        if self.get_chain_totals_head()? != Some(old_tip_number) {
+            return Ok(());
+        }
+        let (Some(current_txs), Some(current_gas)) = (
+            self.get_total_tx_count_opt()?,
+            self.get_total_gas_used_opt()?,
+        ) else {
+            return Ok(());
+        };
+
+        let visible_txs = |block: &Block| {
+            u64::try_from(
+                block
+                    .transactions
+                    .len()
+                    .saturating_add(block.system_transactions.len()),
+            )
+            .map_err(|_| StorageError::Codec("block transaction count exceeds u64".into()))
+        };
+        let removed_txs = old_chain.iter().try_fold(0u64, |total, block| {
+            total
+                .checked_add(visible_txs(block)?)
+                .ok_or_else(|| StorageError::Codec("reorg transaction count overflow".into()))
+        })?;
+        let added_txs = new_chain.iter().try_fold(0u64, |total, block| {
+            total
+                .checked_add(visible_txs(block)?)
+                .ok_or_else(|| StorageError::Codec("reorg transaction count overflow".into()))
+        })?;
+        let removed_gas = old_chain.iter().fold(U256::ZERO, |total, block| {
+            total.saturating_add(U256::from(block.header.gas_used))
+        });
+        let added_gas = new_chain.iter().fold(U256::ZERO, |total, block| {
+            total.saturating_add(U256::from(block.header.gas_used))
+        });
+        let next_txs = current_txs
+            .checked_sub(removed_txs)
+            .and_then(|total| total.checked_add(added_txs))
+            .ok_or_else(|| StorageError::Codec("reorg transaction totals underflow".into()))?;
+        let next_gas = current_gas
+            .checked_sub(removed_gas)
+            .and_then(|total| total.checked_add(added_gas))
+            .ok_or_else(|| StorageError::Codec("reorg gas totals underflow".into()))?;
+        let new_head_number = match new_chain.last() {
+            Some(block) => block.number(),
+            None => self
+                .get_header_by_hash(new_head)?
+                .map(|header| header.number)
+                .ok_or_else(|| {
+                    StorageError::Codec(format!(
+                        "new canonical head header {new_head} is unavailable while updating totals"
+                    ))
+                })?,
+        };
+
+        batch.put(
+            prefix::TOTAL_TX_COUNT.to_vec(),
+            next_txs.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            prefix::TOTAL_GAS_USED.to_vec(),
+            next_gas.to_be_bytes::<32>().to_vec(),
+        );
+        batch.put(
+            prefix::TOTALS_HEAD.to_vec(),
+            new_head_number.to_be_bytes().to_vec(),
+        );
+        Ok(())
     }
 
     /// Mark a block number → hash mapping in the canonical chain index.
@@ -5084,12 +5165,17 @@ mod tests {
     fn commit_reorg_overlay_publishes_state_receipts_and_head_atomically() {
         let db = Arc::new(MemoryDb::new());
         let base_cs = ChainStore::new(Arc::clone(&db));
-        let old_block = empty_block(1);
+        let mut old_block = make_block_with_txs(1);
+        old_block.header.gas_used = 21_000;
         let mut new_block = empty_block(1);
         new_block.header.timestamp = 1;
+        new_block.header.gas_used = 7;
         let old_hash = old_block.hash();
         let new_hash = new_block.hash();
         base_cs.commit_canonical_block(&old_block, None).unwrap();
+        base_cs.set_total_tx_count(1).unwrap();
+        base_cs.set_total_gas_used(U256::from(21_000)).unwrap();
+        base_cs.set_chain_totals_head(1).unwrap();
 
         let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
         overlay.put(b"replayed-state", b"present").unwrap();
@@ -5111,6 +5197,9 @@ mod tests {
         assert_eq!(base_cs.get_head_hash().unwrap(), Some(new_hash));
         assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(new_hash));
         assert_eq!(base_cs.get_receipts(&new_hash).unwrap(), Some(vec![]));
+        assert_eq!(base_cs.get_total_tx_count().unwrap(), 0);
+        assert_eq!(base_cs.get_total_gas_used().unwrap(), U256::from(7));
+        assert_eq!(base_cs.get_chain_totals_head().unwrap(), Some(1));
         assert_ne!(old_hash, new_hash);
     }
 
@@ -5124,6 +5213,9 @@ mod tests {
         let old_hash = old_block.hash();
         let new_hash = new_block.hash();
         base_cs.commit_canonical_block(&old_block, None).unwrap();
+        base_cs.set_total_tx_count(3).unwrap();
+        base_cs.set_total_gas_used(U256::from(5)).unwrap();
+        base_cs.set_chain_totals_head(1).unwrap();
 
         let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
         overlay.put(b"replayed-state", b"present").unwrap();
@@ -5145,6 +5237,9 @@ mod tests {
         assert_eq!(base_cs.get_head_hash().unwrap(), Some(old_hash));
         assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(old_hash));
         assert_eq!(base_cs.get_receipts(&new_hash).unwrap(), None);
+        assert_eq!(base_cs.get_total_tx_count().unwrap(), 3);
+        assert_eq!(base_cs.get_total_gas_used().unwrap(), U256::from(5));
+        assert_eq!(base_cs.get_chain_totals_head().unwrap(), Some(1));
     }
 
     #[test]

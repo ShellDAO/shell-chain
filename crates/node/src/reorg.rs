@@ -173,7 +173,10 @@ impl ReorgEngine {
         // the new canonical chain. Same-height reorgs otherwise leave
         // chain_totals_head unchanged while tx/gas totals still describe the
         // old canonical branch.
-        if chain_store.get_chain_totals_head()?.is_some() {
+        if chain_store
+            .get_chain_totals_head()?
+            .is_some_and(|totals_head| totals_head != new_tip_number)
+        {
             chain_store.rebuild_chain_totals(new_tip_number)?;
         }
 
