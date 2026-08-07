@@ -165,7 +165,15 @@ witness bundle if the storage profile is not `"archive"` and the
 | `stark_amendments_queried_total` | Incremented each time `shell_getProofAmendment` returns a non-null proof. |
 | `shell_stark_settlements_accepted_total` | STARK settlement transactions accepted into chain state (v0.22.x). |
 | `shell_stark_settlements_rejected_total` | STARK settlements rejected due to ordering, layer, or frontier violations (v0.22.x). |
+| `shell_stark_pending_settlements` | Generated amendments waiting for canonical settlement. The prover admission window is limited to two. |
+| `shell_stark_amendments_rate_limited_total` | Authenticated amendments rejected because the settlement window or per-prover rate limit was exhausted. |
 | `shell_stark_frontier_lag` | Blocks between the chain tip and the highest continuously-settled STARK layer. Alert if > 100 (v0.22.x). |
+
+Proving is disabled until the node passes its synchronization and readiness
+gates. Alert when pending settlements remain at the limit while the frontier
+does not advance, or when the rate-limited counter grows continuously. Do not
+raise admission limits until block propagation and settlement are confirmed
+healthy.
 
 ---
 

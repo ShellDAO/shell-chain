@@ -57,6 +57,10 @@ pub struct Metrics {
     pub stark_backlog_depth: IntGauge,
     /// Total ProofAmendment messages broadcast.
     pub stark_amendments_broadcast: IntCounter,
+    /// Number of proof amendments currently waiting for canonical settlement.
+    pub stark_pending_settlements: IntGauge,
+    /// Number of authenticated proof amendments rejected by admission limits.
+    pub stark_amendments_rate_limited: IntCounter,
     /// Total equivocation proofs detected and broadcast.
     pub stark_equivocations_detected: IntCounter,
     /// Number of STARK settlements accepted and included in a produced block.
@@ -189,6 +193,14 @@ impl Metrics {
             "shell_stark_amendments_broadcast_total",
             "Total ProofAmendment messages broadcast",
         ))?;
+        let stark_pending_settlements = IntGauge::with_opts(Opts::new(
+            "shell_stark_pending_settlements",
+            "Proof amendments waiting for canonical settlement",
+        ))?;
+        let stark_amendments_rate_limited = IntCounter::with_opts(Opts::new(
+            "shell_stark_amendments_rate_limited_total",
+            "Authenticated proof amendments rejected by admission limits",
+        ))?;
         let stark_equivocations_detected = IntCounter::with_opts(Opts::new(
             "shell_stark_equivocations_detected_total",
             "Total equivocation proofs detected and broadcast",
@@ -267,6 +279,8 @@ impl Metrics {
         registry.register(Box::new(stark_proof_duration_seconds.clone()))?;
         registry.register(Box::new(stark_backlog_depth.clone()))?;
         registry.register(Box::new(stark_amendments_broadcast.clone()))?;
+        registry.register(Box::new(stark_pending_settlements.clone()))?;
+        registry.register(Box::new(stark_amendments_rate_limited.clone()))?;
         registry.register(Box::new(stark_equivocations_detected.clone()))?;
         registry.register(Box::new(stark_settlements_accepted.clone()))?;
         registry.register(Box::new(stark_settlements_rejected.clone()))?;
@@ -299,6 +313,8 @@ impl Metrics {
             stark_proof_duration_seconds,
             stark_backlog_depth,
             stark_amendments_broadcast,
+            stark_pending_settlements,
+            stark_amendments_rate_limited,
             stark_equivocations_detected,
             stark_settlements_accepted,
             stark_settlements_rejected,
@@ -540,6 +556,8 @@ mod tests {
         assert_eq!(m.peer_count.get(), 0);
         assert_eq!(m.syncing.get(), 0);
         assert_eq!(m.production_ready.get(), 0);
+        assert_eq!(m.stark_pending_settlements.get(), 0);
+        assert_eq!(m.stark_amendments_rate_limited.get(), 0);
         assert_eq!(m.tx_pool_size.get(), 0);
         assert_eq!(m.blocks_imported.get(), 0);
         assert_eq!(m.txs_received.get(), 0);
@@ -575,6 +593,8 @@ mod tests {
         );
         assert!(output.contains("shell_syncing"));
         assert!(output.contains("shell_production_ready"));
+        assert!(output.contains("shell_stark_pending_settlements"));
+        assert!(output.contains("shell_stark_amendments_rate_limited_total"));
         assert!(
             output.contains("shell_tx_pool_size"),
             "should contain tx_pool_size metric"

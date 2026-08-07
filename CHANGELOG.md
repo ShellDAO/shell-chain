@@ -10,6 +10,11 @@ All notable changes to this project will be documented in this file.
 - Account for the outer envelope and session-verification intrinsic gas in AA
   receipts and fee settlement, without treating the unused outer destination
   as a contract-creation request.
+- Start STARK proof generation only after node readiness, and bound both the
+  proof handoff queue and the number of amendments awaiting canonical
+  settlement.
+- Expose pending STARK settlements and rate-limited amendments as Prometheus
+  metrics for prover admission monitoring.
 - Require a production binary build before creating a release tag.
 - Avoid allocating account-trie keys on world-state cache misses and writes.
 - Run advanced CodeQL analysis for fork-based pull requests so every proposed
@@ -33,6 +38,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Accept a rotated wPoA proposer during historical block sync only with a
+  verified commit certificate and after the deterministic view-change timeout,
+  so restarted validators can synchronize safely after a valid view change.
+- Apply backpressure to STARK proof generation and authenticated amendment
+  gossip so an unsettled historical frontier cannot starve block propagation.
 - Bind block-sync responses to the requested starting height before importing
   any peer-supplied blocks.
 - Prune address-metadata undo journals once their blocks are finalized, while

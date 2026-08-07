@@ -24,6 +24,7 @@ use crate::poa::PoaEngine;
 use crate::validator::{ValidatorSet, ValidatorSetConfig};
 use crate::{
     ConsensusEngine, ConsensusError, EngineType, PoaConfig, ViewChangeMessage, ViewChangeState,
+    VIEW_CHANGE_TIMEOUT_MS,
 };
 
 /// Configuration for the weighted PoA engine.
@@ -178,6 +179,21 @@ impl WPoaEngine {
         ViewChangeState::select_proposer(view, &rotated)
     }
 
+    fn first_view_for_proposer(&self, block_number: u64, proposer: Address) -> Option<u64> {
+        if !self.validator_set.is_active(&proposer) {
+            return None;
+        }
+
+        let base = self.base_proposer_for_block(block_number);
+        if proposer == base {
+            return Some(0);
+        }
+
+        let authority_count = self.inner.config().authorities.len();
+        (1..=authority_count as u64)
+            .find(|view| self.proposer_for_block_in_view(block_number, *view) == proposer)
+    }
+
     pub fn handle_view_change_message(
         &mut self,
         msg: ViewChangeMessage,
@@ -280,6 +296,38 @@ impl ConsensusEngine for WPoaEngine {
         // can be performed without ChainStore access:
         //   1. Proposer is in the active validator set (checked above).
         //   2. Proposer matches the weighted round-robin slot (checked above).
+        Ok(())
+    }
+
+    fn verify_header_for_finalized_import(
+        &self,
+        header: &BlockHeader,
+        parent: &BlockHeader,
+    ) -> Result<(), ConsensusError> {
+        let Some(view) = self.first_view_for_proposer(header.number, header.proposer) else {
+            return Err(ConsensusError::UnknownProposer(header.proposer));
+        };
+        if view == 0 {
+            return Ok(());
+        }
+
+        // View-change votes are transient in the current wire format. A node
+        // catching up after restart therefore cannot reconstruct the original
+        // in-memory view, but it can enforce the earliest timestamp at which
+        // that rotated proposer could legally have become active. Live block
+        // production still requires signed view-change quorum before sealing.
+        let timeout_secs = VIEW_CHANGE_TIMEOUT_MS
+            .div_ceil(1_000)
+            .max(self.inner.config().block_time_secs);
+        let earliest = parent
+            .timestamp
+            .saturating_add(timeout_secs.saturating_mul(view));
+        if header.timestamp < earliest {
+            return Err(ConsensusError::InvalidProposer {
+                expected: self.base_proposer_for_block(header.number),
+                got: header.proposer,
+            });
+        }
         Ok(())
     }
 
@@ -489,6 +537,69 @@ mod tests {
         assert!(e.is_proposer(0, &addr(1)));
         assert!(!e.is_proposer(0, &addr(2)));
         assert!(e.is_proposer(1, &addr(2)));
+    }
+
+    #[test]
+    fn import_accepts_rotated_proposer_after_view_timeout() {
+        let e = engine(vec![addr(1), addr(2), addr(3)], vec![1, 1, 1]);
+        let parent = BlockHeader {
+            number: 8,
+            timestamp: 1_000,
+            ..Default::default()
+        };
+        let header = BlockHeader {
+            number: 9,
+            timestamp: 1_010,
+            proposer: addr(2),
+            ..Default::default()
+        };
+
+        assert!(e.verify_header(&header).is_err());
+        assert!(e
+            .verify_header_for_finalized_import(&header, &parent)
+            .is_ok());
+    }
+
+    #[test]
+    fn import_rejects_rotated_proposer_before_view_timeout() {
+        let e = engine(vec![addr(1), addr(2), addr(3)], vec![1, 1, 1]);
+        let parent = BlockHeader {
+            number: 8,
+            timestamp: 1_000,
+            ..Default::default()
+        };
+        let header = BlockHeader {
+            number: 9,
+            timestamp: 1_009,
+            proposer: addr(2),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            e.verify_header_for_finalized_import(&header, &parent),
+            Err(ConsensusError::InvalidProposer { .. })
+        ));
+    }
+
+    #[test]
+    fn import_rejects_non_validator_even_after_view_timeout() {
+        let e = engine(vec![addr(1), addr(2)], vec![1, 1]);
+        let parent = BlockHeader {
+            number: 0,
+            timestamp: 1_000,
+            ..Default::default()
+        };
+        let header = BlockHeader {
+            number: 1,
+            timestamp: 2_000,
+            proposer: addr(9),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            e.verify_header_for_finalized_import(&header, &parent),
+            Err(ConsensusError::UnknownProposer(proposer)) if proposer == addr(9)
+        ));
     }
 
     #[test]

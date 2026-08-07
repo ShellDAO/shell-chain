@@ -154,12 +154,15 @@ impl Drop for ProverServiceHandle {
 pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     backlog: Arc<Mutex<ProofBacklog>>,
     amendment_store: ProofAmendmentStore<S>,
-    amendment_tx: Option<mpsc::UnboundedSender<ProofAmendment>>,
+    amendment_tx: Option<mpsc::Sender<ProofAmendment>>,
     config: ProverConfig,
     /// The node's own address, used as `prover` field in [`ProofAmendment`].
     prover_address: shell_primitives::Address,
     /// The node key that authenticates generated proof amendments.
     prover_signer: Option<Arc<dyn Signer>>,
+    /// Readiness gate controlled by the node event loop. Proving must not
+    /// compete with startup sync or publish amendments from a stale head.
+    readiness_rx: Option<watch::Receiver<bool>>,
     /// L2 STARK mode — controls whether recursive L2 proving is attempted.
     l2_mode: L2StarkMode,
     /// Shared drain frontier: updated after each drain_front so the seeder
@@ -182,6 +185,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             config,
             prover_address,
             prover_signer: None,
+            readiness_rx: None,
             l2_mode: L2StarkMode::Disabled,
             drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -190,6 +194,12 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     /// Set the signer used to authenticate locally generated amendments.
     pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
         self.prover_signer = Some(signer);
+        self
+    }
+
+    /// Pause proof generation until the node has completed startup sync.
+    pub fn with_readiness(mut self, readiness_rx: watch::Receiver<bool>) -> Self {
+        self.readiness_rx = Some(readiness_rx);
         self
     }
 
@@ -202,10 +212,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     /// Send locally generated amendments back to the node event loop for P2P
     /// settlement ordering, reward queueing, and P2P broadcast after they are
     /// durably stored.
-    pub fn with_amendment_sender(
-        mut self,
-        amendment_tx: mpsc::UnboundedSender<ProofAmendment>,
-    ) -> Self {
+    pub fn with_amendment_sender(mut self, amendment_tx: mpsc::Sender<ProofAmendment>) -> Self {
         self.amendment_tx = Some(amendment_tx);
         self
     }
@@ -232,7 +239,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         }
     }
 
-    async fn run_loop(self, mut shutdown_rx: watch::Receiver<bool>) {
+    async fn run_loop(mut self, mut shutdown_rx: watch::Receiver<bool>) {
         info!(
             "ProverService started (max_concurrent={})",
             self.config.max_concurrent_proofs
@@ -251,6 +258,28 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             if *shutdown_rx.borrow() {
                 info!("ProverService received shutdown signal, stopping");
                 break;
+            }
+
+            if self.readiness_rx.as_ref().is_some_and(|rx| !*rx.borrow()) {
+                let readiness_rx = self
+                    .readiness_rx
+                    .as_mut()
+                    .expect("readiness receiver checked above");
+                tokio::select! {
+                    changed = readiness_rx.changed() => {
+                        if changed.is_err() {
+                            info!("ProverService readiness channel closed, stopping");
+                            break;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            info!("ProverService received shutdown signal while paused");
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
 
             // Pop next task from the backlog.
@@ -381,7 +410,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     }
                 }
                 Some(task) => {
-                    self.process_task(task).await;
+                    self.process_task(task, Some(&mut shutdown_rx)).await;
                 }
             }
         }
@@ -389,7 +418,11 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         info!("ProverService stopped");
     }
 
-    async fn process_task(&self, task: ProofTask) {
+    async fn process_task(
+        &self,
+        task: ProofTask,
+        mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
+    ) {
         let block_hash = task.block_hash;
         let block_number = task.block_number;
         debug!(
@@ -492,12 +525,20 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                             Ok(()) => {
                                 info!(
                                     "ProverService: proof amendment stored for range ending at block #{block_number} ({artifact_count} source hashes)"
-                            );
+                                );
                                 if let Some(tx) = &self.amendment_tx {
-                                    if tx.send(amendment).is_err() {
+                                    let sent = if let Some(shutdown_rx) = shutdown_rx.as_mut() {
+                                        tokio::select! {
+                                            result = tx.send(amendment) => result.is_ok(),
+                                            _ = shutdown_rx.changed() => false,
+                                        }
+                                    } else {
+                                        tx.send(amendment).await.is_ok()
+                                    };
+                                    if !sent {
                                         warn!(
-                                        "ProverService: proof amendment broadcast channel closed for block #{block_number}"
-                                    );
+                                            "ProverService: proof amendment channel closed or shutting down for block #{block_number}"
+                                        );
                                     }
                                 }
                             }
@@ -678,6 +719,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_waits_for_node_readiness_before_proving() {
+        let (service, backlog) = make_service();
+        let entry = shell_stark_prover::SigBatchEntry {
+            msg_hash: [1u8; 32],
+            pk_hash: [2u8; 32],
+        };
+        backlog.lock().push(ProofTask::with_sources(
+            [3u8; 32],
+            1,
+            vec![entry; MIN_L1_STARK_TXS],
+            1,
+            vec![ShellHash::from([3u8; 32])],
+            Some(1_000_000),
+        ));
+        let (readiness_tx, readiness_rx) = watch::channel(false);
+        let (amendment_tx, mut amendment_rx) = mpsc::channel(1);
+        let handle = service
+            .with_readiness(readiness_rx)
+            .with_amendment_sender(amendment_tx)
+            .start();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backlog.lock().len(), 1, "syncing prover must stay paused");
+
+        readiness_tx.send(true).expect("service is listening");
+        let amendment = tokio::time::timeout(Duration::from_secs(5), amendment_rx.recv())
+            .await
+            .expect("proof generation timed out")
+            .expect("amendment channel closed");
+        assert_eq!(amendment.block_number, 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn service_stores_full_proof_only_at_range_end() {
         let (service, _backlog) = make_service();
         let first_hash = ShellHash::from([1u8; 32]);
@@ -694,7 +769,7 @@ mod tests {
             Some(10_000),
         );
 
-        service.process_task(task).await;
+        service.process_task(task, None).await;
 
         let pointer_bytes = service
             .amendment_store

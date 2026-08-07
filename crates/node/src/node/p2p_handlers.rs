@@ -581,53 +581,15 @@ impl<S: KvStore + 'static> Node<S> {
         )
     }
 
-    pub fn fast_finalize_with_certificate(
+    /// Verify a commit certificate independently of local canonical storage.
+    /// Block sync uses this before importing a view-changed finalized block;
+    /// finalization performs the canonical-target checks separately.
+    pub(crate) fn verify_commit_certificate(
         &self,
         block_number: u64,
         block_hash: ShellHash,
         cert: &[u8],
     ) -> bool {
-        let canonical_hash = match self.chain_store.get_block_hash_by_number(block_number) {
-            Ok(Some(hash)) => hash,
-            Ok(None) => {
-                warn!(block_number, %block_hash, "FF.7: certificate target is not canonical");
-                return false;
-            }
-            Err(e) => {
-                warn!(block_number, %block_hash, error = %e, "FF.7: failed to resolve canonical certificate target");
-                return false;
-            }
-        };
-        if canonical_hash != block_hash {
-            warn!(
-                block_number,
-                %block_hash,
-                %canonical_hash,
-                "FF.7: certificate target does not match canonical block"
-            );
-            return false;
-        }
-        match self.chain_store.get_header_by_hash(&block_hash) {
-            Ok(Some(header)) if header.number == block_number => {}
-            Ok(Some(header)) => {
-                warn!(
-                    block_number,
-                    %block_hash,
-                    stored_number = header.number,
-                    "FF.7: certificate target height does not match stored header"
-                );
-                return false;
-            }
-            Ok(None) => {
-                warn!(block_number, %block_hash, "FF.7: certificate target header is missing");
-                return false;
-            }
-            Err(e) => {
-                warn!(block_number, %block_hash, error = %e, "FF.7: failed to load certificate target header");
-                return false;
-            }
-        }
-
         let Some(signatures) = Self::decode_commit_certificate(cert) else {
             warn!(block_number, %block_hash, "FF.7: invalid commit certificate encoding");
             return false;
@@ -698,6 +660,59 @@ impl<S: KvStore + 'static> Node<S> {
                 quorum,
                 "FF.7: certificate below quorum"
             );
+            return false;
+        }
+        true
+    }
+
+    pub fn fast_finalize_with_certificate(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+    ) -> bool {
+        let canonical_hash = match self.chain_store.get_block_hash_by_number(block_number) {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                warn!(block_number, %block_hash, "FF.7: certificate target is not canonical");
+                return false;
+            }
+            Err(e) => {
+                warn!(block_number, %block_hash, error = %e, "FF.7: failed to resolve canonical certificate target");
+                return false;
+            }
+        };
+        if canonical_hash != block_hash {
+            warn!(
+                block_number,
+                %block_hash,
+                %canonical_hash,
+                "FF.7: certificate target does not match canonical block"
+            );
+            return false;
+        }
+        match self.chain_store.get_header_by_hash(&block_hash) {
+            Ok(Some(header)) if header.number == block_number => {}
+            Ok(Some(header)) => {
+                warn!(
+                    block_number,
+                    %block_hash,
+                    stored_number = header.number,
+                    "FF.7: certificate target height does not match stored header"
+                );
+                return false;
+            }
+            Ok(None) => {
+                warn!(block_number, %block_hash, "FF.7: certificate target header is missing");
+                return false;
+            }
+            Err(e) => {
+                warn!(block_number, %block_hash, error = %e, "FF.7: failed to load certificate target header");
+                return false;
+            }
+        }
+
+        if !self.verify_commit_certificate(block_number, block_hash, cert) {
             return false;
         }
 

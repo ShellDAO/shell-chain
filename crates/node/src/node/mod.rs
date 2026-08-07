@@ -22,8 +22,9 @@ pub(crate) use tracing::{debug, info, warn};
 
 pub(crate) use shell_consensus::{
     detect_offline, Attestation, ConsensusEngine, EngineType, EquivocationProof, FinalityState,
-    ForkChoice, PeerScorer, PeerScoringConfig, ProofWindowManager, SlashingConfig,
-    ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig, VIEW_CHANGE_TIMEOUT_MS,
+    ForkChoice, PeerScorer, PeerScoringConfig, ProofRateLimiter, ProofWindowManager,
+    RateLimiterConfig, SlashingConfig, ViewChangeMessage, WPoaEvent, WPoaRound, WindowConfig,
+    VIEW_CHANGE_TIMEOUT_MS,
 };
 pub(crate) use shell_core::{
     calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, Block,
@@ -300,6 +301,11 @@ pub struct Node<S: KvStore + 'static> {
     /// This prevents the drain-reseed infinite loop where drained sparse blocks
     /// are immediately re-inserted at the backlog front by the seeder.
     pub(crate) stark_drain_frontier: Arc<std::sync::atomic::AtomicU64>,
+    /// Set after startup synchronization completes so imported catch-up blocks
+    /// cannot fill the proof backlog or trigger proof gossip prematurely.
+    prover_ready: std::sync::atomic::AtomicBool,
+    /// Per-prover admission control for authenticated proof gossip.
+    proof_rate_limiter: parking_lot::Mutex<ProofRateLimiter>,
 }
 
 const SYNC_RETRY_BASE_INTERVAL_SECS: u64 = 5;
@@ -308,6 +314,8 @@ const SYNC_RETRY_BACKOFF_THRESHOLD: u32 = 3;
 const TX_REBROADCAST_INTERVAL_SECS: u64 = 10;
 const MAX_TX_REBROADCAST_PER_TICK: usize = 64;
 const TX_REBROADCAST_COOLDOWN_SECS: u64 = 60;
+const PROVER_AMENDMENT_CHANNEL_CAPACITY: usize = 1;
+const MAX_PENDING_STARK_SETTLEMENTS: usize = 2;
 
 const MAX_DEV_SNAPSHOTS: usize = 128;
 
@@ -562,6 +570,27 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
                 let _ = self.l2_input_index.put(&amendment.block_hash);
             }
         }
+    }
+
+    fn remove_settled_pending(&self, amendments: &[ProofAmendment]) {
+        if amendments.is_empty() {
+            return;
+        }
+        let settled: HashSet<(u32, ShellHash)> = amendments
+            .iter()
+            .flat_map(|amendment| {
+                amendment
+                    .covered_hashes()
+                    .into_iter()
+                    .map(move |source| (amendment.layer, source))
+            })
+            .collect();
+        self.pending_stark_settlements.lock().retain(|pending| {
+            !pending
+                .covered_hashes()
+                .into_iter()
+                .any(|source| settled.contains(&(pending.layer, source)))
+        });
     }
 }
 
@@ -856,6 +885,13 @@ impl<S: KvStore + 'static> Node<S> {
             tx_rebroadcast_seen: parking_lot::Mutex::new(HashMap::new()),
             last_proposed_by: parking_lot::Mutex::new(HashMap::new()),
             stark_drain_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prover_ready: std::sync::atomic::AtomicBool::new(false),
+            proof_rate_limiter: parking_lot::Mutex::new(ProofRateLimiter::new(RateLimiterConfig {
+                initial_tokens: MAX_PENDING_STARK_SETTLEMENTS as u64,
+                refill_rate: 1,
+                refill_interval: std::time::Duration::from_secs(2),
+                gc_after: std::time::Duration::from_secs(600),
+            })),
         };
 
         // H-1: Emit a loud startup warning when stub-l2-verifier is compiled in.
@@ -2980,6 +3016,26 @@ mod tests {
             compressed_size: Some(compressed_size),
             settlement_tx_hash: None,
         }
+    }
+
+    #[test]
+    fn imported_settlement_releases_bounded_pending_slot() {
+        let (node, _signer) = setup_node();
+        let settled = dummy_proof_amendment(1, 1_000, 400);
+        let mut later = dummy_proof_amendment(1, 1_000, 400);
+        later.block_hash = ShellHash::from([0x88; 32]);
+        later.source_hashes = vec![later.block_hash];
+        node.pending_stark_settlements
+            .lock()
+            .extend([settled.clone(), later.clone()]);
+
+        node.prover_orchestrator()
+            .remove_settled_pending(std::slice::from_ref(&settled));
+
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            std::slice::from_ref(&later)
+        );
     }
 
     #[test]
@@ -9143,6 +9199,19 @@ mod tests {
     }
 
     #[test]
+    fn stark_frontier_backlog_pauses_at_pending_settlement_limit() {
+        let (node, _proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+        node.pending_stark_settlements.lock().extend([
+            dummy_proof_amendment(1, 1_000, 400),
+            dummy_proof_amendment(1, 1_000, 400),
+        ]);
+
+        assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 0);
+        assert!(node.proof_backlog.lock().is_empty());
+    }
+
+    #[test]
     fn stark_source_original_size_uses_fallback_for_pruned_stub_block() {
         let (node, proposer_signer) = setup_stark_node();
         store_genesis(&node);
@@ -9247,7 +9316,7 @@ mod tests {
         // must remain in the backlog — the prover waits for more blocks.
         let db = node.store.clone();
         let amendment_store = ProofAmendmentStore::new(db);
-        let (amendment_tx, mut amendment_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (amendment_tx, mut amendment_rx) = tokio::sync::mpsc::channel(1);
         let svc = ProverService::new(
             Arc::clone(&node.proof_backlog),
             amendment_store.clone(),

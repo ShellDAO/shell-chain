@@ -449,22 +449,12 @@ impl<S: KvStore + 'static> Node<S> {
             );
         }
 
-        let (prover_amendment_tx, mut prover_amendment_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prover_amendment_tx, mut prover_amendment_rx) =
+            tokio::sync::mpsc::channel(PROVER_AMENDMENT_CHANNEL_CAPACITY);
+        let (prover_readiness_tx, prover_readiness_rx) = tokio::sync::watch::channel(false);
 
         // H3: Start background prover service if this node is configured to run proving.
         if self.config.node_role.runs_prover() {
-            // Seed enough frontier blocks to form a provable batch (≥ MIN_L1_STARK_TXS entries).
-            // Using a single block or very few blocks risks seeding a batch that passes the
-            // backlog pop but then fails the n_sigs ≥ 512 settlement check.  Seeding up to
-            // DEFAULT_MAX_L1_RANGE_SOURCES ensures the initial batch is large enough while
-            // still respecting the prover's maximum range size.
-            let seeded = self.enqueue_stark_frontier_backlog(DEFAULT_MAX_L1_RANGE_SOURCES)?;
-            if seeded > 0 {
-                info!(
-                    seeded,
-                    "queued historical STARK frontier proof tasks before starting prover"
-                );
-            }
             let prover_address = self.config.proposer_address.unwrap_or(local_signer_address);
             let prover_config = ProverConfig::default();
             let service = ProverService::new(
@@ -475,6 +465,7 @@ impl<S: KvStore + 'static> Node<S> {
             )
             .with_signer(Arc::clone(&signer))
             .with_amendment_sender(prover_amendment_tx)
+            .with_readiness(prover_readiness_rx)
             .with_drain_frontier(Arc::clone(&self.stark_drain_frontier))
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
@@ -535,15 +526,32 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         loop {
+            let prover_ready = production_readiness.can_produce();
+            self.prover_ready
+                .store(prover_ready, std::sync::atomic::Ordering::Release);
+            let _ = prover_readiness_tx.send_if_modified(|ready| {
+                if *ready == prover_ready {
+                    false
+                } else {
+                    *ready = prover_ready;
+                    true
+                }
+            });
             self.metrics.syncing.set(i64::from(
                 sync_requested && !production_readiness.can_produce(),
             ));
             self.metrics
                 .production_ready
                 .set(i64::from(production_readiness.can_produce()));
+            self.metrics
+                .stark_pending_settlements
+                .set(self.pending_stark_settlements.lock().len() as i64);
 
             tokio::select! {
-                Some(amendment) = prover_amendment_rx.recv() => {
+                Some(amendment) = prover_amendment_rx.recv(),
+                    if production_readiness.can_produce()
+                        && self.pending_stark_settlements.lock().len()
+                            < MAX_PENDING_STARK_SETTLEMENTS => {
                     if amendment.layer > 1 {
                         self.metrics.stark_l2_proofs_generated.inc();
                     } else {
@@ -574,14 +582,13 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                         continue;
                     }
-                    if can_produce_blocks {
-                        self.pending_stark_settlements.lock().push(amendment.clone());
-                        info!(
-                            block = amendment.block_number,
-                            layer = amendment.layer,
-                            "local STARK proof queued for reward settlement"
-                        );
-                    }
+                    self.pending_stark_settlements.lock().push(amendment.clone());
+                    info!(
+                        block = amendment.block_number,
+                        layer = amendment.layer,
+                        can_produce_blocks,
+                        "local STARK proof queued for bounded settlement"
+                    );
                     match amendment.to_json() {
                         Ok(payload) => {
                             let block_hash = amendment.block_hash;
@@ -616,13 +623,24 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
                 _ = block_timer.tick() => {
+                    let peers = network.peer_count().await;
+                    production_readiness.refresh(
+                        peers,
+                        sync_requested,
+                        self.head_number(),
+                        std::time::Instant::now(),
+                    );
                     // Periodically reseed the STARK backlog so the prover is never
                     // starved of historical tasks.  Reseed when:
                     //   a) the backlog is completely empty, OR
                     //   b) the front of the backlog has a contiguous run whose total
                     //      entries fall below the proving threshold (prover consumed
                     //      most of the previously-seeded window; needs more history).
-                    if self.config.node_role.runs_prover() {
+                    if self.config.node_role.runs_prover()
+                        && production_readiness.can_produce()
+                        && self.pending_stark_settlements.lock().len()
+                            < MAX_PENDING_STARK_SETTLEMENTS
+                    {
                         let needs_reseed = {
                             let backlog = self.proof_backlog.lock();
                             if backlog.is_empty() {
@@ -643,13 +661,6 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                     }
                     if can_produce_blocks {
-                        let peers = network.peer_count().await;
-                        production_readiness.refresh(
-                            peers,
-                            sync_requested,
-                            self.head_number(),
-                            std::time::Instant::now(),
-                        );
                         if !production_readiness.can_produce() {
                             debug!(
                                 state = ?production_readiness.state(),
@@ -1290,7 +1301,17 @@ impl<S: KvStore + 'static> Node<S> {
                                         let hdr = block.header.clone();
                                         let bhash = block.hash();
                                         let head_before_import = self.head_number();
-                                        match tokio::task::block_in_place(|| self.import_block(block, &verifier)) {
+                                        let verified_certificate = certs.get(&bhash).filter(|cert| {
+                                            self.verify_commit_certificate(num, bhash, cert)
+                                        });
+                                        let import_result = tokio::task::block_in_place(|| {
+                                            if verified_certificate.is_some() {
+                                                self.import_finalized_block(block, &verifier)
+                                            } else {
+                                                self.import_block(block, &verifier)
+                                            }
+                                        });
+                                        match import_result {
                                             Ok(()) => {
                                                 let head_after_import = self.head_number();
                                                 let canonical_advanced =
@@ -1315,7 +1336,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 );
                                                 debug!(number = num, "synced block");
                                                 self.slash_timed_out_challenges(num);
-                                                if let Some(cert) = certs.get(&bhash) {
+                                                if let Some(cert) = verified_certificate {
                                                     self.fast_finalize_with_certificate(
                                                         num, bhash, cert,
                                                     );
@@ -1485,11 +1506,36 @@ impl<S: KvStore + 'static> Node<S> {
                                         );
                                         continue;
                                     }
+                                    if self.pending_stark_settlements.lock().len()
+                                        >= MAX_PENDING_STARK_SETTLEMENTS
+                                    {
+                                        self.metrics.stark_amendments_rate_limited.inc();
+                                        debug!(
+                                            %peer,
+                                            block = block_number,
+                                            "STARK proof deferred because settlement window is full"
+                                        );
+                                        continue;
+                                    }
                                     if let Err(e) = self.validate_stark_amendment_authentication(&amendment) {
                                         warn!(
                                             block = block_number,
                                             layer = amendment.layer,
                                             "STARK proof rejected by prover authentication: {e}"
+                                        );
+                                        continue;
+                                    }
+                                    if !self
+                                        .proof_rate_limiter
+                                        .lock()
+                                        .try_consume(&amendment.prover)
+                                    {
+                                        self.metrics.stark_amendments_rate_limited.inc();
+                                        warn!(
+                                            %peer,
+                                            prover = %amendment.prover,
+                                            block = block_number,
+                                            "STARK proof rejected by per-prover rate limit"
                                         );
                                         continue;
                                     }
@@ -2366,6 +2412,9 @@ impl<S: KvStore + 'static> Node<S> {
         if max_blocks == 0 || !self.config.node_role.runs_prover() {
             return Ok(0);
         }
+        if self.pending_stark_settlements.lock().len() >= MAX_PENDING_STARK_SETTLEMENTS {
+            return Ok(0);
+        }
         // Note: we intentionally do NOT skip when pending_stark_settlements is
         // non-empty.  The inner loop already skips blocks that are covered by a
         // pending settlement, so the early-return here would incorrectly prevent
@@ -2495,6 +2544,16 @@ impl<S: KvStore + 'static> Node<S> {
                         let covered_hashes = amendment.covered_hashes();
                         let covered_count = covered_hashes.len().max(1);
                         let start = amendment.range_start_block().unwrap_or(0);
+                        if self.pending_stark_settlements.lock().len()
+                            >= MAX_PENDING_STARK_SETTLEMENTS
+                        {
+                            debug!(
+                                block = amendment.block_number,
+                                start_block = start,
+                                "STARK seeding paused at settlement admission limit"
+                            );
+                            break;
+                        }
                         info!(
                             block = amendment.block_number,
                             start_block = start,

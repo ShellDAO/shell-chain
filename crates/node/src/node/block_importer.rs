@@ -114,14 +114,23 @@ impl<S: KvStore + 'static> Node<S> {
             })
     }
 
-    fn verify_import_consensus(&self, block: &Block, parent: &Block) -> Result<(), NodeError> {
+    fn verify_import_consensus(
+        &self,
+        block: &Block,
+        parent: &Block,
+        finalized_import: bool,
+    ) -> Result<(), NodeError> {
         let seal = block.proposer_seal.as_ref().ok_or_else(|| {
             NodeError::Startup(format!("block {} missing proposer seal", block.number()))
         })?;
 
         {
             let consensus = self.consensus.read();
-            consensus.verify_header(&block.header)?;
+            if finalized_import {
+                consensus.verify_header_for_finalized_import(&block.header, &parent.header)?;
+            } else {
+                consensus.verify_header(&block.header)?;
+            }
             let cfg = consensus.poa_config();
             let max_allowed =
                 Self::wall_clock_secs_for_import().saturating_add(cfg.max_future_secs);
@@ -880,7 +889,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut settlements = Vec::with_capacity(plan.new_chain.len());
         for block in &plan.new_chain {
             let block_hash = block.hash();
-            self.verify_import_consensus(block, &parent)
+            self.verify_import_consensus(block, &parent, false)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_economics(block, &parent)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
@@ -929,6 +938,8 @@ impl<S: KvStore + 'static> Node<S> {
             }
             self.prover_orchestrator()
                 .record_settled_sources(&block_settlements);
+            self.prover_orchestrator()
+                .remove_settled_pending(&block_settlements);
             self.feed_l2_scheduler_from_settlements(&block_settlements, block.number());
         }
         let adopted_tx_hashes = plan
@@ -990,6 +1001,21 @@ impl<S: KvStore + 'static> Node<S> {
     /// potential fork and skipped. If there is a gap (block number is
     /// more than one ahead of head), missing blocks are requested.
     pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
+        self.import_block_inner(block, false)
+    }
+
+    /// Import a block whose commit certificate has already been verified by
+    /// the network sync path. The certificate permits historical validation of
+    /// a proposer selected after a transient wPoA view change.
+    pub(crate) fn import_finalized_block(
+        &self,
+        block: Block,
+        _verifier: &dyn Verifier,
+    ) -> Result<(), NodeError> {
+        self.import_block_inner(block, true)
+    }
+
+    fn import_block_inner(&self, block: Block, finalized_import: bool) -> Result<(), NodeError> {
         let block_store = self.block_store();
         let consensus = self.consensus_manager();
         let prover = self.prover_orchestrator();
@@ -1015,7 +1041,7 @@ impl<S: KvStore + 'static> Node<S> {
         // fork-choice/reorg can inspect it later instead of dropping evidence.
         if transition == BlockImportTransition::SameHeightFork {
             let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent)?;
+            self.verify_import_consensus(&block, &parent, finalized_import)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
@@ -1053,7 +1079,7 @@ impl<S: KvStore + 'static> Node<S> {
         // number->hash mapping with a disconnected block.
         if transition == BlockImportTransition::NextHeightFork {
             let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent)?;
+            self.verify_import_consensus(&block, &parent, finalized_import)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
@@ -1097,7 +1123,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Verify consensus rules, including parent linkage, timestamp bounds,
         // and proposer seal.
         let parent = self.parent_for_import(&block)?;
-        self.verify_import_consensus(&block, &parent)?;
+        self.verify_import_consensus(&block, &parent, finalized_import)?;
         self.verify_import_economics(&block, &parent)?;
         self.verify_incoming_witness_root(&block)?;
         self.verify_import_sig_aggregate_proof(&block)?;
@@ -1521,6 +1547,7 @@ impl<S: KvStore + 'static> Node<S> {
             );
         }
         prover.record_settled_sources(&stark_settlements);
+        prover.remove_settled_pending(&stark_settlements);
         self.feed_l2_scheduler_from_settlements(&stark_settlements, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
@@ -1574,7 +1601,9 @@ impl<S: KvStore + 'static> Node<S> {
         // proof tasks for imported peer blocks.  ValidatorProver nodes also queue tasks
         // in produce_block (G4) for the blocks they propose; here they cover the
         // remaining 2/3 of blocks produced by the other validators in the committee.
-        if self.config.node_role.runs_prover() {
+        if self.config.node_role.runs_prover()
+            && self.prover_ready.load(std::sync::atomic::Ordering::Acquire)
+        {
             let block_number = block.number();
             let block_hash = block.hash();
             let entries = stark_sources::block_to_sig_batch_entries(&block);

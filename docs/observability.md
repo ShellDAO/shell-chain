@@ -98,6 +98,8 @@ All metrics are prefixed `shell_`.
 | `shell_stark_proof_duration_seconds` | Histogram | STARK proof generation latency |
 | `shell_stark_backlog_depth` | Gauge | Pending proof tasks in queue |
 | `shell_stark_amendments_broadcast_total` | Counter | ProofAmendment messages broadcast |
+| `shell_stark_pending_settlements` | Gauge | Generated amendments awaiting canonical settlement (maximum 2) |
+| `shell_stark_amendments_rate_limited_total` | Counter | Authenticated amendments rejected by admission limits |
 | `shell_stark_equivocations_detected_total` | Counter | Equivocation proofs detected |
 | `shell_stark_settlements_accepted_total` | Counter | STARK settlement transactions accepted (v0.22.x) |
 | `shell_stark_settlements_rejected_total` | Counter | STARK settlements rejected — ordering/layer/frontier violations (v0.22.x) |

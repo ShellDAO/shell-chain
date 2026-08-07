@@ -253,14 +253,24 @@ Key Prometheus metrics for prover operators:
 
 ```
 # Proof generation
-shell_prover_proofs_generated_total          — lifetime proofs submitted
-shell_prover_proof_duration_seconds          — histogram of proof generation time
-shell_prover_queue_depth                     — pending blocks awaiting proof
+shell_stark_proofs_generated_total           - lifetime proofs generated
+shell_stark_proof_duration_seconds           - proof generation latency histogram
+shell_stark_backlog_depth                    - proof tasks waiting for a worker
+shell_stark_pending_settlements              - generated proofs awaiting canonical settlement
+shell_stark_amendments_rate_limited_total    - authenticated amendments rejected by admission limits
+shell_stark_frontier_lag                     - unsettled canonical L0 blocks
 
 # Storage
-shell_storage_cf_size_bytes{cf="witness"}    — should trend toward 0 when STARK is active
-shell_storage_cf_size_bytes{cf="proof"}      — grows ~15 KB/block
+shell_storage_cf_size_bytes{cf="witness"}    - should trend toward 0 when STARK is active
+shell_storage_cf_size_bytes{cf="proof"}      - grows with retained proofs
 ```
+
+Proof generation remains paused while the node is synchronizing or otherwise
+fails its readiness gate. A prover keeps at most two generated amendments in
+flight until canonical settlement releases capacity. Sustained growth in
+`shell_stark_amendments_rate_limited_total`, especially together with a stalled
+chain head, indicates peer pressure or a settlement-path failure and should be
+investigated before increasing any limits.
 
 ---
 

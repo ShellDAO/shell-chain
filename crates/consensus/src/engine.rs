@@ -30,6 +30,20 @@ pub trait ConsensusEngine: Send + Sync {
     /// Checks: proposer is authorized, timestamp is valid, signature is correct.
     fn verify_header(&self, header: &BlockHeader) -> Result<(), ConsensusError>;
 
+    /// Validate proposer selection for a finalized block received from the
+    /// network with a verified commit certificate.
+    ///
+    /// The default is identical to [`Self::verify_header`]. Consensus engines
+    /// with view changes may override this because a restarting node does not
+    /// retain the in-memory view that was active when an older block was sealed.
+    fn verify_header_for_finalized_import(
+        &self,
+        header: &BlockHeader,
+        _parent: &BlockHeader,
+    ) -> Result<(), ConsensusError> {
+        self.verify_header(header)
+    }
+
     /// Seal a block by signing and finalizing it for broadcast.
     ///
     /// The implementation should set `block.proposer_seal` with a valid
