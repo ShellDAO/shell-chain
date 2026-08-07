@@ -2556,7 +2556,7 @@ mod tests {
         assert_eq!(plan.old_chain, vec![canonical]);
         assert_eq!(plan.new_chain, vec![side_one.clone(), side_two.clone()]);
 
-        node.adopt_state_neutral_preferred_fork(plan).unwrap();
+        node.adopt_preferred_fork(plan).unwrap();
 
         assert_eq!(
             node.chain_store.get_head_hash().unwrap(),
@@ -2611,7 +2611,7 @@ mod tests {
     }
 
     #[test]
-    fn stateful_preferred_fork_is_rejected_before_canonical_mutation() {
+    fn preferred_fork_state_root_mismatch_is_rejected_before_canonical_mutation() {
         let (node, signer) = setup_node();
         store_consistent_genesis(&node);
         let proposer = node.config.proposer_address.unwrap();
@@ -2683,11 +2683,11 @@ mod tests {
             .unwrap()
             .expect("stateful side fork should become preferred");
 
-        let error = node.adopt_state_neutral_preferred_fork(plan).unwrap_err();
+        let error = node.adopt_preferred_fork(plan).unwrap_err();
 
         assert!(error
             .to_string()
-            .contains("requires deterministic state replay"));
+            .contains("state root mismatch after deterministic replay"));
         assert_eq!(
             node.chain_store.get_head_hash().unwrap(),
             Some(canonical_hash)
@@ -2697,6 +2697,95 @@ mod tests {
             Some(canonical_hash)
         );
         assert_eq!(node.chain_store.get_block_hash_by_number(2).unwrap(), None);
+    }
+
+    #[test]
+    fn stateful_preferred_fork_is_replayed_and_adopted_atomically() {
+        let (node, proposer_signer) = setup_node();
+        let proposer = node.config.proposer_address.unwrap();
+        let fork_node = setup_node_with_authority(proposer);
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0xBE; 20]);
+        let initial_balance = U256::from(100_000_000_000_000u64);
+        fund_account(&node, &sender, initial_balance);
+        fund_account(&fork_node, &sender, initial_balance);
+        store_consistent_genesis(&node);
+        store_consistent_genesis(&fork_node);
+
+        let canonical = make_block_at_1(&node, &proposer_signer, None);
+        let canonical_hash = canonical.hash();
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let transaction = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&fork_node, &tx_signer, sender, transaction);
+        let side_one = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_one_hash = side_one.hash();
+        node.import_block(side_one.clone(), &MultiVerifier).unwrap();
+
+        let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_two_hash = side_two.hash();
+        node.import_block(side_two.clone(), &MultiVerifier).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("stateful side fork should become preferred");
+
+        node.adopt_preferred_fork(plan).unwrap();
+
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(side_one_hash)
+        );
+        assert_ne!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(canonical_hash)
+        );
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 1);
+        assert_eq!(
+            node.world_state.read().get_balance(&receiver).unwrap(),
+            U256::from(1_000u64)
+        );
+        assert_eq!(
+            node.chain_store
+                .get_receipts(&side_one_hash)
+                .unwrap()
+                .expect("replayed receipts")
+                .len(),
+            side_one.transactions.len() + side_one.system_transactions.len()
+        );
+        assert_eq!(current_state_root(&node), side_two.header.state_root);
     }
 
     #[test]
@@ -2763,7 +2852,7 @@ mod tests {
             .unwrap()
             .expect("invalid side fork should become preferred before revalidation");
 
-        let error = node.adopt_state_neutral_preferred_fork(plan).unwrap_err();
+        let error = node.adopt_preferred_fork(plan).unwrap_err();
 
         assert!(matches!(
             error,

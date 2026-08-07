@@ -391,26 +391,360 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    fn ensure_state_neutral_fork_block(
+    fn replay_preferred_fork_block(
         &self,
         block: &Block,
-        ancestor_state_root: ShellHash,
-        segment: &str,
-    ) -> Result<(), NodeError> {
-        if !block.transactions.is_empty()
-            || !block.system_transactions.is_empty()
-            || block.header.gas_used != 0
-            || block.header.state_root != ancestor_state_root
-            || block.header.transactions_root != ShellHash::ZERO
-            || block.header.receipts_root != ShellHash::ZERO
-            || !Self::decode_system_extra(&block.header.extra_data)?.is_empty()
-        {
-            return Err(NodeError::Startup(format!(
-                "{segment} block {} requires deterministic state replay before adoption",
-                block.number()
-            )));
+        parent_state_root: ShellHash,
+        replay_store: Arc<shell_storage::OverlayStore<S>>,
+    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+        if !Self::decode_system_extra(&block.header.extra_data)?.is_empty() {
+            return Err(Self::invalid_fork(
+                block.hash(),
+                format!(
+                    "block {} uses deprecated block-level STARK settlement extra_data",
+                    block.number()
+                ),
+            ));
         }
-        self.verify_import_logs_bloom(block, &[])
+
+        let replay_cs = ChainStore::new(replay_store.clone());
+        let stark_settlements = block
+            .system_transactions
+            .iter()
+            .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+            .map(|tx| {
+                let payload = tx.proof_payload.as_ref().ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "block {} STARK reward tx {} missing proof payload",
+                        block.number(),
+                        tx.hash()
+                    ))
+                })?;
+                let amendment = ProofAmendment::from_json(payload.as_ref()).map_err(|error| {
+                    NodeError::Startup(format!(
+                        "block {} STARK reward tx {} proof payload decode failed: {error}",
+                        block.number(),
+                        tx.hash()
+                    ))
+                })?;
+                if tx.source_hash != amendment.block_hash
+                    || tx.layer != Some(amendment.layer)
+                    || tx.original_size != amendment.original_size
+                    || tx.compressed_size != amendment.compressed_size
+                {
+                    return Err(NodeError::Startup(format!(
+                        "block {} STARK reward tx {} metadata does not match proof payload",
+                        block.number(),
+                        tx.hash()
+                    )));
+                }
+                Ok(amendment)
+            })
+            .collect::<Result<Vec<_>, NodeError>>()
+            .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+        self.validate_stark_settlement_sequence(&stark_settlements)
+            .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+        for amendment in &stark_settlements {
+            self.validate_stark_amendment_authentication(amendment)
+                .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+            self.validate_stark_proof_source_binding(amendment)
+                .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+        }
+
+        let mut receipts = Vec::new();
+        let mut new_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
+        let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
+        {
+            let mut block_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
+            let batch_verifier = MultiVerifier;
+            let signature_state = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
+            let tx_hashes = block
+                .transactions
+                .iter()
+                .map(SignedTransaction::hash)
+                .collect::<Vec<_>>();
+            let mut signing_pubkeys = Vec::with_capacity(block.transactions.len());
+            for tx in &block.transactions {
+                let uses_custom_validator = signature_state
+                    .get_account(&tx.from)?
+                    .and_then(|account| account.validation_code_hash)
+                    .is_some();
+                if uses_custom_validator {
+                    signing_pubkeys.push(None);
+                    continue;
+                }
+
+                let root_pubkey = match &tx.pubkey_mode {
+                    shell_core::PubkeyMode::Embedded(pubkey) => {
+                        block_pubkeys
+                            .entry(tx.from)
+                            .or_insert_with(|| pubkey.clone());
+                        if replay_cs.get_pubkey(&tx.from)?.is_none() {
+                            new_pubkeys.entry(tx.from).or_insert_with(|| pubkey.clone());
+                        }
+                        pubkey.clone()
+                    }
+                    shell_core::PubkeyMode::Reference => {
+                        if let Some(pubkey) = block_pubkeys.get(&tx.from) {
+                            pubkey.clone()
+                        } else if let Some(pubkey) = replay_cs.get_pubkey(&tx.from)? {
+                            pubkey
+                        } else {
+                            return Err(Self::invalid_fork(
+                                block.hash(),
+                                format!(
+                                    "block {} tx {} references an unavailable public key",
+                                    block.number(),
+                                    tx.hash()
+                                ),
+                            ));
+                        }
+                    }
+                };
+                signing_pubkeys.push(Some(batch_signing_pubkey(
+                    block.number(),
+                    tx,
+                    &root_pubkey,
+                )?));
+            }
+            let verify_items = block
+                .transactions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tx)| {
+                    signing_pubkeys[index].as_deref().map(|pubkey| VerifyItem {
+                        pubkey,
+                        message: tx_hashes[index].as_bytes(),
+                        signature: &tx.signature,
+                    })
+                })
+                .collect::<Vec<_>>();
+            batch_verifier
+                .verify_batch_all(&verify_items)
+                .map_err(|error| {
+                    Self::invalid_fork(
+                        block.hash(),
+                        format!(
+                            "block {} batch signature verification failed: {error}",
+                            block.number()
+                        ),
+                    )
+                })?;
+
+            let replay_ws = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
+            let state_db = ShellStateDb::new(replay_ws, ChainStore::new(replay_store.clone()));
+            let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
+            let pre_verified = PreVerified;
+            let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
+            let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
+            for tx in &block.transactions {
+                let tx_for_validation = tx_for_import_validation(tx, &validation_pubkeys);
+                let world_state = evm.state_db_mut().world_state_mut();
+                let expected_nonce = validation_nonces
+                    .get(&tx.from)
+                    .copied()
+                    .unwrap_or(world_state.get_nonce(&tx.from)?);
+                validate_tx_for_import_with_expected_nonce(
+                    tx_for_validation.as_ref(),
+                    world_state,
+                    &replay_cs,
+                    &pre_verified,
+                    self.config.chain_id,
+                    expected_nonce,
+                )
+                .map_err(|error| {
+                    Self::invalid_fork(
+                        block.hash(),
+                        format!(
+                            "block {} transaction validation failed: {error}",
+                            block.number()
+                        ),
+                    )
+                })?;
+                validation_nonces.insert(
+                    tx.from,
+                    expected_nonce.checked_add(1).ok_or_else(|| {
+                        Self::invalid_fork(
+                            block.hash(),
+                            format!(
+                                "block {} transaction nonce exhausted for {}",
+                                block.number(),
+                                tx.from
+                            ),
+                        )
+                    })?,
+                );
+                if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
+                    validation_pubkeys
+                        .entry(tx.from)
+                        .or_insert_with(|| pubkey.clone());
+                }
+            }
+
+            let mut cumulative_gas = 0u64;
+            let mut total_effective_fees = U256::ZERO;
+            for (index, tx) in block.transactions.iter().enumerate() {
+                if !tx_fits_remaining_block_gas(tx, cumulative_gas, block.header.gas_limit) {
+                    return Err(Self::invalid_fork(
+                        block.hash(),
+                        format!(
+                            "block {} tx {} exceeds remaining block gas",
+                            block.number(),
+                            index
+                        ),
+                    ));
+                }
+                let result = if tx.is_aa_bundle() {
+                    evm.execute_aa_bundle(tx, &block.header, index as u32, cumulative_gas)
+                } else {
+                    evm.execute_tx(tx, &block.header, index as u32, cumulative_gas)
+                }
+                .map_err(|error| {
+                    Self::invalid_fork(
+                        block.hash(),
+                        format!("block {} tx {index} replay failed: {error}", block.number()),
+                    )
+                })?;
+                cumulative_gas = checked_cumulative_block_gas(
+                    cumulative_gas,
+                    result.gas_used,
+                    block.header.gas_limit,
+                )
+                .ok_or_else(|| {
+                    Self::invalid_fork(
+                        block.hash(),
+                        format!("block {} tx {index} gas overflow", block.number()),
+                    )
+                })?;
+                let price = effective_gas_price(
+                    tx.tx.max_fee_per_gas,
+                    tx.tx.max_priority_fee_per_gas,
+                    block.header.base_fee_per_gas,
+                );
+                if !tx.is_aa_bundle() && !result.is_system_tx {
+                    commit_pqvm_state(&result, evm.state_db_mut())?;
+                }
+                total_effective_fees = total_effective_fees
+                    .saturating_add(U256::from(result.gas_used).saturating_mul(U256::from(price)));
+                receipts.push(result.receipt);
+            }
+            if cumulative_gas != block.header.gas_used {
+                return Err(Self::invalid_fork(
+                    block.hash(),
+                    format!(
+                        "block {} gas_used mismatch: expected {}, got {}",
+                        block.number(),
+                        block.header.gas_used,
+                        cumulative_gas
+                    ),
+                ));
+            }
+
+            let mut system_txs = Vec::new();
+            if total_effective_fees > U256::ZERO {
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .add_balance(&block.header.proposer, total_effective_fees)?;
+                let tx_index = block.transactions.len() as u32;
+                let reward_tx = SystemTransaction::block_gas_reward(
+                    self.config.chain_id,
+                    block.number(),
+                    tx_index,
+                    block.header.proposer,
+                    total_effective_fees,
+                    block.header.parent_hash,
+                );
+                receipts.push(TransactionReceipt {
+                    tx_hash: reward_tx.hash(),
+                    block_number: block.number(),
+                    tx_index,
+                    status: 1,
+                    gas_used: 0,
+                    cumulative_gas_used: cumulative_gas,
+                    contract_address: None,
+                    logs_bloom: Bytes::default(),
+                    logs: vec![],
+                });
+                system_txs.push(reward_tx);
+            }
+            for amendment in &stark_settlements {
+                let tx_index = block.transactions.len().saturating_add(system_txs.len()) as u32;
+                let reward_tx = self.build_stark_reward_tx(block.number(), tx_index, amendment)?;
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .add_balance(&reward_tx.to, reward_tx.value)?;
+                receipts.push(TransactionReceipt {
+                    tx_hash: reward_tx.hash(),
+                    block_number: block.number(),
+                    tx_index,
+                    status: 1,
+                    gas_used: 0,
+                    cumulative_gas_used: cumulative_gas,
+                    contract_address: None,
+                    logs_bloom: Bytes::default(),
+                    logs: vec![],
+                });
+                system_txs.push(reward_tx);
+            }
+            if system_txs != block.system_transactions {
+                return Err(Self::invalid_fork(
+                    block.hash(),
+                    format!("block {} system transactions mismatch", block.number()),
+                ));
+            }
+            {
+                let mut registry = AlgorithmRegistry::global_mut();
+                apply_pending_activations(
+                    block.number(),
+                    evm.state_db_mut().world_state_mut(),
+                    &mut registry,
+                    "preferred-fork replay",
+                )?;
+            }
+            evm.state_db_mut().world_state_mut().state_root()?
+        } else {
+            if block.header.gas_used != 0 || !block.system_transactions.is_empty() {
+                return Err(Self::invalid_fork(
+                    block.hash(),
+                    format!(
+                        "block {} has inconsistent empty-block fields",
+                        block.number()
+                    ),
+                ));
+            }
+            let mut world_state = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
+            {
+                let mut registry = AlgorithmRegistry::global_mut();
+                apply_pending_activations(
+                    block.number(),
+                    &mut world_state,
+                    &mut registry,
+                    "preferred-fork empty-block replay",
+                )?;
+            }
+            world_state.state_root()?
+        };
+
+        self.verify_import_logs_bloom(block, &receipts)
+            .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+        if imported_state_root != block.header.state_root {
+            return Err(Self::invalid_fork(
+                block.hash(),
+                format!(
+                    "block {} state root mismatch after deterministic replay: expected {}, got {}",
+                    block.number(),
+                    block.header.state_root,
+                    imported_state_root
+                ),
+            ));
+        }
+        for (address, pubkey) in new_pubkeys {
+            if replay_cs.get_pubkey(&address)?.is_none() {
+                replay_cs.put_pubkey(&address, &pubkey)?;
+            }
+        }
+
+        Ok((receipts, stark_settlements))
     }
 
     pub(super) fn reinsert_reverted_transactions(
@@ -443,10 +777,7 @@ impl<S: KvStore + 'static> Node<S> {
         (inserted, rejected)
     }
 
-    pub(super) fn adopt_state_neutral_preferred_fork(
-        &self,
-        plan: ForkAdoptionPlan,
-    ) -> Result<(), NodeError> {
+    pub(super) fn adopt_preferred_fork(&self, plan: ForkAdoptionPlan) -> Result<(), NodeError> {
         let current_head = self
             .chain_store
             .get_head_block()?
@@ -510,13 +841,6 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
         let ancestor_state_root = ancestor.header.state_root;
-        for block in &plan.old_chain {
-            self.ensure_state_neutral_fork_block(
-                block,
-                ancestor_state_root,
-                "canonical rollback segment",
-            )?;
-        }
 
         let mut state = WorldState::at_root(self.store.clone(), &ancestor_state_root)?;
         state.validate()?;
@@ -528,7 +852,12 @@ impl<S: KvStore + 'static> Node<S> {
         let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
         *AlgorithmRegistry::global_mut() = ancestor_registry;
 
+        let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        let overlay_chain_store = ChainStore::new(overlay.clone());
         let mut parent = ancestor;
+        let mut parent_state_root = ancestor_state_root;
+        let mut receipts = Vec::with_capacity(plan.new_chain.len());
+        let mut settlements = Vec::with_capacity(plan.new_chain.len());
         for block in &plan.new_chain {
             let block_hash = block.hash();
             self.verify_import_consensus(block, &parent)
@@ -539,11 +868,11 @@ impl<S: KvStore + 'static> Node<S> {
                 .map_err(|error| Self::invalid_fork(block_hash, error))?;
             self.verify_import_sig_aggregate_proof(block)
                 .map_err(|error| Self::invalid_fork(block_hash, error))?;
-            self.ensure_state_neutral_fork_block(
-                block,
-                ancestor_state_root,
-                "preferred fork segment",
-            )?;
+            let (block_receipts, block_settlements) =
+                self.replay_preferred_fork_block(block, parent_state_root, overlay.clone())?;
+            parent_state_root = block.header.state_root;
+            receipts.push(block_receipts);
+            settlements.push(block_settlements);
             parent = block.clone();
         }
         if parent.hash() != plan.preferred_hash || parent.number() != plan.preferred_number {
@@ -553,14 +882,11 @@ impl<S: KvStore + 'static> Node<S> {
             });
         }
 
-        let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
-        let overlay_chain_store = ChainStore::new(overlay);
         let stale_canonical_numbers = if plan.canonical_number > plan.preferred_number {
             (plan.preferred_number + 1..=plan.canonical_number).collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        let receipts = vec![Vec::new(); plan.new_chain.len()];
         overlay_chain_store.commit_reorg_overlay(
             &plan.old_chain,
             &plan.new_chain,
@@ -570,7 +896,21 @@ impl<S: KvStore + 'static> Node<S> {
         )?;
         algorithm_registry_rollback.commit();
 
+        state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
         self.block_store().replace_world_state(state);
+        for (block, block_settlements) in plan.new_chain.iter().zip(settlements) {
+            let settlement_hashes = block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .map(SystemTransaction::hash);
+            for (amendment, settlement_hash) in block_settlements.iter().zip(settlement_hashes) {
+                self.store_stark_artifacts(amendment, Some(settlement_hash))?;
+            }
+            self.prover_orchestrator()
+                .record_settled_sources(&block_settlements);
+            self.feed_l2_scheduler_from_settlements(&block_settlements, block.number());
+        }
         let adopted_tx_hashes = plan
             .new_chain
             .iter()
@@ -584,7 +924,7 @@ impl<S: KvStore + 'static> Node<S> {
                     warn!(
                         preferred_number = plan.preferred_number,
                         %error,
-                        "failed to rebuild canonical totals after state-neutral fork adoption"
+                        "failed to rebuild canonical totals after fork adoption"
                     );
                 }
             }
@@ -593,7 +933,7 @@ impl<S: KvStore + 'static> Node<S> {
                 warn!(
                     preferred_number = plan.preferred_number,
                     %error,
-                    "failed to inspect canonical totals after state-neutral fork adoption"
+                    "failed to inspect canonical totals after fork adoption"
                 );
             }
         }
@@ -614,7 +954,7 @@ impl<S: KvStore + 'static> Node<S> {
             mempool_pruned = pruned,
             mempool_reinserted = reinserted,
             mempool_rejected = rejected,
-            "adopted quorum-preferred state-neutral fork"
+            "adopted quorum-preferred fork after deterministic replay"
         );
         Ok(())
     }

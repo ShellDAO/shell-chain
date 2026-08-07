@@ -14,8 +14,8 @@ All notable changes to this project will be documented in this file.
   admission no longer scans the full mempool.
 - Commit replayed state, receipts, canonical indexes, and the replacement head
   in one atomic storage transition during branch adoption.
-- Adopt quorum-preferred forks atomically when both branches are state-neutral,
-  while keeping production paused for branches that still require replay.
+- Deterministically replay and atomically adopt quorum-preferred forks while
+  keeping candidate execution isolated until every commitment is verified.
 - Back off repeated preferred-fork adoption attempts up to 30 seconds, while
   retrying immediately when fork choice selects a different head.
 - Reconcile the mempool after fork adoption by removing newly canonical

@@ -665,7 +665,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 {
                                     continue;
                                 }
-                                match self.adopt_state_neutral_preferred_fork(plan) {
+                                match self.adopt_preferred_fork(plan) {
                                     Ok(()) => fork_adoption_retry.reset(),
                                     Err(error) => {
                                         if let NodeError::InvalidFork {
