@@ -9280,6 +9280,45 @@ mod tests {
     }
 
     #[test]
+    fn rejected_stark_recovery_artifact_does_not_delete_unrelated_proof() {
+        let (node, proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis must be canonical");
+        let block_hash = produce_witnessed_blocks(&node, &proposer_signer, 1)[0];
+        let unrelated = dummy_ordered_amendment(1, vec![block_hash], 1);
+        node.store_stark_artifacts(&unrelated, None).unwrap();
+
+        let mut invalid = dummy_proof_amendment(1, 1_000, 400);
+        invalid.block_hash = genesis_hash;
+        invalid.block_number = 0;
+        invalid.start_block = Some(0);
+        invalid.source_hashes = vec![block_hash];
+        node.amendment_store
+            .put_amendment(&genesis_hash, &invalid.to_json().unwrap())
+            .unwrap();
+
+        node.delete_stored_stark_amendment_artifacts(&invalid, genesis_hash)
+            .unwrap();
+
+        assert!(node
+            .amendment_store
+            .get_amendment(&genesis_hash)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            node.amendment_store
+                .get_amendment(&block_hash)
+                .unwrap()
+                .expect("unrelated proof must survive rejection cleanup"),
+            unrelated.to_json().unwrap()
+        );
+    }
+
+    #[test]
     fn stark_source_original_size_uses_fallback_for_pruned_stub_block() {
         let (node, proposer_signer) = setup_stark_node();
         store_genesis(&node);

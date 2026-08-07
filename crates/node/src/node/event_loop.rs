@@ -2572,9 +2572,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     "discarding invalid stored STARK amendment during recovery"
                                 );
                                 rejected_stored_payloads.insert(payload_hash);
-                                for source_hash in covered_hashes {
-                                    self.amendment_store.delete_amendment(&source_hash)?;
-                                }
+                                self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
                                 // Continue with this canonical source so a fresh proof
                                 // task replaces the invalid persisted artifact.
                             } else {
@@ -2782,6 +2780,37 @@ impl<S: KvStore + 'static> Node<S> {
                 Ok(amendment)
             }
         }
+    }
+
+    pub(crate) fn delete_stored_stark_amendment_artifacts(
+        &self,
+        amendment: &ProofAmendment,
+        stored_key: ShellHash,
+    ) -> Result<(), NodeError> {
+        self.amendment_store.delete_amendment(&stored_key)?;
+        for source_hash in amendment
+            .covered_hashes()
+            .into_iter()
+            .filter(|source_hash| *source_hash != stored_key)
+        {
+            let Some(bytes) = self.amendment_store.get_amendment(&source_hash)? else {
+                continue;
+            };
+            let belongs_to_amendment = match StoredProofArtifact::from_json(&bytes) {
+                Ok(StoredProofArtifact::Amendment(stored)) => {
+                    source_hash == amendment.block_hash && stored.block_hash == amendment.block_hash
+                }
+                Ok(StoredProofArtifact::Pointer(pointer)) => {
+                    pointer.source_hash == source_hash
+                        && pointer.target_hash == amendment.block_hash
+                }
+                Err(_) => false,
+            };
+            if belongs_to_amendment {
+                self.amendment_store.delete_amendment(&source_hash)?;
+            }
+        }
+        Ok(())
     }
 
     fn wall_clock_millis() -> u64 {
