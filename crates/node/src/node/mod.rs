@@ -10079,6 +10079,37 @@ mod tests {
         }
 
         #[test]
+        fn wpoa_vote_persists_certificate_for_already_finalized_block() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
+            node.finality.write().set_finalized_direct(1, block_hash);
+
+            let mut round = WPoaRound::new(1, 0, node.consensus.read().validator_weights());
+            let _ = round.on_block_proposed(block_hash, authority);
+            *node.wpoa_round.lock() = Some(round);
+
+            node.handle_wpoa_vote(
+                authority,
+                block_hash,
+                1,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            );
+
+            assert_eq!(
+                node.wpoa_round.lock().as_ref().map(WPoaRound::phase_name),
+                Some("Committed")
+            );
+            assert!(node
+                .chain_store
+                .get_commit_certificate(&block_hash)
+                .unwrap()
+                .is_some());
+        }
+
+        #[test]
         fn wpoa_round_rebuild_preserves_verified_votes() {
             let signers: Vec<DilithiumSigner> =
                 (0..3).map(|_| DilithiumSigner::generate()).collect();

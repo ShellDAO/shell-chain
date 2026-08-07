@@ -449,15 +449,19 @@ impl<S: KvStore + 'static> Node<S> {
                             };
                             let advanced = {
                                 let mut finality = self.finality.write();
-                                if block_number <= finality.last_finalized_number() {
-                                    false
-                                } else if let Err(e) =
+                                let already_finalized =
+                                    block_number <= finality.last_finalized_number();
+                                let persist_result = if already_finalized {
+                                    self.chain_store
+                                        .set_commit_certificate(&block_hash, &encoded)
+                                } else {
                                     self.chain_store.set_finalized_with_certificate(
                                         block_number,
                                         &block_hash,
                                         &encoded,
                                     )
-                                {
+                                };
+                                if let Err(e) = persist_result {
                                     let round_number = round.round;
                                     let mut retry_round =
                                         WPoaRound::new(block_number, round_number, current_weights);
@@ -475,9 +479,12 @@ impl<S: KvStore + 'static> Node<S> {
                                     tracing::warn!(
                                         block_number,
                                         error = %e,
-                                        "FF: failed to persist finality; restored voting round for retry"
+                                        "FF: failed to persist finality certificate; restored voting round for retry"
                                     );
                                     return;
+                                }
+                                if already_finalized {
+                                    false
                                 } else {
                                     finality.set_finalized_direct(block_number, block_hash)
                                 }
