@@ -1214,9 +1214,12 @@ impl<S: KvStore + 'static> Node<S> {
                                     // error if already known, avoiding TOCTOU race.
                                     let verifier = MultiVerifier;
                                     match self.handle_incoming_tx(*tx, &verifier) {
-                                        Ok(_hash) => {
+                                        Ok(hash) => {
                                             self.metrics.txs_received.inc();
                                             self.metrics.tx_pool_size.set(self.tx_pool.len() as i64);
+                                            if let Some(rpc_handle) = rpc_handle.as_ref() {
+                                                rpc_handle.notify_pending_transaction(hash);
+                                            }
                                         }
                                         Err(e) => {
                                             // MempoolError::Duplicate and nonce-gap errors are

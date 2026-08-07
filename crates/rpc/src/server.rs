@@ -18,7 +18,7 @@ use shell_consensus::{ConsensusEngine, FinalityState};
 use shell_core::SignedTransaction;
 use shell_crypto::Signer;
 use shell_mempool::TxPool;
-use shell_primitives::Address;
+use shell_primitives::{Address, ShellHash};
 use shell_storage::{ChainStore, KvStore, WitnessStore, WorldState};
 
 use crate::admin::AdminApiServer;
@@ -133,6 +133,15 @@ pub struct RpcServerHandle {
     pub ws_handle: Option<ServerHandle>,
     /// TLS termination proxy handle, present when TLS cert+key are configured.
     pub tls_proxy: Option<TlsProxyHandle>,
+    pending_tx_events: tokio::sync::broadcast::Sender<ShellHash>,
+}
+
+impl RpcServerHandle {
+    /// Notify `newPendingTransactions` subscribers about a transaction admitted
+    /// outside the RPC handler, such as one received from a peer.
+    pub fn notify_pending_transaction(&self, hash: ShellHash) {
+        let _ = self.pending_tx_events.send(hash);
+    }
 }
 
 /// Build and start the JSON-RPC server(s).
@@ -233,6 +242,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     if let Some(pas) = proof_amendment_store {
         handler = handler.with_proof_amendment_store(pas);
     }
+    let pending_tx_events = handler.pending_tx_event_sender().clone();
     // Populate the RPC listen address from the configured public address.
     // (The actual bound port may differ when using ephemeral port 0, but for
     // admin_nodeInfo the configured address is what operators care about.)
@@ -388,6 +398,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             ws_addr: Some(ws_addr),
             ws_handle: Some(ws_handle),
             tls_proxy,
+            pending_tx_events: pending_tx_events.clone(),
         })
     } else {
         // Single port: both HTTP and WS on listen_addr (jsonrpsee default).
@@ -418,6 +429,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             ws_addr: None,
             ws_handle: None,
             tls_proxy,
+            pending_tx_events,
         })
     }
 }
@@ -432,6 +444,7 @@ mod tests {
     use jsonrpsee::ws_client::WsClientBuilder;
     use shell_consensus::FinalityState;
     use shell_mempool::{MempoolConfig, TxPool};
+    use shell_primitives::ShellHash;
     use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -508,6 +521,68 @@ mod tests {
         };
 
         assert!(config.validate_dev_rpc_exposure().is_ok());
+    }
+
+    #[tokio::test]
+    async fn externally_admitted_transaction_reaches_pending_subscription() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ws_addr: None,
+            rate_limit_per_sec: None,
+            api_namespaces: vec!["eth".into()],
+            ..RpcConfig::default()
+        };
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let client = WsClientBuilder::default()
+            .build(format!("ws://{}", server.http_addr))
+            .await
+            .unwrap();
+        let mut subscription = client
+            .subscribe::<ShellHash, _>(
+                "eth_subscribe",
+                rpc_params!["newPendingTransactions"],
+                "eth_unsubscribe",
+            )
+            .await
+            .unwrap();
+        let hash = ShellHash::from([0x42; 32]);
+
+        server.notify_pending_transaction(hash);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert_eq!(received, hash);
     }
 
     #[tokio::test]
