@@ -80,6 +80,16 @@ impl<S: KvStore + 'static> Node<S> {
         }
     }
 
+    fn classify_fork_error(block_hash: ShellHash, error: NodeError) -> NodeError {
+        match error {
+            NodeError::Storage(_) | NodeError::Network(_) => error,
+            NodeError::Pqvm(
+                ExecutorError::Storage(_) | ExecutorError::StateDb(StateDbError::Storage(_)),
+            ) => error,
+            error => Self::invalid_fork(block_hash, error),
+        }
+    }
+
     fn wall_clock_secs_for_import() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -397,7 +407,10 @@ impl<S: KvStore + 'static> Node<S> {
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
-        if !Self::decode_system_extra(&block.header.extra_data)?.is_empty() {
+        if !Self::decode_system_extra(&block.header.extra_data)
+            .map_err(|error| Self::classify_fork_error(block.hash(), error))?
+            .is_empty()
+        {
             return Err(Self::invalid_fork(
                 block.hash(),
                 format!(
@@ -443,12 +456,12 @@ impl<S: KvStore + 'static> Node<S> {
             .collect::<Result<Vec<_>, NodeError>>()
             .map_err(|error| Self::invalid_fork(block.hash(), error))?;
         self.validate_stark_settlement_sequence(&stark_settlements)
-            .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+            .map_err(|error| Self::classify_fork_error(block.hash(), error))?;
         for amendment in &stark_settlements {
             self.validate_stark_amendment_authentication(amendment)
-                .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+                .map_err(|error| Self::classify_fork_error(block.hash(), error))?;
             self.validate_stark_proof_source_binding(amendment)
-                .map_err(|error| Self::invalid_fork(block.hash(), error))?;
+                .map_err(|error| Self::classify_fork_error(block.hash(), error))?;
         }
 
         let mut receipts = Vec::new();
@@ -501,11 +514,10 @@ impl<S: KvStore + 'static> Node<S> {
                         }
                     }
                 };
-                signing_pubkeys.push(Some(batch_signing_pubkey(
-                    block.number(),
-                    tx,
-                    &root_pubkey,
-                )?));
+                signing_pubkeys.push(Some(
+                    batch_signing_pubkey(block.number(), tx, &root_pubkey)
+                        .map_err(|error| Self::classify_fork_error(block.hash(), error))?,
+                ));
             }
             let verify_items = block
                 .transactions
@@ -552,14 +564,15 @@ impl<S: KvStore + 'static> Node<S> {
                     self.config.chain_id,
                     expected_nonce,
                 )
-                .map_err(|error| {
-                    Self::invalid_fork(
+                .map_err(|error| match error {
+                    TxValidationError::Storage(error) => NodeError::Storage(error),
+                    error => Self::invalid_fork(
                         block.hash(),
                         format!(
                             "block {} transaction validation failed: {error}",
                             block.number()
                         ),
-                    )
+                    ),
                 })?;
                 validation_nonces.insert(
                     tx.from,
@@ -599,11 +612,15 @@ impl<S: KvStore + 'static> Node<S> {
                 } else {
                     evm.execute_tx(tx, &block.header, index as u32, cumulative_gas)
                 }
-                .map_err(|error| {
-                    Self::invalid_fork(
+                .map_err(|error| match error {
+                    ExecutorError::Storage(error)
+                    | ExecutorError::StateDb(StateDbError::Storage(error)) => {
+                        NodeError::Storage(error)
+                    }
+                    error => Self::invalid_fork(
                         block.hash(),
                         format!("block {} tx {index} replay failed: {error}", block.number()),
-                    )
+                    ),
                 })?;
                 cumulative_gas = checked_cumulative_block_gas(
                     cumulative_gas,
@@ -861,13 +878,13 @@ impl<S: KvStore + 'static> Node<S> {
         for block in &plan.new_chain {
             let block_hash = block.hash();
             self.verify_import_consensus(block, &parent)
-                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+                .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_economics(block, &parent)
-                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+                .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_incoming_witness_root(block)
-                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+                .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_sig_aggregate_proof(block)
-                .map_err(|error| Self::invalid_fork(block_hash, error))?;
+                .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             let (block_receipts, block_settlements) =
                 self.replay_preferred_fork_block(block, parent_state_root, overlay.clone())?;
             parent_state_root = block.header.state_root;
@@ -1594,6 +1611,7 @@ mod tests {
     use super::*;
     use shell_core::{PubkeyMode, Transaction};
     use shell_crypto::SignatureType;
+    use shell_storage::{MemoryDb, StorageError};
 
     fn transaction() -> Transaction {
         Transaction {
@@ -1641,5 +1659,27 @@ mod tests {
             resolved.pubkey_mode,
             PubkeyMode::Embedded(vec![0x55; 1_952])
         );
+    }
+
+    #[test]
+    fn fork_error_classification_preserves_transient_storage_failures() {
+        let block_hash = ShellHash::from([0x44; 32]);
+        let storage = Node::<MemoryDb>::classify_fork_error(
+            block_hash,
+            NodeError::Storage(StorageError::Database("temporary read failure".into())),
+        );
+        let deterministic = Node::<MemoryDb>::classify_fork_error(
+            block_hash,
+            NodeError::Startup("invalid commitment".into()),
+        );
+
+        assert!(matches!(storage, NodeError::Storage(_)));
+        assert!(matches!(
+            deterministic,
+            NodeError::InvalidFork {
+                block_hash: rejected,
+                ..
+            } if rejected == block_hash
+        ));
     }
 }
