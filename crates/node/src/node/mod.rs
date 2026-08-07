@@ -10039,7 +10039,7 @@ mod tests {
             *node.wpoa_round.lock() = Some(round);
 
             db.fail_next_batch();
-            node.handle_wpoa_vote(
+            let failed_certificate = node.handle_wpoa_vote(
                 authority,
                 block_hash,
                 1,
@@ -10052,13 +10052,14 @@ mod tests {
             );
             assert_eq!(node.finality.read().last_finalized_number(), 0);
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
+            assert!(failed_certificate.is_none());
             assert!(node
                 .chain_store
                 .get_commit_certificate(&block_hash)
                 .unwrap()
                 .is_none());
 
-            node.handle_wpoa_vote(
+            let certificate = node.handle_wpoa_vote(
                 authority,
                 block_hash,
                 1,
@@ -10076,6 +10077,12 @@ mod tests {
                 .get_commit_certificate(&block_hash)
                 .unwrap()
                 .is_some());
+            assert_eq!(
+                certificate,
+                node.chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -10091,7 +10098,7 @@ mod tests {
             let _ = round.on_block_proposed(block_hash, authority);
             *node.wpoa_round.lock() = Some(round);
 
-            node.handle_wpoa_vote(
+            let certificate = node.handle_wpoa_vote(
                 authority,
                 block_hash,
                 1,
@@ -10107,6 +10114,12 @@ mod tests {
                 .get_commit_certificate(&block_hash)
                 .unwrap()
                 .is_some());
+            assert_eq!(
+                certificate,
+                node.chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -10568,6 +10581,30 @@ mod tests {
                     assert_eq!(sig.data, vec![1, 2, 3, 4]);
                 }
                 _ => panic!("expected WPoaVote after deserialization"),
+            }
+        }
+
+        #[test]
+        fn wpoa_network_message_commit_certificate_serde() {
+            let block_hash = hash(8);
+            let msg = NetworkMessage::CommitCertificate {
+                block_hash,
+                block_number: 43,
+                certificate: vec![5, 6, 7],
+            };
+            let json = serde_json::to_string(&msg).expect("serialize failed");
+            let decoded: NetworkMessage = serde_json::from_str(&json).expect("deserialize failed");
+            match decoded {
+                NetworkMessage::CommitCertificate {
+                    block_hash: decoded_hash,
+                    block_number,
+                    certificate,
+                } => {
+                    assert_eq!(decoded_hash, block_hash);
+                    assert_eq!(block_number, 43);
+                    assert_eq!(certificate, vec![5, 6, 7]);
+                }
+                _ => panic!("expected CommitCertificate after deserialization"),
             }
         }
 

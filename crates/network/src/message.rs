@@ -80,6 +80,15 @@ pub enum NetworkMessage {
         #[serde(default)]
         nonce: u64,
     },
+    /// Announce a quorum-backed commit certificate for a canonical block.
+    ///
+    /// The certificate is kept outside the block header so finality can
+    /// propagate without changing the block hash.
+    CommitCertificate {
+        block_hash: ShellHash,
+        block_number: u64,
+        certificate: Vec<u8>,
+    },
     /// Ping to check liveness.
     Ping,
     /// Pong response to ping.
@@ -194,7 +203,8 @@ impl NetworkMessage {
             | Self::ProofChallenge(_)
             | Self::ProofChallengeResponse(_)
             | Self::WPoaVote { .. }
-            | Self::WPoaViewChange(_) => MAX_CONSENSUS_MESSAGE_SIZE,
+            | Self::WPoaViewChange(_)
+            | Self::CommitCertificate { .. } => MAX_CONSENSUS_MESSAGE_SIZE,
             Self::BlockRequest { .. }
             | Self::BodyRequest { .. }
             | Self::Ping
@@ -215,9 +225,10 @@ impl NetworkMessage {
             | Self::BodyRequest { .. }
             | Self::BodyResponse { .. } => NetworkTopic::Blocks,
             Self::NewTransaction(_) => NetworkTopic::Transactions,
-            Self::NewAttestation(_) | Self::WPoaVote { .. } | Self::WPoaViewChange(_) => {
-                NetworkTopic::Attestation
-            }
+            Self::NewAttestation(_)
+            | Self::WPoaVote { .. }
+            | Self::WPoaViewChange(_)
+            | Self::CommitCertificate { .. } => NetworkTopic::Attestation,
             Self::ProofAmendment { .. }
             | Self::ProofAck { .. }
             | Self::EquivocationEvidence(_)
@@ -492,7 +503,8 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
         | "ProofChallenge"
         | "ProofChallengeResponse"
         | "WPoaVote"
-        | "WPoaViewChange" => MAX_CONSENSUS_MESSAGE_SIZE,
+        | "WPoaViewChange"
+        | "CommitCertificate" => MAX_CONSENSUS_MESSAGE_SIZE,
         "BlockRequest" | "BodyRequest" | "Ping" | "Pong" | "StorageCapability" => {
             MAX_CONTROL_MESSAGE_SIZE
         }

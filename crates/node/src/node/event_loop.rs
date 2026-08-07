@@ -909,7 +909,20 @@ impl<S: KvStore + 'static> Node<S> {
                                             let _ = network.broadcast(vote_msg).await;
                                             // Record own vote locally so proposer can reach
                                             // quorum without waiting for its message to echo.
-                                            self.handle_wpoa_vote(voter, block_hash, number, pq_sig);
+                                            if let Some(certificate) = self.handle_wpoa_vote(
+                                                voter,
+                                                block_hash,
+                                                number,
+                                                pq_sig,
+                                            ) {
+                                                let _ = network
+                                                    .broadcast(NetworkMessage::CommitCertificate {
+                                                        block_hash,
+                                                        block_number: number,
+                                                        certificate,
+                                                    })
+                                                    .await;
+                                            }
                                             // Push WPoA-advanced finality to the RPC layer.
                                             let fin = self.finality.read().last_finalized_number();
                                             let mut fn_w = finalized_number.write();
@@ -1120,12 +1133,20 @@ impl<S: KvStore + 'static> Node<S> {
                                                         let _ = network.broadcast(vote_msg).await;
                                                         // Record own vote locally; validators should not
                                                         // depend on receiving an echo of their own broadcast.
-                                                        self.handle_wpoa_vote(
+                                                        if let Some(certificate) = self.handle_wpoa_vote(
                                                             voter,
                                                             saved_hash,
                                                             imported_number,
                                                             pq_sig,
-                                                        );
+                                                        ) {
+                                                            let _ = network
+                                                                .broadcast(NetworkMessage::CommitCertificate {
+                                                                    block_hash: saved_hash,
+                                                                    block_number: imported_number,
+                                                                    certificate,
+                                                                })
+                                                                .await;
+                                                        }
                                                         // Push WPoA-advanced finality to the RPC layer.
                                                         let fin = self.finality.read().last_finalized_number();
                                                         let mut fn_w = finalized_number.write();
@@ -1917,13 +1938,44 @@ impl<S: KvStore + 'static> Node<S> {
                                 // W.5: Receive a wPoA vote from a peer validator.
                                 NetworkMessage::WPoaVote { block_hash, block_number, voter, signature } => {
                                     debug!(%peer, block = block_number, %voter, "W.5: received WPoaVote");
-                                    self.handle_wpoa_vote(voter, block_hash, block_number, signature);
+                                    if let Some(certificate) = self.handle_wpoa_vote(
+                                        voter,
+                                        block_hash,
+                                        block_number,
+                                        signature,
+                                    ) {
+                                        let _ = network
+                                            .broadcast(NetworkMessage::CommitCertificate {
+                                                block_hash,
+                                                block_number,
+                                                certificate,
+                                            })
+                                            .await;
+                                    }
                                     // Push WPoA-advanced finality to the RPC layer.
                                     let fin = self.finality.read().last_finalized_number();
                                     let mut fn_w = finalized_number.write();
                                     if fin > *fn_w { *fn_w = fin; }
                                     // PS.2: after every vote, flush scored-below-threshold peers to ban list.
                                     self.flush_scorer_bans();
+                                }
+                                NetworkMessage::CommitCertificate {
+                                    block_hash,
+                                    block_number,
+                                    certificate,
+                                } => {
+                                    debug!(%peer, block = block_number, %block_hash, "FF.7: received commit certificate");
+                                    if self.fast_finalize_with_certificate(
+                                        block_number,
+                                        block_hash,
+                                        &certificate,
+                                    ) {
+                                        let fin = self.finality.read().last_finalized_number();
+                                        let mut fn_w = finalized_number.write();
+                                        if fin > *fn_w {
+                                            *fn_w = fin;
+                                        }
+                                    }
                                 }
                                 // W.5: Receive a signed wPoA view-change vote from a peer validator.
                                 NetworkMessage::WPoaViewChange(view_change) => {
