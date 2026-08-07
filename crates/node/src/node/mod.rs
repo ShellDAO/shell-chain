@@ -6741,6 +6741,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_adopts_stateful_preferred_fork_before_resuming_production() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, proposer_signer) = setup_node();
+        node.config.block_time_ms = 1_000;
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        node.config.max_idle_interval_ms = 0;
+
+        let proposer = node.config.proposer_address.unwrap();
+        let fork_node = setup_node_with_authority(proposer);
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from([0xBE; 20]);
+        let initial_balance = U256::from(100_000_000_000_000u64);
+        fund_account(&node, &sender, initial_balance);
+        fund_account(&fork_node, &sender, initial_balance);
+        store_consistent_genesis(&node);
+        store_consistent_genesis(&fork_node);
+
+        let canonical = make_block_at_1(&node, &proposer_signer, None);
+        let canonical_hash = canonical.hash();
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let transaction = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000u64),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&fork_node, &tx_signer, sender, transaction);
+        let side_one = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_one_hash = side_one.hash();
+        node.import_block(side_one, &MultiVerifier).unwrap();
+
+        let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_two_hash = side_two.hash();
+        node.import_block(side_two, &MultiVerifier).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let node_clone = node.clone();
+        let signer = Arc::new(proposer_signer) as Arc<dyn Signer>;
+        let handle = tokio::spawn(async move { node_clone.run(signer, &mut network).await });
+
+        let observed_height = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match node.chain_store.get_head_block() {
+                    Ok(Some(head)) if head.number() >= 3 => break Ok(head.number()),
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await;
+
+        node.shutdown();
+        let result = handle.await.expect("task panicked");
+        assert!(result.is_ok(), "run() returned error: {:?}", result.err());
+
+        let observed_height = observed_height
+            .expect("timed out waiting for production after fork adoption")
+            .expect("failed to read the canonical head");
+        assert!(observed_height >= 3);
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(side_one_hash)
+        );
+        assert_ne!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(canonical_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(2).unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 1);
+        assert_eq!(
+            node.world_state.read().get_balance(&receiver).unwrap(),
+            U256::from(1_000u64)
+        );
+    }
+
+    #[tokio::test]
     async fn aborting_event_loop_drops_background_prover_service() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::net::SocketAddr;
