@@ -1,4 +1,5 @@
 use super::*;
+use shell_network::PeerId;
 
 const MAX_BLOCK_SYNC_RESPONSE_BLOCKS: usize = 128;
 const MAX_L1_BACKLOG_TASKS: usize = DEFAULT_MAX_L1_RANGE_SOURCES * 2;
@@ -53,14 +54,20 @@ fn block_response_import_allowed(block_count: usize, commit_certificate_count: u
 
 fn block_response_matches_request(
     sync_requested: bool,
-    expected_nonce: Option<u64>,
-    expected_start: Option<u64>,
+    expected: Option<&BlockRequestState>,
     nonce: u64,
     first_block_number: Option<u64>,
+    response_peer: &PeerId,
 ) -> bool {
     sync_requested
-        && expected_nonce == Some(nonce)
-        && expected_start.is_some_and(|start| first_block_number.is_none_or(|first| first == start))
+        && expected.is_some_and(|request| {
+            request.nonce == nonce
+                && first_block_number.is_none_or(|first| first == request.start_number)
+                && request
+                    .peer
+                    .as_ref()
+                    .is_none_or(|peer| peer == response_peer)
+        })
 }
 
 fn matching_empty_block_response_exhausts_request(
@@ -85,19 +92,26 @@ fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BodyRequestState {
     nonce: u64,
     start_number: u64,
+    peer: Option<PeerId>,
 }
 
 fn body_response_matches_request(
-    expected: Option<BodyRequestState>,
+    expected: Option<&BodyRequestState>,
     nonce: u64,
     first_block_number: Option<u64>,
+    response_peer: &PeerId,
 ) -> bool {
     expected.is_some_and(|request| {
-        request.nonce == nonce && first_block_number == Some(request.start_number)
+        request.nonce == nonce
+            && first_block_number == Some(request.start_number)
+            && request
+                .peer
+                .as_ref()
+                .is_none_or(|peer| peer == response_peer)
     })
 }
 
@@ -434,8 +448,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Startup sync: request blocks we don't have from peers.
         // Track whether we are catching up so we don't spam requests.
         let mut sync_requested = false;
-        let mut sync_request_nonce: Option<u64> = None;
-        let mut sync_request_start: Option<u64> = None;
+        let mut sync_request: Option<BlockRequestState> = None;
         let mut body_request: Option<BodyRequestState> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
@@ -453,8 +466,7 @@ impl<S: KvStore + 'static> Node<S> {
                     &network,
                     None,
                     &mut sync_requested,
-                    &mut sync_request_nonce,
-                    &mut sync_request_start,
+                    &mut sync_request,
                     "initial-sync",
                 )
                 .await;
@@ -533,6 +545,7 @@ impl<S: KvStore + 'static> Node<S> {
                         body_request = Some(BodyRequestState {
                             nonce,
                             start_number: 0,
+                            peer: None,
                         });
                         info!(
                             oldest_available = oldest,
@@ -1076,8 +1089,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 != ProductionReadinessState::CatchingUp
                                             {
                                                 sync_requested = false;
-                                                sync_request_nonce = None;
-                                                sync_request_start = None;
+                                                sync_request = None;
                                             }
                                             sync_retry_attempts_without_progress = 0;
                                             sync_retry_timer.reset_after(Duration::from_secs(
@@ -1186,8 +1198,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                     &network,
                                                     Some(&peer),
                                                     &mut sync_requested,
-                                                    &mut sync_request_nonce,
-                                                    &mut sync_request_start,
+                                                    &mut sync_request,
                                                     "gap-detected",
                                                 )
                                                 .await
@@ -1302,13 +1313,14 @@ impl<S: KvStore + 'static> Node<S> {
                                 NetworkMessage::BlockResponse { blocks, commit_certificates, nonce } => {
                                     let first_block_number =
                                         blocks.first().map(|block| block.header.number);
-                                    if !block_response_matches_request(
+                                    let response_matches_sync = block_response_matches_request(
                                         sync_requested,
-                                        sync_request_nonce,
-                                        sync_request_start,
+                                        sync_request.as_ref(),
                                         nonce,
                                         first_block_number,
-                                    ) {
+                                        &peer,
+                                    );
+                                    if !response_matches_sync {
                                         warn!(
                                             %peer,
                                             nonce,
@@ -1334,7 +1346,6 @@ impl<S: KvStore + 'static> Node<S> {
                                         nonce,
                                         "received BlockResponse, importing blocks"
                                     );
-                                    let response_matches_sync = sync_request_nonce == Some(nonce);
                                     let response_is_empty = blocks.is_empty();
                                     let verifier = MultiVerifier;
                                     let mut last_ok: Option<u64> = None;
@@ -1416,8 +1427,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         let peers = network.peer_count().await;
                                         if peers == 0 {
                                             sync_requested = false;
-                                            sync_request_nonce = None;
-                                            sync_request_start = None;
+                                            sync_request = None;
                                             production_readiness.refresh(
                                                 peers,
                                                 sync_requested,
@@ -1434,8 +1444,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             next_block_sync_request_start(last_ok)
                                         else {
                                             sync_requested = false;
-                                            sync_request_nonce = None;
-                                            sync_request_start = None;
+                                            sync_request = None;
                                             production_readiness.refresh(
                                                 peers,
                                                 sync_requested,
@@ -1459,8 +1468,11 @@ impl<S: KvStore + 'static> Node<S> {
                                         };
                                         let _ = network.send_to_peer(&peer, req).await;
                                         sync_requested = true;
-                                        sync_request_nonce = Some(nonce);
-                                        sync_request_start = Some(next_start);
+                                        sync_request = Some(BlockRequestState {
+                                            nonce,
+                                            start_number: next_start,
+                                            peer: Some(peer.clone()),
+                                        });
                                         if response_matches_sync {
                                             production_readiness.note_sync_requested(
                                                 self.head_number(),
@@ -1490,8 +1502,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             response_matches_sync,
                                             response_is_empty,
                                         ) {
-                                            sync_request_nonce = None;
-                                            sync_request_start = None;
+                                            sync_request = None;
                                             sync_requested = false;
                                             production_readiness.note_sync_idle();
                                             sync_retry_attempts_without_progress = 0;
@@ -1834,9 +1845,10 @@ impl<S: KvStore + 'static> Node<S> {
                                     let first_block_number =
                                         blocks.first().map(|block| block.header.number);
                                     if !body_response_matches_request(
-                                        body_request,
+                                        body_request.as_ref(),
                                         nonce,
                                         first_block_number,
+                                        &peer,
                                     ) {
                                         warn!(
                                             %peer,
@@ -1931,6 +1943,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                 body_request = Some(BodyRequestState {
                                                     nonce: next_nonce,
                                                     start_number: next,
+                                                    peer: Some(peer.clone()),
                                                 });
                                             }
                                         } else {
@@ -2022,8 +2035,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     &network,
                                     Some(&peer),
                                     &mut sync_requested,
-                                    &mut sync_request_nonce,
-                                    &mut sync_request_start,
+                                    &mut sync_request,
                                     "peer-connected",
                                 )
                                 .await
@@ -2054,8 +2066,7 @@ impl<S: KvStore + 'static> Node<S> {
                             self.peer_caps.remove(&peer);
                             if network.peer_count().await == 0 {
                                 sync_requested = false;
-                                sync_request_nonce = None;
-                                sync_request_start = None;
+                                sync_request = None;
                                 sync_retry_attempts_without_progress = 0;
                                 production_readiness.refresh(
                                     0,
@@ -2079,8 +2090,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     &network,
                                     None,
                                     &mut sync_requested,
-                                    &mut sync_request_nonce,
-                                    &mut sync_request_start,
+                                    &mut sync_request,
                                     "routing-update",
                                 )
                                 .await
@@ -2184,8 +2194,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 "sync requested but no peers are connected; clearing sync gate to prevent production deadlock"
                             );
                             sync_requested = false;
-                            sync_request_nonce = None;
-                            sync_request_start = None;
+                            sync_request = None;
                             sync_retry_attempts_without_progress = 0;
                             production_readiness.refresh(
                                 peers,
@@ -2202,8 +2211,7 @@ impl<S: KvStore + 'static> Node<S> {
                             &network,
                             None,
                             &mut sync_requested,
-                            &mut sync_request_nonce,
-                            &mut sync_request_start,
+                            &mut sync_request,
                             "sync-retry",
                         )
                         .await;
@@ -2237,8 +2245,7 @@ impl<S: KvStore + 'static> Node<S> {
                             &network,
                             None,
                             &mut sync_requested,
-                            &mut sync_request_nonce,
-                            &mut sync_request_start,
+                            &mut sync_request,
                             "periodic-head-probe",
                         )
                         .await;
@@ -2984,17 +2991,62 @@ mod cadence_tests {
     }
 
     #[test]
-    fn body_response_requires_the_active_request_nonce_and_start() {
-        let request = Some(BodyRequestState {
+    fn body_response_requires_the_active_request_nonce_start_and_peer() {
+        let requested_peer = PeerId("requested".into());
+        let other_peer = PeerId("other".into());
+        let request = BodyRequestState {
             nonce: 7,
             start_number: 42,
-        });
+            peer: Some(requested_peer.clone()),
+        };
 
-        assert!(body_response_matches_request(request, 7, Some(42)));
-        assert!(!body_response_matches_request(None, 7, Some(42)));
-        assert!(!body_response_matches_request(request, 8, Some(42)));
-        assert!(!body_response_matches_request(request, 7, Some(43)));
-        assert!(!body_response_matches_request(request, 7, None));
+        assert!(body_response_matches_request(
+            Some(&request),
+            7,
+            Some(42),
+            &requested_peer
+        ));
+        assert!(!body_response_matches_request(
+            None,
+            7,
+            Some(42),
+            &requested_peer
+        ));
+        assert!(!body_response_matches_request(
+            Some(&request),
+            8,
+            Some(42),
+            &requested_peer
+        ));
+        assert!(!body_response_matches_request(
+            Some(&request),
+            7,
+            Some(43),
+            &requested_peer
+        ));
+        assert!(!body_response_matches_request(
+            Some(&request),
+            7,
+            None,
+            &requested_peer
+        ));
+        assert!(!body_response_matches_request(
+            Some(&request),
+            7,
+            Some(42),
+            &other_peer
+        ));
+
+        let broadcast_request = BodyRequestState {
+            peer: None,
+            ..request
+        };
+        assert!(body_response_matches_request(
+            Some(&broadcast_request),
+            7,
+            Some(42),
+            &other_peer
+        ));
     }
 
     #[test]
@@ -3159,55 +3211,81 @@ mod cadence_tests {
     }
 
     #[test]
-    fn block_response_requires_the_active_request_nonce_and_start() {
+    fn block_response_requires_the_active_request_nonce_start_and_peer() {
+        let requested_peer = PeerId("requested".into());
+        let other_peer = PeerId("other".into());
+        let targeted_request = BlockRequestState {
+            nonce: 7,
+            start_number: 42,
+            peer: Some(requested_peer.clone()),
+        };
         assert!(block_response_matches_request(
             true,
-            Some(7),
-            Some(42),
+            Some(&targeted_request),
             7,
-            Some(42)
+            Some(42),
+            &requested_peer
         ));
         assert!(block_response_matches_request(
             true,
-            Some(7),
-            Some(42),
+            Some(&targeted_request),
             7,
-            None
+            None,
+            &requested_peer
+        ));
+        assert!(!block_response_matches_request(
+            true,
+            Some(&targeted_request),
+            7,
+            Some(42),
+            &other_peer
+        ));
+        let broadcast_request = BlockRequestState {
+            peer: None,
+            ..targeted_request.clone()
+        };
+        assert!(block_response_matches_request(
+            true,
+            Some(&broadcast_request),
+            7,
+            Some(42),
+            &other_peer
         ));
         assert!(!block_response_matches_request(
             false,
-            Some(7),
-            Some(42),
+            Some(&targeted_request),
             7,
-            Some(42)
+            Some(42),
+            &requested_peer
         ));
         assert!(!block_response_matches_request(
             true,
             None,
-            Some(42),
             7,
-            Some(42)
+            Some(42),
+            &requested_peer
         ));
+        let wrong_nonce = BlockRequestState {
+            nonce: 8,
+            ..targeted_request.clone()
+        };
         assert!(!block_response_matches_request(
             true,
-            Some(8),
-            Some(42),
+            Some(&wrong_nonce),
             7,
-            Some(42)
+            Some(42),
+            &requested_peer
         ));
+        let wrong_start = BlockRequestState {
+            start_number: 43,
+            ..targeted_request.clone()
+        };
         assert!(!block_response_matches_request(
             true,
-            Some(7),
-            None,
+            Some(&wrong_start),
             7,
-            Some(42)
-        ));
-        assert!(!block_response_matches_request(
-            true,
-            Some(7),
             Some(42),
-            7,
-            Some(43)
+            &requested_peer
         ));
     }
 

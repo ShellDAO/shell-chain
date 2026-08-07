@@ -731,17 +731,21 @@ struct NetworkInterface<'a, N: NetworkService + ?Sized> {
     inner: &'a mut N,
 }
 
-fn record_sync_request_result(
-    sent: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockRequestState {
     nonce: u64,
     start_number: u64,
+    peer: Option<shell_network::PeerId>,
+}
+
+fn record_sync_request_result(
+    sent: bool,
+    request: BlockRequestState,
     sync_requested: &mut bool,
-    sync_request_nonce: &mut Option<u64>,
-    sync_request_start: &mut Option<u64>,
+    sync_request: &mut Option<BlockRequestState>,
 ) -> bool {
     *sync_requested = sent;
-    *sync_request_nonce = sent.then_some(nonce);
-    *sync_request_start = sent.then_some(start_number);
+    *sync_request = sent.then_some(request);
     sent
 }
 
@@ -1351,8 +1355,7 @@ impl<S: KvStore + 'static> Node<S> {
         network: &NetworkInterface<'_, N>,
         target_peer: Option<&shell_network::PeerId>,
         sync_requested: &mut bool,
-        sync_request_nonce: &mut Option<u64>,
-        sync_request_start: &mut Option<u64>,
+        sync_request: &mut Option<BlockRequestState>,
         reason: &'static str,
     ) -> bool {
         let head_number = self.head_number();
@@ -1369,8 +1372,7 @@ impl<S: KvStore + 'static> Node<S> {
                 "skipping missing-block request at terminal block height"
             );
             *sync_requested = false;
-            *sync_request_nonce = None;
-            *sync_request_start = None;
+            *sync_request = None;
             return false;
         };
         let generated_nonce = SystemTime::now()
@@ -1381,8 +1383,8 @@ impl<S: KvStore + 'static> Node<S> {
         // useful. Once import progress changes the requested range, rotate the nonce
         // so an empty response to the older range cannot reopen production early.
         let nonce = stable_sync_request_nonce(
-            *sync_request_nonce,
-            *sync_request_start,
+            sync_request.as_ref().map(|request| request.nonce),
+            sync_request.as_ref().map(|request| request.start_number),
             start_number,
             generated_nonce,
         );
@@ -1396,27 +1398,23 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             network.broadcast(req).await
         };
-        match send_result {
-            Ok(()) => record_sync_request_result(
-                true,
-                nonce,
-                start_number,
-                sync_requested,
-                sync_request_nonce,
-                sync_request_start,
-            ),
+        let sent = match send_result {
+            Ok(()) => true,
             Err(e) => {
                 tracing::warn!(reason, error = %e, "failed to request missing blocks");
-                record_sync_request_result(
-                    false,
-                    nonce,
-                    start_number,
-                    sync_requested,
-                    sync_request_nonce,
-                    sync_request_start,
-                )
+                false
             }
-        }
+        };
+        record_sync_request_result(
+            sent,
+            BlockRequestState {
+                nonce,
+                start_number,
+                peer: target_peer.cloned(),
+            },
+            sync_requested,
+            sync_request,
+        )
     }
 
     async fn rebroadcast_pending_transactions<N: NetworkService + ?Sized>(
@@ -2470,32 +2468,45 @@ mod tests {
     #[test]
     fn failed_sync_request_does_not_leave_an_in_flight_nonce() {
         let mut sync_requested = true;
-        let mut sync_request_nonce = Some(7);
-        let mut sync_request_start = Some(10);
+        let requested_peer = shell_network::PeerId("requested".into());
+        let mut sync_request = Some(BlockRequestState {
+            nonce: 7,
+            start_number: 10,
+            peer: Some(requested_peer.clone()),
+        });
 
         assert!(!record_sync_request_result(
             false,
-            8,
-            11,
+            BlockRequestState {
+                nonce: 8,
+                start_number: 11,
+                peer: Some(requested_peer.clone()),
+            },
             &mut sync_requested,
-            &mut sync_request_nonce,
-            &mut sync_request_start,
+            &mut sync_request,
         ));
         assert!(!sync_requested);
-        assert_eq!(sync_request_nonce, None);
-        assert_eq!(sync_request_start, None);
+        assert_eq!(sync_request, None);
 
         assert!(record_sync_request_result(
             true,
-            9,
-            12,
+            BlockRequestState {
+                nonce: 9,
+                start_number: 12,
+                peer: Some(requested_peer.clone()),
+            },
             &mut sync_requested,
-            &mut sync_request_nonce,
-            &mut sync_request_start,
+            &mut sync_request,
         ));
         assert!(sync_requested);
-        assert_eq!(sync_request_nonce, Some(9));
-        assert_eq!(sync_request_start, Some(12));
+        assert_eq!(
+            sync_request,
+            Some(BlockRequestState {
+                nonce: 9,
+                start_number: 12,
+                peer: Some(requested_peer),
+            })
+        );
     }
 
     #[test]
