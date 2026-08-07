@@ -63,6 +63,12 @@ if [[ "$1" == "is-active" ]]; then
   exit 0
 fi
 if [[ "$1" == "restart" || "$1" == "start" ]]; then
+  if [[ "$1" == "start" && "${*: -1}" == "tx-worker.service" \
+    && -n "${WATCHDOG_TEST_FAIL_TX_START_ONCE:-}" \
+    && ! -e "$WATCHDOG_TEST_FAIL_TX_START_ONCE" ]]; then
+    touch "$WATCHDOG_TEST_FAIL_TX_START_ONCE"
+    exit 1
+  fi
   printf '%s\n' "$*" >"$WATCHDOG_TEST_RESTARTED"
 fi
 EOF
@@ -80,6 +86,7 @@ run_watchdog() {
   local endpoints="$1" services="$2" state_dir="$3" actions="$4"
   local inactive="${5:-}" conflicting="${6:-}" env_file="${7:-$tmp/missing-env}"
   local metrics="${8:-shell_block_height 10}"
+  local fail_tx_start_once="${9:-}"
   local restarted="$state_dir/restarted"
   mkdir -p "$state_dir"
   rm -f "$restarted"
@@ -88,6 +95,7 @@ run_watchdog() {
     WATCHDOG_TEST_INACTIVE="$inactive" \
     WATCHDOG_TEST_METRICS="$metrics" \
     WATCHDOG_TEST_RESTARTED="$restarted" \
+    WATCHDOG_TEST_FAIL_TX_START_ONCE="$fail_tx_start_once" \
     SHELL_WATCHDOG_ENDPOINTS="$endpoints" \
     SHELL_WATCHDOG_SERVICES="$services" \
     SHELL_WATCHDOG_FAILURE_THRESHOLD=1 \
@@ -208,5 +216,19 @@ if grep -Eq '^(start|restart|stop) ' "$actions"; then
   echo "watchdog changed services before validator heights converged" >&2
   exit 1
 fi
+
+: >"$actions"
+tx_start_failed_once="$tmp/tx-start-failed-once"
+run_watchdog \
+  "http://ready,http://missing" \
+  "ready.service,unreachable.service" \
+  "$tmp/tx-resume-retry" \
+  "$actions" \
+  "" \
+  "" \
+  "$tmp/missing-env" \
+  $'shell_block_height 10' \
+  "$tx_start_failed_once" || true
+[[ "$(grep -c '^start tx-worker.service$' "$actions")" == 2 ]]
 
 printf '%s\n' "shell cluster watchdog tests passed"

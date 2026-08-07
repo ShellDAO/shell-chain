@@ -101,8 +101,8 @@ cluster_heights_equal() {
 
 resume_tx_worker() {
   if (( tx_resume_required == 1 )); then
+    systemctl start "$SHELL_WATCHDOG_TX_SERVICE" || return 1
     tx_resume_required=0
-    systemctl start "$SHELL_WATCHDOG_TX_SERVICE"
   fi
 }
 trap resume_tx_worker EXIT INT TERM
