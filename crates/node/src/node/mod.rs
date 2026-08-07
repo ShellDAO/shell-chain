@@ -424,10 +424,28 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
 
     fn prune_grace_witnesses(&self, current_head: u64) {
         let mut grace_map = self.pending_grace_deletes.lock();
-        let due: Vec<_> = grace_map
+        let candidates: Vec<_> = grace_map
             .iter()
             .filter_map(|(hash, delete_at)| (current_head >= *delete_at).then_some(*hash))
             .collect();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut due = Vec::with_capacity(candidates.len());
+        let mut already_absent = Vec::new();
+        for hash in candidates {
+            match self.chain_store.has_witness_bundle(&hash) {
+                Ok(true) => due.push(hash),
+                Ok(false) => already_absent.push(hash),
+                Err(error) => {
+                    warn!(%hash, %error, "L2: failed to inspect due witness bundle");
+                }
+            }
+        }
+        for hash in already_absent {
+            grace_map.remove(&hash);
+        }
         if due.is_empty() {
             return;
         }
@@ -9680,6 +9698,17 @@ mod tests {
 
         assert!(!node.pending_grace_deletes.lock().contains_key(&block_hash));
         assert!(!node.chain_store.has_witness_bundle(&block_hash).unwrap());
+    }
+
+    #[test]
+    fn grace_window_prune_drops_already_absent_witness_schedule() {
+        let (node, _signer) = setup_node();
+        let block_hash = ShellHash::from([0x43; 32]);
+        node.pending_grace_deletes.lock().insert(block_hash, 10);
+
+        node.block_store().prune_grace_witnesses(10);
+
+        assert!(!node.pending_grace_deletes.lock().contains_key(&block_hash));
     }
 
     #[test]
