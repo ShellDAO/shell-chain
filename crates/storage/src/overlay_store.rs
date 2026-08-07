@@ -25,6 +25,44 @@ impl<S: KvStore> OverlayStore<S> {
         self.commit_with_batch(WriteBatch::new())
     }
 
+    /// Snapshot the currently staged writes for later per-operation rollback
+    /// journaling. The snapshot does not include values read through from the
+    /// base store.
+    pub fn checkpoint(&self) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>, StorageError> {
+        self.changes
+            .read()
+            .map(|changes| changes.clone())
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    /// Return the values visible at `checkpoint` for keys whose staged value
+    /// has since changed and matches one of `prefixes`.
+    #[allow(clippy::type_complexity)]
+    pub fn previous_values_since(
+        &self,
+        checkpoint: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        prefixes: &[&[u8]],
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, StorageError> {
+        let changes = self
+            .changes
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut previous = Vec::new();
+        for (key, value) in changes.iter() {
+            if !prefixes.iter().any(|prefix| key.starts_with(prefix))
+                || checkpoint.get(key) == Some(value)
+            {
+                continue;
+            }
+            let old_value = match checkpoint.get(key) {
+                Some(value) => value.clone(),
+                None => self.base.get(key)?,
+            };
+            previous.push((key.clone(), old_value));
+        }
+        Ok(previous)
+    }
+
     /// Atomically apply pending changes together with an additional batch.
     ///
     /// Additional operations are appended after overlay changes, so explicit
@@ -175,5 +213,29 @@ mod tests {
         );
         assert_eq!(base.get(b"block/1").unwrap(), Some(b"encoded".to_vec()));
         assert_eq!(base.get(b"HEAD").unwrap(), Some(b"canonical".to_vec()));
+    }
+
+    #[test]
+    fn previous_values_since_checkpoint_tracks_base_and_staged_values() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"pk/account-a", b"base").unwrap();
+        let overlay = OverlayStore::new(base);
+        overlay.put(b"pk/account-a", b"first").unwrap();
+        overlay.put(b"gc/account-b", b"config").unwrap();
+        let checkpoint = overlay.checkpoint().unwrap();
+
+        overlay.put(b"pk/account-a", b"second").unwrap();
+        overlay.delete(b"gc/account-b").unwrap();
+        overlay.put(b"unrelated", b"ignored").unwrap();
+
+        assert_eq!(
+            overlay
+                .previous_values_since(&checkpoint, &[b"pk/", b"gc/"])
+                .unwrap(),
+            vec![
+                (b"gc/account-b".to_vec(), Some(b"config".to_vec())),
+                (b"pk/account-a".to_vec(), Some(b"first".to_vec())),
+            ]
+        );
     }
 }

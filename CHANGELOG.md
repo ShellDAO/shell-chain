@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file.
   production can resume, while retaining backoff for transient failures.
 - Reconstruct signature-algorithm policy from the common ancestor state before
   validating a preferred branch, with rollback when adoption fails.
+- Journal canonical public-key and guardian-recovery metadata changes so fork
+  replay restores the common-ancestor view before validating either branch.
 
 ### Fixed
 

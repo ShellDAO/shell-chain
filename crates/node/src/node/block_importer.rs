@@ -407,6 +407,7 @@ impl<S: KvStore + 'static> Node<S> {
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+        let metadata_checkpoint = replay_store.checkpoint()?;
         if !Self::decode_system_extra(&block.header.extra_data)
             .map_err(|error| Self::classify_fork_error(block.hash(), error))?
             .is_empty()
@@ -760,6 +761,7 @@ impl<S: KvStore + 'static> Node<S> {
                 replay_cs.put_pubkey(&address, &pubkey)?;
             }
         }
+        replay_cs.stage_address_metadata_undo(&block.hash(), &metadata_checkpoint)?;
 
         Ok((receipts, stark_settlements))
     }
@@ -871,6 +873,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
         let overlay_chain_store = ChainStore::new(overlay.clone());
+        overlay_chain_store.restore_address_metadata(&plan.old_chain)?;
         let mut parent = ancestor;
         let mut parent_state_root = ancestor_state_root;
         let mut receipts = Vec::with_capacity(plan.new_chain.len());

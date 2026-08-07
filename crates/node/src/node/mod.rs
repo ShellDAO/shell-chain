@@ -2148,6 +2148,36 @@ mod tests {
         hash
     }
 
+    fn submit_key_rotation<S: KvStore + 'static>(
+        node: &Node<S>,
+        tx_signer: &impl Signer,
+        sender: Address,
+        new_pubkey: &[u8],
+    ) -> ShellHash {
+        submit_signed_tx(
+            node,
+            tx_signer,
+            sender,
+            Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(shell_pqvm::account_manager_address()),
+                value: U256::ZERO,
+                data: Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                    new_pubkey,
+                    tx_signer.sig_type().as_u8(),
+                )),
+                gas_limit: 100_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+        )
+    }
+
     fn current_state_root<S: KvStore + 'static>(node: &Node<S>) -> ShellHash {
         let mut ws = node.world_state.write();
         ws.state_root().unwrap()
@@ -2721,6 +2751,88 @@ mod tests {
             side_one.transactions.len() + side_one.system_transactions.len()
         );
         assert_eq!(current_state_root(&node), side_two.header.state_root);
+    }
+
+    #[test]
+    fn preferred_fork_replay_restores_ancestor_public_key() {
+        let (node, proposer_signer) = setup_node();
+        let proposer = node.config.proposer_address.unwrap();
+        let fork_node = setup_node_with_authority(proposer);
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let initial_pubkey = tx_signer.public_key().to_vec();
+        let canonical_pubkey = vec![0xC1; 1312];
+        let preferred_pubkey = vec![0xD2; 1312];
+        let initial_balance = U256::from(1_000_000_000_000_000u64);
+        for chain in [&node, &fork_node] {
+            fund_account(chain, &sender, initial_balance);
+            chain
+                .chain_store
+                .put_pubkey(&sender, &initial_pubkey)
+                .unwrap();
+            store_consistent_genesis(chain);
+        }
+        let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+
+        submit_key_rotation(&node, &tx_signer, sender, &canonical_pubkey);
+        let canonical = node.produce_block(&proposer_signer, 100).unwrap();
+        let canonical_hash = canonical.hash();
+        assert_eq!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(canonical_pubkey.clone())
+        );
+
+        submit_key_rotation(&fork_node, &tx_signer, sender, &preferred_pubkey);
+        let side_one = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_one_hash = side_one.hash();
+        let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
+        let side_two_hash = side_two.hash();
+        assert_ne!(side_one_hash, canonical_hash);
+
+        for block in [&side_one, &side_two] {
+            node.chain_store.put_side_fork_block(block).unwrap();
+            node.fork_choice.write().add_block(
+                block.hash(),
+                block.header.parent_hash,
+                block.number(),
+                0,
+                false,
+            );
+        }
+        assert_eq!(side_one.header.parent_hash, genesis_hash);
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("rotated-key side fork should become preferred");
+        assert_eq!(plan.old_chain, vec![canonical]);
+
+        node.adopt_preferred_fork(plan).unwrap();
+
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(preferred_pubkey)
+        );
+        assert_ne!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(initial_pubkey)
+        );
     }
 
     #[test]
@@ -6745,16 +6857,43 @@ mod tests {
 
         let tx_signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let reverted_signer = DilithiumSigner::generate();
+        let reverted_sender = Address::from_public_key(
+            reverted_signer.public_key(),
+            reverted_signer.sig_type().as_u8(),
+        );
         let receiver = Address::from([0xBE; 20]);
+        let reverted_receiver = Address::from([0xCF; 20]);
         let initial_balance = U256::from(100_000_000_000_000u64);
         fund_account(&node, &sender, initial_balance);
         fund_account(&fork_node, &sender, initial_balance);
+        fund_account(&node, &reverted_sender, initial_balance);
+        fund_account(&fork_node, &reverted_sender, initial_balance);
         store_consistent_genesis(&node);
         store_consistent_genesis(&fork_node);
 
-        let canonical = make_block_at_1(&node, &proposer_signer, None);
+        let reverted_tx_hash = submit_signed_tx(
+            &node,
+            &reverted_signer,
+            reverted_sender,
+            Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(reverted_receiver),
+                value: U256::from(2_000u64),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+        );
+        let canonical = node.produce_block(&proposer_signer, 100).unwrap();
         let canonical_hash = canonical.hash();
-        node.import_block(canonical, &MultiVerifier).unwrap();
+        assert_eq!(canonical.transactions.len(), 1);
 
         let transaction = Transaction {
             chain_id: 1337,
@@ -6832,6 +6971,22 @@ mod tests {
         assert_eq!(
             node.world_state.read().get_balance(&receiver).unwrap(),
             U256::from(1_000u64)
+        );
+        let resumed_block = node
+            .chain_store
+            .get_block_by_number(3)
+            .unwrap()
+            .expect("production should resume at block 3");
+        assert!(resumed_block
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == reverted_tx_hash));
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_balance(&reverted_receiver)
+                .unwrap(),
+            U256::from(2_000u64)
         );
     }
 

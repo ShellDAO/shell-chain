@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -66,6 +67,12 @@ pub struct RecoveryProposal {
     /// Block number after which `executeRecovery` may be called.
     /// Zero means the threshold has not yet been reached.
     pub maturity_block: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AddressMetadataUndoEntry {
+    key: Vec<u8>,
+    previous_value: Option<Vec<u8>>,
 }
 
 /// Storage format version bytes for migration compatibility.
@@ -159,6 +166,8 @@ mod prefix {
     pub const GUARDIAN_CONFIG: &[u8] = b"gc/";
     /// Active recovery proposal: key = "rp/" + address(32) → JSON-encoded RecoveryProposal
     pub const RECOVERY_PROPOSAL: &[u8] = b"rp/";
+    /// Undo journal for address-keyed metadata changed by a canonical block.
+    pub const ADDRESS_METADATA_UNDO: &[u8] = b"mu/";
     pub const TOTAL_TX_COUNT: &[u8] = b"TOTAL_TX_COUNT";
     pub const TOTAL_GAS_USED: &[u8] = b"TOTAL_GAS_USED";
     pub const TOTALS_HEAD: &[u8] = b"TOTALS_HEAD";
@@ -386,6 +395,10 @@ impl<S: KvStore> ChainStore<S> {
 
     fn pubkey_key(address: &Address) -> Vec<u8> {
         [prefix::PUBKEY_BY_ADDR, address.as_ref()].concat()
+    }
+
+    fn address_metadata_undo_key(block_hash: &ShellHash) -> Vec<u8> {
+        [prefix::ADDRESS_METADATA_UNDO, block_hash.as_bytes()].concat()
     }
 
     // ── Block operations ───────────────────────────────────────
@@ -1911,12 +1924,92 @@ impl<S: KvStore> ChainStore<S> {
 }
 
 impl<S: KvStore> ChainStore<OverlayStore<S>> {
+    const ADDRESS_METADATA_PREFIXES: [&'static [u8]; 3] = [
+        prefix::PUBKEY_BY_ADDR,
+        prefix::GUARDIAN_CONFIG,
+        prefix::RECOVERY_PROPOSAL,
+    ];
+
+    /// Stage an undo journal for address-keyed metadata changed since the
+    /// supplied overlay checkpoint.
+    pub fn stage_address_metadata_undo(
+        &self,
+        block_hash: &ShellHash,
+        checkpoint: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<(), StorageError> {
+        let entries = self
+            .store
+            .previous_values_since(checkpoint, &Self::ADDRESS_METADATA_PREFIXES)?
+            .into_iter()
+            .map(|(key, previous_value)| AddressMetadataUndoEntry {
+                key,
+                previous_value,
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        self.store
+            .put(&Self::address_metadata_undo_key(block_hash), &encoded)
+    }
+
+    /// Restore address-keyed metadata to the parent of `old_chain` by applying
+    /// each canonical block's undo journal from tip to ancestor.
+    pub fn restore_address_metadata(&self, old_chain: &[Block]) -> Result<(), StorageError> {
+        const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_UNDO_ENTRIES: usize = 1_000_000;
+
+        for block in old_chain.iter().rev() {
+            let block_hash = block.hash();
+            let encoded = match self
+                .store
+                .get(&Self::address_metadata_undo_key(&block_hash))?
+            {
+                Some(encoded) => encoded,
+                None if block.transactions.is_empty() => continue,
+                None => {
+                    return Err(StorageError::Database(format!(
+                        "address metadata undo journal unavailable for block {block_hash}"
+                    )))
+                }
+            };
+            if encoded.len() > MAX_UNDO_BYTES {
+                return Err(StorageError::Codec(format!(
+                    "address metadata undo journal for block {block_hash} exceeds size limit"
+                )));
+            }
+            let entries: Vec<AddressMetadataUndoEntry> = serde_json::from_slice(&encoded)
+                .map_err(|error| StorageError::Codec(error.to_string()))?;
+            if entries.len() > MAX_UNDO_ENTRIES {
+                return Err(StorageError::Codec(format!(
+                    "address metadata undo journal for block {block_hash} exceeds entry limit"
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            for entry in entries {
+                let valid_key = Self::ADDRESS_METADATA_PREFIXES.iter().any(|prefix| {
+                    entry.key.starts_with(prefix) && entry.key.len() == prefix.len() + 32
+                });
+                if !valid_key || !seen.insert(entry.key.clone()) {
+                    return Err(StorageError::Codec(format!(
+                        "invalid address metadata undo journal for block {block_hash}"
+                    )));
+                }
+                match entry.previous_value {
+                    Some(value) => self.store.put(&entry.key, &value)?,
+                    None => self.store.delete(&entry.key)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically commit overlay changes and canonical block artifacts to the base store.
     pub fn commit_canonical_overlay(
         &self,
         block: &Block,
         receipts: Option<&[TransactionReceipt]>,
     ) -> Result<(), StorageError> {
+        self.stage_address_metadata_undo(&block.hash(), &BTreeMap::new())?;
         let batch = self.canonical_block_batch(block, receipts)?;
         self.store.commit_with_batch(batch)
     }
@@ -4874,6 +4967,82 @@ mod tests {
         assert_eq!(base_cs.get_head_hash().unwrap(), Some(old_hash));
         assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(old_hash));
         assert_eq!(base_cs.get_receipts(&new_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn address_metadata_undo_restores_canonical_parent_values() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let account = Address::from([0xA1; 32]);
+        let old_pubkey = vec![0x11; 32];
+        let new_pubkey = vec![0x22; 32];
+        base_cs.put_pubkey(&account, &old_pubkey).unwrap();
+        let block = empty_block(1);
+
+        let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
+        let overlay_cs = ChainStore::new(Arc::clone(&overlay));
+        overlay_cs.put_pubkey(&account, &new_pubkey).unwrap();
+        overlay_cs
+            .put_guardian_config(
+                &account,
+                &GuardianConfig {
+                    guardians: vec![Address::from([0xB2; 32])],
+                    threshold: 1,
+                    timelock: MIN_RECOVERY_TIMELOCK,
+                },
+            )
+            .unwrap();
+        overlay_cs
+            .put_recovery_proposal(
+                &account,
+                &RecoveryProposal {
+                    new_pubkey: vec![0x33; 32],
+                    new_algo: 1,
+                    votes: vec![],
+                    maturity_block: 0,
+                },
+            )
+            .unwrap();
+        overlay_cs.commit_canonical_overlay(&block, None).unwrap();
+
+        let rollback_overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
+        let rollback_cs = ChainStore::new(rollback_overlay);
+        rollback_cs
+            .restore_address_metadata(std::slice::from_ref(&block))
+            .unwrap();
+
+        assert_eq!(rollback_cs.get_pubkey(&account).unwrap(), Some(old_pubkey));
+        assert_eq!(rollback_cs.get_guardian_config(&account).unwrap(), None);
+        assert_eq!(rollback_cs.get_recovery_proposal(&account).unwrap(), None);
+        assert_eq!(base_cs.get_pubkey(&account).unwrap(), Some(new_pubkey));
+    }
+
+    #[test]
+    fn address_metadata_restore_requires_a_complete_undo_journal() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(1);
+        base_cs.commit_canonical_block(&block, None).unwrap();
+        let overlay_cs = ChainStore::new(Arc::new(OverlayStore::new(db)));
+
+        let error = overlay_cs
+            .restore_address_metadata(std::slice::from_ref(&block))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("undo journal unavailable"));
+    }
+
+    #[test]
+    fn address_metadata_restore_accepts_legacy_empty_blocks() {
+        let db = Arc::new(MemoryDb::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let block = empty_block(1);
+        base_cs.commit_canonical_block(&block, None).unwrap();
+        let overlay_cs = ChainStore::new(Arc::new(OverlayStore::new(db)));
+
+        overlay_cs
+            .restore_address_metadata(std::slice::from_ref(&block))
+            .unwrap();
     }
 
     #[test]
