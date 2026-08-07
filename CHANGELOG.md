@@ -29,6 +29,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Bind block-sync responses to the requested starting height before importing
+  any peer-supplied blocks.
 - Prune address-metadata undo journals once their blocks are finalized, while
   retaining every journal that a valid reorganization can still require.
 - Reject side-fork blocks with malformed or invalid STARK aggregate proofs

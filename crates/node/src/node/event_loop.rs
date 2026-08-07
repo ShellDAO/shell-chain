@@ -53,9 +53,13 @@ fn block_response_import_allowed(block_count: usize, commit_certificate_count: u
 fn block_response_matches_request(
     sync_requested: bool,
     expected_nonce: Option<u64>,
+    expected_start: Option<u64>,
     nonce: u64,
+    first_block_number: Option<u64>,
 ) -> bool {
-    sync_requested && expected_nonce == Some(nonce)
+    sync_requested
+        && expected_nonce == Some(nonce)
+        && expected_start.is_some_and(|start| first_block_number.is_none_or(|first| first == start))
 }
 
 fn matching_empty_block_response_exhausts_request(
@@ -1241,15 +1245,19 @@ impl<S: KvStore + 'static> Node<S> {
                                     let _ = network.send_to_peer(&peer, resp).await;
                                 }
                                 NetworkMessage::BlockResponse { blocks, commit_certificates, nonce } => {
+                                    let first_block_number =
+                                        blocks.first().map(|block| block.header.number);
                                     if !block_response_matches_request(
                                         sync_requested,
                                         sync_request_nonce,
+                                        sync_request_start,
                                         nonce,
+                                        first_block_number,
                                     ) {
                                         warn!(
                                             %peer,
                                             nonce,
-                                            "dropping unsolicited or stale BlockResponse"
+                                            "dropping unsolicited, stale, or misaligned BlockResponse"
                                         );
                                         continue;
                                     }
@@ -2906,11 +2914,56 @@ mod cadence_tests {
     }
 
     #[test]
-    fn block_response_requires_the_active_request_nonce() {
-        assert!(block_response_matches_request(true, Some(7), 7));
-        assert!(!block_response_matches_request(false, Some(7), 7));
-        assert!(!block_response_matches_request(true, None, 7));
-        assert!(!block_response_matches_request(true, Some(8), 7));
+    fn block_response_requires_the_active_request_nonce_and_start() {
+        assert!(block_response_matches_request(
+            true,
+            Some(7),
+            Some(42),
+            7,
+            Some(42)
+        ));
+        assert!(block_response_matches_request(
+            true,
+            Some(7),
+            Some(42),
+            7,
+            None
+        ));
+        assert!(!block_response_matches_request(
+            false,
+            Some(7),
+            Some(42),
+            7,
+            Some(42)
+        ));
+        assert!(!block_response_matches_request(
+            true,
+            None,
+            Some(42),
+            7,
+            Some(42)
+        ));
+        assert!(!block_response_matches_request(
+            true,
+            Some(8),
+            Some(42),
+            7,
+            Some(42)
+        ));
+        assert!(!block_response_matches_request(
+            true,
+            Some(7),
+            None,
+            7,
+            Some(42)
+        ));
+        assert!(!block_response_matches_request(
+            true,
+            Some(7),
+            Some(42),
+            7,
+            Some(43)
+        ));
     }
 
     #[test]
