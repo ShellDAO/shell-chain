@@ -277,6 +277,7 @@ impl<S: KvStore + 'static> Node<S> {
         use shell_rpc::{start_rpc_server, BlockEvent};
         use tokio::time::{interval, Duration};
 
+        self.recover_unfinalized_head()?;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
         let mut network = NetworkInterface::new(network);
         let local_signer_address =

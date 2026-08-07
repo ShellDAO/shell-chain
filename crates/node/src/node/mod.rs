@@ -4576,6 +4576,67 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_rewinds_unfinalized_canonical_suffix() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let finalized = node.produce_block(&signer, 100).unwrap();
+        let finalized_hash = finalized.hash();
+        node.finality
+            .write()
+            .set_finalized_direct(finalized.number(), finalized_hash);
+        node.chain_store
+            .set_finalized_number(finalized.number())
+            .unwrap();
+        let block_two = node.produce_block(&signer, 100).unwrap();
+        let block_three = node.produce_block(&signer, 100).unwrap();
+
+        assert_eq!(node.recover_unfinalized_head().unwrap(), 2);
+        let recovered_head = node.chain_store.get_head_block().unwrap().unwrap();
+        assert_eq!(recovered_head.hash(), finalized_hash);
+        assert_eq!(recovered_head.number(), finalized.number());
+        assert_eq!(
+            node.chain_store
+                .get_block_hash_by_number(block_two.number())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            node.chain_store
+                .get_block_hash_by_number(block_three.number())
+                .unwrap(),
+            None
+        );
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&block_two.hash())
+            .unwrap()
+            .is_some());
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&block_three.hash())
+            .unwrap()
+            .is_some());
+        assert_eq!(node.fork_choice.read().head(), &finalized_hash);
+        assert_eq!(node.metrics.block_height.get(), finalized.number() as i64);
+        assert_eq!(node.metrics.finality_lag_blocks.get(), 0);
+        node.check_core_invariants().unwrap();
+        assert_eq!(node.recover_unfinalized_head().unwrap(), 0);
+    }
+
+    #[test]
+    fn startup_recovery_preserves_head_without_durable_finality() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let unfinalized = node.produce_block(&signer, 100).unwrap();
+
+        assert_eq!(node.recover_unfinalized_head().unwrap(), 0);
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().hash(),
+            unfinalized.hash()
+        );
+    }
+
+    #[test]
     fn node_recovers_finalized_hash_after_finalized_body_is_pruned() {
         let (node, signer) = setup_node();
         store_genesis(&node);

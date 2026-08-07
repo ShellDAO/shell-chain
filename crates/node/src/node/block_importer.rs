@@ -805,6 +805,138 @@ impl<S: KvStore + 'static> Node<S> {
         (inserted, rejected)
     }
 
+    /// Rewind a persisted unfinalized suffix before this process joins the network.
+    ///
+    /// wPoA votes are process-local until a commit certificate is persisted. After
+    /// a restart, retaining blocks above the durable finalized cursor can strand
+    /// validators on incompatible suffixes that cannot be authenticated by block
+    /// sync. The block records remain available by hash, while canonical state,
+    /// indexes, and address metadata are restored atomically to the finalized tip.
+    pub(super) fn recover_unfinalized_head(&self) -> Result<usize, NodeError> {
+        let Some(finalized_number) = self.chain_store.get_finalized_number()? else {
+            return Ok(0);
+        };
+        let head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        if head.number() <= finalized_number {
+            return Ok(0);
+        }
+
+        let finalized_hash = self
+            .chain_store
+            .get_block_hash_by_number(finalized_number)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "cannot recover unfinalized head: canonical finalized block #{finalized_number} is missing"
+                ))
+            })?;
+        let finalized_block = self
+            .chain_store
+            .get_block_by_hash(&finalized_hash)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "cannot recover unfinalized head: finalized block {finalized_hash} is unavailable"
+                ))
+            })?;
+        let mut old_chain = Vec::with_capacity(
+            usize::try_from(head.number().saturating_sub(finalized_number)).unwrap_or(usize::MAX),
+        );
+        for number in finalized_number.saturating_add(1)..=head.number() {
+            let block_hash = self
+                .chain_store
+                .get_block_hash_by_number(number)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "cannot recover unfinalized head: canonical mapping for block #{number} is missing"
+                    ))
+                })?;
+            let block = self
+                .chain_store
+                .get_block_by_hash(&block_hash)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "cannot recover unfinalized head: canonical block #{number} ({block_hash}) is unavailable"
+                    ))
+                })?;
+            old_chain.push(block);
+        }
+
+        // Preflight the finalized state and algorithm registry before committing
+        // the canonical rollback. A malformed or pruned state root must leave the
+        // existing canonical metadata untouched.
+        let mut restored_state =
+            WorldState::at_root(self.store.clone(), &finalized_block.header.state_root)?;
+        restored_state.validate()?;
+        let restored_registry = load_algorithm_registry(&restored_state).map_err(|error| {
+            NodeError::Startup(format!(
+                "failed to restore algorithm registry at finalized block #{finalized_number}: {error}"
+            ))
+        })?;
+
+        let overlay = Arc::new(OverlayStore::new(self.store.clone()));
+        let overlay_chain_store = ChainStore::new(overlay);
+        overlay_chain_store.restore_address_metadata(&old_chain)?;
+        let stale_canonical_numbers =
+            (finalized_number.saturating_add(1)..=head.number()).collect::<Vec<_>>();
+        overlay_chain_store.commit_reorg_overlay(
+            &old_chain,
+            &[],
+            &stale_canonical_numbers,
+            &[],
+            &finalized_hash,
+        )?;
+
+        *self.world_state.write() = restored_state;
+        *AlgorithmRegistry::global_mut() = restored_registry;
+        *self.fork_choice.write() = restore_fork_choice(
+            self.chain_store.as_ref(),
+            finalized_number,
+            finalized_hash,
+            finalized_number,
+        );
+        self.prover_orchestrator()
+            .rewind_settled_frontiers(finalized_number);
+        self.last_proposed_by
+            .lock()
+            .retain(|_, number| *number <= finalized_number);
+
+        for block in &old_chain {
+            let mut reverted_settlements = Self::decode_system_extra(&block.header.extra_data)?;
+            reverted_settlements.extend(
+                block
+                    .system_transactions
+                    .iter()
+                    .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                    .filter_map(|tx| {
+                        ProofAmendment::from_json(tx.proof_payload.as_ref()?.as_ref()).ok()
+                    }),
+            );
+            self.block_store()
+                .cancel_settled_witness_deletes(&reverted_settlements);
+        }
+
+        if self.chain_store.get_chain_totals_head()?.is_some() {
+            self.chain_store.rebuild_chain_totals(finalized_number)?;
+        }
+        let reverted_txs = unique_reverted_transactions(&old_chain, &[]);
+        let (reinserted, rejected) = self.reinsert_reverted_transactions(&reverted_txs);
+        self.metrics.block_height.set(finalized_number as i64);
+        self.metrics
+            .update_finality(finalized_number, finalized_number);
+
+        warn!(
+            old_head = head.number(),
+            finalized_number,
+            rolled_back = old_chain.len(),
+            mempool_reinserted = reinserted,
+            mempool_rejected = rejected,
+            "recovered canonical state by rewinding an unfinalized startup suffix"
+        );
+        Ok(old_chain.len())
+    }
+
     pub(super) fn adopt_preferred_fork(&self, plan: ForkAdoptionPlan) -> Result<(), NodeError> {
         let current_head = self
             .chain_store
