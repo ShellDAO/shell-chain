@@ -87,9 +87,10 @@ For navigating `crates/node/` specifically, see
   settlement carrier.
 - **Witness pruner cutoff** is always
   `min(retention_cutoff, stark_frontier)`.
-- **Drain-frontier** is an `Arc<AtomicU64>` that is monotonic per process;
-  the seeder must clamp `scan_start` to
-  `max(contiguous_pending_end - 16, drain_frontier)`.
+- **STARK frontier recovery** preserves canonical order: recovered historical
+  tasks are inserted by block height ahead of queued live-tip work, sparse or
+  missing frontier ranges are retained rather than drained, and sources remain
+  reserved while proof generation or event-loop handoff is in flight.
 - **`L2StarkMode::Active` is allowed only when the deployment explicitly
   opts into the white-paper STARK target path and its operational gates.**
 
