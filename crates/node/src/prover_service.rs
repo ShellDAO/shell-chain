@@ -322,6 +322,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 }
                 Some(task) => {
                     let layer = task.layer;
+                    let block_number = task.block_number;
                     let source_hashes = if task.source_hashes.is_empty() {
                         vec![ShellHash::from(task.block_hash)]
                     } else {
@@ -331,7 +332,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     if !handed_off {
                         self.backlog
                             .lock()
-                            .complete_in_flight(layer, &source_hashes);
+                            .complete_in_flight(layer, block_number, &source_hashes);
                     }
                 }
             }

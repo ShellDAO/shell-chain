@@ -1,6 +1,7 @@
 use super::*;
 
 const MAX_BLOCK_SYNC_RESPONSE_BLOCKS: usize = 128;
+const MAX_L1_BACKLOG_TASKS: usize = DEFAULT_MAX_L1_RANGE_SOURCES * 2;
 const FORK_ADOPTION_RETRY_BASE_SECS: u64 = 5;
 const FORK_ADOPTION_RETRY_MAX_SECS: u64 = 30;
 
@@ -95,6 +96,16 @@ fn bounded_request_numbers(
     max_count: u64,
 ) -> impl Iterator<Item = u64> {
     (0..count.min(max_count)).filter_map(move |offset| start_number.checked_add(offset))
+}
+
+fn bounded_finalized_request_numbers(
+    start_number: u64,
+    count: u64,
+    max_count: u64,
+    finalized_number: u64,
+) -> impl Iterator<Item = u64> {
+    bounded_request_numbers(start_number, count, max_count)
+        .take_while(move |number| *number <= finalized_number)
 }
 
 fn next_block_sync_request_start(last_imported: u64) -> Option<u64> {
@@ -549,7 +560,11 @@ impl<S: KvStore + 'static> Node<S> {
                             < MAX_PENDING_STARK_SETTLEMENTS => {
                     self.proof_backlog
                         .lock()
-                        .complete_in_flight(amendment.layer, &amendment.covered_hashes());
+                        .complete_in_flight(
+                            amendment.layer,
+                            amendment.block_number,
+                            &amendment.covered_hashes(),
+                        );
                     if amendment.layer > 1 {
                         self.metrics.stark_l2_proofs_generated.inc();
                     } else {
@@ -1234,10 +1249,13 @@ impl<S: KvStore + 'static> Node<S> {
                                         "received BlockRequest"
                                     );
                                     let mut blocks = Vec::new();
-                                    for n in bounded_request_numbers(
+                                    let finalized_number =
+                                        self.finality.read().last_finalized_number();
+                                    for n in bounded_finalized_request_numbers(
                                         start_number,
                                         safe_count,
                                         MAX_BLOCK_SYNC_RESPONSE_BLOCKS as u64,
+                                        finalized_number,
                                     ) {
                                         match self.chain_store.get_block_by_number(n) {
                                             Ok(Some(block)) => blocks.push(block),
@@ -1247,6 +1265,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     info!(
                                         count = blocks.len(),
                                         from = start_number,
+                                        finalized = finalized_number,
                                         "responding to block request"
                                     );
                                     let commit_certificates = blocks
@@ -2461,6 +2480,14 @@ impl<S: KvStore + 'static> Node<S> {
         if self.pending_stark_settlements.lock().len() >= MAX_PENDING_STARK_SETTLEMENTS {
             return Ok(0);
         }
+        let available_backlog_slots = {
+            let backlog = self.proof_backlog.lock();
+            MAX_L1_BACKLOG_TASKS.saturating_sub(backlog.covered_block_count_for_layer(1))
+        };
+        if available_backlog_slots == 0 {
+            return Ok(0);
+        }
+        let max_blocks = max_blocks.min(available_backlog_slots);
         // Note: we intentionally do NOT skip when pending_stark_settlements is
         // non-empty.  The inner loop already skips blocks that are covered by a
         // pending settlement, so the early-return here would incorrectly prevent
@@ -2487,7 +2514,8 @@ impl<S: KvStore + 'static> Node<S> {
         // to bound startup cost.
         let hard_cap = max_blocks
             .saturating_mul(4)
-            .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4);
+            .max(DEFAULT_MAX_L1_RANGE_SOURCES * 4)
+            .min(available_backlog_slots);
         let mut seeded_entries = 0usize;
 
         let pending_overlay = {
@@ -2510,7 +2538,13 @@ impl<S: KvStore + 'static> Node<S> {
             .copied()
             .unwrap_or(0);
         let contiguous_pending_end = self.first_canonical_block_below_layer(1, &pending_overlay)?;
-        let scan_start = contiguous_pending_end.saturating_sub(16);
+        let Some(scan_start) = self.proof_backlog.lock().first_uncovered_block_for_layer(
+            1,
+            contiguous_pending_end,
+            head,
+        ) else {
+            return Ok(0);
+        };
         info!(
             settled_frontier,
             contiguous_pending_end, scan_start, head, "STARK seeding: scan parameters"
@@ -3001,6 +3035,15 @@ mod cadence_tests {
     fn bounded_request_numbers_caps_peer_count() {
         let numbers: Vec<_> = bounded_request_numbers(10, 4, 2).collect();
         assert_eq!(numbers, vec![10, 11]);
+    }
+
+    #[test]
+    fn block_sync_responses_stop_at_finalized_height() {
+        let numbers: Vec<_> = bounded_finalized_request_numbers(10, 8, 128, 12).collect();
+        assert_eq!(numbers, vec![10, 11, 12]);
+        assert!(bounded_finalized_request_numbers(13, 1, 128, 12)
+            .next()
+            .is_none());
     }
 
     #[test]

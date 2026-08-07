@@ -174,6 +174,10 @@ pub struct ProofBacklog {
     in_flight_sources: HashMap<(u32, ShellHash), usize>,
     /// Per-layer sorted block-number counts — enables O(log n) frontier lookups.
     layer_blocks: BTreeMap<u32, BTreeMap<u64, usize>>,
+    /// Canonical L1 source heights covered by pending tasks.
+    pending_block_coverage: BTreeMap<u32, BTreeMap<u64, usize>>,
+    /// Canonical L1 source heights reserved by an active prover task.
+    in_flight_block_coverage: BTreeMap<u32, BTreeMap<u64, usize>>,
     /// Depth at which [`is_above_threshold`] returns `true`.
     ///
     /// [`is_above_threshold`]: ProofBacklog::is_above_threshold
@@ -199,6 +203,8 @@ impl ProofBacklog {
             source_index: HashMap::new(),
             in_flight_sources: HashMap::new(),
             layer_blocks: BTreeMap::new(),
+            pending_block_coverage: BTreeMap::new(),
+            in_flight_block_coverage: BTreeMap::new(),
             watermark_threshold,
             total_enqueued: 0,
             total_completed: 0,
@@ -310,10 +316,24 @@ impl ProofBacklog {
     }
 
     /// Release source reservations after proof failure or event-loop handoff.
-    pub fn complete_in_flight(&mut self, layer: u32, source_hashes: &[ShellHash]) {
+    pub fn complete_in_flight(
+        &mut self,
+        layer: u32,
+        block_number: u64,
+        source_hashes: &[ShellHash],
+    ) {
         for source_hash in source_hashes {
             Self::decrement_hash_count(&mut self.in_flight_sources, &(layer, *source_hash));
         }
+        let task = ProofTask::with_sources(
+            [0u8; 32],
+            block_number,
+            Vec::new(),
+            layer,
+            source_hashes.to_vec(),
+            None,
+        );
+        Self::decrement_task_coverage(&mut self.in_flight_block_coverage, &task);
     }
 
     /// Pop the next task from the front of the queue (FIFO).
@@ -583,6 +603,45 @@ impl ProofBacklog {
             .map(|(number, _)| *number)
     }
 
+    /// Number of pending tasks for a STARK layer.
+    pub fn pending_task_count_for_layer(&self, layer: u32) -> usize {
+        self.layer_blocks
+            .get(&layer)
+            .map(|blocks| blocks.values().copied().sum())
+            .unwrap_or(0)
+    }
+
+    /// Number of source heights covered by pending and in-flight L1 work.
+    pub fn covered_block_count_for_layer(&self, layer: u32) -> usize {
+        self.pending_block_coverage
+            .get(&layer)
+            .map(BTreeMap::len)
+            .unwrap_or(0)
+            .saturating_add(
+                self.in_flight_block_coverage
+                    .get(&layer)
+                    .map(BTreeMap::len)
+                    .unwrap_or(0),
+            )
+    }
+
+    /// Return the first canonical L1 height not covered by pending or in-flight work.
+    ///
+    /// This lookup is entirely in memory. Frontier recovery uses it to avoid
+    /// rereading every already-queued historical block from RocksDB on each
+    /// production tick.
+    pub fn first_uncovered_block_for_layer(&self, layer: u32, start: u64, end: u64) -> Option<u64> {
+        if start > end {
+            return None;
+        }
+        let pending = self.pending_block_coverage.get(&layer);
+        let in_flight = self.in_flight_block_coverage.get(&layer);
+        (start..=end).find(|number| {
+            !pending.is_some_and(|blocks| blocks.contains_key(number))
+                && !in_flight.is_some_and(|blocks| blocks.contains_key(number))
+        })
+    }
+
     /// Drain all pending tasks, returning them in FIFO order.
     ///
     /// Useful for graceful shutdown — the caller can persist or re-queue tasks.
@@ -591,6 +650,7 @@ impl ProofBacklog {
         self.total_completed += tasks.len() as u64;
         self.source_index.clear();
         self.layer_blocks.clear();
+        self.pending_block_coverage.clear();
         tasks
     }
 
@@ -625,6 +685,7 @@ impl ProofBacklog {
             .or_default()
             .entry(task.block_number)
             .or_default() += 1;
+        Self::increment_task_coverage(&mut self.pending_block_coverage, task);
     }
 
     fn index_remove(&mut self, task: &ProofTask) {
@@ -644,6 +705,7 @@ impl ProofBacklog {
                 self.layer_blocks.remove(&task.layer);
             }
         }
+        Self::decrement_task_coverage(&mut self.pending_block_coverage, task);
     }
 
     fn reserve_in_flight(&mut self, task: &ProofTask) {
@@ -659,6 +721,50 @@ impl ProofBacklog {
                     .entry((task.layer, *source_hash))
                     .or_default() += 1;
             }
+        }
+        Self::increment_task_coverage(&mut self.in_flight_block_coverage, task);
+    }
+
+    fn task_coverage(task: &ProofTask) -> Option<std::ops::RangeInclusive<u64>> {
+        if task.layer != 1 {
+            return None;
+        }
+        let source_count = u64::try_from(task.source_hashes.len().max(1)).ok()?;
+        let start = task
+            .block_number
+            .saturating_add(1)
+            .saturating_sub(source_count);
+        Some(start..=task.block_number)
+    }
+
+    fn increment_task_coverage(
+        coverage: &mut BTreeMap<u32, BTreeMap<u64, usize>>,
+        task: &ProofTask,
+    ) {
+        let Some(range) = Self::task_coverage(task) else {
+            return;
+        };
+        let blocks = coverage.entry(task.layer).or_default();
+        for number in range {
+            *blocks.entry(number).or_default() += 1;
+        }
+    }
+
+    fn decrement_task_coverage(
+        coverage: &mut BTreeMap<u32, BTreeMap<u64, usize>>,
+        task: &ProofTask,
+    ) {
+        let Some(range) = Self::task_coverage(task) else {
+            return;
+        };
+        let Some(blocks) = coverage.get_mut(&task.layer) else {
+            return;
+        };
+        for number in range {
+            Self::decrement_block_count(blocks, number);
+        }
+        if blocks.is_empty() {
+            coverage.remove(&task.layer);
         }
     }
 
@@ -719,6 +825,7 @@ mod tests {
     fn assert_index_consistency(backlog: &ProofBacklog) {
         let mut expected_sources = HashMap::new();
         let mut expected_blocks: BTreeMap<u32, BTreeMap<u64, usize>> = BTreeMap::new();
+        let mut expected_coverage: BTreeMap<u32, BTreeMap<u64, usize>> = BTreeMap::new();
 
         for task in &backlog.pending {
             if task.source_hashes.is_empty() {
@@ -737,10 +844,17 @@ mod tests {
                 .or_default()
                 .entry(task.block_number)
                 .or_default() += 1;
+            if let Some(range) = ProofBacklog::task_coverage(task) {
+                let blocks = expected_coverage.entry(task.layer).or_default();
+                for number in range {
+                    *blocks.entry(number).or_default() += 1;
+                }
+            }
         }
 
         assert_eq!(backlog.source_index, expected_sources);
         assert_eq!(backlog.layer_blocks, expected_blocks);
+        assert_eq!(backlog.pending_block_coverage, expected_coverage);
     }
 
     #[test]
@@ -820,14 +934,33 @@ mod tests {
         let task = b.pop_contiguous_for_proving(1, 0).expect("proof task");
         assert!(b.is_empty());
         assert!(b.contains_source(1, &source));
+        assert_eq!(b.first_uncovered_block_for_layer(1, 10, 11), Some(11));
 
         b.insert_ordered_batch(vec![make_task(10)]);
         assert!(b.is_empty(), "reserved source must not be re-enqueued");
 
-        b.complete_in_flight(task.layer, &task.source_hashes);
+        b.complete_in_flight(task.layer, task.block_number, &task.source_hashes);
         assert!(!b.contains_source(1, &source));
+        assert_eq!(b.first_uncovered_block_for_layer(1, 10, 11), Some(10));
         b.insert_ordered_batch(vec![make_task(10)]);
         assert_eq!(b.len(), 1);
+        assert_index_consistency(&b);
+    }
+
+    #[test]
+    fn coverage_index_finds_gap_without_scanning_queued_sources() {
+        let mut b = ProofBacklog::new();
+        b.insert_ordered_batch(
+            (10..=20)
+                .filter(|number| *number != 15)
+                .map(make_task)
+                .collect(),
+        );
+
+        assert_eq!(b.pending_task_count_for_layer(1), 10);
+        assert_eq!(b.covered_block_count_for_layer(1), 10);
+        assert_eq!(b.first_uncovered_block_for_layer(1, 10, 20), Some(15));
+        assert_eq!(b.first_uncovered_block_for_layer(1, 16, 20), None);
         assert_index_consistency(&b);
     }
 
