@@ -106,7 +106,7 @@ pub(crate) use shell_stark_prover::{
     proof::SigBatchProof,
     prover::{compute_batch_root, verify_sig_batch, SigBatchEntry},
     AggregationConfig, AggregationScheduler, AggregationTrigger, ProofAmendment, ProofBacklog,
-    ProofTask, SettledL1Input, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
+    ProofTask, SettledL1Input, StoredProofArtifact, DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS,
 };
 
 fn tx_fits_remaining_block_gas(
@@ -9244,6 +9244,39 @@ mod tests {
             .expect("invalid stored amendment must be replaced with a proof task");
         assert_eq!(task.block_number, 0);
         assert_eq!(task.source_hashes, vec![genesis_hash]);
+    }
+
+    #[test]
+    fn stark_frontier_recovery_preserves_valid_proof_pointers() {
+        let (node, proposer_signer) = setup_stark_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis must be canonical");
+        let hashes = produce_witnessed_blocks(&node, &proposer_signer, 2);
+        let sources = vec![genesis_hash, hashes[0], hashes[1]];
+        let amendment = dummy_ordered_amendment(1, sources.clone(), 2);
+        while node.proof_backlog.lock().pop().is_some() {}
+        node.store_stark_artifacts(&amendment, None).unwrap();
+
+        assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 3);
+
+        assert!(node.proof_backlog.lock().is_empty());
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            std::slice::from_ref(&amendment)
+        );
+        for source_hash in sources {
+            assert!(
+                node.amendment_store
+                    .get_amendment(&source_hash)
+                    .unwrap()
+                    .is_some(),
+                "valid stored artifact must survive recovery"
+            );
+        }
     }
 
     #[test]
