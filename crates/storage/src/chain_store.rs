@@ -676,6 +676,19 @@ impl<S: KvStore> ChainStore<S> {
         self.store.delete(&Self::witness_key(hash))
     }
 
+    /// Delete multiple witness bundles in one atomic storage batch.
+    pub fn delete_witness_bundles(&self, hashes: &[ShellHash]) -> Result<(), StorageError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for hash in hashes {
+            batch.delete(Self::witness_key(hash));
+        }
+        self.store.write_batch(batch)
+    }
+
     /// Returns `true` if a witness bundle is stored for the given block hash.
     pub fn has_witness_bundle(&self, hash: &ShellHash) -> Result<bool, StorageError> {
         Ok(self.store.get(&Self::witness_key(hash))?.is_some())
@@ -4954,6 +4967,24 @@ mod tests {
             loaded.transactions[0].signature.data.is_empty(),
             "stub sig after witness deletion"
         );
+    }
+
+    #[test]
+    fn delete_witness_bundles_removes_multiple_bundles() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db);
+        let blocks: Vec<_> = (0..4).map(make_block_with_txs).collect();
+        let hashes: Vec<_> = blocks.iter().map(Block::hash).collect();
+        for block in &blocks {
+            cs.put_block(block).unwrap();
+        }
+
+        cs.delete_witness_bundles(&hashes[..3]).unwrap();
+
+        for hash in hashes.iter().take(3) {
+            assert!(!cs.has_witness_bundle(hash).unwrap());
+        }
+        assert!(cs.has_witness_bundle(&hashes[3]).unwrap());
     }
 
     #[test]

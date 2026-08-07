@@ -1675,25 +1675,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     }
-                                    self.pending_stark_settlements.lock().push(amendment.clone());
-                                    // L2: delete covered witness bundles once proof is secured, unless grace window is active.
-                                    let grace = self.config.pruning.proof_replacement_grace;
-                                    let source_end_block = amendment.block_number;
-                                    let head = self.chain_store.get_head_block()
-                                        .ok().flatten().map(|b| b.header.number).unwrap_or(0);
-                                    for hash in covered_hashes {
-                                        if grace == 0 || head.saturating_sub(source_end_block) >= grace {
-                                            match self.chain_store.delete_witness_bundle(&hash) {
-                                                Ok(()) => info!(block = source_end_block, %hash, "L2: witness bundle deleted after proof replacement"),
-                                                Err(e) => warn!(block = source_end_block, %hash, "L2: failed to delete witness bundle: {e}"),
-                                            }
-                                        } else {
-                                            // Schedule deletion from the signed source-range end.
-                                            let delete_at = source_end_block.saturating_add(grace);
-                                            self.pending_grace_deletes.lock().insert(hash, delete_at);
-                                            debug!(block = source_end_block, %hash, grace, head, delete_at, "L2: proof stored, within grace window — deletion scheduled");
-                                        }
-                                    }
+                                    self.pending_stark_settlements.lock().push(amendment);
                                 }
                                 // G5: Acknowledge that a peer has stored a proof amendment.
                                 NetworkMessage::ProofAck { block_hash, holder } => {

@@ -551,6 +551,12 @@ impl<S: KvStore + 'static> Node<S> {
             self.metrics.stark_frontier_lag.set(lag);
         }
         self.feed_l2_scheduler_from_settlements(&settled_stark_proofs, block.number());
+        block_store.schedule_settled_witness_deletes(
+            &settled_stark_proofs,
+            block.number(),
+            self.config.pruning.proof_replacement_grace,
+        );
+        block_store.prune_grace_witnesses(block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
 
         // Remove included transactions from mempool.

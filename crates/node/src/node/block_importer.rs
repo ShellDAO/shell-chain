@@ -926,7 +926,21 @@ impl<S: KvStore + 'static> Node<S> {
         algorithm_registry_rollback.commit();
 
         state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
-        self.block_store().replace_world_state(state);
+        let block_store = self.block_store();
+        block_store.replace_world_state(state);
+        for block in &plan.old_chain {
+            let mut reverted_settlements = Self::decode_system_extra(&block.header.extra_data)?;
+            reverted_settlements.extend(
+                block
+                    .system_transactions
+                    .iter()
+                    .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                    .filter_map(|tx| {
+                        ProofAmendment::from_json(tx.proof_payload.as_ref()?.as_ref()).ok()
+                    }),
+            );
+            block_store.cancel_settled_witness_deletes(&reverted_settlements);
+        }
         for (block, block_settlements) in plan.new_chain.iter().zip(settlements) {
             let settlement_hashes = block
                 .system_transactions
@@ -941,7 +955,13 @@ impl<S: KvStore + 'static> Node<S> {
             self.prover_orchestrator()
                 .remove_settled_pending(&block_settlements);
             self.feed_l2_scheduler_from_settlements(&block_settlements, block.number());
+            block_store.schedule_settled_witness_deletes(
+                &block_settlements,
+                block.number(),
+                self.config.pruning.proof_replacement_grace,
+            );
         }
+        block_store.prune_grace_witnesses(plan.preferred_number);
         let adopted_tx_hashes = plan
             .new_chain
             .iter()
@@ -1555,7 +1575,14 @@ impl<S: KvStore + 'static> Node<S> {
         self.last_proposed_by
             .lock()
             .insert(block.header.proposer, block.number());
-        // L2 grace-window: flush any witnesses whose delete_at block has been reached.
+        // Witness replacement begins only after the proof is in a canonical
+        // settlement block. Peer gossip alone must never make source data
+        // unavailable. The grace period is measured from settlement inclusion.
+        block_store.schedule_settled_witness_deletes(
+            &stark_settlements,
+            block.number(),
+            self.config.pruning.proof_replacement_grace,
+        );
         block_store.prune_grace_witnesses(block.number());
 
         // Remove any included transactions from our mempool.
