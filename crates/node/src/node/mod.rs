@@ -3829,7 +3829,8 @@ mod tests {
 
     #[test]
     fn stark_settled_index_survives_simulated_restart() {
-        let (node, signer) = setup_node();
+        let (mut node, signer) = setup_node();
+        node.config.pruning.proof_replacement_grace = 128;
         store_genesis(&node);
         let genesis_hash = node
             .chain_store
@@ -3843,7 +3844,8 @@ mod tests {
         node.pending_stark_settlements
             .lock()
             .push(amendment.clone());
-        node.produce_block(&signer, 100).unwrap();
+        let settlement_block = node.produce_block(&signer, 100).unwrap();
+        assert!(node.chain_store.has_witness_bundle(&hashes[0]).unwrap());
 
         // Verify settled_stark_sources was populated.
         assert!(
@@ -3863,12 +3865,18 @@ mod tests {
 
         // Simulate restart: clear in-memory set and reload via index (fast path).
         node.settled_stark_sources.lock().clear();
+        node.pending_grace_deletes.lock().clear();
         assert!(
             node.settled_stark_sources.lock().is_empty(),
             "cleared before rebuild"
         );
         let count = node.rebuild_settled_stark_sources_from_chain().unwrap();
         assert_eq!(count, 3, "fast path should restore 3 settled entries");
+        assert_eq!(
+            node.pending_grace_deletes.lock().get(&hashes[0]),
+            Some(&settlement_block.number().saturating_add(128)),
+            "restart rebuild must preserve the original settlement grace deadline"
+        );
 
         // After rebuild, settled_stark_sources should contain all three sources.
         assert!(

@@ -2296,6 +2296,11 @@ impl<S: KvStore + 'static> Node<S> {
                 .chain(tx_settlements)
             {
                 self.store_stark_artifacts(&amendment, settlement_tx_hash)?;
+                self.block_store().schedule_settled_witness_deletes(
+                    std::slice::from_ref(&amendment),
+                    number,
+                    self.config.pruning.proof_replacement_grace,
+                );
                 for source in amendment.covered_hashes() {
                     canonical.insert((amendment.layer, source));
                 }
@@ -2305,6 +2310,7 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         }
+        self.block_store().prune_grace_witnesses(head);
 
         // ── Step 2: reconcile the persistent `ss/` index ─────────────────────
         // Remove stale entries that no longer exist on the canonical chain.
