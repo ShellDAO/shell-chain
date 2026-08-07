@@ -23,6 +23,10 @@ cat >"$tmp/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$WATCHDOG_TEST_ACTIONS"
 if [[ "$1" == "is-active" ]]; then
+  service="${*: -1}"
+  case ",${WATCHDOG_TEST_INACTIVE:-}," in
+    *",${service},"*) exit 3 ;;
+  esac
   exit 0
 fi
 EOF
@@ -41,11 +45,15 @@ chmod +x "$tmp/bin/curl" "$tmp/bin/systemctl" "$tmp/bin/logger" "$tmp/bin/flock"
 
 run_watchdog() {
   local endpoints="$1" services="$2" state_dir="$3" actions="$4"
+  local inactive="${5:-}" conflicting="${6:-}"
   PATH="$tmp/bin:$PATH" \
     WATCHDOG_TEST_ACTIONS="$actions" \
+    WATCHDOG_TEST_INACTIVE="$inactive" \
     SHELL_WATCHDOG_ENDPOINTS="$endpoints" \
     SHELL_WATCHDOG_SERVICES="$services" \
     SHELL_WATCHDOG_FAILURE_THRESHOLD=1 \
+    SHELL_WATCHDOG_INACTIVE_FAILURE_THRESHOLD=1 \
+    SHELL_WATCHDOG_CONFLICTING_SERVICES="$conflicting" \
     SHELL_WATCHDOG_STATE_DIR="$state_dir" \
     bash "$watchdog"
 }
@@ -63,6 +71,29 @@ fi
 
 : >"$actions"
 run_watchdog "http://syncing,http://unready" "syncing.service,unready.service" "$tmp/syncing" "$actions"
-[[ ! -s "$actions" ]]
+if grep -Eq '^(start|restart|stop) ' "$actions"; then
+  echo "watchdog disrupted active synchronization" >&2
+  exit 1
+fi
+
+: >"$actions"
+run_watchdog \
+  "http://syncing,http://ready" \
+  "inactive.service,ready.service" \
+  "$tmp/inactive" \
+  "$actions" \
+  "inactive.service"
+grep -qx 'reset-failed inactive.service' "$actions"
+grep -qx 'start inactive.service' "$actions"
+
+: >"$actions"
+run_watchdog \
+  "http://ready,http://ready" \
+  "ready-a.service,ready-b.service" \
+  "$tmp/conflict" \
+  "$actions" \
+  "" \
+  "legacy.service"
+grep -qx 'stop legacy.service' "$actions"
 
 printf '%s\n' "shell cluster watchdog tests passed"

@@ -29,9 +29,12 @@ sudo systemctl enable --now shell-cluster-watchdog.timer
 
 The watchdog requires every configured validator to report production readiness,
 waits for sustained unavailability before taking action, never restarts while a
-reachable node reports active synchronization, and restarts only an unready
-validator per recovery interval. Order services from lowest to highest voting
-weight in the environment file.
+reachable managed node reports active synchronization, and restarts only an
+unready validator per recovery interval. Inactive services use a shorter failure
+threshold and cannot be hidden by an unrelated process responding on the same
+health endpoint. Order services from lowest to highest voting weight in the
+environment file. Set `SHELL_WATCHDOG_CONFLICTING_SERVICES` only for legacy or
+mutually exclusive units that must never run beside the managed validators.
 
 Operational defaults:
 
