@@ -238,7 +238,10 @@ ok "Created annotated tag: ${TAG}"
 echo ""
 read -r -p "Push tag ${TAG} to ${RELEASE_REMOTE}? [y/N] " CONFIRM
 if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
-    git push "$RELEASE_REMOTE" "$TAG"
+    if ! "$SCRIPT_DIR/push-release-tag.sh" \
+        "$RELEASE_REMOTE" "$TAG" "$RELEASE_COMMIT"; then
+        fail "Release tag push was rejected"
+    fi
     ok "Pushed tag ${TAG} to ${RELEASE_REMOTE}"
     echo ""
     echo "Next steps:"
@@ -247,7 +250,7 @@ if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
     echo "  3. Build the remaining platforms with scripts/build-release-binary.sh and attach the binaries"
     echo "  4. Publish Docker image: docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/shelldao/shell-chain:${TAG} --push ."
 else
-    warn "Tag created locally but NOT pushed. Run: git push ${RELEASE_REMOTE} ${TAG}"
+    warn "Tag created locally but NOT pushed. Run: scripts/push-release-tag.sh ${RELEASE_REMOTE} ${TAG} ${RELEASE_COMMIT}"
 fi
 
 echo ""

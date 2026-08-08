@@ -69,8 +69,14 @@ fi
 if ! grep -Fq '"$SCRIPT_DIR/build-release-binary.sh"' "$SCRIPT_DIR/release.sh"; then
     fail "release preflight does not build the production binary before tagging"
 fi
-if ! grep -Fq 'git push "$RELEASE_REMOTE" "$TAG"' "$SCRIPT_DIR/release.sh"; then
-    fail "release tag push does not use the validated remote"
+if ! grep -Fq '"$SCRIPT_DIR/push-release-tag.sh"' "$SCRIPT_DIR/release.sh"; then
+    fail "release tag push does not preserve the validated source and main refs"
+fi
+if grep -Fq 'Run: git push' "$SCRIPT_DIR/release.sh"; then
+    fail "deferred release instructions bypass the validated tag push helper"
+fi
+if ! grep -Fq 'check-release-remote.sh' "$SCRIPT_DIR/push-release-tag.sh"; then
+    fail "release tag push does not revalidate the canonical remote"
 fi
 
 LOCK_FIXTURE="$TMP_DIR/lock-fixture"
@@ -148,6 +154,15 @@ fi
 TAG_REMOTE="$TMP_DIR/tag-remote.git"
 TAG_FIXTURE="$TMP_DIR/tag-fixture"
 TAG_CHECKOUT="$TMP_DIR/tag-checkout"
+PUSH_HELPER_DIR="$TMP_DIR/push-helpers"
+mkdir -p "$PUSH_HELPER_DIR"
+cp "$SCRIPT_DIR/push-release-tag.sh" "$SCRIPT_DIR/check-release-lineage.sh" \
+    "$PUSH_HELPER_DIR/"
+cat > "$PUSH_HELPER_DIR/check-release-remote.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$PUSH_HELPER_DIR/check-release-remote.sh"
 git init -q --bare "$TAG_REMOTE"
 git init -q -b main "$TAG_FIXTURE"
 git -C "$TAG_FIXTURE" config user.name "ShellDAO Release Test"
@@ -162,6 +177,41 @@ git -C "$TAG_FIXTURE" tag -a v0.27.10 -m "prefix fixture"
 git -C "$TAG_FIXTURE" push -q canonical v0.27.10
 (cd "$TAG_FIXTURE" && \
     "$SCRIPT_DIR/check-release-tag.sh" canonical v0.27.1 >/dev/null)
+
+PUSH_COMMIT=$(git -C "$TAG_FIXTURE" rev-parse HEAD)
+git -C "$TAG_FIXTURE" tag -a v0.27.3 -m "validated release"
+(cd "$TAG_FIXTURE" && "$PUSH_HELPER_DIR/push-release-tag.sh" \
+    canonical v0.27.3 "$PUSH_COMMIT" >/dev/null)
+if [ "$(git --git-dir="$TAG_REMOTE" rev-parse refs/tags/v0.27.3^\{commit\})" \
+    != "$PUSH_COMMIT" ]; then
+    fail "validated release tag push used the wrong commit"
+fi
+
+printf 'advance before confirmation\n' >> "$TAG_FIXTURE/history"
+git -C "$TAG_FIXTURE" commit -qam "advance canonical main before confirmation"
+git -C "$TAG_FIXTURE" push -q canonical main
+git -C "$TAG_FIXTURE" tag -a v0.27.4 "$PUSH_COMMIT" -m "stale release"
+if PUSH_OUTPUT=$(cd "$TAG_FIXTURE" && "$PUSH_HELPER_DIR/push-release-tag.sh" \
+    canonical v0.27.4 "$PUSH_COMMIT" 2>&1); then
+    fail "release tag push unexpectedly accepted changed canonical main"
+fi
+if ! grep -Fq "release commit is stale relative to canonical main" <<<"$PUSH_OUTPUT"; then
+    fail "stale canonical main rejection was not specific: $PUSH_OUTPUT"
+fi
+if git --git-dir="$TAG_REMOTE" show-ref --verify --quiet refs/tags/v0.27.4; then
+    fail "release push published a tag after canonical main changed"
+fi
+
+CURRENT_MAIN=$(git -C "$TAG_FIXTURE" rev-parse HEAD)
+git -C "$TAG_FIXTURE" tag -a v0.27.5 "$PUSH_COMMIT" -m "wrong release source"
+if PUSH_OUTPUT=$(cd "$TAG_FIXTURE" && "$PUSH_HELPER_DIR/push-release-tag.sh" \
+    canonical v0.27.5 "$CURRENT_MAIN" 2>&1); then
+    fail "release tag push unexpectedly accepted a changed tag target"
+fi
+if ! grep -Fq "does not point to the validated release commit" <<<"$PUSH_OUTPUT"; then
+    fail "changed tag target rejection was not specific: $PUSH_OUTPUT"
+fi
+
 git -C "$TAG_FIXTURE" tag -a v0.27.2 -m "local release"
 if TAG_OUTPUT=$(cd "$TAG_FIXTURE" && \
     "$SCRIPT_DIR/check-release-tag.sh" canonical v0.27.2 2>&1); then
@@ -331,6 +381,7 @@ make_fixture() {
         "$SCRIPT_DIR/check-release-tag.sh" \
         "$SCRIPT_DIR/check-release-source.sh" \
         "$SCRIPT_DIR/check-release-metadata.sh" \
+        "$SCRIPT_DIR/push-release-tag.sh" \
         "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
     printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
     mkdir -p "$fixture/fuzz"
@@ -425,6 +476,7 @@ cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/changelog-excerpt.sh" \
     "$SCRIPT_DIR/check-release-tag.sh" \
     "$SCRIPT_DIR/check-release-source.sh" \
     "$SCRIPT_DIR/check-release-metadata.sh" \
+    "$SCRIPT_DIR/push-release-tag.sh" \
     "$SCRIPT_DIR/supply-chain-tool-versions.sh" "$fixture/scripts/"
 printf '[workspace.package]\nversion = "0.27.1"\n' > "$fixture/Cargo.toml"
 mkdir -p "$fixture/fuzz"

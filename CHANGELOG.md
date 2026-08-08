@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Revalidate canonical `main` and the exact annotated tag source after release
+  confirmation, rejecting a push when either changed during the prompt.
 - Make sparse parallel-execution wave planning linear in the current wave size
   by checking conflict-set disjointness against indexed wave membership.
 - Make weighted proposer selection linear in the validator count and allocation-free.
