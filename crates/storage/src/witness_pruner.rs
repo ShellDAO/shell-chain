@@ -169,6 +169,17 @@ impl WitnessPruner {
             // Resolve block hash from chain store (canonical mapping).
             match chain_store.get_block_hash_by_number(block_number)? {
                 Some(hash) => {
+                    let header = chain_store.get_header_by_hash(&hash)?.ok_or_else(|| {
+                        StorageError::InvalidInput(format!(
+                            "witness pruner: canonical header missing for block {block_number}"
+                        ))
+                    })?;
+                    if header.number != block_number {
+                        return Err(StorageError::InvalidInput(format!(
+                            "witness pruner: canonical block {block_number} header reports block {}",
+                            header.number
+                        )));
+                    }
                     if !may_prune(block_number, &hash) {
                         break;
                     }
@@ -416,6 +427,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("canonical hash missing for block 2"));
+        assert_eq!(pruner.pruned_below(), 0);
+        for hash in hashes {
+            assert!(ws.has_bundle(&hash).unwrap());
+        }
+    }
+
+    #[test]
+    fn mismatched_canonical_header_fails_without_advancing_or_deleting() {
+        let (_db, cs, ws) = make_store();
+        let hashes: Vec<ShellHash> = (0..10).map(|n| store_block(&cs, n)).collect();
+        for hash in &hashes {
+            store_bundle(&ws, hash);
+        }
+        cs.set_canonical(2, &hashes[8]).unwrap();
+
+        let mut pruner = WitnessPruner::new(5);
+        let err = pruner.prune_before(9, None, &cs, &ws).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("canonical block 2 header reports block 8"));
         assert_eq!(pruner.pruned_below(), 0);
         for hash in hashes {
             assert!(ws.has_bundle(&hash).unwrap());

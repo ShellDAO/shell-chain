@@ -130,6 +130,17 @@ impl BodyPruner {
                     )));
                 }
                 Some(hash) => {
+                    let header = chain_store.get_header_by_hash(&hash)?.ok_or_else(|| {
+                        StorageError::InvalidInput(format!(
+                            "body pruner: canonical header missing for block {block_number}"
+                        ))
+                    })?;
+                    if header.number != block_number {
+                        return Err(StorageError::InvalidInput(format!(
+                            "body pruner: canonical block {block_number} header reports block {}",
+                            header.number
+                        )));
+                    }
                     if chain_store.has_body(&hash)? {
                         hashes_to_prune.push(hash);
                         result.bodies_pruned = result.bodies_pruned.saturating_add(1);
@@ -301,6 +312,25 @@ mod tests {
             .contains("canonical hash missing for block 2"));
         assert_eq!(pruner.pruned_below(), 0);
         for n in [0, 1, 3, 4] {
+            let hash = cs.get_block_hash_by_number(n).unwrap().unwrap();
+            assert!(cs.has_body(&hash).unwrap());
+        }
+    }
+
+    #[test]
+    fn mismatched_canonical_header_fails_without_advancing_or_deleting() {
+        let cs = setup_chain(10);
+        let wrong_hash = cs.get_block_hash_by_number(8).unwrap().unwrap();
+        cs.set_canonical(2, &wrong_hash).unwrap();
+
+        let mut pruner = BodyPruner::new(5);
+        let err = pruner.prune_before(9, &cs).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("canonical block 2 header reports block 8"));
+        assert_eq!(pruner.pruned_below(), 0);
+        for n in [0, 1, 3, 4, 8] {
             let hash = cs.get_block_hash_by_number(n).unwrap().unwrap();
             assert!(cs.has_body(&hash).unwrap());
         }
