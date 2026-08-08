@@ -2081,6 +2081,24 @@ mod tests {
         (node, signer, db)
     }
 
+    #[test]
+    fn authority_pubkey_propagates_registry_read_failure() {
+        let (node, signer, db) = setup_failing_batch_node();
+        let authority = node.config.proposer_address.unwrap();
+        node.chain_store
+            .put_pubkey(&authority, signer.public_key())
+            .unwrap();
+
+        db.fail_next_get();
+        let error = node.authority_pubkey(&authority).unwrap_err();
+
+        assert!(matches!(
+            error,
+            NodeError::Storage(StorageError::Database(message))
+                if message.contains("injected get failure")
+        ));
+    }
+
     fn configure_pending_activation<S: KvStore + 'static>(
         node: &Node<S>,
         height: u64,

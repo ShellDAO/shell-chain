@@ -42,6 +42,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Propagate authority-registry and equivocation lookup storage failures during
+  block import instead of misclassifying them as unknown proposers or missing
+  equivocation evidence.
 - Prevent custom-validator V2 policy reverts from retrying through the reduced
   legacy V1 authorization interface.
 - Bind snapshot checksums to framed key and value records and require the

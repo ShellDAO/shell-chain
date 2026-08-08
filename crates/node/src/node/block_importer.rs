@@ -167,7 +167,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let proposer = &block.header.proposer;
-        let pubkey = self.authority_pubkey(proposer).ok_or_else(|| {
+        let pubkey = self.authority_pubkey(proposer)?.ok_or_else(|| {
             NodeError::Startup(format!(
                 "block {} seal verification failed: proposer {} pubkey unknown",
                 block.number(),
@@ -186,25 +186,31 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    fn authority_pubkey(&self, authority: &Address) -> Option<Vec<u8>> {
-        self.known_authorities
-            .read()
-            .get(authority)
-            .cloned()
-            .or_else(|| self.chain_store.get_pubkey(authority).ok().flatten())
+    pub(super) fn authority_pubkey(
+        &self,
+        authority: &Address,
+    ) -> Result<Option<Vec<u8>>, NodeError> {
+        if let Some(pubkey) = self.known_authorities.read().get(authority).cloned() {
+            return Ok(Some(pubkey));
+        }
+        Ok(self.chain_store.get_pubkey(authority)?)
     }
 
-    fn queue_signed_equivocation_if_valid(&self, existing: &Block, candidate: &Block) {
+    fn queue_signed_equivocation_if_valid(
+        &self,
+        existing: &Block,
+        candidate: &Block,
+    ) -> Result<(), NodeError> {
         let Some(equivocation) = EquivocationProof::from_blocks(existing, candidate) else {
-            return;
+            return Ok(());
         };
-        let Some(pubkey) = self.authority_pubkey(&equivocation.offender) else {
+        let Some(pubkey) = self.authority_pubkey(&equivocation.offender)? else {
             warn!(
                 offender = %equivocation.offender,
                 block_number = equivocation.header_a.number,
                 "I1: double-sign candidate ignored because offender pubkey is unknown"
             );
-            return;
+            return Ok(());
         };
         let verifier = MultiVerifier;
         if !equivocation.verify_signed(&pubkey, &verifier) {
@@ -213,7 +219,7 @@ impl<S: KvStore + 'static> Node<S> {
                 block_number = equivocation.header_a.number,
                 "I1: double-sign candidate ignored because proposer seals do not verify"
             );
-            return;
+            return Ok(());
         }
         warn!(
             offender = %equivocation.offender,
@@ -221,6 +227,7 @@ impl<S: KvStore + 'static> Node<S> {
             "I1: signed double-sign detected, queuing equivocation broadcast"
         );
         self.equivocation_queue.lock().push(equivocation);
+        Ok(())
     }
 
     fn verify_incoming_witness_root(&self, block: &Block) -> Result<(), NodeError> {
@@ -1205,8 +1212,8 @@ impl<S: KvStore + 'static> Node<S> {
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
             self.validate_side_fork_transactions(&block, &parent)?;
-            if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
-                self.queue_signed_equivocation_if_valid(&existing, &block);
+            if let Some(existing) = block_store.block_by_number(incoming)? {
+                self.queue_signed_equivocation_if_valid(&existing, &block)?;
             }
             let remote_hash = incoming_hash;
             block_store.put_side_fork_block(&block)?;
@@ -1261,10 +1268,10 @@ impl<S: KvStore + 'static> Node<S> {
         // I1: Equivocation detection — check if the incoming block's proposer has
         // already produced a block at this height. Only fires for truly new blocks
         // (incoming == expected), preventing false positives from stale gossip.
-        if let Ok(Some(existing)) = block_store.block_by_number(incoming) {
+        if let Some(existing) = block_store.block_by_number(incoming)? {
             if existing.hash() != block.hash() && existing.header.proposer == block.header.proposer
             {
-                self.queue_signed_equivocation_if_valid(&existing, &block);
+                self.queue_signed_equivocation_if_valid(&existing, &block)?;
             }
         }
 
