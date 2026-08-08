@@ -2708,6 +2708,78 @@ mod tests {
     }
 
     #[test]
+    fn adopted_quorum_attested_fork_advances_finality_without_another_attestation() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical, &MultiVerifier).unwrap();
+
+        let fork_node = setup_node_with_authority(proposer);
+        fork_node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        store_consistent_genesis(&fork_node);
+        let side_one = fork_node.produce_block(&signer, 100).unwrap();
+        let side_one_hash = side_one.hash();
+        node.import_block(side_one, &MultiVerifier).unwrap();
+        let side_two = fork_node.produce_block(&signer, 100).unwrap();
+        let side_two_hash = side_two.hash();
+        let side_two_parent = side_two.header.parent_hash;
+        node.import_block(side_two, &MultiVerifier).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let attestation = Attestation::new(
+            node.config.chain_id,
+            side_two_parent,
+            side_two_hash,
+            2,
+            proposer,
+            0,
+            vec![1],
+        );
+        assert!(node
+            .finality
+            .write()
+            .record_attestation_weighted(attestation, total_weight));
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_two_hash, total_weight);
+
+        assert_eq!(node.finality.read().last_finalized_number(), 0);
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("attested side fork should become preferred");
+        node.adopt_preferred_fork(plan).unwrap();
+
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(side_two_hash)
+        );
+        assert_eq!(node.finality.read().last_finalized_number(), 2);
+        assert_eq!(*node.finality.read().last_finalized_hash(), side_two_hash);
+        assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(2));
+        assert_eq!(
+            node.fork_choice
+                .read()
+                .score(&side_two_hash)
+                .map(|score| score.is_finalized),
+            Some(1)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(side_one_hash)
+        );
+    }
+
+    #[test]
     fn reverted_transactions_are_reinserted_in_nonce_order() {
         let (node, _) = setup_node();
         let signer = DilithiumSigner::generate();

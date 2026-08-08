@@ -176,7 +176,43 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
-    fn advance_fork_choice_finality(&self, block_number: u64, block_hash: ShellHash) {
+    pub(super) fn finalize_canonical_pending_attestations(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+    ) -> Result<bool, NodeError> {
+        if self.chain_store.get_block_hash_by_number(block_number)? != Some(block_hash) {
+            return Ok(false);
+        }
+
+        let total_weight = self
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let finalized = {
+            let mut finality = self.finality.write();
+            if !finality.can_finalize_weighted(&block_hash, block_number, total_weight) {
+                return Ok(false);
+            }
+            self.chain_store.set_finalized_number(block_number)?;
+            finality.check_finality_weighted(&block_hash, block_number, total_weight)
+        };
+
+        if finalized {
+            tracing::info!(
+                block = block_number,
+                hash = %block_hash,
+                "canonicalized attested block finalized"
+            );
+            self.advance_fork_choice_finality(block_number, block_hash);
+        }
+        Ok(finalized)
+    }
+
+    pub(super) fn advance_fork_choice_finality(&self, block_number: u64, block_hash: ShellHash) {
         let mut fork_choice = self.fork_choice.write();
         fork_choice.mark_finalized(&block_hash);
         if fork_choice

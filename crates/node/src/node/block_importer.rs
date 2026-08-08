@@ -1140,6 +1140,7 @@ impl<S: KvStore + 'static> Node<S> {
                 .lock()
                 .insert(block.header.proposer, block.number());
         }
+        self.finalize_canonical_pending_attestations(plan.preferred_number, plan.preferred_hash)?;
 
         info!(
             preferred_hash = %plan.preferred_hash,
