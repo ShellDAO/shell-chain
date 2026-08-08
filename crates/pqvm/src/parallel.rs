@@ -174,6 +174,16 @@ impl ParallelScheduler {
             };
         }
 
+        if graph.conflicts.is_empty() {
+            return ParallelExecutionPlan {
+                waves: vec![ExecutionWave {
+                    tx_indices: (0..graph.rwsets.len()).collect(),
+                    parallelizable: graph.rwsets.len() > 1,
+                }],
+                fallback_serial: false,
+            };
+        }
+
         let mut conflicts_by_tx = vec![HashSet::new(); graph.rwsets.len()];
         for conflict in &graph.conflicts {
             if conflict.left < conflicts_by_tx.len() && conflict.right < conflicts_by_tx.len() {
@@ -183,30 +193,39 @@ impl ParallelScheduler {
         }
 
         let mut waves: Vec<ExecutionWave> = Vec::new();
+        let mut in_last_wave = vec![false; graph.rwsets.len()];
         for (tx_index, tx_conflicts) in conflicts_by_tx.iter().enumerate() {
             let can_join_last_wave = waves
                 .last()
                 .map(|wave| {
-                    wave.tx_indices
-                        .iter()
-                        .all(|existing| !tx_conflicts.contains(existing))
+                    if tx_conflicts.len() < wave.tx_indices.len() {
+                        tx_conflicts.iter().all(|conflict| !in_last_wave[*conflict])
+                    } else {
+                        wave.tx_indices
+                            .iter()
+                            .all(|existing| !tx_conflicts.contains(existing))
+                    }
                 })
                 .unwrap_or(false);
 
             if can_join_last_wave {
                 if let Some(wave) = waves.last_mut() {
                     wave.tx_indices.push(tx_index);
+                    wave.parallelizable = true;
                 }
+                in_last_wave[tx_index] = true;
             } else {
+                if let Some(wave) = waves.last() {
+                    for existing in &wave.tx_indices {
+                        in_last_wave[*existing] = false;
+                    }
+                }
                 waves.push(ExecutionWave {
                     tx_indices: vec![tx_index],
                     parallelizable: false,
                 });
+                in_last_wave[tx_index] = true;
             }
-        }
-
-        for wave in &mut waves {
-            wave.parallelizable = wave.tx_indices.len() > 1;
         }
 
         ParallelExecutionPlan {
@@ -654,6 +673,39 @@ mod tests {
         assert_eq!(plan.waves.len(), 1);
         assert_eq!(plan.waves[0].tx_indices, vec![0, 1]);
         assert!(plan.waves[0].parallelizable);
+    }
+
+    #[test]
+    fn scheduler_packs_sparse_pair_conflicts_into_two_waves() {
+        let graph = TxConflictGraph {
+            rwsets: vec![TxReadWriteSet::new(); 6],
+            conflicts: (0..3)
+                .map(|left| TxConflict {
+                    left,
+                    right: left + 3,
+                    reason: ConflictReason::WriteWrite,
+                    shared_paths: Vec::new(),
+                })
+                .collect(),
+        };
+        let scheduler = ParallelScheduler::new(ParallelPqvmConfig {
+            enabled: true,
+            ..ParallelPqvmConfig::default()
+        });
+
+        let plan = scheduler.plan_from_graph(&graph);
+
+        assert_eq!(plan.waves.len(), 2);
+        assert_eq!(plan.waves[0].tx_indices, vec![0, 1, 2]);
+        assert_eq!(plan.waves[1].tx_indices, vec![3, 4, 5]);
+        assert!(plan.waves.iter().all(|wave| wave.parallelizable));
+        for wave in &plan.waves {
+            for (offset, left) in wave.tx_indices.iter().enumerate() {
+                for right in wave.tx_indices.iter().skip(offset + 1) {
+                    assert!(!graph.has_conflict(*left, *right));
+                }
+            }
+        }
     }
 
     #[test]

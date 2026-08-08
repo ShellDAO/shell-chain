@@ -6,7 +6,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{PQSignature, SignatureType};
-use shell_pqvm::{HeuristicRwSetExtractor, ParallelPqvmConfig, ParallelScheduler};
+use shell_pqvm::{
+    ConflictReason, HeuristicRwSetExtractor, ParallelPqvmConfig, ParallelScheduler, TxConflict,
+    TxConflictGraph, TxReadWriteSet,
+};
 use shell_primitives::{Address, Bytes, U256};
 
 fn make_tx(nonce: u64, to: Address) -> SignedTransaction {
@@ -94,11 +97,47 @@ fn bench_dense_plan(c: &mut Criterion) {
     });
 }
 
+/// Benchmark wave planning when every transaction can share one parallel wave.
+fn bench_independent_plan(c: &mut Criterion) {
+    let sched = scheduler();
+    let graph = TxConflictGraph {
+        rwsets: vec![TxReadWriteSet::new(); 4_096],
+        conflicts: Vec::new(),
+    };
+
+    c.bench_function("parallel/independent_plan_4096", |b| {
+        b.iter(|| black_box(sched.plan_from_graph(black_box(&graph))))
+    });
+}
+
+/// Benchmark wave planning for sparse pairwise conflicts across two waves.
+fn bench_sparse_plan(c: &mut Criterion) {
+    const TX_COUNT: usize = 4_096;
+    let sched = scheduler();
+    let graph = TxConflictGraph {
+        rwsets: vec![TxReadWriteSet::new(); TX_COUNT],
+        conflicts: (0..TX_COUNT / 2)
+            .map(|left| TxConflict {
+                left,
+                right: left + TX_COUNT / 2,
+                reason: ConflictReason::WriteWrite,
+                shared_paths: Vec::new(),
+            })
+            .collect(),
+    };
+
+    c.bench_function("parallel/sparse_plan_4096", |b| {
+        b.iter(|| black_box(sched.plan_from_graph(black_box(&graph))))
+    });
+}
+
 criterion_group!(
     benches,
     bench_empty_batch,
     bench_small_batch_no_conflict,
     bench_small_batch_with_conflict,
-    bench_dense_plan
+    bench_dense_plan,
+    bench_independent_plan,
+    bench_sparse_plan
 );
 criterion_main!(benches);

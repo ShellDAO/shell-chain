@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Make sparse parallel-execution wave planning linear in the current wave size
+  by checking conflict-set disjointness against indexed wave membership.
 - Make weighted proposer selection linear in the validator count and allocation-free.
 - Account for the outer envelope and session-verification intrinsic gas in AA
   receipts and fee settlement, without treating the unused outer destination
