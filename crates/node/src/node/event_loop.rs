@@ -115,6 +115,19 @@ fn body_response_matches_request(
     })
 }
 
+fn release_body_request_for_disconnected_peer(
+    request: &mut Option<BodyRequestState>,
+    disconnected_peer: &PeerId,
+) -> Option<(u64, u64)> {
+    let request = request.as_mut()?;
+    if request.peer.as_ref() != Some(disconnected_peer) {
+        return None;
+    }
+
+    request.peer = None;
+    Some((request.start_number, request.nonce))
+}
+
 fn bounded_request_numbers(
     start_number: u64,
     count: u64,
@@ -2026,6 +2039,37 @@ impl<S: KvStore + 'static> Node<S> {
                                     oldest_body_block: oldest,
                                 }).await;
                             }
+                            if let Some(request) = body_request
+                                .as_ref()
+                                .filter(|request| request.peer.is_none())
+                                .cloned()
+                            {
+                                let nonce = Self::wall_clock_millis()
+                                    .max(request.nonce.saturating_add(1));
+                                if network
+                                    .send_to_peer(
+                                        &peer,
+                                        NetworkMessage::BodyRequest {
+                                            start_number: request.start_number,
+                                            count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                            nonce,
+                                        },
+                                    )
+                                    .await
+                                    .is_ok()
+                                {
+                                    body_request = Some(BodyRequestState {
+                                        nonce,
+                                        start_number: request.start_number,
+                                        peer: Some(peer.clone()),
+                                    });
+                                    info!(
+                                        %peer,
+                                        start_number = request.start_number,
+                                        "L4: resumed historical body back-fill with connected peer"
+                                    );
+                                }
+                            }
                             if !sync_requested {
                                 sync_retry_attempts_without_progress = 0;
                                 sync_retry_timer.reset_after(Duration::from_secs(
@@ -2064,7 +2108,38 @@ impl<S: KvStore + 'static> Node<S> {
                         Some(NetworkEvent::PeerDisconnected(peer)) => {
                             info!(%peer, "peer disconnected");
                             self.peer_caps.remove(&peer);
-                            if network.peer_count().await == 0 {
+                            let peers = network.peer_count().await;
+                            if let Some((start_number, previous_nonce)) =
+                                release_body_request_for_disconnected_peer(
+                                    &mut body_request,
+                                    &peer,
+                                )
+                            {
+                                if peers > 0 {
+                                    let nonce = Self::wall_clock_millis()
+                                        .max(previous_nonce.saturating_add(1));
+                                    if network
+                                        .broadcast(NetworkMessage::BodyRequest {
+                                            start_number,
+                                            count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                            nonce,
+                                        })
+                                        .await
+                                        .is_ok()
+                                    {
+                                        body_request = Some(BodyRequestState {
+                                            nonce,
+                                            start_number,
+                                            peer: None,
+                                        });
+                                        info!(
+                                            start_number,
+                                            "L4: retried historical body back-fill after peer disconnect"
+                                        );
+                                    }
+                                }
+                            }
+                            if peers == 0 {
                                 sync_requested = false;
                                 sync_request = None;
                                 sync_retry_attempts_without_progress = 0;
@@ -3047,6 +3122,38 @@ mod cadence_tests {
             Some(42),
             &other_peer
         ));
+    }
+
+    #[test]
+    fn disconnected_body_peer_releases_request_for_retry() {
+        let disconnected = PeerId("disconnected".into());
+        let mut request = Some(BodyRequestState {
+            nonce: 7,
+            start_number: 42,
+            peer: Some(disconnected.clone()),
+        });
+
+        assert_eq!(
+            release_body_request_for_disconnected_peer(&mut request, &disconnected),
+            Some((42, 7))
+        );
+        assert_eq!(request.unwrap().peer, None);
+    }
+
+    #[test]
+    fn unrelated_disconnect_keeps_body_request_bound() {
+        let requested = PeerId("requested".into());
+        let mut request = Some(BodyRequestState {
+            nonce: 7,
+            start_number: 42,
+            peer: Some(requested.clone()),
+        });
+
+        assert_eq!(
+            release_body_request_for_disconnected_peer(&mut request, &PeerId("other".into())),
+            None
+        );
+        assert_eq!(request.unwrap().peer, Some(requested));
     }
 
     #[test]
