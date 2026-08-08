@@ -132,6 +132,15 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     readiness_rx: Option<watch::Receiver<bool>>,
     /// L2 STARK mode — controls whether recursive L2 proving is attempted.
     l2_mode: L2StarkMode,
+    #[cfg(test)]
+    test_event_tx: Option<mpsc::UnboundedSender<ProverServiceTestEvent>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProverServiceTestEvent {
+    Started,
+    BacklogPolled,
 }
 
 impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
@@ -151,6 +160,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             prover_signer: None,
             readiness_rx: None,
             l2_mode: L2StarkMode::Disabled,
+            #[cfg(test)]
+            test_event_tx: None,
         }
     }
 
@@ -197,6 +208,10 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             "ProverService started (max_concurrent={})",
             self.config.max_concurrent_proofs
         );
+        #[cfg(test)]
+        if let Some(tx) = &self.test_event_tx {
+            let _ = tx.send(ProverServiceTestEvent::Started);
+        }
         let idle_sleep = tokio::time::Duration::from_millis(self.config.idle_poll_ms);
         let mut last_stall_log = Instant::now()
             .checked_sub(std::time::Duration::from_secs(300))
@@ -246,6 +261,10 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                         .pop_contiguous_for_proving(DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS)
                 }
             };
+            #[cfg(test)]
+            if let Some(tx) = &self.test_event_tx {
+                let _ = tx.send(ProverServiceTestEvent::BacklogPolled);
+            }
 
             match task {
                 None => {
@@ -539,6 +558,43 @@ mod tests {
         (service, backlog)
     }
 
+    fn observe_service(
+        mut service: ProverService<MemoryDb>,
+    ) -> (
+        ProverServiceHandle,
+        mpsc::UnboundedReceiver<ProverServiceTestEvent>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        service.test_event_tx = Some(event_tx);
+        (service.start(), event_rx)
+    }
+
+    async fn expect_service_event(
+        event_rx: &mut mpsc::UnboundedReceiver<ProverServiceTestEvent>,
+        expected: ProverServiceTestEvent,
+    ) {
+        let actual = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("prover service event timed out")
+            .expect("prover service event channel closed");
+        assert_eq!(actual, expected);
+    }
+
+    async fn shutdown_cleanly(mut handle: ProverServiceHandle) {
+        handle
+            .shutdown_tx
+            .take()
+            .expect("started service must own its shutdown sender")
+            .send(true)
+            .expect("prover service must be listening for shutdown");
+        handle
+            .join_handle
+            .take()
+            .expect("started service must own its task")
+            .await
+            .expect("prover service task must exit cleanly");
+    }
+
     #[test]
     fn prover_config_defaults() {
         let cfg = ProverConfig::default();
@@ -561,17 +617,18 @@ mod tests {
     #[tokio::test]
     async fn service_starts_and_shuts_down_cleanly() {
         let (service, _backlog) = make_service();
-        let handle = service.start();
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        handle.shutdown().await;
+        let (handle, mut event_rx) = observe_service(service);
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::Started).await;
+        shutdown_cleanly(handle).await;
     }
 
     #[tokio::test]
     async fn service_drains_empty_backlog_without_panic() {
         let (service, _backlog) = make_service();
-        let handle = service.start();
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        handle.shutdown().await;
+        let (handle, mut event_rx) = observe_service(service);
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::Started).await;
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::BacklogPolled).await;
+        shutdown_cleanly(handle).await;
     }
 
     #[tokio::test]
@@ -607,9 +664,10 @@ mod tests {
             let mut b = backlog.lock();
             b.push(ProofTask::new([0u8; 32], 1, vec![]));
         }
-        let handle = service.start();
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        handle.shutdown().await;
+        let (handle, mut event_rx) = observe_service(service);
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::Started).await;
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::BacklogPolled).await;
+        shutdown_cleanly(handle).await;
         let b = backlog.lock();
         assert_eq!(b.len(), 1, "below-threshold run must remain in backlog");
         assert_eq!(b.total_completed(), 0, "no proof must be generated");
@@ -632,12 +690,18 @@ mod tests {
         ));
         let (readiness_tx, readiness_rx) = watch::channel(false);
         let (amendment_tx, mut amendment_rx) = mpsc::channel(1);
-        let handle = service
-            .with_readiness(readiness_rx)
-            .with_amendment_sender(amendment_tx)
-            .start();
+        let (handle, mut event_rx) = observe_service(
+            service
+                .with_readiness(readiness_rx)
+                .with_amendment_sender(amendment_tx),
+        );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        expect_service_event(&mut event_rx, ProverServiceTestEvent::Started).await;
+        assert_eq!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "syncing prover must not poll the backlog"
+        );
         assert_eq!(backlog.lock().len(), 1, "syncing prover must stay paused");
 
         readiness_tx.send(true).expect("service is listening");
