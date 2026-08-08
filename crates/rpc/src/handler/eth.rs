@@ -1098,10 +1098,14 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             None => (cursor, Vec::new()),
         };
         let remaining_blocks = MAX_BLOCK_RANGE.saturating_sub(removed_blocks.len() as u64);
-        let canonical_from = base_cursor
-            .block_number
-            .checked_add(1)
-            .filter(|from| remaining_blocks > 0 && *from <= canonical_latest);
+        let canonical_from = if base_cursor.block_number == 0 && base_cursor.block_hash.is_none() {
+            // A cursor without a hash represents a filter installed before the
+            // chain had a head. Block zero is new to that filter once it exists.
+            Some(base_cursor.block_number)
+        } else {
+            base_cursor.block_number.checked_add(1)
+        }
+        .filter(|from| remaining_blocks > 0 && *from <= canonical_latest);
         let canonical_to = canonical_from.map(|from| {
             canonical_latest.min(from.saturating_add(remaining_blocks.saturating_sub(1)))
         });

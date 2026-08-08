@@ -5752,6 +5752,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_filter_installed_before_genesis_returns_genesis_hash() {
+        let handler = setup();
+        let filter_id = EthApiServer::new_block_filter(&handler).await.unwrap();
+
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id.clone())
+                .await
+                .unwrap(),
+            serde_json::json!([genesis_hash])
+        );
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn new_filter_returns_hex_id() {
         let handler = setup();
         let raw: crate::filter::RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
@@ -6148,6 +6169,32 @@ mod tests {
         let arr = changes.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn log_filter_installed_before_genesis_returns_genesis_logs() {
+        let handler = setup();
+        let address = Address::from([0xE4; 20]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"address":"{}"}}"#, address)).unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        let log = shell_core::Log::new(address, vec![], Bytes::new()).unwrap();
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![log]]);
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id.clone())
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["blockNumber"], "0x0");
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(genesis_hash));
+        assert_eq!(
+            EthApiServer::get_filter_changes(&handler, filter_id)
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
