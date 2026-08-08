@@ -146,12 +146,15 @@ impl<S: KvStore + 'static> Node<S> {
             // F-302: Re-validate before execution (algorithm restrictions may have
             // changed since admission). Uses import-path validator (checks nonce,
             // skips balance because execution enforces spendability).
-            let pre_verifier = PreVerified;
+            // A transaction may have been admitted before an earlier block
+            // rotated its sender key. Re-check the signature against the
+            // current binding before including it in a later block.
+            let verifier = MultiVerifier;
             if let Err(e) = validate_tx_for_import(
                 tx,
                 evm.state_db_mut().world_state_mut(),
                 &import_cs,
-                &pre_verifier,
+                &verifier,
                 self.config.chain_id,
             ) {
                 debug!(

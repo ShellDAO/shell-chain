@@ -5356,6 +5356,61 @@ mod tests {
     }
 
     #[test]
+    fn produce_block_revalidates_pending_signature_after_key_rotation() {
+        let (node, proposer_signer) = setup_node();
+        store_genesis(&node);
+
+        let old_signer = DilithiumSigner::generate();
+        let new_signer = DilithiumSigner::generate();
+        let sender =
+            Address::from_public_key(old_signer.public_key(), old_signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(1_000_000_000_000_000u64));
+        node.chain_store
+            .put_pubkey(&sender, old_signer.public_key())
+            .unwrap();
+
+        submit_key_rotation(&node, &old_signer, sender, new_signer.public_key());
+
+        let stale_tx = Transaction {
+            chain_id: 1337,
+            nonce: 1,
+            to: Some(Address::from([0x44; 20])),
+            value: U256::from(1u64),
+            data: Bytes::default(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signing_hash = stale_tx.signing_hash(old_signer.sig_type().as_u8());
+        let stale_signature = old_signer.sign(signing_hash.as_bytes()).unwrap();
+        let stale_signed = SignedTransaction::new(sender, stale_tx, stale_signature);
+        let stale_hash = stale_signed.hash();
+        node.tx_pool
+            .insert(
+                stale_signed,
+                &mut node.world_state.write(),
+                node.chain_store.as_ref(),
+                &MultiVerifier,
+            )
+            .unwrap();
+
+        let rotation_block = node.produce_block(&proposer_signer, 1).unwrap();
+        assert_eq!(rotation_block.transactions.len(), 1);
+        assert_eq!(
+            node.chain_store.get_pubkey(&sender).unwrap(),
+            Some(new_signer.public_key().to_vec())
+        );
+
+        let next_block = node.produce_block(&proposer_signer, 100).unwrap();
+        assert!(next_block.transactions.is_empty());
+        assert!(node.tx_pool.contains(&stale_hash));
+    }
+
+    #[test]
     fn produce_block_commit_failure_does_not_persist_key_rotation() {
         let (node, proposer_signer, failing_db) = setup_failing_batch_node();
         let tx_signer = DilithiumSigner::generate();
