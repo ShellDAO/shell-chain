@@ -444,7 +444,8 @@ impl<S: KvStore + 'static> Node<S> {
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
-        let metadata_checkpoint = replay_store.checkpoint()?;
+        let replay_cs = ChainStore::new(replay_store.clone());
+        let metadata_checkpoint = replay_cs.address_metadata_checkpoint()?;
         if !Self::decode_system_extra(&block.header.extra_data)
             .map_err(|error| Self::classify_fork_error(block.hash(), error))?
             .is_empty()
@@ -458,7 +459,6 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let replay_cs = ChainStore::new(replay_store.clone());
         let stark_settlements = block
             .system_transactions
             .iter()

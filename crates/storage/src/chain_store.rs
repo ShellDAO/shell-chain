@@ -2123,6 +2123,14 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         prefix::RECOVERY_PROPOSAL,
     ];
 
+    /// Snapshot address-keyed metadata staged in the overlay.
+    pub fn address_metadata_checkpoint(
+        &self,
+    ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>, StorageError> {
+        self.store
+            .checkpoint_prefixes(&Self::ADDRESS_METADATA_PREFIXES)
+    }
+
     /// Stage an undo journal for address-keyed metadata changed since the
     /// supplied overlay checkpoint.
     pub fn stage_address_metadata_undo(

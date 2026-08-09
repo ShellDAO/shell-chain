@@ -7,7 +7,7 @@ use alloy_rlp::{Decodable, Encodable};
 use shell_core::{Block, BlockHeader, SignedTransaction, Transaction};
 use shell_crypto::{PQSignature, SignatureType};
 use shell_primitives::{Address, Bytes, ShellHash, U256};
-use shell_storage::{ChainStore, MemoryDb, MerkleTrie};
+use shell_storage::{ChainStore, KvStore, MemoryDb, MerkleTrie, OverlayStore};
 
 fn sample_header() -> BlockHeader {
     BlockHeader {
@@ -184,11 +184,36 @@ fn bench_merkle_trie(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_overlay_checkpoint(c: &mut Criterion) {
+    let base = Arc::new(MemoryDb::new());
+    let overlay = OverlayStore::new(base);
+    for index in 0u64..50_000 {
+        overlay
+            .put(&index.to_be_bytes(), black_box(&[7; 128]))
+            .unwrap();
+    }
+    for index in 0u64..10 {
+        let mut key = b"pk/".to_vec();
+        key.extend_from_slice(&index.to_be_bytes());
+        overlay.put(&key, b"metadata").unwrap();
+    }
+
+    let mut group = c.benchmark_group("overlay/checkpoint");
+    group.bench_function("all_changes", |b| {
+        b.iter(|| black_box(overlay.checkpoint().unwrap()));
+    });
+    group.bench_function("metadata_prefixes", |b| {
+        b.iter(|| black_box(overlay.checkpoint_prefixes(black_box(&[b"pk/"])).unwrap()));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_header_rlp,
     bench_block_rlp,
     bench_chain_store,
     bench_merkle_trie,
+    bench_overlay_checkpoint,
 );
 criterion_main!(benches);

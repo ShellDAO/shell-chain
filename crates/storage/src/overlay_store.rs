@@ -35,6 +35,31 @@ impl<S: KvStore> OverlayStore<S> {
             .map_err(|e| StorageError::Database(e.to_string()))
     }
 
+    /// Snapshot only staged writes whose keys match one of `prefixes`.
+    ///
+    /// This keeps narrow rollback journals proportional to the indexed data
+    /// they protect instead of cloning unrelated state accumulated in the
+    /// overlay.
+    pub fn checkpoint_prefixes(
+        &self,
+        prefixes: &[&[u8]],
+    ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>, StorageError> {
+        let changes = self
+            .changes
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut checkpoint = BTreeMap::new();
+        for prefix in prefixes {
+            for (key, value) in changes.range(prefix.to_vec()..) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                checkpoint.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(checkpoint)
+    }
+
     /// Return the values visible at `checkpoint` for keys whose staged value
     /// has since changed and matches one of `prefixes`.
     #[allow(clippy::type_complexity)]
@@ -47,20 +72,23 @@ impl<S: KvStore> OverlayStore<S> {
             .changes
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let mut previous = Vec::new();
-        for (key, value) in changes.iter() {
-            if !prefixes.iter().any(|prefix| key.starts_with(prefix))
-                || checkpoint.get(key) == Some(value)
-            {
-                continue;
+        let mut previous = BTreeMap::new();
+        for prefix in prefixes {
+            for (key, value) in changes.range(prefix.to_vec()..) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if checkpoint.get(key) == Some(value) {
+                    continue;
+                }
+                let old_value = match checkpoint.get(key) {
+                    Some(value) => value.clone(),
+                    None => self.base.get(key)?,
+                };
+                previous.insert(key.clone(), old_value);
             }
-            let old_value = match checkpoint.get(key) {
-                Some(value) => value.clone(),
-                None => self.base.get(key)?,
-            };
-            previous.push((key.clone(), old_value));
         }
-        Ok(previous)
+        Ok(previous.into_iter().collect())
     }
 
     /// Atomically apply pending changes together with an additional batch.
@@ -237,5 +265,27 @@ mod tests {
                 (b"pk/account-a".to_vec(), Some(b"first".to_vec())),
             ]
         );
+    }
+
+    #[test]
+    fn prefix_checkpoint_excludes_unrelated_staged_writes() {
+        let base = Arc::new(MemoryDb::new());
+        let overlay = OverlayStore::new(base);
+        overlay.put(b"state/account-a", &[7; 1024]).unwrap();
+        overlay.put(b"pk/account-a", b"first").unwrap();
+        overlay.put(b"gc/account-b", b"config").unwrap();
+
+        let checkpoint = overlay.checkpoint_prefixes(&[b"pk/", b"gc/"]).unwrap();
+
+        assert_eq!(checkpoint.len(), 2);
+        assert_eq!(
+            checkpoint.get(b"pk/account-a".as_slice()),
+            Some(&Some(b"first".to_vec()))
+        );
+        assert_eq!(
+            checkpoint.get(b"gc/account-b".as_slice()),
+            Some(&Some(b"config".to_vec()))
+        );
+        assert!(!checkpoint.contains_key(b"state/account-a".as_slice()));
     }
 }
