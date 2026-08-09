@@ -102,6 +102,20 @@ impl ProverServiceHandle {
             let _ = join_handle.await;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown_cleanly(mut self) {
+        self.shutdown_tx
+            .take()
+            .expect("started service must own its shutdown sender")
+            .send(true)
+            .expect("prover service must be listening for shutdown");
+        self.join_handle
+            .take()
+            .expect("started service must own its task")
+            .await
+            .expect("prover service task must exit cleanly");
+    }
 }
 
 impl Drop for ProverServiceHandle {
@@ -138,7 +152,7 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProverServiceTestEvent {
+pub(crate) enum ProverServiceTestEvent {
     Started,
     BacklogPolled,
 }
@@ -188,6 +202,15 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     /// durably stored.
     pub fn with_amendment_sender(mut self, amendment_tx: mpsc::Sender<ProofAmendment>) -> Self {
         self.amendment_tx = Some(amendment_tx);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_event_sender(
+        mut self,
+        test_event_tx: mpsc::UnboundedSender<ProverServiceTestEvent>,
+    ) -> Self {
+        self.test_event_tx = Some(test_event_tx);
         self
     }
 
@@ -559,14 +582,13 @@ mod tests {
     }
 
     fn observe_service(
-        mut service: ProverService<MemoryDb>,
+        service: ProverService<MemoryDb>,
     ) -> (
         ProverServiceHandle,
         mpsc::UnboundedReceiver<ProverServiceTestEvent>,
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        service.test_event_tx = Some(event_tx);
-        (service.start(), event_rx)
+        (service.with_test_event_sender(event_tx).start(), event_rx)
     }
 
     async fn expect_service_event(
@@ -580,19 +602,8 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    async fn shutdown_cleanly(mut handle: ProverServiceHandle) {
-        handle
-            .shutdown_tx
-            .take()
-            .expect("started service must own its shutdown sender")
-            .send(true)
-            .expect("prover service must be listening for shutdown");
-        handle
-            .join_handle
-            .take()
-            .expect("started service must own its task")
-            .await
-            .expect("prover service task must exit cleanly");
+    async fn shutdown_cleanly(handle: ProverServiceHandle) {
+        handle.shutdown_cleanly().await;
     }
 
     #[test]

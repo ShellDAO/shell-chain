@@ -9724,7 +9724,7 @@ mod tests {
     /// wastes work and would always be rejected by settlement.
     #[tokio::test]
     async fn stark_prover_service_waits_when_entries_below_l1_threshold() {
-        use crate::prover_service::{ProverConfig, ProverService};
+        use crate::prover_service::{ProverConfig, ProverService, ProverServiceTestEvent};
         use shell_storage::ProofAmendmentStore;
 
         let (node, proposer_signer) = setup_stark_node();
@@ -9765,10 +9765,21 @@ mod tests {
             node.config.proposer_address.unwrap_or_default(),
         )
         .with_amendment_sender(amendment_tx);
-        let handle = svc.start();
+        let (test_event_tx, mut test_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = svc.with_test_event_sender(test_event_tx).start();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        handle.shutdown().await;
+        for expected in [
+            ProverServiceTestEvent::Started,
+            ProverServiceTestEvent::BacklogPolled,
+        ] {
+            let observed =
+                tokio::time::timeout(tokio::time::Duration::from_secs(1), test_event_rx.recv())
+                    .await
+                    .expect("prover service event timed out")
+                    .expect("prover service event channel closed");
+            assert_eq!(observed, expected);
+        }
+        handle.shutdown_cleanly().await;
 
         assert_eq!(
             node.proof_backlog.lock().len(),
