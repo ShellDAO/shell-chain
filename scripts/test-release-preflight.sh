@@ -121,6 +121,9 @@ git -C "$TMP_DIR" init -q -b main remote-fixture
 git -C "$REMOTE_FIXTURE" remote add canonical https://github.com/ShellDAO/shell-chain.git
 git -C "$REMOTE_FIXTURE" remote add canonical-ssh git@github.com:ShellDAO/shell-chain.git
 git -C "$REMOTE_FIXTURE" remote add fork https://github.com/example/shell-chain.git
+git -C "$REMOTE_FIXTURE" remote add split https://github.com/example/shell-chain.git
+git -C "$REMOTE_FIXTURE" remote set-url --push split \
+    https://github.com/ShellDAO/shell-chain.git
 git -C "$REMOTE_FIXTURE" remote add multi https://github.com/ShellDAO/shell-chain.git
 git -C "$REMOTE_FIXTURE" remote set-url --add --push multi \
     https://github.com/ShellDAO/shell-chain.git
@@ -135,6 +138,13 @@ if REMOTE_OUTPUT=$(cd "$REMOTE_FIXTURE" && \
 fi
 if ! grep -Fq "does not target ShellDAO/shell-chain" <<<"$REMOTE_OUTPUT"; then
     fail "fork rejection did not explain the required release target: $REMOTE_OUTPUT"
+fi
+if REMOTE_OUTPUT=$(cd "$REMOTE_FIXTURE" && \
+    "$SCRIPT_DIR/check-release-remote.sh" split 2>&1); then
+    fail "release remote check unexpectedly accepted a noncanonical fetch URL"
+fi
+if ! grep -Fq "fetch URL does not target ShellDAO/shell-chain" <<<"$REMOTE_OUTPUT"; then
+    fail "split fetch/push rejection was not specific: $REMOTE_OUTPUT"
 fi
 if REMOTE_OUTPUT=$(cd "$REMOTE_FIXTURE" && \
     "$SCRIPT_DIR/check-release-remote.sh" multi 2>&1); then
