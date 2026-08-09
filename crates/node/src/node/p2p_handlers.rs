@@ -614,32 +614,24 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Option<HashMap<Address, shell_crypto::PQSignature>> {
         if let Ok(raw) = serde_json::from_slice::<HashMap<String, shell_crypto::PQSignature>>(cert)
         {
-            return Some(
-                raw.into_iter()
-                    .filter_map(|(addr, sig)| {
-                        Self::parse_certificate_signer(&addr).map(|a| (a, sig))
-                    })
-                    .collect(),
-            );
+            return raw
+                .into_iter()
+                .map(|(addr, sig)| Self::parse_certificate_signer(&addr).map(|a| (a, sig)))
+                .collect();
         }
 
         // Legacy sidecars encoded {Address(...) -> sig_hex} and implicitly used Dilithium3.
         let raw = serde_json::from_slice::<HashMap<String, String>>(cert).ok()?;
-        Some(
-            raw.into_iter()
-                .filter_map(|(addr, sig_hex)| {
-                    let addr = Self::parse_certificate_signer(&addr)?;
-                    let data = hex::decode(sig_hex).ok()?;
-                    Some((
-                        addr,
-                        shell_crypto::PQSignature::new(
-                            shell_crypto::SignatureType::Dilithium3,
-                            data,
-                        ),
-                    ))
-                })
-                .collect(),
-        )
+        raw.into_iter()
+            .map(|(addr, sig_hex)| {
+                let addr = Self::parse_certificate_signer(&addr)?;
+                let data = hex::decode(sig_hex).ok()?;
+                Some((
+                    addr,
+                    shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, data),
+                ))
+            })
+            .collect()
     }
 
     /// Verify a commit certificate independently of local canonical storage.

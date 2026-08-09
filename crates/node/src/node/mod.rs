@@ -10796,6 +10796,57 @@ mod tests {
         }
 
         #[test]
+        fn fast_finalize_rejects_certificate_with_malformed_signer() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
+            let quorum_signatures =
+                HashMap::from([(authority, signer.sign(block_hash.as_bytes()).unwrap())]);
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&quorum_signatures).unwrap();
+            let mut cert_value =
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&cert)
+                    .unwrap();
+            let valid_signature = cert_value.values().next().unwrap().clone();
+            cert_value.insert("not-an-address".into(), valid_signature);
+            let malformed_cert = serde_json::to_vec(&cert_value).unwrap();
+
+            assert!(!node.fast_finalize_with_certificate(1, block_hash, &malformed_cert));
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert!(node
+                .chain_store
+                .get_commit_certificate(&block_hash)
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn fast_finalize_rejects_legacy_certificate_with_malformed_signature() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+
+            let block_hash = store_next_wpoa_block(&node, genesis_hash);
+            let valid_signature = signer.sign(block_hash.as_bytes()).unwrap();
+            let cert = serde_json::to_vec(&HashMap::from([
+                (authority.to_string(), hex::encode(valid_signature.data)),
+                (Address::from([0x99; 20]).to_string(), "not-hex".into()),
+            ]))
+            .unwrap();
+
+            assert!(!node.fast_finalize_with_certificate(1, block_hash, &cert));
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert!(node
+                .chain_store
+                .get_commit_certificate(&block_hash)
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
         fn fast_finalize_rejects_exactly_two_thirds_weight() {
             let signers: Vec<DilithiumSigner> =
                 (0..3).map(|_| DilithiumSigner::generate()).collect();
