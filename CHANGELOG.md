@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject authenticated STARK amendments whose declared `compressed_size` does not match the proof artifact size, preventing underreported metadata from satisfying compression and reward policy.
+
 ## [0.27.4] — 2026-08-12 — Protocol safety and operational resilience
 
 ### Breaking Changes

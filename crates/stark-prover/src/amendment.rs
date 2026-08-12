@@ -179,6 +179,13 @@ impl ProofAmendment {
         if signature.len() > MAX_SIGNATURE_BYTES {
             return Err("prover authentication signature exceeds size limit".to_owned());
         }
+        let expected_compressed_size = self.estimated_wire_size_bytes();
+        if self.compressed_size != Some(expected_compressed_size) {
+            return Err(format!(
+                "compressed_size does not match proof artifact size: expected {expected_compressed_size}, got {:?}",
+                self.compressed_size
+            ));
+        }
         if Address::from_public_key(public_key, sig_type.as_u8()) != self.prover {
             return Err("prover address does not match authentication key".to_owned());
         }
@@ -191,15 +198,18 @@ impl ProofAmendment {
 
     /// Estimated wire size in bytes.
     pub fn size_bytes(&self) -> usize {
-        self.compressed_size.unwrap_or_else(|| {
-            self.proof.size_bytes() as u64
+        self.compressed_size
+            .unwrap_or_else(|| self.estimated_wire_size_bytes()) as usize
+    }
+
+    fn estimated_wire_size_bytes(&self) -> u64 {
+        self.proof.size_bytes() as u64
             + 32  // block_hash
             + 8   // block_number
             + 20  // prover address
             + self.prover_signature.len() as u64
             + (self.source_hashes.len() as u64).saturating_mul(32)
             + 32 // JSON/range metadata overhead estimate
-        }) as usize
     }
 
     /// Source block/artifact hashes covered by this amendment.
@@ -529,6 +539,33 @@ mod tests {
         amendment
             .verify_prover_authentication()
             .expect("verify amendment");
+    }
+
+    #[test]
+    fn prover_authentication_rejects_underreported_compressed_size() {
+        let signer = DilithiumSigner::generate();
+        let mut amendment = make_amendment();
+        amendment.original_size = Some(u64::MAX);
+        amendment
+            .sign_prover_authentication(&signer)
+            .expect("sign amendment");
+
+        amendment.compressed_size = Some(1);
+        let message = amendment.signing_message();
+        let public_key = signer.public_key();
+        amendment.prover_signature = encode_prover_authentication(
+            signer.sig_type(),
+            public_key,
+            signer.sign(&message).expect("sign tampered size"),
+            u16::try_from(public_key.len()).expect("public key length"),
+        )
+        .expect("encode authentication");
+
+        assert!(amendment.has_valid_embedded_compression());
+        assert!(amendment
+            .verify_prover_authentication()
+            .unwrap_err()
+            .contains("compressed_size does not match proof artifact size"));
     }
 
     #[test]
