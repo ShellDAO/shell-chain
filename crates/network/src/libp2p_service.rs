@@ -4,7 +4,7 @@
 //! broadcast, mDNS for local peer discovery, and Kademlia DHT for
 //! global peer discovery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -173,6 +173,35 @@ struct PendingDirectMessages {
     bytes: usize,
     max_messages: usize,
     max_bytes: usize,
+}
+
+struct ExplicitMdnsPeers {
+    peers: HashSet<Libp2pPeerId>,
+    max_peers: usize,
+}
+
+impl ExplicitMdnsPeers {
+    fn new(max_peers: usize) -> Self {
+        Self {
+            peers: HashSet::new(),
+            max_peers,
+        }
+    }
+
+    fn admit(&mut self, peer: Libp2pPeerId) -> bool {
+        if self.peers.contains(&peer) {
+            return true;
+        }
+        if self.max_peers > 0 && self.peers.len() >= self.max_peers {
+            return false;
+        }
+        self.peers.insert(peer);
+        true
+    }
+
+    fn remove(&mut self, peer: &Libp2pPeerId) -> bool {
+        self.peers.remove(peer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +765,30 @@ struct SwarmLoopConfig {
     peer_security: PeerSecurityConfig,
 }
 
+struct SwarmLoopState {
+    peer_tracker: crate::security::PeerTracker,
+    peer_ban_list: crate::security::PeerBanList,
+    pending_direct_messages: PendingDirectMessages,
+    explicit_mdns_peers: ExplicitMdnsPeers,
+}
+
+impl SwarmLoopState {
+    fn new(config: PeerSecurityConfig) -> Self {
+        Self {
+            peer_tracker: crate::security::PeerTracker::new(config.max_peers),
+            peer_ban_list: crate::security::PeerBanList::new(
+                config.ban_threshold,
+                config.ban_duration,
+            ),
+            pending_direct_messages: PendingDirectMessages::new(
+                MAX_PENDING_DIRECT_MESSAGES,
+                MAX_PENDING_DIRECT_BYTES,
+            ),
+            explicit_mdns_peers: ExplicitMdnsPeers::new(config.max_peers),
+        }
+    }
+}
+
 struct PeerCountResetGuard(Arc<AtomicUsize>);
 
 impl Drop for PeerCountResetGuard {
@@ -768,15 +821,8 @@ async fn swarm_loop(
     event_tx: mpsc::Sender<NetworkEvent>,
     loop_config: SwarmLoopConfig,
 ) {
-    let mut pending_direct_messages =
-        PendingDirectMessages::new(MAX_PENDING_DIRECT_MESSAGES, MAX_PENDING_DIRECT_BYTES);
+    let mut state = SwarmLoopState::new(loop_config.peer_security);
     let _peer_count_reset = PeerCountResetGuard(Arc::clone(&loop_config.peer_count));
-    // F-305: Initialize peer tracking and ban list.
-    let mut peer_tracker = crate::security::PeerTracker::new(loop_config.peer_security.max_peers);
-    let mut peer_ban_list = crate::security::PeerBanList::new(
-        loop_config.peer_security.ban_threshold,
-        loop_config.peer_security.ban_duration,
-    );
 
     // Subscribe to gossipsub topics.
     if let Err(e) = swarm
@@ -863,13 +909,13 @@ async fn swarm_loop(
                             );
                         } else {
                             let data: Arc<[u8]> = data.into();
-                            match direct_message_admission(&pending_direct_messages, data.len()) {
+                            match direct_message_admission(&state.pending_direct_messages, data.len()) {
                                 DirectMessageAdmission::Send => {
                                     let request_id = swarm
                                         .behaviour_mut()
                                         .direct_message
                                         .send_request(&peer, Arc::clone(&data));
-                                    pending_direct_messages.insert(
+                                    state.pending_direct_messages.insert(
                                         request_id,
                                         PendingDirectMessage { topic, data },
                                     );
@@ -899,9 +945,7 @@ async fn swarm_loop(
                     &mut swarm,
                     &event_tx,
                     &loop_config,
-                    &mut peer_tracker,
-                    &mut peer_ban_list,
-                    &mut pending_direct_messages,
+                    &mut state,
                 );
             }
             _ = kad_bootstrap_interval.tick() => {
@@ -916,7 +960,7 @@ async fn swarm_loop(
                 }
             }
             _ = score_log_interval.tick() => {
-                peer_ban_list.purge_expired();
+                state.peer_ban_list.purge_expired();
                 log_peer_scores(&swarm);
             }
             _ = bw_tick.tick() => {
@@ -981,10 +1025,14 @@ fn handle_swarm_event(
     swarm: &mut Swarm<ShellBehaviour>,
     event_tx: &mpsc::Sender<NetworkEvent>,
     loop_config: &SwarmLoopConfig,
-    peer_tracker: &mut crate::security::PeerTracker,
-    peer_ban_list: &mut crate::security::PeerBanList,
-    pending_direct_messages: &mut PendingDirectMessages,
+    state: &mut SwarmLoopState,
 ) {
+    let SwarmLoopState {
+        peer_tracker,
+        peer_ban_list,
+        pending_direct_messages,
+        explicit_mdns_peers,
+    } = state;
     match event {
         SwarmEvent::Behaviour(ShellBehaviourEvent::DirectMessage(
             request_response::Event::Message {
@@ -1251,7 +1299,11 @@ fn handle_swarm_event(
                 info!("discovered peer on address peer={peer_id} address={addr}");
                 // The mDNS behaviour supplies live addresses during dial resolution and
                 // removes them on expiry, so they must not enter persistent peer caches.
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                if explicit_mdns_peers.admit(peer_id) {
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                } else {
+                    debug!(%peer_id, "mDNS explicit peer limit reached");
+                }
             }
         }
         // mDNS peer expired.
@@ -1261,7 +1313,7 @@ fn handle_swarm_event(
                 let still_discovered = swarm.behaviour().mdns.as_ref().is_some_and(|mdns| {
                     mdns_peer_still_discovered(&peer_id, mdns.discovered_nodes())
                 });
-                if !still_discovered {
+                if !still_discovered && explicit_mdns_peers.remove(&peer_id) {
                     swarm
                         .behaviour_mut()
                         .gossipsub
@@ -2300,13 +2352,7 @@ mod tests {
             max_msg_size: config.max_message_size,
             peer_security: PeerSecurityConfig::from(&config),
         };
-        let mut peer_tracker = crate::security::PeerTracker::new(config.max_peers);
-        let mut peer_ban_list = crate::security::PeerBanList::new(
-            config.ban_threshold,
-            Duration::from_secs(config.ban_duration_secs),
-        );
-        let mut pending_direct_messages =
-            PendingDirectMessages::new(MAX_PENDING_DIRECT_MESSAGES, MAX_PENDING_DIRECT_BYTES);
+        let mut state = SwarmLoopState::new(PeerSecurityConfig::from(&config));
 
         handle_swarm_event(
             SwarmEvent::Behaviour(ShellBehaviourEvent::Mdns(mdns::Event::Discovered(vec![(
@@ -2316,9 +2362,7 @@ mod tests {
             &mut swarm,
             &event_tx,
             &loop_config,
-            &mut peer_tracker,
-            &mut peer_ban_list,
-            &mut pending_direct_messages,
+            &mut state,
         );
         handle_swarm_event(
             SwarmEvent::Behaviour(ShellBehaviourEvent::Mdns(mdns::Event::Expired(vec![(
@@ -2327,9 +2371,7 @@ mod tests {
             &mut swarm,
             &event_tx,
             &loop_config,
-            &mut peer_tracker,
-            &mut peer_ban_list,
-            &mut pending_direct_messages,
+            &mut state,
         );
 
         assert!(
@@ -2351,6 +2393,22 @@ mod tests {
             &peer_id,
             [&other_peer].into_iter()
         ));
+    }
+
+    #[test]
+    fn mdns_explicit_peers_respect_peer_limit_and_reclaim_capacity() {
+        let first = Libp2pPeerId::random();
+        let second = Libp2pPeerId::random();
+        let mut peers = ExplicitMdnsPeers::new(1);
+
+        assert!(peers.admit(first));
+        assert!(
+            peers.admit(first),
+            "duplicate discovery must remain admitted"
+        );
+        assert!(!peers.admit(second));
+        assert!(peers.remove(&first));
+        assert!(peers.admit(second));
     }
 
     #[test]

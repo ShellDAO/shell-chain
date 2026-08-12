@@ -61,6 +61,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Bound the mDNS explicit-peer set to the configured peer limit and reclaim
+  capacity when discovered peers expire.
 - Commit state-trie node deletion and its durable pruning cursor atomically.
 - Validate canonical suffix continuity before startup recovery rewinds to the
   durable finalized checkpoint.
