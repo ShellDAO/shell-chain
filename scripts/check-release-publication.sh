@@ -60,10 +60,15 @@ except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(1)
 
 errors = []
+expected_prerelease = "-" in tag.removeprefix("v")
 if release.get("tag_name") != tag:
     errors.append("release tag does not match the validated tag")
 if release.get("draft") is not False:
     errors.append("release is still a draft")
+if release.get("prerelease") is not expected_prerelease:
+    errors.append(
+        f"release prerelease state does not match tag (expected {expected_prerelease})"
+    )
 if not isinstance(release.get("published_at"), str) or not release["published_at"]:
     errors.append("release has no publication timestamp")
 if not isinstance(release.get("html_url"), str) or not release["html_url"]:

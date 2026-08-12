@@ -112,14 +112,14 @@ PUBLICATION_COMMIT=$(git -C "$PUBLICATION_FIXTURE" rev-parse HEAD)
 git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9 -m "publication fixture"
 git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9
 cat > "$TMP_DIR/release.json" <<'EOF'
-{"tag_name":"v0.27.9","draft":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
+{"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
 EOF
 (cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
     RELEASE_FIXTURE="$TMP_DIR/release.json" \
     "$PUBLICATION_HELPER/check-release-publication.sh" \
     canonical v0.27.9 "$PUBLICATION_COMMIT" >/dev/null)
 cat > "$TMP_DIR/release.json" <<'EOF'
-{"tag_name":"v0.27.9","draft":true,"published_at":null,"html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
+{"tag_name":"v0.27.9","draft":true,"prerelease":false,"published_at":null,"html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
 EOF
 if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
     GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
@@ -130,6 +130,29 @@ fi
 if ! grep -Fq "release is still a draft" <<<"$PUBLICATION_OUTPUT"; then
     fail "draft release rejection was not specific: $PUBLICATION_OUTPUT"
 fi
+
+cat > "$TMP_DIR/release.json" <<'EOF'
+{"tag_name":"v0.27.9","draft":false,"prerelease":true,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
+EOF
+if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
+    GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" 2>&1); then
+    fail "release publication check unexpectedly accepted a prerelease stable tag"
+fi
+if ! grep -Fq "release prerelease state does not match tag" <<<"$PUBLICATION_OUTPUT"; then
+    fail "prerelease state rejection was not specific: $PUBLICATION_OUTPUT"
+fi
+
+git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9-rc.1 -m "prerelease publication fixture"
+git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9-rc.1
+cat > "$TMP_DIR/release.json" <<'EOF'
+{"tag_name":"v0.27.9-rc.1","draft":false,"prerelease":true,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9-rc.1"}
+EOF
+(cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
+    RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9-rc.1 "$PUBLICATION_COMMIT" >/dev/null)
 
 LOCK_FIXTURE="$TMP_DIR/lock-fixture"
 mkdir -p "$LOCK_FIXTURE/src"
