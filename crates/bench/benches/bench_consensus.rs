@@ -3,7 +3,7 @@
 /// Covers PoA seal/verify header and proposer selection.
 /// Run with: `cargo bench --package shell-bench --bench bench_consensus`
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use shell_consensus::{ConsensusEngine, PoaConfig, PoaEngine};
+use shell_consensus::{ConsensusEngine, PoaConfig, PoaEngine, ValidatorSet, ValidatorSetConfig};
 use shell_core::{Block, BlockHeader};
 use shell_crypto::{DilithiumSigner, Signer};
 use shell_primitives::{Address, Bytes, ShellHash};
@@ -72,6 +72,11 @@ fn bench_poa_proposer_selection(c: &mut Criterion) {
     let config = PoaConfig::new(validators.clone(), 2).with_weights(vec![100; validators.len()]);
     let mut engine = PoaEngine::new(config.clone());
     engine.slash_authority(&validators[0]);
+    let mut validator_set = ValidatorSet::from_genesis(
+        validators.iter().copied().map(|address| (address, 100)),
+        ValidatorSetConfig::default(),
+    );
+    validator_set.slash(&validators[0], 0).unwrap();
 
     let mut group = c.benchmark_group("poa");
     group.throughput(Throughput::Elements(1));
@@ -85,6 +90,12 @@ fn bench_poa_proposer_selection(c: &mut Criterion) {
     group.bench_function("weighted_engine_is_proposer_1000", |b| {
         b.iter(|| {
             engine.is_proposer(black_box(1_000_u64), black_box(&validators[500]));
+        })
+    });
+
+    group.bench_function("weighted_validator_set_proposer_1000", |b| {
+        b.iter(|| {
+            validator_set.weighted_proposer(black_box(1_000_u64));
         })
     });
 

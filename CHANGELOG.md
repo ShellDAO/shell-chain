@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Avoid allocating the active-validator view during weighted proposer selection
+  and active-count checks.
 - Revalidate canonical `main` and the exact annotated tag source after release
   confirmation, rejecting a push when either changed during the prompt.
 - Make sparse parallel-execution wave planning linear in the current wave size

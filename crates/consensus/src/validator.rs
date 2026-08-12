@@ -165,7 +165,11 @@ impl ValidatorSet {
 
     /// Return the number of active validators.
     pub fn active_count(&self) -> usize {
-        self.active_validators().len()
+        self.order
+            .iter()
+            .filter_map(|address| self.validators.get(address))
+            .filter(|validator| validator.status.is_active())
+            .count()
     }
 
     /// Return validator info for `address`, or `None` if not found.
@@ -193,41 +197,38 @@ impl ValidatorSet {
     /// Returns `None` only if there are no active validators (should never
     /// occur in a live network).
     pub fn weighted_proposer(&self, block_number: u64) -> Option<Address> {
-        let active = self.active_validators();
-        let n = active.len();
-        if n == 0 {
+        let active = || {
+            self.order.iter().filter_map(|address| {
+                let validator = self.validators.get(address)?;
+                validator.status.is_active().then_some(validator)
+            })
+        };
+        let total =
+            active().try_fold(0u64, |total, validator| total.checked_add(validator.weight))?;
+        if total == 0 && active().next().is_none() {
             return None;
         }
-
-        let total = active
-            .iter()
-            .try_fold(0u64, |acc, validator| acc.checked_add(validator.weight))?;
         if total == 0 {
             // Fallback: plain round-robin when all weights are 0.
-            let idx = (block_number as usize).checked_rem(n).unwrap_or(0);
-            return Some(
-                active
-                    .get(idx)
-                    .unwrap_or_else(|| unreachable!("idx < n"))
-                    .address,
-            );
+            let active_count = active().count();
+            let idx = (block_number as usize)
+                .checked_rem(active_count)
+                .unwrap_or(0);
+            return active().nth(idx).map(|validator| validator.address);
         }
 
         let slot = block_number.checked_rem(total).unwrap_or(0);
         let mut cumulative: u64 = 0;
-        for v in &active {
-            cumulative = cumulative.checked_add(v.weight)?;
+        let mut last = None;
+        for validator in active() {
+            last = Some(validator.address);
+            cumulative = cumulative.checked_add(validator.weight)?;
             if slot < cumulative {
-                return Some(v.address);
+                return Some(validator.address);
             }
         }
         // Unreachable: slot < total means we always find a validator.
-        Some(
-            active
-                .last()
-                .unwrap_or_else(|| unreachable!("active.is_empty() checked above"))
-                .address,
-        )
+        last
     }
 
     // ── Lifecycle mutations ───────────────────────────────────────────────
