@@ -72,11 +72,63 @@ fi
 if ! grep -Fq '"$SCRIPT_DIR/push-release-tag.sh"' "$SCRIPT_DIR/release.sh"; then
     fail "release tag push does not preserve the validated source and main refs"
 fi
+if ! grep -Fq 'check-release-publication.sh' "$SCRIPT_DIR/release.sh"; then
+    fail "release instructions do not verify the published GitHub release"
+fi
 if grep -Fq 'Run: git push' "$SCRIPT_DIR/release.sh"; then
     fail "deferred release instructions bypass the validated tag push helper"
 fi
 if ! grep -Fq 'check-release-remote.sh' "$SCRIPT_DIR/push-release-tag.sh"; then
     fail "release tag push does not revalidate the canonical remote"
+fi
+
+PUBLICATION_HELPER="$TMP_DIR/publication-helpers"
+mkdir -p "$PUBLICATION_HELPER"
+cp "$SCRIPT_DIR/check-release-publication.sh" "$PUBLICATION_HELPER/"
+cat > "$PUBLICATION_HELPER/check-release-remote.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$PUBLICATION_HELPER/check-release-remote.sh"
+FAKE_PUBLICATION_GH="$TMP_DIR/fake-publication-gh"
+cat > "$FAKE_PUBLICATION_GH" <<'EOF'
+#!/usr/bin/env bash
+cat "$RELEASE_FIXTURE"
+EOF
+chmod +x "$FAKE_PUBLICATION_GH"
+
+PUBLICATION_REMOTE="$TMP_DIR/publication-remote.git"
+PUBLICATION_FIXTURE="$TMP_DIR/publication-fixture"
+git init -q --bare "$PUBLICATION_REMOTE"
+git init -q -b main "$PUBLICATION_FIXTURE"
+git -C "$PUBLICATION_FIXTURE" config user.name "ShellDAO Release Test"
+git -C "$PUBLICATION_FIXTURE" config user.email "release-test@shelldao.org"
+printf 'release\n' > "$PUBLICATION_FIXTURE/history"
+git -C "$PUBLICATION_FIXTURE" add history
+git -C "$PUBLICATION_FIXTURE" commit -qm "release publication fixture"
+git -C "$PUBLICATION_FIXTURE" remote add canonical "$PUBLICATION_REMOTE"
+git -C "$PUBLICATION_FIXTURE" push -q -u canonical main
+PUBLICATION_COMMIT=$(git -C "$PUBLICATION_FIXTURE" rev-parse HEAD)
+git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9 -m "publication fixture"
+git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9
+cat > "$TMP_DIR/release.json" <<'EOF'
+{"tag_name":"v0.27.9","draft":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
+EOF
+(cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
+    RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" >/dev/null)
+cat > "$TMP_DIR/release.json" <<'EOF'
+{"tag_name":"v0.27.9","draft":true,"published_at":null,"html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9"}
+EOF
+if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
+    GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" 2>&1); then
+    fail "release publication check unexpectedly accepted a draft"
+fi
+if ! grep -Fq "release is still a draft" <<<"$PUBLICATION_OUTPUT"; then
+    fail "draft release rejection was not specific: $PUBLICATION_OUTPUT"
 fi
 
 LOCK_FIXTURE="$TMP_DIR/lock-fixture"

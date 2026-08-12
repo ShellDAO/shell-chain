@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Add a post-tag release check that verifies the canonical annotated tag and
+  confirms the corresponding GitHub release is publicly published.
 - Avoid allocating the active-validator view during weighted proposer selection
   and active-count checks.
 - Revalidate canonical `main` and the exact annotated tag source after release
