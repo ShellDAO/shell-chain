@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep round-robin proposer selection deterministic across target pointer widths
+  for block numbers above the native `usize` range.
 - Reject published releases whose GitHub prerelease state disagrees with the
   stable or prerelease status encoded in the validated semantic-version tag.
 - Reject authenticated STARK amendments whose declared `compressed_size` does not match the proof artifact size, preventing underreported metadata from satisfying compression and reward policy.

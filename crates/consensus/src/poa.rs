@@ -4,7 +4,7 @@ use shell_core::{Block, BlockHeader};
 use shell_crypto::{PQSignature, Signer, Verifier};
 use shell_primitives::{keccak256, Address};
 
-use crate::{ConsensusEngine, ConsensusError, EngineType};
+use crate::{round_robin_index, ConsensusEngine, ConsensusError, EngineType};
 
 /// PoA configuration: authority list and block timing.
 #[derive(Debug, Clone)]
@@ -101,12 +101,11 @@ impl PoaConfig {
             return self.weighted_proposer_for_block(block_number);
         }
         let idx = if self.epoch_length > 0 {
-            (block_number.checked_rem(self.epoch_length).unwrap_or(0) as usize)
-                .checked_rem(n)
-                .unwrap_or(0)
+            round_robin_index(block_number.checked_rem(self.epoch_length).unwrap_or(0), n)
         } else {
-            (block_number as usize).checked_rem(n).unwrap_or(0)
-        };
+            round_robin_index(block_number, n)
+        }
+        .unwrap_or(0);
         self.authorities
             .get(idx)
             .copied()
@@ -268,16 +267,16 @@ impl PoaEngine {
 
         if self.config.authority_weights.is_empty() {
             let idx = if self.config.epoch_length > 0 {
-                (block_number
-                    .checked_rem(self.config.epoch_length)
-                    .unwrap_or(0) as usize)
-                    .checked_rem(active_count)
-                    .unwrap_or(0)
+                round_robin_index(
+                    block_number
+                        .checked_rem(self.config.epoch_length)
+                        .unwrap_or(0),
+                    active_count,
+                )
             } else {
-                (block_number as usize)
-                    .checked_rem(active_count)
-                    .unwrap_or(0)
-            };
+                round_robin_index(block_number, active_count)
+            }
+            .unwrap_or(0);
             return self
                 .config
                 .authorities
@@ -792,6 +791,13 @@ mod tests {
             let expected_idx = b as usize % addrs.len();
             assert_eq!(config.proposer_for_block(b), addrs[expected_idx]);
         }
+    }
+
+    #[test]
+    fn proposer_for_block_handles_full_block_number_range() {
+        let addrs = make_addrs(7);
+        let config = PoaConfig::new(addrs.clone(), 1);
+        assert_eq!(config.proposer_for_block(u64::MAX), addrs[1]);
     }
 
     #[test]

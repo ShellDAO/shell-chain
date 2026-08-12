@@ -28,6 +28,14 @@ pub use slashing::{
     SlashingConfig,
 };
 pub use validator::{ValidatorInfo, ValidatorSet, ValidatorSetConfig, ValidatorStatus};
+
+fn round_robin_index(block_number: u64, count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let count = u64::try_from(count).expect("validator count fits in u64");
+    Some(usize::try_from(block_number % count).expect("proposer index fits in usize"))
+}
 pub use view_change::{ViewChangeMessage, ViewChangeState, VIEW_CHANGE_TIMEOUT_MS};
 pub use window::{ProofWindowManager, WindowConfig, WindowError, WindowState};
 pub use wpoa::{WPoaConfig, WPoaEngine};

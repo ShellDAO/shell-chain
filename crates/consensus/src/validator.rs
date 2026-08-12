@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use shell_primitives::Address;
 
-use crate::ConsensusError;
+use crate::{round_robin_index, ConsensusError};
 
 // ---------------------------------------------------------------------------
 // Validator status and info
@@ -211,9 +211,7 @@ impl ValidatorSet {
         if total == 0 {
             // Fallback: plain round-robin when all weights are 0.
             let active_count = active().count();
-            let idx = (block_number as usize)
-                .checked_rem(active_count)
-                .unwrap_or(0);
+            let idx = round_robin_index(block_number, active_count)?;
             return active().nth(idx).map(|validator| validator.address);
         }
 
@@ -369,6 +367,12 @@ mod tests {
         assert_eq!(set.weighted_proposer(1), Some(addr(2)));
         assert_eq!(set.weighted_proposer(2), Some(addr(3)));
         assert_eq!(set.weighted_proposer(3), Some(addr(1)));
+    }
+
+    #[test]
+    fn zero_weight_fallback_handles_full_block_number_range() {
+        let set = set_with((1..=7).map(|index| (addr(index), 0)).collect());
+        assert_eq!(set.weighted_proposer(u64::MAX), Some(addr(2)));
     }
 
     #[test]
