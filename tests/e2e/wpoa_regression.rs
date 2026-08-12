@@ -9,14 +9,13 @@
 //! These tests use in-memory components only (no Docker / network).
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use shell_consensus::{
     detect_double_sign, detect_offline, SlashingConfig, ValidatorSet, ValidatorSetConfig,
 };
 use shell_core::BlockHeader;
 use shell_primitives::{Address, Bytes, ShellHash, U256};
-use shell_storage::{MemoryDb, WorldState};
+use shell_storage::{KvStore, MemoryDb, WorldState};
 
 use shell_e2e::{make_funded_account, make_transfer, setup, sign_tx, TEST_CHAIN_ID};
 
@@ -210,33 +209,24 @@ fn world_state_cache_write_through() {
 #[test]
 fn world_state_cache_hit_after_warm() {
     let db = Arc::new(MemoryDb::new());
-    let mut ws = WorldState::new(db);
+    let mut ws = WorldState::new(Arc::clone(&db));
 
     let addr = make_addr(7);
     ws.set_balance(&addr, U256::from(1_000_000u64)).unwrap();
+    let root = ws.state_root().unwrap();
 
-    // Cold run: first read populates the cache.
-    let cold_start = Instant::now();
-    let _ = ws.get_account(&addr).unwrap();
-    let cold_elapsed = cold_start.elapsed();
+    // Re-open with an empty account cache, then populate it from the trie.
+    let ws = WorldState::at_root(Arc::clone(&db), &root).unwrap();
+    let account = ws.get_account(&addr).unwrap();
+    assert_eq!(account.as_ref().unwrap().balance, U256::from(1_000_000u64));
 
-    // Warm run: subsequent reads should come from the LRU cache.
-    let warm_start = Instant::now();
-    for _ in 0..1000 {
-        let _ = ws.get_account(&addr).unwrap();
+    // Remove the backing trie. A second successful read proves the warmed
+    // account was served from the LRU rather than storage.
+    for (key, _) in db.scan_all().unwrap() {
+        db.delete(&key).unwrap();
     }
-    let warm_elapsed = warm_start.elapsed();
 
-    // The 1000 warm cache hits must complete in less time than 1000× the
-    // cold read. We use a 10× factor to give CI ample headroom.
-    let cold_micros = cold_elapsed.as_micros().max(1);
-    let warm_per_hit_micros = warm_elapsed.as_micros() / 1000;
-    assert!(
-        warm_per_hit_micros < cold_micros * 10,
-        "cache hits ({warm_per_hit_micros}µs/hit) should be faster than cold reads \
-         ({}µs) with 10× margin",
-        cold_micros
-    );
+    assert_eq!(ws.get_account(&addr).unwrap(), account);
 }
 
 #[test]
