@@ -288,7 +288,19 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 let Some(pending_number) = head.header.number.checked_add(1) else {
                     return Ok(None);
                 };
-                let all_pending = self.tx_pool.pending_for_block(1000);
+                let base_fee_per_gas = shell_core::calculate_base_fee(
+                    head.header.gas_used,
+                    head.header.gas_limit,
+                    head.header.base_fee_per_gas,
+                );
+                let excess_blob_gas = shell_core::calc_excess_blob_gas(
+                    head.header.excess_blob_gas,
+                    head.header.blob_gas_used,
+                );
+                let blob_base_fee = shell_core::calc_blob_gas_price(excess_blob_gas);
+                let all_pending =
+                    self.tx_pool
+                        .pending_for_block_at_fees(1000, base_fee_per_gas, blob_base_fee);
                 // F-101: cap pending block candidates by gas_limit to prevent
                 // oversized pseudo-blocks.
                 let gas_limit = head.header.gas_limit;
@@ -344,7 +356,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     receipts_root: ShellHash::ZERO,
                     transactions,
                     size: hex_u64(size as u64),
-                    base_fee_per_gas: hex_u64(head.header.base_fee_per_gas),
+                    base_fee_per_gas: hex_u64(base_fee_per_gas),
                     total_difficulty: "0x1".into(),
                     sha3_uncles: crate::types::EMPTY_OMMER_HASH.into(),
                     uncles: vec![],
@@ -356,7 +368,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     withdrawals_root: ShellHash::ZERO.to_string(),
                     parent_beacon_block_root: ShellHash::ZERO.to_string(),
                     blob_gas_used: hex_u64(0),
-                    excess_blob_gas: hex_u64(0),
+                    excess_blob_gas: hex_u64(excess_blob_gas),
                     sig_aggregate_proof: None,
                     sig_aggregate_proof_size: None,
                     compression_layer: 0,

@@ -5381,6 +5381,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_block_uses_next_fees_and_excludes_underpriced_transactions() {
+        let handler = setup();
+        let mut block = make_genesis_block();
+        block.header.gas_limit = 42_000;
+        block.header.gas_used = 42_000;
+        block.header.base_fee_per_gas = 100;
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+
+        let signer = DilithiumSigner::generate();
+        let addr = signer_address(&signer);
+        {
+            let mut ws = handler.world_state.write();
+            ws.add_balance(&addr, U256::from(100_000_000_000u64))
+                .unwrap();
+        }
+        handler
+            .chain_store
+            .put_pubkey(&addr, signer.public_key())
+            .unwrap();
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 100,
+            gas_limit: 21_000,
+            to: Some(test_address(b"pending-next-fee-to")),
+            value: U256::ZERO,
+            data: Bytes::default(),
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let sig = signer.sign(tx.hash().0.as_slice()).unwrap();
+        let signed = SignedTransaction::new(addr, tx, sig);
+        {
+            let mut ws = handler.world_state.write();
+            handler
+                .tx_pool
+                .insert(
+                    signed,
+                    &mut ws,
+                    handler.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+        }
+
+        let rpc = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rpc.base_fee_per_gas, "0x70");
+        assert_eq!(rpc.transactions, serde_json::json!([]));
+        assert_eq!(rpc.gas_used, "0x0");
+    }
+
+    #[tokio::test]
     async fn pending_block_skips_oversized_candidates_and_keeps_later_fit_txs() {
         let handler = setup();
         let mut block = make_genesis_block();
@@ -5526,7 +5588,8 @@ mod tests {
     #[tokio::test]
     async fn pending_block_uses_block_candidate_nonce_order() {
         let handler = setup();
-        let block = make_genesis_block();
+        let mut block = make_genesis_block();
+        block.header.base_fee_per_gas = 1;
         let hash = block.hash();
         handler.chain_store.put_block(&block).unwrap();
         handler.chain_store.set_canonical(0, &hash).unwrap();
