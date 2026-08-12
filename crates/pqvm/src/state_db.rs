@@ -152,10 +152,24 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
         &self.chain_store
     }
 
-    /// Returns mutable WorldState and shared ChainStore in one borrow,
-    /// avoiding the split-borrow issue with separate accessors.
+    /// Returns mutable WorldState and shared ChainStore in one borrow.
     pub(crate) fn world_state_and_chain_store(&mut self) -> (&mut WorldState<S>, &ChainStore<S>) {
         (&mut self.world_state, &self.chain_store)
+    }
+
+    /// Returns the state components needed to commit an execution result.
+    pub(crate) fn commit_parts(
+        &mut self,
+    ) -> (
+        &mut WorldState<S>,
+        &ChainStore<S>,
+        &HashMap<EvmAddress, ShellAddress>,
+    ) {
+        (
+            &mut self.world_state,
+            &self.chain_store,
+            &self.address_registry,
+        )
     }
 
     /// Convert a shell-chain Account to revm AccountInfo.

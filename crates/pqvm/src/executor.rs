@@ -1000,15 +1000,13 @@ pub fn commit_pqvm_state<S: KvStore + 'static>(
     result: &TxExecutionResult,
     state_db: &mut ShellStateDb<S>,
 ) -> Result<(), ExecutorError> {
-    // Clone the registry before the split borrow (typically 0–1 entries).
-    let registry = state_db.address_registry.clone();
+    let (world_state, chain_store, registry) = state_db.commit_parts();
     let resolve = |addr: &alloy_primitives::Address| {
         registry
             .get(addr)
             .copied()
             .unwrap_or_else(|| ShellAddress::from(*addr))
     };
-    let (world_state, chain_store) = state_db.world_state_and_chain_store();
     do_commit_state(result, world_state, chain_store, &resolve)?;
     state_db.clear_address_registry();
     Ok(())
