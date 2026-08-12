@@ -4,7 +4,7 @@
 # Automates the git tagging and release checklist for a new version.
 #
 # Usage: ./scripts/release.sh <version>
-#   e.g.  ./scripts/release.sh 0.27.3
+#   e.g.  ./scripts/release.sh 0.27.4
 #
 # Pre-conditions:
 #   - Working tree must be clean (no uncommitted changes)
@@ -30,11 +30,11 @@ fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
     echo "Usage: $0 <version>"
-    echo "  e.g. $0 0.27.3"
+    echo "  e.g. $0 0.27.4"
     exit 1
 fi
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-    fail "Version must be semver without a leading 'v' (for example, 0.27.3 or 0.28.0-rc.1)"
+    fail "Version must be semver without a leading 'v' (for example, 0.27.4 or 0.28.0-rc.1)"
 fi
 
 TAG="v${VERSION}"

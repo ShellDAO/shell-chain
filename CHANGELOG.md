@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.4] — 2026-08-12 — Protocol safety and operational resilience
+
 ### Breaking Changes
 
 - Bind the sender-bound transaction identity rules into the genesis header.
