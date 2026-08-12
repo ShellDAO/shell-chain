@@ -959,18 +959,23 @@ mod tests {
             .unwrap();
         let mut subscriptions = Vec::new();
         for _ in 0..16 {
-            subscriptions.push(
-                client
-                    .subscribe::<serde_json::Value, _>(
-                        "eth_subscribe",
-                        rpc_params!["syncing"],
-                        "eth_unsubscribe",
-                    )
+            let mut subscription = client
+                .subscribe::<serde_json::Value, _>(
+                    "eth_subscribe",
+                    rpc_params!["syncing"],
+                    "eth_unsubscribe",
+                )
+                .await
+                .unwrap();
+            let initial =
+                tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
                     .await
-                    .unwrap(),
-            );
+                    .expect("syncing subscription did not become active")
+                    .expect("syncing subscription closed before its initial status")
+                    .expect("initial syncing status was invalid");
+            assert_eq!(initial, serde_json::json!(false));
+            subscriptions.push(subscription);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let extra = client
             .subscribe::<serde_json::Value, _>(
                 "eth_subscribe",
