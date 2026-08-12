@@ -164,6 +164,14 @@ impl<S: KvStore + 'static> Node<S> {
                     error = %e,
                     "produce_block: skipping tx that failed re-validation"
                 );
+                if is_permanently_invalid_mempool_tx(&e) {
+                    let removed = self.tx_pool.remove_with_descendants(&tx.hash());
+                    debug!(
+                        tx_hash = %tx.hash(),
+                        removed,
+                        "produce_block: removed permanently invalid tx and descendants from mempool"
+                    );
+                }
                 continue;
             }
 
@@ -616,4 +624,57 @@ fn is_unrecoverable_executor_error(error: &shell_pqvm::ExecutorError) -> bool {
                 shell_storage::StorageError::Trie(_),
             ))
     )
+}
+
+fn is_permanently_invalid_mempool_tx(error: &TxValidationError) -> bool {
+    matches!(
+        error,
+        TxValidationError::ChainIdMismatch { .. }
+            | TxValidationError::GasTooLow(_)
+            | TxValidationError::NonceOverflow
+            | TxValidationError::InvalidAccessList(_)
+            | TxValidationError::InvalidBlobTx(_)
+            | TxValidationError::InvalidAaBundle(_)
+            | TxValidationError::SignatureInvalid
+            | TxValidationError::DisallowedAlgorithm(_)
+            | TxValidationError::PaymasterSignatureInvalid
+            | TxValidationError::SessionKeyExpired { .. }
+            | TxValidationError::SessionValueCapExceeded
+            | TxValidationError::SessionTargetMismatch
+            | TxValidationError::SessionRootSignatureInvalid
+            | TxValidationError::SessionKeySignatureInvalid
+            | TxValidationError::SessionKeyDisallowedAlgorithm(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_permanently_invalid_mempool_tx;
+    use crate::node::TxValidationError;
+
+    #[test]
+    fn permanent_mempool_revalidation_errors_exclude_state_dependent_failures() {
+        assert!(is_permanently_invalid_mempool_tx(
+            &TxValidationError::SignatureInvalid
+        ));
+        assert!(is_permanently_invalid_mempool_tx(
+            &TxValidationError::SessionKeyExpired {
+                expiry_block: 1,
+                current_block: 2,
+            }
+        ));
+
+        assert!(!is_permanently_invalid_mempool_tx(
+            &TxValidationError::NonceMismatch {
+                expected: 1,
+                got: 2,
+            }
+        ));
+        assert!(!is_permanently_invalid_mempool_tx(
+            &TxValidationError::PaymasterRejected
+        ));
+        assert!(!is_permanently_invalid_mempool_tx(
+            &TxValidationError::PubkeyConflict
+        ));
+    }
 }

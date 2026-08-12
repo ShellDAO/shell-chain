@@ -5510,6 +5510,33 @@ mod tests {
             )
             .unwrap();
 
+        let descendant_tx = Transaction {
+            chain_id: 1337,
+            nonce: 2,
+            to: Some(Address::from([0x55; 20])),
+            value: U256::from(1u64),
+            data: Bytes::default(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let descendant_signing_hash = descendant_tx.signing_hash(old_signer.sig_type().as_u8());
+        let descendant_signature = old_signer.sign(descendant_signing_hash.as_bytes()).unwrap();
+        let descendant_signed = SignedTransaction::new(sender, descendant_tx, descendant_signature);
+        let descendant_hash = descendant_signed.hash();
+        node.tx_pool
+            .insert(
+                descendant_signed,
+                &mut node.world_state.write(),
+                node.chain_store.as_ref(),
+                &MultiVerifier,
+            )
+            .unwrap();
+
         let rotation_block = node.produce_block(&proposer_signer, 1).unwrap();
         assert_eq!(rotation_block.transactions.len(), 1);
         assert_eq!(
@@ -5519,7 +5546,8 @@ mod tests {
 
         let next_block = node.produce_block(&proposer_signer, 100).unwrap();
         assert!(next_block.transactions.is_empty());
-        assert!(node.tx_pool.contains(&stale_hash));
+        assert!(!node.tx_pool.contains(&stale_hash));
+        assert!(!node.tx_pool.contains(&descendant_hash));
     }
 
     #[test]
