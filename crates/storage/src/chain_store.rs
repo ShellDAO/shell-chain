@@ -2228,6 +2228,18 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
             .checkpoint_prefixes(&Self::ADDRESS_METADATA_PREFIXES)
     }
 
+    /// Stage serialized proof artifacts in the same overlay as a canonical transition.
+    pub fn put_proof_amendments(
+        &self,
+        artifacts: impl IntoIterator<Item = (ShellHash, Vec<u8>)>,
+    ) -> Result<(), StorageError> {
+        for (block_hash, bytes) in artifacts {
+            self.store
+                .put(&ProofAmendmentStore::<S>::key(&block_hash), &bytes)?;
+        }
+        Ok(())
+    }
+
     /// Stage an undo journal for address-keyed metadata changed since the
     /// supplied overlay checkpoint.
     pub fn stage_address_metadata_undo(
@@ -5616,6 +5628,47 @@ mod tests {
         assert_eq!(base_cs.get_total_gas_used().unwrap(), U256::from(5));
         assert_eq!(base_cs.get_chain_totals_head().unwrap(), Some(1));
         assert_eq!(base_cs.get_finalized_number().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn commit_reorg_overlay_includes_staged_proof_artifacts_atomically() {
+        let db = Arc::new(FailingBatchStore::new());
+        let base_cs = ChainStore::new(Arc::clone(&db));
+        let old_block = empty_block(1);
+        let mut new_block = empty_block(1);
+        new_block.header.timestamp = 1;
+        let old_hash = old_block.hash();
+        let new_hash = new_block.hash();
+        let source_hash = ShellHash::from([0xA1; 32]);
+        base_cs.commit_canonical_block(&old_block, None).unwrap();
+
+        let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
+        let overlay_cs = ChainStore::new(overlay);
+        overlay_cs
+            .put_proof_amendments([(source_hash, b"proof".to_vec())])
+            .unwrap();
+        db.fail_next_batch();
+
+        let error = overlay_cs
+            .commit_reorg_overlay(
+                std::slice::from_ref(&old_block),
+                std::slice::from_ref(&new_block),
+                &[],
+                &[vec![]],
+                &new_hash,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected batch failure"));
+        assert_eq!(base_cs.get_head_hash().unwrap(), Some(old_hash));
+        assert_eq!(base_cs.get_block_hash_by_number(1).unwrap(), Some(old_hash));
+        assert_eq!(
+            ProofAmendmentStore::new(db)
+                .get_amendment(&source_hash)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

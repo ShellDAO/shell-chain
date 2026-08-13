@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Commit preferred-fork STARK proof artifacts atomically with the canonical
+  reorganization so an artifact write failure cannot publish a partial fork.
 - Reject incomplete canonical log-query ranges instead of silently returning
   partial results when a block below the current head is unavailable.
 - Return errors for invalid PQ-HD recovery phrases and mnemonic generation

@@ -667,6 +667,20 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(stored)
     }
 
+    pub(crate) fn stark_artifacts(
+        amendment: &ProofAmendment,
+        settlement_tx_hash: Option<ShellHash>,
+    ) -> Result<Vec<(ShellHash, Vec<u8>)>, NodeError> {
+        amendment
+            .storage_artifacts_with_settlement(settlement_tx_hash)
+            .map_err(|e| {
+                NodeError::Startup(format!(
+                    "serialize STARK proof artifacts for block #{}: {e}",
+                    amendment.block_number
+                ))
+            })
+    }
+
     fn validate_stark_amendment_ordering_with_overlay(
         &self,
         amendment: &ProofAmendment,

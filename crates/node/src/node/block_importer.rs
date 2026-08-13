@@ -835,6 +835,15 @@ impl<S: KvStore + 'static> Node<S> {
                 replay_cs.put_pubkey(&address, &pubkey)?;
             }
         }
+        let settlement_hashes = block
+            .system_transactions
+            .iter()
+            .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+            .map(SystemTransaction::hash);
+        for (amendment, settlement_hash) in stark_settlements.iter().zip(settlement_hashes) {
+            replay_cs
+                .put_proof_amendments(Self::stark_artifacts(amendment, Some(settlement_hash))?)?;
+        }
         replay_cs.stage_address_metadata_undo(&block.hash(), &metadata_checkpoint)?;
 
         Ok((receipts, stark_settlements))
@@ -1184,14 +1193,6 @@ impl<S: KvStore + 'static> Node<S> {
             block_store.cancel_settled_witness_deletes(&reverted_settlements);
         }
         for (block, block_settlements) in plan.new_chain.iter().zip(settlements) {
-            let settlement_hashes = block
-                .system_transactions
-                .iter()
-                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
-                .map(SystemTransaction::hash);
-            for (amendment, settlement_hash) in block_settlements.iter().zip(settlement_hashes) {
-                self.store_stark_artifacts(amendment, Some(settlement_hash))?;
-            }
             self.prover_orchestrator()
                 .record_settled_sources(&block_settlements);
             self.prover_orchestrator()
