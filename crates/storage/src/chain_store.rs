@@ -2232,7 +2232,8 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         self.store.commit_with_batch(batch)
     }
 
-    /// Atomically commit replayed state and canonical reorganization artifacts.
+    /// Atomically commit replayed state, canonical reorganization artifacts,
+    /// and an optional finalized cursor.
     pub fn commit_reorg_overlay(
         &self,
         old_chain: &[Block],
@@ -2240,6 +2241,7 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         stale_canonical_numbers: &[u64],
         new_chain_receipts: &[Vec<TransactionReceipt>],
         new_head: &ShellHash,
+        finalized_number: Option<u64>,
     ) -> Result<(), StorageError> {
         if new_chain.len() != new_chain_receipts.len() {
             return Err(StorageError::Database(
@@ -2251,6 +2253,12 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
             self.reorg_batch(old_chain, new_chain, stale_canonical_numbers, new_head)?;
         for (block, receipts) in new_chain.iter().zip(new_chain_receipts) {
             batch.put(Self::receipts_key(&block.hash()), encode_rlp_list(receipts));
+        }
+        if let Some(number) = finalized_number {
+            batch.put(
+                prefix::FINALIZED_NUMBER.to_vec(),
+                number.to_be_bytes().to_vec(),
+            );
         }
         self.store.commit_with_batch(batch)
     }
@@ -5299,6 +5307,7 @@ mod tests {
                 &[],
                 &[vec![]],
                 &new_hash,
+                Some(1),
             )
             .unwrap();
 
@@ -5312,6 +5321,7 @@ mod tests {
         assert_eq!(base_cs.get_total_tx_count().unwrap(), 0);
         assert_eq!(base_cs.get_total_gas_used().unwrap(), U256::from(7));
         assert_eq!(base_cs.get_chain_totals_head().unwrap(), Some(1));
+        assert_eq!(base_cs.get_finalized_number().unwrap(), Some(1));
         assert_ne!(old_hash, new_hash);
     }
 
@@ -5328,6 +5338,7 @@ mod tests {
         base_cs.set_total_tx_count(3).unwrap();
         base_cs.set_total_gas_used(U256::from(5)).unwrap();
         base_cs.set_chain_totals_head(1).unwrap();
+        base_cs.set_finalized_number(0).unwrap();
 
         let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
         overlay.put(b"replayed-state", b"present").unwrap();
@@ -5341,6 +5352,7 @@ mod tests {
                 &[],
                 &[vec![]],
                 &new_hash,
+                Some(1),
             )
             .unwrap_err();
 
@@ -5352,6 +5364,7 @@ mod tests {
         assert_eq!(base_cs.get_total_tx_count().unwrap(), 3);
         assert_eq!(base_cs.get_total_gas_used().unwrap(), U256::from(5));
         assert_eq!(base_cs.get_chain_totals_head().unwrap(), Some(1));
+        assert_eq!(base_cs.get_finalized_number().unwrap(), Some(0));
     }
 
     #[test]

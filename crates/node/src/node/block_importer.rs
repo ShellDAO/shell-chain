@@ -946,6 +946,7 @@ impl<S: KvStore + 'static> Node<S> {
             &stale_canonical_numbers,
             &[],
             &finalized_hash,
+            None,
         )?;
 
         *self.world_state.write() = restored_state;
@@ -1112,14 +1113,46 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             Vec::new()
         };
+        let total_weight = self
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let mut finality = self.finality.write();
+        let finalizes_preferred = finality.can_finalize_weighted(
+            &plan.preferred_hash,
+            plan.preferred_number,
+            total_weight,
+        );
         overlay_chain_store.commit_reorg_overlay(
             &plan.old_chain,
             &plan.new_chain,
             &stale_canonical_numbers,
             &receipts,
             &plan.preferred_hash,
+            finalizes_preferred.then_some(plan.preferred_number),
         )?;
         algorithm_registry_rollback.commit();
+
+        if finalizes_preferred {
+            let finalized = finality.check_finality_weighted(
+                &plan.preferred_hash,
+                plan.preferred_number,
+                total_weight,
+            );
+            debug_assert!(finalized, "prechecked preferred-fork finality must apply");
+            drop(finality);
+            tracing::info!(
+                block = plan.preferred_number,
+                hash = %plan.preferred_hash,
+                "canonicalized attested block finalized"
+            );
+            self.advance_fork_choice_finality(plan.preferred_number, plan.preferred_hash);
+        } else {
+            drop(finality);
+        }
 
         self.prover_orchestrator()
             .rewind_settled_frontiers(plan.ancestor_number);
@@ -1193,8 +1226,6 @@ impl<S: KvStore + 'static> Node<S> {
                 .lock()
                 .insert(block.header.proposer, block.number());
         }
-        self.finalize_canonical_pending_attestations(plan.preferred_number, plan.preferred_hash)?;
-
         info!(
             preferred_hash = %plan.preferred_hash,
             preferred_number = plan.preferred_number,

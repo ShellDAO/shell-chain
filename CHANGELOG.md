@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Commit quorum-backed fork adoption and its finalized cursor atomically so a
+  follow-up storage error cannot leave canonical state ahead of finality.
 - Avoid reporting removed logs from blocks that predate a polling filter while
   still reporting matching logs from a replacement chain.
 - Keep epoch-boundary validator reloads on the canonical weighted path and

@@ -2709,8 +2709,8 @@ mod tests {
     }
 
     #[test]
-    fn adopted_quorum_attested_fork_advances_finality_without_another_attestation() {
-        let (node, signer) = setup_node();
+    fn adopted_quorum_attested_fork_commits_finality_without_a_follow_up_write() {
+        let (node, signer, db) = setup_failing_batch_node();
         store_consistent_genesis(&node);
         let proposer = node.config.proposer_address.unwrap();
         node.register_authority_pubkey(proposer, signer.public_key().to_vec());
@@ -2758,6 +2758,7 @@ mod tests {
             .preferred_fork_plan()
             .unwrap()
             .expect("attested side fork should become preferred");
+        db.fail_next_put();
         node.adopt_preferred_fork(&plan).unwrap();
 
         assert_eq!(
@@ -8869,8 +8870,8 @@ mod tests {
     // ── B5: witness_root validation tests ────────────────────────────────────
 
     /// Build a height-1 block with an optional witness_root set.
-    fn make_block_at_1(
-        node: &Node<MemoryDb>,
+    fn make_block_at_1<S: KvStore + 'static>(
+        node: &Node<S>,
         signer: &dyn Signer,
         witness_root: Option<ShellHash>,
     ) -> Block {
