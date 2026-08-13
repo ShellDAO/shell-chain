@@ -2912,7 +2912,7 @@ impl<S: KvStore + 'static> Node<S> {
         amendment: &ProofAmendment,
         stored_key: ShellHash,
     ) -> Result<(), NodeError> {
-        self.amendment_store.delete_amendment(&stored_key)?;
+        let mut artifact_keys = vec![stored_key];
         for source_hash in amendment
             .covered_hashes()
             .into_iter()
@@ -2932,10 +2932,12 @@ impl<S: KvStore + 'static> Node<S> {
                 Err(_) => false,
             };
             if belongs_to_amendment {
-                self.amendment_store.delete_amendment(&source_hash)?;
+                artifact_keys.push(source_hash);
             }
         }
-        Ok(())
+        self.amendment_store
+            .delete_amendments_atomic(artifact_keys)
+            .map_err(NodeError::from)
     }
 
     fn wall_clock_millis() -> u64 {

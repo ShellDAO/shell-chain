@@ -9805,6 +9805,28 @@ mod tests {
     }
 
     #[test]
+    fn rejected_stark_recovery_artifact_delete_is_atomic() {
+        let (node, _signer, db) = setup_failing_batch_node();
+        let first = ShellHash::from([0x51; 32]);
+        let last = ShellHash::from([0x52; 32]);
+        let amendment = dummy_ordered_amendment(1, vec![first, last], 1);
+        node.store_stark_artifacts(&amendment, None).unwrap();
+        db.fail_next_batch();
+
+        let error = node
+            .delete_stored_stark_amendment_artifacts(&amendment, first)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected batch failure"));
+        assert!(node
+            .amendment_store
+            .get_amendment(&first)
+            .unwrap()
+            .is_some());
+        assert!(node.amendment_store.get_amendment(&last).unwrap().is_some());
+    }
+
+    #[test]
     fn stark_source_original_size_uses_fallback_for_pruned_stub_block() {
         let (node, proposer_signer) = setup_stark_node();
         store_genesis(&node);

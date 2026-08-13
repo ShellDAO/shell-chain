@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Delete rejected STARK proof-range artifacts atomically so a storage failure
+  cannot leave a partially removed pointer set.
 - Retry historical body back-fill requests after a response timeout so a
   dropped peer message cannot stall recovery indefinitely.
 - Reject snapshots whose finalized or aggregate-totals progress is ahead of

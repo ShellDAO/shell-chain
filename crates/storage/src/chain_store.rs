@@ -2490,6 +2490,18 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         self.store.write_batch(batch)
     }
 
+    /// Atomically delete all artifacts belonging to one proof range.
+    pub fn delete_amendments_atomic(
+        &self,
+        block_hashes: impl IntoIterator<Item = ShellHash>,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        for block_hash in block_hashes {
+            batch.delete(Self::key(&block_hash));
+        }
+        self.store.write_batch(batch)
+    }
+
     /// Retrieve the raw bytes of the `ProofAmendment` for a block, if present.
     pub fn get_amendment(&self, block_hash: &ShellHash) -> Result<Option<Vec<u8>>, StorageError> {
         self.store.get(&Self::key(block_hash))
@@ -2967,6 +2979,35 @@ mod tests {
         assert!(err.to_string().contains("injected batch failure"));
         assert_eq!(amendments.get_amendment(&first).unwrap(), None);
         assert_eq!(amendments.get_amendment(&last).unwrap(), None);
+    }
+
+    #[test]
+    fn proof_amendment_range_delete_failure_leaves_all_artifacts() {
+        let store = Arc::new(FailingBatchStore::new());
+        let amendments = ProofAmendmentStore::new(Arc::clone(&store));
+        let first = ShellHash::from([5u8; 32]);
+        let last = ShellHash::from([6u8; 32]);
+        amendments
+            .put_amendments_atomic(vec![
+                (first, b"pointer".to_vec()),
+                (last, b"proof".to_vec()),
+            ])
+            .unwrap();
+        store.fail_next_batch();
+
+        let err = amendments
+            .delete_amendments_atomic([first, last])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected batch failure"));
+        assert_eq!(
+            amendments.get_amendment(&first).unwrap(),
+            Some(b"pointer".to_vec())
+        );
+        assert_eq!(
+            amendments.get_amendment(&last).unwrap(),
+            Some(b"proof".to_vec())
+        );
     }
 
     fn empty_block(number: u64) -> Block {
