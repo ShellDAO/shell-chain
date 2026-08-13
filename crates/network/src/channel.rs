@@ -74,7 +74,7 @@ impl PeerCountState {
 impl NetworkBus {
     /// Create a new bus with the given channel capacity.
     pub fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
+        let (tx, _) = broadcast::channel(capacity.max(1));
         Self {
             tx,
             next_peer_id: Arc::new(AtomicUsize::new(0)),
@@ -305,6 +305,28 @@ mod tests {
             },
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_bus_remains_usable() {
+        let bus = NetworkBus::new(0);
+        let config = NetworkConfig::default();
+        let node_a = bus.join(&config);
+        let mut node_b = bus.join(&config);
+
+        node_a.broadcast(NetworkMessage::Ping).await.unwrap();
+
+        let event = timeout(Duration::from_secs(1), node_b.next_event())
+            .await
+            .expect("timeout")
+            .expect("no event");
+        assert!(matches!(
+            event,
+            NetworkEvent::MessageReceived {
+                message: NetworkMessage::Ping,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
