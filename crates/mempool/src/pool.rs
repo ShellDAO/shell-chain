@@ -2457,10 +2457,11 @@ mod tests {
 
         let incumbent_signer = DilithiumSigner::generate();
         let incumbent_pubkey = incumbent_signer.public_key().to_vec();
+        let first_nonce = u64::default();
         let incumbent = make_signed_value_tx_with_fees(
             &incumbent_signer,
             &incumbent_pubkey,
-            0,
+            first_nonce,
             101,
             100,
             U256::ZERO,
@@ -2473,7 +2474,7 @@ mod tests {
         let incoming = make_signed_value_tx_with_fees(
             &incoming_signer,
             &incoming_pubkey,
-            0,
+            first_nonce,
             102,
             2,
             U256::ZERO,
