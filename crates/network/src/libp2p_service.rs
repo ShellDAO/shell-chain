@@ -37,7 +37,13 @@ const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
 const DIRECT_MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/direct/1");
 const MAX_PENDING_DIRECT_MESSAGES: usize = 256;
 const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
+const MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_IDENTITY_KEY_SIZE: u64 = 64 * 1024;
+
+fn max_concurrent_direct_streams(max_message_size: usize) -> usize {
+    (MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION / max_message_size.max(1))
+        .clamp(1, MAX_PENDING_DIRECT_MESSAGES)
+}
 
 /// Topic category for gossipsub routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,7 +710,7 @@ fn build_swarm_with_identity(
                 [(DIRECT_MESSAGE_PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30))
-                    .with_max_concurrent_streams(256),
+                    .with_max_concurrent_streams(max_concurrent_direct_streams(max_msg_size)),
             );
 
             let dcutr_behaviour: Option<dcutr::Behaviour> =
@@ -1792,6 +1798,16 @@ mod tests {
         .await
         .expect_err("oversized direct messages must be rejected before deserialization");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn direct_message_streams_respect_the_per_connection_byte_budget() {
+        assert_eq!(
+            max_concurrent_direct_streams(crate::message::MAX_MESSAGE_SIZE),
+            2
+        );
+        assert_eq!(max_concurrent_direct_streams(1024 * 1024), 100);
+        assert_eq!(max_concurrent_direct_streams(1024), 256);
     }
 
     #[tokio::test]
