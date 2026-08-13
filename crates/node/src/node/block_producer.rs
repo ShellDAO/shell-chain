@@ -23,6 +23,7 @@ impl<S: KvStore + 'static> Node<S> {
     /// commits state changes after every transaction (so subsequent txs see
     /// prior updates), assembles a block, and commits it to storage.
     pub fn produce_block(&self, signer: &dyn Signer, max_txs: usize) -> Result<Block, NodeError> {
+        let max_txs = max_txs.min(self.config.network_type.default_params().max_tx_per_block);
         let block_store = self.block_store();
         let consensus = self.consensus_manager();
         let prover = self.prover_orchestrator();

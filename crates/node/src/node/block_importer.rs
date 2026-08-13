@@ -144,6 +144,16 @@ impl<S: KvStore + 'static> Node<S> {
         parent: &Block,
         finalized_import: bool,
     ) -> Result<(), NodeError> {
+        let max_transactions = self.config.network_type.default_params().max_tx_per_block;
+        if block.transactions.len() > max_transactions {
+            return Err(NodeError::Startup(format!(
+                "block {} contains {} transactions, exceeding the network limit of {}",
+                block.number(),
+                block.transactions.len(),
+                max_transactions,
+            )));
+        }
+
         let seal = block.proposer_seal.as_ref().ok_or_else(|| {
             NodeError::Startup(format!("block {} missing proposer seal", block.number()))
         })?;

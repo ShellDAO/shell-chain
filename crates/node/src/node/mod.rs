@@ -5684,6 +5684,55 @@ mod tests {
     }
 
     #[test]
+    fn import_block_rejects_transactions_above_network_limit() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let state_root = current_state_root(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let transaction = signed_tx_with_gas_limit(21_000);
+        let max_transactions = node.config.network_type.default_params().max_tx_per_block;
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: node.chain_store.get_head_hash().unwrap().unwrap(),
+                state_root,
+                transactions_root: ShellHash::default(),
+                receipts_root: ShellHash::default(),
+                logs_bloom: Bytes::default(),
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1_700_000_001,
+                extra_data: Bytes::default(),
+                proposer,
+                sig_aggregate_proof: None,
+                base_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                withdrawals_root: ShellHash::ZERO,
+                parent_beacon_block_root: ShellHash::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                witness_root: None,
+            },
+            transactions: vec![transaction; max_transactions + 1],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        node.consensus
+            .read()
+            .sign_block(&mut block, &signer)
+            .unwrap();
+
+        let error = node.import_block(block, &MultiVerifier).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the network limit of 100"),
+            "expected transaction-limit rejection, got {error}"
+        );
+    }
+
+    #[test]
     fn import_block_rejects_empty_header_blob_gas_used_mismatch() {
         let (node, signer) = setup_node();
         store_genesis(&node);
