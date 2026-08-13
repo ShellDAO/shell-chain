@@ -7368,6 +7368,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_shutdown_interrupts_startup_backfill_delay() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, signer) = setup_node();
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let signer = Arc::new(signer) as Arc<dyn Signer>;
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(signer, &mut network).await }
+        });
+
+        tokio::task::yield_now().await;
+        node.shutdown();
+        let result = tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("shutdown remained blocked by startup backfill delay")
+            .expect("event loop task panicked");
+        assert!(result.is_ok(), "run() returned error: {:?}", result.err());
+    }
+
+    #[tokio::test]
     async fn event_loop_adopts_stateful_preferred_fork_before_resuming_production() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;

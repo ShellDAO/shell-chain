@@ -558,7 +558,14 @@ impl<S: KvStore + 'static> Node<S> {
         // then scan for missing bodies and issue the initial BodyRequest to kick
         // off historical body back-fill on nodes that upgraded their storage profile.
         {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
             if network.peer_count().await > 0 {
                 let oldest = self.oldest_available_body_block();
                 let head = self.head_number();
