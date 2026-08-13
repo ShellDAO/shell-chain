@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Avoid reporting removed logs from blocks that predate a polling filter while
+  still reporting matching logs from a replacement chain.
 - Keep epoch-boundary validator reloads on the canonical weighted path and
   avoid producer-only offline penalties that could diverge consensus state.
 - Reject malformed semantic versions throughout the release helpers, including

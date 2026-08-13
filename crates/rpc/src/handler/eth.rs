@@ -1073,9 +1073,9 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     }
 
     async fn get_filter_changes(&self, id: String) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let (is_log, cursor) = self
+        let (is_log, cursor, changes_from_block) = self
             .filter_registry
-            .get_filter_cursor(&id)
+            .get_filter_poll_state(&id)
             .ok_or_else(|| not_found("filter not found"))?;
 
         let head = self.chain_store.get_head_block().map_err(internal_err)?;
@@ -1156,7 +1156,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             let mut results = Vec::new();
 
             for (block_number, block_hash) in removed_blocks {
-                if block_number >= filter.from_block.unwrap_or(0)
+                if changes_from_block.is_some_and(|from| block_number >= from)
+                    && block_number >= filter.from_block.unwrap_or(0)
                     && block_number <= removed_to_block
                 {
                     append_filter_logs(

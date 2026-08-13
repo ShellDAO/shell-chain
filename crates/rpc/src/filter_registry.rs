@@ -50,6 +50,8 @@ pub struct FilterEntry {
     pub last_poll_block: u64,
     /// Canonical block hash at `last_poll_block`, when a head exists.
     pub last_poll_hash: Option<ShellHash>,
+    /// First block whose changes can be reported by this filter.
+    pub changes_from_block: Option<u64>,
     /// Last access time for TTL-based expiry.
     pub last_access: Instant,
 }
@@ -135,6 +137,11 @@ impl FilterRegistry {
                 kind,
                 last_poll_block: current_block,
                 last_poll_hash: current_hash,
+                changes_from_block: if current_block == 0 && current_hash.is_none() {
+                    Some(0)
+                } else {
+                    current_block.checked_add(1)
+                },
                 last_access: Instant::now(),
             };
             filters.insert(id.clone(), entry);
@@ -156,6 +163,14 @@ impl FilterRegistry {
     /// Returns `None` if the filter does not exist.
     /// Updates the last access timestamp.
     pub fn get_filter_cursor(&self, id: &str) -> Option<(bool, FilterCursor)> {
+        self.get_filter_poll_state(id)
+            .map(|(is_log, cursor, _)| (is_log, cursor))
+    }
+
+    /// Get the filter kind, canonical cursor, and first reportable block.
+    /// Returns `None` if the filter does not exist.
+    /// Updates the last access timestamp.
+    pub fn get_filter_poll_state(&self, id: &str) -> Option<(bool, FilterCursor, Option<u64>)> {
         if !is_valid_filter_id(id) {
             return None;
         }
@@ -170,6 +185,7 @@ impl FilterRegistry {
                 block_number: entry.last_poll_block,
                 block_hash: entry.last_poll_hash,
             },
+            entry.changes_from_block,
         ))
     }
 
@@ -381,6 +397,7 @@ mod tests {
                         kind: FilterKind::Block,
                         last_poll_block: i as u64,
                         last_poll_hash: None,
+                        changes_from_block: (i as u64).checked_add(1),
                         last_access: expired_at,
                     },
                 );
@@ -418,6 +435,24 @@ mod tests {
         let (is_log, last_poll) = reg.get_filter_info(&id).unwrap();
         assert!(is_log);
         assert_eq!(last_poll, 5);
+    }
+
+    #[test]
+    fn poll_state_tracks_the_first_post_install_block() {
+        let reg = FilterRegistry::new();
+        let head_hash = ShellHash::from_slice(&[0x10; 32]);
+        let at_head = reg
+            .new_filter_at(FilterKind::Block, 5, Some(head_hash))
+            .unwrap();
+        let before_genesis = reg.new_filter(FilterKind::Block, 0).unwrap();
+        let at_max = reg.new_filter(FilterKind::Block, u64::MAX).unwrap();
+
+        assert_eq!(reg.get_filter_poll_state(&at_head).unwrap().2, Some(6));
+        assert_eq!(
+            reg.get_filter_poll_state(&before_genesis).unwrap().2,
+            Some(0)
+        );
+        assert_eq!(reg.get_filter_poll_state(&at_max).unwrap().2, None);
     }
 
     #[test]
@@ -632,6 +667,7 @@ mod tests {
                 kind: FilterKind::Block,
                 last_poll_block: 0,
                 last_poll_hash: None,
+                changes_from_block: Some(0),
                 last_access: Instant::now() + std::time::Duration::from_secs(60),
             },
         );

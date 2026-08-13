@@ -6481,6 +6481,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_filter_does_not_remove_logs_from_before_installation() {
+        let handler = setup();
+        let address = Address::from([0xA3; 20]);
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        let old_log = shell_core::Log::new(address, vec![], Bytes::from_static(b"old")).unwrap();
+        let old_hash =
+            store_block_with_logs_on_parent(&handler, 1, genesis_hash, 1, vec![vec![old_log]]);
+        let raw: RawLogFilter =
+            serde_json::from_str(&format!(r#"{{"fromBlock":"0x0","address":"{}"}}"#, address))
+                .unwrap();
+        let filter_id = EthApiServer::new_filter(&handler, raw).await.unwrap();
+
+        let replacement_log =
+            shell_core::Log::new(address, vec![], Bytes::from_static(b"new")).unwrap();
+        let replacement_hash = store_block_with_logs_on_parent(
+            &handler,
+            1,
+            genesis_hash,
+            2,
+            vec![vec![replacement_log]],
+        );
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_ne!(logs[0]["blockHash"], serde_json::json!(old_hash));
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(replacement_hash));
+        assert_eq!(logs[0]["removed"], false);
+    }
+
+    #[tokio::test]
     async fn log_filter_returns_removed_and_deep_reorg_replacement_logs() {
         let handler = setup();
         let address = Address::from([0xA2; 20]);
