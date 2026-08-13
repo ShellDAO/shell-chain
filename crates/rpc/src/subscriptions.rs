@@ -30,8 +30,8 @@ const MAX_SUBSCRIPTIONS: u32 = 1024;
 /// Maximum number of concurrent subscriptions per WebSocket connection.
 const MAX_SUBSCRIPTIONS_PER_CONNECTION: u32 = 16;
 
-/// Auto-disconnect a subscriber after this many consecutive lag events (F-042).
-const MAX_CONSECUTIVE_LAGS: u32 = 3;
+/// Auto-disconnect a subscriber after this many lag events (F-042).
+const MAX_LAG_EVENTS: u32 = 3;
 
 /// Maximum topic positions accepted by log subscriptions.
 const MAX_LOG_TOPIC_POSITIONS: usize = 4;
@@ -398,6 +398,11 @@ fn unsupported_subscription_type_err(_sub_type: &str) -> jsonrpsee::types::Error
     ))
 }
 
+fn lag_limit_reached(lag_events: &mut u32) -> bool {
+    *lag_events = lag_events.saturating_add(1);
+    *lag_events >= MAX_LAG_EVENTS
+}
+
 // ---------------------------------------------------------------------------
 // RPC trait definition
 // ---------------------------------------------------------------------------
@@ -555,7 +560,7 @@ async fn forward_new_heads(
     mut rx: broadcast::Receiver<BlockEvent>,
     sink: jsonrpsee::SubscriptionSink,
 ) {
-    let mut consecutive_lags: u32 = 0;
+    let mut lag_events: u32 = 0;
     loop {
         let event = tokio::select! {
             _ = sink.closed() => break,
@@ -567,7 +572,6 @@ async fn forward_new_heads(
                 removed: false,
                 ..
             }) => {
-                consecutive_lags = 0;
                 let value = header_to_json(&header);
                 let Ok(msg) = SubscriptionMessage::from_json(&value) else {
                     tracing::error!("failed to serialize header for subscription");
@@ -577,13 +581,11 @@ async fn forward_new_heads(
                     break;
                 }
             }
-            Ok(BlockEvent::NewBlock { removed: true, .. }) => {
-                consecutive_lags = 0;
-            }
+            Ok(BlockEvent::NewBlock { removed: true, .. }) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                consecutive_lags += 1;
-                tracing::warn!(skipped = n, consecutive_lags, "newHeads subscriber lagged");
-                if consecutive_lags >= MAX_CONSECUTIVE_LAGS {
+                let disconnect = lag_limit_reached(&mut lag_events);
+                tracing::warn!(skipped = n, lag_events, "newHeads subscriber lagged");
+                if disconnect {
                     tracing::error!("newHeads subscriber too slow — disconnecting");
                     break;
                 }
@@ -598,7 +600,7 @@ async fn forward_logs(
     sink: jsonrpsee::SubscriptionSink,
     filter: LogFilter,
 ) {
-    let mut consecutive_lags: u32 = 0;
+    let mut lag_events: u32 = 0;
     loop {
         let event = tokio::select! {
             _ = sink.closed() => return,
@@ -610,7 +612,6 @@ async fn forward_logs(
                 receipts,
                 removed,
             }) => {
-                consecutive_lags = 0;
                 let mut global_log_index: usize = 0;
                 for receipt in &receipts {
                     for log in &receipt.logs {
@@ -636,9 +637,9 @@ async fn forward_logs(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                consecutive_lags += 1;
-                tracing::warn!(skipped = n, consecutive_lags, "logs subscriber lagged");
-                if consecutive_lags >= MAX_CONSECUTIVE_LAGS {
+                let disconnect = lag_limit_reached(&mut lag_events);
+                tracing::warn!(skipped = n, lag_events, "logs subscriber lagged");
+                if disconnect {
                     tracing::error!("logs subscriber too slow — disconnecting");
                     return;
                 }
@@ -653,7 +654,7 @@ async fn forward_pending_txs(
     mut rx: broadcast::Receiver<ShellHash>,
     sink: jsonrpsee::SubscriptionSink,
 ) {
-    let mut consecutive_lags: u32 = 0;
+    let mut lag_events: u32 = 0;
     loop {
         let event = tokio::select! {
             _ = sink.closed() => break,
@@ -661,7 +662,6 @@ async fn forward_pending_txs(
         };
         match event {
             Ok(tx_hash) => {
-                consecutive_lags = 0;
                 let value = serde_json::json!(tx_hash);
                 let Ok(msg) = SubscriptionMessage::from_json(&value) else {
                     tracing::error!("failed to serialize tx hash for subscription");
@@ -672,13 +672,13 @@ async fn forward_pending_txs(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                consecutive_lags += 1;
+                let disconnect = lag_limit_reached(&mut lag_events);
                 tracing::warn!(
                     skipped = n,
-                    consecutive_lags,
+                    lag_events,
                     "newPendingTransactions subscriber lagged"
                 );
-                if consecutive_lags >= MAX_CONSECUTIVE_LAGS {
+                if disconnect {
                     tracing::error!("newPendingTransactions subscriber too slow — disconnecting");
                     break;
                 }
@@ -704,7 +704,7 @@ async fn forward_syncing(
         return;
     }
 
-    let mut consecutive_lags: u32 = 0;
+    let mut lag_events: u32 = 0;
     loop {
         let event = tokio::select! {
             _ = sink.closed() => break,
@@ -712,7 +712,6 @@ async fn forward_syncing(
         };
         match event {
             Ok(status) => {
-                consecutive_lags = 0;
                 let value = sync_status_to_json(&status);
                 let Ok(msg) = SubscriptionMessage::from_json(&value) else {
                     tracing::error!("failed to serialize sync status for subscription");
@@ -723,9 +722,9 @@ async fn forward_syncing(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                consecutive_lags += 1;
-                tracing::warn!(skipped = n, consecutive_lags, "syncing subscriber lagged");
-                if consecutive_lags >= MAX_CONSECUTIVE_LAGS {
+                let disconnect = lag_limit_reached(&mut lag_events);
+                tracing::warn!(skipped = n, lag_events, "syncing subscriber lagged");
+                if disconnect {
                     tracing::error!("syncing subscriber too slow — disconnecting");
                     break;
                 }
@@ -1423,6 +1422,19 @@ mod tests {
         assert_eq!(tracker.active_count(), 1);
         assert!(tracker.try_acquire_for_connection(3));
         assert_eq!(tracker.active_count(), 2);
+    }
+
+    #[test]
+    fn subscription_lag_limit_accumulates_across_resumed_delivery() {
+        let mut lag_events = 0;
+
+        assert!(!lag_limit_reached(&mut lag_events));
+
+        // A successfully resumed delivery must not forgive an already skipped event.
+        assert!(!lag_limit_reached(&mut lag_events));
+        assert!(lag_limit_reached(&mut lag_events));
+
+        assert_eq!(lag_events, MAX_LAG_EVENTS);
     }
 
     // -------------------------------------------------------------------

@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Disconnect subscriptions after three cumulative lag events so successful
+  delivery between overruns cannot indefinitely mask repeated notification gaps.
 - Inspect the release binary in Cargo's configured target directory so custom
   `CARGO_TARGET_DIR` builds cannot validate or publish a stale default-path artifact.
 - Commit development snapshot rewinds in one storage batch so an I/O failure
