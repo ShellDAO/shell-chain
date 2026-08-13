@@ -1810,6 +1810,17 @@ impl<S: KvStore + 'static> Node<S> {
                 import_cs.put_pubkey(address, pubkey)?;
             }
         }
+        let settlement_hashes = block
+            .system_transactions
+            .iter()
+            .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+            .map(|tx| tx.hash());
+        for (amendment, settlement_tx_hash) in stark_settlements.iter().zip(settlement_hashes) {
+            import_cs.put_proof_amendments(Self::stark_artifacts(
+                amendment,
+                Some(settlement_tx_hash),
+            )?)?;
+        }
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
         // Commit to storage.
@@ -1817,21 +1828,6 @@ impl<S: KvStore + 'static> Node<S> {
         let block_hash = block.hash();
         algorithm_registry_rollback.commit();
         block_store.replace_world_state(committed_world_state);
-        let settlement_hashes: Vec<ShellHash> = block
-            .system_transactions
-            .iter()
-            .filter(|tx| tx.kind == SystemTxKind::StarkReward)
-            .map(|tx| tx.hash())
-            .collect();
-        for (amendment, settlement_tx_hash) in stark_settlements.iter().zip(settlement_hashes) {
-            let stored = self.store_stark_artifacts(amendment, Some(settlement_tx_hash))?;
-            debug!(
-                block = block.number(),
-                layer = amendment.layer,
-                stored,
-                "materialized canonical STARK proof artifacts from imported block"
-            );
-        }
         prover.record_settled_sources(&stark_settlements);
         prover.remove_settled_pending(&stark_settlements);
         self.feed_l2_scheduler_from_settlements(&stark_settlements, block.number());

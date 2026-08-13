@@ -524,6 +524,19 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             None
         };
+        let stage_artifacts = settled_stark_artifacts.iter().try_for_each(
+            |(amendment, settlement_tx_hash)| -> Result<(), NodeError> {
+                import_cs.put_proof_amendments(Self::stark_artifacts(
+                    amendment,
+                    Some(*settlement_tx_hash),
+                )?)?;
+                Ok(())
+            },
+        );
+        if let Err(err) = stage_artifacts {
+            prover.restore_pending_stark_settlements(drained_stark_settlements);
+            return Err(err);
+        }
         if let Err(err) = import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice())) {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
             return Err(err.into());
@@ -548,9 +561,6 @@ impl<S: KvStore + 'static> Node<S> {
             );
         }
         prover.record_accepted_settlements(settled_stark_proofs.len());
-        for (amendment, settlement_tx_hash) in &settled_stark_artifacts {
-            self.store_stark_artifacts(amendment, Some(*settlement_tx_hash))?;
-        }
         prover.record_settled_sources(&settled_stark_proofs);
         if !settled_stark_proofs.is_empty() {
             let l1_frontier = self

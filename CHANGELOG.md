@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Commit canonical STARK settlement artifacts atomically with produced and
+  imported blocks so an artifact write failure cannot publish a partial block.
 - Bound concurrent direct-message streams per peer connection by their
   aggregate payload budget so large requests cannot reserve memory using the
   count limit alone.

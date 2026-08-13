@@ -1890,6 +1890,7 @@ mod tests {
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
         fail_next_batch: AtomicBool,
+        fail_proof_batch: AtomicBool,
         fail_head_batch: AtomicBool,
     }
 
@@ -1900,12 +1901,17 @@ mod tests {
                 fail_next_get: AtomicBool::new(false),
                 fail_next_put: AtomicBool::new(false),
                 fail_next_batch: AtomicBool::new(false),
+                fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
             }
         }
 
         fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_proof_batch(&self) {
+            self.fail_proof_batch.store(true, Ordering::SeqCst);
         }
 
         fn fail_next_get(&self) {
@@ -1947,6 +1953,16 @@ mod tests {
         fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
             if self.fail_next_batch.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected batch failure".into()));
+            }
+            if self.fail_proof_batch.load(Ordering::SeqCst)
+                && batch.ops().iter().any(
+                    |op| matches!(op, WriteBatchOp::Put { key, .. } if key.starts_with(b"pa/")),
+                )
+            {
+                self.fail_proof_batch.store(false, Ordering::SeqCst);
+                return Err(StorageError::Database(
+                    "injected proof artifact batch failure".into(),
+                ));
             }
             if self.fail_head_batch.load(Ordering::SeqCst)
                 && batch.ops().iter().any(
@@ -5383,7 +5399,7 @@ mod tests {
         node.pending_stark_settlements
             .lock()
             .push(amendment.clone());
-        failing_db.fail_next_batch();
+        failing_db.fail_proof_batch();
         let err = node.produce_block(&signer, 100).unwrap_err();
         assert!(
             matches!(err, NodeError::Storage(_)),
@@ -5428,6 +5444,11 @@ mod tests {
             .settled_stark_sources
             .lock()
             .contains(&(amendment.layer, hashes[1])));
+        assert!(node
+            .pending_stark_settlements
+            .lock()
+            .iter()
+            .any(|pending| pending.block_hash == amendment.block_hash));
     }
 
     #[test]
