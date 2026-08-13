@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep the node event loop running when post-commit reorganization event
+  publication cannot load historical receipts.
 - Disconnect subscriptions after three cumulative lag events so successful
   delivery between overruns cannot indefinitely mask repeated notification gaps.
 - Inspect the release binary in Cargo's configured target directory so custom

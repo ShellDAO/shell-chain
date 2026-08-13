@@ -111,6 +111,30 @@ fn reorg_block_events<S: KvStore + 'static>(
     Ok(events)
 }
 
+fn publish_reorg_block_events<S: KvStore + 'static>(
+    chain_store: &ChainStore<S>,
+    plan: &ForkAdoptionPlan,
+    block_event_tx: &tokio::sync::broadcast::Sender<BlockEvent>,
+) {
+    match reorg_block_events(chain_store, plan) {
+        Ok(events) => {
+            for event in events {
+                if block_event_tx.send(event).is_err() {
+                    tracing::warn!("no active subscribers for reorg block events");
+                    break;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                preferred_hash = %plan.preferred_hash,
+                %error,
+                "failed to publish block events after committed fork adoption"
+            );
+        }
+    }
+}
+
 fn body_response_import_allowed(block_count: usize) -> bool {
     block_count > 0 && block_count <= crate::historical_sync::BODY_BACKFILL_BATCH_SIZE as usize
 }
@@ -760,14 +784,11 @@ impl<S: KvStore + 'static> Node<S> {
                                 match self.adopt_preferred_fork(&plan) {
                                     Ok(()) => {
                                         fork_adoption_retry.reset();
-                                        for event in reorg_block_events(&self.chain_store, &plan)? {
-                                            if block_event_tx.send(event).is_err() {
-                                                tracing::warn!(
-                                                    "no active subscribers for reorg block events"
-                                                );
-                                                break;
-                                            }
-                                        }
+                                        publish_reorg_block_events(
+                                            &self.chain_store,
+                                            &plan,
+                                            &block_event_tx,
+                                        );
                                     }
                                     Err(error) => {
                                         if let NodeError::InvalidFork {
@@ -3004,6 +3025,43 @@ mod cadence_tests {
                 (new_two.hash(), false),
             ]
         );
+    }
+
+    #[test]
+    fn committed_reorg_event_failure_does_not_escape_the_event_loop() {
+        let chain_store = ChainStore::new(Arc::new(MemoryDb::new()));
+        let ancestor = Block {
+            header: BlockHeader::default(),
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let mut old_block = ancestor.clone();
+        old_block.header.number = 1;
+        old_block.header.parent_hash = ancestor.hash();
+        old_block.header.timestamp = 1;
+        let mut new_block = old_block.clone();
+        new_block.header.timestamp = 2;
+        chain_store.put_receipts(&new_block.hash(), &[]).unwrap();
+
+        let plan = ForkAdoptionPlan {
+            preferred_hash: new_block.hash(),
+            preferred_number: 1,
+            canonical_number: 1,
+            ancestor_hash: ancestor.hash(),
+            ancestor_number: 0,
+            old_chain: vec![old_block],
+            new_chain: vec![new_block],
+            reverted_txs: vec![],
+        };
+        let (block_event_tx, mut block_event_rx) = tokio::sync::broadcast::channel(4);
+
+        publish_reorg_block_events(&chain_store, &plan, &block_event_tx);
+
+        assert!(matches!(
+            block_event_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
