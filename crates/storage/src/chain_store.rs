@@ -1657,6 +1657,7 @@ impl<S: KvStore> ChainStore<S> {
         let mut snapshot_chain_config = None;
         let mut snapshot_finalized_number = None;
         let mut snapshot_metadata_undo_pruned_finalized = None;
+        let mut snapshot_chain_totals_head = None;
         let mut snapshot_state_trie_pruned_below = None;
         let mut progress_keys = std::collections::HashSet::new();
         while let Some(entry) = snap_reader.next_entry()? {
@@ -1711,6 +1712,13 @@ impl<S: KvStore> ChainStore<S> {
                         )
                     })?;
                     snapshot_metadata_undo_pruned_finalized = Some(u64::from_be_bytes(encoded));
+                } else if entry.key == prefix::TOTALS_HEAD {
+                    let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
+                        StorageError::State(
+                            "snapshot chain progress metadata has invalid length".into(),
+                        )
+                    })?;
+                    snapshot_chain_totals_head = Some(u64::from_be_bytes(encoded));
                 } else if entry.key == prefix::STATE_TRIE_PRUNED_BELOW {
                     let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
                         StorageError::State(
@@ -1766,6 +1774,16 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot address metadata undo pruning cursor exceeds finalized height".into(),
+            ));
+        }
+        if snapshot_finalized_number.is_some_and(|number| number > metadata.block_number) {
+            return Err(StorageError::State(
+                "snapshot finalized height exceeds canonical head".into(),
+            ));
+        }
+        if snapshot_chain_totals_head.is_some_and(|number| number > metadata.block_number) {
+            return Err(StorageError::State(
+                "snapshot totals head exceeds canonical head".into(),
             ));
         }
         if snapshot_state_trie_pruned_below.unwrap_or(0) > metadata.block_number {
@@ -3970,6 +3988,70 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cursor exceeds finalized height"));
+        assert!(store.get(b"untrusted-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_finalized_height_beyond_head_before_writes() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            1,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(prefix::FINALIZED_NUMBER, &2u64.to_be_bytes())
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("finalized height exceeds canonical head"));
+        assert!(store.get(b"untrusted-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_totals_head_beyond_head_before_writes() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            1,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+            ShellHash::ZERO,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(prefix::TOTALS_HEAD, &2u64.to_be_bytes())
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("totals head exceeds canonical head"));
         assert!(store.get(b"untrusted-key").unwrap().is_none());
     }
 

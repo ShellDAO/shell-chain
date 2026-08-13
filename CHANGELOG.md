@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject snapshots whose finalized or aggregate-totals progress is ahead of
+  their canonical head before writing any imported entries.
 - Keep the node event loop running when post-commit reorganization event
   publication cannot load historical receipts.
 - Disconnect subscriptions after three cumulative lag events so successful
