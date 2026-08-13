@@ -6,6 +6,7 @@ const MAX_BLOCK_SYNC_RESPONSE_BLOCKS: usize = 128;
 const MAX_L1_BACKLOG_TASKS: usize = DEFAULT_MAX_L1_RANGE_SOURCES * 2;
 const FORK_ADOPTION_RETRY_BASE_SECS: u64 = 5;
 const FORK_ADOPTION_RETRY_MAX_SECS: u64 = 30;
+const BODY_BACKFILL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 struct ForkAdoptionRetry {
@@ -144,6 +145,13 @@ struct BodyRequestState {
     nonce: u64,
     start_number: u64,
     peer: Option<PeerId>,
+    requested_at: std::time::Instant,
+}
+
+impl BodyRequestState {
+    fn is_stale(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.requested_at) >= BODY_BACKFILL_REQUEST_TIMEOUT
+    }
 }
 
 fn body_response_matches_request(
@@ -609,6 +617,7 @@ impl<S: KvStore + 'static> Node<S> {
                             nonce,
                             start_number: 0,
                             peer: None,
+                            requested_at: std::time::Instant::now(),
                         });
                         info!(
                             oldest_available = oldest,
@@ -1937,6 +1946,7 @@ impl<S: KvStore + 'static> Node<S> {
                                                     nonce: next_nonce,
                                                     start_number: next,
                                                     peer: Some(peer.clone()),
+                                                    requested_at: std::time::Instant::now(),
                                                 });
                                             }
                                         } else {
@@ -2042,6 +2052,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         nonce,
                                         start_number: request.start_number,
                                         peer: Some(peer.clone()),
+                                        requested_at: std::time::Instant::now(),
                                     });
                                     info!(
                                         %peer,
@@ -2111,6 +2122,7 @@ impl<S: KvStore + 'static> Node<S> {
                                             nonce,
                                             start_number,
                                             peer: None,
+                                            requested_at: std::time::Instant::now(),
                                         });
                                         info!(
                                             start_number,
@@ -2242,6 +2254,45 @@ impl<S: KvStore + 'static> Node<S> {
 
                 _ = sync_retry_timer.tick() => {
                     let peers = network.peer_count().await;
+                    if let Some(request) = body_request
+                        .as_ref()
+                        .filter(|request| request.is_stale(std::time::Instant::now()))
+                        .cloned()
+                    {
+                        if peers == 0 {
+                            body_request = Some(BodyRequestState {
+                                peer: None,
+                                requested_at: std::time::Instant::now(),
+                                ..request
+                            });
+                            debug!(
+                                "L4: body back-fill request timed out while no peers were connected"
+                            );
+                        } else {
+                            let nonce = Self::wall_clock_millis()
+                                .max(request.nonce.saturating_add(1));
+                            if network
+                                .broadcast(NetworkMessage::BodyRequest {
+                                    start_number: request.start_number,
+                                    count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                    nonce,
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                body_request = Some(BodyRequestState {
+                                    nonce,
+                                    start_number: request.start_number,
+                                    peer: None,
+                                    requested_at: std::time::Instant::now(),
+                                });
+                                info!(
+                                    start_number = request.start_number,
+                                    "L4: retried timed-out historical body back-fill request"
+                                );
+                            }
+                        }
+                    }
                     if sync_requested {
                         if peers == 0 {
                             warn!(
@@ -3149,6 +3200,7 @@ mod cadence_tests {
             nonce: 7,
             start_number: 42,
             peer: Some(requested_peer.clone()),
+            requested_at: std::time::Instant::now(),
         };
 
         assert!(body_response_matches_request(
@@ -3207,6 +3259,7 @@ mod cadence_tests {
             nonce: 7,
             start_number: 42,
             peer: Some(disconnected.clone()),
+            requested_at: std::time::Instant::now(),
         });
 
         assert_eq!(
@@ -3223,6 +3276,7 @@ mod cadence_tests {
             nonce: 7,
             start_number: 42,
             peer: Some(requested.clone()),
+            requested_at: std::time::Instant::now(),
         });
 
         assert_eq!(
@@ -3230,6 +3284,22 @@ mod cadence_tests {
             None
         );
         assert_eq!(request.unwrap().peer, Some(requested));
+    }
+
+    #[test]
+    fn body_request_becomes_stale_at_timeout() {
+        let requested_at = std::time::Instant::now();
+        let request = BodyRequestState {
+            nonce: 7,
+            start_number: 42,
+            peer: Some(PeerId("requested".into())),
+            requested_at,
+        };
+
+        assert!(!request.is_stale(
+            requested_at + BODY_BACKFILL_REQUEST_TIMEOUT - std::time::Duration::from_millis(1),
+        ));
+        assert!(request.is_stale(requested_at + BODY_BACKFILL_REQUEST_TIMEOUT));
     }
 
     #[test]

@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Retry historical body back-fill requests after a response timeout so a
+  dropped peer message cannot stall recovery indefinitely.
 - Reject snapshots whose finalized or aggregate-totals progress is ahead of
   their canonical head before writing any imported entries.
 - Keep the node event loop running when post-commit reorganization event
