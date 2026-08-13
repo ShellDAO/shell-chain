@@ -344,7 +344,7 @@ impl ForkChoice {
 
     /// Re-evaluate head by scanning all scores. Use after bulk updates.
     pub fn recalculate_head(&mut self) {
-        if let Some((hash, score)) = self.scores.iter().max_by_key(|(_, s)| (*s).clone()) {
+        if let Some((hash, score)) = self.scores.iter().max_by(|(_, a), (_, b)| a.cmp(b)) {
             self.head = *hash;
             self.head_score = score.clone();
         }

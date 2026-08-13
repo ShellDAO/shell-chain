@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- Avoid cloning every fork-choice score while recalculating the canonical head.
+
 ### Fixed
 
 - Delete rejected STARK proof-range artifacts atomically so a storage failure

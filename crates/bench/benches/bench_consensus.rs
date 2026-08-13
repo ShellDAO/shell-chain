@@ -4,7 +4,7 @@
 /// Run with: `cargo bench --package shell-bench --bench bench_consensus`
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use shell_consensus::{
-    ConsensusEngine, PoaConfig, PoaEngine, ValidatorSet, ValidatorSetConfig, WPoaRound,
+    ConsensusEngine, ForkChoice, PoaConfig, PoaEngine, ValidatorSet, ValidatorSetConfig, WPoaRound,
 };
 use shell_core::{Block, BlockHeader};
 use shell_crypto::{DilithiumSigner, PQSignature, SignatureType, Signer};
@@ -139,10 +139,35 @@ fn bench_wpoa_quorum_commit(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fork_choice_recalculate_head(c: &mut Criterion) {
+    const BLOCK_COUNT: u64 = 10_000;
+    let genesis = ShellHash::from([0x11; 32]);
+    let mut fork_choice = ForkChoice::new(genesis);
+    let mut parent = genesis;
+    for number in 1..=BLOCK_COUNT {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&number.to_be_bytes());
+        let hash = ShellHash::from(bytes);
+        fork_choice.add_block(hash, parent, number, number % 100, true);
+        parent = hash;
+    }
+
+    let mut group = c.benchmark_group("fork_choice");
+    group.throughput(Throughput::Elements(BLOCK_COUNT));
+    group.bench_function("recalculate_head_10000", |b| {
+        b.iter(|| {
+            fork_choice.recalculate_head();
+            black_box(fork_choice.head());
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_poa_sign,
     bench_poa_proposer_selection,
-    bench_wpoa_quorum_commit
+    bench_wpoa_quorum_commit,
+    bench_fork_choice_recalculate_head
 );
 criterion_main!(benches);
