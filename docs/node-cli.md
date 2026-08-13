@@ -249,6 +249,9 @@ shell-node import-state --snapshot <PATH>
 `--block` may be used to assert the expected canonical head. Historical
 snapshots are not exported from a live chain database.
 
+Snapshot import requires a trusted local chain configuration and rejects a
+chain store that already has a canonical head.
+
 ---
 
 ### 2.10 `removedb`

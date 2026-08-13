@@ -736,7 +736,9 @@ shell-node --datadir shell-data import-state --snapshot snapshot.jsonl
 ```
 
 Import verifies the snapshot checksum, chain identity, canonical head, and
-non-empty head state trie before publishing the imported chain height.
+non-empty head state trie before publishing the imported chain height. The chain
+store must not already have a canonical head; initialize its trusted chain
+configuration, then import before syncing or producing blocks.
 
 **Remove the database:**
 

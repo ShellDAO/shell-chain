@@ -139,6 +139,11 @@ pub async fn checkpoint_sync<S: KvStore + 'static>(
             config.chain_id, expected_chain_id
         )));
     }
+    if chain_store.get_head_hash()?.is_some() {
+        return Err(NodeError::Startup(
+            "checkpoint sync requires a chain store without a canonical head".into(),
+        ));
+    }
 
     // Import the snapshot into the chain store.
     info!("Importing checkpoint snapshot...");
@@ -169,16 +174,12 @@ fn verify_imported_head<S: KvStore>(
     Ok(())
 }
 
-/// Check whether the chain is empty (no blocks beyond genesis).
+/// Check whether the chain store has no canonical head.
 ///
-/// Returns `true` if checkpoint sync should proceed: head block is
-/// either missing or is the genesis block (number == 0). Storage errors are
-/// returned so a damaged or unavailable chain store is never treated as empty.
+/// Storage errors are returned so a damaged or unavailable chain store is
+/// never treated as empty.
 pub fn should_checkpoint_sync<S: KvStore>(chain_store: &ChainStore<S>) -> Result<bool, NodeError> {
-    Ok(match chain_store.get_head_block()? {
-        Some(head) => head.number() == 0,
-        None => true,
-    })
+    Ok(chain_store.get_head_hash()?.is_none())
 }
 
 /// Download a file from `url` into an already-open exclusive file using `curl`.
@@ -325,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_checkpoint_sync_genesis_only() {
+    fn test_should_checkpoint_sync_rejects_genesis_head() {
         use shell_core::{Block, BlockHeader};
         use shell_primitives::{Address, Bytes};
 
@@ -363,8 +364,7 @@ mod tests {
         chain_store.set_canonical(0, &hash).unwrap();
         chain_store.set_head(&hash).unwrap();
 
-        // Genesis-only chain should still allow checkpoint sync.
-        assert!(should_checkpoint_sync(&chain_store).unwrap());
+        assert!(!should_checkpoint_sync(&chain_store).unwrap());
     }
 
     struct FailingReadStore;

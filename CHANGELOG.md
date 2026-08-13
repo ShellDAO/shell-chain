@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject snapshot imports into non-empty chain stores so older snapshots cannot
+  rewind canonical progress or merge stale destination records into the import.
 - Commit preferred-fork STARK proof artifacts atomically with the canonical
   reorganization so an artifact write failure cannot publish a partial fork.
 - Reject incomplete canonical log-query ranges instead of silently returning
