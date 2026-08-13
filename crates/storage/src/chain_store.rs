@@ -1624,9 +1624,8 @@ impl<S: KvStore> ChainStore<S> {
         metadata.validate_compatibility(chain_config.chain_id, &chain_config.genesis_hash)?;
 
         let mut snap_writer = crate::SnapshotWriter::new(writer, metadata)?;
-        for (key, value) in self.store.scan_all()? {
-            snap_writer.write_entry(&key, &value)?;
-        }
+        self.store
+            .visit_all(&mut |key, value| snap_writer.write_entry(key, value))?;
         snap_writer.finalize()
     }
 

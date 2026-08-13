@@ -21,7 +21,7 @@ pub use chain_store::{
     WitnessStore, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
 };
 pub use error::StorageError;
-pub use kv_store::{KvStore, WriteBatch, WriteBatchOp};
+pub use kv_store::{EntryVisitor, KvStore, WriteBatch, WriteBatchOp};
 pub use memory_db::MemoryDb;
 pub use merkle_trie::MerkleTrie;
 pub use overlay_store::OverlayStore;

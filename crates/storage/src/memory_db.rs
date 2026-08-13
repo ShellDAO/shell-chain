@@ -233,6 +233,28 @@ mod tests {
     }
 
     #[test]
+    fn visit_all_visits_entries_in_key_order() {
+        let db = MemoryDb::new();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"a", b"1").unwrap();
+
+        let mut entries = Vec::new();
+        db.visit_all(&mut |key, value| {
+            entries.push((key.to_vec(), value.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+    }
+
+    #[test]
     fn len_and_is_empty() {
         let db = MemoryDb::new();
         assert!(db.is_empty().unwrap());

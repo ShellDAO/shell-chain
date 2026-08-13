@@ -30,7 +30,7 @@ use rocksdb::{
     DBCompressionType, DBWithThreadMode, MultiThreaded, Options, WriteBatch as RocksWriteBatch,
 };
 
-use crate::kv_store::saturating_entry_len;
+use crate::kv_store::{saturating_entry_len, EntryVisitor};
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 
 /// Column family names used by shell-chain.
@@ -469,6 +469,15 @@ impl KvStore for RocksDbStore {
         }
         Ok(results)
     }
+
+    fn visit_all(&self, visitor: &mut EntryVisitor<'_>) -> Result<(), StorageError> {
+        let cf = self.cf();
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+            visitor(&key, &value)?;
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for RocksDbStore {
@@ -567,6 +576,29 @@ mod tests {
                 (b"a".to_vec(), b"1".to_vec()),
                 (b"b".to_vec(), b"2".to_vec()),
                 (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn visit_all_visits_entries_in_key_order() {
+        let (_dir, stores) = open_temp();
+        let s = &stores.chain;
+        s.put(b"b", b"2").unwrap();
+        s.put(b"a", b"1").unwrap();
+
+        let mut entries = Vec::new();
+        s.visit_all(&mut |key, value| {
+            entries.push((key.to_vec(), value.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
             ]
         );
     }

@@ -6,6 +6,8 @@ pub(crate) fn saturating_entry_len(key_len: usize, value_len: usize) -> u64 {
         .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
 }
 
+pub type EntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StorageError> + 'a;
+
 /// Operation in a write batch.
 #[derive(Debug, Clone)]
 pub enum WriteBatchOp {
@@ -114,6 +116,15 @@ pub trait KvStore: Send + Sync {
     #[allow(clippy::type_complexity)]
     fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         self.scan_prefix(&[])
+    }
+
+    /// Visit every entry in ascending key order without requiring the caller
+    /// to retain the complete store contents.
+    fn visit_all(&self, visitor: &mut EntryVisitor<'_>) -> Result<(), StorageError> {
+        for (key, value) in self.scan_all()? {
+            visitor(&key, &value)?;
+        }
+        Ok(())
     }
 }
 
