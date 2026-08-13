@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Commit development snapshot rewinds in one storage batch so an I/O failure
+  cannot partially roll back canonical indexes or chain progress.
 - Commit quorum-backed fork adoption and its finalized cursor atomically so a
   follow-up storage error cannot leave canonical state ahead of finality.
 - Avoid reporting removed logs from blocks that predate a polling filter while

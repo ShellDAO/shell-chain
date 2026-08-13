@@ -1530,29 +1530,17 @@ impl<S: KvStore + 'static> Node<S> {
             .chain_store
             .get_head_block()?
             .ok_or(NodeError::NoGenesis)?;
+        let mut removed_blocks = Vec::new();
+        let mut stale_canonical_numbers = Vec::new();
         if current_head.number() > snapshot.head_number {
             for number in (snapshot.head_number + 1)..=current_head.number() {
                 if let Some(block) = self.chain_store.get_block_by_number(number)? {
-                    self.chain_store
-                        .delete_block_transaction_indexes(&block.hash())?;
+                    removed_blocks.push(block);
                 }
-                self.chain_store.delete_canonical(number)?;
+                stale_canonical_numbers.push(number);
             }
         }
-
-        self.chain_store.set_head(&snapshot.head_hash)?;
-        self.chain_store
-            .set_total_tx_count(snapshot.total_tx_count)?;
-        self.chain_store
-            .set_total_gas_used(snapshot.total_gas_used)?;
-        self.chain_store
-            .set_chain_totals_head(snapshot.head_number)?;
-        self.chain_store
-            .set_finalized_number(snapshot.finalized_number)?;
-
         let restored_ws = WorldState::at_root(self.store.clone(), &snapshot.state_root)?;
-        *self.world_state.write() = restored_ws;
-
         let finalized_hash = if snapshot.finalized_number == 0 {
             ShellHash::ZERO
         } else {
@@ -1561,6 +1549,16 @@ impl<S: KvStore + 'static> Node<S> {
                 .map(|b| b.hash())
                 .unwrap_or(ShellHash::ZERO)
         };
+        self.chain_store.commit_canonical_rewind(
+            &removed_blocks,
+            &stale_canonical_numbers,
+            &snapshot.head_hash,
+            snapshot.total_tx_count,
+            snapshot.total_gas_used,
+            snapshot.finalized_number,
+        )?;
+
+        *self.world_state.write() = restored_ws;
         *self.finality.write() = if snapshot.finalized_number > 0 {
             shell_consensus::FinalityState::with_finalized(
                 snapshot.finalized_number,
@@ -4982,6 +4980,42 @@ mod tests {
         );
         assert!(!node.revert(&snapshot_1).unwrap());
         assert!(node.dev_state.read().snapshots.is_empty());
+    }
+
+    #[test]
+    fn dev_rpc_revert_storage_failure_preserves_canonical_progress() {
+        let (node, signer, db) = setup_failing_batch_node();
+        store_genesis(&node);
+        *node.runtime_signer.write() = Some(Arc::new(signer));
+
+        let snapshot_id = node.snapshot().unwrap();
+        node.mine_blocks(1).unwrap();
+        let head_before = node.chain_store.get_head_block().unwrap().unwrap();
+        let totals_before = node
+            .chain_store
+            .get_chain_totals(head_before.number())
+            .unwrap();
+
+        db.fail_next_batch();
+        assert!(node.revert(&snapshot_id).is_err());
+
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().hash(),
+            head_before.hash()
+        );
+        assert_eq!(
+            node.chain_store
+                .get_block_hash_by_number(head_before.number())
+                .unwrap(),
+            Some(head_before.hash())
+        );
+        assert_eq!(
+            node.chain_store
+                .get_chain_totals(head_before.number())
+                .unwrap(),
+            totals_before
+        );
+        assert!(node.dev_state.read().snapshots.contains_key(&1));
     }
 
     #[test]

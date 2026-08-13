@@ -582,6 +582,54 @@ impl<S: KvStore> ChainStore<S> {
         self.store.write_batch(batch)
     }
 
+    /// Atomically rewind canonical mappings, transaction indexes, and chain
+    /// progress to a previously captured canonical head.
+    pub fn commit_canonical_rewind(
+        &self,
+        removed_blocks: &[Block],
+        stale_canonical_numbers: &[u64],
+        new_head: &ShellHash,
+        total_tx_count: u64,
+        total_gas_used: U256,
+        finalized_number: u64,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        for block in removed_blocks {
+            let block_hash = block.hash();
+            let system_txs = self.get_system_transactions(&block_hash)?;
+            Self::append_delete_transaction_indexes(&mut batch, block, &system_txs);
+        }
+        for number in stale_canonical_numbers {
+            batch.delete(Self::number_key(*number));
+        }
+        batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        batch.put(
+            prefix::TOTAL_TX_COUNT.to_vec(),
+            total_tx_count.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            prefix::TOTAL_GAS_USED.to_vec(),
+            total_gas_used.to_be_bytes::<32>().to_vec(),
+        );
+        let new_head_number = self
+            .get_header_by_hash(new_head)?
+            .map(|header| header.number)
+            .ok_or_else(|| {
+                StorageError::InvalidInput(format!(
+                    "canonical rewind head header {new_head} is unavailable"
+                ))
+            })?;
+        batch.put(
+            prefix::TOTALS_HEAD.to_vec(),
+            new_head_number.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            prefix::FINALIZED_NUMBER.to_vec(),
+            finalized_number.to_be_bytes().to_vec(),
+        );
+        self.store.write_batch(batch)
+    }
+
     /// Atomically switch canonical mappings, transaction indexes, and HEAD to
     /// a prevalidated replacement chain.
     pub fn commit_reorg(
