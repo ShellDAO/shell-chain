@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_HOME="${HOME:?HOME must be set}"
 CARGO_HOME_PATH="${CARGO_HOME:-$BUILD_HOME/.cargo}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 SEPARATOR=$'\x1f'
 
 if [ -n "${RUSTFLAGS:-}" ]; then
@@ -36,9 +37,9 @@ BINARY_NAME="shell-node"
 case "$(uname -s)" in
     CYGWIN* | MINGW* | MSYS*) BINARY_NAME+=".exe" ;;
 esac
-BINARY="$PROJECT_DIR/target/release/$BINARY_NAME"
+BINARY="$TARGET_DIR/release/$BINARY_NAME"
 if [ ! -x "$BINARY" ]; then
-    echo "release binary not found: target/release/$BINARY_NAME" >&2
+    echo "release binary not found: $BINARY" >&2
     exit 1
 fi
 
@@ -49,4 +50,4 @@ for path in "$BUILD_HOME" "$CARGO_HOME_PATH" "$PROJECT_DIR"; do
     fi
 done
 
-echo "release binary: target/release/$BINARY_NAME"
+echo "release binary: $BINARY"

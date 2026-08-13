@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Inspect the release binary in Cargo's configured target directory so custom
+  `CARGO_TARGET_DIR` builds cannot validate or publish a stale default-path artifact.
 - Commit development snapshot rewinds in one storage batch so an I/O failure
   cannot partially roll back canonical indexes or chain progress.
 - Commit quorum-backed fork adoption and its finalized cursor atomically so a

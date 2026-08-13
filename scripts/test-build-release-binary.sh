@@ -22,13 +22,14 @@ cat > "$FIXTURE/bin/cargo" <<'EOF'
 set -euo pipefail
 printf '%s' "$CARGO_ENCODED_RUSTFLAGS" > "$CAPTURE_DIR/flags"
 printf '%s\n' "$@" > "$CAPTURE_DIR/args"
-mkdir -p target/release
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+mkdir -p "$TARGET_DIR/release"
 if [ -n "${FAKE_BINARY_CONTENT:-}" ]; then
-    printf '%s' "$FAKE_BINARY_CONTENT" > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+    printf '%s' "$FAKE_BINARY_CONTENT" > "$TARGET_DIR/release/shell-node${FAKE_EXE_SUFFIX:-}"
 else
-    printf '#!/usr/bin/env sh\nexit 0\n' > "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+    printf '#!/usr/bin/env sh\nexit 0\n' > "$TARGET_DIR/release/shell-node${FAKE_EXE_SUFFIX:-}"
 fi
-chmod +x "target/release/shell-node${FAKE_EXE_SUFFIX:-}"
+chmod +x "$TARGET_DIR/release/shell-node${FAKE_EXE_SUFFIX:-}"
 EOF
 chmod +x "$FIXTURE/bin/cargo"
 
@@ -55,6 +56,12 @@ grep -Fxq -- 'shell-node' "$CAPTURE_DIR/args"
 grep -Fxq 'rocksdb,libp2p' "$CAPTURE_DIR/args"
 grep -Fxq -- '--' "$CAPTURE_DIR/args"
 grep -Fxq -- '-Clink-arg=-Wl,-no_uuid' "$CAPTURE_DIR/args"
+
+CUSTOM_TARGET="$TMP_DIR/custom target"
+CARGO_TARGET_DIR="$CUSTOM_TARGET" FAKE_BINARY_CONTENT="$CUSTOM_TARGET/release-output" \
+HOME="$TMP_DIR/custom target home" PATH="$FIXTURE/bin:$PATH" CAPTURE_DIR="$CAPTURE_DIR" \
+    "$FIXTURE/scripts/build-release-binary.sh"
+grep -Fq "$CUSTOM_TARGET/release-output" "$CUSTOM_TARGET/release/shell-node"
 
 FAKE_UNAME=MINGW64_NT FAKE_EXE_SUFFIX=.exe \
 HOME="$TMP_DIR/windows home" PATH="$FIXTURE/bin:$PATH" CAPTURE_DIR="$CAPTURE_DIR" \
