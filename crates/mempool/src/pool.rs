@@ -146,7 +146,8 @@ impl TxPool {
         verifier: &V,
     ) -> Result<ShellHash, MempoolError> {
         // --- Stateless checks (before acquiring lock) ---
-        let tx_size = self.validate_stateless(&tx, world_state, chain_store, verifier)?;
+        let (tx_size, base_fee_per_gas) =
+            self.validate_stateless(&tx, world_state, chain_store, verifier)?;
 
         // --- Balance floor check (F-020) ---
         let sender = tx.sender();
@@ -297,7 +298,8 @@ impl TxPool {
         let (evicted_hashes, projected_bytes) = Self::capacity_evictions(
             &inner,
             initial_evictions,
-            -(priority_fee as i128),
+            miner_tip(tx.tx.max_fee_per_gas, priority_fee, base_fee_per_gas),
+            base_fee_per_gas,
             sender,
             nonce,
             tx_size,
@@ -672,7 +674,7 @@ impl TxPool {
         world_state: &mut WorldState<S>,
         chain_store: &ChainStore<S>,
         verifier: &V,
-    ) -> Result<usize, MempoolError> {
+    ) -> Result<(usize, u64), MempoolError> {
         // Chain ID
         if tx.tx.chain_id != self.config.chain_id {
             return Err(MempoolError::ChainIdMismatch {
@@ -681,6 +683,7 @@ impl TxPool {
             });
         }
 
+        let mut base_fee_per_gas = 0;
         if let Some(head_hash) = chain_store.get_head_hash().map_err(MempoolError::Storage)? {
             let head = chain_store
                 .get_header_by_hash(&head_hash)
@@ -688,6 +691,7 @@ impl TxPool {
                 .ok_or_else(|| {
                     MempoolError::InvalidTransaction("canonical head header is missing".into())
                 })?;
+            base_fee_per_gas = head.base_fee_per_gas;
             if tx.tx.gas_limit > head.gas_limit {
                 return Err(MempoolError::InvalidTransaction(format!(
                     "transaction gas limit {} exceeds block gas limit {}",
@@ -777,7 +781,7 @@ impl TxPool {
 
         validate_aa_tx(tx, world_state, chain_store, verifier)
             .map_err(|err| map_aa_validation_error(tx, err))?;
-        Ok(tx_size)
+        Ok((tx_size, base_fee_per_gas))
     }
 
     /// Remove a single entry from all indexes. Caller holds write lock.
@@ -806,13 +810,17 @@ impl TxPool {
 
     /// Plan lower-priority evictions until both count and byte limits fit.
     ///
+    /// Priority is the miner tip payable at the current base fee, matching
+    /// block candidate ordering rather than the transaction's advertised cap.
+    ///
     /// Selecting an entry also selects all later nonces from that sender so
     /// capacity pressure cannot leave an unexecutable nonce tail behind.
     #[allow(clippy::too_many_arguments)]
     fn capacity_evictions(
         inner: &PoolInner,
         mut evicted_hashes: HashSet<ShellHash>,
-        incoming_neg_priority_fee: i128,
+        incoming_effective_tip: u64,
+        base_fee_per_gas: u64,
         incoming_sender: Address,
         incoming_nonce: u64,
         incoming_size: usize,
@@ -825,8 +833,6 @@ impl TxPool {
             .fold(0usize, |total, entry| {
                 total.saturating_add(entry.serialized_size)
             });
-        let mut candidates = inner.by_priority.iter().rev();
-
         loop {
             let projected_count = inner
                 .by_hash
@@ -846,24 +852,27 @@ impl TxPool {
                 ));
             }
 
-            let mut candidate = None;
-            for (priority_key, hash) in candidates.by_ref() {
-                if evicted_hashes.contains(hash) {
-                    continue;
-                }
-                if incoming_neg_priority_fee >= priority_key.neg_priority_fee {
-                    break;
-                }
-
-                let Some(entry) = inner.by_hash.get(hash) else {
-                    continue;
-                };
-                if entry.tx.sender() == incoming_sender && entry.tx.tx.nonce <= incoming_nonce {
-                    continue;
-                }
-                candidate = Some(*hash);
-                break;
-            }
+            let candidate = inner
+                .by_priority
+                .iter()
+                .filter_map(|(priority_key, hash)| {
+                    if evicted_hashes.contains(hash) {
+                        return None;
+                    }
+                    let entry = inner.by_hash.get(hash)?;
+                    if entry.tx.sender() == incoming_sender && entry.tx.tx.nonce <= incoming_nonce {
+                        return None;
+                    }
+                    let effective_tip = miner_tip(
+                        entry.tx.tx.max_fee_per_gas,
+                        entry.tx.tx.max_priority_fee_per_gas,
+                        base_fee_per_gas,
+                    );
+                    Some((effective_tip, priority_key.seq, *hash))
+                })
+                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                .filter(|(effective_tip, _, _)| incoming_effective_tip > *effective_tip)
+                .map(|(_, _, hash)| hash);
 
             let Some(candidate) = candidate else {
                 return if count_fits {
@@ -2433,6 +2442,48 @@ mod tests {
 
         assert_eq!(pool.len(), 2);
         assert!(!pool.contains(&low_hash)); // evicted
+    }
+
+    #[test]
+    fn pool_full_evicts_by_effective_tip_at_current_base_fee() {
+        let config = MempoolConfig {
+            max_pool_size: 1,
+            ..make_config()
+        };
+        let pool = TxPool::new(config);
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        set_head(&cs, 30_000_000, 100);
+
+        let incumbent_signer = DilithiumSigner::generate();
+        let incumbent_pubkey = incumbent_signer.public_key().to_vec();
+        let incumbent = make_signed_value_tx_with_fees(
+            &incumbent_signer,
+            &incumbent_pubkey,
+            0,
+            101,
+            100,
+            U256::ZERO,
+        );
+        let incumbent_hash = incumbent.hash();
+        insert_rich(&pool, incumbent, &verifier, &mut ws, &cs).unwrap();
+
+        let incoming_signer = DilithiumSigner::generate();
+        let incoming_pubkey = incoming_signer.public_key().to_vec();
+        let incoming = make_signed_value_tx_with_fees(
+            &incoming_signer,
+            &incoming_pubkey,
+            0,
+            102,
+            2,
+            U256::ZERO,
+        );
+        let incoming_hash = incoming.hash();
+        insert_rich(&pool, incoming, &verifier, &mut ws, &cs).unwrap();
+
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.contains(&incumbent_hash));
+        assert!(pool.contains(&incoming_hash));
     }
 
     #[test]
