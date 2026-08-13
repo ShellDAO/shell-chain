@@ -3410,8 +3410,9 @@ mod tests {
         ws.set_account(&caller, &account_with_balance(1_000_000))
             .unwrap();
 
-        let code_hash = keccak256(b"default-validator");
-        cs.put_code(&code_hash, b"\x60\x00").unwrap();
+        let code = b"\x60\x00";
+        let code_hash = keccak256(code);
+        cs.put_code(&code_hash, code).unwrap();
 
         let calldata = encode_set_validation_code_calldata(&code_hash);
         let outcome = execute_system_contract_call(

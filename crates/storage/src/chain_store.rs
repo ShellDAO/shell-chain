@@ -1491,10 +1491,15 @@ impl<S: KvStore> ChainStore<S> {
 
     /// Store contract bytecode keyed by its hash.
     ///
-    /// The caller is responsible for computing `keccak256(code)` and passing
-    /// it as `code_hash`. The code can later be retrieved by hash via
-    /// [`get_code`].
+    /// The supplied key must equal `keccak256(code)`. The code can later be
+    /// retrieved by hash via [`get_code`].
     pub fn put_code(&self, code_hash: &ShellHash, code: &[u8]) -> Result<(), StorageError> {
+        let computed_hash = shell_primitives::keccak256(code);
+        if computed_hash != *code_hash {
+            return Err(StorageError::InvalidInput(format!(
+                "contract code hash mismatch: expected {code_hash}, computed {computed_hash}"
+            )));
+        }
         self.store.put(&Self::code_key(code_hash), code)
     }
 
@@ -1744,6 +1749,16 @@ impl<S: KvStore> ChainStore<S> {
                     ));
                 }
                 snapshot_chain_config = Some(config);
+            } else if let Some(encoded_hash) = entry.key.strip_prefix(prefix::CODE_BY_HASH) {
+                let code_hash = ShellHash::try_from_slice(encoded_hash).map_err(|_| {
+                    StorageError::State("snapshot contract code key has invalid length".into())
+                })?;
+                let computed_hash = shell_primitives::keccak256(&entry.value);
+                if computed_hash != code_hash {
+                    return Err(StorageError::State(format!(
+                        "snapshot contract code hash mismatch: expected {code_hash}, computed {computed_hash}"
+                    )));
+                }
             }
         }
 
@@ -3306,6 +3321,21 @@ mod tests {
     }
 
     #[test]
+    fn code_storage_rejects_mismatched_hash_without_writing() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store);
+        let code = b"\x60\x80\x60\x40\x52";
+        let wrong_hash = shell_primitives::keccak256(b"different code");
+
+        let error = cs.put_code(&wrong_hash, code).unwrap_err();
+
+        assert!(
+            matches!(error, StorageError::InvalidInput(message) if message.contains("contract code hash mismatch"))
+        );
+        assert!(cs.get_code(&wrong_hash).unwrap().is_none());
+    }
+
+    #[test]
     fn pubkey_registry_roundtrip() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(store);
@@ -3716,6 +3746,57 @@ mod tests {
         // Verify data was written
         assert_eq!(store.get(b"test-key-1").unwrap(), Some(b"value-1".to_vec()));
         assert_eq!(store.get(b"test-key-2").unwrap(), Some(b"value-2".to_vec()));
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_mismatched_code_hash_before_writes() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let block = empty_block(0);
+        let block_hash = block.hash();
+        let wrong_code_hash = shell_primitives::keccak256(b"different code");
+        let code_key = ChainStore::<MemoryDb>::code_key(&wrong_code_hash);
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            block.number(),
+            block_hash,
+            block.header.state_root,
+            ShellHash::default(),
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, block_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&block_hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            write_snapshot_body(&mut writer, &block);
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(block.number()),
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer.write_entry(&code_key, b"\x60\x00").unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::default())
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("snapshot contract code hash mismatch"));
+        assert!(store.get(b"untrusted-key").unwrap().is_none());
+        assert!(store.get(&code_key).unwrap().is_none());
     }
 
     #[test]

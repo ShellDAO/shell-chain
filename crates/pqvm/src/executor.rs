@@ -943,7 +943,7 @@ fn do_commit_state<S: KvStore + 'static>(
 
         // Store deployed contract bytecode.
         if let Some(code) = &info.code {
-            let code_bytes = code.bytes_slice();
+            let code_bytes = code.original_byte_slice();
             if !code_bytes.is_empty() && info.code_hash != KECCAK_EMPTY {
                 let code_hash = ShellHash::from(info.code_hash);
                 chain_store.put_code(&code_hash, code_bytes)?;
