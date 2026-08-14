@@ -1,6 +1,7 @@
 //! Core transaction pool implementation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -22,6 +23,29 @@ use crate::{MempoolConfig, MempoolError};
 /// Protects against oversized SPHINCS+ signatures (~49 KB) and large
 /// access lists flooding the pool.
 pub const MAX_TX_SIZE: usize = 128 * 1024;
+
+#[derive(Default)]
+struct SerializedSizeCounter(usize);
+
+impl Write for SerializedSizeCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("serialized transaction size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_transaction_size(tx: &SignedTransaction) -> serde_json::Result<usize> {
+    let mut counter = SerializedSizeCounter::default();
+    serde_json::to_writer(&mut counter, tx)?;
+    Ok(counter.0)
+}
 
 /// Thread-safe transaction pool.
 ///
@@ -772,7 +796,7 @@ impl TxPool {
 
         // Per-tx serialized size limit — protects against oversized PQ
         // signatures and access lists.
-        let tx_size = serde_json::to_vec(tx).map(|v| v.len()).map_err(|e| {
+        let tx_size = serialized_transaction_size(tx).map_err(|e| {
             MempoolError::InvalidTransaction(format!("tx serialization failed: {e}"))
         })?;
         if tx_size > MAX_TX_SIZE {
@@ -2733,6 +2757,16 @@ mod tests {
         assert_eq!(pool.size_bytes(), tx2_size);
         pool.clear();
         assert_eq!(pool.size_bytes(), 0);
+    }
+
+    #[test]
+    fn streamed_transaction_size_matches_json_encoding() {
+        let tx = make_signed_tx_with_data(100, 4096);
+
+        assert_eq!(
+            serialized_transaction_size(&tx).unwrap(),
+            serde_json::to_vec(&tx).unwrap().len()
+        );
     }
 
     #[test]

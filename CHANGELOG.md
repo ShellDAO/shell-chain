@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- Count serialized mempool transaction bytes without allocating and discarding
+  a full JSON buffer during every admission attempt.
 - Reuse validated reorganization blocks during commit preparation instead of
   loading every old and replacement block from storage twice.
 - Avoid cloning every fork-choice score while recalculating the canonical head.
