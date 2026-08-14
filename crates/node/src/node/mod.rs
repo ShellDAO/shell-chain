@@ -4387,7 +4387,8 @@ mod tests {
         store_genesis(&node);
 
         let (signer, addr, pubkey) = make_stark_account(&node);
-        let tx = make_embedded_tx(&signer, addr, pubkey, 0, 1);
+        let nonce = node.world_state.read().get_nonce(&addr).unwrap();
+        let tx = make_embedded_tx(&signer, addr, pubkey, nonce, 1);
         let verifier = MultiVerifier;
         {
             let mut world_state = node.world_state.write();
