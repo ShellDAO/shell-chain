@@ -166,6 +166,34 @@ impl<S: KvStore + 'static> Node<S> {
         ))
     }
 
+    fn canonical_l1_source_size(
+        &self,
+        source_hash: &ShellHash,
+        source_block: &Block,
+        entry_count: usize,
+    ) -> Result<u64, NodeError> {
+        if entry_count == 0 {
+            return Ok(0);
+        }
+        if let Some(size) = self.witness_store.bundle_size(source_hash)? {
+            return Ok(size);
+        }
+
+        let (_, witness_bundle) = shell_core::StrippedBlock::split(source_block);
+        if !witness_bundle.is_empty()
+            && witness_bundle
+                .witnesses
+                .iter()
+                .all(|witness| !witness.signature.data.is_empty())
+        {
+            return Ok(alloy_rlp::encode(&witness_bundle).len() as u64);
+        }
+
+        Err(NodeError::Startup(format!(
+            "STARK proof binding: canonical source size for {source_hash} is unavailable"
+        )))
+    }
+
     /// Cryptographically verify that a [`ProofAmendment`] is bound to the
     /// canonical source entries it claims to cover.
     ///
@@ -228,6 +256,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Reconstruct canonical entries from all covered source blocks.
         let covered = amendment.covered_hashes();
         let mut all_entries: Vec<shell_stark_prover::prover::SigBatchEntry> = Vec::new();
+        let mut canonical_original_size = 0u64;
         for source_hash in &covered {
             let block = self
                 .chain_store
@@ -237,7 +266,19 @@ impl<S: KvStore + 'static> Node<S> {
                         "STARK proof binding: source block {source_hash} not found"
                     ))
                 })?;
-            all_entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+            let entries = stark_sources::block_to_sig_batch_entries(&block);
+            canonical_original_size = canonical_original_size.saturating_add(
+                self.canonical_l1_source_size(source_hash, &block, entries.len())?,
+            );
+            all_entries.extend(entries);
+        }
+
+        if amendment.original_size != Some(canonical_original_size) {
+            self.metrics.stark_settlements_rejected.inc();
+            return Err(NodeError::Startup(format!(
+                "STARK proof original_size {:?} does not match canonical source size {}",
+                amendment.original_size, canonical_original_size
+            )));
         }
 
         // Check 1: declared n_sigs must match the actual canonical entry count.

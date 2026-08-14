@@ -4358,6 +4358,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_binding_rejects_inflated_original_size_for_empty_range() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let genesis_hash = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .expect("genesis hash");
+        let hashes = produce_witnessed_blocks(&node, &signer, 1);
+        let mut amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0]], 1);
+        amendment.original_size = Some(u64::MAX);
+        amendment
+            .sign_prover_authentication(&signer)
+            .expect("sign inflated amendment");
+
+        let error = node
+            .validate_stark_proof_source_binding(&amendment)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("original_size"));
+    }
+
+    #[test]
+    fn source_binding_rejects_inflated_original_size_for_non_empty_range() {
+        let (node, proposer_signer) = setup_node();
+        store_genesis(&node);
+
+        let (signer, addr, pubkey) = make_stark_account(&node);
+        let tx = make_embedded_tx(&signer, addr, pubkey, 0, 1);
+        let verifier = MultiVerifier;
+        {
+            let mut world_state = node.world_state.write();
+            node.tx_pool
+                .insert(tx, &mut world_state, node.chain_store.as_ref(), &verifier)
+                .unwrap();
+        }
+        let block = node.produce_block(&proposer_signer, 1).unwrap();
+        let source_hash = block.hash();
+        let entries = stark_sources::block_to_sig_batch_entries(&block);
+        let canonical_size = node
+            .witness_store
+            .bundle_size(&source_hash)
+            .unwrap()
+            .expect("source witness size");
+        let proof = shell_stark_prover::prove_sig_batch(&entries).unwrap();
+        let mut amendment = ProofAmendment {
+            version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+            block_hash: source_hash,
+            block_number: 1,
+            start_block: Some(1),
+            proof,
+            prover: Address::ZERO,
+            prover_signature: Bytes::new(),
+            layer: 1,
+            source_hashes: vec![source_hash],
+            original_size: Some(canonical_size.saturating_add(1)),
+            compressed_size: None,
+            settlement_tx_hash: None,
+        };
+        amendment
+            .sign_prover_authentication(&signer)
+            .expect("sign inflated amendment");
+
+        let error = node
+            .validate_stark_proof_source_binding(&amendment)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("original_size"));
+    }
+
     /// The ordering validator must reject an amendment whose `source_hashes`
     /// skips a canonical empty block (i.e., the declared range is not contiguous
     /// with the actual canonical chain).
