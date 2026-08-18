@@ -15,6 +15,48 @@ fi
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+require_regular_file() {
+  local path="$1"
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    echo "$path must be a regular file, not a symlink" >&2
+    exit 1
+  fi
+}
+
+require_regular_directory() {
+  local path="$1"
+  if [[ ! -d "$path" || -L "$path" ]]; then
+    echo "$path must be a directory, not a symlink" >&2
+    exit 1
+  fi
+}
+
+require_safe_output() {
+  local path="$1"
+  if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+    echo "$path must be a regular file or absent, not a symlink" >&2
+    exit 1
+  fi
+}
+
+require_regular_directory "$(dirname "$CONTRACT")"
+require_regular_directory "$(dirname "$TOOL_DIR")"
+require_regular_file "$CONTRACT"
+require_regular_directory "$TOOL_DIR"
+require_regular_file "$TOOL_DIR/package.json"
+require_regular_file "$TOOL_DIR/package-lock.json"
+if [[ -L "$TOOL_DIR/node_modules" ]]; then
+  echo "$TOOL_DIR/node_modules must not be a symlink" >&2
+  exit 1
+fi
+if [[ "$mode" == "--check" ]]; then
+  require_regular_file "$ABI"
+  require_regular_file "$RUNTIME"
+else
+  require_safe_output "$ABI"
+  require_safe_output "$RUNTIME"
+fi
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 

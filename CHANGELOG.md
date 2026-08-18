@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject symlinked validator artifact inputs, outputs, and compiler directories
+  before local regeneration or CI verification can follow them.
 - Keep circuit-relay server capacity disabled unless explicitly enabled,
   independently of relay-client NAT traversal.
 - Reject state-trie pruning cursors that advance beyond finality during

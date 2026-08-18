@@ -32,6 +32,8 @@ jobs:
         run: scripts/test-cli-git-hash-watch.sh
       - name: Check Dockerfile base image pins
         run: scripts/check-dockerfile-base-pins.sh
+      - name: Test DefaultPQValidator artifact paths
+        run: scripts/test-default-pq-validator-artifacts.sh
       - name: Check DefaultPQValidator artifacts
         run: scripts/default-pq-validator-artifacts.sh --check
       - name: Check workspace lockfile
