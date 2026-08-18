@@ -1222,14 +1222,14 @@ impl<S: KvStore + 'static> Node<S> {
             .ok_or(NodeError::NoGenesis)?;
         let canonical_number = canonical_head.number();
         let canonical_hash = canonical_head.hash();
-        let (
-            preferred_hash,
-            preferred_number,
-            attested_weight,
-            ancestor_hash,
-            old_hashes,
-            new_hashes,
-        ) = {
+        let total_weight = self
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let (preferred_hash, preferred_number, ancestor_hash, old_hashes, new_hashes) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
             let score = fork_choice.score(&preferred_hash).ok_or_else(|| {
@@ -1237,7 +1237,10 @@ impl<S: KvStore + 'static> Node<S> {
                     "fork-choice preferred block {preferred_hash} has no score"
                 ))
             })?;
-            if preferred_hash == canonical_hash || score.block_number <= canonical_number {
+            if preferred_hash == canonical_hash || score.block_number < canonical_number {
+                return Ok(None);
+            }
+            if !FinalityState::has_weighted_quorum(score.attested_weight, total_weight) {
                 return Ok(None);
             }
             let ancestor_hash = fork_choice
@@ -1250,7 +1253,6 @@ impl<S: KvStore + 'static> Node<S> {
             (
                 preferred_hash,
                 score.block_number,
-                score.attested_weight,
                 ancestor_hash,
                 fork_choice.chain_between(&canonical_hash, &ancestor_hash),
                 fork_choice.chain_between(&preferred_hash, &ancestor_hash),
@@ -1274,16 +1276,6 @@ impl<S: KvStore + 'static> Node<S> {
             return Err(NodeError::Startup(format!(
                 "fork-choice paths disagree on common ancestor {ancestor_hash} at #{ancestor_number}"
             )));
-        }
-        let total_weight = self
-            .consensus
-            .read()
-            .validator_weights()
-            .values()
-            .copied()
-            .fold(0u64, u64::saturating_add);
-        if !FinalityState::has_weighted_quorum(attested_weight, total_weight) {
-            return Ok(None);
         }
         let (finalized_number, finalized_hash) = {
             let finality = self.finality.read();
@@ -2632,6 +2624,55 @@ mod tests {
         assert!(finalized_error
             .to_string()
             .contains("crosses finalized block"));
+    }
+
+    #[test]
+    fn quorum_preferred_same_height_fork_is_adopted() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+
+        let canonical = make_block_at_1(&node, &signer, None);
+        let canonical_hash = canonical.hash();
+        node.import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+
+        let mut side = canonical;
+        side.header.timestamp += 1;
+        side.proposer_seal = Some(
+            signer
+                .sign(side.header.hash().as_bytes())
+                .expect("sign side block"),
+        );
+        let side_hash = side.hash();
+        node.import_block(side.clone(), &MultiVerifier).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_hash, total_weight);
+
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("same-height fork should become preferred");
+        assert_eq!(
+            plan.old_chain.iter().map(Block::hash).collect::<Vec<_>>(),
+            vec![canonical_hash]
+        );
+        assert_eq!(plan.new_chain, vec![side]);
+
+        node.adopt_preferred_fork(&plan).unwrap();
+
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(side_hash));
+        assert!(node.preferred_fork_plan().unwrap().is_none());
     }
 
     #[test]
