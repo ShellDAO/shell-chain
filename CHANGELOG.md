@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file.
 - Increase canonical total supply whenever a STARK settlement mints its reward.
 - Require release publication checks to find a versioned node archive and
   checksum manifest instead of accepting any unrelated downloadable asset.
+- Verify every published node archive against its `SHA256SUMS` entry instead
+  of trusting the presence of a checksum manifest by name alone.
 - Avoid allocating complete encoded witness bundles when only their canonical
   RLP length is needed for STARK source-size accounting.
 - Keep canonical signature-algorithm governance changes from rejecting valid

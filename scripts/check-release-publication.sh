@@ -41,18 +41,20 @@ if [ "$REMOTE_TAG_COMMIT" != "$RELEASE_COMMIT" ]; then
 fi
 
 RELEASE_FILE=$(mktemp)
-trap 'rm -f "$RELEASE_FILE"' EXIT
+ARCHIVE_LIST=$(mktemp)
+ASSET_DIR=$(mktemp -d)
+trap 'rm -f "$RELEASE_FILE" "$ARCHIVE_LIST"; rm -rf "$ASSET_DIR"' EXIT
 if ! "$GH_BIN" api \
     -H 'Accept: application/vnd.github+json' \
     "/repos/ShellDAO/shell-chain/releases/tags/${TAG}" > "$RELEASE_FILE"; then
     fail "could not load the GitHub release for '${TAG}'"
 fi
 
-python3 - "$TAG" "$RELEASE_FILE" <<'PY'
+python3 - "$TAG" "$RELEASE_FILE" "$ARCHIVE_LIST" <<'PY'
 import json
 import sys
 
-tag, path = sys.argv[1:]
+tag, path, archive_list_path = sys.argv[1:]
 try:
     with open(path, encoding="utf-8") as source:
         release = json.load(source)
@@ -95,10 +97,12 @@ else:
             errors.append(f"release asset '{name}' has no download URL")
 
     archive_prefix = f"shell-node-{tag}-"
-    if not any(
-        name.startswith(archive_prefix) and name.endswith(".tar.gz")
+    archive_names = sorted(
+        name
         for name in asset_names
-    ):
+        if name.startswith(archive_prefix) and name.endswith(".tar.gz")
+    )
+    if not archive_names:
         errors.append("release has no versioned shell-node archive")
     if "SHA256SUMS" not in asset_names:
         errors.append("release has no SHA256SUMS manifest")
@@ -108,5 +112,86 @@ if errors:
         print(f"release publication check failed: {error}", file=sys.stderr)
     raise SystemExit(1)
 
-print(f"published GitHub release verified for {tag}: {release['html_url']}")
+with open(archive_list_path, "w", encoding="utf-8") as destination:
+    destination.writelines(f"{name}\n" for name in archive_names)
 PY
+
+DOWNLOAD_ARGS=(
+    release download "$TAG"
+    --repo ShellDAO/shell-chain
+    --dir "$ASSET_DIR"
+    --pattern SHA256SUMS
+)
+while IFS= read -r archive_name; do
+    DOWNLOAD_ARGS+=(--pattern "$archive_name")
+done < "$ARCHIVE_LIST"
+if ! "$GH_BIN" "${DOWNLOAD_ARGS[@]}"; then
+    fail "could not download release archives and checksum manifest"
+fi
+
+python3 - "$ASSET_DIR" "$ARCHIVE_LIST" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+
+asset_dir = pathlib.Path(sys.argv[1])
+archive_list_path = pathlib.Path(sys.argv[2])
+archive_names = archive_list_path.read_text(encoding="utf-8").splitlines()
+manifest_path = asset_dir / "SHA256SUMS"
+
+try:
+    manifest_lines = manifest_path.read_text(encoding="utf-8").splitlines()
+except OSError as error:
+    print(
+        f"release publication check failed: could not read SHA256SUMS: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+checksums = {}
+for line_number, line in enumerate(manifest_lines, start=1):
+    if not line.strip():
+        continue
+    match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)", line)
+    if match is None:
+        print(
+            f"release publication check failed: malformed SHA256SUMS line {line_number}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    digest, name = match.groups()
+    if name in checksums:
+        print(
+            f"release publication check failed: duplicate SHA256SUMS entry for '{name}'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    checksums[name] = digest.lower()
+
+for name in archive_names:
+    expected = checksums.get(name)
+    if expected is None:
+        print(
+            f"release publication check failed: SHA256SUMS does not cover '{name}'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    try:
+        archive = asset_dir / name
+        actual = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+    except OSError as error:
+        print(
+            f"release publication check failed: could not read release asset '{name}': {error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if actual != expected:
+        print(
+            f"release publication check failed: checksum mismatch for release asset '{name}'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+
+echo "published GitHub release verified for ${TAG}: https://github.com/ShellDAO/shell-chain/releases/tag/${TAG}"

@@ -110,7 +110,35 @@ chmod +x "$PUBLICATION_HELPER/check-release-remote.sh"
 FAKE_PUBLICATION_GH="$TMP_DIR/fake-publication-gh"
 cat > "$FAKE_PUBLICATION_GH" <<'EOF'
 #!/usr/bin/env bash
-cat "$RELEASE_FIXTURE"
+set -euo pipefail
+if [ "${1:-}" = "api" ]; then
+    cat "$RELEASE_FIXTURE"
+    exit 0
+fi
+if [ "${1:-}" != "release" ] || [ "${2:-}" != "download" ]; then
+    exit 1
+fi
+shift 2
+destination=
+patterns=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dir)
+            destination=$2
+            shift 2
+            ;;
+        --pattern)
+            patterns+=("$2")
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+for pattern in "${patterns[@]}"; do
+    cp "$RELEASE_ASSET_FIXTURE/$pattern" "$destination/$pattern"
+done
 EOF
 chmod +x "$FAKE_PUBLICATION_GH"
 
@@ -128,13 +156,42 @@ git -C "$PUBLICATION_FIXTURE" push -q -u canonical main
 PUBLICATION_COMMIT=$(git -C "$PUBLICATION_FIXTURE" rev-parse HEAD)
 git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9 -m "publication fixture"
 git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9
+RELEASE_ASSET_FIXTURE="$TMP_DIR/release-assets"
+mkdir -p "$RELEASE_ASSET_FIXTURE"
+printf 'stable release archive\n' \
+    > "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz"
+python3 - "$RELEASE_ASSET_FIXTURE" v0.27.9 <<'PY'
+import hashlib
+import pathlib
+import sys
+
+asset_dir = pathlib.Path(sys.argv[1])
+tag = sys.argv[2]
+archive = asset_dir / f"shell-node-{tag}-x86_64-unknown-linux-gnu.tar.gz"
+digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+(asset_dir / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+PY
 cat > "$TMP_DIR/release.json" <<'EOF'
 {"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[{"name":"shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz"},{"name":"SHA256SUMS","state":"uploaded","size":128,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/SHA256SUMS"}]}
 EOF
 (cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
     RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    RELEASE_ASSET_FIXTURE="$RELEASE_ASSET_FIXTURE" \
     "$PUBLICATION_HELPER/check-release-publication.sh" \
     canonical v0.27.9 "$PUBLICATION_COMMIT" >/dev/null)
+
+printf 'tampered release archive\n' \
+    > "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz"
+if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
+    GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    RELEASE_ASSET_FIXTURE="$RELEASE_ASSET_FIXTURE" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" 2>&1); then
+    fail "release publication check unexpectedly accepted a checksum mismatch"
+fi
+if ! grep -Fq "checksum mismatch for release asset" <<<"$PUBLICATION_OUTPUT"; then
+    fail "release checksum rejection was not specific: $PUBLICATION_OUTPUT"
+fi
 cat > "$TMP_DIR/release.json" <<'EOF'
 {"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[]}
 EOF
@@ -206,11 +263,26 @@ fi
 
 git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9-rc.1 -m "prerelease publication fixture"
 git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9-rc.1
+rm -f "$RELEASE_ASSET_FIXTURE"/*
+printf 'prerelease archive\n' \
+    > "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-rc.1-x86_64-unknown-linux-gnu.tar.gz"
+python3 - "$RELEASE_ASSET_FIXTURE" v0.27.9-rc.1 <<'PY'
+import hashlib
+import pathlib
+import sys
+
+asset_dir = pathlib.Path(sys.argv[1])
+tag = sys.argv[2]
+archive = asset_dir / f"shell-node-{tag}-x86_64-unknown-linux-gnu.tar.gz"
+digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+(asset_dir / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+PY
 cat > "$TMP_DIR/release.json" <<'EOF'
 {"tag_name":"v0.27.9-rc.1","draft":false,"prerelease":true,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9-rc.1","assets":[{"name":"shell-node-v0.27.9-rc.1-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9-rc.1/shell-node-v0.27.9-rc.1-x86_64-unknown-linux-gnu.tar.gz"},{"name":"SHA256SUMS","state":"uploaded","size":128,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9-rc.1/SHA256SUMS"}]}
 EOF
 (cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
     RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    RELEASE_ASSET_FIXTURE="$RELEASE_ASSET_FIXTURE" \
     "$PUBLICATION_HELPER/check-release-publication.sh" \
     canonical v0.27.9-rc.1 "$PUBLICATION_COMMIT" >/dev/null)
 
