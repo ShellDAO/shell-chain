@@ -4098,6 +4098,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_logs_rejects_noncontiguous_canonical_snapshot() {
+        let handler = setup();
+        let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
+        store_block_with_logs_on_parent(
+            &handler,
+            1,
+            ShellHash::from_slice(&[0x99; 32]),
+            1,
+            vec![vec![]],
+        );
+        let raw: crate::filter::RawLogFilter =
+            serde_json::from_str(r#"{"fromBlock":"0x0","toBlock":"0x1"}"#).unwrap();
+
+        let err = EthApiServer::get_logs(&handler, raw).await.unwrap_err();
+
+        assert_eq!(err.code(), -32603);
+        assert_eq!(err.message(), "Internal server error");
+        assert_eq!(
+            handler.chain_store.get_block_hash_by_number(0).unwrap(),
+            Some(genesis_hash)
+        );
+    }
+
+    #[tokio::test]
     async fn get_logs_ignores_requested_blocks_above_head() {
         let handler = setup();
         store_block_with_logs(&handler, 0, vec![vec![]]);

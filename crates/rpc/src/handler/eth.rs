@@ -946,6 +946,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         }
 
         let mut results = Vec::new();
+        let mut expected_parent = None;
 
         for block_num in from..=to {
             let block = match self
@@ -961,13 +962,20 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     )));
                 }
             };
+            if let Some(expected_parent) = expected_parent {
+                if block.header.parent_hash != expected_parent {
+                    return Err(internal_err(format!(
+                        "canonical block {block_num} changed during log query"
+                    )));
+                }
+            }
 
             // Fast path: check block-level bloom filter.
+            let block_hash = block.hash();
+            expected_parent = Some(block_hash);
             if !filter.matches_bloom(block.header.logs_bloom.as_ref()) {
                 continue;
             }
-
-            let block_hash = block.hash();
 
             let receipts = match self
                 .chain_store
