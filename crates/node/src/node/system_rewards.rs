@@ -129,6 +129,19 @@ impl<S: KvStore + 'static> Node<S> {
         ))
     }
 
+    pub(crate) fn apply_stark_mint<T: KvStore + 'static>(
+        world_state: &mut WorldState<T>,
+        reward_tx: &SystemTransaction,
+    ) -> Result<(), NodeError> {
+        let total_supply = world_state.get_total_supply()?;
+        let updated_supply = total_supply
+            .checked_add(reward_tx.value)
+            .ok_or_else(|| NodeError::Startup("STARK reward mint overflows total supply".into()))?;
+        world_state.add_balance(&reward_tx.to, reward_tx.value)?;
+        world_state.set_total_supply(updated_supply)?;
+        Ok(())
+    }
+
     pub(crate) fn stark_source_original_size(
         &self,
         source_hash: &ShellHash,

@@ -418,9 +418,7 @@ impl<S: KvStore + 'static> Node<S> {
                     continue;
                 }
             };
-            evm.state_db_mut()
-                .world_state_mut()
-                .add_balance(&reward_tx.to, reward_tx.value)?;
+            Self::apply_stark_mint(evm.state_db_mut().world_state_mut(), &reward_tx)?;
             receipts.push(TransactionReceipt {
                 tx_hash: reward_tx.hash(),
                 block_number: next_number,

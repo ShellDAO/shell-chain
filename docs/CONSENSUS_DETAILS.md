@@ -68,6 +68,8 @@ For normal transaction blocks, the reward rules are:
   (where `source_count` counts covered source blocks that contain user transactions);
 - L2+ recursive STARK settlements receive only the layer-discounted mint reward
   `100 SHELL / 2^L × source_count`; no gas-fee share at any STARK layer.
+- every STARK mint increases the canonical `totalSupply` state value by the
+  exact reward amount.
 
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.

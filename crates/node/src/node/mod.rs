@@ -3709,12 +3709,18 @@ mod tests {
         let amendment = dummy_ordered_amendment(1, vec![genesis_hash, hashes[0], hashes[1]], 2);
         leader.pending_stark_settlements.lock().push(amendment);
         let settlement_block = leader.produce_block(&signer, 100).unwrap();
-        let settlement_tx_hash = settlement_block
+        let settlement_tx = settlement_block
             .system_transactions
             .iter()
             .find(|tx| tx.kind == SystemTxKind::StarkReward)
-            .expect("settlement tx")
-            .hash();
+            .expect("settlement tx");
+        let settlement_tx_hash = settlement_tx.hash();
+        let expected_total_supply = settlement_tx.value;
+        assert_eq!(
+            leader.world_state.read().get_total_supply().unwrap(),
+            expected_total_supply,
+            "block production must add STARK mint rewards to total supply"
+        );
         assert_eq!(settlement_block.number(), block2_number + 1);
         assert!(
             block2
@@ -3751,6 +3757,11 @@ mod tests {
         follower.import_block(block2, &verifier).unwrap();
         put_dummy_witness(&follower, &hashes[1]);
         follower.import_block(settlement_block, &verifier).unwrap();
+        assert_eq!(
+            follower.world_state.read().get_total_supply().unwrap(),
+            expected_total_supply,
+            "block import must reproduce the STARK mint supply update"
+        );
 
         let pointer_bytes = follower
             .amendment_store

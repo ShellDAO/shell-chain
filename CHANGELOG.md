@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Increase canonical total supply whenever a STARK settlement mints its reward.
 - Require release publication checks to find a versioned node archive and
   checksum manifest instead of accepting any unrelated downloadable asset.
 - Avoid allocating complete encoded witness bundles when only their canonical
