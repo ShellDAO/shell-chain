@@ -1172,11 +1172,10 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             drop(finality);
         }
+        let resulting_finalized_number = self.finality.read().last_finalized_number();
         self.metrics.block_height.set(plan.preferred_number as i64);
-        self.metrics.update_finality(
-            plan.preferred_number,
-            self.finality.read().last_finalized_number(),
-        );
+        self.metrics
+            .update_finality(plan.preferred_number, resulting_finalized_number);
 
         self.prover_orchestrator()
             .rewind_settled_frontiers(plan.ancestor_number);
@@ -1209,7 +1208,7 @@ impl<S: KvStore + 'static> Node<S> {
                 self.config.pruning.proof_replacement_grace,
             );
         }
-        block_store.prune_grace_witnesses(finalized_number);
+        block_store.prune_grace_witnesses(resulting_finalized_number);
         let adopted_tx_hashes = plan
             .new_chain
             .iter()

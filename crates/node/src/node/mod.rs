@@ -2772,6 +2772,15 @@ mod tests {
             .preferred_fork_plan()
             .unwrap()
             .expect("attested side fork should become preferred");
+        node.witness_store
+            .put_bundle(
+                &side_one_hash,
+                &WitnessBundle {
+                    witnesses: Vec::new(),
+                },
+            )
+            .unwrap();
+        node.pending_grace_deletes.lock().insert(side_one_hash, 2);
         db.fail_next_put();
         node.adopt_preferred_fork(&plan).unwrap();
 
@@ -2796,6 +2805,11 @@ mod tests {
             node.chain_store.get_block_hash_by_number(1).unwrap(),
             Some(side_one_hash)
         );
+        assert!(!node.chain_store.has_witness_bundle(&side_one_hash).unwrap());
+        assert!(!node
+            .pending_grace_deletes
+            .lock()
+            .contains_key(&side_one_hash));
     }
 
     #[test]
