@@ -1866,20 +1866,16 @@ impl<S: KvStore> ChainStore<S> {
             ));
         }
         let finalized_number = snapshot_finalized_number.unwrap_or(0);
-        if snapshot_body_pruned_below.unwrap_or(0) > finalized_number {
-            return Err(StorageError::State(
-                "snapshot body pruning cursor exceeds finalized height".into(),
-            ));
-        }
-        if snapshot_witness_pruned_below.unwrap_or(0) > finalized_number {
-            return Err(StorageError::State(
-                "snapshot witness pruning cursor exceeds finalized height".into(),
-            ));
-        }
-        if snapshot_state_trie_pruned_below.unwrap_or(0) > metadata.block_number {
-            return Err(StorageError::State(
-                "snapshot state-trie pruning cursor exceeds canonical head".into(),
-            ));
+        for (label, cursor) in [
+            ("body", snapshot_body_pruned_below),
+            ("witness", snapshot_witness_pruned_below),
+            ("state-trie", snapshot_state_trie_pruned_below),
+        ] {
+            if cursor.unwrap_or(0) > finalized_number {
+                return Err(StorageError::State(format!(
+                    "snapshot {label} pruning cursor exceeds finalized height"
+                )));
+            }
         }
 
         let head_hash = head_hash
@@ -4244,7 +4240,11 @@ mod tests {
 
     #[test]
     fn test_import_snapshot_rejects_pruning_cursors_beyond_finality_before_writes() {
-        for cursor_key in [prefix::BODY_PRUNED_BELOW, prefix::WITNESS_PRUNED_BELOW] {
+        for cursor_key in [
+            prefix::BODY_PRUNED_BELOW,
+            prefix::WITNESS_PRUNED_BELOW,
+            prefix::STATE_TRIE_PRUNED_BELOW,
+        ] {
             let store = Arc::new(MemoryDb::new());
             let cs = ChainStore::new(Arc::clone(&store));
             let meta = crate::SnapshotMetadata::new(
@@ -4275,38 +4275,6 @@ mod tests {
                 .contains("pruning cursor exceeds finalized height"));
             assert!(store.get(b"untrusted-key").unwrap().is_none());
         }
-    }
-
-    #[test]
-    fn test_import_snapshot_rejects_state_trie_cursor_beyond_head_before_writes() {
-        let store = Arc::new(MemoryDb::new());
-        let cs = ChainStore::new(Arc::clone(&store));
-        let meta = crate::SnapshotMetadata::new(
-            1337,
-            1,
-            ShellHash::ZERO,
-            ShellHash::ZERO,
-            ShellHash::ZERO,
-        );
-        let mut buf = Vec::new();
-        {
-            let mut writer =
-                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
-            writer.write_entry(b"untrusted-key", b"value").unwrap();
-            writer
-                .write_entry(prefix::STATE_TRIE_PRUNED_BELOW, &2u64.to_be_bytes())
-                .unwrap();
-            writer.finalize().unwrap();
-        }
-
-        let error = cs
-            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
-            .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("state-trie pruning cursor exceeds canonical head"));
-        assert!(store.get(b"untrusted-key").unwrap().is_none());
     }
 
     #[test]

@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject state-trie pruning cursors that advance beyond finality during
+  snapshot import and node startup.
 - Reject reorganization commits whose rollback segment is not the current
   canonical chain, preventing wrong-branch index deletion.
 - Honor shutdown requests that arrive before the node event loop subscribes,
