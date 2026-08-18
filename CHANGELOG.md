@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject unsupported STARK amendment and proof-pointer versions instead of
+  interpreting them with current protocol semantics.
 - Require published node archives to be readable gzip tar packages containing
   one executable node binary.
 - Reject symlinked validator artifact inputs, outputs, and compiler directories

@@ -23,6 +23,7 @@ use crate::proof::SigBatchProof;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofAmendment {
     /// Protocol version for forward-compatibility.
+    #[serde(deserialize_with = "deserialize_proof_amendment_version")]
     pub version: u8,
     /// Hash of the block this proof covers.
     pub block_hash: ShellHash,
@@ -77,6 +78,32 @@ fn default_layer() -> u32 {
     1
 }
 
+fn deserialize_proof_amendment_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u8::deserialize(deserializer)?;
+    if version != PROOF_AMENDMENT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported proof amendment version {version}"
+        )));
+    }
+    Ok(version)
+}
+
+fn deserialize_proof_pointer_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u8::deserialize(deserializer)?;
+    if version != PROOF_POINTER_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported proof pointer version {version}"
+        )));
+    }
+    Ok(version)
+}
+
 impl ProofAmendment {
     /// Serialize to JSON bytes for P2P transmission or storage.
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
@@ -116,6 +143,12 @@ impl ProofAmendment {
     /// Bind the prover identity and all reward-relevant amendment metadata to a
     /// self-contained post-quantum signature envelope.
     pub fn sign_prover_authentication(&mut self, signer: &dyn Signer) -> Result<(), String> {
+        if self.version != PROOF_AMENDMENT_VERSION {
+            return Err(format!(
+                "unsupported proof amendment version {}",
+                self.version
+            ));
+        }
         let public_key = signer.public_key();
         let public_key_len = u16::try_from(public_key.len())
             .map_err(|_| "prover public key exceeds authentication envelope limit".to_owned())?;
@@ -151,6 +184,12 @@ impl ProofAmendment {
 
     /// Verify the embedded prover key, address binding, and signature.
     pub fn verify_prover_authentication(&self) -> Result<(), String> {
+        if self.version != PROOF_AMENDMENT_VERSION {
+            return Err(format!(
+                "unsupported proof amendment version {}",
+                self.version
+            ));
+        }
         let envelope = self.prover_signature.as_ref();
         if envelope.len() < PROVER_AUTH_HEADER_BYTES {
             return Err("missing prover authentication envelope".to_owned());
@@ -335,6 +374,7 @@ fn encode_prover_authentication(
 /// compression layer and proof target without duplicating the proof payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofPointer {
+    #[serde(deserialize_with = "deserialize_proof_pointer_version")]
     pub version: u8,
     pub source_hash: ShellHash,
     pub source_block: u64,
@@ -470,6 +510,18 @@ mod tests {
     }
 
     #[test]
+    fn amendment_json_rejects_unsupported_version() {
+        let mut amendment = make_amendment();
+        amendment.version = PROOF_AMENDMENT_VERSION + 1;
+        let json = amendment.to_json().expect("serialize");
+
+        let error = ProofAmendment::from_json(&json).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported proof amendment version"));
+    }
+
+    #[test]
     fn proof_pointer_json_roundtrip() {
         let pointer = ProofPointer {
             version: PROOF_POINTER_VERSION,
@@ -489,6 +541,27 @@ mod tests {
             StoredProofArtifact::from_json(&json).expect("stored artifact"),
             StoredProofArtifact::Pointer(_)
         ));
+    }
+
+    #[test]
+    fn proof_pointer_json_rejects_unsupported_version() {
+        let pointer = ProofPointer {
+            version: PROOF_POINTER_VERSION + 1,
+            source_hash: ShellHash::from([0x11; 32]),
+            source_block: 40,
+            target_hash: ShellHash::from([0x22; 32]),
+            target_block: 42,
+            start_block: 40,
+            end_block: 42,
+            layer: 1,
+            settlement_tx_hash: None,
+        };
+        let json = pointer.to_json().expect("serialize");
+
+        let error = ProofPointer::from_json(&json).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported proof pointer version"));
     }
 
     #[test]
@@ -539,6 +612,22 @@ mod tests {
         amendment
             .verify_prover_authentication()
             .expect("verify amendment");
+    }
+
+    #[test]
+    fn prover_authentication_rejects_unsupported_amendment_version() {
+        let signer = DilithiumSigner::generate();
+        let mut amendment = make_amendment();
+        amendment.version = PROOF_AMENDMENT_VERSION + 1;
+
+        assert!(amendment
+            .sign_prover_authentication(&signer)
+            .unwrap_err()
+            .contains("unsupported proof amendment version"));
+        assert!(amendment
+            .verify_prover_authentication()
+            .unwrap_err()
+            .contains("unsupported proof amendment version"));
     }
 
     #[test]
