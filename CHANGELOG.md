@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep canonical signature-algorithm governance changes from rejecting valid
+  competing-fork candidates before stateful adoption replay.
 - Check direct-message pending capacity before charging the outbound bandwidth
   budget so locally dropped overload does not suppress later sendable traffic.
 - Apply witness-retention cleanup against finality advanced by preferred-fork

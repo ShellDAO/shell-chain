@@ -348,6 +348,13 @@ impl<S: KvStore + 'static> Node<S> {
         let import_cs = ChainStore::new(import_store.clone());
         import_cs.set_head(&parent.hash())?;
         let mut world_state = WorldState::at_root(import_store, &parent.header.state_root)?;
+        // A side-fork parent's full trie is not guaranteed to be materialized
+        // until adoption replay. Use the compile-time registry for provisional
+        // cryptographic validation so canonical governance state cannot reject
+        // a competing candidate. Adoption replay reloads the ancestor registry
+        // and enforces every stateful algorithm transition before commit.
+        let _algorithm_registry_rollback = AlgorithmRegistryRollback::new();
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
         let verifier = MultiVerifier;
         let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         let mut validation_nonces: HashMap<Address, u64> = HashMap::new();

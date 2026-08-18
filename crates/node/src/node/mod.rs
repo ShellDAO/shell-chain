@@ -9365,6 +9365,73 @@ mod tests {
     }
 
     #[test]
+    fn import_side_fork_ignores_canonical_algorithm_deprecation() {
+        const TEST_NAME: &str =
+            "node::tests::import_side_fork_ignores_canonical_algorithm_deprecation";
+        const ISOLATED_MARKER: &str = "SHELL_TEST_ISOLATED_SIDE_FORK_ALGORITHM_REGISTRY";
+        if run_isolated(TEST_NAME, ISOLATED_MARKER) {
+            return;
+        }
+
+        struct RegistryReset(AlgorithmRegistry);
+
+        impl Drop for RegistryReset {
+            fn drop(&mut self) {
+                *AlgorithmRegistry::global_mut() = self.0.clone();
+            }
+        }
+
+        let _reset = RegistryReset(AlgorithmRegistry::global().clone());
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+
+        let (node, proposer_signer) = setup_node();
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+        let tx_signer = DilithiumSigner::generate();
+        let tx_algorithm = tx_signer.sig_type();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_algorithm.as_u8());
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let tx = make_embedded_tx(&tx_signer, sender, tx_signer.public_key().to_vec(), 0, 1);
+        node.tx_pool
+            .insert(
+                tx,
+                &mut node.world_state.write(),
+                node.chain_store.as_ref(),
+                &MultiVerifier,
+            )
+            .unwrap();
+
+        let canonical = node.produce_block(&proposer_signer, 100).unwrap();
+        let mut side_fork = canonical.clone();
+        side_fork.header.extra_data = Bytes::from_static(b"parent-algorithm-registry");
+        side_fork.header.witness_root = None;
+        side_fork.proposer_seal = Some(
+            proposer_signer
+                .sign(side_fork.header.hash().as_bytes())
+                .unwrap(),
+        );
+        let side_fork_hash = side_fork.hash();
+
+        AlgorithmRegistry::global_mut().deprecate(tx_algorithm);
+        assert!(!AlgorithmRegistry::global().is_allowed(tx_algorithm));
+
+        node.import_block(side_fork, &MultiVerifier).unwrap();
+
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&side_fork_hash)
+            .unwrap()
+            .is_some());
+        assert!(node.fork_choice.read().contains(&side_fork_hash));
+        assert!(
+            !AlgorithmRegistry::global().is_allowed(tx_algorithm),
+            "side-fork validation must restore the canonical registry"
+        );
+    }
+
+    #[test]
     fn import_side_fork_accepts_valid_session_key_signature() {
         let (node, proposer_signer) = setup_node();
         let proposer = node.config.proposer_address.unwrap();
