@@ -1,4 +1,5 @@
 use super::*;
+use alloy_rlp::Encodable;
 
 const SYSTEM_EXTRA_PREFIX: &[u8] = b"shell:system-extra:v1:";
 const BASE_STARK_MINT_WEI: u128 = 100_000_000_000_000_000_000;
@@ -152,8 +153,7 @@ impl<S: KvStore + 'static> Node<S> {
         if has_real_witness_material {
             let (_, witness_bundle) = shell_core::StrippedBlock::split(source_block);
             if !witness_bundle.is_empty() {
-                let witness_bytes = alloy_rlp::encode(&witness_bundle);
-                return Ok(Some(witness_bytes.len() as u64));
+                return Ok(Some(witness_bundle.length() as u64));
             }
         }
 
@@ -186,7 +186,7 @@ impl<S: KvStore + 'static> Node<S> {
                 .iter()
                 .all(|witness| !witness.signature.data.is_empty())
         {
-            return Ok(alloy_rlp::encode(&witness_bundle).len() as u64);
+            return Ok(witness_bundle.length() as u64);
         }
 
         Err(NodeError::Startup(format!(

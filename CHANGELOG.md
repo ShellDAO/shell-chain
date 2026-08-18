@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Avoid allocating complete encoded witness bundles when only their canonical
+  RLP length is needed for STARK source-size accounting.
 - Keep canonical signature-algorithm governance changes from rejecting valid
   competing-fork candidates before stateful adoption replay.
 - Check direct-message pending capacity before charging the outbound bandwidth

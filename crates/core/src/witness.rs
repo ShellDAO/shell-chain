@@ -622,6 +622,7 @@ mod tests {
         ]);
         let encoded = bundle.rlp_encode();
         let decoded = WitnessBundle::decode(&mut &encoded[..]).expect("decode failed");
+        assert_eq!(bundle.length(), encoded.len());
         assert_eq!(bundle, decoded);
         assert_eq!(decoded.len(), 2);
         assert!(decoded.witnesses[0].has_pubkey());
