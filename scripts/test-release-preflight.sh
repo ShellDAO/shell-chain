@@ -129,7 +129,7 @@ PUBLICATION_COMMIT=$(git -C "$PUBLICATION_FIXTURE" rev-parse HEAD)
 git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9 -m "publication fixture"
 git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9
 cat > "$TMP_DIR/release.json" <<'EOF'
-{"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[{"name":"shell-node-linux-x86_64","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/shell-node-linux-x86_64"}]}
+{"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[{"name":"shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz"},{"name":"SHA256SUMS","state":"uploaded","size":128,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/SHA256SUMS"}]}
 EOF
 (cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
     RELEASE_FIXTURE="$TMP_DIR/release.json" \
@@ -147,6 +147,21 @@ fi
 if ! grep -Fq "release has no downloadable assets" <<<"$PUBLICATION_OUTPUT"; then
     fail "missing release asset rejection was not specific: $PUBLICATION_OUTPUT"
 fi
+
+cat > "$TMP_DIR/release.json" <<'EOF'
+{"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[{"name":"release-notes.txt","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/release-notes.txt"}]}
+EOF
+if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
+    GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" 2>&1); then
+    fail "release publication check unexpectedly accepted unrelated assets"
+fi
+for expected in "no versioned shell-node archive" "no SHA256SUMS manifest"; do
+    if ! grep -Fq "$expected" <<<"$PUBLICATION_OUTPUT"; then
+        fail "missing release package rejection was not specific: $PUBLICATION_OUTPUT"
+    fi
+done
 
 cat > "$TMP_DIR/release.json" <<'EOF'
 {"tag_name":"v0.27.9","draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9","assets":[{"name":"shell-node-linux-x86_64","state":"new","size":0,"browser_download_url":""}]}
@@ -192,7 +207,7 @@ fi
 git -C "$PUBLICATION_FIXTURE" tag -a v0.27.9-rc.1 -m "prerelease publication fixture"
 git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9-rc.1
 cat > "$TMP_DIR/release.json" <<'EOF'
-{"tag_name":"v0.27.9-rc.1","draft":false,"prerelease":true,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9-rc.1","assets":[{"name":"shell-node-linux-x86_64","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9-rc.1/shell-node-linux-x86_64"}]}
+{"tag_name":"v0.27.9-rc.1","draft":false,"prerelease":true,"published_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9-rc.1","assets":[{"name":"shell-node-v0.27.9-rc.1-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","size":1024,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9-rc.1/shell-node-v0.27.9-rc.1-x86_64-unknown-linux-gnu.tar.gz"},{"name":"SHA256SUMS","state":"uploaded","size":128,"browser_download_url":"https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9-rc.1/SHA256SUMS"}]}
 EOF
 (cd "$PUBLICATION_FIXTURE" && GH_BIN="$FAKE_PUBLICATION_GH" \
     RELEASE_FIXTURE="$TMP_DIR/release.json" \

@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Require release publication checks to find a versioned node archive and
+  checksum manifest instead of accepting any unrelated downloadable asset.
 - Avoid allocating complete encoded witness bundles when only their canonical
   RLP length is needed for STARK source-size accounting.
 - Keep canonical signature-algorithm governance changes from rejecting valid

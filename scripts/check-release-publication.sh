@@ -79,11 +79,13 @@ assets = release.get("assets")
 if not isinstance(assets, list) or not assets:
     errors.append("release has no downloadable assets")
 else:
+    asset_names = set()
     for asset in assets:
         name = asset.get("name") if isinstance(asset, dict) else None
         if not isinstance(name, str) or not name:
             errors.append("release has an asset without a name")
             continue
+        asset_names.add(name)
         if asset.get("state") != "uploaded":
             errors.append(f"release asset '{name}' is not fully uploaded")
         if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
@@ -91,6 +93,15 @@ else:
         url = asset.get("browser_download_url")
         if not isinstance(url, str) or not url:
             errors.append(f"release asset '{name}' has no download URL")
+
+    archive_prefix = f"shell-node-{tag}-"
+    if not any(
+        name.startswith(archive_prefix) and name.endswith(".tar.gz")
+        for name in asset_names
+    ):
+        errors.append("release has no versioned shell-node archive")
+    if "SHA256SUMS" not in asset_names:
+        errors.append("release has no SHA256SUMS manifest")
 
 if errors:
     for error in errors:
