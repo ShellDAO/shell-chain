@@ -206,10 +206,18 @@ impl FilterRegistry {
     }
 
     /// Replace the canonical cursor after a successful poll.
+    /// `observed_canonical_from` is the first replacement-chain block processed
+    /// by this poll and makes later removals from that delivered chain reportable.
     ///
     /// Returns `false` when another poll changed the cursor or the filter
     /// expired while results were being constructed.
-    pub fn update_cursor(&self, id: &str, expected: FilterCursor, cursor: FilterCursor) -> bool {
+    pub fn update_cursor(
+        &self,
+        id: &str,
+        expected: FilterCursor,
+        cursor: FilterCursor,
+        observed_canonical_from: Option<u64>,
+    ) -> bool {
         if !is_valid_filter_id(id) {
             return false;
         }
@@ -223,6 +231,15 @@ impl FilterRegistry {
             }
             entry.last_poll_block = cursor.block_number;
             entry.last_poll_hash = cursor.block_hash;
+            if matches!(&entry.kind, FilterKind::Log(_)) {
+                if let Some(observed_from) = observed_canonical_from {
+                    entry.changes_from_block = Some(
+                        entry
+                            .changes_from_block
+                            .map_or(observed_from, |from| from.min(observed_from)),
+                    );
+                }
+            }
             entry.last_access = Instant::now();
             return true;
         }
@@ -521,6 +538,7 @@ mod tests {
                 block_number: 15,
                 block_hash: Some(ancestor_hash),
             },
+            None,
         ));
 
         assert_eq!(
@@ -567,6 +585,7 @@ mod tests {
                 block_number: 8,
                 block_hash: Some(ShellHash::from_slice(&[0x55; 32])),
             },
+            None,
         ));
         assert_eq!(
             reg.get_filter_cursor(&id).unwrap().1,

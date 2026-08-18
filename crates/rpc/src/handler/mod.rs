@@ -6542,7 +6542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_filter_does_not_remove_logs_from_before_installation() {
+    async fn log_filter_only_removes_same_height_versions_delivered_after_installation() {
         let handler = setup();
         let address = Address::from([0xA3; 20]);
         let genesis_hash = store_block_with_logs(&handler, 0, vec![vec![]]);
@@ -6564,7 +6564,7 @@ mod tests {
             vec![vec![replacement_log]],
         );
 
-        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id.clone())
             .await
             .unwrap();
         let logs = changes.as_array().unwrap();
@@ -6572,6 +6572,20 @@ mod tests {
         assert_ne!(logs[0]["blockHash"], serde_json::json!(old_hash));
         assert_eq!(logs[0]["blockHash"], serde_json::json!(replacement_hash));
         assert_eq!(logs[0]["removed"], false);
+
+        let next_log = shell_core::Log::new(address, vec![], Bytes::from_static(b"next")).unwrap();
+        let next_hash =
+            store_block_with_logs_on_parent(&handler, 1, genesis_hash, 3, vec![vec![next_log]]);
+
+        let changes = EthApiServer::get_filter_changes(&handler, filter_id)
+            .await
+            .unwrap();
+        let logs = changes.as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0]["blockHash"], serde_json::json!(replacement_hash));
+        assert_eq!(logs[0]["removed"], true);
+        assert_eq!(logs[1]["blockHash"], serde_json::json!(next_hash));
+        assert_eq!(logs[1]["removed"], false);
     }
 
     #[tokio::test]
