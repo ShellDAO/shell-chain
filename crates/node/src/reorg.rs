@@ -502,6 +502,8 @@ mod tests {
         old_block.transactions.push(make_tx());
         chain_store.put_block(&old_block).unwrap();
         let old_hash = old_block.hash();
+        chain_store.set_canonical(6, &old_hash).unwrap();
+        chain_store.set_head(&old_hash).unwrap();
 
         let result = ReorgEngine::execute(
             &chain_store,
@@ -733,6 +735,8 @@ mod tests {
         old_block.transactions.push(tx.clone());
         chain_store.put_block(&old_block).unwrap();
         let old_hash = old_block.hash();
+        chain_store.set_canonical(6, &old_hash).unwrap();
+        chain_store.set_head(&old_hash).unwrap();
 
         let mut new_block = make_block(6, ancestor_hash, root);
         new_block.header.timestamp += 1; // different block, same tx
@@ -769,6 +773,8 @@ mod tests {
         old_block.transactions.push(tx.clone());
         chain_store.put_block(&old_block).unwrap();
         let old_hash = old_block.hash();
+        chain_store.set_canonical(6, &old_hash).unwrap();
+        chain_store.set_head(&old_hash).unwrap();
 
         let mut new_block = make_block(6, ancestor_hash, root);
         new_block.header.timestamp += 1;
@@ -856,6 +862,9 @@ mod tests {
         let old8 = make_block(8, oh7, root);
         chain_store.put_block(&old8).unwrap();
         let oh8 = old8.hash();
+        chain_store.set_canonical(6, &oh6).unwrap();
+        chain_store.set_canonical(7, &oh7).unwrap();
+        chain_store.set_canonical(8, &oh8).unwrap();
         chain_store.set_head(&oh8).unwrap();
 
         // New fork chain: 3 blocks (6', 7', 8') with different timestamps
@@ -944,6 +953,9 @@ mod tests {
         let mut old7 = make_block(7, old6.hash(), root);
         old7.transactions.push(tx_b.clone());
         chain_store.put_block(&old7).unwrap();
+        chain_store.set_canonical(6, &old6.hash()).unwrap();
+        chain_store.set_canonical(7, &old7.hash()).unwrap();
+        chain_store.set_head(&old7.hash()).unwrap();
 
         // New chain: 1 block, no transactions.
         let mut new6 = make_block(6, ancestor_hash, root);

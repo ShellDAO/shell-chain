@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject reorganization commits whose rollback segment is not the current
+  canonical chain, preventing wrong-branch index deletion.
 - Honor shutdown requests that arrive before the node event loop subscribes,
   preventing startup from missing the only shutdown notification.
 - Keep view-change proposer rotation deterministic across target pointer widths

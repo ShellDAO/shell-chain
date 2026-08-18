@@ -677,6 +677,12 @@ impl<S: KvStore> ChainStore<S> {
 
         for block in old_chain {
             let block_hash = block.hash();
+            if self.get_block_hash_by_number(block.number())? != Some(block_hash) {
+                return Err(StorageError::InvalidInput(format!(
+                    "reorg rollback block {block_hash} is not canonical at #{}",
+                    block.number()
+                )));
+            }
             let system_txs = self.get_system_transactions(&block_hash)?;
             Self::append_delete_transaction_indexes(&mut batch, block, &system_txs);
         }
@@ -5814,6 +5820,47 @@ mod tests {
         assert!(cs.get_block_by_number(block.number()).unwrap().is_none());
         assert!(cs.get_receipts(&hash).unwrap().is_none());
         assert!(cs.get_tx_location(&tx_hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn commit_reorg_rejects_noncanonical_rollback_block() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db);
+        let canonical = make_block_with_txs(1);
+        let canonical_hash = canonical.hash();
+        let tx_hash = canonical.transactions[0].hash();
+        cs.commit_canonical_block(&canonical, None).unwrap();
+
+        let mut side_block = canonical.clone();
+        side_block.header.timestamp += 1;
+        let side_hash = side_block.hash();
+        cs.put_side_fork_block(&side_block).unwrap();
+
+        let mut replacement = empty_block(1);
+        replacement.header.timestamp += 2;
+        let replacement_hash = replacement.hash();
+        cs.put_side_fork_block(&replacement).unwrap();
+
+        let error = cs
+            .commit_reorg(
+                std::slice::from_ref(&side_block),
+                std::slice::from_ref(&replacement),
+                &[],
+                &replacement_hash,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::InvalidInput(_)));
+        assert_eq!(cs.get_head_hash().unwrap(), Some(canonical_hash));
+        assert_eq!(
+            cs.get_block_hash_by_number(1).unwrap(),
+            Some(canonical_hash)
+        );
+        assert_eq!(
+            cs.get_tx_location(&tx_hash).unwrap(),
+            Some((canonical_hash, 0))
+        );
+        assert_ne!(side_hash, canonical_hash);
     }
 
     #[test]
