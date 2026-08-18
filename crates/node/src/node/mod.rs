@@ -9393,7 +9393,14 @@ mod tests {
         let sender = Address::from_public_key(tx_signer.public_key(), tx_algorithm.as_u8());
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
         store_consistent_genesis(&node);
-        let tx = make_embedded_tx(&tx_signer, sender, tx_signer.public_key().to_vec(), 0, 1);
+        let nonce = node.world_state.read().get_nonce(&sender).unwrap();
+        let tx = make_embedded_tx(
+            &tx_signer,
+            sender,
+            tx_signer.public_key().to_vec(),
+            nonce,
+            1,
+        );
         node.tx_pool
             .insert(
                 tx,
