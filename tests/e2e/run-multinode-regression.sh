@@ -54,6 +54,32 @@ Environment:
 USAGE
 }
 
+run_non_authority_validator_negative() (
+  local test_dir out err
+  test_dir="$(mktemp -d "${TMPDIR:-/tmp}/shell-node-start-negative.XXXXXX")"
+  trap 'rm -rf "$test_dir"' EXIT
+  out="$test_dir/stdout"
+  err="$test_dir/stderr"
+
+  if SHELL_NODE_ROLE=validator \
+    SHELL_KEYSTORE="$test_dir/missing-validator.json" \
+    SHELL_PASSWORD_FILE="$test_dir/missing-validator.pw" \
+    "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh" >"$out" 2>"$err"; then
+    echo "non-authority validator guard unexpectedly allowed startup" >&2
+    return 1
+  fi
+  if ! grep -q 'SHELL_KEYSTORE is not readable' "$err"; then
+    echo "non-authority validator guard failed for an unexpected reason" >&2
+    cat "$err" >&2
+    return 1
+  fi
+  if ! grep -q 'configured validator authority mismatch: expected .* got ' "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh"; then
+    echo "systemd validator authority mismatch log lost expected/derived comparison" >&2
+    return 1
+  fi
+  echo "non-authority-validator-negative passed"
+)
+
 run_profile() {
   local profile="$1"
   shift
@@ -101,26 +127,7 @@ run_profile() {
       run_profile validator-prover "$@"
       ;;
     non-authority-validator-negative)
-      local out="/tmp/shell-node-start-negative.out"
-      local err="/tmp/shell-node-start-negative.err"
-      rm -f "$out" "$err"
-      if SHELL_NODE_ROLE=validator \
-        SHELL_KEYSTORE=/tmp/shell-chain-missing-validator.json \
-        SHELL_PASSWORD_FILE=/tmp/shell-chain-missing-validator.pw \
-        "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh" >"$out" 2>"$err"; then
-        echo "non-authority validator guard unexpectedly allowed startup" >&2
-        return 1
-      fi
-      if ! grep -q 'SHELL_KEYSTORE is not readable' "$err"; then
-        echo "non-authority validator guard failed for an unexpected reason" >&2
-        cat "$err" >&2
-        return 1
-      fi
-      if ! grep -q 'configured validator authority mismatch: expected .* got ' "$PROJECT_DIR/infra/testnet/systemd/shell-node-start.sh"; then
-        echo "systemd validator authority mismatch log lost expected/derived comparison" >&2
-        return 1
-      fi
-      echo "non-authority-validator-negative passed"
+      run_non_authority_validator_negative
       ;;
     *)
       echo "unknown multinode regression profile: $profile" >&2
