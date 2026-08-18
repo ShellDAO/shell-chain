@@ -134,6 +134,7 @@ import hashlib
 import pathlib
 import re
 import sys
+import tarfile
 
 asset_dir = pathlib.Path(sys.argv[1])
 archive_list_path = pathlib.Path(sys.argv[2])
@@ -189,6 +190,65 @@ for name in archive_names:
     if actual != expected:
         print(
             f"release publication check failed: checksum mismatch for release asset '{name}'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    try:
+        with tarfile.open(archive, mode="r:gz") as package:
+            members = package.getmembers()
+    except (OSError, tarfile.TarError) as error:
+        print(
+            f"release publication check failed: release asset '{name}' is not a "
+            f"readable gzip tar archive: {error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    files = []
+    for member in members:
+        member_path = pathlib.PurePosixPath(member.name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            print(
+                f"release publication check failed: release asset '{name}' "
+                "contains an unsafe archive path",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if member.isdir():
+            continue
+        if not member.isfile():
+            print(
+                f"release publication check failed: release asset '{name}' "
+                "contains a non-regular archive entry",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        files.append((member_path, member))
+
+    if len(files) != 1 or files[0][0] not in {
+        pathlib.PurePosixPath("shell-node"),
+        pathlib.PurePosixPath("shell-node.exe"),
+    }:
+        print(
+            f"release publication check failed: release asset '{name}' must "
+            "contain exactly one root shell-node executable",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    member = files[0][1]
+    if member.size <= 0:
+        print(
+            f"release publication check failed: release asset '{name}' "
+            "contains an empty node binary",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if member.mode & 0o111 == 0:
+        print(
+            f"release publication check failed: release asset '{name}' "
+            "contains a non-executable node binary",
             file=sys.stderr,
         )
         raise SystemExit(1)

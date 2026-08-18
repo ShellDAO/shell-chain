@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Require published node archives to be readable gzip tar packages containing
+  one executable node binary.
 - Reject symlinked validator artifact inputs, outputs, and compiler directories
   before local regeneration or CI verification can follow them.
 - Keep circuit-relay server capacity disabled unless explicitly enabled,
