@@ -171,6 +171,14 @@ or lower-layer-gap artifacts cannot prune witnesses or claim rewards.
 | `compressionLayer` | Highest STARK compression layer currently known for the block (`0` means no accepted proof artifact). |
 | `pruningStatus` | Local witness state: `unpruned`, `compressedWitnessRetained`, `pruned`, `notWitnessed`, `pending`, or `unknown`. |
 
+### Restart-safe pruning progress
+
+Body and witness pruning commit their deletion batch and first-unprocessed block
+number atomically. After restart, each pruner resumes from that durable cursor
+instead of rescanning canonical mappings that may already have been removed.
+Logical snapshots carry both cursors and reject progress ahead of the snapshot's
+finalized height.
+
 ### L3 — State trie pruning (experimental)
 
 Controlled by `state_pruning_experimental = false` (default off).

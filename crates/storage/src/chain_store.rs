@@ -194,6 +194,8 @@ mod prefix {
     pub const TOTAL_TX_COUNT: &[u8] = b"TOTAL_TX_COUNT";
     pub const TOTAL_GAS_USED: &[u8] = b"TOTAL_GAS_USED";
     pub const TOTALS_HEAD: &[u8] = b"TOTALS_HEAD";
+    pub const BODY_PRUNED_BELOW: &[u8] = b"BODY_PRUNED_BELOW";
+    pub const WITNESS_PRUNED_BELOW: &[u8] = b"WITNESS_PRUNED_BELOW";
     pub const STATE_TRIE_PRUNED_BELOW: &[u8] = b"STATE_TRIE_PRUNED_BELOW";
     /// Side fork marker: key = "sf/" + block_number(8) + block_hash(32).
     pub const SIDE_FORK_BY_NUMBER: &[u8] = b"sf/";
@@ -817,6 +819,24 @@ impl<S: KvStore> ChainStore<S> {
         self.store.write_batch(batch)
     }
 
+    /// Delete stripped bodies and advance the durable body-pruning cursor in
+    /// one atomic batch.
+    pub fn prune_bodies_below(
+        &self,
+        hashes: &[ShellHash],
+        pruned_below: u64,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        for hash in hashes {
+            batch.delete(Self::body_key(hash));
+        }
+        batch.put(
+            prefix::BODY_PRUNED_BELOW.to_vec(),
+            pruned_below.to_be_bytes().to_vec(),
+        );
+        self.store.write_batch(batch)
+    }
+
     /// Delete the witness bundle (PQ signatures) for the given block hash.
     ///
     /// Called after a [`ProofAmendment`] (STARK proof) is accepted for the
@@ -837,6 +857,24 @@ impl<S: KvStore> ChainStore<S> {
         for hash in hashes {
             batch.delete(Self::witness_key(hash));
         }
+        self.store.write_batch(batch)
+    }
+
+    /// Delete witness bundles and advance the durable witness-pruning cursor in
+    /// one atomic batch.
+    pub fn prune_witness_bundles_below(
+        &self,
+        hashes: &[ShellHash],
+        pruned_below: u64,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        for hash in hashes {
+            batch.delete(Self::witness_key(hash));
+        }
+        batch.put(
+            prefix::WITNESS_PRUNED_BELOW.to_vec(),
+            pruned_below.to_be_bytes().to_vec(),
+        );
         self.store.write_batch(batch)
     }
 
@@ -1675,6 +1713,8 @@ impl<S: KvStore> ChainStore<S> {
         let mut snapshot_finalized_number = None;
         let mut snapshot_metadata_undo_pruned_finalized = None;
         let mut snapshot_chain_totals_head = None;
+        let mut snapshot_body_pruned_below = None;
+        let mut snapshot_witness_pruned_below = None;
         let mut snapshot_state_trie_pruned_below = None;
         let mut progress_keys = std::collections::HashSet::new();
         while let Some(entry) = snap_reader.next_entry()? {
@@ -1698,6 +1738,8 @@ impl<S: KvStore> ChainStore<S> {
                     | prefix::TOTAL_TX_COUNT
                     | prefix::TOTAL_GAS_USED
                     | prefix::TOTALS_HEAD
+                    | prefix::BODY_PRUNED_BELOW
+                    | prefix::WITNESS_PRUNED_BELOW
                     | prefix::STATE_TRIE_PRUNED_BELOW
             ) {
                 if !progress_keys.insert(entry.key.clone()) {
@@ -1736,6 +1778,20 @@ impl<S: KvStore> ChainStore<S> {
                         )
                     })?;
                     snapshot_chain_totals_head = Some(u64::from_be_bytes(encoded));
+                } else if entry.key == prefix::BODY_PRUNED_BELOW {
+                    let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
+                        StorageError::State(
+                            "snapshot chain progress metadata has invalid length".into(),
+                        )
+                    })?;
+                    snapshot_body_pruned_below = Some(u64::from_be_bytes(encoded));
+                } else if entry.key == prefix::WITNESS_PRUNED_BELOW {
+                    let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
+                        StorageError::State(
+                            "snapshot chain progress metadata has invalid length".into(),
+                        )
+                    })?;
+                    snapshot_witness_pruned_below = Some(u64::from_be_bytes(encoded));
                 } else if entry.key == prefix::STATE_TRIE_PRUNED_BELOW {
                     let encoded: [u8; 8] = entry.value.as_slice().try_into().map_err(|_| {
                         StorageError::State(
@@ -1801,6 +1857,17 @@ impl<S: KvStore> ChainStore<S> {
         if snapshot_chain_totals_head.is_some_and(|number| number > metadata.block_number) {
             return Err(StorageError::State(
                 "snapshot totals head exceeds canonical head".into(),
+            ));
+        }
+        let finalized_number = snapshot_finalized_number.unwrap_or(0);
+        if snapshot_body_pruned_below.unwrap_or(0) > finalized_number {
+            return Err(StorageError::State(
+                "snapshot body pruning cursor exceeds finalized height".into(),
+            ));
+        }
+        if snapshot_witness_pruned_below.unwrap_or(0) > finalized_number {
+            return Err(StorageError::State(
+                "snapshot witness pruning cursor exceeds finalized height".into(),
             ));
         }
         if snapshot_state_trie_pruned_below.unwrap_or(0) > metadata.block_number {
@@ -1876,6 +1943,8 @@ impl<S: KvStore> ChainStore<S> {
                     | prefix::TOTAL_TX_COUNT
                     | prefix::TOTAL_GAS_USED
                     | prefix::TOTALS_HEAD
+                    | prefix::BODY_PRUNED_BELOW
+                    | prefix::WITNESS_PRUNED_BELOW
                     | prefix::STATE_TRIE_PRUNED_BELOW
             ) {
                 pending_publication.put(entry.key, entry.value);
@@ -1932,6 +2001,8 @@ impl<S: KvStore> ChainStore<S> {
             prefix::TOTAL_TX_COUNT,
             prefix::TOTAL_GAS_USED,
             prefix::TOTALS_HEAD,
+            prefix::BODY_PRUNED_BELOW,
+            prefix::WITNESS_PRUNED_BELOW,
             prefix::STATE_TRIE_PRUNED_BELOW,
         ] {
             if !progress_keys.contains(key) {
@@ -1969,6 +2040,33 @@ impl<S: KvStore> ChainStore<S> {
             )),
             None => Ok(None),
         }
+    }
+
+    fn pruning_cursor(&self, key: &[u8], label: &str) -> Result<u64, StorageError> {
+        match self.store.get(key)? {
+            Some(bytes) if bytes.len() == 8 => {
+                let encoded: [u8; 8] = bytes.try_into().map_err(|_| {
+                    StorageError::Codec(format!("invalid {label} pruning cursor encoding"))
+                })?;
+                Ok(u64::from_be_bytes(encoded))
+            }
+            Some(_) => Err(StorageError::Codec(format!(
+                "invalid {label} pruning cursor encoding"
+            ))),
+            None => Ok(0),
+        }
+    }
+
+    /// Return the first canonical block whose body has not been processed by
+    /// the body pruner.
+    pub fn body_pruned_below(&self) -> Result<u64, StorageError> {
+        self.pruning_cursor(prefix::BODY_PRUNED_BELOW, "body")
+    }
+
+    /// Return the first canonical block whose witness has not been processed by
+    /// the witness pruner.
+    pub fn witness_pruned_below(&self) -> Result<u64, StorageError> {
+        self.pruning_cursor(prefix::WITNESS_PRUNED_BELOW, "witness")
     }
 
     /// Delete address-metadata undo journals that can no longer be used by a
@@ -3938,6 +4036,12 @@ mod tests {
         cs.set_total_gas_used(U256::from(11)).unwrap();
         cs.set_chain_totals_head(9).unwrap();
         store
+            .put(prefix::BODY_PRUNED_BELOW, &9u64.to_be_bytes())
+            .unwrap();
+        store
+            .put(prefix::WITNESS_PRUNED_BELOW, &9u64.to_be_bytes())
+            .unwrap();
+        store
             .put(prefix::STATE_TRIE_PRUNED_BELOW, &9u64.to_be_bytes())
             .unwrap();
         let block = empty_block(0);
@@ -3986,6 +4090,8 @@ mod tests {
         assert_eq!(cs.get_total_tx_count().unwrap(), 0);
         assert_eq!(cs.get_total_gas_used().unwrap(), U256::ZERO);
         assert_eq!(cs.get_chain_totals_head().unwrap(), None);
+        assert_eq!(cs.body_pruned_below().unwrap(), 0);
+        assert_eq!(cs.witness_pruned_below().unwrap(), 0);
         assert!(store
             .get(prefix::STATE_TRIE_PRUNED_BELOW)
             .unwrap()
@@ -4131,6 +4237,41 @@ mod tests {
     }
 
     #[test]
+    fn test_import_snapshot_rejects_pruning_cursors_beyond_finality_before_writes() {
+        for cursor_key in [prefix::BODY_PRUNED_BELOW, prefix::WITNESS_PRUNED_BELOW] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let meta = crate::SnapshotMetadata::new(
+                1337,
+                2,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut buf = Vec::new();
+            {
+                let mut writer =
+                    crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+                writer.write_entry(b"untrusted-key", b"value").unwrap();
+                writer
+                    .write_entry(prefix::FINALIZED_NUMBER, &1u64.to_be_bytes())
+                    .unwrap();
+                writer.write_entry(cursor_key, &2u64.to_be_bytes()).unwrap();
+                writer.finalize().unwrap();
+            }
+
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("pruning cursor exceeds finalized height"));
+            assert!(store.get(b"untrusted-key").unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn test_import_snapshot_rejects_state_trie_cursor_beyond_head_before_writes() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
@@ -4196,6 +4337,15 @@ mod tests {
                 )
                 .unwrap();
             writer
+                .write_entry(prefix::FINALIZED_NUMBER, &1u64.to_be_bytes())
+                .unwrap();
+            writer
+                .write_entry(prefix::BODY_PRUNED_BELOW, &1u64.to_be_bytes())
+                .unwrap();
+            writer
+                .write_entry(prefix::WITNESS_PRUNED_BELOW, &1u64.to_be_bytes())
+                .unwrap();
+            writer
                 .write_entry(prefix::STATE_TRIE_PRUNED_BELOW, &1u64.to_be_bytes())
                 .unwrap();
             writer.finalize().unwrap();
@@ -4208,6 +4358,8 @@ mod tests {
             store.get(prefix::STATE_TRIE_PRUNED_BELOW).unwrap(),
             Some(1u64.to_be_bytes().to_vec())
         );
+        assert_eq!(cs.body_pruned_below().unwrap(), 1);
+        assert_eq!(cs.witness_pruned_below().unwrap(), 1);
     }
 
     #[test]

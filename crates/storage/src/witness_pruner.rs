@@ -61,9 +61,14 @@ pub struct WitnessPruner {
 impl WitnessPruner {
     /// Create a new pruner with the given retention window.
     pub fn new(retention_count: u64) -> Self {
+        Self::with_pruned_below(retention_count, 0)
+    }
+
+    /// Create a pruner restored from a durable progress cursor.
+    pub fn with_pruned_below(retention_count: u64, pruned_below: u64) -> Self {
         Self {
             retention_count,
-            pruned_below: 0,
+            pruned_below,
         }
     }
 
@@ -153,9 +158,8 @@ impl WitnessPruner {
             return Ok(WitnessPruneResult::default());
         }
 
-        // A restarted node reconstructs this in-memory cursor from zero. Bound
-        // each pass so a large finalized history cannot stall one block commit
-        // or allocate a history-sized deletion batch.
+        // Bound each pass so a large finalized history cannot stall one block
+        // commit or allocate a history-sized deletion batch.
         let pass_cutoff = cutoff.min(
             self.pruned_below
                 .saturating_add(MAX_WITNESS_PRUNE_BLOCKS_PER_PASS),
@@ -203,7 +207,7 @@ impl WitnessPruner {
             }
         }
 
-        witness_store.delete_bundles(&hashes_to_prune)?;
+        chain_store.prune_witness_bundles_below(&hashes_to_prune, advanced_to)?;
         self.pruned_below = advanced_to;
         Ok(result)
     }
@@ -359,6 +363,27 @@ mod tests {
         for hash in hashes.iter().skip(12) {
             assert!(ws.has_bundle(hash).unwrap());
         }
+    }
+
+    #[test]
+    fn durable_cursor_resumes_after_canonical_mapping_cleanup() {
+        let (_db, cs, ws) = make_store();
+        let hashes: Vec<ShellHash> = (0..12).map(|n| store_block(&cs, n)).collect();
+        for hash in &hashes {
+            store_bundle(&ws, hash);
+        }
+
+        let mut pruner = WitnessPruner::new(5);
+        pruner.prune_before(9, None, &cs, &ws).unwrap();
+        assert_eq!(cs.witness_pruned_below().unwrap(), 5);
+
+        cs.delete_canonical(2).unwrap();
+        let mut restarted = WitnessPruner::with_pruned_below(5, cs.witness_pruned_below().unwrap());
+        let result = restarted.prune_before(11, None, &cs, &ws).unwrap();
+
+        assert_eq!(result.pruned_count, 2);
+        assert_eq!(restarted.pruned_below(), 7);
+        assert_eq!(cs.witness_pruned_below().unwrap(), 7);
     }
 
     #[test]

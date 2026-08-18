@@ -55,8 +55,8 @@ pub struct BodyPruneResult {
 ///
 /// # Idempotency
 /// The pruner tracks `pruned_below` to avoid re-processing blocks that have
-/// already been expired.  Multiple calls with the same `current_head` are safe
-/// and cheap.
+/// already been expired. The cursor is committed atomically with body deletion
+/// so a restarted node can resume after canonical mappings are pruned.
 #[derive(Debug)]
 pub struct BodyPruner {
     /// Blocks below the overflow-safe retention cutoff are eligible for expiry.
@@ -72,9 +72,14 @@ impl BodyPruner {
     ///
     /// Pass `retention_count = 0` to disable pruning (archive mode).
     pub fn new(retention_count: u64) -> Self {
+        Self::with_pruned_below(retention_count, 0)
+    }
+
+    /// Create a pruner restored from a durable progress cursor.
+    pub fn with_pruned_below(retention_count: u64, pruned_below: u64) -> Self {
         Self {
             retention_count,
-            pruned_below: 0,
+            pruned_below,
         }
     }
 
@@ -108,8 +113,7 @@ impl BodyPruner {
             return Ok(BodyPruneResult::default());
         }
 
-        // The cursor is intentionally in memory, so restart can leave a large
-        // backlog. Keep each commit-time pass bounded and catch up incrementally.
+        // Keep each commit-time pass bounded and catch up incrementally.
         let pass_horizon = expiry_horizon.min(
             self.pruned_below
                 .saturating_add(MAX_BODY_PRUNE_BLOCKS_PER_PASS),
@@ -152,7 +156,7 @@ impl BodyPruner {
             }
         }
 
-        chain_store.delete_bodies(&hashes_to_prune)?;
+        chain_store.prune_bodies_below(&hashes_to_prune, pass_horizon)?;
         self.pruned_below = pass_horizon;
         Ok(result)
     }
@@ -278,6 +282,22 @@ mod tests {
         let r2 = pruner.prune_before(14, &cs).unwrap();
         assert_eq!(r2.bodies_pruned, 5);
         assert_eq!(pruner.pruned_below(), 10);
+    }
+
+    #[test]
+    fn durable_cursor_resumes_after_canonical_mapping_cleanup() {
+        let cs = setup_chain(12);
+        let mut pruner = BodyPruner::new(5);
+        pruner.prune_before(9, &cs).unwrap();
+        assert_eq!(cs.body_pruned_below().unwrap(), 5);
+
+        cs.delete_canonical(2).unwrap();
+        let mut restarted = BodyPruner::with_pruned_below(5, cs.body_pruned_below().unwrap());
+        let result = restarted.prune_before(11, &cs).unwrap();
+
+        assert_eq!(result.bodies_pruned, 2);
+        assert_eq!(restarted.pruned_below(), 7);
+        assert_eq!(cs.body_pruned_below().unwrap(), 7);
     }
 
     #[test]

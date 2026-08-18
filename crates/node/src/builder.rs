@@ -60,6 +60,8 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
         let chain_store = Arc::new(ChainStore::new(store.clone()));
         let finalized_number = chain_store.get_finalized_number()?;
         let head = chain_store.get_head_block()?;
+        let body_pruned_below = chain_store.body_pruned_below()?;
+        let witness_pruned_below = chain_store.witness_pruned_below()?;
 
         // Finality is a durable safety boundary. Validate it before constructing
         // volatile state so malformed metadata cannot be downgraded to genesis.
@@ -82,6 +84,17 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
                         "canonical mapping for finalized block #{finalized_number} is missing"
                     ))
                 })?;
+        }
+        let finalized_number = finalized_number.unwrap_or(0);
+        for (label, pruned_below) in [
+            ("body", body_pruned_below),
+            ("witness", witness_pruned_below),
+        ] {
+            if pruned_below > finalized_number {
+                return Err(NodeError::Startup(format!(
+                    "{label} pruning cursor {pruned_below} is ahead of finalized block #{finalized_number}"
+                )));
+            }
         }
 
         let cache_mb = self.config.state_cache_size_mb;
@@ -237,6 +250,40 @@ mod tests {
             result,
             Err(NodeError::Storage(StorageError::Codec(message)))
                 if message.contains("invalid finalized number encoding")
+        ));
+    }
+
+    #[test]
+    fn build_rejects_malformed_pruning_cursor() {
+        let authority = Address::from_public_key(b"test-authority", 0);
+        let config = NodeConfig::dev(authority);
+        let store = Arc::new(MemoryDb::new());
+        store.put(b"BODY_PRUNED_BELOW", &[0; 7]).unwrap();
+
+        let result = NodeBuilder::new(config, store).build();
+
+        assert!(matches!(
+            result,
+            Err(NodeError::Storage(StorageError::Codec(message)))
+                if message.contains("invalid body pruning cursor encoding")
+        ));
+    }
+
+    #[test]
+    fn build_rejects_pruning_cursor_ahead_of_finality() {
+        let authority = Address::from_public_key(b"test-authority", 0);
+        let config = NodeConfig::dev(authority);
+        let store = Arc::new(MemoryDb::new());
+        store
+            .put(b"WITNESS_PRUNED_BELOW", &1u64.to_be_bytes())
+            .unwrap();
+
+        let result = NodeBuilder::new(config, store).build();
+
+        assert!(matches!(
+            result,
+            Err(NodeError::Startup(message))
+                if message.contains("witness pruning cursor 1 is ahead of finalized block #0")
         ));
     }
 

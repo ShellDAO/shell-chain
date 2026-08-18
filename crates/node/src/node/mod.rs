@@ -865,8 +865,20 @@ impl<S: KvStore + 'static> Node<S> {
             config.pruning.witness_retention,
         ));
         let witness_store = Arc::new(WitnessStore::new(store.clone()));
-        let witness_pruner = WitnessPruner::new(config.pruning.witness_retention);
-        let body_pruner = BodyPruner::new(config.pruning.body_retention);
+        let witness_pruned_below = chain_store.witness_pruned_below().unwrap_or_else(|error| {
+            warn!(%error, "failed to restore witness-pruning cursor");
+            0
+        });
+        let body_pruned_below = chain_store.body_pruned_below().unwrap_or_else(|error| {
+            warn!(%error, "failed to restore body-pruning cursor");
+            0
+        });
+        let witness_pruner = WitnessPruner::with_pruned_below(
+            config.pruning.witness_retention,
+            witness_pruned_below,
+        );
+        let body_pruner =
+            BodyPruner::with_pruned_below(config.pruning.body_retention, body_pruned_below);
         let peer_capability_limit = if config.network.max_peers == 0 {
             crate::historical_sync::MAX_PEER_CAPABILITY_RECORDS
         } else {
@@ -8103,6 +8115,42 @@ mod tests {
 
         assert_eq!(node.body_pruner.read().pruned_below(), 2);
         assert_eq!(node.witness_pruner.read().pruned_below(), 2);
+    }
+
+    #[test]
+    fn node_restores_durable_body_and_witness_pruning_cursors() {
+        let (node, signer) = setup_node_with_retention(2, 2);
+        store_genesis(&node);
+        for _ in 0..5 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+
+        let finalized = node.chain_store.get_block_by_number(3).unwrap().unwrap();
+        node.chain_store.set_finalized_number(3).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(3, finalized.hash());
+        for number in 0..2 {
+            let hash = node
+                .chain_store
+                .get_block_hash_by_number(number)
+                .unwrap()
+                .unwrap();
+            node.settled_stark_sources.lock().insert((1, hash));
+        }
+        node.produce_block(&signer, 0).unwrap();
+
+        let restarted = Node::new(
+            node.config.clone(),
+            Arc::clone(&node.store),
+            Arc::clone(&node.chain_store),
+            Arc::clone(&node.world_state),
+            Arc::clone(&node.tx_pool),
+            Arc::clone(&node.consensus),
+        );
+
+        assert_eq!(restarted.body_pruner.read().pruned_below(), 2);
+        assert_eq!(restarted.witness_pruner.read().pruned_below(), 2);
     }
 
     #[test]
