@@ -31,8 +31,9 @@ pub(crate) use shell_core::{
     WitnessBundle, MAX_BLOB_GAS_PER_BLOCK,
 };
 pub(crate) use shell_crypto::{
-    infer_signature_type_from_address, AlgorithmRegistry, BatchVerifier, MultiVerifier,
-    PQSignature, PreVerified, Signer, Verifier, VerifyItem, ALLOWED_ALGORITHMS,
+    infer_signature_type_from_address, with_algorithm_registry_override, AlgorithmRegistry,
+    BatchVerifier, MultiVerifier, PQSignature, PreVerified, Signer, Verifier, VerifyItem,
+    ALLOWED_ALGORITHMS,
 };
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};

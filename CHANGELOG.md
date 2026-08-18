@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep provisional side-fork signature policy thread-local so concurrent
+  canonical transaction validation continues to enforce governance state.
 - Bound validated P2P payload bytes queued for node processing so the event
   count limit cannot retain many protocol-maximum messages simultaneously.
 - Isolate multinode guard-test artifacts so concurrent runs cannot interfere.

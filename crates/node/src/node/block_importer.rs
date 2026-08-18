@@ -351,10 +351,11 @@ impl<S: KvStore + 'static> Node<S> {
         // A side-fork parent's full trie is not guaranteed to be materialized
         // until adoption replay. Use the compile-time registry for provisional
         // cryptographic validation so canonical governance state cannot reject
-        // a competing candidate. Adoption replay reloads the ancestor registry
-        // and enforces every stateful algorithm transition before commit.
-        let _algorithm_registry_rollback = AlgorithmRegistryRollback::new();
-        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+        // a competing candidate. Keep that policy thread-local so concurrent
+        // canonical validation continues to enforce governance state. Adoption
+        // replay reloads the ancestor registry and enforces every stateful
+        // algorithm transition before commit.
+        let provisional_registry = AlgorithmRegistry::default();
         let verifier = MultiVerifier;
         let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
@@ -366,15 +367,17 @@ impl<S: KvStore + 'static> Node<S> {
                 None => world_state.get_nonce(&tx.from)?,
             };
 
-            validate_tx_for_import_at_block(
-                tx_for_validation.as_ref(),
-                &mut world_state,
-                &import_cs,
-                &verifier,
-                self.config.chain_id,
-                Some(expected_nonce),
-                &block.header,
-            )
+            with_algorithm_registry_override(&provisional_registry, || {
+                validate_tx_for_import_at_block(
+                    tx_for_validation.as_ref(),
+                    &mut world_state,
+                    &import_cs,
+                    &verifier,
+                    self.config.chain_id,
+                    Some(expected_nonce),
+                    &block.header,
+                )
+            })
             .map_err(|error| {
                 NodeError::Startup(format!(
                     "block {} side-fork tx validation failed: {error}",

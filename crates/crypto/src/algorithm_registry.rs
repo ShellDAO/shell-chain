@@ -16,6 +16,7 @@
 //!
 //! [`ALLOWED_ALGORITHMS`]: crate::ALLOWED_ALGORITHMS
 
+use std::cell::RefCell;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
@@ -212,12 +213,51 @@ fn global_registry() -> &'static RwLock<AlgorithmRegistry> {
     REGISTRY.get_or_init(|| RwLock::new(AlgorithmRegistry::from_allowlist()))
 }
 
+thread_local! {
+    static REGISTRY_OVERRIDES: RefCell<Vec<AlgorithmRegistry>> = const { RefCell::new(Vec::new()) };
+}
+
+struct RegistryOverrideGuard;
+
+impl Drop for RegistryOverrideGuard {
+    fn drop(&mut self) {
+        REGISTRY_OVERRIDES.with(|overrides| {
+            overrides
+                .borrow_mut()
+                .pop()
+                .expect("algorithm registry override stack must be balanced");
+        });
+    }
+}
+
+/// Run synchronous validation against a branch-local algorithm registry.
+///
+/// The override is confined to the current thread and restored on return or
+/// panic, so historical or provisional validation cannot expose its policy to
+/// concurrent canonical validation.
+pub fn with_algorithm_registry_override<T>(
+    registry: &AlgorithmRegistry,
+    operation: impl FnOnce() -> T,
+) -> T {
+    REGISTRY_OVERRIDES.with(|overrides| overrides.borrow_mut().push(registry.clone()));
+    let _guard = RegistryOverrideGuard;
+    operation()
+}
+
 /// Convenience function: check whether `algo` is allowed according to the
 /// global compile-time registry.
 ///
 /// Callers that cannot easily obtain a `&AlgorithmRegistry` reference should
 /// use this instead of reaching for `ALLOWED_ALGORITHMS` directly.
 pub fn is_algorithm_allowed(algo: SignatureType) -> bool {
+    if let Some(allowed) = REGISTRY_OVERRIDES.with(|overrides| {
+        overrides
+            .borrow()
+            .last()
+            .map(|registry| registry.is_allowed(algo))
+    }) {
+        return allowed;
+    }
     AlgorithmRegistry::global().is_allowed(algo)
 }
 
@@ -352,6 +392,31 @@ mod tests {
         }];
         let reg = AlgorithmRegistry { entries };
         assert!(!reg.is_allowed(SignatureType::Dilithium3));
+    }
+
+    #[test]
+    fn registry_override_is_thread_local_and_restored() {
+        let algorithm = SignatureType::Dilithium3;
+        let global_allowed = is_algorithm_allowed(algorithm);
+        let mut provisional = AlgorithmRegistry::default();
+        if global_allowed {
+            provisional.deprecate(algorithm);
+        } else {
+            provisional.activate(algorithm);
+        }
+
+        with_algorithm_registry_override(&provisional, || {
+            assert_eq!(is_algorithm_allowed(algorithm), !global_allowed);
+            assert_eq!(
+                std::thread::spawn(move || is_algorithm_allowed(algorithm))
+                    .join()
+                    .unwrap(),
+                global_allowed,
+                "another thread must continue using canonical policy"
+            );
+        });
+
+        assert_eq!(is_algorithm_allowed(algorithm), global_allowed);
     }
 
     #[test]
