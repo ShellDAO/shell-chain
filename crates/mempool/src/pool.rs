@@ -778,7 +778,7 @@ impl TxPool {
 
         let Some(intrinsic) = compute_intrinsic_gas(
             tx.tx.data.as_ref(),
-            tx.tx.is_contract_creation(),
+            tx.tx.is_contract_creation() && !tx.is_aa_bundle(),
             &tx.tx.access_list,
         )
         .checked_add(aa_extra_gas) else {
@@ -1855,6 +1855,63 @@ mod tests {
 
         let err = insert_rich(&pool, signed, &verifier, &mut ws, &cs).unwrap_err();
         assert!(matches!(err, MempoolError::GasTooLow { .. }));
+    }
+
+    #[test]
+    fn accepts_aa_outer_envelope_without_contract_creation_surcharge() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+        let recipient = test_address(b"recipient-placeholder-key-data-for-address");
+        let tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::default(),
+            gas_limit: 71_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 50,
+            access_list: None,
+            tx_type: AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let bundle = AaBundle {
+            inner_calls: vec![InnerCall {
+                to: Some(recipient),
+                value: U256::ZERO,
+                data: Bytes::default(),
+                gas_limit: 50_000,
+            }],
+            ..Default::default()
+        };
+        let placeholder_sig = signer.sign(b"placeholder-aa-signature").unwrap();
+        let unsigned = SignedTransaction::with_aa_bundle(
+            from,
+            tx.clone(),
+            placeholder_sig,
+            PubkeyMode::Embedded(pubkey.clone()),
+            bundle.clone(),
+        )
+        .unwrap();
+        let signature = signer
+            .sign(unsigned.sender_signing_hash().as_bytes())
+            .unwrap();
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            signature,
+            PubkeyMode::Embedded(pubkey),
+            bundle,
+        )
+        .unwrap();
+
+        assert!(insert_rich(&pool, signed, &verifier, &mut ws, &cs).is_ok());
     }
 
     #[test]
