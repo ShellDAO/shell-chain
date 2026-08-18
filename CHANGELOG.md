@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Check direct-message pending capacity before charging the outbound bandwidth
+  budget so locally dropped overload does not suppress later sendable traffic.
 - Apply witness-retention cleanup against finality advanced by preferred-fork
   adoption instead of waiting for a later finality event.
 - Update `h2` to 0.4.16 to reject unbounded empty DATA frames.

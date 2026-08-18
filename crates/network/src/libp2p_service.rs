@@ -214,7 +214,8 @@ impl ExplicitMdnsPeers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectMessageAdmission {
     Send,
-    Drop,
+    PendingLimit,
+    BandwidthLimit,
 }
 
 impl PendingDirectMessages {
@@ -258,13 +259,18 @@ impl PendingDirectMessages {
 
 fn direct_message_admission(
     pending: &PendingDirectMessages,
+    bandwidth: &BandwidthTracker,
     data_len: usize,
 ) -> DirectMessageAdmission {
-    if pending.can_accept(data_len) {
-        DirectMessageAdmission::Send
-    } else {
-        DirectMessageAdmission::Drop
+    if !pending.can_accept(data_len) {
+        return DirectMessageAdmission::PendingLimit;
     }
+
+    if !bandwidth.record_outbound(data_len as u64) {
+        return DirectMessageAdmission::BandwidthLimit;
+    }
+
+    DirectMessageAdmission::Send
 }
 
 fn take_direct_message_fallback(
@@ -982,32 +988,34 @@ async fn swarm_loop(
                         }
                     }
                     Some(SwarmCommand::SendToPeer { peer, topic, data }) => {
-                        let data_len = data.len() as u64;
-                        if !loop_config.bandwidth.record_outbound(data_len) {
-                            warn!(
-                                bytes = data_len,
-                                %peer,
-                                "Outbound bandwidth limit exceeded - skipping direct message"
-                            );
-                        } else {
-                            let data: Arc<[u8]> = data.into();
-                            match direct_message_admission(&state.pending_direct_messages, data.len()) {
-                                DirectMessageAdmission::Send => {
-                                    let request_id = swarm
-                                        .behaviour_mut()
-                                        .direct_message
-                                        .send_request(&peer, Arc::clone(&data));
-                                    state.pending_direct_messages.insert(
-                                        request_id,
-                                        PendingDirectMessage { topic, data },
-                                    );
-                                }
-                                DirectMessageAdmission::Drop => {
-                                    warn!(
-                                        %peer,
-                                        "direct message pending limit reached; dropping peer-targeted message"
-                                    );
-                                }
+                        let data: Arc<[u8]> = data.into();
+                        match direct_message_admission(
+                            &state.pending_direct_messages,
+                            &loop_config.bandwidth,
+                            data.len(),
+                        ) {
+                            DirectMessageAdmission::Send => {
+                                let request_id = swarm
+                                    .behaviour_mut()
+                                    .direct_message
+                                    .send_request(&peer, Arc::clone(&data));
+                                state.pending_direct_messages.insert(
+                                    request_id,
+                                    PendingDirectMessage { topic, data },
+                                );
+                            }
+                            DirectMessageAdmission::PendingLimit => {
+                                warn!(
+                                    %peer,
+                                    "direct message pending limit reached; dropping peer-targeted message"
+                                );
+                            }
+                            DirectMessageAdmission::BandwidthLimit => {
+                                warn!(
+                                    bytes = data.len(),
+                                    %peer,
+                                    "Outbound bandwidth limit exceeded - skipping direct message"
+                                );
                             }
                         }
                     }
@@ -1988,10 +1996,23 @@ mod tests {
     #[test]
     fn direct_message_overload_drops_instead_of_broadcasting() {
         let pending = PendingDirectMessages::new(0, 0);
+        let bandwidth = BandwidthTracker::new(0, 1);
 
         assert_eq!(
-            direct_message_admission(&pending, 1),
-            DirectMessageAdmission::Drop
+            direct_message_admission(&pending, &bandwidth, 1),
+            DirectMessageAdmission::PendingLimit
+        );
+        assert_eq!(bandwidth.stats().total_outbound, 0);
+    }
+
+    #[test]
+    fn direct_message_bandwidth_limit_applies_after_pending_admission() {
+        let pending = PendingDirectMessages::new(1, 2);
+        let bandwidth = BandwidthTracker::new(0, 1);
+
+        assert_eq!(
+            direct_message_admission(&pending, &bandwidth, 2),
+            DirectMessageAdmission::BandwidthLimit
         );
     }
 
