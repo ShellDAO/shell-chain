@@ -43,6 +43,9 @@ pub enum TxValidationError {
     #[error("unsupported transaction type: {0:#x}")]
     UnsupportedTransactionType(u8),
 
+    #[error("max priority fee per gas {priority_fee} exceeds max fee per gas {max_fee}")]
+    PriorityFeeAboveMaxFee { priority_fee: u64, max_fee: u64 },
+
     #[error("gas limit below intrinsic: {0}")]
     GasTooLow(u64),
 
@@ -128,6 +131,7 @@ impl TxValidationError {
             Self::InsufficientBalance { .. } => "insufficient_balance",
             Self::ChainIdMismatch { .. } => "chain_id_mismatch",
             Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
+            Self::PriorityFeeAboveMaxFee { .. } => "priority_fee_above_max_fee",
             Self::GasTooLow(_) => "gas_too_low",
             Self::PubkeyConflict => "pubkey_conflict",
             Self::DisallowedAlgorithm(_) => "disallowed_algorithm",
@@ -166,6 +170,16 @@ pub fn validate_transaction_type(tx_type: u8) -> Result<(), TxValidationError> {
     } else {
         Err(TxValidationError::UnsupportedTransactionType(tx_type))
     }
+}
+
+fn validate_fee_caps(tx: &Transaction) -> Result<(), TxValidationError> {
+    if tx.max_priority_fee_per_gas > tx.max_fee_per_gas {
+        return Err(TxValidationError::PriorityFeeAboveMaxFee {
+            priority_fee: tx.max_priority_fee_per_gas,
+            max_fee: tx.max_fee_per_gas,
+        });
+    }
+    Ok(())
 }
 
 fn max_transaction_gas_cost(tx: &Transaction) -> Option<U256> {
@@ -210,6 +224,7 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     }
 
     validate_transaction_type(tx.tx_type)?;
+    validate_fee_caps(tx)?;
 
     // 1b. Access list size validation
     if let Err(msg) = tx.validate_access_list() {
@@ -437,6 +452,7 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
     }
 
     validate_transaction_type(tx.tx_type)?;
+    validate_fee_caps(tx)?;
 
     // 2. Access list size
     if let Err(msg) = tx.validate_access_list() {
@@ -853,6 +869,38 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxValidationError::ChainIdMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_priority_fee_above_max_fee() {
+        let signer = make_signer();
+        let (mut ws, cs) = setup_stores();
+        let from = signer_address(&signer);
+        fund_account(&mut ws, &from, U256::from(1_000_000));
+
+        let mut tx = simple_transfer(test_chain_id(), 0);
+        tx.max_fee_per_gas = 9;
+        tx.max_priority_fee_per_gas = 10;
+        let signed = sign_tx(&signer, tx, true);
+
+        let result = validate_tx(&signed, &mut ws, &cs, &DilithiumVerifier, test_chain_id());
+        assert!(matches!(
+            result,
+            Err(TxValidationError::PriorityFeeAboveMaxFee {
+                priority_fee: 10,
+                max_fee: 9,
+            })
+        ));
+
+        let result =
+            validate_tx_for_import(&signed, &mut ws, &cs, &DilithiumVerifier, test_chain_id());
+        assert!(matches!(
+            result,
+            Err(TxValidationError::PriorityFeeAboveMaxFee {
+                priority_fee: 10,
+                max_fee: 9,
+            })
         ));
     }
 
@@ -2041,6 +2089,13 @@ mod tests {
                     have: U256::from(10u64),
                 },
             ),
+            (
+                "priority_fee_above_max_fee",
+                TxValidationError::PriorityFeeAboveMaxFee {
+                    priority_fee: 10,
+                    max_fee: 9,
+                },
+            ),
         ];
         for (expected_label, err) in cases {
             let label = err.kind_str();
@@ -2075,6 +2130,10 @@ mod tests {
                 got: 2,
             },
             TxValidationError::UnsupportedTransactionType(4),
+            TxValidationError::PriorityFeeAboveMaxFee {
+                priority_fee: 2,
+                max_fee: 1,
+            },
             TxValidationError::GasTooLow(21_000),
             TxValidationError::PubkeyConflict,
             TxValidationError::InvalidAccessList("x".into()),
