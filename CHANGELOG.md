@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- Scope provisional side-fork signature policy once per block instead of once
+  per transaction.
 - Count serialized mempool transaction bytes without allocating and discarding
   a full JSON buffer during every admission attempt.
 - Reuse validated reorganization blocks during commit preparation instead of

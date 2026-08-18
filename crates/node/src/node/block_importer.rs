@@ -360,14 +360,15 @@ impl<S: KvStore + 'static> Node<S> {
         let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
 
-        for tx in &block.transactions {
-            let tx_for_validation = tx_for_import_validation(tx, &validation_pubkeys, &import_cs)?;
-            let expected_nonce = match validation_nonces.get(&tx.from) {
-                Some(next_nonce) => *next_nonce,
-                None => world_state.get_nonce(&tx.from)?,
-            };
+        with_algorithm_registry_override(&provisional_registry, || {
+            for tx in &block.transactions {
+                let tx_for_validation =
+                    tx_for_import_validation(tx, &validation_pubkeys, &import_cs)?;
+                let expected_nonce = match validation_nonces.get(&tx.from) {
+                    Some(next_nonce) => *next_nonce,
+                    None => world_state.get_nonce(&tx.from)?,
+                };
 
-            with_algorithm_registry_override(&provisional_registry, || {
                 validate_tx_for_import_at_block(
                     tx_for_validation.as_ref(),
                     &mut world_state,
@@ -377,31 +378,31 @@ impl<S: KvStore + 'static> Node<S> {
                     Some(expected_nonce),
                     &block.header,
                 )
-            })
-            .map_err(|error| {
-                NodeError::Startup(format!(
-                    "block {} side-fork tx validation failed: {error}",
-                    block.number()
-                ))
-            })?;
+                .map_err(|error| {
+                    NodeError::Startup(format!(
+                        "block {} side-fork tx validation failed: {error}",
+                        block.number()
+                    ))
+                })?;
 
-            let next_nonce = expected_nonce.checked_add(1).ok_or_else(|| {
-                NodeError::Startup(format!(
-                    "block {} side-fork tx validation exhausted nonce space for {}",
-                    block.number(),
-                    tx.from
-                ))
-            })?;
-            validation_nonces.insert(tx.from, next_nonce);
+                let next_nonce = expected_nonce.checked_add(1).ok_or_else(|| {
+                    NodeError::Startup(format!(
+                        "block {} side-fork tx validation exhausted nonce space for {}",
+                        block.number(),
+                        tx.from
+                    ))
+                })?;
+                validation_nonces.insert(tx.from, next_nonce);
 
-            if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
-                validation_pubkeys
-                    .entry(tx.from)
-                    .or_insert_with(|| pubkey.clone());
+                if let shell_core::PubkeyMode::Embedded(pubkey) = &tx.pubkey_mode {
+                    validation_pubkeys
+                        .entry(tx.from)
+                        .or_insert_with(|| pubkey.clone());
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn verify_import_economics(&self, block: &Block, parent: &Block) -> Result<(), NodeError> {
