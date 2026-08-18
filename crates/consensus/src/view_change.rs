@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use shell_primitives::{Address, ShellHash};
 
+use crate::round_robin_index;
+
 pub const VIEW_CHANGE_TIMEOUT_MS: u64 = 10_000;
 
 /// Domain tag for the view-change signing payload.
@@ -166,7 +168,7 @@ impl ViewChangeState {
 
     pub fn select_proposer(view: u64, authorities: &[Address]) -> Address {
         assert!(!authorities.is_empty(), "authority set must not be empty");
-        authorities[(view as usize) % authorities.len()]
+        authorities[round_robin_index(view, authorities.len()).unwrap_or(0)]
     }
 
     pub fn reset_for_block(&mut self, now_ms: u64) {
@@ -215,6 +217,16 @@ mod tests {
         assert_eq!(ViewChangeState::select_proposer(1, &authorities), addr(2));
         assert_eq!(ViewChangeState::select_proposer(2, &authorities), addr(3));
         assert_eq!(ViewChangeState::select_proposer(3, &authorities), addr(1));
+    }
+
+    #[test]
+    fn select_proposer_handles_full_view_range() {
+        let authorities = (1..=7).map(addr).collect::<Vec<_>>();
+
+        assert_eq!(
+            ViewChangeState::select_proposer(u64::MAX, &authorities),
+            addr(2)
+        );
     }
 
     #[test]

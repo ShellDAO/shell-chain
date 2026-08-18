@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep view-change proposer rotation deterministic across target pointer widths
+  for view numbers above the native `usize` range.
 - Keep provisional side-fork signature policy thread-local so concurrent
   canonical transaction validation continues to enforce governance state.
 - Bound validated P2P payload bytes queued for node processing so the event
