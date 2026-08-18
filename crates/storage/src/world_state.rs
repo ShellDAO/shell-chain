@@ -12,6 +12,14 @@ use shell_primitives::{keccak256, Address, ShellHash, U256};
 
 use crate::{KvStore, MerkleTrie, StorageError, WriteBatch};
 
+const MAX_SNAPSHOT_TRIE_DEPTH: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SnapshotTrieKind {
+    Accounts,
+    Storage,
+}
+
 /// Approximate resident size of one account-cache entry.
 ///
 /// Besides the decoded account and address key, each LRU entry needs linked-list
@@ -664,6 +672,18 @@ impl<S: KvStore + 'static> WorldState<S> {
         Ok(visited)
     }
 
+    /// Validate every trie node reachable from an imported state root.
+    pub fn validate_snapshot_nodes(store: &S, root: ShellHash) -> Result<(), StorageError> {
+        let mut visited = HashSet::new();
+        Self::validate_hashed_snapshot_node(
+            store,
+            root,
+            SnapshotTrieKind::Accounts,
+            &mut visited,
+            0,
+        )
+    }
+
     /// Delete all hashed trie nodes reachable from the given state root except
     /// those explicitly protected by `protected_nodes`.
     pub fn delete_state_snapshot(
@@ -702,6 +722,184 @@ impl<S: KvStore + 'static> WorldState<S> {
         };
         visited.insert(node_hash);
         Self::collect_hashed_refs_in_raw(store, &raw_node, visited)
+    }
+
+    fn validate_hashed_snapshot_node(
+        store: &S,
+        node_hash: ShellHash,
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
+        depth: usize,
+    ) -> Result<(), StorageError> {
+        if depth > MAX_SNAPSHOT_TRIE_DEPTH {
+            return Err(StorageError::Trie(
+                "state trie exceeds maximum traversal depth".into(),
+            ));
+        }
+        // Ethereum's empty-trie root is not backed by a database entry.
+        if node_hash == keccak256(&[0x80]) || !visited.insert((node_hash, kind)) {
+            return Ok(());
+        }
+        let raw_node = store.get(node_hash.as_bytes())?.ok_or_else(|| {
+            StorageError::State(format!("state trie node {node_hash} is missing"))
+        })?;
+        if keccak256(&raw_node) != node_hash {
+            return Err(StorageError::State(format!(
+                "state trie node {node_hash} does not match its content hash"
+            )));
+        }
+        Self::validate_snapshot_node_raw(store, &raw_node, kind, visited, depth)
+    }
+
+    fn validate_snapshot_node_raw(
+        store: &S,
+        raw_node: &[u8],
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
+        depth: usize,
+    ) -> Result<(), StorageError> {
+        if depth > MAX_SNAPSHOT_TRIE_DEPTH {
+            return Err(StorageError::Trie(
+                "state trie exceeds maximum traversal depth".into(),
+            ));
+        }
+        let rlp = Rlp::new(raw_node);
+        let payload = rlp
+            .payload_info()
+            .map_err(|e| StorageError::Trie(e.to_string()))?;
+        if payload.total() != raw_node.len() {
+            return Err(StorageError::Trie(
+                "state trie node has trailing bytes".into(),
+            ));
+        }
+        match rlp
+            .prototype()
+            .map_err(|e| StorageError::Trie(e.to_string()))?
+        {
+            Prototype::Data(0) => Ok(()),
+            Prototype::List(2) => {
+                let compact = rlp
+                    .at(0)
+                    .and_then(|item| item.data())
+                    .map_err(|e| StorageError::Trie(e.to_string()))?;
+                if Self::validate_snapshot_compact_path(compact)? {
+                    let value = rlp
+                        .at(1)
+                        .and_then(|item| item.data())
+                        .map_err(|e| StorageError::Trie(e.to_string()))?;
+                    Self::validate_snapshot_leaf(store, value, kind, visited, depth)
+                } else {
+                    let child = rlp.at(1).map_err(|e| StorageError::Trie(e.to_string()))?;
+                    Self::validate_snapshot_child(store, child.as_raw(), kind, visited, depth + 1)
+                }
+            }
+            Prototype::List(17) => {
+                for index in 0..16 {
+                    let child = rlp
+                        .at(index)
+                        .map_err(|e| StorageError::Trie(e.to_string()))?;
+                    Self::validate_snapshot_child(store, child.as_raw(), kind, visited, depth + 1)?;
+                }
+                let value = rlp
+                    .at(16)
+                    .and_then(|item| item.data())
+                    .map_err(|e| StorageError::Trie(e.to_string()))?;
+                if value.is_empty() {
+                    Ok(())
+                } else {
+                    Self::validate_snapshot_leaf(store, value, kind, visited, depth)
+                }
+            }
+            _ => Err(StorageError::Trie("invalid state trie node shape".into())),
+        }
+    }
+
+    fn validate_snapshot_child(
+        store: &S,
+        raw_child: &[u8],
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
+        depth: usize,
+    ) -> Result<(), StorageError> {
+        let child = Rlp::new(raw_child);
+        match child
+            .prototype()
+            .map_err(|e| StorageError::Trie(e.to_string()))?
+        {
+            Prototype::Data(0) => Ok(()),
+            Prototype::Data(32) => {
+                let hash = ShellHash::try_from_slice(
+                    child
+                        .data()
+                        .map_err(|e| StorageError::Trie(e.to_string()))?,
+                )
+                .map_err(|e| StorageError::Trie(e.to_string()))?;
+                Self::validate_hashed_snapshot_node(store, hash, kind, visited, depth)
+            }
+            Prototype::Data(_) => Err(StorageError::Trie(
+                "invalid state trie child reference".into(),
+            )),
+            _ if raw_child.len() >= 32 => Err(StorageError::Trie(
+                "oversized state trie child must use a hash reference".into(),
+            )),
+            _ => Self::validate_snapshot_node_raw(store, raw_child, kind, visited, depth),
+        }
+    }
+
+    fn validate_snapshot_leaf(
+        store: &S,
+        value: &[u8],
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
+        depth: usize,
+    ) -> Result<(), StorageError> {
+        match kind {
+            SnapshotTrieKind::Storage => ShellHash::try_from_slice(value)
+                .map(|_| ())
+                .map_err(|e| StorageError::Codec(e.to_string())),
+            SnapshotTrieKind::Accounts => {
+                let mut rest = value;
+                let account =
+                    Account::decode(&mut rest).map_err(|e| StorageError::Codec(e.to_string()))?;
+                if !rest.is_empty() {
+                    return Err(StorageError::Codec(
+                        "account record has trailing bytes".into(),
+                    ));
+                }
+                if account.storage_root != ShellHash::ZERO {
+                    Self::validate_hashed_snapshot_node(
+                        store,
+                        account.storage_root,
+                        SnapshotTrieKind::Storage,
+                        visited,
+                        depth + 1,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_snapshot_compact_path(compact: &[u8]) -> Result<bool, StorageError> {
+        let first = compact
+            .first()
+            .ok_or_else(|| StorageError::Trie("state trie compact path is empty".into()))?;
+        let flag = first >> 4;
+        if flag > 3 || (flag & 1 == 0 && first & 0x0f != 0) {
+            return Err(StorageError::Trie(
+                "state trie compact path has invalid flags".into(),
+            ));
+        }
+        let is_leaf = flag & 2 != 0;
+        let path_nibbles = (compact.len() - 1)
+            .saturating_mul(2)
+            .saturating_add(usize::from(flag & 1));
+        if !is_leaf && path_nibbles == 0 {
+            return Err(StorageError::Trie(
+                "state trie extension path is empty".into(),
+            ));
+        }
+        Ok(is_leaf)
     }
 
     fn collect_hashed_refs_in_raw(
@@ -967,6 +1165,64 @@ mod tests {
         ws2.add_balance(&addr, U256::from(100)).unwrap();
 
         assert_eq!(ws1.state_root().unwrap(), ws2.state_root().unwrap());
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_missing_descendant_node() {
+        let store = test_store();
+        let mut state = WorldState::new(Arc::clone(&store));
+        for seed in 1u8..=8 {
+            state
+                .set_balance(&Address::from([seed; 20]), U256::from(seed))
+                .unwrap();
+        }
+        let root = state.state_root().unwrap();
+        let nodes = WorldState::collect_snapshot_node_hashes(store.as_ref(), root).unwrap();
+        let descendant = nodes
+            .into_iter()
+            .find(|node| *node != root)
+            .expect("multi-account trie should contain a hashed descendant");
+
+        store.delete(descendant.as_bytes()).unwrap();
+
+        let error = WorldState::validate_snapshot_nodes(store.as_ref(), root).unwrap_err();
+        assert!(error.to_string().contains("state trie node"));
+        assert!(error.to_string().contains("is missing"));
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_miskeyed_node_content() {
+        let store = test_store();
+        let mut state = WorldState::new(Arc::clone(&store));
+        state
+            .set_balance(&Address::from([1; 20]), U256::from(1))
+            .unwrap();
+        let root = state.state_root().unwrap();
+
+        store.put(root.as_bytes(), &[0x80]).unwrap();
+
+        let error = WorldState::validate_snapshot_nodes(store.as_ref(), root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its content hash"));
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_missing_account_storage_root() {
+        let store = test_store();
+        let mut state = WorldState::new(Arc::clone(&store));
+        let account = Address::from([1; 20]);
+        state
+            .set_storage(&account, &keccak256(b"slot"), &keccak256(b"value"))
+            .unwrap();
+        let root = state.state_root().unwrap();
+        let storage_root = state.get_account(&account).unwrap().unwrap().storage_root;
+
+        store.delete(storage_root.as_bytes()).unwrap();
+
+        let error = WorldState::validate_snapshot_nodes(store.as_ref(), root).unwrap_err();
+        assert!(error.to_string().contains("state trie node"));
+        assert!(error.to_string().contains("is missing"));
     }
 
     #[test]
