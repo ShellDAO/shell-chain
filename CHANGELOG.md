@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Remove the redundant wall-clock batch-verification timing comparison from
+  the unit suite; performance coverage remains in the Criterion benchmark.
 - Reject account-trie records with trailing RLP bytes instead of accepting
   non-canonical persisted state.
 - Count malformed direct-message streams as peer violations so repeatedly
