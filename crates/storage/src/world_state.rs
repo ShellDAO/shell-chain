@@ -137,8 +137,14 @@ impl<S: KvStore + 'static> WorldState<S> {
         let key = Self::account_key(address);
         let result = match self.account_trie.get(key.as_bytes())? {
             Some(data) => {
-                let account = Account::decode(&mut &data[..])
-                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                let mut rest = &data[..];
+                let account =
+                    Account::decode(&mut rest).map_err(|e| StorageError::Codec(e.to_string()))?;
+                if !rest.is_empty() {
+                    return Err(StorageError::Codec(
+                        "account record has trailing bytes".into(),
+                    ));
+                }
                 Some(account)
             }
             None => None,
@@ -870,6 +876,22 @@ mod tests {
         let loaded = ws.get_account(&addr).unwrap().unwrap();
         assert_eq!(loaded.balance, U256::from(1000));
         assert_eq!(loaded.nonce, 0);
+    }
+
+    #[test]
+    fn get_account_rejects_trailing_rlp_bytes() {
+        let mut ws = WorldState::new(test_store());
+        let addr = test_address(b"non-canonical-account");
+        let account = Account::new_user_account(keccak256(b"account-key"), U256::from(1));
+        let mut encoded = Vec::new();
+        account.encode(&mut encoded);
+        encoded.push(0);
+
+        let key = WorldState::<MemoryDb>::account_key(&addr);
+        ws.account_trie.insert(key.as_bytes(), &encoded).unwrap();
+
+        let error = ws.get_account(&addr).unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"));
     }
 
     #[test]

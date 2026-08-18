@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject account-trie records with trailing RLP bytes instead of accepting
+  non-canonical persisted state.
 - Count malformed direct-message streams as peer violations so repeatedly
   oversized payloads reach the configured temporary-ban threshold.
 - Make oversized transaction-gossip rejection coverage synchronize on a valid
