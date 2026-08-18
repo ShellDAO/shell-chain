@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject unknown `newPendingTransactions` subscription option fields instead
+  of silently treating misspelled requests as hash-only subscriptions.
 - Remove the redundant wall-clock batch-verification timing comparison from
   the unit suite; performance coverage remains in the Criterion benchmark.
 - Reject account-trie records with trailing RLP bytes instead of accepting

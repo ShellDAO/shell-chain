@@ -150,7 +150,8 @@ filter fields are rejected as invalid parameters rather than ignored.
 
 `newPendingTransactions` currently returns hashes only. Requests with
 `includeTransactions: true` are rejected because full transaction objects are
-not supported.
+not supported. Option objects may contain only `includeTransactions`; unknown
+fields are rejected as invalid parameters.
 
 ### eth_unsubscribe (WebSocket only)
 

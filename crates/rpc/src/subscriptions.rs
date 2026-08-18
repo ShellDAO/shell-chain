@@ -377,15 +377,22 @@ fn validate_pending_tx_params(
         Some(serde_json::Value::Bool(true)) => Err(invalid_params_err(
             "newPendingTransactions full transaction objects are not supported",
         )),
-        Some(serde_json::Value::Object(obj)) => match obj.get("includeTransactions") {
-            None | Some(serde_json::Value::Bool(false)) => Ok(()),
-            Some(serde_json::Value::Bool(true)) => Err(invalid_params_err(
-                "newPendingTransactions full transaction objects are not supported",
-            )),
-            Some(_) => Err(invalid_params_err(
-                "newPendingTransactions includeTransactions must be boolean",
-            )),
-        },
+        Some(serde_json::Value::Object(obj)) => {
+            if obj.keys().any(|field| field != "includeTransactions") {
+                return Err(invalid_params_err(
+                    "newPendingTransactions params object only supports includeTransactions",
+                ));
+            }
+            match obj.get("includeTransactions") {
+                None | Some(serde_json::Value::Bool(false)) => Ok(()),
+                Some(serde_json::Value::Bool(true)) => Err(invalid_params_err(
+                    "newPendingTransactions full transaction objects are not supported",
+                )),
+                Some(_) => Err(invalid_params_err(
+                    "newPendingTransactions includeTransactions must be boolean",
+                )),
+            }
+        }
         Some(_) => Err(invalid_params_err(
             "newPendingTransactions params must be a boolean or object",
         )),
@@ -1209,6 +1216,8 @@ mod tests {
             serde_json::json!("true"),
             serde_json::json!([]),
             serde_json::json!({"includeTransactions": "true"}),
+            serde_json::json!({"includeTransaction": true}),
+            serde_json::json!({"includeTransactions": false, "extra": false}),
         ] {
             let err = validate_pending_tx_params(Some(&value)).unwrap_err();
             assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
