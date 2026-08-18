@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Remove a machine-speed-dependent TPS assertion from the deterministic test
+  suite; production throughput remains covered by the load-test harness.
 - Reject unsupported STARK amendment and proof-pointer versions instead of
   interpreting them with current protocol semantics.
 - Require published node archives to be readable gzip tar packages containing
