@@ -95,62 +95,38 @@ pub fn build_trace(
     // to ensure at least one stable padding row at the end.
     let trace_len = ((entries.len() + 1).max(8)).next_power_of_two();
 
-    // Pre-compute all accumulator and leaf values.
-    let mut acc_lo = BaseElement::ZERO;
-    let mut acc_hi = BaseElement::ZERO;
-    let mut accs_lo: Vec<BaseElement> = Vec::with_capacity(trace_len);
-    let mut accs_hi: Vec<BaseElement> = Vec::with_capacity(trace_len);
-    let mut leafs_lo: Vec<BaseElement> = Vec::with_capacity(trace_len);
-    let mut leafs_hi: Vec<BaseElement> = Vec::with_capacity(trace_len);
-
-    for entry in entries.iter() {
-        let (lo, hi) = entry.to_field_elements();
-        accs_lo.push(acc_lo);
-        accs_hi.push(acc_hi);
-        leafs_lo.push(lo);
-        leafs_hi.push(hi);
-        acc_lo = acc_lo.exp(3u32.into()) + lo;
-        acc_hi = acc_hi.exp(3u32.into()) + hi;
-    }
-
-    // Padding rows: keep both accumulators stable.
-    // acc_lo^3 + pad_lo = acc_lo  =>  pad_lo = acc_lo - acc_lo^3
-    for _ in entries.len()..trace_len {
-        let pad_lo = acc_lo - acc_lo.exp(3u32.into());
-        let pad_hi = acc_hi - acc_hi.exp(3u32.into());
-        accs_lo.push(acc_lo);
-        accs_hi.push(acc_hi);
-        leafs_lo.push(pad_lo);
-        leafs_hi.push(pad_hi);
-    }
-
-    let batch_root_lo = acc_lo;
-    let batch_root_hi = acc_hi;
-
-    // Fill the Winterfell TraceTable.
-    let al = accs_lo.clone();
-    let ah = accs_hi.clone();
-    let ll = leafs_lo.clone();
-    let lh = leafs_hi.clone();
+    // Fill the Winterfell TraceTable directly so the four columns are not
+    // allocated and duplicated before being copied into the table.
+    let (first_lo, first_hi) = entries[0].to_field_elements();
     let mut trace = TraceTable::new(TRACE_WIDTH, trace_len);
     trace.fill(
         |state| {
-            state[COL_ACC_LO] = al[0];
-            state[COL_ACC_HI] = ah[0];
-            state[COL_LEAF_LO] = ll[0];
-            state[COL_LEAF_HI] = lh[0];
+            state[COL_LEAF_LO] = first_lo;
+            state[COL_LEAF_HI] = first_hi;
         },
         |step, state| {
             let next = step + 1;
-            if next < trace_len {
-                state[COL_ACC_LO] = accs_lo[next];
-                state[COL_ACC_HI] = accs_hi[next];
-                state[COL_LEAF_LO] = leafs_lo[next];
-                state[COL_LEAF_HI] = leafs_hi[next];
-            }
+            let acc_lo = state[COL_ACC_LO].exp(3u32.into()) + state[COL_LEAF_LO];
+            let acc_hi = state[COL_ACC_HI].exp(3u32.into()) + state[COL_LEAF_HI];
+            state[COL_ACC_LO] = acc_lo;
+            state[COL_ACC_HI] = acc_hi;
+            let (leaf_lo, leaf_hi) = entries
+                .get(next)
+                .map(SigBatchEntry::to_field_elements)
+                .unwrap_or_else(|| {
+                    // Keep both accumulators stable throughout the padding rows.
+                    (
+                        acc_lo - acc_lo.exp(3u32.into()),
+                        acc_hi - acc_hi.exp(3u32.into()),
+                    )
+                });
+            state[COL_LEAF_LO] = leaf_lo;
+            state[COL_LEAF_HI] = leaf_hi;
         },
     );
 
+    let batch_root_lo = trace.get(COL_ACC_LO, trace_len - 1);
+    let batch_root_hi = trace.get(COL_ACC_HI, trace_len - 1);
     (trace, batch_root_lo, batch_root_hi)
 }
 
