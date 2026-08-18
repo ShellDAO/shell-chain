@@ -527,6 +527,7 @@ fn build_swarm_with_identity(
     let enable_kademlia = config.enable_kademlia;
     let enable_peer_scoring = config.enable_peer_scoring;
     let enable_relay = config.enable_relay;
+    let enable_relay_server = config.enable_relay_server;
     let enable_dcutr = config.enable_dcutr;
     let enable_autonat = config.enable_autonat;
     let blocks_topic_name = config.blocks_topic.clone();
@@ -744,7 +745,7 @@ fn build_swarm_with_identity(
             };
 
             // Relay server with amplification limits (F-071).
-            let relay_server_behaviour: Option<relay::Behaviour> = if relay_behaviour.is_some() {
+            let relay_server_behaviour: Option<relay::Behaviour> = if enable_relay_server {
                 let relay_cfg = relay::Config {
                     max_reservations: 128,
                     max_circuits: 16,
@@ -2459,6 +2460,7 @@ mod tests {
     fn config_defaults_enable_nat_traversal() {
         let config = NetworkConfig::default();
         assert!(config.enable_relay);
+        assert!(!config.enable_relay_server);
         assert!(config.enable_dcutr);
         assert!(config.enable_autonat);
     }
@@ -2480,6 +2482,7 @@ mod tests {
     fn build_swarm_with_relay_dcutr_autonat() {
         let config = NetworkConfig {
             enable_relay: true,
+            enable_relay_server: false,
             enable_dcutr: true,
             enable_autonat: true,
             enable_mdns: false,
@@ -2487,11 +2490,30 @@ mod tests {
             enable_peer_scoring: false,
             ..Default::default()
         };
-        let swarm = build_swarm(&config);
+        let swarm = build_swarm(&config).expect("NAT traversal should build");
+        assert!(swarm.behaviour().relay_client.is_enabled());
         assert!(
-            swarm.is_ok(),
-            "build_swarm should succeed with NAT traversal enabled"
+            !swarm.behaviour().relay_server.is_enabled(),
+            "enabling the relay client must not expose a relay server"
         );
+    }
+
+    #[test]
+    fn build_swarm_with_explicit_relay_server() {
+        let config = NetworkConfig {
+            enable_relay: false,
+            enable_relay_server: true,
+            enable_dcutr: false,
+            enable_autonat: false,
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_peer_scoring: false,
+            ..Default::default()
+        };
+        let swarm = build_swarm(&config).expect("relay server should build when opted in");
+
+        assert!(!swarm.behaviour().relay_client.is_enabled());
+        assert!(swarm.behaviour().relay_server.is_enabled());
     }
 
     #[test]

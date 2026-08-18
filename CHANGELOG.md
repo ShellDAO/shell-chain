@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep circuit-relay server capacity disabled unless explicitly enabled,
+  independently of relay-client NAT traversal.
 - Reject state-trie pruning cursors that advance beyond finality during
   snapshot import and node startup.
 - Reject reorganization commits whose rollback segment is not the current

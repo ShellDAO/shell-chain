@@ -42,6 +42,8 @@ pub struct NetworkConfig {
     pub enable_peer_scoring: bool,
     /// Enable relay client for NAT traversal (connect through relay nodes).
     pub enable_relay: bool,
+    /// Enable serving circuit-relay reservations and forwarded traffic.
+    pub enable_relay_server: bool,
     /// Enable DCUtR (Direct Connection Upgrade through Relay) for hole-punching.
     pub enable_dcutr: bool,
     /// Enable autonat for automatic NAT status detection.
@@ -84,6 +86,7 @@ impl Default for NetworkConfig {
             enable_kademlia: true,
             enable_peer_scoring: true,
             enable_relay: true,
+            enable_relay_server: false,
             enable_dcutr: true,
             enable_autonat: true,
             max_connections: 100,
@@ -225,6 +228,7 @@ mod tests {
         assert!(config.enable_kademlia);
         assert!(config.enable_peer_scoring);
         assert!(config.enable_relay);
+        assert!(!config.enable_relay_server);
         assert!(config.enable_dcutr);
         assert!(config.enable_autonat);
         assert_eq!(config.max_connections, 100);
