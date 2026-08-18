@@ -1591,7 +1591,7 @@ impl<S: KvStore + 'static> Node<S> {
 
     /// Signal the node to shut down.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
     }
 
     /// Record a canonical state root, then run pruning bounded by finalized height.
@@ -7566,6 +7566,33 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(100), handle)
             .await
             .expect("shutdown remained blocked by startup backfill delay")
+            .expect("event loop task panicked");
+        assert!(result.is_ok(), "run() returned error: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn event_loop_honors_shutdown_requested_before_start() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, signer) = setup_node();
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let signer = Arc::new(signer) as Arc<dyn Signer>;
+        node.shutdown();
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(signer, &mut network).await }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("event loop ignored shutdown requested before startup")
             .expect("event loop task panicked");
         assert!(result.is_ok(), "run() returned error: {:?}", result.err());
     }

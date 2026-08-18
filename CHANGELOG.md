@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor shutdown requests that arrive before the node event loop subscribes,
+  preventing startup from missing the only shutdown notification.
 - Keep view-change proposer rotation deterministic across target pointer widths
   for view numbers above the native `usize` range.
 - Keep provisional side-fork signature policy thread-local so concurrent

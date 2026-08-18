@@ -366,6 +366,11 @@ impl<S: KvStore + 'static> Node<S> {
         use shell_rpc::{start_rpc_server, BlockEvent};
         use tokio::time::{interval, Duration};
 
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
         self.recover_unfinalized_head()?;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
         let mut network = NetworkInterface::new(network);
@@ -497,7 +502,6 @@ impl<S: KvStore + 'static> Node<S> {
         let mut peer_count_timer = interval(Duration::from_secs(10));
         let mut sync_retry_timer = interval(Duration::from_secs(SYNC_RETRY_BASE_INTERVAL_SECS));
         let mut tx_rebroadcast_timer = interval(Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS));
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut sync_retry_attempts_without_progress = 0u32;
         let mut fork_adoption_retry = ForkAdoptionRetry::default();
         let startup_sync_grace = Self::startup_sync_grace(self.config.block_time_ms);
