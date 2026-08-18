@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Bound validated P2P payload bytes queued for node processing so the event
+  count limit cannot retain many protocol-maximum messages simultaneously.
 - Isolate multinode guard-test artifacts so concurrent runs cannot interfere.
 - Increase canonical total supply whenever a STARK settlement mints its reward.
 - Require release publication checks to find a versioned node archive and

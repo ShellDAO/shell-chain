@@ -23,7 +23,7 @@ use libp2p::{
     autonat, connection_limits, dcutr, identify, mdns, noise, relay, tcp, yamux, Multiaddr,
     PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -38,6 +38,7 @@ const DIRECT_MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/dire
 const MAX_PENDING_DIRECT_MESSAGES: usize = 256;
 const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
+const MAX_PENDING_EVENT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_IDENTITY_KEY_SIZE: u64 = 64 * 1024;
 
 fn max_concurrent_direct_streams(max_message_size: usize) -> usize {
@@ -303,7 +304,7 @@ fn inbound_direct_message_is_peer_violation(error: &request_response::InboundFai
 /// Communication with the swarm is via async channels.
 pub struct Libp2pNetwork {
     cmd_tx: mpsc::Sender<SwarmCommand>,
-    event_rx: mpsc::Receiver<NetworkEvent>,
+    event_rx: mpsc::Receiver<QueuedNetworkEvent>,
     peer_count: Arc<AtomicUsize>,
     bandwidth: Arc<BandwidthTracker>,
     max_msg_size: usize,
@@ -317,6 +318,7 @@ impl Libp2pNetwork {
     pub async fn new(config: &NetworkConfig) -> Result<Self, NetworkError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, event_rx) = mpsc::channel(256);
+        let event_byte_budget = Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES));
         let peer_count = Arc::new(AtomicUsize::new(0));
         let max_msg_size = config.effective_max_message_size();
         let bandwidth = Arc::new(BandwidthTracker::new(
@@ -367,6 +369,7 @@ impl Libp2pNetwork {
             bandwidth: Arc::clone(&bandwidth),
             boot_nodes,
             max_msg_size,
+            event_byte_budget,
             peer_security: PeerSecurityConfig::from(config),
         };
 
@@ -850,6 +853,7 @@ struct SwarmLoopConfig {
     bandwidth: Arc<BandwidthTracker>,
     boot_nodes: Vec<Multiaddr>,
     max_msg_size: usize,
+    event_byte_budget: Arc<Semaphore>,
     peer_security: PeerSecurityConfig,
 }
 
@@ -906,7 +910,7 @@ impl From<&NetworkConfig> for PeerSecurityConfig {
 async fn swarm_loop(
     mut swarm: Swarm<ShellBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
-    event_tx: mpsc::Sender<NetworkEvent>,
+    event_tx: mpsc::Sender<QueuedNetworkEvent>,
     loop_config: SwarmLoopConfig,
 ) {
     let mut state = SwarmLoopState::new(loop_config.peer_security);
@@ -1113,7 +1117,7 @@ fn mdns_peer_still_discovered<'a>(
 fn handle_swarm_event(
     event: SwarmEvent<ShellBehaviourEvent>,
     swarm: &mut Swarm<ShellBehaviour>,
-    event_tx: &mpsc::Sender<NetworkEvent>,
+    event_tx: &mpsc::Sender<QueuedNetworkEvent>,
     loop_config: &SwarmLoopConfig,
     state: &mut SwarmLoopState,
 ) {
@@ -1153,7 +1157,13 @@ fn handle_swarm_event(
             let peer = PeerId(source.to_string());
             match crate::message::deserialize_checked(&data, loop_config.max_msg_size) {
                 Ok(message) => {
-                    if let Err(error) = try_forward_message_event(event_tx, peer, message) {
+                    if let Err(error) = try_forward_message_event(
+                        event_tx,
+                        &loop_config.event_byte_budget,
+                        peer,
+                        message,
+                        data.len(),
+                    ) {
                         debug!(
                             ?error,
                             peer = %source,
@@ -1307,9 +1317,15 @@ fn handle_swarm_event(
                             );
                         return;
                     }
-                    let acceptance = match try_forward_message_event(event_tx, peer, msg) {
+                    let acceptance = match try_forward_message_event(
+                        event_tx,
+                        &loop_config.event_byte_budget,
+                        peer,
+                        msg,
+                        message.data.len(),
+                    ) {
                         Ok(()) => gossipsub::MessageAcceptance::Accept,
-                        Err(EventQueueError::Full) => {
+                        Err(EventQueueError::Full | EventQueueError::ByteLimit) => {
                             debug!(
                                 peer = %propagation_source,
                                 "Node event queue is full - ignoring validated message"
@@ -1614,16 +1630,41 @@ fn topic_kind_for_message(msg: &NetworkMessage) -> TopicKind {
 }
 
 fn try_forward_message_event(
-    event_tx: &mpsc::Sender<NetworkEvent>,
+    event_tx: &mpsc::Sender<QueuedNetworkEvent>,
+    byte_budget: &Arc<Semaphore>,
     peer: PeerId,
     message: NetworkMessage,
+    serialized_size: usize,
 ) -> Result<(), EventQueueError> {
-    try_forward_event(event_tx, NetworkEvent::MessageReceived { peer, message })
+    let permits = u32::try_from(serialized_size).map_err(|_| EventQueueError::ByteLimit)?;
+    let byte_permit = Arc::clone(byte_budget)
+        .try_acquire_many_owned(permits)
+        .map_err(|_| EventQueueError::ByteLimit)?;
+    try_forward_queued_event(
+        event_tx,
+        QueuedNetworkEvent {
+            event: NetworkEvent::MessageReceived { peer, message },
+            _byte_permit: Some(byte_permit),
+        },
+    )
 }
 
 fn try_forward_event(
-    event_tx: &mpsc::Sender<NetworkEvent>,
+    event_tx: &mpsc::Sender<QueuedNetworkEvent>,
     event: NetworkEvent,
+) -> Result<(), EventQueueError> {
+    try_forward_queued_event(
+        event_tx,
+        QueuedNetworkEvent {
+            event,
+            _byte_permit: None,
+        },
+    )
+}
+
+fn try_forward_queued_event(
+    event_tx: &mpsc::Sender<QueuedNetworkEvent>,
+    event: QueuedNetworkEvent,
 ) -> Result<(), EventQueueError> {
     event_tx.try_send(event).map_err(|error| match error {
         mpsc::error::TrySendError::Full(_) => EventQueueError::Full,
@@ -1631,9 +1672,15 @@ fn try_forward_event(
     })
 }
 
+struct QueuedNetworkEvent {
+    event: NetworkEvent,
+    _byte_permit: Option<OwnedSemaphorePermit>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventQueueError {
     Full,
+    ByteLimit,
     Closed,
 }
 
@@ -1688,7 +1735,7 @@ impl NetworkService for Libp2pNetwork {
     }
 
     async fn next_event(&mut self) -> Option<NetworkEvent> {
-        self.event_rx.recv().await
+        self.event_rx.recv().await.map(|queued| queued.event)
     }
 
     async fn peer_count(&self) -> usize {
@@ -2086,20 +2133,72 @@ mod tests {
     #[tokio::test]
     async fn validated_message_forwarding_does_not_wait_on_a_full_queue() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
+        let byte_budget = Arc::new(Semaphore::new(2));
         let peer = PeerId::from("peer-a");
 
-        try_forward_message_event(&event_tx, peer.clone(), NetworkMessage::Ping).unwrap();
-        let error = try_forward_message_event(&event_tx, peer.clone(), NetworkMessage::Pong)
-            .expect_err("a full node event queue must reject without waiting");
+        try_forward_message_event(
+            &event_tx,
+            &byte_budget,
+            peer.clone(),
+            NetworkMessage::Ping,
+            1,
+        )
+        .unwrap();
+        let error = try_forward_message_event(
+            &event_tx,
+            &byte_budget,
+            peer.clone(),
+            NetworkMessage::Pong,
+            1,
+        )
+        .expect_err("a full node event queue must reject without waiting");
 
         assert_eq!(error, EventQueueError::Full);
         assert!(matches!(
-            event_rx.recv().await,
+            event_rx.recv().await.map(|queued| queued.event),
             Some(NetworkEvent::MessageReceived {
                 peer: received_peer,
                 message: NetworkMessage::Ping,
             }) if received_peer == peer
         ));
+    }
+
+    #[tokio::test]
+    async fn validated_message_forwarding_enforces_a_byte_budget() {
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let byte_budget = Arc::new(Semaphore::new(4));
+        let peer = PeerId::from("peer-a");
+
+        try_forward_message_event(
+            &event_tx,
+            &byte_budget,
+            peer.clone(),
+            NetworkMessage::Ping,
+            4,
+        )
+        .unwrap();
+        let error = try_forward_message_event(
+            &event_tx,
+            &byte_budget,
+            peer.clone(),
+            NetworkMessage::Pong,
+            1,
+        )
+        .expect_err("queued payload bytes must stay within the configured budget");
+        assert_eq!(error, EventQueueError::ByteLimit);
+
+        let queued = event_rx.recv().await.unwrap();
+        assert!(matches!(
+            &queued.event,
+            NetworkEvent::MessageReceived {
+                message: NetworkMessage::Ping,
+                ..
+            }
+        ));
+        drop(queued);
+
+        try_forward_message_event(&event_tx, &byte_budget, peer, NetworkMessage::Pong, 1)
+            .expect("dequeueing must release the byte reservation");
     }
 
     #[tokio::test]
@@ -2119,7 +2218,7 @@ mod tests {
 
         assert_eq!(error, EventQueueError::Full);
         assert!(matches!(
-            event_rx.recv().await,
+            event_rx.recv().await.map(|queued| queued.event),
             Some(NetworkEvent::RoutingTableUpdated { peer_count: 1 })
         ));
     }
@@ -2563,6 +2662,7 @@ mod tests {
             bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
             boot_nodes: Vec::new(),
             max_msg_size: config.max_message_size,
+            event_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES)),
             peer_security: PeerSecurityConfig::from(&config),
         };
         let mut state = SwarmLoopState::new(PeerSecurityConfig::from(&config));
