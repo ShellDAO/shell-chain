@@ -38,6 +38,7 @@ const DIRECT_MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/dire
 const MAX_PENDING_DIRECT_MESSAGES: usize = 256;
 const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
+const MAX_PENDING_COMMAND_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_PENDING_EVENT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_IDENTITY_KEY_SIZE: u64 = 64 * 1024;
 
@@ -60,11 +61,13 @@ enum SwarmCommand {
     Publish {
         topic: TopicKind,
         data: Vec<u8>,
+        byte_permit: OwnedSemaphorePermit,
     },
     SendToPeer {
         peer: Libp2pPeerId,
         topic: TopicKind,
         data: Vec<u8>,
+        byte_permit: OwnedSemaphorePermit,
     },
     /// Request a snapshot of current peer scores.
     PeerScores {
@@ -304,6 +307,7 @@ fn inbound_direct_message_is_peer_violation(error: &request_response::InboundFai
 /// Communication with the swarm is via async channels.
 pub struct Libp2pNetwork {
     cmd_tx: mpsc::Sender<SwarmCommand>,
+    command_byte_budget: Arc<Semaphore>,
     event_rx: mpsc::Receiver<QueuedNetworkEvent>,
     peer_count: Arc<AtomicUsize>,
     bandwidth: Arc<BandwidthTracker>,
@@ -318,6 +322,7 @@ impl Libp2pNetwork {
     pub async fn new(config: &NetworkConfig) -> Result<Self, NetworkError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, event_rx) = mpsc::channel(256);
+        let command_byte_budget = Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES));
         let event_byte_budget = Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES));
         let peer_count = Arc::new(AtomicUsize::new(0));
         let max_msg_size = config.effective_max_message_size();
@@ -377,6 +382,7 @@ impl Libp2pNetwork {
 
         Ok(Self {
             cmd_tx,
+            command_byte_budget,
             event_rx,
             peer_count,
             bandwidth,
@@ -970,7 +976,7 @@ async fn swarm_loop(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(SwarmCommand::Publish { topic, data }) => {
+                    Some(SwarmCommand::Publish { topic, data, byte_permit }) => {
                         let data_len = data.len() as u64;
                         let ident = match topic {
                             TopicKind::Blocks => loop_config.blocks_topic.clone(),
@@ -991,8 +997,9 @@ async fn swarm_loop(
                         {
                             debug!("Gossipsub publish error: {e}");
                         }
+                        drop(byte_permit);
                     }
-                    Some(SwarmCommand::SendToPeer { peer, topic, data }) => {
+                    Some(SwarmCommand::SendToPeer { peer, topic, data, byte_permit }) => {
                         let data: Arc<[u8]> = data.into();
                         match direct_message_admission(
                             &state.pending_direct_messages,
@@ -1023,6 +1030,7 @@ async fn swarm_loop(
                                 );
                             }
                         }
+                        drop(byte_permit);
                     }
                     Some(SwarmCommand::PeerScores { reply }) => {
                         let scores = collect_peer_scores(&swarm);
@@ -1708,9 +1716,15 @@ impl NetworkService for Libp2pNetwork {
         let topic = topic_kind_for_message(&msg);
 
         let data = crate::message::serialize_checked(&msg, self.max_msg_size)?;
+        let byte_permit =
+            acquire_command_byte_permit(&self.command_byte_budget, data.len()).await?;
 
         self.cmd_tx
-            .send(SwarmCommand::Publish { topic, data })
+            .send(SwarmCommand::Publish {
+                topic,
+                data,
+                byte_permit,
+            })
             .await
             .map_err(|_| NetworkError::ChannelClosed)?;
 
@@ -1728,9 +1742,16 @@ impl NetworkService for Libp2pNetwork {
             .parse::<Libp2pPeerId>()
             .map_err(|error| NetworkError::Transport(format!("invalid peer id: {error}")))?;
         let data = crate::message::serialize_checked(&msg, self.max_msg_size)?;
+        let byte_permit =
+            acquire_command_byte_permit(&self.command_byte_budget, data.len()).await?;
 
         self.cmd_tx
-            .send(SwarmCommand::SendToPeer { peer, topic, data })
+            .send(SwarmCommand::SendToPeer {
+                peer,
+                topic,
+                data,
+                byte_permit,
+            })
             .await
             .map_err(|_| NetworkError::ChannelClosed)
     }
@@ -1754,6 +1775,20 @@ impl NetworkService for Libp2pNetwork {
             .map_err(|_| NetworkError::ChannelClosed)?;
         Ok(())
     }
+}
+
+async fn acquire_command_byte_permit(
+    byte_budget: &Arc<Semaphore>,
+    serialized_size: usize,
+) -> Result<OwnedSemaphorePermit, NetworkError> {
+    let permits = u32::try_from(serialized_size).map_err(|_| NetworkError::MessageTooLarge {
+        size: serialized_size,
+        limit: u32::MAX as usize,
+    })?;
+    Arc::clone(byte_budget)
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| NetworkError::ChannelClosed)
 }
 
 /// Extract the libp2p PeerId from a multiaddr containing a `/p2p/<peer_id>` component.
@@ -1887,6 +1922,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(1);
         let network = Libp2pNetwork {
             cmd_tx,
+            command_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES)),
             event_rx,
             peer_count: Arc::new(AtomicUsize::new(0)),
             bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
@@ -1899,8 +1935,22 @@ mod tests {
             .await
             .unwrap();
 
-        match cmd_rx.recv().await.unwrap() {
-            SwarmCommand::SendToPeer { peer, topic, data } => {
+        let command = cmd_rx.recv().await.unwrap();
+        let queued_size = match &command {
+            SwarmCommand::SendToPeer { data, .. } => data.len(),
+            _ => panic!("send_to_peer must not fall back to gossip broadcast"),
+        };
+        assert_eq!(
+            network.command_byte_budget.available_permits(),
+            MAX_PENDING_COMMAND_BYTES - queued_size
+        );
+        match command {
+            SwarmCommand::SendToPeer {
+                peer,
+                topic,
+                data,
+                byte_permit,
+            } => {
                 assert_eq!(peer, target);
                 assert_eq!(topic, TopicKind::Blocks);
                 assert!(matches!(
@@ -1908,9 +1958,14 @@ mod tests {
                         .unwrap(),
                     NetworkMessage::Ping
                 ));
+                drop(byte_permit);
             }
             _ => panic!("send_to_peer must not fall back to gossip broadcast"),
         }
+        assert_eq!(
+            network.command_byte_budget.available_permits(),
+            MAX_PENDING_COMMAND_BYTES
+        );
     }
 
     #[tokio::test]
@@ -1919,6 +1974,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(1);
         let network = Libp2pNetwork {
             cmd_tx,
+            command_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES)),
             event_rx,
             peer_count: Arc::new(AtomicUsize::new(0)),
             bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
