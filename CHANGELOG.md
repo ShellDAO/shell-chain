@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Require imported snapshot headers to form a complete canonical path to the
+  trusted genesis and reject retained height mappings that conflict with it.
 - Reject release archives whose node binary format or architecture does not
   match the target triple in the archive name.
 - Bound serialized P2P payload bytes waiting in the outbound swarm command

@@ -1690,6 +1690,47 @@ impl<S: KvStore> ChainStore<S> {
         snap_writer.finalize()
     }
 
+    fn validate_snapshot_canonical_ancestry(
+        &self,
+        mut block_hash: ShellHash,
+        mut block_number: u64,
+        expected_genesis_hash: &ShellHash,
+    ) -> Result<(), StorageError> {
+        if *expected_genesis_hash == ShellHash::ZERO {
+            return Ok(());
+        }
+        loop {
+            let header = self.get_header_by_hash(&block_hash)?.ok_or_else(|| {
+                StorageError::State(format!(
+                    "snapshot canonical ancestry is incomplete: header for block #{block_number} ({block_hash}) is missing"
+                ))
+            })?;
+            if header.hash() != block_hash || header.number != block_number {
+                return Err(StorageError::State(format!(
+                    "snapshot canonical ancestry header does not match block #{block_number} ({block_hash})"
+                )));
+            }
+            if self
+                .get_block_hash_by_number(block_number)?
+                .is_some_and(|canonical_hash| canonical_hash != block_hash)
+            {
+                return Err(StorageError::State(format!(
+                    "snapshot canonical mapping for block #{block_number} conflicts with its header ancestry"
+                )));
+            }
+            if block_number == 0 {
+                if block_hash != *expected_genesis_hash {
+                    return Err(StorageError::State(
+                        "snapshot canonical ancestry does not end at the trusted genesis".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            block_hash = header.parent_hash;
+            block_number -= 1;
+        }
+    }
+
     /// Import chain data from a snapshot reader.
     ///
     /// Validates the snapshot metadata against the current chain configuration,
@@ -1930,7 +1971,6 @@ impl<S: KvStore> ChainStore<S> {
                 "snapshot canonical head body does not match its stored header".into(),
             ));
         }
-
         snap_reader.rewind()?;
 
         // Import all entries
@@ -1965,6 +2005,12 @@ impl<S: KvStore> ChainStore<S> {
         if !batch.is_empty() {
             self.store.write_batch(batch)?;
         }
+
+        self.validate_snapshot_canonical_ancestry(
+            head_hash,
+            metadata.block_number,
+            expected_genesis_hash,
+        )?;
 
         if metadata.state_root != ShellHash::ZERO {
             if self.store.get(metadata.state_root.as_bytes())?.is_none() {
@@ -4771,6 +4817,135 @@ mod tests {
             .to_string()
             .contains("canonical head mapping does not match HEAD"));
         assert!(store.get(b"untrusted-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_head_disconnected_from_trusted_genesis() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let genesis = empty_block(0);
+        let genesis_hash = genesis.hash();
+        let mut head = empty_block(1);
+        head.header.parent_hash = ShellHash::from([0x77; 32]);
+        let head_hash = head.hash();
+        let config = ChainConfig {
+            chain_id: 1337,
+            genesis_hash,
+        };
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            head.number(),
+            head_hash,
+            head.header.state_root,
+            genesis_hash,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, head_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&genesis_hash),
+                    &encode_rlp(&genesis.header),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(genesis.number()),
+                    genesis_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&head_hash),
+                    &encode_rlp(&head.header),
+                )
+                .unwrap();
+            write_snapshot_body(&mut writer, &head);
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(head.number()),
+                    head_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(prefix::CHAIN_CONFIG, &serde_json::to_vec(&config).unwrap())
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &genesis_hash)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("snapshot canonical ancestry is incomplete"));
+        assert_eq!(cs.get_head_hash().unwrap(), None);
+    }
+
+    #[test]
+    fn test_import_snapshot_rejects_canonical_mapping_outside_head_ancestry() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let genesis = empty_block(0);
+        let genesis_hash = genesis.hash();
+        let mut head = empty_block(1);
+        head.header.parent_hash = genesis_hash;
+        let head_hash = head.hash();
+        let meta = crate::SnapshotMetadata::new(
+            1337,
+            head.number(),
+            head_hash,
+            head.header.state_root,
+            genesis_hash,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                crate::SnapshotWriter::new(std::io::Cursor::new(&mut buf), meta).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, head_hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&genesis_hash),
+                    &encode_rlp(&genesis.header),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(genesis.number()),
+                    ShellHash::from([0x44; 32]).as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&head_hash),
+                    &encode_rlp(&head.header),
+                )
+                .unwrap();
+            write_snapshot_body(&mut writer, &head);
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::number_key(head.number()),
+                    head_hash.as_bytes(),
+                )
+                .unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let error = cs
+            .import_snapshot(std::io::Cursor::new(buf), 1337, &genesis_hash)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("canonical mapping for block #0 conflicts"));
+        assert_eq!(cs.get_head_hash().unwrap(), None);
     }
 
     #[test]
