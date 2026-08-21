@@ -18,6 +18,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve monotonic state-trie pruning progress when a node restarts with a
+  larger retention window.
 - Validate rollback settlement metadata before committing startup recovery or
   preferred-fork canonical changes.
 - Remove a machine-speed-dependent TPS assertion from the deterministic test

@@ -374,6 +374,13 @@ pub fn prune_state_trie<S: KvStore + 'static>(
         return Ok(StateTriePruneResult::default());
     };
 
+    let pruned_below = state_trie_pruned_below(store.as_ref())?;
+    // Trie deletion is irreversible, so changing retention must not rewind the
+    // durable cursor into a range whose canonical mappings may already be gone.
+    if keep_below_block <= pruned_below {
+        return Ok(StateTriePruneResult::default());
+    }
+
     let mut old_roots = Vec::new();
     let mut retained_roots = HashSet::new();
 
@@ -384,7 +391,6 @@ pub fn prune_state_trie<S: KvStore + 'static>(
         retained_roots.insert(canonical_state_root(&chain_store, block_number)?);
     }
 
-    let pruned_below = state_trie_pruned_below(store.as_ref())?.min(keep_below_block);
     let pass_end = pruned_below
         .saturating_add(MAX_STATE_TRIE_PRUNE_BLOCKS_PER_PASS)
         .min(keep_below_block);
@@ -728,6 +734,24 @@ mod tests {
 
         assert!(first.pruned_roots > 0);
         assert_eq!(second, StateTriePruneResult::default());
+        assert_eq!(
+            store.get(STATE_TRIE_PRUNED_BELOW_KEY).unwrap(),
+            Some(2u64.to_be_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn state_trie_pruning_does_not_rewind_progress_for_a_larger_retention_window() {
+        let (store, _, _) = populate_state_chain();
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        store
+            .put(STATE_TRIE_PRUNED_BELOW_KEY, &2u64.to_be_bytes())
+            .unwrap();
+        chain_store.delete_canonical(1).unwrap();
+
+        let result = prune_state_trie(Arc::clone(&store), 1, StorageProfile::Light).unwrap();
+
+        assert_eq!(result, StateTriePruneResult::default());
         assert_eq!(
             store.get(STATE_TRIE_PRUNED_BELOW_KEY).unwrap(),
             Some(2u64.to_be_bytes().to_vec())
