@@ -12,6 +12,12 @@ use crate::middleware::{ApiKeyLayer, RateLimitLayer, RpcRateLimitLayer};
 use crate::tls_proxy::{start_tls_proxy, TlsProxyHandle};
 
 const MAX_BATCH_REQUEST_LEN: u32 = 100;
+const GOVERNANCE_SIGNING_METHODS: [&str; 4] = [
+    "shell_proposeAddValidator",
+    "shell_proposeRemoveValidator",
+    "shell_proposeSetValidatorWeight",
+    "shell_proposeSetValidatorStake",
+];
 const DEFAULT_MAX_RESPONSE_BODY_SIZE: u32 = 10 * 1024 * 1024;
 
 use shell_consensus::{ConsensusEngine, FinalityState};
@@ -181,6 +187,15 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     consensus_engine: Option<Arc<parking_lot::RwLock<dyn ConsensusEngine>>>,
     proof_amendment_store: Option<Arc<shell_storage::ProofAmendmentStore<S>>>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    let restrict_governance_signing = proposer_signer.is_some()
+        && config.has_api_namespace("shell")
+        && config.api_key.is_none()
+        && (!config.listen_addr.ip().is_loopback()
+            || config
+                .ws_addr
+                .map(|addr| !addr.ip().is_loopback())
+                .unwrap_or(false));
+
     // Load and validate TLS configuration.
     // When cert+key are provided, we start jsonrpsee on an internal loopback
     // port and front it with a tokio-rustls TLS proxy on the configured address.
@@ -321,7 +336,21 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         module.merge(LegacyEvmApiServer::into_rpc(handler.clone()))?;
     }
     if ns.iter().any(|n| n == "shell") {
-        module.merge(ShellApiServer::into_rpc(handler.clone()))?;
+        let mut shell_module = ShellApiServer::into_rpc(handler.clone());
+        if restrict_governance_signing {
+            for method in GOVERNANCE_SIGNING_METHODS {
+                if shell_module.remove_method(method).is_none() {
+                    return Err(format!(
+                        "could not disable unauthenticated governance RPC method '{method}'"
+                    )
+                    .into());
+                }
+            }
+            warn!(
+                "Signer-backed governance RPC methods are disabled on unauthenticated non-loopback listeners; configure --rpc-api-key or use a loopback listener to enable them"
+            );
+        }
+        module.merge(shell_module)?;
     }
     if ns.iter().any(|n| n == "web3") {
         module.merge(Web3ApiServer::into_rpc(handler.clone()))?;
@@ -436,15 +465,16 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{start_rpc_server, RpcConfig};
+    use super::{start_rpc_server, RpcConfig, GOVERNANCE_SIGNING_METHODS};
     use jsonrpsee::core::client::{ClientT, Error as ClientError, SubscriptionClientT};
     use jsonrpsee::core::params::BatchRequestBuilder;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
     use jsonrpsee::ws_client::WsClientBuilder;
     use shell_consensus::FinalityState;
+    use shell_crypto::DilithiumSigner;
     use shell_mempool::{MempoolConfig, TxPool};
-    use shell_primitives::ShellHash;
+    use shell_primitives::{Address, ShellHash};
     use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -521,6 +551,68 @@ mod tests {
         };
 
         assert!(config.validate_dev_rpc_exposure().is_ok());
+    }
+
+    #[tokio::test]
+    async fn public_unauthenticated_rpc_omits_governance_signing_methods() {
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let config = RpcConfig {
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            ws_addr: None,
+            rate_limit_per_sec: None,
+            api_namespaces: vec!["shell".into()],
+            ..RpcConfig::default()
+        };
+        let server = start_rpc_server(
+            config,
+            chain_store,
+            world_state,
+            tx_pool,
+            42,
+            None,
+            block_events,
+            Some(Arc::new(DilithiumSigner::generate())),
+            Some(Address::from([0x11; 20])),
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.http_addr.port()));
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{endpoint}"))
+            .unwrap();
+
+        let validators = client
+            .request::<Vec<Address>, _>("shell_getValidators", rpc_params![])
+            .await
+            .unwrap();
+        for method in GOVERNANCE_SIGNING_METHODS {
+            let error = client
+                .request::<String, _>(method, rpc_params![Address::from([0x22; 20]).to_string()])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ClientError::Call(ref call)
+                    if call.code() == jsonrpsee::types::error::METHOD_NOT_FOUND_CODE
+            ));
+        }
+
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+        assert!(validators.is_empty());
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Disable signer-backed validator governance RPC methods on unauthenticated
+  non-loopback listeners while retaining public read-only Shell RPC methods.
 - Enforce runtime algorithm deprecation when batch-validating session root
   authorizations during block import.
 - Require imported snapshot headers to form a complete canonical path to the

@@ -431,14 +431,14 @@ pub trait ShellApi {
     #[method(name = "getValidators")]
     async fn get_validators(&self) -> Result<Vec<Address>, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Add a validator to the active set. Unauthenticated until M3.
+    /// Disabled legacy direct-mutation method. Use `proposeAddValidator`.
     #[method(name = "addValidator")]
     async fn add_validator(
         &self,
         address: String,
     ) -> Result<bool, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Remove a validator from the active set. Unauthenticated until M3.
+    /// Disabled legacy direct-mutation method. Use `proposeRemoveValidator`.
     #[method(name = "removeValidator")]
     async fn remove_validator(
         &self,
@@ -469,6 +469,7 @@ pub trait ShellApi {
 
     /// Propose adding a validator via system contract transaction.
     /// Requires the node to be configured as a validator.
+    /// Available remotely only when RPC API-key authentication is configured.
     /// Returns the transaction hash on success.
     #[method(name = "proposeAddValidator")]
     async fn propose_add_validator(
@@ -478,6 +479,7 @@ pub trait ShellApi {
 
     /// Propose removing a validator via system contract transaction.
     /// Requires the node to be configured as a validator.
+    /// Available remotely only when RPC API-key authentication is configured.
     /// Returns the transaction hash on success.
     #[method(name = "proposeRemoveValidator")]
     async fn propose_remove_validator(
@@ -487,6 +489,7 @@ pub trait ShellApi {
 
     /// Propose updating a validator's governance weight via system contract transaction.
     /// Requires the node to be configured as a validator.
+    /// Available remotely only when RPC API-key authentication is configured.
     /// Takes effect when a weighted quorum (>2/3 of total weight) supports the change.
     /// Returns the transaction hash on success.
     #[method(name = "proposeSetValidatorWeight")]
@@ -498,6 +501,7 @@ pub trait ShellApi {
 
     /// Propose updating a validator's locked stake via system contract transaction.
     /// In staking mode, consensus weight is derived from this stake.
+    /// Available remotely only when RPC API-key authentication is configured.
     #[method(name = "proposeSetValidatorStake")]
     async fn propose_set_validator_stake(
         &self,

@@ -941,6 +941,8 @@ Returns whether an address is a validator.
 ### shell_proposeAddValidator
 
 Submits a governance transaction to add a validator (requires the node to have a proposer keystore).
+On non-loopback RPC listeners, this signer-backed method is registered only
+when `--rpc-api-key` is configured.
 
 **Parameters:**
 | # | Type | Required | Description |
@@ -954,6 +956,8 @@ Submits a governance transaction to add a validator (requires the node to have a
 ### shell_proposeRemoveValidator
 
 Submits a governance transaction to remove a validator.
+On non-loopback RPC listeners, this signer-backed method is registered only
+when `--rpc-api-key` is configured.
 
 **Parameters:**
 | # | Type | Required | Description |
