@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Enforce runtime algorithm deprecation when batch-validating session root
+  authorizations during block import.
 - Require imported snapshot headers to form a complete canonical path to the
   trusted genesis and reject retained height mappings that conflict with it.
 - Reject release archives whose node binary format or architecture does not

@@ -79,12 +79,12 @@ fn batch_signing_pubkey(
         )));
     }
     let auth_hash = session_auth.auth_hash(tx.tx.chain_id);
-    let root_valid = ALLOWED_ALGORITHMS.iter().copied().any(|algorithm| {
-        let signature = PQSignature::new(algorithm, session_auth.root_signature.as_ref().to_vec());
-        MultiVerifier
-            .verify(root_pubkey, auth_hash.as_bytes(), &signature)
-            .unwrap_or(false)
-    });
+    let root_valid = verify_import_session_root_signature(
+        root_pubkey,
+        &auth_hash,
+        session_auth.root_signature.as_ref(),
+        &MultiVerifier,
+    );
     if !root_valid {
         return Err(NodeError::Startup(format!(
             "block {} tx {} session root signature is invalid",
@@ -94,6 +94,24 @@ fn batch_signing_pubkey(
     }
 
     Ok(session_auth.session_pubkey.as_ref().to_vec())
+}
+
+fn verify_import_session_root_signature<V: Verifier>(
+    root_pubkey: &[u8],
+    auth_hash: &ShellHash,
+    root_signature: &[u8],
+    verifier: &V,
+) -> bool {
+    ALLOWED_ALGORITHMS
+        .iter()
+        .copied()
+        .filter(|algorithm| shell_crypto::is_algorithm_allowed(*algorithm))
+        .any(|algorithm| {
+            let signature = PQSignature::new(algorithm, root_signature.to_vec());
+            verifier
+                .verify(root_pubkey, auth_hash.as_bytes(), &signature)
+                .unwrap_or(false)
+        })
 }
 
 impl<S: KvStore + 'static> Node<S> {
@@ -1932,7 +1950,7 @@ impl<S: KvStore + 'static> Node<S> {
 mod tests {
     use super::*;
     use shell_core::{Account, PubkeyMode, Transaction};
-    use shell_crypto::{DilithiumSigner, SignatureType, Signer};
+    use shell_crypto::{CryptoError, DilithiumSigner, SignatureType, Signer};
     use shell_storage::{MemoryDb, StorageError};
 
     fn transaction() -> Transaction {
@@ -1950,6 +1968,46 @@ mod tests {
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct AlgorithmOnlyVerifier(SignatureType);
+
+    impl Verifier for AlgorithmOnlyVerifier {
+        fn verify(
+            &self,
+            _pubkey: &[u8],
+            _message: &[u8],
+            signature: &PQSignature,
+        ) -> Result<bool, CryptoError> {
+            Ok(signature.sig_type == self.0)
+        }
+
+        fn sig_type(&self) -> SignatureType {
+            self.0
+        }
+    }
+
+    #[test]
+    fn import_session_root_signature_skips_deprecated_algorithms() {
+        let root_pubkey = [0x42; 64];
+        let auth_hash = ShellHash::from([0x24; 32]);
+        let verifier = AlgorithmOnlyVerifier(SignatureType::MlDsa65);
+        assert!(verify_import_session_root_signature(
+            &root_pubkey,
+            &auth_hash,
+            &[1],
+            &verifier,
+        ));
+
+        let mut registry = AlgorithmRegistry::default();
+        registry.deprecate(SignatureType::MlDsa65);
+
+        let verified = with_algorithm_registry_override(&registry, || {
+            verify_import_session_root_signature(&root_pubkey, &auth_hash, &[1], &verifier)
+        });
+
+        assert!(!verified);
     }
 
     #[test]
