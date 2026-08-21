@@ -493,14 +493,14 @@ Returns the current validator set from world state.
 add_validator(address: String, ) → bool
 ```
 
-Add a validator to the active set. Unauthenticated until M3.
+Disabled legacy direct-mutation method. Use `proposeAddValidator`.
 
 ### shell_removeValidator
 ```
 remove_validator(address: String, ) → bool
 ```
 
-Remove a validator from the active set. Unauthenticated until M3.
+Disabled legacy direct-mutation method. Use `proposeRemoveValidator`.
 
 ### shell_encodeAddValidator
 ```
@@ -530,6 +530,7 @@ propose_add_validator(address: String, ) → String
 
 Propose adding a validator via system contract transaction.
 Requires the node to be configured as a validator.
+Available remotely only when RPC API-key authentication is configured.
 Returns the transaction hash on success.
 
 ### shell_proposeRemoveValidator
@@ -539,6 +540,7 @@ propose_remove_validator(address: String, ) → String
 
 Propose removing a validator via system contract transaction.
 Requires the node to be configured as a validator.
+Available remotely only when RPC API-key authentication is configured.
 Returns the transaction hash on success.
 
 ### shell_proposeSetValidatorWeight
@@ -548,6 +550,7 @@ propose_set_validator_weight(address: String, weight: u64, ) → String
 
 Propose updating a validator's governance weight via system contract transaction.
 Requires the node to be configured as a validator.
+Available remotely only when RPC API-key authentication is configured.
 Takes effect when a weighted quorum (>2/3 of total weight) supports the change.
 Returns the transaction hash on success.
 
@@ -558,6 +561,7 @@ propose_set_validator_stake(address: String, stake: String, ) → String
 
 Propose updating a validator's locked stake via system contract transaction.
 In staking mode, consensus weight is derived from this stake.
+Available remotely only when RPC API-key authentication is configured.
 
 ### shell_getValidatorStatus
 ```
