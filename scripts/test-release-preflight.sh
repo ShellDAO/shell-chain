@@ -159,7 +159,18 @@ git -C "$PUBLICATION_FIXTURE" push -q canonical v0.27.9
 RELEASE_ASSET_FIXTURE="$TMP_DIR/release-assets"
 mkdir -p "$RELEASE_ASSET_FIXTURE"
 RELEASE_BINARY_FIXTURE="$TMP_DIR/shell-node"
-printf '#!/usr/bin/env sh\nexit 0\n' > "$RELEASE_BINARY_FIXTURE"
+python3 - "$RELEASE_BINARY_FIXTURE" <<'PY'
+import pathlib
+import sys
+
+header = bytearray(64)
+header[:4] = b"\x7fELF"
+header[4] = 2
+header[5] = 1
+header[16:18] = (3).to_bytes(2, "little")
+header[18:20] = (0x3E).to_bytes(2, "little")
+pathlib.Path(sys.argv[1]).write_bytes(header)
+PY
 chmod +x "$RELEASE_BINARY_FIXTURE"
 COPYFILE_DISABLE=1 tar -czf "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz" \
     -C "$TMP_DIR" shell-node
@@ -182,6 +193,53 @@ EOF
     RELEASE_ASSET_FIXTURE="$RELEASE_ASSET_FIXTURE" \
     "$PUBLICATION_HELPER/check-release-publication.sh" \
     canonical v0.27.9 "$PUBLICATION_COMMIT" >/dev/null)
+
+python3 - "$RELEASE_BINARY_FIXTURE" <<'PY'
+import pathlib
+import sys
+
+header = bytearray(64)
+header[:4] = b"\xcf\xfa\xed\xfe"
+header[4:8] = (0x0100000C).to_bytes(4, "little")
+header[12:16] = (2).to_bytes(4, "little")
+pathlib.Path(sys.argv[1]).write_bytes(header)
+PY
+COPYFILE_DISABLE=1 tar -czf "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz" \
+    -C "$TMP_DIR" shell-node
+python3 - "$RELEASE_ASSET_FIXTURE" v0.27.9 <<'PY'
+import hashlib
+import pathlib
+import sys
+
+asset_dir = pathlib.Path(sys.argv[1])
+tag = sys.argv[2]
+archive = asset_dir / f"shell-node-{tag}-x86_64-unknown-linux-gnu.tar.gz"
+digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+(asset_dir / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+PY
+if PUBLICATION_OUTPUT=$(cd "$PUBLICATION_FIXTURE" && \
+    GH_BIN="$FAKE_PUBLICATION_GH" RELEASE_FIXTURE="$TMP_DIR/release.json" \
+    RELEASE_ASSET_FIXTURE="$RELEASE_ASSET_FIXTURE" \
+    "$PUBLICATION_HELPER/check-release-publication.sh" \
+    canonical v0.27.9 "$PUBLICATION_COMMIT" 2>&1); then
+    fail "release publication check unexpectedly accepted a mismatched binary target"
+fi
+if ! grep -Fq "does not match archive target" <<<"$PUBLICATION_OUTPUT"; then
+    fail "release binary target rejection was not specific: $PUBLICATION_OUTPUT"
+fi
+
+python3 - "$RELEASE_BINARY_FIXTURE" <<'PY'
+import pathlib
+import sys
+
+header = bytearray(64)
+header[:4] = b"\x7fELF"
+header[4] = 2
+header[5] = 1
+header[16:18] = (3).to_bytes(2, "little")
+header[18:20] = (0x3E).to_bytes(2, "little")
+pathlib.Path(sys.argv[1]).write_bytes(header)
+PY
 
 printf 'tampered release archive\n' \
     > "$RELEASE_ASSET_FIXTURE/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz"

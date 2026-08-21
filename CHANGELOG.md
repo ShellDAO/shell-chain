@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject release archives whose node binary format or architecture does not
+  match the target triple in the archive name.
 - Bound serialized P2P payload bytes waiting in the outbound swarm command
   queue so its count limit cannot retain gigabytes of protocol-maximum messages.
 - Preserve monotonic state-trie pruning progress when a node restarts with a

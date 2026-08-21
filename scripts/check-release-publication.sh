@@ -129,17 +129,71 @@ if ! "$GH_BIN" "${DOWNLOAD_ARGS[@]}"; then
     fail "could not download release archives and checksum manifest"
 fi
 
-python3 - "$ASSET_DIR" "$ARCHIVE_LIST" <<'PY'
+python3 - "$ASSET_DIR" "$ARCHIVE_LIST" "$TAG" <<'PY'
 import hashlib
 import pathlib
 import re
+import struct
 import sys
 import tarfile
 
 asset_dir = pathlib.Path(sys.argv[1])
 archive_list_path = pathlib.Path(sys.argv[2])
+tag = sys.argv[3]
 archive_names = archive_list_path.read_text(encoding="utf-8").splitlines()
 manifest_path = asset_dir / "SHA256SUMS"
+
+
+def binary_matches_target(header, member_path, target):
+    arch = target.split("-", 1)[0]
+    if arch not in {"x86_64", "aarch64"}:
+        return False
+
+    if "-linux-" in target:
+        if member_path.name != "shell-node" or len(header) < 20:
+            return False
+        byteorder = {1: "little", 2: "big"}.get(header[5])
+        if header[:4] != b"\x7fELF" or header[4] != 2 or byteorder is None:
+            return False
+        file_type = int.from_bytes(header[16:18], byteorder)
+        machine = int.from_bytes(header[18:20], byteorder)
+        return file_type in {2, 3} and machine == {
+            "x86_64": 0x3E,
+            "aarch64": 0xB7,
+        }[arch]
+
+    if target.endswith("-apple-darwin"):
+        if member_path.name != "shell-node" or len(header) < 16:
+            return False
+        byteorder = {
+            b"\xcf\xfa\xed\xfe": "little",
+            b"\xfe\xed\xfa\xcf": "big",
+        }.get(header[:4])
+        if byteorder is None:
+            return False
+        cpu_type = int.from_bytes(header[4:8], byteorder)
+        file_type = int.from_bytes(header[12:16], byteorder)
+        return file_type == 2 and cpu_type == {
+            "x86_64": 0x01000007,
+            "aarch64": 0x0100000C,
+        }[arch]
+
+    if "-windows-" in target:
+        if member_path.name != "shell-node.exe" or len(header) < 64:
+            return False
+        pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+        if header[:2] != b"MZ" or len(header) < pe_offset + 26:
+            return False
+        if header[pe_offset : pe_offset + 4] != b"PE\0\0":
+            return False
+        machine = struct.unpack_from("<H", header, pe_offset + 4)[0]
+        optional_magic = struct.unpack_from("<H", header, pe_offset + 24)[0]
+        return optional_magic == 0x20B and machine == {
+            "x86_64": 0x8664,
+            "aarch64": 0xAA64,
+        }[arch]
+
+    return False
 
 try:
     manifest_lines = manifest_path.read_text(encoding="utf-8").splitlines()
@@ -249,6 +303,31 @@ for name in archive_names:
         print(
             f"release publication check failed: release asset '{name}' "
             "contains a non-executable node binary",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    archive_prefix = f"shell-node-{tag}-"
+    target = name[len(archive_prefix) : -len(".tar.gz")]
+    member_path, member = files[0]
+    try:
+        with tarfile.open(archive, mode="r:gz") as package:
+            source = package.extractfile(member.name)
+            if source is None:
+                raise tarfile.ExtractError("node binary is not readable")
+            header = source.read(65536)
+    except (OSError, tarfile.TarError) as error:
+        print(
+            f"release publication check failed: could not inspect node binary "
+            f"in release asset '{name}': {error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if not binary_matches_target(header, member_path, target):
+        print(
+            f"release publication check failed: node binary format or architecture "
+            f"does not match archive target '{target}' in release asset '{name}'",
             file=sys.stderr,
         )
         raise SystemExit(1)
