@@ -44,6 +44,22 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(envelope.stark_proofs)
     }
 
+    pub(crate) fn reverted_stark_settlements(
+        block: &Block,
+    ) -> Result<Vec<ProofAmendment>, NodeError> {
+        let mut settlements = Self::decode_system_extra(&block.header.extra_data)?;
+        settlements.extend(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .filter_map(|tx| {
+                    ProofAmendment::from_json(tx.proof_payload.as_ref()?.as_ref()).ok()
+                }),
+        );
+        Ok(settlements)
+    }
+
     pub(crate) fn stark_reward_value(
         &self,
         _reward_block_number: u64,

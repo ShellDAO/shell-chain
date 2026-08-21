@@ -962,6 +962,10 @@ impl<S: KvStore + 'static> Node<S> {
                 "failed to restore algorithm registry at finalized block #{finalized_number}: {error}"
             ))
         })?;
+        let reverted_settlements = old_chain
+            .iter()
+            .map(Self::reverted_stark_settlements)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let overlay = Arc::new(OverlayStore::new(self.store.clone()));
         let overlay_chain_store = ChainStore::new(overlay);
@@ -991,19 +995,9 @@ impl<S: KvStore + 'static> Node<S> {
             .lock()
             .retain(|_, number| *number <= finalized_number);
 
-        for block in &old_chain {
-            let mut reverted_settlements = Self::decode_system_extra(&block.header.extra_data)?;
-            reverted_settlements.extend(
-                block
-                    .system_transactions
-                    .iter()
-                    .filter(|tx| tx.kind == SystemTxKind::StarkReward)
-                    .filter_map(|tx| {
-                        ProofAmendment::from_json(tx.proof_payload.as_ref()?.as_ref()).ok()
-                    }),
-            );
+        for block_settlements in &reverted_settlements {
             self.block_store()
-                .cancel_settled_witness_deletes(&reverted_settlements);
+                .cancel_settled_witness_deletes(block_settlements);
         }
 
         if self
@@ -1135,6 +1129,11 @@ impl<S: KvStore + 'static> Node<S> {
                 reason: "preferred-fork plan does not terminate at the selected head".into(),
             });
         }
+        let reverted_settlements = plan
+            .old_chain
+            .iter()
+            .map(Self::reverted_stark_settlements)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let stale_canonical_numbers = if plan.canonical_number > plan.preferred_number {
             (plan.preferred_number + 1..=plan.canonical_number).collect::<Vec<_>>()
@@ -1192,18 +1191,8 @@ impl<S: KvStore + 'static> Node<S> {
         state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
         let block_store = self.block_store();
         block_store.replace_world_state(state);
-        for block in &plan.old_chain {
-            let mut reverted_settlements = Self::decode_system_extra(&block.header.extra_data)?;
-            reverted_settlements.extend(
-                block
-                    .system_transactions
-                    .iter()
-                    .filter(|tx| tx.kind == SystemTxKind::StarkReward)
-                    .filter_map(|tx| {
-                        ProofAmendment::from_json(tx.proof_payload.as_ref()?.as_ref()).ok()
-                    }),
-            );
-            block_store.cancel_settled_witness_deletes(&reverted_settlements);
+        for block_settlements in &reverted_settlements {
+            block_store.cancel_settled_witness_deletes(block_settlements);
         }
         for (block, block_settlements) in plan.new_chain.iter().zip(settlements) {
             self.prover_orchestrator()

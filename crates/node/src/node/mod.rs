@@ -2777,6 +2777,81 @@ mod tests {
     }
 
     #[test]
+    fn preferred_fork_rejects_malformed_rollback_metadata_before_canonical_mutation() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let proposer = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        let genesis_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+
+        let side_one = make_block_at_1(&node, &signer, None);
+        let side_one_hash = side_one.hash();
+        let mut side_two = side_one.clone();
+        side_two.header.parent_hash = side_one_hash;
+        side_two.header.number = 2;
+        side_two.header.timestamp += 1;
+        side_two.header.base_fee_per_gas = calculate_base_fee(
+            side_one.header.gas_used,
+            side_one.header.gas_limit,
+            side_one.header.base_fee_per_gas,
+        );
+        side_two.proposer_seal = Some(
+            signer
+                .sign(side_two.header.hash().as_bytes())
+                .expect("sign side-fork child"),
+        );
+        let side_two_hash = side_two.hash();
+
+        let mut malformed_canonical = make_block_at_1(&node, &signer, None);
+        malformed_canonical.header.timestamp += 2;
+        malformed_canonical.header.extra_data =
+            Bytes::from_static(b"shell:system-extra:v1:{malformed");
+        malformed_canonical.proposer_seal = Some(
+            signer
+                .sign(malformed_canonical.header.hash().as_bytes())
+                .expect("sign malformed canonical block"),
+        );
+        let malformed_hash = malformed_canonical.hash();
+        node.chain_store.put_block(&malformed_canonical).unwrap();
+        node.chain_store.set_canonical(1, &malformed_hash).unwrap();
+        node.chain_store.set_head(&malformed_hash).unwrap();
+        node.chain_store.put_side_fork_block(&side_one).unwrap();
+        node.chain_store.put_side_fork_block(&side_two).unwrap();
+
+        let total_weight = node
+            .consensus
+            .read()
+            .validator_weights()
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        {
+            let mut fork_choice = node.fork_choice.write();
+            *fork_choice = ForkChoice::new(genesis_hash);
+            fork_choice.add_block(malformed_hash, genesis_hash, 1, 0, false);
+            fork_choice.add_block(side_one_hash, genesis_hash, 1, 0, false);
+            fork_choice.add_block(side_two_hash, side_one_hash, 2, total_weight, false);
+        }
+        let plan = node
+            .preferred_fork_plan()
+            .unwrap()
+            .expect("side fork should become preferred");
+
+        let error = node.adopt_preferred_fork(&plan).unwrap_err();
+
+        assert!(error.to_string().contains("decode system extra"));
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(malformed_hash)
+        );
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(malformed_hash)
+        );
+        assert_eq!(node.chain_store.get_block_hash_by_number(2).unwrap(), None);
+    }
+
+    #[test]
     fn adopted_quorum_attested_fork_commits_finality_without_a_follow_up_write() {
         let (node, signer, db) = setup_failing_batch_node();
         store_consistent_genesis(&node);
@@ -4930,6 +5005,48 @@ mod tests {
                 .get_block_hash_by_number(block_three.number())
                 .unwrap(),
             Some(head_hash)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_rejects_malformed_rollback_metadata_before_mutation() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let finalized = node.produce_block(&signer, 100).unwrap();
+        let finalized_hash = finalized.hash();
+        node.finality
+            .write()
+            .set_finalized_direct(finalized.number(), finalized_hash);
+        node.chain_store
+            .set_finalized_number(finalized.number())
+            .unwrap();
+        let block_two = node.produce_block(&signer, 100).unwrap();
+        let mut malformed = block_two;
+        malformed.header.extra_data = Bytes::from_static(b"shell:system-extra:v1:{malformed");
+        malformed.proposer_seal = Some(
+            signer
+                .sign(malformed.header.hash().as_bytes())
+                .expect("sign malformed canonical block"),
+        );
+        let malformed_hash = malformed.hash();
+        node.chain_store.put_block(&malformed).unwrap();
+        node.chain_store
+            .set_canonical(malformed.number(), &malformed_hash)
+            .unwrap();
+        node.chain_store.set_head(&malformed_hash).unwrap();
+
+        let error = node.recover_unfinalized_head().unwrap_err();
+
+        assert!(error.to_string().contains("decode system extra"));
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(malformed_hash)
+        );
+        assert_eq!(
+            node.chain_store
+                .get_block_hash_by_number(malformed.number())
+                .unwrap(),
+            Some(malformed_hash)
         );
     }
 
