@@ -343,7 +343,9 @@ Shell-Chain implements the **Cancun** EVM specification. Key compatibility detai
 
 ### Signature behavior
 
-- **`ecrecover` (0x01) is disabled.** The precompile exists at address `0x01` but is a no-op — it returns empty bytes to force PQ migration. Contracts that call `ecrecover` will receive an empty result, not `address(0)`. Do not rely on it.
+- **Ethereum `ecrecover` is unavailable.** Address `0x01` is repurposed for
+  ML-DSA-family verification. ECDSA-formatted calldata is interpreted as PQ
+  verifier input and returns the 32-byte false value, not an Ethereum address.
 - **Use the PQ precompile suite instead.** The current runtime exposes six native precompiles at `0x0001`–`0x0006`.
 
 ### PQ precompile suite (`0x0001`–`0x0006`)
