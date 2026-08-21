@@ -222,7 +222,7 @@ impl TxWitness {
         out: &mut dyn alloy_rlp::BufMut,
     ) {
         let pk_bytes = pubkey.unwrap_or(&[]);
-        let payload_len = signature.length() + pk_bytes.length();
+        let payload_len = Self::parts_payload_length(signature, pubkey);
         let header = alloy_rlp::Header {
             list: true,
             payload_length: payload_len,
@@ -230,6 +230,15 @@ impl TxWitness {
         header.encode(out);
         signature.encode(out);
         pk_bytes.encode(out);
+    }
+
+    fn parts_payload_length(signature: &PQSignature, pubkey: Option<&[u8]>) -> usize {
+        signature.length() + pubkey.unwrap_or(&[]).length()
+    }
+
+    fn parts_length(signature: &PQSignature, pubkey: Option<&[u8]>) -> usize {
+        let payload_len = Self::parts_payload_length(signature, pubkey);
+        alloy_rlp::length_of_length(payload_len) + payload_len
     }
 }
 
@@ -239,9 +248,7 @@ impl Encodable for TxWitness {
     }
 
     fn length(&self) -> usize {
-        let pk_bytes: &[u8] = self.pubkey.as_deref().unwrap_or(&[]);
-        let payload_len = self.signature.length() + pk_bytes.length();
-        alloy_rlp::length_of_length(payload_len) + payload_len
+        Self::parts_length(&self.signature, self.pubkey.as_deref())
     }
 }
 
@@ -341,6 +348,22 @@ impl WitnessBundle {
             }),
             transactions.len(),
         )
+    }
+
+    /// Return the canonical RLP length of a witness bundle represented by full
+    /// transactions, without cloning witness material into a temporary bundle.
+    pub fn encoded_length_from_transactions(transactions: &[SignedTransaction]) -> usize {
+        let payload_len = transactions
+            .iter()
+            .map(|tx| {
+                let pubkey = match &tx.pubkey_mode {
+                    PubkeyMode::Embedded(pubkey) => Some(pubkey.as_slice()),
+                    PubkeyMode::Reference => None,
+                };
+                TxWitness::parts_length(&tx.signature, pubkey)
+            })
+            .sum();
+        alloy_rlp::length_of_length(payload_len) + payload_len
     }
 
     fn compute_root_from_parts<'a, I>(parts: I, len: usize) -> ShellHash
@@ -661,6 +684,14 @@ mod tests {
         assert_eq!(
             WitnessBundle::compute_root_from_transactions(&transactions),
             bundle.compute_root()
+        );
+        assert_eq!(
+            WitnessBundle::encoded_length_from_transactions(&transactions),
+            bundle.length()
+        );
+        assert_eq!(
+            WitnessBundle::encoded_length_from_transactions(&transactions),
+            bundle.rlp_encode().len()
         );
     }
 

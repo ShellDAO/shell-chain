@@ -1,5 +1,4 @@
 use super::*;
-use alloy_rlp::Encodable;
 
 const SYSTEM_EXTRA_PREFIX: &[u8] = b"shell:system-extra:v1:";
 const BASE_STARK_MINT_WEI: u128 = 100_000_000_000_000_000_000;
@@ -180,10 +179,9 @@ impl<S: KvStore + 'static> Node<S> {
             .iter()
             .any(|tx| !tx.signature.data.is_empty());
         if has_real_witness_material {
-            let (_, witness_bundle) = shell_core::StrippedBlock::split(source_block);
-            if !witness_bundle.is_empty() {
-                return Ok(Some(witness_bundle.length() as u64));
-            }
+            return Ok(Some(WitnessBundle::encoded_length_from_transactions(
+                &source_block.transactions,
+            ) as u64));
         }
 
         // If a full node pruned the raw witness before the prover caught up, the
@@ -208,14 +206,15 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(size);
         }
 
-        let (_, witness_bundle) = shell_core::StrippedBlock::split(source_block);
-        if !witness_bundle.is_empty()
-            && witness_bundle
-                .witnesses
+        if !source_block.transactions.is_empty()
+            && source_block
+                .transactions
                 .iter()
-                .all(|witness| !witness.signature.data.is_empty())
+                .all(|tx| !tx.signature.data.is_empty())
         {
-            return Ok(witness_bundle.length() as u64);
+            return Ok(
+                WitnessBundle::encoded_length_from_transactions(&source_block.transactions) as u64,
+            );
         }
 
         Err(NodeError::Startup(format!(

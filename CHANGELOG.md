@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- Count canonical witness-bundle bytes directly from borrowed transactions
+  instead of cloning complete block payloads and witness material.
 - Build signature-batch STARK traces directly in the prover table instead of
   allocating and duplicating four temporary columns.
 - Scope provisional side-fork signature policy once per block instead of once

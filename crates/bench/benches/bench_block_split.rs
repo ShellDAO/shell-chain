@@ -11,7 +11,7 @@
 /// Run with: `cargo bench --package shell-bench --bench bench_block_split`
 use alloy_rlp::Encodable;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use shell_core::{Block, BlockHeader, SignedTransaction, Transaction};
+use shell_core::{Block, BlockHeader, SignedTransaction, Transaction, WitnessBundle};
 use shell_crypto::{DilithiumSigner, Signer};
 use shell_primitives::{Address, Bytes, U256};
 
@@ -105,6 +105,14 @@ fn post_proof_size(block: &Block) -> usize {
     sbuf.len()
 }
 
+fn materialized_witness_size(block: &Block) -> usize {
+    block.clone().split().1.length()
+}
+
+fn direct_witness_size(block: &Block) -> usize {
+    WitnessBundle::encoded_length_from_transactions(&block.transactions)
+}
+
 // ─── Size report (run at benchmark startup) ───────────────────────────────────
 
 fn print_size_table() {
@@ -171,5 +179,26 @@ fn bench_encode_legacy(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_encode_legacy);
+fn bench_witness_size(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_split/witness_size");
+
+    for tx_count in [10usize, 50, 100] {
+        let block = make_block(tx_count);
+        group.throughput(Throughput::Elements(tx_count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("materialized", tx_count),
+            &block,
+            |b, block| b.iter(|| black_box(materialized_witness_size(block))),
+        );
+
+        group.bench_with_input(BenchmarkId::new("direct", tx_count), &block, |b, block| {
+            b.iter(|| black_box(direct_witness_size(block)))
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_encode_legacy, bench_witness_size);
 criterion_main!(benches);
