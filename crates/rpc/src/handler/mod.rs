@@ -64,6 +64,8 @@ pub struct RpcHandler<S: KvStore + 'static> {
     proposer_signer: Option<Arc<dyn Signer>>,
     /// Address of the proposer (derived from the signer's public key).
     proposer_address: Option<Address>,
+    /// Serializes nonce selection and submission for signer-backed governance transactions.
+    proposer_submission_lock: Arc<parking_lot::Mutex<()>>,
     /// Timestamp when the RPC handler was created, used for uptime calculation.
     start_time: Instant,
     /// F-073: counter for bloom filter false positives in eth_getLogs.
@@ -114,6 +116,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             subscription_tracker: self.subscription_tracker.clone(),
             proposer_signer: self.proposer_signer.clone(),
             proposer_address: self.proposer_address,
+            proposer_submission_lock: Arc::clone(&self.proposer_submission_lock),
             start_time: self.start_time,
             bloom_false_positives: Arc::clone(&self.bloom_false_positives),
             finalized_number: Arc::clone(&self.finalized_number),
@@ -161,6 +164,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             subscription_tracker: SubscriptionTracker::default(),
             proposer_signer: None,
             proposer_address: None,
+            proposer_submission_lock: Arc::new(parking_lot::Mutex::new(())),
             start_time: Instant::now(),
             bloom_false_positives: Arc::new(AtomicU64::new(0)),
             finalized_number,
@@ -394,10 +398,12 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             ErrorObjectOwned::owned(-32601, "node is not configured as a validator", None::<()>)
         })?;
 
-        let nonce = {
+        let _submission_guard = self.proposer_submission_lock.lock();
+        let chain_nonce = {
             let ws = self.world_state.read();
             ws.get_nonce(&proposer_addr).map_err(internal_err)?
         };
+        let nonce = self.tx_pool.pending_nonce(&proposer_addr, chain_nonce);
         let max_fee_per_gas = self
             .chain_store
             .get_head_block()
@@ -4565,6 +4571,29 @@ mod tests {
         let pending = handler.tx_pool.pending(100);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tx.nonce, 5);
+    }
+
+    #[tokio::test]
+    async fn governance_proposals_use_contiguous_pending_nonces() {
+        let (handler, _signer, _addr) = setup_with_proposer();
+        let add_target = Address::from([0xAB; 20]).to_string();
+        let remove_target = Address::from([0xCD; 20]).to_string();
+
+        ShellApiServer::propose_add_validator(&handler, add_target)
+            .await
+            .unwrap();
+        ShellApiServer::propose_remove_validator(&handler, remove_target)
+            .await
+            .unwrap();
+
+        let mut nonces = handler
+            .tx_pool
+            .pending(100)
+            .into_iter()
+            .map(|tx| tx.tx.nonce)
+            .collect::<Vec<_>>();
+        nonces.sort_unstable();
+        assert_eq!(nonces, vec![0, 1]);
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Allocate signer-backed validator governance transaction nonces from the
+  contiguous pending sender queue so multiple proposals can await inclusion.
 - Disable signer-backed validator governance RPC methods on unauthenticated
   non-loopback listeners while retaining public read-only Shell RPC methods.
 - Enforce runtime algorithm deprecation when batch-validating session root
