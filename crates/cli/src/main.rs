@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod commands;
@@ -529,9 +529,23 @@ enum PqHdCommands {
     },
 }
 
+fn config_or_cli<T>(
+    matches: &clap::ArgMatches,
+    id: &str,
+    cli_value: T,
+    config_value: Option<T>,
+) -> T {
+    if matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
+        cli_value
+    } else {
+        config_value.unwrap_or(cli_value)
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
     // Build password args from global flags (used by key/run/tx subcommands).
     let password_args = PasswordArgs {
@@ -630,32 +644,25 @@ async fn main() {
             };
 
             // Merge: CLI explicit values take priority over config file.
-            let datadir = if cli.datadir != *"shell-data" {
-                cli.datadir
-            } else {
-                file_config
-                    .node
-                    .datadir
-                    .map(PathBuf::from)
-                    .unwrap_or(cli.datadir)
-            };
-
-            let effective_rpc_addr = if rpc_addr != "127.0.0.1:8545" {
-                rpc_addr
-            } else {
-                file_config.rpc.listen_addr.unwrap_or(rpc_addr)
-            };
-
-            // Resolve network type first so block_time default can come from it.
-            let effective_network = if network != "dev" {
-                network.clone()
-            } else {
-                file_config
-                    .node
-                    .network
-                    .clone()
-                    .unwrap_or_else(|| network.clone())
-            };
+            let run_matches = matches.subcommand_matches("run").expect("run arguments");
+            let datadir = config_or_cli(
+                &matches,
+                "datadir",
+                cli.datadir,
+                file_config.node.datadir.map(PathBuf::from),
+            );
+            let effective_rpc_addr = config_or_cli(
+                run_matches,
+                "rpc_addr",
+                rpc_addr,
+                file_config.rpc.listen_addr,
+            );
+            let effective_network = config_or_cli(
+                run_matches,
+                "network",
+                network,
+                file_config.node.network.clone(),
+            );
 
             // Block time: explicit CLI > config file > network-profile default.
             let network_default_block_time = match effective_network.as_str() {
@@ -669,11 +676,8 @@ async fn main() {
             let effective_keystore =
                 keystore.or_else(|| file_config.node.keystore.map(PathBuf::from));
 
-            let effective_chain_id = if chain_id != 1337 {
-                chain_id
-            } else {
-                file_config.node.chain_id.unwrap_or(chain_id)
-            };
+            let effective_chain_id =
+                config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
             // Storage backend: explicit CLI > config file > network-profile default.
             // dev → memory (ephemeral); testnet/mainnet → rocksdb (persistent).
@@ -700,27 +704,22 @@ async fn main() {
 
             let effective_ws = ws || file_config.rpc.ws_enabled.unwrap_or(false);
 
-            let effective_ws_port = if ws_port != 8546 {
-                ws_port
-            } else {
-                file_config.rpc.ws_port.unwrap_or(ws_port)
-            };
+            let effective_ws_port =
+                config_or_cli(run_matches, "ws_port", ws_port, file_config.rpc.ws_port);
 
             let effective_p2p = p2p || file_config.p2p.enabled.unwrap_or(false);
 
-            let effective_p2p_addr = if p2p_addr != "0.0.0.0:30303" {
-                p2p_addr
-            } else {
-                file_config.p2p.listen_addr.unwrap_or(p2p_addr)
-            };
+            let effective_p2p_addr = config_or_cli(
+                run_matches,
+                "p2p_addr",
+                p2p_addr,
+                file_config.p2p.listen_addr,
+            );
 
             let effective_enable_mdns = enable_mdns || file_config.p2p.enable_mdns.unwrap_or(false);
 
-            let effective_pruning = if pruning != 0 {
-                pruning
-            } else {
-                file_config.node.pruning.unwrap_or(pruning)
-            };
+            let effective_pruning =
+                config_or_cli(run_matches, "pruning", pruning, file_config.node.pruning);
 
             let effective_rpc_cors =
                 rpc_cors.or_else(|| file_config.rpc.cors_origins.map(|v| v.join(",")));
@@ -891,6 +890,82 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_config_precedence<T>(id: &str, flag: &str, default: T, configured: T)
+    where
+        T: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let omitted = Cli::command()
+            .try_get_matches_from(["shell-node", "run"])
+            .unwrap();
+        let run = omitted.subcommand_matches("run").unwrap();
+        let parsed = run.get_one::<T>(id).unwrap().clone();
+        assert_eq!(parsed, default);
+        assert_eq!(
+            config_or_cli(run, id, parsed.clone(), Some(configured.clone())),
+            configured
+        );
+        assert_eq!(config_or_cli(run, id, parsed, None), default);
+
+        let default_text = run.get_raw(id).unwrap().next().unwrap().to_str().unwrap();
+        let explicit = Cli::command()
+            .try_get_matches_from(["shell-node", "run", flag, default_text])
+            .unwrap();
+        let run = explicit.subcommand_matches("run").unwrap();
+        let parsed = run.get_one::<T>(id).unwrap().clone();
+        assert_eq!(config_or_cli(run, id, parsed, Some(configured)), default);
+    }
+
+    #[test]
+    fn explicit_run_defaults_override_file_config() {
+        check_config_precedence(
+            "network",
+            "--network",
+            "dev".to_string(),
+            "testnet".to_string(),
+        );
+        check_config_precedence("chain_id", "--chain-id", 1337u64, 42u64);
+        check_config_precedence("ws_port", "--ws-port", 8546u16, 9546u16);
+        check_config_precedence("pruning", "--pruning", 0u64, 128u64);
+        check_config_precedence(
+            "rpc_addr",
+            "--rpc-addr",
+            "127.0.0.1:8545".to_string(),
+            "0.0.0.0:9545".to_string(),
+        );
+        check_config_precedence(
+            "p2p_addr",
+            "--p2p-addr",
+            "0.0.0.0:30303".to_string(),
+            "127.0.0.1:30304".to_string(),
+        );
+    }
+
+    #[test]
+    fn explicit_global_datadir_overrides_file_before_or_after_subcommand() {
+        for args in [
+            vec!["shell-node", "--datadir", "shell-data", "run"],
+            vec!["shell-node", "run", "--datadir", "shell-data"],
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            assert_eq!(
+                config_or_cli(
+                    &matches,
+                    "datadir",
+                    cli.datadir,
+                    Some(PathBuf::from("configured-data"))
+                ),
+                PathBuf::from("shell-data")
+            );
+        }
+        check_config_precedence(
+            "datadir",
+            "--datadir",
+            PathBuf::from("shell-data"),
+            PathBuf::from("configured-data"),
+        );
+    }
 
     #[test]
     fn stark_aggregation_is_opt_in_for_run() {
