@@ -134,6 +134,9 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        if self.max_per_sec == u32::MAX {
+            return futures_util::future::Either::Left(self.inner.call(req));
+        }
         let bucket_key = rate_limit_bucket_key(&req);
         let allowed = {
             let mut buckets = self.buckets.lock();
@@ -366,6 +369,22 @@ mod tests {
         fn call(&mut self, _: Request<()>) -> Self::Future {
             std::future::ready(Ok(Response::new(())))
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_rate_limit_does_not_track_buckets() {
+        let layer = RateLimitLayer::from_config(None);
+        let mut svc = layer.layer(OkService);
+        for i in 0..32 {
+            let mut req = Request::new(());
+            req.extensions_mut()
+                .insert(std::net::SocketAddr::from(([127, 0, 0, i], 10001)));
+            assert_eq!(
+                svc.ready().await.unwrap().call(req).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(layer.bucket_count(), 0);
     }
 
     #[tokio::test]
