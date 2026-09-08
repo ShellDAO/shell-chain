@@ -2058,6 +2058,17 @@ impl<S: KvStore> ChainStore<S> {
             }
         }
 
+        // Snapshots may omit the config entry. Publish the caller's validated
+        // chain identity with the head so a fresh destination remains bootable.
+        let config = ChainConfig {
+            chain_id: expected_chain_id,
+            genesis_hash: *expected_genesis_hash,
+        };
+        pending_publication.put(
+            prefix::CHAIN_CONFIG.to_vec(),
+            serde_json::to_vec(&config).map_err(|e| StorageError::Serialization(e.to_string()))?,
+        );
+
         // Publish chain progress only after every other record is durable. A
         // failed streaming import must retain a mutually consistent old view.
         // Missing snapshot keys delete stale destination progress in the same
@@ -3984,6 +3995,13 @@ mod tests {
         // Verify data was written
         assert_eq!(store.get(b"test-key-1").unwrap(), Some(b"value-1".to_vec()));
         assert_eq!(store.get(b"test-key-2").unwrap(), Some(b"value-2".to_vec()));
+        assert_eq!(
+            cs.get_chain_config().unwrap(),
+            Some(ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::default(),
+            })
+        );
     }
 
     #[test]
