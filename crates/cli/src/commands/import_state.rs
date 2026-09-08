@@ -148,7 +148,7 @@ mod tests {
         import_state(dir.path().to_path_buf(), snapshot.clone()).unwrap();
         {
             let stores =
-                shell_storage::RocksDbStore::open_all(&dir.path().join("db"), None).unwrap();
+                shell_storage::RocksDbStore::open_all(dir.path().join("db"), None).unwrap();
             let chain_store = ChainStore::new(Arc::new(stores.state));
             assert_eq!(chain_store.get_head_hash().unwrap(), Some(expected_head));
         }
@@ -177,7 +177,7 @@ mod tests {
         assert!(error.to_string().contains("genesis"));
 
         let stores =
-            shell_storage::RocksDbStore::open_all(&destination.path().join("db"), None).unwrap();
+            shell_storage::RocksDbStore::open_all(destination.path().join("db"), None).unwrap();
         let chain_store = ChainStore::new(Arc::new(stores.state));
         assert!(chain_store.get_head_hash().unwrap().is_none());
         assert!(chain_store.get_chain_config().unwrap().is_none());
