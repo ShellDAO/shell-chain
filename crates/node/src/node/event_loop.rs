@@ -500,6 +500,7 @@ impl<S: KvStore + 'static> Node<S> {
         // loop is briefly delayed (e.g. startup sync, block import latency).
         block_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut peer_count_timer = interval(Duration::from_secs(10));
+        let mut storage_size_cache = crate::metrics::StorageSizeCache::default();
         let mut sync_retry_timer = interval(Duration::from_secs(SYNC_RETRY_BASE_INTERVAL_SECS));
         let mut tx_rebroadcast_timer = interval(Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS));
         let mut sync_retry_attempts_without_progress = 0u32;
@@ -2204,56 +2205,7 @@ impl<S: KvStore + 'static> Node<S> {
                 _ = peer_count_timer.tick() => {
                     let peers = network.peer_count().await;
                     self.metrics.peer_count.set(peers as i64);
-                // ops-metrics: update per-CF storage size gauges with a 300s TTL cache.
-                // The fallback approximate_prefix_bytes() scans all matching keys; refreshing
-                // it every 10s scales poorly as the DB grows. Cache with atomics to amortize.
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    use std::time::{SystemTime, UNIX_EPOCH};
-
-                    const STORAGE_SIZE_CACHE_TTL_SECS: u64 = 300;
-                    static LAST_STORAGE_SIZE_UPDATE: AtomicU64 = AtomicU64::new(0);
-                    static CACHED_CHAIN_BYTES: AtomicU64 = AtomicU64::new(0);
-                    static CACHED_WITNESS_BYTES: AtomicU64 = AtomicU64::new(0);
-                    static CACHED_PROOF_BYTES: AtomicU64 = AtomicU64::new(0);
-
-                    let now_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let last = LAST_STORAGE_SIZE_UPDATE.load(Ordering::Relaxed);
-
-                    if now_secs.saturating_sub(last) >= STORAGE_SIZE_CACHE_TTL_SECS {
-                        let chain_bytes = self
-                            .chain_store
-                            .approximate_prefix_bytes(b"b/")
-                            .unwrap_or(0)
-                            .saturating_add(
-                                self.chain_store.approximate_prefix_bytes(b"h/").unwrap_or(0),
-                            )
-                            .saturating_add(
-                                self.chain_store.approximate_prefix_bytes(b"n/").unwrap_or(0),
-                            );
-                        let witness_bytes =
-                            self.chain_store.approximate_prefix_bytes(b"w/").unwrap_or(0);
-                        let proof_bytes =
-                            self.chain_store.approximate_prefix_bytes(b"pa/").unwrap_or(0);
-
-                        CACHED_CHAIN_BYTES.store(chain_bytes, Ordering::Relaxed);
-                        CACHED_WITNESS_BYTES.store(witness_bytes, Ordering::Relaxed);
-                        CACHED_PROOF_BYTES.store(proof_bytes, Ordering::Relaxed);
-                        LAST_STORAGE_SIZE_UPDATE.store(now_secs, Ordering::Relaxed);
-                    }
-
-                    // State trie bytes are stored in a separate KV namespace; use 0 until
-                    // the trie store exposes a size_estimate().
-                    self.metrics.update_cf_sizes(
-                        CACHED_CHAIN_BYTES.load(Ordering::Relaxed),
-                        CACHED_WITNESS_BYTES.load(Ordering::Relaxed),
-                        0,
-                        CACHED_PROOF_BYTES.load(Ordering::Relaxed),
-                    );
-                }
+                    storage_size_cache.update(&self.chain_store, &self.metrics);
                 }
 
                 _ = sync_retry_timer.tick() => {
