@@ -49,12 +49,31 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
         let store = Arc::new(stores.state);
         let chain_store = ChainStore::new(store);
 
-        // Require a local chain configuration as the trust anchor. The
-        // snapshot's own genesis hash is metadata, not authentication.
-        let cfg = chain_store.get_chain_config()?.ok_or(
-            "fresh database has no trusted chain config; initialize the chain before importing state",
-        )?;
         ensure_no_canonical_head(&chain_store)?;
+
+        // The trust anchor must come from local configuration, not the snapshot.
+        // `init` writes genesis.json without opening the persistent database.
+        let cfg = match chain_store.get_chain_config()? {
+            Some(cfg) => cfg,
+            None => {
+                let genesis_path = datadir.join("genesis.json");
+                if !genesis_path.is_file() {
+                    return Err(
+                        "fresh database has no trusted chain config; initialize the chain before importing state"
+                            .into(),
+                    );
+                }
+                let genesis = shell_genesis::GenesisConfig::from_file(&genesis_path)?;
+                let block = shell_genesis::initialize_genesis(
+                    &genesis,
+                    Arc::new(shell_storage::MemoryDb::new()),
+                )?;
+                shell_storage::ChainConfig {
+                    chain_id: genesis.chain_id,
+                    genesis_hash: block.hash(),
+                }
+            }
+        };
 
         let file = std::fs::File::open(&snapshot)?;
         let reader = std::io::BufReader::new(file);
@@ -92,5 +111,75 @@ mod tests {
         let error = ensure_no_canonical_head(&chain_store).unwrap_err();
 
         assert!(error.to_string().contains("existing canonical head"));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn prepare_snapshot(
+        datadir: &std::path::Path,
+    ) -> (shell_genesis::GenesisConfig, ShellHash, PathBuf) {
+        crate::commands::init(datadir.to_path_buf(), None, 1337, "dev".into()).unwrap();
+        let genesis =
+            shell_genesis::GenesisConfig::from_file(&datadir.join("genesis.json")).unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let block = shell_genesis::initialize_genesis(&genesis, Arc::clone(&store)).unwrap();
+        let hash = block.hash();
+        let snapshot = datadir.join("snapshot.jsonl");
+        ChainStore::new(store)
+            .export_snapshot(
+                shell_storage::SnapshotMetadata::new(
+                    genesis.chain_id,
+                    block.number(),
+                    hash,
+                    block.header.state_root,
+                    hash,
+                ),
+                std::fs::File::create(&snapshot).unwrap(),
+            )
+            .unwrap();
+        (genesis, hash, snapshot)
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn snapshot_import_works_after_init_without_starting_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, expected_head, snapshot) = prepare_snapshot(dir.path());
+
+        import_state(dir.path().to_path_buf(), snapshot.clone()).unwrap();
+        {
+            let stores =
+                shell_storage::RocksDbStore::open_all(dir.path().join("db"), None).unwrap();
+            let chain_store = ChainStore::new(Arc::new(stores.state));
+            assert_eq!(chain_store.get_head_hash().unwrap(), Some(expected_head));
+        }
+
+        let error = import_state(dir.path().to_path_buf(), snapshot).unwrap_err();
+        assert!(error.to_string().contains("existing canonical head"));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn fresh_snapshot_import_requires_matching_local_genesis() {
+        let source = tempfile::tempdir().unwrap();
+        let (mut genesis, _, snapshot) = prepare_snapshot(source.path());
+        let destination = tempfile::tempdir().unwrap();
+
+        let error = import_state(destination.path().to_path_buf(), snapshot.clone()).unwrap_err();
+        assert!(error.to_string().contains("trusted chain config"));
+
+        genesis.timestamp += 1;
+        std::fs::write(
+            destination.path().join("genesis.json"),
+            genesis.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        let error = import_state(destination.path().to_path_buf(), snapshot).unwrap_err();
+        assert!(error.to_string().contains("genesis"));
+
+        let stores =
+            shell_storage::RocksDbStore::open_all(destination.path().join("db"), None).unwrap();
+        let chain_store = ChainStore::new(Arc::new(stores.state));
+        assert!(chain_store.get_head_hash().unwrap().is_none());
+        assert!(chain_store.get_chain_config().unwrap().is_none());
     }
 }

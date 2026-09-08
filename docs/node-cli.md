@@ -252,6 +252,16 @@ snapshots are not exported from a live chain database.
 Snapshot import requires a trusted local chain configuration and rejects a
 chain store that already has a canonical head.
 
+For a fresh data directory, initialize it with the trusted genesis file before
+importing. The importer derives the chain identity from that local file when
+the database has no stored chain configuration; it does not trust the
+snapshot's declared identity as its own authority.
+
+```bash
+shell-node --datadir chain-data init --genesis genesis.json
+shell-node --datadir chain-data import-state --snapshot snapshot.jsonl
+```
+
 ---
 
 ### 2.10 `removedb`
