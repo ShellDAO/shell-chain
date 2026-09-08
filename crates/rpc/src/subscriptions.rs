@@ -556,6 +556,7 @@ fn header_to_json(header: &BlockHeader) -> serde_json::Value {
         "timestamp": hex_u64(header.timestamp),
         "gasLimit": hex_u64(header.gas_limit),
         "gasUsed": hex_u64(header.gas_used),
+        "baseFeePerGas": hex_u64(header.base_fee_per_gas),
         "miner": header.proposer,
         "stateRoot": header.state_root,
         "transactionsRoot": header.transactions_root,
@@ -1006,10 +1007,13 @@ mod tests {
 
     #[test]
     fn header_to_json_roundtrip() {
-        let header = sample_header(42);
+        let mut header = sample_header(42);
+        assert_eq!(header_to_json(&header)["baseFeePerGas"], "0x0");
+        header.base_fee_per_gas = 1_000_000_000;
         let json = header_to_json(&header);
         assert_eq!(json["number"], "0x2a");
         assert_eq!(json["gasUsed"], "0x5208");
+        assert_eq!(json["baseFeePerGas"], "0x3b9aca00");
     }
 
     #[test]
