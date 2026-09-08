@@ -36,13 +36,14 @@ impl PeerCountState {
     }
 
     fn register(&self, connected_peer_count: &Arc<AtomicUsize>) {
-        let live_peers = self.live_peers.fetch_add(1, Ordering::Relaxed) + 1;
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        let live_peers = self.live_peers.fetch_add(1, Ordering::Relaxed) + 1;
         handles.push(Arc::downgrade(connected_peer_count));
         Self::refresh_handles(&mut handles, live_peers);
     }
 
     fn unregister(&self) {
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         let live_peers = self
             .live_peers
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -50,7 +51,6 @@ impl PeerCountState {
             })
             .map(|previous| previous - 1)
             .unwrap_or(0);
-        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         Self::refresh_handles(&mut handles, live_peers);
     }
 
@@ -227,6 +227,43 @@ mod tests {
     use shell_crypto::PQSignature;
     use shell_primitives::{Address, Bytes, ShellHash, U256};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn concurrent_peer_changes_keep_handles_consistent() {
+        const WORKERS: usize = 8;
+        let state = PeerCountState::new();
+        let observer = Arc::new(AtomicUsize::new(0));
+        state.register(&observer);
+        let barrier = std::sync::Barrier::new(WORKERS);
+        let consistent = AtomicBool::new(true);
+
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    for _ in 0..32 {
+                        let handle = Arc::new(AtomicUsize::new(0));
+                        state.register(&handle);
+                        barrier.wait();
+                        if handle.load(Ordering::Relaxed) != WORKERS
+                            || observer.load(Ordering::Relaxed) != WORKERS
+                        {
+                            consistent.store(false, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                        state.unregister();
+                        barrier.wait();
+                        if observer.load(Ordering::Relaxed) != 0 {
+                            consistent.store(false, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+
+        assert!(consistent.load(Ordering::Relaxed));
+        assert_eq!(state.connected_peers(), 0);
+    }
 
     fn test_block(number: u64) -> Block {
         Block {
