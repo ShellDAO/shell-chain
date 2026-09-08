@@ -46,8 +46,8 @@ pub async fn start_tls_proxy(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("TLS proxy shutting down");
                         break;
                     }
@@ -106,4 +106,53 @@ async fn forward_connection(
 
     tokio::try_join!(c2s, s2c)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn start_test_proxy() -> TlsProxyHandle {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let addr = "127.0.0.1:0".parse().unwrap();
+        start_tls_proxy(addr, addr, Arc::new(config)).await.unwrap()
+    }
+
+    async fn assert_listener_released(addr: SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(_listener) => return,
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("failed to rebind proxy listener: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("proxy retained its listening socket after shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropping_handle_releases_listener() {
+        let proxy = start_test_proxy().await;
+        let addr = proxy.public_addr;
+        drop(proxy);
+        assert_listener_released(addr).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_releases_listener() {
+        let proxy = start_test_proxy().await;
+        proxy.shutdown();
+        assert_listener_released(proxy.public_addr).await;
+    }
 }
