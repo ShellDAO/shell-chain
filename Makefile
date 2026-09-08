@@ -1,9 +1,9 @@
 .PHONY: bench bench-quick test ci invariant-network invariant-hash-signing invariant-aa-paymaster invariant-stark-pruning invariant-rpc e2e e2e-extended load-test chaos-test security-audit
 
-# Mirror CI checks exactly (run before every push)
+# Run workspace Rust quality checks before every push.
 ci:
 	cargo fmt --all -- --check
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
 
 # Run full criterion benchmarks for all workspace crates
