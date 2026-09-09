@@ -44,8 +44,11 @@ pub async fn start_tls_proxy(
     info!("TLS proxy listening on {actual_addr} -> backend {backend_addr}");
 
     tokio::spawn(async move {
+        // Handshakes and forwarding tasks stop when the proxy shuts down.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                Some(_) = connections.join_next() => {}
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         info!("TLS proxy shutting down");
@@ -57,7 +60,7 @@ pub async fn start_tls_proxy(
                         Ok((tcp_stream, peer_addr)) => {
                             debug!("TLS proxy: new connection from {peer_addr}");
                             let acceptor = acceptor.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 match acceptor.accept(tcp_stream).await {
                                     Ok(tls_stream) => {
                                         if let Err(e) = forward_connection(tls_stream, backend_addr).await {
@@ -154,5 +157,76 @@ mod tests {
         let proxy = start_test_proxy().await;
         proxy.shutdown();
         assert_listener_released(proxy.public_addr).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_proxy_closes_forwarded_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let server_config = Arc::new(server_config);
+
+        for drop_handle in [false, true] {
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = start_tls_proxy(
+                "127.0.0.1:0".parse().unwrap(),
+                backend.local_addr().unwrap(),
+                Arc::clone(&server_config),
+            )
+            .await
+            .unwrap();
+            let (mut client, mut backend_stream) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let tcp = tokio::net::TcpStream::connect(proxy.public_addr)
+                        .await
+                        .unwrap();
+                    let client = connector
+                        .connect("localhost".try_into().unwrap(), tcp)
+                        .await
+                        .unwrap();
+                    let (stream, _) = backend.accept().await.unwrap();
+                    (client, stream)
+                })
+                .await
+                .expect("TLS proxy connection did not start");
+            client.write_all(b"ping").await.unwrap();
+            let mut ping = [0; 4];
+            tokio::time::timeout(Duration::from_secs(2), backend_stream.read_exact(&mut ping))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&ping, b"ping");
+
+            if drop_handle {
+                drop(proxy);
+            } else {
+                proxy.shutdown();
+            }
+            let mut byte = [0; 1];
+            let count =
+                tokio::time::timeout(Duration::from_secs(2), backend_stream.read(&mut byte))
+                    .await
+                    .expect("forwarded connection survived proxy shutdown")
+                    .unwrap();
+            assert_eq!(count, 0);
+        }
     }
 }
