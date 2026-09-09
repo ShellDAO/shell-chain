@@ -547,17 +547,22 @@ pub async fn serve_metrics(metrics: Arc<Metrics>, addr: SocketAddr) {
     };
     tracing::info!(%addr, "metrics server listening");
 
+    // Cancelling the server also cancels its established HTTP connections.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!(error = %e, "metrics server accept error");
-                continue;
+        let (stream, _) = tokio::select! {
+            Some(_) = connections.join_next() => continue,
+            accepted = listener.accept() => match accepted {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "metrics server accept error");
+                    continue;
+                }
             }
         };
 
         let metrics = Arc::clone(&metrics);
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let io = TokioIo::new(stream);
             let service = hyper::service::service_fn(move |req| {
                 let metrics = Arc::clone(&metrics);
@@ -589,6 +594,54 @@ mod tests {
             .uri(path)
             .body(http_body_util::Empty::new())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelling_metrics_server_closes_keep_alive_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::{timeout, Duration};
+
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let server = tokio::spawn(serve_metrics(Arc::new(Metrics::default()), addr));
+        let mut client = timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(client) => break client,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("metrics listener did not start");
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            let mut buf = [0; 1024];
+            while !response.ends_with(b"}") {
+                let count = client.read(&mut buf).await.unwrap();
+                assert_ne!(count, 0, "connection closed before health response");
+                response.extend_from_slice(&buf[..count]);
+            }
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        })
+        .await
+        .expect("health response did not complete");
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let mut byte = [0; 1];
+        let count = timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("connection survived metrics server cancellation")
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
