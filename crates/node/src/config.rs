@@ -211,7 +211,7 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     /// This node's authority address (if it is a block producer).
     pub proposer_address: Option<Address>,
-    /// Block production interval in milliseconds.
+    /// Block production interval in milliseconds. Must be greater than zero.
     ///
     /// When building from genesis, prefer deriving this from
     /// [`NetworkType::default_block_time_ms`] so that Testnet/Mainnet

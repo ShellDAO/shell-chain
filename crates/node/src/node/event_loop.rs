@@ -371,6 +371,12 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(());
         }
 
+        if self.config.block_time_ms == 0 {
+            return Err(NodeError::Startup(
+                "block_time_ms must be greater than zero".into(),
+            ));
+        }
+
         self.recover_unfinalized_head()?;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
         let mut network = NetworkInterface::new(network);

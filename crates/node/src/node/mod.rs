@@ -7608,6 +7608,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_rejects_zero_block_time_before_startup() {
+        use shell_network::{NetworkBus, NetworkConfig};
+
+        let (mut node, signer) = setup_node();
+        node.config.block_time_ms = 0;
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let error = Arc::clone(&node)
+            .run(Arc::new(signer), &mut network)
+            .await
+            .expect_err("zero block time must fail startup");
+
+        assert!(matches!(error, NodeError::Startup(_)));
+        assert!(error
+            .to_string()
+            .contains("block_time_ms must be greater than zero"));
+        assert!(node.runtime_signer.read().is_none());
+        assert!(node.known_authorities.read().is_empty());
+    }
+
+    #[tokio::test]
     async fn event_loop_produces_blocks() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
