@@ -744,10 +744,28 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             .filter(|percentiles| !percentiles.is_empty())
             .map(|_| Vec::with_capacity((latest.saturating_sub(oldest) + 1) as usize));
 
+        let mut next_base_fee = shell_core::INITIAL_BASE_FEE;
         for num in oldest..=latest {
-            match self.chain_store.get_block_by_number(num) {
-                Ok(Some(block)) => {
-                    let h = &block.header;
+            let header = match self
+                .chain_store
+                .get_block_hash_by_number(num)
+                .map_err(internal_err)?
+            {
+                Some(hash) => self
+                    .chain_store
+                    .get_header_by_hash(&hash)
+                    .map_err(internal_err)?,
+                None => None,
+            };
+            match header {
+                Some(h) => {
+                    if num == latest {
+                        next_base_fee = shell_core::fee::calculate_base_fee(
+                            h.gas_used,
+                            h.gas_limit,
+                            h.base_fee_per_gas,
+                        );
+                    }
                     base_fee_per_gas.push(hex_u64(h.base_fee_per_gas));
                     let ratio = if h.gas_limit > 0 {
                         h.gas_used as f64 / h.gas_limit as f64
@@ -756,11 +774,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     };
                     gas_used_ratio.push(ratio);
                 }
-                Ok(None) => {
+                None => {
                     base_fee_per_gas.push(hex_u64(0));
                     gas_used_ratio.push(0.0);
                 }
-                Err(error) => return Err(internal_err(error)),
             }
             if let (Some(reward), Some(percentiles)) = (&mut reward, reward_percentiles.as_ref()) {
                 reward.push(vec![hex_u64(0); percentiles.len()]);
@@ -768,20 +785,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         }
 
         // Append next block's predicted base fee (one more entry than gas_used_ratio).
-        if let Some(head) = self
-            .chain_store
-            .get_block_by_number(latest)
-            .map_err(internal_err)?
-        {
-            let next = shell_core::fee::calculate_base_fee(
-                head.header.gas_used,
-                head.header.gas_limit,
-                head.header.base_fee_per_gas,
-            );
-            base_fee_per_gas.push(hex_u64(next));
-        } else {
-            base_fee_per_gas.push(hex_u64(shell_core::INITIAL_BASE_FEE));
-        }
+        base_fee_per_gas.push(hex_u64(next_base_fee));
 
         Ok(serde_json::json!({
             "oldestBlock": hex_u64(oldest),
