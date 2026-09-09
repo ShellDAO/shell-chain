@@ -2703,6 +2703,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fee_history_preserves_fees_after_historical_body_pruning() {
+        let handler = setup();
+        let mut old = make_genesis_block();
+        old.header.base_fee_per_gas = 2_000_000_000;
+        old.header.gas_limit = 30_000_000;
+        old.header.gas_used = 15_000_000;
+        let mut head = old.clone();
+        head.header.number = 1;
+        head.header.parent_hash = old.hash();
+        head.header.gas_used = 30_000_000;
+        for block in [&old, &head] {
+            handler.chain_store.put_block(block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(block.number(), &block.hash())
+                .unwrap();
+        }
+        handler.chain_store.set_head(&head.hash()).unwrap();
+
+        let before =
+            EthApiServer::fee_history(&handler, "0x2".into(), "latest".into(), Some(vec![50.0]))
+                .await
+                .unwrap();
+        let historical_before =
+            EthApiServer::fee_history(&handler, "0x1".into(), "0x0".into(), None)
+                .await
+                .unwrap();
+        assert_eq!(before["gasUsedRatio"], serde_json::json!([0.5, 1.0]));
+        assert_eq!(
+            historical_before["baseFeePerGas"],
+            serde_json::json!(["0x77359400", "0x77359400"])
+        );
+
+        handler.chain_store.delete_body(&old.hash()).unwrap();
+        assert!(handler
+            .chain_store
+            .get_block_by_number(0)
+            .unwrap()
+            .is_none());
+        assert!(handler
+            .chain_store
+            .get_header_by_hash(&old.hash())
+            .unwrap()
+            .is_some());
+
+        let after =
+            EthApiServer::fee_history(&handler, "0x2".into(), "latest".into(), Some(vec![50.0]))
+                .await
+                .unwrap();
+        let historical_after =
+            EthApiServer::fee_history(&handler, "0x1".into(), "0x0".into(), None)
+                .await
+                .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(historical_after, historical_before);
+    }
+
+    #[tokio::test]
     async fn fee_history_returns_zero_priority_rewards_when_requested() {
         let handler = setup();
         let mut block = make_genesis_block();
