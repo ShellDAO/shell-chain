@@ -603,13 +603,11 @@ impl<S: KvStore + 'static> Node<S> {
         {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        return Ok(());
-                    }
-                }
+                _ = shutdown_rx.changed() => {}
             }
-            if network.peer_count().await > 0 {
+            // A shutdown during startup must still reach the cleanup below.
+            let shutdown_requested = *shutdown_rx.borrow();
+            if !shutdown_requested && network.peer_count().await > 0 {
                 let oldest = self.oldest_available_body_block();
                 let head = self.head_number();
                 if oldest > 0 {
@@ -639,7 +637,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
-        loop {
+        while !*shutdown_rx.borrow() {
             let prover_ready = production_readiness.can_produce();
             self.prover_ready
                 .store(prover_ready, std::sync::atomic::Ordering::Release);

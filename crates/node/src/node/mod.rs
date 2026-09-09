@@ -7747,27 +7747,51 @@ mod tests {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
 
-        let (mut node, signer) = setup_node();
-        node.config.rpc_enabled = false;
-        node.config.metrics.enabled = false;
-        store_consistent_genesis(&node);
+        for fail_flush in [false, true] {
+            let (mut node, signer, db) = setup_failing_batch_node();
+            node.config.rpc_enabled = false;
+            node.config.metrics.enabled = false;
+            store_consistent_genesis(&node);
+            db.fail_next_flush.store(fail_flush, Ordering::SeqCst);
 
-        let bus = NetworkBus::new(64);
-        let mut network = bus.join(&NetworkConfig::default());
-        let node = Arc::new(node);
-        let signer = Arc::new(signer) as Arc<dyn Signer>;
-        let handle = tokio::spawn({
-            let node = Arc::clone(&node);
-            async move { node.run(signer, &mut network).await }
-        });
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let node = Arc::new(node);
+            let handle = tokio::spawn({
+                let node = Arc::clone(&node);
+                async move {
+                    let result = node.run(Arc::new(signer), &mut network).await;
+                    (result, network)
+                }
+            });
 
-        tokio::task::yield_now().await;
-        node.shutdown();
-        let result = tokio::time::timeout(Duration::from_millis(100), handle)
-            .await
-            .expect("shutdown remained blocked by startup backfill delay")
-            .expect("event loop task panicked");
-        assert!(result.is_ok(), "run() returned error: {:?}", result.err());
+            tokio::task::yield_now().await;
+            node.shutdown();
+            let (result, mut network) = tokio::time::timeout(Duration::from_millis(100), handle)
+                .await
+                .expect("shutdown remained blocked by startup backfill delay")
+                .expect("event loop task panicked");
+            assert!(node.runtime_signer.read().is_some(), "startup never began");
+            assert_eq!(node.head_number(), 0, "shutdown produced a block");
+
+            // Keep the network alive so Drop cannot hide skipped cleanup.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), network.next_event())
+                    .await
+                    .expect("network event stream remained open")
+                    .is_none()
+            );
+            if fail_flush {
+                assert!(matches!(
+                    result,
+                    Err(NodeError::Storage(StorageError::Database(message)))
+                        if message == "injected flush failure"
+                ));
+                assert!(!db.fail_next_flush.load(Ordering::SeqCst));
+            } else {
+                assert!(result.is_ok(), "run() returned error: {:?}", result.err());
+            }
+        }
     }
 
     #[tokio::test]
