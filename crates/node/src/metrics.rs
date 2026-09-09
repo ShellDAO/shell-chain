@@ -569,6 +569,7 @@ pub async fn serve_metrics(metrics: Arc<Metrics>, addr: SocketAddr) {
                 async move { Ok::<_, std::convert::Infallible>(handle_request(req, &metrics)) }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
                 .serve_connection(io, service)
                 .await
             {
@@ -594,6 +595,41 @@ mod tests {
             .uri(path)
             .body(http_body_util::Empty::new())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_server_times_out_incomplete_request_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::{timeout, Duration};
+
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let server = tokio::spawn(serve_metrics(Arc::new(Metrics::default()), addr));
+        let mut client = timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(client) => break client,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("metrics server did not start");
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost:")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        // Hyper's default request-header timeout is 30 seconds.
+        let closed = timeout(Duration::from_secs(35), client.read_to_end(&mut response)).await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        closed
+            .expect("incomplete request survived the header timeout")
+            .unwrap();
     }
 
     #[tokio::test]
