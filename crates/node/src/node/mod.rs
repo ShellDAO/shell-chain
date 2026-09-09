@@ -1894,6 +1894,7 @@ mod tests {
         inner: MemoryDb,
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
+        fail_next_flush: AtomicBool,
         fail_next_batch: AtomicBool,
         fail_proof_batch: AtomicBool,
         fail_head_batch: AtomicBool,
@@ -1905,6 +1906,7 @@ mod tests {
                 inner: MemoryDb::new(),
                 fail_next_get: AtomicBool::new(false),
                 fail_next_put: AtomicBool::new(false),
+                fail_next_flush: AtomicBool::new(false),
                 fail_next_batch: AtomicBool::new(false),
                 fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
@@ -1952,6 +1954,9 @@ mod tests {
         }
 
         fn flush(&self) -> Result<(), StorageError> {
+            if self.fail_next_flush.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Database("injected flush failure".into()));
+            }
             self.inner.flush()
         }
 
@@ -7683,6 +7688,58 @@ mod tests {
             "expected at least 3 blocks, got {}",
             observed_height
         );
+    }
+
+    #[tokio::test]
+    async fn event_loop_reports_flush_failure_after_stopping_network() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, signer, db) = setup_failing_batch_node();
+        node.config.block_time_ms = 1_000;
+        node.config.max_idle_interval_ms = 0;
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move {
+                let result = node.run(Arc::new(signer), &mut network).await;
+                (result, network)
+            }
+        });
+
+        // Wait until startup completes and the main event loop produces a block.
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while node.head_number() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        db.fail_next_flush.store(true, Ordering::SeqCst);
+        node.shutdown();
+        let (result, mut network) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown did not finish")
+            .expect("event loop panicked");
+        started.expect("node did not produce a block");
+
+        // Keep the network alive so Drop cannot hide a skipped shutdown call.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), network.next_event())
+                .await
+                .expect("network event stream remained open")
+                .is_none()
+        );
+        assert!(matches!(
+            result,
+            Err(NodeError::Storage(StorageError::Database(message)))
+                if message == "injected flush failure"
+        ));
     }
 
     #[tokio::test]

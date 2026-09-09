@@ -2344,15 +2344,16 @@ impl<S: KvStore + 'static> Node<S> {
 
         task_lifecycle.shutdown().await;
 
-        // Flush storage to disk.
-        if let Err(e) = self.store.flush() {
+        // Preserve the flush error while still shutting down the network.
+        let flush_result = self.store.flush();
+        if let Err(e) = &flush_result {
             eprintln!("⚠  Storage flush failed: {e}");
         } else {
             eprintln!("✓ Storage flushed to disk");
         }
 
         let _ = network.shutdown().await;
-        Ok(())
+        flush_result.map_err(NodeError::from)
     }
 
     pub(crate) fn rebuild_settled_stark_sources_from_chain(&self) -> Result<usize, NodeError> {
