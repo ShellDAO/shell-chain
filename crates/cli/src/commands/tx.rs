@@ -411,6 +411,9 @@ fn submit_tx(
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
 
+// Match the node's default maximum JSON-RPC response size.
+const MAX_RPC_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 fn rpc_post(
     url: &str,
     body: &serde_json::Value,
@@ -422,8 +425,16 @@ fn rpc_post(
         .post(url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())?;
-    let json: serde_json::Value = resp.into_json()?;
-    Ok(json)
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take((MAX_RPC_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RPC_RESPONSE_BYTES {
+        return Err(format!("RPC response exceeds {MAX_RPC_RESPONSE_BYTES} bytes").into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn rpc_chain_id(url: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -574,6 +585,67 @@ mod tests {
         let nonce = rpc_get_nonce(&url, &address);
         server.join().unwrap();
         assert_eq!(nonce.unwrap(), 5);
+    }
+
+    #[test]
+    fn rpc_post_bounds_response_bytes_without_content_length() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let limit = 10 * 1024 * 1024;
+        for extra_byte in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let mut response = br#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.to_vec();
+                response.resize(limit + usize::from(extra_byte), b' ');
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n").unwrap();
+                // An oversized response may be rejected while the peer is writing.
+                if let Err(error) = socket.write_all(&response) {
+                    assert!(extra_byte, "valid response write failed: {error}");
+                }
+            });
+
+            let result = rpc_post(
+                &url,
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []
+                }),
+            );
+            server.join().unwrap();
+            if extra_byte {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("RPC response exceeds"));
+            } else {
+                assert_eq!(result.unwrap()["result"], "0x1");
+            }
+        }
     }
 
     #[test]
