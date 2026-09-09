@@ -567,6 +567,14 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             .execute_tx(&signed, &header, 0, 0)
             .map_err(|e| internal_err(format!("PQVM execution failed: {e}")))?;
 
+        if !result.receipt.succeeded() {
+            return Err(ErrorObjectOwned::owned(
+                crate::error::SERVER_ERROR,
+                "execution failed",
+                Some(hex_bytes(&result.output)),
+            ));
+        }
+
         Ok((result.output.clone(), result.gas_used))
     }
 
@@ -3622,6 +3630,50 @@ mod tests {
             result,
             "0x000000000000000000000000000000000000000000000000000000000000002a"
         );
+    }
+
+    #[tokio::test]
+    async fn eth_simulation_distinguishes_return_revert_and_halt() {
+        for (code, expected_output, succeeds) in [
+            ("63deadbeef6000526004601cf3", "0xdeadbeef", true),
+            ("63deadbeef6000526004601cfd", "0xdeadbeef", false),
+            ("60006000fd", "0x", false),
+            ("fe", "0x", false),
+        ] {
+            let handler = setup();
+            let address = test_address(b"simulation-result-contract");
+            let code = hex::decode(code).unwrap();
+            let code_hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&code_hash, &code).unwrap();
+            handler
+                .world_state
+                .write()
+                .set_code_hash(&address, code_hash)
+                .unwrap();
+            let request = crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: Some("0x186a0".into()),
+                access_list: None,
+            };
+
+            let call = EthApiServer::call(&handler, request.clone(), None).await;
+            let estimate = EthApiServer::estimate_gas(&handler, request).await;
+            if succeeds {
+                assert_eq!(call.unwrap(), expected_output);
+                assert!(estimate.is_ok());
+            } else {
+                for result in [call, estimate] {
+                    let error =
+                        result.expect_err("failed execution must not be reported as success");
+                    assert_eq!(error.code(), crate::error::SERVER_ERROR);
+                    let data: String = serde_json::from_str(error.data().unwrap().get()).unwrap();
+                    assert_eq!(data, expected_output);
+                }
+            }
+        }
     }
 
     #[tokio::test]
