@@ -14,6 +14,42 @@ use prometheus::{
     Opts, Registry, TextEncoder,
 };
 
+const STORAGE_SIZE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Cached storage size estimates belonging to one node run.
+#[derive(Default)]
+pub(crate) struct StorageSizeCache {
+    updated_at: Option<Instant>,
+    chain_bytes: u64,
+    witness_bytes: u64,
+    proof_bytes: u64,
+}
+
+impl StorageSizeCache {
+    pub(crate) fn update<S: shell_storage::KvStore>(
+        &mut self,
+        store: &shell_storage::ChainStore<S>,
+        metrics: &Metrics,
+    ) {
+        if self
+            .updated_at
+            .is_none_or(|last| last.elapsed() >= STORAGE_SIZE_CACHE_TTL)
+        {
+            self.chain_bytes = store
+                .approximate_prefix_bytes(b"b/")
+                .unwrap_or(0)
+                .saturating_add(store.approximate_prefix_bytes(b"h/").unwrap_or(0))
+                .saturating_add(store.approximate_prefix_bytes(b"n/").unwrap_or(0));
+            self.witness_bytes = store.approximate_prefix_bytes(b"w/").unwrap_or(0);
+            self.proof_bytes = store.approximate_prefix_bytes(b"pa/").unwrap_or(0);
+            self.updated_at = Some(Instant::now());
+        }
+
+        // State trie sizing is unavailable; retain the existing zero estimate.
+        metrics.update_cf_sizes(self.chain_bytes, self.witness_bytes, 0, self.proof_bytes);
+    }
+}
+
 /// Prometheus metrics for a shell-chain node.
 pub struct Metrics {
     /// Current block height.
@@ -553,6 +589,64 @@ mod tests {
             .uri(path)
             .body(http_body_util::Empty::new())
             .unwrap()
+    }
+
+    #[test]
+    fn storage_size_caches_keep_node_estimates_separate() {
+        use shell_storage::{ChainStore, KvStore, MemoryDb};
+
+        let first_store = Arc::new(MemoryDb::new());
+        first_store.put(b"b/a", &[0; 4]).unwrap();
+        let second_store = Arc::new(MemoryDb::new());
+        second_store.put(b"b/a", &[0; 12]).unwrap();
+        let first_metrics = Metrics::default();
+        let second_metrics = Metrics::default();
+        let mut first_cache = StorageSizeCache::default();
+        let mut second_cache = StorageSizeCache::default();
+
+        first_cache.update(&ChainStore::new(first_store), &first_metrics);
+        second_cache.update(&ChainStore::new(second_store), &second_metrics);
+
+        assert_eq!(
+            first_metrics
+                .storage_cf_size
+                .with_label_values(&["chain"])
+                .get(),
+            7.0
+        );
+        assert_eq!(
+            second_metrics
+                .storage_cf_size
+                .with_label_values(&["chain"])
+                .get(),
+            15.0
+        );
+    }
+
+    #[test]
+    fn storage_size_cache_refreshes_only_after_ttl() {
+        use shell_storage::{ChainStore, KvStore, MemoryDb};
+
+        let store = Arc::new(MemoryDb::new());
+        store.put(b"b/a", &[0; 4]).unwrap();
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        let metrics = Metrics::default();
+        let mut cache = StorageSizeCache::default();
+        cache.update(&chain_store, &metrics);
+
+        store.put(b"b/a", &[0; 5]).unwrap();
+        cache.update(&chain_store, &metrics);
+        assert_eq!(
+            metrics.storage_cf_size.with_label_values(&["chain"]).get(),
+            7.0
+        );
+
+        cache.updated_at = Some(Instant::now() - STORAGE_SIZE_CACHE_TTL);
+        cache.update(&chain_store, &metrics);
+        assert_eq!(
+            metrics.storage_cf_size.with_label_values(&["chain"]).get(),
+            8.0
+        );
     }
 
     #[test]
