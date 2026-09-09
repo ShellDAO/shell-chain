@@ -253,6 +253,12 @@ Ethereum add-on AA layer.
 
 ## 9. Developer pointers
 
+For `shell_sendTransaction`, each AA `inner_calls[].gas_limit` accepts either
+a JSON unsigned integer or a canonical `0x` quantity (for example, `21000` or
+`"0x5208"`). Both forms must fit in `u64`; hexadecimal quantities must have no
+leading zeroes except `"0x0"`. JSON output remains numeric, and this input
+compatibility does not change RLP encoding or signing hashes.
+
 If you want to trace the implementation in code:
 
 - `crates/primitives/src/address.rs` — address derivation (`BLAKE3(algo_id || pubkey)`, 32-byte output, `0x` hex encoding)

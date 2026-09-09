@@ -745,7 +745,36 @@ pub struct InnerCall {
     pub data: Bytes,
     /// Advisory gas cap for this inner call. The sum across all inner calls
     /// MUST be ≤ the outer `Transaction.gas_limit`.
+    #[serde(deserialize_with = "deserialize_inner_gas_limit")]
     pub gas_limit: u64,
+}
+
+fn deserialize_inner_gas_limit<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum GasLimit {
+        Number(u64),
+        Quantity(String),
+    }
+
+    match GasLimit::deserialize(deserializer)? {
+        GasLimit::Number(value) => Ok(value),
+        GasLimit::Quantity(value) => {
+            let digits = value.strip_prefix("0x").filter(|digits| {
+                !digits.is_empty()
+                    && digits.len() <= 16
+                    && (digits.len() == 1 || !digits.starts_with('0'))
+                    && digits.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            });
+            digits
+                .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+                .ok_or_else(|| {
+                    serde::de::Error::custom("inner gas_limit must be a canonical u64 hex quantity")
+                })
+        }
+    }
 }
 
 impl Encodable for InnerCall {
@@ -2015,6 +2044,51 @@ impl Decodable for SignedTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inner_call_json_accepts_numeric_and_hex_gas_limits() {
+        for gas_limit in [0, 21_000, u64::MAX] {
+            let numeric = serde_json::json!({
+                "to": null, "value": "0x0", "data": "0x", "gas_limit": gas_limit,
+            });
+            let mut hex = numeric.clone();
+            hex["gas_limit"] = serde_json::json!(format!("0x{gas_limit:x}"));
+            let numeric_call: InnerCall = serde_json::from_value(numeric.clone()).unwrap();
+            let hex_call: InnerCall = serde_json::from_value(hex).unwrap();
+            assert_eq!(hex_call, numeric_call);
+            assert_eq!(
+                alloy_rlp::encode(&hex_call),
+                alloy_rlp::encode(&numeric_call)
+            );
+            assert_eq!(serde_json::to_value(hex_call).unwrap(), numeric);
+        }
+    }
+
+    #[test]
+    fn inner_call_json_rejects_invalid_gas_limits() {
+        for gas_limit in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!("21000"),
+            serde_json::json!("0x"),
+            serde_json::json!("0x00"),
+            serde_json::json!("0x01"),
+            serde_json::json!("0X1"),
+            serde_json::json!("0x+1"),
+            serde_json::json!("0x1g"),
+            serde_json::json!("0x10000000000000000"),
+        ] {
+            let call = serde_json::json!({
+                "to": null, "value": "0x0", "data": "0x", "gas_limit": gas_limit,
+            });
+            assert!(
+                serde_json::from_value::<InnerCall>(call).is_err(),
+                "accepted {gas_limit}"
+            );
+        }
+    }
 
     fn valid_blob_hash() -> ShellHash {
         let mut bytes = [0u8; 32];
