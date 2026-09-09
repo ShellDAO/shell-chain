@@ -446,9 +446,18 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let store = self.chain_store.store().clone();
 
         // Snapshot current state root so the temp WorldState sees committed data.
-        let state_root = {
+        let (state_root, head_header) = {
             let mut ws = self.world_state.write();
-            ws.state_root().map_err(internal_err)?
+            let head_header = match self.chain_store.get_head_hash().map_err(internal_err)? {
+                Some(hash) => Some(
+                    self.chain_store
+                        .get_header_by_hash(&hash)
+                        .map_err(internal_err)?
+                        .ok_or_else(|| internal_err("canonical head header is missing"))?,
+                ),
+                None => None,
+            };
+            (ws.state_root().map_err(internal_err)?, head_header)
         };
 
         let world_state = WorldState::at_root(store.clone(), &state_root).map_err(internal_err)?;
@@ -459,13 +468,18 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let from = req.from.unwrap_or(Address::ZERO);
         // Cap gas to prevent DoS via unbounded simulated execution.
         const RPC_GAS_CAP: u64 = 50_000_000;
+        const DEFAULT_RPC_GAS_LIMIT: u64 = 30_000_000;
+        let block_gas_limit = head_header
+            .as_ref()
+            .map_or(DEFAULT_RPC_GAS_LIMIT, |header| header.gas_limit);
         let gas_limit = req
             .gas
             .as_deref()
             .map(|s| parse_hex_u64(s))
             .transpose()?
-            .unwrap_or(30_000_000)
-            .min(RPC_GAS_CAP);
+            .unwrap_or(block_gas_limit)
+            .min(RPC_GAS_CAP)
+            .min(block_gas_limit);
         let value = req
             .value
             .as_deref()
@@ -542,14 +556,14 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let sig = shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]);
         let signed = SignedTransaction::new(from, tx, sig);
 
-        let header = BlockHeader {
+        let header = head_header.unwrap_or(BlockHeader {
             parent_hash: ShellHash::ZERO,
             state_root: ShellHash::ZERO,
             transactions_root: ShellHash::ZERO,
             receipts_root: ShellHash::ZERO,
             logs_bloom: Bytes::default(),
             number: 0,
-            gas_limit: 30_000_000,
+            gas_limit: DEFAULT_RPC_GAS_LIMIT,
             gas_used: 0,
             timestamp: 0,
             extra_data: Bytes::default(),
@@ -561,7 +575,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             blob_gas_used: 0,
             excess_blob_gas: 0,
             witness_root: None,
-        };
+        });
 
         let result = evm
             .execute_tx(&signed, &header, 0, 0)
@@ -3630,6 +3644,70 @@ mod tests {
             result,
             "0x000000000000000000000000000000000000000000000000000000000000002a"
         );
+    }
+
+    #[tokio::test]
+    async fn eth_call_rejects_missing_canonical_head_header() {
+        let handler = setup();
+        handler
+            .chain_store
+            .set_head(&ShellHash::from([0xab; 32]))
+            .unwrap();
+        let request = crate::types::CallRequest {
+            from: None,
+            to: Some(test_address(b"missing-head-call")),
+            data: None,
+            value: None,
+            gas: None,
+            access_list: None,
+        };
+        let error = EthApiServer::call(&handler, request, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::INTERNAL_ERROR);
+        assert_eq!(error.message(), "Internal server error");
+    }
+
+    #[tokio::test]
+    async fn eth_call_uses_current_head_block_context() {
+        let handler = setup();
+        let address = test_address(b"block-context-contract");
+        // Return NUMBER, TIMESTAMP and GASLIMIT as three 32-byte words.
+        let code = hex::decode("43600052426020524560405260606000f3").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, code_hash)
+            .unwrap();
+
+        let mut block = make_genesis_block();
+        block.header.number = 42;
+        block.header.timestamp = 1_700_000_123;
+        block.header.gas_limit = 6_000_000;
+        block.header.base_fee_per_gas = 1_000_000_000;
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_head(&block.hash()).unwrap();
+        // The simulation needs the header, even if the body is unavailable.
+        handler.chain_store.delete_body(&block.hash()).unwrap();
+        let request = crate::types::CallRequest {
+            from: None,
+            to: Some(address),
+            data: None,
+            value: None,
+            gas: None,
+            access_list: None,
+        };
+
+        let output = EthApiServer::call(&handler, request.clone(), Some("latest".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            format!("0x{:064x}{:064x}{:064x}", 42, 1_700_000_123, 6_000_000)
+        );
+        assert!(EthApiServer::estimate_gas(&handler, request).await.is_ok());
     }
 
     #[tokio::test]
