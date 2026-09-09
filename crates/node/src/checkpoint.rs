@@ -191,6 +191,7 @@ async fn download_snapshot(url: &str, output_file: &std::fs::File) -> Result<(),
         .try_clone()
         .map_err(|e| NodeError::Startup(format!("clone checkpoint snapshot output: {e}")))?;
     let output = tokio::process::Command::new("curl")
+        .kill_on_drop(true)
         .args([
             "--fail",
             "--silent",
@@ -247,6 +248,55 @@ mod tests {
     use shell_storage::{MemoryDb, SnapshotMetadata, SnapshotWriter, StorageError, WriteBatch};
     use std::io::Cursor;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancelling_download_closes_the_http_connection() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let dir = std::env::temp_dir().join(format!(
+            "shell-checkpoint-cancel-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = DownloadedSnapshot::create(&dir).unwrap();
+        let path = snapshot.path.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/snapshot", listener.local_addr().unwrap());
+        let download = tokio::spawn(async move { download_snapshot(&url, snapshot.file()?).await });
+        let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reader = BufReader::new(socket);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        // Keep the response pending so cancellation must stop the downloader.
+        download.abort();
+        assert!(download.await.unwrap_err().is_cancelled());
+        let closed = timeout(Duration::from_secs(2), reader.read(&mut [0; 1])).await;
+        drop(reader);
+        assert!(!path.exists());
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(
+            closed
+                .expect("cancelled download kept its connection open")
+                .unwrap(),
+            0
+        );
+    }
 
     fn make_test_snapshot() -> Vec<u8> {
         let meta =
