@@ -442,7 +442,7 @@ fn rpc_get_nonce(url: &str, addr: &Address) -> Result<u64, Box<dyn std::error::E
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_getTransactionCount",
-        "params": [format!("{addr}"), "latest"],
+        "params": [format!("{addr}"), "pending"],
         "id": 1
     });
     let result = rpc_post(url, &body)?;
@@ -521,6 +521,60 @@ fn parse_rpc_quantity(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_nonce_includes_pending_transactions() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let address = Address::from([0x11; 32]);
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let mut body = vec![0; content_length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["method"], "eth_getTransactionCount");
+            assert_eq!(request["params"][0], address.to_string());
+            // Confirmed nonce is 3; two consecutive transactions are still pending.
+            let nonce = match request["params"][1].as_str().unwrap() {
+                "latest" => "0x3",
+                "pending" => "0x5",
+                tag => panic!("unexpected block tag: {tag}"),
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": nonce
+            })
+            .to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+
+        let nonce = rpc_get_nonce(&url, &address);
+        server.join().unwrap();
+        assert_eq!(nonce.unwrap(), 5);
+    }
 
     #[test]
     fn parse_hex_address() {
