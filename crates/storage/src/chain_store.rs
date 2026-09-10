@@ -9,6 +9,9 @@ use shell_primitives::{Address, ShellHash, U256};
 
 use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
 
+const SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES: usize = 10_000;
+const SNAPSHOT_IMPORT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Persistent chain configuration (written once at genesis).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -1975,6 +1978,7 @@ impl<S: KvStore> ChainStore<S> {
 
         // Import all entries
         let mut batch = crate::WriteBatch::new();
+        let mut batch_bytes = 0usize;
         let mut pending_publication = crate::WriteBatch::new();
         while let Some(entry) = snap_reader.next_entry()? {
             if matches!(
@@ -1992,12 +1996,22 @@ impl<S: KvStore> ChainStore<S> {
                 pending_publication.put(entry.key, entry.value);
                 continue;
             }
-            batch.put(entry.key, entry.value);
-
-            // Flush in batches of 10000 to avoid excessive memory use
-            if batch.len() >= 10_000 {
+            let entry_bytes = entry.key.len().saturating_add(entry.value.len());
+            // Bound retained payload even when individual snapshot values are large.
+            if !batch.is_empty()
+                && batch_bytes.saturating_add(entry_bytes) > SNAPSHOT_IMPORT_BATCH_MAX_BYTES
+            {
                 self.store.write_batch(batch)?;
                 batch = crate::WriteBatch::new();
+                batch_bytes = 0;
+            }
+            batch.put(entry.key, entry.value);
+            batch_bytes = batch_bytes.saturating_add(entry_bytes);
+
+            if batch.len() >= SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES {
+                self.store.write_batch(batch)?;
+                batch = crate::WriteBatch::new();
+                batch_bytes = 0;
             }
         }
 
@@ -3047,6 +3061,7 @@ mod tests {
         fail_next_batch: AtomicBool,
         fail_batch_after: AtomicUsize,
         batch_calls: AtomicUsize,
+        max_batch_bytes: AtomicUsize,
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
     }
@@ -3058,6 +3073,7 @@ mod tests {
                 fail_next_batch: AtomicBool::new(false),
                 fail_batch_after: AtomicUsize::new(usize::MAX),
                 batch_calls: AtomicUsize::new(0),
+                max_batch_bytes: AtomicUsize::new(0),
                 fail_put_after: AtomicUsize::new(usize::MAX),
                 put_calls: AtomicUsize::new(0),
             }
@@ -3100,6 +3116,15 @@ mod tests {
         }
 
         fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            let bytes = batch
+                .ops()
+                .iter()
+                .map(|op| match op {
+                    crate::WriteBatchOp::Put { key, value } => key.len() + value.len(),
+                    crate::WriteBatchOp::Delete { key } => key.len(),
+                })
+                .sum();
+            self.max_batch_bytes.fetch_max(bytes, Ordering::SeqCst);
             let call_num = self.batch_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_next_batch.swap(false, Ordering::SeqCst)
                 || call_num >= self.fail_batch_after.load(Ordering::SeqCst)
@@ -4002,6 +4027,71 @@ mod tests {
                 genesis_hash: ShellHash::default(),
             })
         );
+    }
+
+    #[test]
+    fn snapshot_import_bounds_large_value_batches_and_defers_head_publication() {
+        let block = empty_block(0);
+        let hash = block.hash();
+        let metadata =
+            crate::SnapshotMetadata::new(1337, 0, hash, block.header.state_root, ShellHash::ZERO);
+        let value = vec![0x5A; crate::snapshot::MAX_SNAPSHOT_VALUE_BYTES];
+        let mut snapshot = Vec::new();
+        {
+            let mut writer = crate::SnapshotWriter::new(&mut snapshot, metadata).unwrap();
+            writer
+                .write_entry(prefix::HEAD_BLOCK, hash.as_bytes())
+                .unwrap();
+            writer
+                .write_entry(
+                    &ChainStore::<MemoryDb>::header_key(&hash),
+                    &encode_rlp(&block.header),
+                )
+                .unwrap();
+            write_snapshot_body(&mut writer, &block);
+            writer
+                .write_entry(&ChainStore::<MemoryDb>::number_key(0), hash.as_bytes())
+                .unwrap();
+            for index in 0..3 {
+                writer
+                    .write_entry(format!("snapshot/large/{index}").as_bytes(), &value)
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let store = Arc::new(FailingBatchStore::new());
+        let chain = ChainStore::new(Arc::clone(&store));
+        chain
+            .import_snapshot(std::io::Cursor::new(&snapshot), 1337, &ShellHash::ZERO)
+            .unwrap();
+        assert_eq!(chain.get_head_hash().unwrap(), Some(hash));
+        for index in 0..3 {
+            assert_eq!(
+                store
+                    .get(format!("snapshot/large/{index}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(value.as_slice())
+            );
+        }
+        let max_bytes = store.max_batch_bytes.load(Ordering::SeqCst);
+        assert!(
+            max_bytes <= 16 * 1024 * 1024,
+            "snapshot batch retained {max_bytes} bytes"
+        );
+
+        let failed_store = Arc::new(FailingBatchStore::new());
+        let failed_chain = ChainStore::new(Arc::clone(&failed_store));
+        let old_head = ShellHash::from([0xAB; 32]);
+        failed_chain.set_head(&old_head).unwrap();
+        failed_chain.set_total_tx_count(7).unwrap();
+        failed_store.fail_batch_after(2);
+        let error = failed_chain
+            .import_snapshot(std::io::Cursor::new(&snapshot), 1337, &ShellHash::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected batch failure"));
+        assert_eq!(failed_chain.get_head_hash().unwrap(), Some(old_head));
+        assert_eq!(failed_chain.get_total_tx_count().unwrap(), 7);
     }
 
     #[test]
