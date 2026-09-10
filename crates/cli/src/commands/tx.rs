@@ -14,6 +14,8 @@ use shell_primitives::{Address, Bytes, U256};
 use crate::password::{resolve_password, PasswordArgs};
 use crate::secure_file::read_sensitive_file;
 
+use super::rpc::rpc_post;
+
 #[derive(Subcommand)]
 pub enum TxCommand {
     /// Send a value transfer transaction.
@@ -410,32 +412,6 @@ fn submit_tx(
 // ---------------------------------------------------------------------------
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
-
-// Match the node's default maximum JSON-RPC response size.
-const MAX_RPC_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-fn rpc_post(
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(5))
-        .build();
-    let resp = agent
-        .post(url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())?;
-    use std::io::Read;
-
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take((MAX_RPC_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_RPC_RESPONSE_BYTES {
-        return Err(format!("RPC response exceeds {MAX_RPC_RESPONSE_BYTES} bytes").into());
-    }
-    Ok(serde_json::from_slice(&bytes)?)
-}
 
 fn rpc_chain_id(url: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let body = serde_json::json!({

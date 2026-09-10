@@ -8,6 +8,8 @@ use shell_primitives::Address;
 
 use crate::secure_file::read_sensitive_file;
 
+use super::rpc::rpc_post;
+
 #[derive(Subcommand)]
 pub enum AccountCommand {
     /// List keystore addresses found in the data directory.
@@ -137,23 +139,11 @@ fn cmd_nonce(address: String, rpc_url: String) -> Result<(), Box<dyn std::error:
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (shared with tx.rs via duplication — small surface, not worth a
-// shared module for two one-liners)
+// Address parsing
 // ---------------------------------------------------------------------------
 
 fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error>> {
     Address::parse(s).map_err(|e| format!("invalid address '{s}': {e}").into())
-}
-
-fn rpc_post(
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let resp = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())?;
-    let json: serde_json::Value = resp.into_json()?;
-    Ok(json)
 }
 
 #[cfg(test)]
@@ -212,5 +202,67 @@ mod tests {
         symlink(target, linked).unwrap();
 
         assert!(cmd_list(dir.path().to_path_buf()).is_ok());
+    }
+
+    #[test]
+    fn account_queries_reject_oversized_rpc_responses() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        for query_balance in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    request["method"],
+                    if query_balance {
+                        "eth_getBalance"
+                    } else {
+                        "eth_getTransactionCount"
+                    }
+                );
+                let mut response = br#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.to_vec();
+                response.resize(10 * 1024 * 1024 + 1, b' ');
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n").unwrap();
+                // The client can close as soon as it sees the excess byte.
+                let _ = socket.write_all(&response);
+            });
+            let address = Address::from([0x11; 32]).to_string();
+            let result = if query_balance {
+                cmd_balance(address, url)
+            } else {
+                cmd_nonce(address, url)
+            };
+            server.join().unwrap();
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("RPC response exceeds"));
+        }
     }
 }

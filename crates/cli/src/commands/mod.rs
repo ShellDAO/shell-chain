@@ -9,6 +9,7 @@ mod init;
 mod key;
 pub mod pqhd;
 mod removedb;
+mod rpc;
 pub mod run;
 pub mod tx;
 mod version;
