@@ -93,6 +93,20 @@ fn find_filter_reorg<S: KvStore + 'static>(
     }
 }
 
+// Log queries and filter cursors need headers even after transaction bodies are pruned.
+fn get_canonical_header<S: KvStore + 'static>(
+    chain_store: &ChainStore<S>,
+    number: u64,
+) -> Result<Option<BlockHeader>, ErrorObjectOwned> {
+    let Some(hash) = chain_store
+        .get_block_hash_by_number(number)
+        .map_err(internal_err)?
+    else {
+        return Ok(None);
+    };
+    chain_store.get_header_by_hash(&hash).map_err(internal_err)
+}
+
 fn append_filter_logs<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
     filter: &crate::filter::LogFilter,
@@ -953,11 +967,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let mut expected_parent = None;
 
         for block_num in from..=to {
-            let block = match self
-                .chain_store
-                .get_block_by_number(block_num)
-                .map_err(internal_err)?
-            {
+            let header = match get_canonical_header(&self.chain_store, block_num)? {
                 Some(b) => b,
                 None if !has_head || block_num > latest => continue,
                 None => {
@@ -967,7 +977,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 }
             };
             if let Some(expected_parent) = expected_parent {
-                if block.header.parent_hash != expected_parent {
+                if header.parent_hash != expected_parent {
                     return Err(internal_err(format!(
                         "canonical block {block_num} changed during log query"
                     )));
@@ -975,9 +985,9 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             }
 
             // Fast path: check block-level bloom filter.
-            let block_hash = block.hash();
+            let block_hash = header.hash();
             expected_parent = Some(block_hash);
-            if !filter.matches_bloom(block.header.logs_bloom.as_ref()) {
+            if !filter.matches_bloom(header.logs_bloom.as_ref()) {
                 continue;
             }
 
@@ -987,15 +997,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .map_err(internal_err)?
             {
                 Some(receipts) => receipts,
-                None if block
-                    .header
-                    .logs_bloom
-                    .as_ref()
-                    .iter()
-                    .all(|byte| *byte == 0) =>
-                {
-                    Vec::new()
-                }
+                None if header.logs_bloom.as_ref().iter().all(|byte| *byte == 0) => Vec::new(),
                 None => {
                     return Err(internal_err(format!(
                         "receipts for block {block_hash} are unavailable during log query"
@@ -1144,23 +1146,20 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         let mut expected_parent = base_cursor.block_hash;
         if let (Some(from), Some(to)) = (canonical_from, canonical_to) {
             for block_number in from..=to {
-                let block = self
-                    .chain_store
-                    .get_block_by_number(block_number)
-                    .map_err(internal_err)?
-                    .ok_or_else(|| {
+                let header =
+                    get_canonical_header(&self.chain_store, block_number)?.ok_or_else(|| {
                         internal_err(format!(
                             "canonical block {block_number} missing during filter poll"
                         ))
                     })?;
                 if let Some(expected_parent) = expected_parent {
-                    if block.header.parent_hash != expected_parent {
+                    if header.parent_hash != expected_parent {
                         return Err(internal_err(format!(
                             "canonical block {block_number} changed during filter poll"
                         )));
                     }
                 }
-                let block_hash = block.hash();
+                let block_hash = header.hash();
                 canonical_blocks.push((block_number, block_hash));
                 expected_parent = Some(block_hash);
                 new_cursor = FilterCursor {

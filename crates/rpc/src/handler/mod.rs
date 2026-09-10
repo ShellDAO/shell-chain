@@ -4249,6 +4249,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_logs_preserves_results_after_body_pruning() {
+        let handler = setup();
+        let target = Address::from([0xAA; 20]);
+        let other = Address::from([0xBB; 20]);
+        let log = |address| shell_core::Log::new(address, vec![], Bytes::from(vec![0x42])).unwrap();
+        let old_hash = store_block_with_logs(
+            &handler,
+            0,
+            vec![vec![log(other)], vec![log(other), log(target)]],
+        );
+        store_block_with_logs(&handler, 1, vec![vec![]]);
+        let raw: RawLogFilter = serde_json::from_value(serde_json::json!({
+            "fromBlock": "0x0", "toBlock": "latest", "address": target
+        }))
+        .unwrap();
+        let before = EthApiServer::get_logs(&handler, raw.clone()).await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].transaction_index, "0x1");
+        assert_eq!(before[0].log_index, "0x2");
+        let filter_id = EthApiServer::new_filter(&handler, raw.clone())
+            .await
+            .unwrap();
+
+        handler.chain_store.delete_body(&old_hash).unwrap();
+        assert!(handler
+            .chain_store
+            .get_block_by_number(0)
+            .unwrap()
+            .is_none());
+        assert!(handler
+            .chain_store
+            .get_receipts(&old_hash)
+            .unwrap()
+            .is_some());
+        let expected = serde_json::to_value(before).unwrap();
+        let after = EthApiServer::get_logs(&handler, raw).await.unwrap();
+        assert_eq!(serde_json::to_value(after).unwrap(), expected);
+        let filter_logs = EthApiServer::get_filter_logs(&handler, filter_id)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(filter_logs).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn filter_changes_preserve_results_after_body_pruning() {
+        let handler = setup();
+        store_block_with_logs(&handler, 0, vec![vec![]]);
+        let raw: RawLogFilter = serde_json::from_value(serde_json::json!({})).unwrap();
+        let log_before = EthApiServer::new_filter(&handler, raw.clone())
+            .await
+            .unwrap();
+        let log_after = EthApiServer::new_filter(&handler, raw).await.unwrap();
+        let block_before = EthApiServer::new_block_filter(&handler).await.unwrap();
+        let block_after = EthApiServer::new_block_filter(&handler).await.unwrap();
+        let log = shell_core::Log::new(Address::from([0xAA; 20]), vec![], Bytes::new()).unwrap();
+        let old_hash = store_block_with_logs(&handler, 1, vec![vec![log]]);
+        let head_hash = store_block_with_logs(&handler, 2, vec![vec![]]);
+        let expected_logs = EthApiServer::get_filter_changes(&handler, log_before)
+            .await
+            .unwrap();
+        let expected_blocks = EthApiServer::get_filter_changes(&handler, block_before)
+            .await
+            .unwrap();
+        assert_eq!(expected_logs.as_array().unwrap().len(), 1);
+        assert_eq!(expected_blocks, serde_json::json!([old_hash, head_hash]));
+
+        handler.chain_store.delete_body(&old_hash).unwrap();
+        assert!(handler
+            .chain_store
+            .get_block_by_number(1)
+            .unwrap()
+            .is_none());
+        for (id, expected) in [(log_after, expected_logs), (block_after, expected_blocks)] {
+            let changes = EthApiServer::get_filter_changes(&handler, id.clone())
+                .await
+                .unwrap();
+            assert_eq!(changes, expected);
+            assert_eq!(
+                EthApiServer::get_filter_changes(&handler, id)
+                    .await
+                    .unwrap(),
+                serde_json::json!([])
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn get_logs_empty_range_returns_empty() {
         let handler = setup();
         let raw: crate::filter::RawLogFilter =
