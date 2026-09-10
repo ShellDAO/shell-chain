@@ -777,6 +777,7 @@ async fn main() {
                 rpc_tls_key,
                 unsafe_dev_exposed: effective_unsafe_dev_exposed,
                 metrics_addr: effective_metrics_addr,
+                metrics_enabled: file_config.metrics.enabled.unwrap_or(true),
                 max_idle_interval,
                 mempool_max_size,
                 mempool_max_bytes,
