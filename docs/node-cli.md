@@ -37,6 +37,10 @@ These flags apply to every subcommand:
 | `--password-stdin` | `false` | Read keystore password from stdin (one line) |
 | `--allow-env-password` | `false` | Allow reading password from `SHELL_KEYSTORE_PASSWORD` env var |
 
+When using `run --config`, `[logging].format` supplies the log format unless
+`--log-format` is explicitly set. The log filter precedence is `--log-level`,
+then `RUST_LOG`, then `[logging].level`, then `info`.
+
 ---
 
 ## 2. Subcommands
