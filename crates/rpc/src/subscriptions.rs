@@ -588,6 +588,17 @@ fn log_to_json(
     })
 }
 
+// A full outbound queue must not keep an unsubscribed forwarder and its slot alive.
+async fn send_subscription_message(
+    sink: &jsonrpsee::SubscriptionSink,
+    message: SubscriptionMessage,
+) -> bool {
+    tokio::select! {
+        _ = sink.closed() => false,
+        result = sink.send(message) => result.is_ok(),
+    }
+}
+
 async fn forward_new_heads(
     mut rx: broadcast::Receiver<BlockEvent>,
     sink: jsonrpsee::SubscriptionSink,
@@ -609,7 +620,7 @@ async fn forward_new_heads(
                     tracing::error!("failed to serialize header for subscription");
                     break;
                 };
-                if sink.send(msg).await.is_err() {
+                if !send_subscription_message(&sink, msg).await {
                     break;
                 }
             }
@@ -660,7 +671,7 @@ async fn forward_logs(
                                 tracing::error!("failed to serialize log for subscription");
                                 return;
                             };
-                            if sink.send(msg).await.is_err() {
+                            if !send_subscription_message(&sink, msg).await {
                                 return;
                             }
                         }
@@ -699,7 +710,7 @@ async fn forward_pending_txs(
                     tracing::error!("failed to serialize tx hash for subscription");
                     break;
                 };
-                if sink.send(msg).await.is_err() {
+                if !send_subscription_message(&sink, msg).await {
                     break;
                 }
             }
@@ -732,7 +743,7 @@ async fn forward_syncing(
         tracing::error!("failed to serialize initial sync status");
         return;
     };
-    if sink.send(msg).await.is_err() {
+    if !send_subscription_message(&sink, msg).await {
         return;
     }
 
@@ -749,7 +760,7 @@ async fn forward_syncing(
                     tracing::error!("failed to serialize sync status for subscription");
                     break;
                 };
-                if sink.send(msg).await.is_err() {
+                if !send_subscription_message(&sink, msg).await {
                     break;
                 }
             }
@@ -833,6 +844,101 @@ mod tests {
                 topics: vec![topic],
                 data: Bytes::new(),
             }],
+        }
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_releases_capacity_while_notification_send_is_blocked() {
+        use shell_consensus::FinalityState;
+        use shell_mempool::{MempoolConfig, TxPool};
+        use shell_storage::{ChainStore, MemoryDb, WorldState};
+        use std::time::Duration;
+
+        for sub_type in ["newHeads", "logs", "newPendingTransactions", "syncing"] {
+            let db = Arc::new(MemoryDb::new());
+            let (blocks, _) = broadcast::channel(16);
+            let handler = RpcHandler::new(
+                Arc::new(ChainStore::new(db.clone())),
+                Arc::new(parking_lot::RwLock::new(WorldState::new(db))),
+                Arc::new(TxPool::new(MempoolConfig::default())),
+                42,
+                None,
+                blocks.clone(),
+                Arc::new(parking_lot::RwLock::new(0)),
+                Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            );
+            let tracker = handler.subscription_tracker().clone();
+            let pending_txs = handler.pending_tx_event_sender().clone();
+            let syncing = handler.sync_event_sender().clone();
+            let module = EthPubSubServer::into_rpc(handler);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": [sub_type]
+            });
+            // Exercise the registered RPC methods and real subscription sink with
+            // a one-message outbound queue, keeping the receiver open but unread.
+            let (response, notifications) = module
+                .raw_json_request(&request.to_string(), 1)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let id = response.get("result").expect("subscription was rejected");
+            assert_eq!(tracker.active_count(), 1);
+
+            match sub_type {
+                "newHeads" | "logs" => {
+                    for number in 1..=2 {
+                        blocks
+                            .send(BlockEvent::NewBlock {
+                                header: sample_header(number),
+                                receipts: vec![sample_receipt(Address::ZERO, ShellHash::ZERO)],
+                                removed: false,
+                            })
+                            .unwrap();
+                    }
+                }
+                "newPendingTransactions" => {
+                    pending_txs.send(ShellHash::ZERO).unwrap();
+                    pending_txs.send(ShellHash::ZERO).unwrap();
+                }
+                "syncing" => {
+                    // The initial status fills the queue before this update.
+                    syncing.send(SyncStatus::NotSyncing).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while notifications.len() != 1
+                    || !blocks.is_empty()
+                    || !pending_txs.is_empty()
+                    || !syncing.is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("forwarder did not reach the blocked send");
+
+            let unsubscribe = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "eth_unsubscribe", "params": [id]
+            });
+            let (response, _) = module
+                .raw_json_request(&unsubscribe.to_string(), 1)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"], true);
+            let released = tokio::time::timeout(Duration::from_secs(1), async {
+                while tracker.active_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            // Close the queue even on regression failure so the blocked task exits.
+            drop(notifications);
+            assert!(
+                released.is_ok(),
+                "{sub_type} retained capacity after unsubscribe"
+            );
         }
     }
 
