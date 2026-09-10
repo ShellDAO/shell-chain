@@ -56,6 +56,7 @@ pub struct RunArgs {
     pub rpc_tls_key: Option<String>,
     pub unsafe_dev_exposed: bool,
     pub metrics_addr: String,
+    pub metrics_enabled: bool,
     /// Maximum seconds between blocks when mempool is empty (0 = disabled).
     pub max_idle_interval: u64,
     /// Maximum number of pending transactions in the mempool (default: 4096).
@@ -709,7 +710,7 @@ async fn run_with_store<S: KvStore + 'static>(
             )
         },
         metrics: shell_node::config::MetricsConfig {
-            enabled: true,
+            enabled: args.metrics_enabled,
             listen_addr: args.metrics_addr.parse()?,
         },
         max_idle_interval_ms: args.max_idle_interval * 1000,
@@ -773,7 +774,11 @@ async fn run_with_store<S: KvStore + 'static>(
             }
             eprintln!("   P2P:         {p2p_listen} (libp2p)");
             eprintln!("   Authority:   {authority}");
-            eprintln!("   Metrics:     http://{}", args.metrics_addr);
+            if args.metrics_enabled {
+                eprintln!("   Metrics:     http://{}", args.metrics_addr);
+            } else {
+                eprintln!("   Metrics:     disabled");
+            }
             eprintln!("   Block time:  {}ms", args.block_time);
             if args.pruning > 0 {
                 eprintln!("   Pruning:     keep last {} state roots", args.pruning);
@@ -837,7 +842,11 @@ async fn run_with_store<S: KvStore + 'static>(
             eprintln!("   WS:          ws://{ws}");
         }
         eprintln!("   Authority:   {authority}");
-        eprintln!("   Metrics:     http://{}", args.metrics_addr);
+        if args.metrics_enabled {
+            eprintln!("   Metrics:     http://{}", args.metrics_addr);
+        } else {
+            eprintln!("   Metrics:     disabled");
+        }
         eprintln!("   Block time:  {}ms", args.block_time);
         if args.pruning > 0 {
             eprintln!("   Pruning:     keep last {} state roots", args.pruning);
@@ -927,6 +936,7 @@ mod tests {
             rpc_tls_key: None,
             unsafe_dev_exposed: false,
             metrics_addr: "127.0.0.1:9090".into(),
+            metrics_enabled: true,
             max_idle_interval: 60,
             mempool_max_size: None,
             mempool_max_bytes: None,
