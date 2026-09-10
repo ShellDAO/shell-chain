@@ -550,6 +550,20 @@ async fn main() {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
+    // Read run configuration before logging is initialized so its logging section applies.
+    let file_config = match &cli.command {
+        Commands::Run {
+            config: Some(path), ..
+        } => match config::load_config(path) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        },
+        _ => ShellConfig::default(),
+    };
+
     // Build password args from global flags (used by key/run/tx subcommands).
     let password_args = PasswordArgs {
         password_file: cli.password_file,
@@ -557,14 +571,22 @@ async fn main() {
         allow_env_password: cli.allow_env_password,
     };
 
-    // Build env filter: --log-level flag > RUST_LOG env var > "info" default.
+    // Log filter precedence: --log-level > RUST_LOG > TOML > "info".
     let filter = match &cli.log_level {
         Some(level) => EnvFilter::new(level),
-        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(file_config.logging.level.as_deref().unwrap_or("info"))
+        }),
     };
 
     // Initialize tracing subscriber with the chosen format.
-    match cli.log_format.as_str() {
+    let log_format = config_or_cli(
+        &matches,
+        "log_format",
+        cli.log_format,
+        file_config.logging.format.clone(),
+    );
+    match log_format.as_str() {
         "json" => {
             tracing_subscriber::fmt()
                 .json()
@@ -595,7 +617,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Run {
-            config: config_path,
+            config: _,
             rpc_addr,
             network,
             block_time,
@@ -634,18 +656,6 @@ async fn main() {
             consensus_engine,
             node_role,
         } => {
-            // Load config file if specified (CLI args override file values).
-            let file_config = match &config_path {
-                Some(path) => match config::load_config(path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                },
-                None => ShellConfig::default(),
-            };
-
             // Merge: CLI explicit values take priority over config file.
             let run_matches = matches.subcommand_matches("run").expect("run arguments");
             let datadir = config_or_cli(
