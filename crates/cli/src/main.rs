@@ -29,6 +29,9 @@ mod secure_file;
 use config::ShellConfig;
 use password::PasswordArgs;
 
+// NodeConfig stores the CLI's idle interval in milliseconds.
+const MAX_IDLE_INTERVAL_SECS: u64 = u64::MAX / 1000;
+
 #[derive(Parser)]
 #[command(
     name = "shell-node",
@@ -180,7 +183,7 @@ enum Commands {
         /// (legacy behavior). Default `600`: skip empty blocks but heartbeat
         /// every ten minutes to keep sync, light clients, and timestamp
         /// monotonicity healthy without reward inflation.
-        #[arg(long, default_value = "600")]
+        #[arg(long, default_value = "600", value_parser = clap::value_parser!(u64).range(..=MAX_IDLE_INTERVAL_SECS))]
         max_idle_interval: u64,
 
         /// Maximum number of pending transactions in the mempool.
@@ -965,6 +968,36 @@ mod tests {
             PathBuf::from("shell-data"),
             PathBuf::from("configured-data"),
         );
+    }
+
+    #[test]
+    fn run_idle_interval_rejects_millisecond_overflow() {
+        for seconds in [u64::MAX / 1000 + 1, u64::MAX] {
+            let value = seconds.to_string();
+            let error = Cli::try_parse_from(["shell-node", "run", "--max-idle-interval", &value])
+                .err()
+                .expect("unrepresentable idle interval was accepted");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("--max-idle-interval"));
+        }
+    }
+
+    #[test]
+    fn run_idle_interval_preserves_valid_boundaries() {
+        for seconds in [0, 600, u64::MAX / 1000] {
+            let value = seconds.to_string();
+            let cli =
+                Cli::try_parse_from(["shell-node", "run", "--max-idle-interval", &value]).unwrap();
+            match cli.command {
+                Commands::Run {
+                    max_idle_interval, ..
+                } => {
+                    assert_eq!(max_idle_interval, seconds);
+                    assert!(max_idle_interval.checked_mul(1000).is_some());
+                }
+                _ => panic!("expected run command"),
+            }
+        }
     }
 
     #[test]
