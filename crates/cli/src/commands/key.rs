@@ -87,11 +87,15 @@ pub fn key_inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("  KDF:        {}", encrypted.kdf);
     eprintln!("  Cipher:     {}", encrypted.cipher);
-    eprintln!(
-        "  Public key: 0x{}...{}",
-        &encrypted.public_key[..16],
-        &encrypted.public_key[encrypted.public_key.len() - 16..]
-    );
+    if encrypted.public_key.len() <= 32 {
+        eprintln!("  Public key: 0x{}", encrypted.public_key);
+    } else {
+        eprintln!(
+            "  Public key: 0x{}...{}",
+            &encrypted.public_key[..16],
+            &encrypted.public_key[encrypted.public_key.len() - 16..]
+        );
+    }
 
     Ok(())
 }
@@ -159,5 +163,43 @@ fn signature_type_from_key_type(
         "mldsa65" => Ok(SignatureType::MlDsa65),
         "sphincs-sha2-256f" => Ok(SignatureType::SphincsSha2256f),
         other => Err(format!("unsupported keystore algorithm: {other}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inspect_public_key(public_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("keystore.json");
+        let key = serde_json::json!({
+            "version": 1,
+            "address": "",
+            "key_type": "mldsa65",
+            "kdf": "argon2id",
+            "kdf_params": {"m_cost": 65536, "t_cost": 3, "p_cost": 4, "salt": ""},
+            "cipher": "xchacha20-poly1305",
+            "cipher_params": {"nonce": ""},
+            "ciphertext": "",
+            "public_key": public_key
+        });
+        std::fs::write(&path, serde_json::to_vec(&key)?)?;
+        key_inspect(path)
+    }
+
+    #[test]
+    fn key_inspect_handles_short_public_key_previews() {
+        for bytes in [0, 1, 7, 8, 15, 16, 17, 1952] {
+            inspect_public_key(&"ab".repeat(bytes)).unwrap();
+        }
+    }
+
+    #[test]
+    fn key_inspect_rejects_malformed_public_key_hex() {
+        for public_key in ["a", "zz", "公钥"] {
+            let error = inspect_public_key(public_key).unwrap_err();
+            assert!(error.to_string().contains("invalid public_key"));
+        }
     }
 }
