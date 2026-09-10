@@ -11098,6 +11098,42 @@ mod tests {
         }
 
         #[test]
+        fn wpoa_stale_unknown_votes_do_not_create_score_records() {
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis_hash = store_genesis_wpoa(&node);
+            let finalized_hash = store_next_wpoa_block(&node, genesis_hash);
+            node.finality
+                .write()
+                .set_finalized_direct(1, finalized_hash);
+            let conflicting_hash = hash(99);
+            assert_ne!(conflicting_hash, finalized_hash);
+
+            for byte in 0..64u8 {
+                let unknown = Address::from([byte; 32]);
+                assert!(!node.known_authorities.read().contains_key(&unknown));
+                let signature = PQSignature::new(SignatureType::Dilithium3, vec![0]);
+                assert!(node
+                    .handle_wpoa_vote(unknown, conflicting_hash, 1, signature)
+                    .is_none());
+            }
+            assert_eq!(node.peer_scorer.lock().len(), 0);
+            assert_eq!(node.finality.read().last_finalized_number(), 1);
+            assert_eq!(*node.finality.read().last_finalized_hash(), finalized_hash);
+
+            // Known validators still receive the existing stale-vote penalty.
+            let signature = signer.sign(conflicting_hash.as_bytes()).unwrap();
+            assert!(node
+                .handle_wpoa_vote(authority, conflicting_hash, 1, signature)
+                .is_none());
+            let scorer = node.peer_scorer.lock();
+            assert_eq!(scorer.len(), 1);
+            let peer_id = shell_consensus::ScoringPeerId::from(format!("{authority:?}"));
+            assert_eq!(scorer.score(&peer_id), 80);
+        }
+
+        #[test]
         fn wpoa_handle_vote_rejects_zero_total_validator_weight() {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();

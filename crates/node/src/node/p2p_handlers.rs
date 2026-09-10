@@ -246,6 +246,21 @@ impl<S: KvStore + 'static> Node<S> {
         block_number: u64,
         sig: shell_crypto::PQSignature,
     ) -> Option<Vec<u8>> {
+        // Reject unknown identities before any score record can be created.
+        let pubkey = {
+            let known = self.known_authorities.read();
+            match known.get(&voter) {
+                Some(pk) => pk.clone(),
+                None => {
+                    tracing::warn!(
+                        %voter,
+                        "C-3: WPoA vote from unknown validator — rejecting"
+                    );
+                    return None;
+                }
+            }
+        };
+
         // FF.6: Drop votes for blocks that have already been finalized at a different hash
         // (stale or conflicting vote). Penalise the sender.
         {
@@ -280,19 +295,6 @@ impl<S: KvStore + 'static> Node<S> {
         // The signing pre-image is the raw block hash bytes (mirrors event_loop.rs).
         // Mirrors the same pattern used in handle_wpoa_view_change.
         {
-            let known = self.known_authorities.read();
-            let pubkey = match known.get(&voter) {
-                Some(pk) => pk.clone(),
-                None => {
-                    tracing::warn!(
-                        %voter,
-                        "C-3: WPoA vote from unknown validator — rejecting"
-                    );
-                    return None;
-                }
-            };
-            drop(known); // release read lock before potential peer_scorer lock
-
             let sig_type = match shell_crypto::infer_signature_type_from_address(&pubkey, &voter) {
                 Some(t) if shell_crypto::is_algorithm_allowed(t) => t,
                 Some(t) => {
