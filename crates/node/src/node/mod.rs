@@ -7691,6 +7691,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_expires_inactive_proof_rate_limits() {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, signer) = setup_node();
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+        let inactive = Address::from([0x51; 32]);
+        let active = Address::from([0x52; 32]);
+        {
+            let mut limiter = node.proof_rate_limiter.lock();
+            *limiter = ProofRateLimiter::new(RateLimiterConfig {
+                initial_tokens: 1,
+                refill_rate: 1,
+                refill_interval: Duration::from_secs(60),
+                gc_after: Duration::from_secs(3),
+            });
+            assert!(limiter.try_consume(&inactive));
+            assert!(limiter.try_consume(&active));
+        }
+
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            let signer = Arc::new(signer) as Arc<dyn Signer>;
+            async move { node.run(signer, &mut network).await }
+        });
+        let collected = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                {
+                    let mut limiter = node.proof_rate_limiter.lock();
+                    if limiter.try_consume(&active) {
+                        break Err("active prover rate limit was reset");
+                    }
+                    if limiter.len() == 1 {
+                        break Ok(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        node.shutdown();
+        assert!(handle.await.expect("event loop task panicked").is_ok());
+        collected
+            .expect("inactive prover rate limit was never collected")
+            .expect("active prover rate limit must remain in effect");
+    }
+
+    #[tokio::test]
     async fn event_loop_reports_flush_failure_after_stopping_network() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
