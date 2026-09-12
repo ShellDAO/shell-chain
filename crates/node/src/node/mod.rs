@@ -692,7 +692,17 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
         target_peer: Option<&shell_network::PeerId>,
         limit: usize,
     ) -> Vec<Arc<SignedTransaction>> {
-        let txs = self.tx_pool.pending_for_block_shared(limit);
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Cooling transactions must not consume the periodic output budget.
+        // Inspect the bounded pool through shared references before filtering.
+        let candidate_limit = if target_peer.is_some() {
+            limit
+        } else {
+            usize::MAX
+        };
+        let txs = self.tx_pool.pending_for_block_shared(candidate_limit);
         if txs.is_empty() || target_peer.is_some() {
             return txs;
         }
@@ -715,6 +725,7 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
                     true
                 }
             })
+            .take(limit)
             .collect();
         drop(seen);
         selected
@@ -2498,6 +2509,49 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(Arc::ptr_eq(&stored[0], &first[0]));
         assert!(node.mem_pool().pending_for_rebroadcast(None, 1).is_empty());
+    }
+
+    #[test]
+    fn periodic_rebroadcast_fills_batches_after_cooldown_filtering() {
+        let (node, _proposer_signer) = setup_node();
+        let signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        let hashes: Vec<_> = (0..3)
+            .map(|nonce| {
+                let tx = Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(Address::from([0x57; 32])),
+                    value: U256::ZERO,
+                    data: shell_primitives::Bytes::new(),
+                    gas_limit: 21_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE + 1,
+                    max_priority_fee_per_gas: 1,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                submit_signed_tx(&node, &signer, sender, tx)
+            })
+            .collect();
+        assert!(node.mem_pool().pending_for_rebroadcast(None, 0).is_empty());
+        assert!(node.tx_rebroadcast_seen.lock().is_empty());
+        for expected in &hashes {
+            let batch = node.mem_pool().pending_for_rebroadcast(None, 1);
+            assert_eq!(
+                batch.len(),
+                1,
+                "cooling transactions must not consume the batch limit"
+            );
+            assert_eq!(batch[0].hash(), *expected);
+        }
+        assert!(node.mem_pool().pending_for_rebroadcast(None, 1).is_empty());
+        let peer = shell_network::PeerId("new-peer".into());
+        let peer_batch = node.mem_pool().pending_for_rebroadcast(Some(&peer), 1);
+        assert_eq!(peer_batch.len(), 1);
+        assert_eq!(peer_batch[0].hash(), hashes[0]);
     }
 
     #[test]
