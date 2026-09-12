@@ -496,6 +496,9 @@ fn parse_rpc_quantity(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     if hex.is_empty() {
         return Err("RPC quantity must not be empty".into());
     }
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("RPC quantity must contain only hexadecimal digits".into());
+    }
     if hex.len() > 1 && hex.starts_with('0') {
         return Err(format!("RPC quantity must be canonical without leading zeroes: {s}").into());
     }
@@ -670,6 +673,8 @@ mod tests {
     fn parse_rpc_quantity_accepts_prefixed_hex() {
         assert_eq!(parse_rpc_quantity("0x0").unwrap(), 0);
         assert_eq!(parse_rpc_quantity("0xff").unwrap(), 255);
+        assert_eq!(parse_rpc_quantity("0xFF").unwrap(), 255);
+        assert_eq!(parse_rpc_quantity("0xffffffffffffffff").unwrap(), u64::MAX);
     }
 
     #[test]
@@ -680,6 +685,9 @@ mod tests {
         assert!(parse_rpc_quantity("0x00").is_err());
         assert!(parse_rpc_quantity("0x01").is_err());
         assert!(parse_rpc_quantity("0x10000000000000000").is_err());
+        for invalid in ["0x+1", "0x+00", "0x-1", "0x 1", "0x1_0", "0xgg"] {
+            assert!(parse_rpc_quantity(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
