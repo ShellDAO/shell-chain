@@ -2205,8 +2205,9 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
 
-                // Periodically update peer count metric.
+                // Periodically expire inactive proof limits and update peer metrics.
                 _ = peer_count_timer.tick() => {
+                    self.proof_rate_limiter.lock().gc();
                     let peers = network.peer_count().await;
                     self.metrics.peer_count.set(peers as i64);
                     storage_size_cache.update(&self.chain_store, &self.metrics);
