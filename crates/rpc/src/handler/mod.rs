@@ -1795,6 +1795,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validator_snapshot_preserves_proposer_stats_after_body_pruning() {
+        let handler = setup();
+        let first = test_address(b"first-proposer");
+        let second = test_address(b"second-proposer");
+        let mut hashes = Vec::new();
+        for number in 0..4 {
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.proposer = if number == 2 { second } else { first };
+            if let Some(parent) = hashes.last() {
+                block.header.parent_hash = *parent;
+            }
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            hashes.push(block.hash());
+        }
+        handler.chain_store.set_head(&hashes[3]).unwrap();
+        let options = || {
+            Some(RpcValidatorSnapshotOptions {
+                proposer_window: Some(3),
+            })
+        };
+        let before = ShellApiServer::get_validator_snapshot(&handler, options())
+            .await
+            .unwrap();
+        assert_eq!(before.proposer_stats.len(), 2);
+        let first_stats = before
+            .proposer_stats
+            .iter()
+            .find(|stats| stats["address"] == first.to_string())
+            .unwrap();
+        assert_eq!(first_stats["blocksProposed"], 2);
+        assert_eq!(first_stats["lastSeenBlock"], 3);
+        let second_stats = before
+            .proposer_stats
+            .iter()
+            .find(|stats| stats["address"] == second.to_string())
+            .unwrap();
+        assert_eq!(second_stats["blocksProposed"], 1);
+        assert_eq!(second_stats["lastSeenBlock"], 2);
+
+        handler.chain_store.delete_bodies(&hashes[1..3]).unwrap();
+        assert!(handler
+            .chain_store
+            .get_block_by_number(2)
+            .unwrap()
+            .is_none());
+        let mut side_fork = make_genesis_block();
+        side_fork.header.number = 2;
+        side_fork.header.proposer = first;
+        handler.chain_store.put_block(&side_fork).unwrap();
+
+        let after = ShellApiServer::get_validator_snapshot(&handler, options())
+            .await
+            .unwrap();
+        assert_eq!(after.proposer_stats, before.proposer_stats);
+        assert_eq!(after.block_number, 3);
+        assert_eq!(after.proposer_window, 3);
+    }
+
+    #[tokio::test]
     async fn get_transactions_by_address_total_counts_all_matches() {
         let handler = setup();
         let sender = DilithiumSigner::generate();

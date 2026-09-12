@@ -662,12 +662,20 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let from = head_number.saturating_sub(proposer_window.saturating_sub(1));
         let mut counts = std::collections::BTreeMap::<String, (u64, u64)>::new();
         for number in from..=head_number {
-            if let Some(block) = self
+            let Some(hash) = self
                 .chain_store
-                .get_block_by_number(number)
+                .get_block_hash_by_number(number)
+                .map_err(internal_err)?
+            else {
+                continue;
+            };
+            // Proposer history survives body pruning in canonical headers.
+            if let Some(header) = self
+                .chain_store
+                .get_header_by_hash(&hash)
                 .map_err(internal_err)?
             {
-                let key = block.header.proposer.to_string();
+                let key = header.proposer.to_string();
                 let entry = counts.entry(key).or_insert((0, 0));
                 entry.0 = entry.0.saturating_add(1);
                 entry.1 = entry.1.max(number);
