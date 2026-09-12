@@ -726,6 +726,72 @@ mod tests {
     }
 
     #[test]
+    fn state_trie_pruning_reclaims_old_contract_storage_and_preserves_shared_nodes() {
+        let store = Arc::new(MemoryDb::new());
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        let mut state = WorldState::new(Arc::clone(&store));
+        let changed = sample_address(1);
+        let unchanged = sample_address(2);
+        let slots = (1u8..=8).map(dummy_root).collect::<Vec<_>>();
+        for address in [changed, unchanged] {
+            for (index, slot) in slots.iter().enumerate() {
+                state
+                    .set_storage(&address, slot, &dummy_root(index as u8 + 1))
+                    .unwrap();
+            }
+        }
+        let shared_storage = state.get_account(&unchanged).unwrap().unwrap().storage_root;
+        let mut parent = ShellHash::ZERO;
+        let mut obsolete_storage = ShellHash::ZERO;
+        for number in 0..3 {
+            if number > 0 {
+                state
+                    .set_storage(&changed, &slots[0], &dummy_root(20 + number as u8))
+                    .unwrap();
+            }
+            if number == 1 {
+                obsolete_storage = state.get_account(&changed).unwrap().unwrap().storage_root;
+            }
+            let block = make_block(number, parent, state.state_root().unwrap());
+            parent = block.hash();
+            if number == 0 {
+                chain_store
+                    .commit_genesis_block(
+                        &block,
+                        &ChainConfig {
+                            chain_id: 1337,
+                            genesis_hash: parent,
+                        },
+                    )
+                    .unwrap();
+            } else {
+                chain_store.commit_canonical_block(&block, None).unwrap();
+            }
+        }
+        assert!(store.get(obsolete_storage.as_bytes()).unwrap().is_some());
+        prune_state_trie(Arc::clone(&store), 2, StorageProfile::Light).unwrap();
+        assert!(store.get(obsolete_storage.as_bytes()).unwrap().is_none());
+        assert!(store.get(shared_storage.as_bytes()).unwrap().is_some());
+        let retained_root = state.state_root().unwrap();
+        let retained = WorldState::at_root(Arc::clone(&store), &retained_root).unwrap();
+        WorldState::validate_snapshot_nodes(store.as_ref(), retained_root).unwrap();
+        for (index, slot) in slots.iter().enumerate() {
+            assert_eq!(
+                retained.get_storage(&unchanged, slot).unwrap(),
+                dummy_root(index as u8 + 1)
+            );
+            assert_eq!(
+                retained.get_storage(&changed, slot).unwrap(),
+                if index == 0 {
+                    dummy_root(22)
+                } else {
+                    dummy_root(index as u8 + 1)
+                }
+            );
+        }
+    }
+
+    #[test]
     fn state_trie_pruning_persists_progress_cursor() {
         let (store, _, _) = populate_state_chain();
 

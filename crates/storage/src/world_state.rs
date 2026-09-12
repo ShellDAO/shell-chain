@@ -662,14 +662,14 @@ impl<S: KvStore + 'static> WorldState<S> {
         Ok(ShellHash::from(root))
     }
 
-    /// Collect all hashed trie-node keys reachable from the given state root.
+    /// Collect all hashed account and contract-storage trie nodes reachable from a state root.
     pub fn collect_snapshot_node_hashes(
         store: &S,
         root: ShellHash,
     ) -> Result<HashSet<ShellHash>, StorageError> {
         let mut visited = HashSet::new();
-        Self::collect_hashed_node(store, root, &mut visited)?;
-        Ok(visited)
+        Self::collect_hashed_node(store, root, SnapshotTrieKind::Accounts, &mut visited)?;
+        Ok(visited.into_iter().map(|(hash, _)| hash).collect())
     }
 
     /// Validate every trie node reachable from an imported state root.
@@ -712,16 +712,17 @@ impl<S: KvStore + 'static> WorldState<S> {
     fn collect_hashed_node(
         store: &S,
         node_hash: ShellHash,
-        visited: &mut HashSet<ShellHash>,
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
     ) -> Result<(), StorageError> {
-        if visited.contains(&node_hash) {
+        if visited.contains(&(node_hash, kind)) {
             return Ok(());
         }
         let Some(raw_node) = store.get(node_hash.as_bytes())? else {
             return Ok(());
         };
-        visited.insert(node_hash);
-        Self::collect_hashed_refs_in_raw(store, &raw_node, visited)
+        visited.insert((node_hash, kind));
+        Self::collect_hashed_refs_in_raw(store, &raw_node, kind, visited)
     }
 
     fn validate_hashed_snapshot_node(
@@ -905,7 +906,8 @@ impl<S: KvStore + 'static> WorldState<S> {
     fn collect_hashed_refs_in_raw(
         store: &S,
         raw_node: &[u8],
-        visited: &mut HashSet<ShellHash>,
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
     ) -> Result<(), StorageError> {
         let rlp = Rlp::new(raw_node);
         match rlp
@@ -919,14 +921,18 @@ impl<S: KvStore + 'static> WorldState<S> {
                     .and_then(|item| item.data())
                     .map_err(|e| StorageError::Trie(e.to_string()))?;
                 if Self::compact_path_is_leaf(key) {
-                    return Ok(());
+                    let value = rlp
+                        .at(1)
+                        .and_then(|item| item.data())
+                        .map_err(|e| StorageError::Trie(e.to_string()))?;
+                    return Self::collect_storage_refs_from_leaf(store, value, kind, visited);
                 }
                 let child_raw = rlp
                     .at(1)
                     .map_err(|e| StorageError::Trie(e.to_string()))?
                     .as_raw()
                     .to_vec();
-                Self::collect_hashed_refs_from_item(store, &child_raw, visited)
+                Self::collect_hashed_refs_from_item(store, &child_raw, kind, visited)
             }
             Prototype::List(17) => {
                 for index in 0..16 {
@@ -935,9 +941,13 @@ impl<S: KvStore + 'static> WorldState<S> {
                         .map_err(|e| StorageError::Trie(e.to_string()))?
                         .as_raw()
                         .to_vec();
-                    Self::collect_hashed_refs_from_item(store, &child_raw, visited)?;
+                    Self::collect_hashed_refs_from_item(store, &child_raw, kind, visited)?;
                 }
-                Ok(())
+                let value = rlp
+                    .at(16)
+                    .and_then(|item| item.data())
+                    .map_err(|e| StorageError::Trie(e.to_string()))?;
+                Self::collect_storage_refs_from_leaf(store, value, kind, visited)
             }
             _ => Ok(()),
         }
@@ -946,7 +956,8 @@ impl<S: KvStore + 'static> WorldState<S> {
     fn collect_hashed_refs_from_item(
         store: &S,
         raw_item: &[u8],
-        visited: &mut HashSet<ShellHash>,
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
     ) -> Result<(), StorageError> {
         let rlp = Rlp::new(raw_item);
         let prototype = rlp
@@ -957,12 +968,39 @@ impl<S: KvStore + 'static> WorldState<S> {
                 rlp.data().map_err(|e| StorageError::Trie(e.to_string()))?,
             )
             .map_err(|e| StorageError::Trie(e.to_string()))?;
-            return Self::collect_hashed_node(store, hash, visited);
+            return Self::collect_hashed_node(store, hash, kind, visited);
         }
         match prototype {
             Prototype::Data(_) => Ok(()),
-            _ => Self::collect_hashed_refs_in_raw(store, raw_item, visited),
+            _ => Self::collect_hashed_refs_in_raw(store, raw_item, kind, visited),
         }
+    }
+
+    fn collect_storage_refs_from_leaf(
+        store: &S,
+        value: &[u8],
+        kind: SnapshotTrieKind,
+        visited: &mut HashSet<(ShellHash, SnapshotTrieKind)>,
+    ) -> Result<(), StorageError> {
+        if kind == SnapshotTrieKind::Storage || value.is_empty() {
+            return Ok(());
+        }
+        let mut rest = value;
+        let account = Account::decode(&mut rest).map_err(|e| StorageError::Codec(e.to_string()))?;
+        if !rest.is_empty() {
+            return Err(StorageError::Codec(
+                "account record has trailing bytes".into(),
+            ));
+        }
+        if account.storage_root != ShellHash::ZERO {
+            Self::collect_hashed_node(
+                store,
+                account.storage_root,
+                SnapshotTrieKind::Storage,
+                visited,
+            )?;
+        }
+        Ok(())
     }
 
     fn compact_path_is_leaf(compact: &[u8]) -> bool {
