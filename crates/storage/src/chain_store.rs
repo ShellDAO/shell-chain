@@ -197,6 +197,8 @@ mod prefix {
     pub const TOTAL_TX_COUNT: &[u8] = b"TOTAL_TX_COUNT";
     pub const TOTAL_GAS_USED: &[u8] = b"TOTAL_GAS_USED";
     pub const TOTALS_HEAD: &[u8] = b"TOTALS_HEAD";
+    /// Canonical stripped-body digest retained across body pruning.
+    pub const BODY_DIGEST_BY_HASH: &[u8] = b"bd1/";
     pub const BODY_PRUNED_BELOW: &[u8] = b"BODY_PRUNED_BELOW";
     pub const WITNESS_PRUNED_BELOW: &[u8] = b"WITNESS_PRUNED_BELOW";
     pub const STATE_TRIE_PRUNED_BELOW: &[u8] = b"STATE_TRIE_PRUNED_BELOW";
@@ -293,6 +295,10 @@ impl<S: KvStore> ChainStore<S> {
 
     fn body_key(hash: &ShellHash) -> Vec<u8> {
         [prefix::BODY_BY_HASH, hash.as_bytes()].concat()
+    }
+
+    fn body_digest_key(hash: &ShellHash) -> Vec<u8> {
+        [prefix::BODY_DIGEST_BY_HASH, hash.as_bytes()].concat()
     }
 
     fn witness_key(hash: &ShellHash) -> Vec<u8> {
@@ -809,7 +815,7 @@ impl<S: KvStore> ChainStore<S> {
     /// The block header, witness bundle, and canonical mapping are preserved;
     /// only the stripped transaction payloads are removed.
     pub fn delete_body(&self, hash: &ShellHash) -> Result<(), StorageError> {
-        self.store.delete(&Self::body_key(hash))
+        self.delete_bodies(std::slice::from_ref(hash))
     }
 
     /// Delete multiple stripped block bodies in a single write batch.
@@ -822,9 +828,7 @@ impl<S: KvStore> ChainStore<S> {
         }
 
         let mut batch = WriteBatch::new();
-        for hash in hashes {
-            batch.delete(Self::body_key(hash));
-        }
+        self.stage_body_deletions(&mut batch, hashes)?;
         self.store.write_batch(batch)
     }
 
@@ -836,14 +840,31 @@ impl<S: KvStore> ChainStore<S> {
         pruned_below: u64,
     ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
-        for hash in hashes {
-            batch.delete(Self::body_key(hash));
-        }
+        self.stage_body_deletions(&mut batch, hashes)?;
         batch.put(
             prefix::BODY_PRUNED_BELOW.to_vec(),
             pruned_below.to_be_bytes().to_vec(),
         );
         self.store.write_batch(batch)
+    }
+
+    fn stage_body_deletions(
+        &self,
+        batch: &mut WriteBatch,
+        hashes: &[ShellHash],
+    ) -> Result<(), StorageError> {
+        for hash in hashes {
+            if let Some(bytes) = self.store.get(&Self::body_key(hash))? {
+                // Normalize legacy encodings before hashing so a restored body
+                // can be compared using the current stripped-block encoding.
+                let body: StrippedBlock = decode_versioned(&bytes)?;
+                let digest = shell_primitives::blake3_hash(&encode_rlp(&body));
+                batch.put(Self::body_digest_key(hash), digest.as_bytes().to_vec());
+            }
+            // Keep an existing digest when pruning an already absent body.
+            batch.delete(Self::body_key(hash));
+        }
+        Ok(())
     }
 
     /// Delete the witness bundle (PQ signatures) for the given block hash.
@@ -961,6 +982,14 @@ impl<S: KvStore> ChainStore<S> {
         let hash = block.hash();
         let (stripped, _bundle) = shell_core::StrippedBlock::split(block);
         let body_bytes = encode_rlp(&stripped);
+        if let Some(expected) = self.store.get(&Self::body_digest_key(&hash))? {
+            let actual = shell_primitives::blake3_hash(&body_bytes);
+            if expected.as_slice() != actual.as_bytes() {
+                return Err(StorageError::InvalidInput(
+                    "backfill body does not match the locally pruned body".into(),
+                ));
+            }
+        }
         self.store.put(&Self::body_key(&hash), &body_bytes)?;
         Ok(())
     }
@@ -5900,6 +5929,118 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         }
+    }
+
+    #[test]
+    fn backfill_rejects_changed_body_with_canonical_header() {
+        let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+        let original = make_block_with_txs(1);
+        let hash = original.hash();
+        cs.put_block(&original).unwrap();
+        cs.set_canonical(1, &hash).unwrap();
+        cs.delete_body(&hash).unwrap();
+        let mut changed = original.clone();
+        changed.transactions[0].tx.value = U256::from(999_999);
+        assert_eq!(changed.hash(), hash);
+        assert_eq!(cs.get_block_hash_by_number(1).unwrap(), Some(hash));
+        assert!(
+            cs.put_body_only(&changed).is_err(),
+            "changed body accepted under canonical header"
+        );
+        assert!(!cs.has_body(&hash).unwrap());
+        cs.put_body_only(&original).unwrap();
+        assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(original));
+    }
+
+    #[test]
+    fn backfill_checks_batch_pruning_digest_after_witness_removal() {
+        for with_cursor in [false, true] {
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            let mut original = make_block_with_txs(1);
+            original
+                .system_transactions
+                .push(SystemTransaction::block_gas_reward(
+                    1,
+                    1,
+                    1,
+                    Address::ZERO,
+                    U256::from(10),
+                    original.header.parent_hash,
+                ));
+            let hash = original.hash();
+            cs.put_block(&original).unwrap();
+            cs.delete_witness_bundle(&hash).unwrap();
+            if with_cursor {
+                cs.prune_bodies_below(&[hash], 2).unwrap();
+                assert_eq!(cs.body_pruned_below().unwrap(), 2);
+            } else {
+                cs.delete_bodies(&[hash]).unwrap();
+            }
+            // Repeating deletion must preserve the original digest.
+            cs.delete_body(&hash).unwrap();
+            let mut changed = original.clone();
+            changed.system_transactions.clear();
+            assert!(cs.put_body_only(&changed).is_err());
+            let (stripped, _) = StrippedBlock::split(&original);
+            cs.put_body_only(&stripped.clone().into_block(None))
+                .unwrap();
+            let restored = cs.get_block_by_hash(&hash).unwrap().unwrap();
+            assert_eq!(StrippedBlock::split(&restored).0, stripped);
+        }
+    }
+
+    #[test]
+    fn body_pruning_digest_and_cursor_are_atomic() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(1);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        db.fail_next_batch();
+        assert!(cs.prune_bodies_below(&[hash], 2).is_err());
+        assert!(cs.has_body(&hash).unwrap());
+        assert_eq!(cs.body_pruned_below().unwrap(), 0);
+        assert!(db
+            .get(&ChainStore::<FailingBatchStore>::body_digest_key(&hash))
+            .unwrap()
+            .is_none());
+        cs.prune_bodies_below(&[hash], 2).unwrap();
+        assert!(!cs.has_body(&hash).unwrap());
+        assert_eq!(cs.body_pruned_below().unwrap(), 2);
+        assert!(db
+            .get(&ChainStore::<FailingBatchStore>::body_digest_key(&hash))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn backfill_without_legacy_digest_remains_compatible() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(1);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        // Model a body removed before local digests were introduced.
+        db.delete(&ChainStore::<MemoryDb>::body_key(&hash)).unwrap();
+        cs.put_body_only(&block).unwrap();
+        assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
+    fn backfill_normalizes_legacy_body_encoding_before_pruning() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(1);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        let (stripped, _) = StrippedBlock::split(&block);
+        let mut legacy = vec![format_version::JSON];
+        legacy.extend(serde_json::to_vec(&stripped).unwrap());
+        db.put(&ChainStore::<MemoryDb>::body_key(&hash), &legacy)
+            .unwrap();
+        cs.delete_body(&hash).unwrap();
+        cs.put_body_only(&block).unwrap();
+        assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(block));
     }
 
     #[test]

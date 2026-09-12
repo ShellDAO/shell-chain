@@ -344,6 +344,18 @@ background; normal consensus is not interrupted. When finished, the node logs:
 ✓ historical body back-fill complete
 ```
 
+Body pruning retains a 32-byte BLAKE3 digest of the canonical stripped-body
+encoding under `bd1/<hash>`, atomically with body deletion and pruning progress.
+Back-fill checks this local digest before writing a replacement body, including
+user and system transaction payloads. PQ witnesses are excluded, so peers can
+serve bodies after witness pruning. The digest is retained after restoration.
+Legacy body encodings are normalized before hashing.
+
+Bodies already pruned before these digests were introduced retain the existing
+back-fill behavior when no digest is available. This local integrity check does
+not activate `transactions_root` validation or change consensus; it cannot
+authenticate legacy missing bodies without a retained digest.
+
 If no peer with sufficient history is reachable, the node logs a warning and
 retries on each new peer connection.
 
