@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Refuse Unix `removedb --force` while another process holds the database lock.
+
 - Preserve existing nonce, contract code, and storage when `genesis add-alloc`
   updates an account balance.
 - Refuse Unix backup restores while another process holds the database lock,
