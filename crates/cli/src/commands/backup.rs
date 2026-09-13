@@ -138,7 +138,20 @@ pub fn restore_backup(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let backup = if db_path.exists() {
+    // Copying a LOCK file after taking its process-associated fcntl lock could
+    // release that lock when the copy's input handle closes. Lock only after
+    // staging is complete, and hold both locks through installation/rollback.
+    #[cfg(unix)]
+    let database_lock = lock_database_for_restore(&db_path)?;
+    #[cfg(unix)]
+    let _staged_lock = lock_database_for_restore(&staged_db)?
+        .ok_or("staged database disappeared before restore")?;
+    #[cfg(unix)]
+    let database_exists = database_lock.is_some();
+    #[cfg(not(unix))]
+    let database_exists = db_path.exists();
+
+    let backup = if database_exists {
         let bak = next_backup_path(&datadir, ts);
         std::fs::rename(&db_path, &bak)?;
         eprintln!("ℹ  Existing DB renamed to {}", bak.display());
@@ -177,6 +190,52 @@ pub fn restore_backup(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Acquire the same whole-file POSIX lock used by RocksDB without opening the
+/// database itself, so an offline corrupt database can still be replaced.
+#[cfg(unix)]
+fn lock_database_for_restore(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, CWD};
+
+    let directory = match open_backup_directory(path) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let lock = rustix::fs::openat(
+        &directory,
+        "LOCK",
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = rustix::fs::fstat(&lock).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "database LOCK entry must be a regular file",
+        ));
+    }
+    rustix::fs::fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
+        let cause = std::io::Error::from(error);
+        std::io::Error::new(
+            cause.kind(),
+            format!("cannot lock database for restore; stop the node before retrying: {cause}"),
+        )
+    })?;
+
+    let opened = rustix::fs::fstat(&directory).map_err(std::io::Error::from)?;
+    let current =
+        rustix::fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+    if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
+        return Err(std::io::Error::other(
+            "database path changed while acquiring restore lock",
+        ));
+    }
+    Ok(Some(lock))
+}
 
 /// Recursively copy a directory tree (used for restore).
 #[cfg(unix)]
@@ -423,6 +482,121 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[test]
+    fn restore_database_in_child_process() {
+        let Ok(datadir) = std::env::var("SHELL_TEST_RESTORE_DATA_DIR") else {
+            return;
+        };
+        if std::env::var_os("SHELL_TEST_RESTORE_LOCK_PROBE").is_some() {
+            shell_storage::RocksDbStore::open_all(PathBuf::from(datadir).join("db"), None).unwrap();
+            return;
+        }
+        let backup = std::env::var("SHELL_TEST_RESTORE_BACKUP_DIR").unwrap();
+        restore_backup(PathBuf::from(datadir), PathBuf::from(backup)).unwrap();
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[test]
+    fn restore_refuses_database_held_open_by_another_process() {
+        use shell_storage::{KvStore, RocksDbStore};
+
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db = datadir.join("db");
+        let backup = root.path().join("checkpoint");
+        let stores = RocksDbStore::open_all(&db, None).unwrap();
+        stores.state.put(b"restore-marker", b"checkpoint").unwrap();
+        stores.create_checkpoint(&backup).unwrap();
+        stores.state.put(b"restore-marker", b"live").unwrap();
+        let original_current = std::fs::read(db.join("CURRENT")).unwrap();
+
+        let restore = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::backup::tests::restore_database_in_child_process",
+                    "--nocapture",
+                ])
+                .env("SHELL_TEST_RESTORE_DATA_DIR", &datadir)
+                .env("SHELL_TEST_RESTORE_BACKUP_DIR", &backup)
+                .output()
+                .unwrap()
+        };
+        let rejected = restore();
+        assert!(
+            !rejected.status.success(),
+            "restore must refuse a database still open in another process"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("stop the node"));
+        assert_eq!(std::fs::read(db.join("CURRENT")).unwrap(), original_current);
+        assert_eq!(
+            stores.state.get(b"restore-marker").unwrap().unwrap(),
+            b"live"
+        );
+        assert_eq!(std::fs::read_dir(&datadir).unwrap().count(), 1);
+
+        drop(stores);
+        let restored = restore();
+        assert!(restored.status.success(), "{:?}", restored);
+        let restored_stores = RocksDbStore::open_all(&db, None).unwrap();
+        assert_eq!(
+            restored_stores
+                .state
+                .get(b"restore-marker")
+                .unwrap()
+                .unwrap(),
+            b"checkpoint"
+        );
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[test]
+    fn restore_lock_follows_installed_database_until_released() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged");
+        drop(shell_storage::RocksDbStore::open_all(&staged, None).unwrap());
+        let lock = lock_database_for_restore(&staged).unwrap().unwrap();
+        std::fs::rename(&staged, root.path().join("db")).unwrap();
+
+        let open_database = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::backup::tests::restore_database_in_child_process",
+                    "--nocapture",
+                ])
+                .env("SHELL_TEST_RESTORE_DATA_DIR", root.path())
+                .env("SHELL_TEST_RESTORE_LOCK_PROBE", "1")
+                .output()
+                .unwrap()
+        };
+        let rejected = open_database();
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("lock"));
+        drop(lock);
+        let opened = open_database();
+        assert!(opened.status.success(), "{:?}", opened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_lock_refuses_symbolic_links_and_nonregular_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("db");
+        std::fs::create_dir(&db).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"preserve").unwrap();
+        symlink(&outside, db.join("LOCK")).unwrap();
+        assert!(lock_database_for_restore(&db).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        std::fs::remove_file(db.join("LOCK")).unwrap();
+        std::fs::create_dir(db.join("LOCK")).unwrap();
+        assert!(lock_database_for_restore(&db).is_err());
+    }
 
     #[test]
     fn restore_rejects_invalid_source_without_moving_live_database() {
