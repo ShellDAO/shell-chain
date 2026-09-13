@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve existing nonce, contract code, and storage when `genesis add-alloc`
+  updates an account balance.
 - Refuse Unix backup restores while another process holds the database lock,
   and keep the staged database locked through installation.
 

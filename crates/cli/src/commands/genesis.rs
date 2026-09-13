@@ -9,8 +9,8 @@ use shell_primitives::Address;
 
 /// Add (or update) an allocation entry in a genesis JSON file.
 ///
-/// Reads genesis, inserts `alloc[address] = { "balance": balance }`, then
-/// writes back to `output` (or the same file if `output` is `None`).
+/// Updates the balance while preserving existing account fields, then writes
+/// back to `output` (or the same file if `output` is `None`).
 pub fn genesis_add_alloc(
     genesis_path: PathBuf,
     address: String,
@@ -32,15 +32,15 @@ pub fn genesis_add_alloc(
         .entry("alloc")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
 
-    // Insert or overwrite the allocation entry.
-    let entry = serde_json::json!({
-        "balance": balance,
-        "nonce": 0
-    });
-    alloc
+    let entry = alloc
         .as_object_mut()
         .ok_or("genesis.alloc is not a JSON object")?
-        .insert(addr_key.clone(), entry);
+        .entry(addr_key.clone())
+        .or_insert_with(|| serde_json::json!({"nonce": 0}));
+    entry
+        .as_object_mut()
+        .ok_or("allocation entry is not a JSON object")?
+        .insert("balance".into(), Value::String(balance.clone()));
 
     write_json_doc(&genesis_path, output, &doc)?;
 
@@ -163,6 +163,87 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_alloc_preserves_existing_account_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        let output = dir.path().join("updated.json");
+        let address = format!("0x{}", "ab".repeat(32));
+        let other = format!("0x{}", "cd".repeat(32));
+        let slot = format!("0x{}", "00".repeat(32));
+        let value = format!("0x{}", "01".repeat(32));
+        let original = serde_json::json!({
+            "chain_id": 1,
+            "alloc": {
+                &address: {
+                    "balance": "100", "nonce": 7, "code": "0x6000",
+                    "storage": {&slot: value}
+                },
+                &other: {"balance": "50"}
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let mut expected = original.clone();
+        expected["alloc"][&address]["balance"] = Value::String("200".into());
+
+        genesis_add_alloc(
+            path.clone(),
+            address.clone(),
+            "200".into(),
+            Some(output.clone()),
+        )
+        .unwrap();
+        assert_eq!(read_json_doc(&path).unwrap(), original);
+        assert_eq!(read_json_doc(&output).unwrap(), expected);
+
+        genesis_add_alloc(path.clone(), address, "200".into(), None).unwrap();
+        assert_eq!(read_json_doc(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn add_alloc_creates_account_without_changing_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        let address = format!("0x{}", "ab".repeat(32));
+        let other = format!("0x{}", "cd".repeat(32));
+        std::fs::write(&path, br#"{"chain_id":1}"#).unwrap();
+        genesis_add_alloc(path.clone(), address.clone(), "100".into(), None).unwrap();
+        genesis_add_alloc(path.clone(), other.clone(), "200".into(), None).unwrap();
+        assert_eq!(
+            read_json_doc(&path).unwrap(),
+            serde_json::json!({
+                "chain_id": 1,
+                "alloc": {
+                    &address: {"balance": "100", "nonce": 0},
+                    &other: {"balance": "200", "nonce": 0}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn add_alloc_rejects_non_object_account_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        let output = dir.path().join("updated.json");
+        let address = format!("0x{}", "ab".repeat(32));
+        for entry in [Value::Null, serde_json::json!(42), serde_json::json!([])] {
+            let original =
+                serde_json::to_vec(&serde_json::json!({"alloc": {&address: entry}})).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            for destination in [None, Some(output.clone())] {
+                let error =
+                    genesis_add_alloc(path.clone(), address.clone(), "200".into(), destination)
+                        .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("allocation entry is not a JSON object"));
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert!(!output.exists());
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
