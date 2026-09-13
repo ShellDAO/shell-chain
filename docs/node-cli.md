@@ -234,12 +234,15 @@ shell-node wallet <create|balance|send|export> [OPTIONS]
 
 ### 2.8 `backup` Subcommands
 
-Hot backup and restore for the RocksDB data directory:
+Offline backup and restore for the RocksDB data directory:
 
 ```
 shell-node backup create [--output <DIR>]
 shell-node backup restore <BACKUP_DIR>
 ```
+
+Stop the node before creating or restoring a backup. On Unix, restore refuses
+to replace a database that another process still has locked.
 
 ---
 

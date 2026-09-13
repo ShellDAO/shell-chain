@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Refuse Unix backup restores while another process holds the database lock,
+  and keep the staged database locked through installation.
+
 - Apply the RPC connection limit to pending TLS handshakes and forwarded
   connections, releasing capacity when either stage terminates.
 - Allocate signer-backed validator governance transaction nonces from the
