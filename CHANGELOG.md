@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Persist or reuse the default genesis authority key during `init` so a subsequent
+  `run` uses the authorized identity and can produce blocks.
 - Refuse Unix `removedb --force` while another process holds the database lock.
 
 - Preserve existing nonce, contract code, and storage when `genesis add-alloc`

@@ -40,6 +40,11 @@ cargo build --release -p shell-cli --bin shell-node
 ./target/release/shell-node --datadir ./data run --network dev --db memory
 ```
 
+Without `--genesis`, initialization saves the development authority in
+`dev-authority.json` inside the data directory, reusing an existing key when present.
+The subsequent `run` command uses that key unless `--keystore` is supplied.
+New development key files have owner-only permissions on Unix.
+
 For production deployments with Docker, see the [Operator Guide](docs/TESTNET_OPERATOR_GUIDE.md).
 
 ## Native Account Abstraction

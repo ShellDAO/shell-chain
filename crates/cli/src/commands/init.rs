@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use shell_crypto::DilithiumSigner;
 use shell_crypto::Signer;
 use shell_genesis::{
     initialize_genesis, AllocEntry, ConsensusConfig, GenesisConfig, NetworkType,
@@ -15,6 +14,8 @@ use shell_primitives::{Address, U256};
 use shell_storage::MemoryDb;
 
 use tracing::info;
+
+use super::run::{load_or_create_dev_signer, DEV_AUTHORITY_KEY_FILE};
 
 const DEV_AUTHORITY_INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000_000_000_000u128;
 
@@ -69,7 +70,7 @@ pub fn init(
                 network_type.as_str(),
                 block_time_secs
             );
-            let signer = DilithiumSigner::generate();
+            let signer = load_or_create_dev_signer(&datadir.join(DEV_AUTHORITY_KEY_FILE))?;
             let authority =
                 Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
 
@@ -134,6 +135,89 @@ pub fn init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_genesis_persists_the_authority_used_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+
+        let key_path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
+        assert!(
+            key_path.is_file(),
+            "init must retain the genesis authority key"
+        );
+        let signer = load_or_create_dev_signer(&key_path).unwrap();
+        let genesis = GenesisConfig::from_file(&dir.path().join("genesis.json")).unwrap();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        assert_eq!(genesis.consensus.authorities(), &[authority]);
+        assert_eq!(
+            genesis.consensus.authority_pubkeys(),
+            &[format!("0x{}", hex::encode(signer.public_key()))]
+        );
+        assert!(genesis.alloc.contains_key(&authority));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn default_genesis_reuses_an_existing_dev_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
+        let signer = load_or_create_dev_signer(&key_path).unwrap();
+        let original = std::fs::read(&key_path).unwrap();
+
+        init(dir.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+
+        let genesis = GenesisConfig::from_file(&dir.path().join("genesis.json")).unwrap();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        assert_eq!(genesis.consensus.authorities(), &[authority]);
+        assert!(
+            std::fs::read(key_path).unwrap() == original,
+            "existing key must not be replaced"
+        );
+    }
+
+    #[test]
+    fn default_genesis_rejects_invalid_key_without_replacing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
+        let genesis_path = dir.path().join("genesis.json");
+        std::fs::write(&key_path, b"invalid key").unwrap();
+        std::fs::write(&genesis_path, b"existing genesis").unwrap();
+
+        assert!(init(dir.path().to_path_buf(), None, 1337, "dev".into()).is_err());
+
+        assert_eq!(std::fs::read(key_path).unwrap(), b"invalid key");
+        assert_eq!(std::fs::read(genesis_path).unwrap(), b"existing genesis");
+    }
+
+    #[test]
+    fn supplied_genesis_does_not_generate_a_dev_key() {
+        let source = tempfile::tempdir().unwrap();
+        init(source.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+        let genesis_path = source.path().join("genesis.json");
+        let destination = tempfile::tempdir().unwrap();
+
+        init(
+            destination.path().to_path_buf(),
+            Some(genesis_path.clone()),
+            1337,
+            "dev".into(),
+        )
+        .unwrap();
+
+        assert!(!destination.path().join(DEV_AUTHORITY_KEY_FILE).exists());
+        assert_eq!(
+            std::fs::read(destination.path().join("genesis.json")).unwrap(),
+            std::fs::read(genesis_path).unwrap()
+        );
+    }
 
     #[test]
     fn rejects_unknown_network_before_creating_datadir() {
