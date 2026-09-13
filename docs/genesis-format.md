@@ -208,6 +208,9 @@ Write or copy an example from `examples/genesis-testnet-wpoa.json`.
 
 ### 2. CLI (`genesis add-alloc`)
 
+For an existing address, this command updates only its balance and preserves
+its nonce, contract code, and storage. New accounts start with nonce zero.
+
 ```bash
 # Start from a template
 cp examples/genesis-testnet-wpoa.json my-genesis.json

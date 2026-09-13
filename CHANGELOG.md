@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve existing nonce, contract code, and storage when `genesis add-alloc`
+  updates an account balance.
+
 - Apply the RPC connection limit to pending TLS handshakes and forwarded
   connections, releasing capacity when either stage terminates.
 - Allocate signer-backed validator governance transaction nonces from the
