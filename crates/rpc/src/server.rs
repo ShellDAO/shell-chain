@@ -42,7 +42,7 @@ use crate::tls;
 pub struct RpcConfig {
     /// Address to bind the HTTP (+WS) server (default: 127.0.0.1:8545).
     pub listen_addr: SocketAddr,
-    /// Maximum number of concurrent connections (default: 100).
+    /// Maximum concurrent connections, including pending TLS handshakes (default: 100).
     pub max_connections: u32,
     /// Optional dedicated WebSocket address. When `Some`, a WS-only server is
     /// started on this address and the HTTP server becomes HTTP-only.
@@ -414,7 +414,13 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 
         // Start TLS proxy if TLS is configured, forwarding public_addr → http_addr.
         let tls_proxy = if let Some(cfg) = tls_cfg {
-            let proxy = start_tls_proxy(config.listen_addr, http_addr, cfg.server_config).await?;
+            let proxy = start_tls_proxy(
+                config.listen_addr,
+                http_addr,
+                cfg.server_config,
+                config.max_connections,
+            )
+            .await?;
             info!("TLS proxy up: {} -> {}", proxy.public_addr, http_addr);
             Some(proxy)
         } else {
@@ -445,7 +451,13 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
 
         // Start TLS proxy if TLS is configured, forwarding public_addr → http_addr.
         let tls_proxy = if let Some(cfg) = tls_cfg {
-            let proxy = start_tls_proxy(config.listen_addr, http_addr, cfg.server_config).await?;
+            let proxy = start_tls_proxy(
+                config.listen_addr,
+                http_addr,
+                cfg.server_config,
+                config.max_connections,
+            )
+            .await?;
             info!("TLS proxy up: {} -> {}", proxy.public_addr, http_addr);
             Some(proxy)
         } else {
@@ -551,6 +563,115 @@ mod tests {
         };
 
         assert!(config.validate_dev_rpc_exposure().is_ok());
+    }
+
+    #[tokio::test]
+    async fn tls_connections_respect_rpc_limit_before_and_after_handshake() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cert_path = temp.path().join("cert.pem");
+        let key_path = temp.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let db = Arc::new(MemoryDb::new());
+        let (block_events, _) = tokio::sync::broadcast::channel(16);
+        let server = start_rpc_server(
+            RpcConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                ws_addr: None,
+                max_connections: 1,
+                tls_cert_path: Some(cert_path.to_str().unwrap().into()),
+                tls_key_path: Some(key_path.to_str().unwrap().into()),
+                ..RpcConfig::default()
+            },
+            Arc::new(ChainStore::new(Arc::clone(&db))),
+            Arc::new(parking_lot::RwLock::new(WorldState::new(db))),
+            Arc::new(TxPool::new(MempoolConfig::default())),
+            42,
+            None,
+            block_events,
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(0)),
+            Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let addr = server.tls_proxy.as_ref().unwrap().public_addr;
+
+        // An idle TCP connection must consume capacity before sending ClientHello.
+        let pending = TcpStream::connect(addr).await.unwrap();
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0; 1];
+        let rejected = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte))
+            .await
+            .expect("TLS proxy retained a connection beyond the configured limit")
+            .unwrap();
+        assert_eq!(rejected, 0);
+        drop(extra);
+        drop(pending);
+
+        for _ in 0..2 {
+            // Abandoned handshakes and closed forwarded connections both release capacity.
+            let mut client = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let tcp = TcpStream::connect(addr).await.unwrap();
+                    if let Ok(client) = connector
+                        .connect("localhost".try_into().unwrap(), tcp)
+                        .await
+                    {
+                        break client;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("abandoned handshake retained its connection slot");
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = [0; 1024];
+            let count = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response[..count].starts_with(b"HTTP/1.1"));
+
+            // Forwarding retains the same slot rather than releasing it at handshake completion.
+            let mut extra = TcpStream::connect(addr).await.unwrap();
+            let rejected = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte))
+                .await
+                .expect("forwarding did not retain its TLS connection slot")
+                .unwrap();
+            assert_eq!(rejected, 0);
+            drop(extra);
+            drop(client);
+        }
+        server.tls_proxy.as_ref().unwrap().shutdown();
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
     }
 
     #[tokio::test]

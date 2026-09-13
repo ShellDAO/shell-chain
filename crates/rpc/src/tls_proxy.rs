@@ -31,14 +31,17 @@ impl TlsProxyHandle {
 ///  - public_addr  : TLS listener (externally reachable)
 /// - backend_addr : plain HTTP/WS jsonrpsee server (loopback)
 /// - tls_config   : pre-built rustls::ServerConfig
+/// - max_connections: maximum active handshakes and forwarded connections
 pub async fn start_tls_proxy(
     public_addr: SocketAddr,
     backend_addr: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+    max_connections: u32,
 ) -> Result<TlsProxyHandle, std::io::Error> {
     let listener = TcpListener::bind(public_addr).await?;
     let actual_addr = listener.local_addr()?;
     let acceptor = TlsAcceptor::from(tls_config);
+    let capacity = Arc::new(tokio::sync::Semaphore::new(max_connections as usize));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     info!("TLS proxy listening on {actual_addr} -> backend {backend_addr}");
@@ -58,9 +61,14 @@ pub async fn start_tls_proxy(
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((tcp_stream, peer_addr)) => {
+                            let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() else {
+                                drop(tcp_stream);
+                                continue;
+                            };
                             debug!("TLS proxy: new connection from {peer_addr}");
                             let acceptor = acceptor.clone();
                             connections.spawn(async move {
+                                let _permit = permit;
                                 match acceptor.accept(tcp_stream).await {
                                     Ok(tls_stream) => {
                                         if let Err(e) = forward_connection(tls_stream, backend_addr).await {
@@ -125,7 +133,9 @@ mod tests {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
         let addr = "127.0.0.1:0".parse().unwrap();
-        start_tls_proxy(addr, addr, Arc::new(config)).await.unwrap()
+        start_tls_proxy(addr, addr, Arc::new(config), 1)
+            .await
+            .unwrap()
     }
 
     async fn assert_listener_released(addr: SocketAddr) {
@@ -190,6 +200,7 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
                 backend.local_addr().unwrap(),
                 Arc::clone(&server_config),
+                1,
             )
             .await
             .unwrap();
