@@ -60,6 +60,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo test --workspace
+      - name: Test interactive password fallback
+        run: |
+          cargo build -p shell-cli --bin shell-node
+          python3 scripts/test-password-prompts.py target/debug/shell-node
       - name: Test production libp2p backend
         run: cargo test -p shell-network --features libp2p
 
