@@ -277,7 +277,10 @@ shell-node --datadir chain-data import-state --snapshot snapshot.jsonl
 shell-node removedb [--force]
 ```
 
-Removes the chain database directory. `--force` skips the confirmation prompt.
+Without `--force`, previews the database path and size without deleting it.
+With `--force`, removes the chain database directory. On Unix, removal refuses
+an existing database lock held by another process. Stop the node and disable
+automatic restarts for the entire operation.
 
 ---
 

@@ -56,6 +56,9 @@ pub fn removedb(datadir: PathBuf, force: bool) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
 
+    #[cfg(unix)]
+    let _database_lock = super::database_lock::lock_database(&db_path)?;
+
     std::fs::remove_dir_all(&db_path)?;
     eprintln!("✓ Removed {} ({} bytes)", db_path.display(), dir_size);
 
@@ -127,6 +130,90 @@ fn dir_size_inner(path: &Path, depth: usize, entries_seen: &mut u64) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[test]
+    fn remove_database_in_child_process() {
+        let Some(datadir) = std::env::var_os("SHELL_TEST_REMOVE_DATA_DIR") else {
+            return;
+        };
+        removedb(PathBuf::from(datadir), true).unwrap();
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[test]
+    fn removedb_refuses_database_held_open_by_another_process() {
+        use shell_storage::{KvStore, RocksDbStore};
+
+        let root = tempfile::tempdir().unwrap();
+        let datadir = root.path().join("chain");
+        let db = datadir.join("db");
+        let stores = RocksDbStore::open_all(&db, None).unwrap();
+        stores.state.put(b"remove-marker", b"live").unwrap();
+        let original_current = std::fs::read(db.join("CURRENT")).unwrap();
+        let remove = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::removedb::tests::remove_database_in_child_process",
+                    "--nocapture",
+                ])
+                .env("SHELL_TEST_REMOVE_DATA_DIR", &datadir)
+                .output()
+                .unwrap()
+        };
+
+        let rejected = remove();
+        assert!(
+            !rejected.status.success(),
+            "must refuse to remove an active database"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("stop the node"));
+        assert_eq!(std::fs::read(db.join("CURRENT")).unwrap(), original_current);
+        assert_eq!(
+            stores.state.get(b"remove-marker").unwrap().unwrap(),
+            b"live"
+        );
+
+        drop(stores);
+        let removed = remove();
+        assert!(removed.status.success(), "{removed:?}");
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn removedb_preview_does_not_create_lock_file() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("db");
+        std::fs::create_dir(&db).unwrap();
+        std::fs::write(db.join("CURRENT"), b"preview").unwrap();
+
+        removedb(root.path().to_path_buf(), false).unwrap();
+
+        assert_eq!(std::fs::read(db.join("CURRENT")).unwrap(), b"preview");
+        assert_eq!(std::fs::read_dir(&db).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removedb_refuses_abnormal_lock_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("db");
+        std::fs::create_dir(&db).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, db.join("LOCK")).unwrap();
+        assert!(removedb(root.path().to_path_buf(), true).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert!(db.join("LOCK").is_symlink());
+
+        std::fs::remove_file(db.join("LOCK")).unwrap();
+        std::fs::create_dir(db.join("LOCK")).unwrap();
+        assert!(removedb(root.path().to_path_buf(), true).is_err());
+        assert!(db.join("LOCK").is_dir());
+    }
 
     #[test]
     fn removedb_rejects_empty_data_directory() {

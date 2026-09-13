@@ -27,3 +27,11 @@ while restore holds its lock. Existing staging, rollback and corrupt-database
 recovery behavior is preserved. This guard applies to Unix; other platforms
 retain their existing filesystem behavior. It does not authorize concurrent
 operator moves or edits of the database directory during restore.
+
+The same native ownership check is shared with `removedb --force` on Unix. It
+runs after the read-only size scan and before deletion, and refuses an already
+open database without requiring its contents to be readable by RocksDB. A
+preview does not acquire or create a lock. Unlike restore, removal unlinks the
+lock file as part of deleting the directory; operators must prevent new node
+starts for the entire operation. This is an active-owner check, not a guarantee
+against concurrent process startup or manual directory replacement.

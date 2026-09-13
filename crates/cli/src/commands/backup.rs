@@ -18,6 +18,9 @@
 //! Both subcommands print structured status to stderr and return a machine-readable
 //! JSON summary to stdout so they can be composed in shell scripts.
 
+#[cfg(unix)]
+use super::database_lock::lock_database;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,10 +145,10 @@ pub fn restore_backup(
     // release that lock when the copy's input handle closes. Lock only after
     // staging is complete, and hold both locks through installation/rollback.
     #[cfg(unix)]
-    let database_lock = lock_database_for_restore(&db_path)?;
+    let database_lock = lock_database(&db_path)?;
     #[cfg(unix)]
-    let _staged_lock = lock_database_for_restore(&staged_db)?
-        .ok_or("staged database disappeared before restore")?;
+    let _staged_lock =
+        lock_database(&staged_db)?.ok_or("staged database disappeared before restore")?;
     #[cfg(unix)]
     let database_exists = database_lock.is_some();
     #[cfg(not(unix))]
@@ -190,52 +193,6 @@ pub fn restore_backup(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Acquire the same whole-file POSIX lock used by RocksDB without opening the
-/// database itself, so an offline corrupt database can still be replaced.
-#[cfg(unix)]
-fn lock_database_for_restore(
-    path: &std::path::Path,
-) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
-    use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, CWD};
-
-    let directory = match open_backup_directory(path) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let lock = rustix::fs::openat(
-        &directory,
-        "LOCK",
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(std::io::Error::from)?;
-    let metadata = rustix::fs::fstat(&lock).map_err(std::io::Error::from)?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "database LOCK entry must be a regular file",
-        ));
-    }
-    rustix::fs::fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
-        let cause = std::io::Error::from(error);
-        std::io::Error::new(
-            cause.kind(),
-            format!("cannot lock database for restore; stop the node before retrying: {cause}"),
-        )
-    })?;
-
-    let opened = rustix::fs::fstat(&directory).map_err(std::io::Error::from)?;
-    let current =
-        rustix::fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
-    if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
-        return Err(std::io::Error::other(
-            "database path changed while acquiring restore lock",
-        ));
-    }
-    Ok(Some(lock))
-}
 
 /// Recursively copy a directory tree (used for restore).
 #[cfg(unix)]
@@ -557,7 +514,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let staged = root.path().join("staged");
         drop(shell_storage::RocksDbStore::open_all(&staged, None).unwrap());
-        let lock = lock_database_for_restore(&staged).unwrap().unwrap();
+        let lock = lock_database(&staged).unwrap().unwrap();
         std::fs::rename(&staged, root.path().join("db")).unwrap();
 
         let open_database = || {
@@ -591,11 +548,11 @@ mod tests {
         let outside = root.path().join("outside");
         std::fs::write(&outside, b"preserve").unwrap();
         symlink(&outside, db.join("LOCK")).unwrap();
-        assert!(lock_database_for_restore(&db).is_err());
+        assert!(lock_database(&db).is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
         std::fs::remove_file(db.join("LOCK")).unwrap();
         std::fs::create_dir(db.join("LOCK")).unwrap();
-        assert!(lock_database_for_restore(&db).is_err());
+        assert!(lock_database(&db).is_err());
     }
 
     #[test]

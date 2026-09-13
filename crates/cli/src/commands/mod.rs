@@ -2,6 +2,8 @@
 
 pub mod account;
 mod backup;
+#[cfg(unix)]
+mod database_lock;
 mod export_state;
 mod genesis;
 mod import_state;
