@@ -1,7 +1,7 @@
 //! Checkpoint sync: download and import a snapshot from a remote URL.
 //!
 //! This is a one-time operation at node startup. If the chain is empty
-//! (no blocks beyond genesis), the node downloads a snapshot file from
+//! (no canonical head), the node downloads a snapshot file from
 //! the given URL, validates it, and imports it via `ChainStore::import_snapshot`.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -204,8 +204,14 @@ async fn download_snapshot(url: &str, output_file: &std::fs::File) -> Result<(),
             "--",
             url,
         ])
+        .stdin(Stdio::null())
         .stdout(Stdio::from(curl_output))
-        .output()
+        .stderr(Stdio::piped())
+        // Command::output replaces stdout with a pipe, discarding the file
+        // redirect and buffering the snapshot in memory instead.
+        .spawn()
+        .map_err(|e| NodeError::Startup(format!("failed to run curl: {e}")))?
+        .wait_with_output()
         .await
         .map_err(|e| NodeError::Startup(format!("failed to run curl: {e}")))?;
 
