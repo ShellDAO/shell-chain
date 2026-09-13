@@ -342,6 +342,65 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Populate an empty chain from a checkpoint or local genesis before node startup.
+async fn initialize_chain<S: KvStore + 'static>(
+    store: Arc<S>,
+    genesis_config: &GenesisConfig,
+    datadir: &Path,
+    chain_id: u64,
+    checkpoint_url: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let chain_store = ChainStore::new(Arc::clone(&store));
+    if shell_node::checkpoint::should_checkpoint_sync(&chain_store)? {
+        if let Some(url) = checkpoint_url {
+            if genesis_config.chain_id != chain_id {
+                return Err(
+                    "checkpoint chain ID does not match local genesis configuration".into(),
+                );
+            }
+            // Derive the trust anchor without publishing a canonical head in
+            // the destination: snapshot import requires an empty chain.
+            let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
+            let trusted = shell_storage::ChainConfig {
+                chain_id,
+                genesis_hash: genesis.hash(),
+            };
+            match chain_store.get_chain_config()? {
+                Some(existing)
+                    if existing.chain_id != trusted.chain_id
+                        || existing.genesis_hash != trusted.genesis_hash =>
+                {
+                    return Err(
+                        "stored chain config does not match local checkpoint trust anchor".into(),
+                    );
+                }
+                Some(_) => {}
+                None => chain_store.put_chain_config(&trusted)?,
+            }
+            info!("Chain is empty, starting checkpoint sync");
+            let block_num =
+                shell_node::checkpoint::checkpoint_sync(url, &chain_store, datadir, chain_id)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> {
+                        format!("checkpoint sync failed: {e}").into()
+                    })?;
+            info!("Checkpoint sync complete at block #{block_num}");
+        } else {
+            let genesis_block = initialize_genesis(genesis_config, store)?;
+            info!(
+                "Genesis block #{} (state_root: {:?})",
+                genesis_block.number(),
+                genesis_block.header.state_root
+            );
+        }
+    } else if checkpoint_url.is_some() {
+        info!("Chain already has a canonical head, skipping checkpoint sync");
+    }
+
+    initialize_authority_pubkeys(genesis_config, &chain_store)?;
+    Ok(())
+}
+
 /// Core node startup logic, generic over storage backend.
 async fn run_with_store<S: KvStore + 'static>(
     store: Arc<S>,
@@ -564,38 +623,14 @@ async fn run_with_store<S: KvStore + 'static>(
         config
     };
 
-    // Initialize genesis only if chain has no head block.
-    if !resumed {
-        let genesis_block = initialize_genesis(&genesis_config, store.clone())?;
-        info!(
-            "Genesis block #{} (state_root: {:?})",
-            genesis_block.number(),
-            genesis_block.header.state_root
-        );
-    }
-
-    initialize_authority_pubkeys(&genesis_config, &chain_store)?;
-
-    // Checkpoint sync: download and import snapshot if --checkpoint-url is set
-    // and the chain has no blocks beyond genesis.
-    if let Some(ref url) = args.checkpoint_url {
-        if shell_node::checkpoint::should_checkpoint_sync(&chain_store)? {
-            info!("Chain is empty, starting checkpoint sync");
-            let block_num = shell_node::checkpoint::checkpoint_sync(
-                url,
-                &chain_store,
-                &args.datadir,
-                args.chain_id,
-            )
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("checkpoint sync failed: {e}").into()
-            })?;
-            info!("Checkpoint sync complete at block #{block_num}");
-        } else {
-            info!("Chain already has blocks, skipping checkpoint sync");
-        }
-    }
+    initialize_chain(
+        Arc::clone(&store),
+        &genesis_config,
+        &args.datadir,
+        args.chain_id,
+        args.checkpoint_url.as_deref(),
+    )
+    .await?;
 
     // Extract authorities and epoch_length from genesis.
     let authorities = genesis_config.consensus.authorities().to_vec();
@@ -1155,6 +1190,205 @@ mod tests {
             system_transactions: vec![],
             proposer_seal: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn checkpoint_fixture(dir: &Path, config: &GenesisConfig) -> (String, ShellHash) {
+        let source = Arc::new(MemoryDb::new());
+        let genesis = initialize_genesis(config, Arc::clone(&source)).unwrap();
+        let block = test_block(1, genesis.hash(), genesis.header.state_root);
+        let chain = ChainStore::new(source);
+        chain.commit_canonical_block(&block, None).unwrap();
+        let path = dir.join("source-snapshot.jsonl");
+        chain
+            .export_snapshot(
+                shell_storage::SnapshotMetadata::new(
+                    config.chain_id,
+                    block.number(),
+                    block.hash(),
+                    block.header.state_root,
+                    genesis.hash(),
+                ),
+                std::fs::File::create(&path).unwrap(),
+            )
+            .unwrap();
+        (format!("file://{}", path.display()), block.hash())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_start_checkpoint_imports_before_publishing_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let (url, expected_head) = checkpoint_fixture(dir.path(), &config);
+        let store = Arc::new(MemoryDb::new());
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            Some(&url),
+        )
+        .await
+        .unwrap();
+        let chain = ChainStore::new(store);
+        assert_eq!(chain.get_head_hash().unwrap(), Some(expected_head));
+        assert_eq!(chain.get_head_block().unwrap().unwrap().number(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_start_checkpoint_failure_leaves_no_canonical_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let invalid = dir.path().join("invalid-snapshot.jsonl");
+        std::fs::write(&invalid, "not a snapshot").unwrap();
+        let url = format!("file://{}", invalid.display());
+        let store = Arc::new(MemoryDb::new());
+        let result = initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            Some(&url),
+        )
+        .await;
+        assert!(result.is_err(), "invalid checkpoint must fail startup");
+        let chain = ChainStore::new(Arc::clone(&store));
+        assert!(chain.get_head_hash().unwrap().is_none());
+        let (url, expected_head) = checkpoint_fixture(dir.path(), &config);
+        initialize_chain(store, &config, dir.path(), config.chain_id, Some(&url))
+            .await
+            .unwrap();
+        assert_eq!(chain.get_head_hash().unwrap(), Some(expected_head));
+        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("checkpoint_snapshot-")));
+    }
+
+    #[tokio::test]
+    async fn first_start_without_checkpoint_initializes_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let store = Arc::new(MemoryDb::new());
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = ChainStore::new(store).get_head_block().unwrap().unwrap();
+        assert_eq!(head.number(), 0);
+        let expected = initialize_genesis(&config, Arc::new(MemoryDb::new())).unwrap();
+        assert_eq!(head.hash(), expected.hash());
+    }
+
+    #[tokio::test]
+    async fn first_start_checkpoint_does_not_replace_an_existing_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        for height in [0, 1] {
+            let store = Arc::new(MemoryDb::new());
+            let genesis = initialize_genesis(&config, Arc::clone(&store)).unwrap();
+            let chain = ChainStore::new(Arc::clone(&store));
+            if height > 0 {
+                chain
+                    .commit_canonical_block(
+                        &test_block(height, genesis.hash(), genesis.header.state_root),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            initialize_chain(
+                store.clone(),
+                &config,
+                dir.path(),
+                config.chain_id,
+                Some("invalid-checkpoint-url"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_start_checkpoint_rejects_a_different_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let other = test_genesis(Address::from([8u8; 20]));
+        let (url, _) = checkpoint_fixture(dir.path(), &other);
+        let store = Arc::new(MemoryDb::new());
+        let result = initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            Some(&url),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("genesis hash mismatch"));
+        let chain = ChainStore::new(store);
+        assert!(chain.get_head_hash().unwrap().is_none());
+        let trusted = initialize_genesis(&config, Arc::new(MemoryDb::new())).unwrap();
+        assert_eq!(
+            chain.get_chain_config().unwrap().unwrap().genesis_hash,
+            trusted.hash()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_start_checkpoint_preserves_conflicting_stored_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(Arc::clone(&store));
+        let existing = ChainConfig {
+            chain_id: config.chain_id,
+            genesis_hash: ShellHash::from([0xAB; 32]),
+        };
+        chain.put_chain_config(&existing).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let result = initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            Some("invalid-checkpoint-url"),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("stored chain config"));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn first_start_checkpoint_rejects_a_different_chain_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let store = Arc::new(MemoryDb::new());
+        let result = initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            42,
+            Some("invalid-checkpoint-url"),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("chain ID"));
+        assert!(store.scan_prefix(b"").unwrap().is_empty());
     }
 
     #[test]

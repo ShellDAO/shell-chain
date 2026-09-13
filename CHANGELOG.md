@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Import first-start checkpoints before publishing a genesis head, and stream
+  downloads into the snapshot file while preserving local genesis validation.
 - Persist or reuse the default genesis authority key during `init` so a subsequent
   `run` uses the authorized identity and can produce blocks.
 - Refuse Unix `removedb --force` while another process holds the database lock.

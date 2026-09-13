@@ -68,7 +68,7 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--bootnodes <MULTIADDRS>` | — | Comma-separated bootstrap peer multiaddrs |
 | `--enable-mdns` | `false` | Enable mDNS local peer discovery (disable in cloud) |
 | `--pruning <N>` | `0` | Retain last N state roots (0 = archive, keep all) |
-| `--checkpoint-url <URL>` | — | Download snapshot from URL on first start |
+| `--checkpoint-url <URL>` | — | Import a snapshot before genesis initialization when the database has no canonical head |
 | `--rpc-cors <ORIGINS>` | — | CORS allowed origins (comma-separated, `*` for all) |
 | `--rpc-rate-limit <N>` | — | RPC rate limit requests/second per bearer token or public bucket |
 | `--rpc-api <NAMESPACES>` | all | Enabled namespaces: `eth,net,web3,shell,evm,debug,trace` |
@@ -88,6 +88,12 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--body-retention <N>` | profile default | Override TX body retention (0 = keep forever) |
 | `--enable-stark-aggregation` | `false` | Enable local STARK aggregate proof generation. Expensive; use only on prover or validator-prover nodes. |
 | `--consensus-engine <ENGINE>` | `poa` | Consensus engine: `poa` or `wpoa` |
+
+For checkpoint sync, initialize the local configuration with the intended
+network's trusted genesis before the first run. The snapshot must match that
+genesis and the selected chain ID. An existing canonical head, including a
+genesis-only database, causes checkpoint sync to be skipped. A failed download
+or validation does not publish a head, so the same database can retry the import.
 
 **Network Profile Defaults:**
 
