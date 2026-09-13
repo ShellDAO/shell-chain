@@ -93,7 +93,11 @@ pub fn resolve_password(
 /// Falls through to a single-prompt for non-interactive sources (file / stdin),
 /// because confirmation doesn't make sense when the password is already written.
 pub fn resolve_new_password(args: &PasswordArgs) -> Result<String, Box<dyn std::error::Error>> {
-    if args.password_file.is_some() || args.password_stdin || args.allow_env_password {
+    if args.password_file.is_some()
+        || args.password_stdin
+        || (args.allow_env_password
+            && std::env::var("SHELL_KEYSTORE_PASSWORD").is_ok_and(|password| !password.is_empty()))
+    {
         return resolve_password("", args);
     }
 
