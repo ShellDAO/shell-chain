@@ -93,7 +93,7 @@ pub struct RunArgs {
 
 /// Maximum genesis file size: 10 MB (F-082).
 const MAX_GENESIS_FILE_SIZE: u64 = 10 * 1024 * 1024;
-const DEV_AUTHORITY_KEY_FILE: &str = "dev-authority.json";
+pub(super) const DEV_AUTHORITY_KEY_FILE: &str = "dev-authority.json";
 const DEV_AUTHORITY_INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000_000_000_000u128;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,7 +143,9 @@ fn load_dev_signer(path: &Path) -> Result<DilithiumSigner, Box<dyn std::error::E
     decode_dev_signer(&read_sensitive_file(path)?)
 }
 
-fn load_or_create_dev_signer(path: &Path) -> Result<DilithiumSigner, Box<dyn std::error::Error>> {
+pub(super) fn load_or_create_dev_signer(
+    path: &Path,
+) -> Result<DilithiumSigner, Box<dyn std::error::Error>> {
     match read_sensitive_file(path) {
         Ok(json) => {
             let signer = decode_dev_signer(&json)?;
