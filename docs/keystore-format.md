@@ -268,27 +268,27 @@ The SDK and CLI are **fully cross-compatible** since shell-chain v0.21.0 / shell
 
 ## 12. Migration from Pre-v1 (sk+pk) Format
 
-Before F-TESTNET-FIXES (v0.20.0), the SDK `encryptKeystore()` stored `sk ‖ pk` in the
-ciphertext. This format is **not supported** by shell-chain v0.21.0+ / shell-sdk v0.7.0+.
-
-If you have keystores produced by `shell-sdk < 0.7.0`, re-encrypt them:
-
-```bash
-# 1. Decrypt with old SDK → extract sk
-# 2. Re-encrypt with current shell-node
-echo "old-password" | shell-node --password-stdin key generate \
-    --algorithm dilithium3 \
-    --output new-keystore.json
-# (then manually import your existing key material)
-```
-
-Or use the `shell-node key migrate` subcommand (v0.21.0+):
+Older SDK keystores stored `sk ‖ pk` in the authenticated ciphertext. Normal
+node and SDK decryption accepts only the current `sk` payload. Use the explicit
+migration command to preserve the existing key and rewrite its container:
 
 ```bash
 shell-node --password-file /run/secrets/pw key migrate \
     --input old-keystore.json \
     --output new-keystore.json
 ```
+
+Migration accepts both current secret-key-only payloads and legacy payloads whose
+appended public key exactly matches the `public_key` field. It retains the declared
+signature algorithm and the original private and public keys, derives the canonical
+address, and encrypts with the same password using a fresh salt and nonce. It does
+not convert keys between signature algorithms or generate a replacement account.
+The output must be a new file; the input is preserved.
+
+Legacy migration permits up to 12,288 ciphertext hex characters while retaining
+the existing version, cipher, salt, nonce, public-key and Argon2id limits. Normal
+decryption retains its 8,192-character ciphertext limit. HD seed keystores are not
+signer keystores and are not accepted by this command.
 
 ---
 

@@ -6,7 +6,7 @@ use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
 
-use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer, SphincsSigner};
+use shell_crypto::{CryptoError, DilithiumSigner, MlDsaSigner, Signer, SphincsSigner};
 use shell_primitives::Address;
 
 use crate::types::{
@@ -19,6 +19,7 @@ const MAX_SALT_HEX_LEN: usize = 64;
 const NONCE_HEX_LEN: usize = 48;
 const MAX_CIPHERTEXT_HEX_LEN: usize = 8_192;
 const MAX_PUBLIC_KEY_HEX_LEN: usize = 4_096;
+const MAX_MIGRATION_CIPHERTEXT_HEX_LEN: usize = MAX_CIPHERTEXT_HEX_LEN + MAX_PUBLIC_KEY_HEX_LEN;
 
 /// Encrypt a Dilithium3 signer with a password.
 ///
@@ -74,7 +75,7 @@ pub fn decrypt(
     encrypted: &EncryptedKey,
     password: &[u8],
 ) -> Result<DilithiumSigner, KeystoreError> {
-    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password, MAX_CIPHERTEXT_HEX_LEN)?;
     let signer = DilithiumSigner::from_bytes(&public_key, &secret_key)?;
     Ok(signer)
 }
@@ -134,7 +135,7 @@ pub fn decrypt_mldsa(
         )));
     }
 
-    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password, MAX_CIPHERTEXT_HEX_LEN)?;
     let signer = MlDsaSigner::from_bytes(&public_key, &secret_key)?;
     Ok(signer)
 }
@@ -157,12 +158,70 @@ pub fn decrypt_any(
     }
 }
 
+/// Re-encrypt a signer keystore in the canonical secret-key-only format.
+///
+/// Unlike normal decryption, this explicit migration accepts legacy payloads
+/// containing `secret_key || public_key`. The authenticated public-key suffix
+/// must match the public metadata. The algorithm and key material are preserved;
+/// the address, salt, nonce and encryption parameters are regenerated.
+pub fn migrate_keystore(
+    encrypted: &EncryptedKey,
+    password: &[u8],
+) -> Result<EncryptedKey, KeystoreError> {
+    if !matches!(
+        encrypted.key_type.as_str(),
+        "dilithium3" | "" | "mldsa65" | "sphincs-sha2-256f"
+    ) {
+        return Err(KeystoreError::InvalidKey(format!(
+            "unsupported key_type: {}",
+            encrypted.key_type
+        )));
+    }
+    let (secret_key, public_key) =
+        raw_decrypt(encrypted, password, MAX_MIGRATION_CIPHERTEXT_HEX_LEN)?;
+    match encrypted.key_type.as_str() {
+        "mldsa65" => encrypt_mldsa(
+            &migration_signer(&secret_key, &public_key, MlDsaSigner::from_bytes)?,
+            password,
+        ),
+        "sphincs-sha2-256f" => encrypt_sphincs(
+            &migration_signer(&secret_key, &public_key, SphincsSigner::from_bytes)?,
+            password,
+        ),
+        _ => encrypt(
+            &migration_signer(&secret_key, &public_key, DilithiumSigner::from_bytes)?,
+            password,
+        ),
+    }
+}
+
+fn migration_signer<T>(
+    plaintext: &[u8],
+    public_key: &[u8],
+    from_bytes: impl Fn(&[u8], &[u8]) -> Result<T, CryptoError>,
+) -> Result<T, KeystoreError> {
+    match from_bytes(public_key, plaintext) {
+        Err(CryptoError::InvalidSecretKeyLength { expected, got })
+            if got == expected + public_key.len() =>
+        {
+            if &plaintext[expected..] != public_key {
+                return Err(KeystoreError::InvalidKey(
+                    "legacy payload public key does not match public_key".into(),
+                ));
+            }
+            from_bytes(public_key, &plaintext[..expected]).map_err(Into::into)
+        }
+        result => result.map_err(Into::into),
+    }
+}
+
 /// Internal helper: derive key + decrypt ciphertext, returning (secret_key, public_key).
 fn raw_decrypt(
     encrypted: &EncryptedKey,
     password: &[u8],
+    max_ciphertext_hex_len: usize,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), KeystoreError> {
-    validate_keystore_metadata(encrypted)?;
+    validate_keystore_metadata(encrypted, max_ciphertext_hex_len)?;
 
     let salt = hex::decode(&encrypted.kdf_params.salt)
         .map_err(|e| KeystoreError::InvalidKey(format!("bad salt hex: {e}")))?;
@@ -233,7 +292,10 @@ fn validate_kdf_params(params: &KdfParams) -> Result<(), KeystoreError> {
     Ok(())
 }
 
-fn validate_keystore_metadata(encrypted: &EncryptedKey) -> Result<(), KeystoreError> {
+fn validate_keystore_metadata(
+    encrypted: &EncryptedKey,
+    max_ciphertext_hex_len: usize,
+) -> Result<(), KeystoreError> {
     if encrypted.version != 1 {
         return Err(KeystoreError::InvalidKey(format!(
             "unsupported keystore version: {}",
@@ -264,7 +326,7 @@ fn validate_keystore_metadata(encrypted: &EncryptedKey) -> Result<(), KeystoreEr
             "nonce must be {NONCE_HEX_LEN} hex characters"
         )));
     }
-    if encrypted.ciphertext.len() > MAX_CIPHERTEXT_HEX_LEN {
+    if encrypted.ciphertext.len() > max_ciphertext_hex_len {
         return Err(KeystoreError::InvalidKey("ciphertext is too large".into()));
     }
     if encrypted.public_key.len() > MAX_PUBLIC_KEY_HEX_LEN {
@@ -334,7 +396,7 @@ pub fn decrypt_sphincs(
         )));
     }
 
-    let (secret_key, public_key) = raw_decrypt(encrypted, password)?;
+    let (secret_key, public_key) = raw_decrypt(encrypted, password, MAX_CIPHERTEXT_HEX_LEN)?;
     let signer = SphincsSigner::from_bytes(&public_key, &secret_key)?;
     Ok(signer)
 }
@@ -394,7 +456,7 @@ pub fn decrypt_hd_seed(
             encrypted.key_type
         )));
     }
-    validate_keystore_metadata(encrypted)?;
+    validate_keystore_metadata(encrypted, MAX_CIPHERTEXT_HEX_LEN)?;
 
     let salt = hex::decode(&encrypted.kdf_params.salt)
         .map_err(|e| KeystoreError::InvalidKey(format!("bad salt hex: {e}")))?;
@@ -429,6 +491,153 @@ pub fn decrypt_hd_seed(
 mod tests {
     use super::*;
     use shell_crypto::Signer;
+
+    fn migration_fixture(key_type: &str, plaintext: &[u8], public_key: &[u8]) -> EncryptedKey {
+        let salt = rand::random::<[u8; 32]>();
+        let nonce = rand::random::<[u8; 24]>();
+        let kdf_params = KdfParams {
+            m_cost: 8,
+            t_cost: 1,
+            p_cost: 1,
+            salt: hex::encode(salt),
+        };
+        let key = Zeroizing::new(derive_key(b"migration-test", &salt, &kdf_params).unwrap());
+        let ciphertext = XChaCha20Poly1305::new((&*key).into())
+            .encrypt((&nonce).into(), plaintext)
+            .unwrap();
+        EncryptedKey {
+            version: 1,
+            address: "legacy-address".into(),
+            key_type: key_type.into(),
+            kdf: "argon2id".into(),
+            kdf_params,
+            cipher: "xchacha20-poly1305".into(),
+            cipher_params: CipherParams {
+                nonce: hex::encode(nonce),
+            },
+            ciphertext: hex::encode(ciphertext),
+            public_key: hex::encode(public_key),
+        }
+    }
+
+    fn assert_legacy_migration(signer: &dyn Signer, secret_key: &[u8], key_type: &str) {
+        let mut plaintext = Zeroizing::new(secret_key.to_vec());
+        plaintext.extend_from_slice(signer.public_key());
+        let legacy = migration_fixture(key_type, &plaintext, signer.public_key());
+        assert!(decrypt_any(&legacy, b"migration-test").is_err());
+
+        let migrated = migrate_keystore(&legacy, b"migration-test").unwrap();
+        assert_eq!(migrated.ciphertext.len(), (secret_key.len() + 16) * 2);
+        assert_eq!(migrated.key_type, key_type);
+        assert_eq!(migrated.public_key, legacy.public_key);
+        assert_eq!(
+            migrated.address,
+            Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()).to_string()
+        );
+        assert_ne!(migrated.kdf_params.salt, legacy.kdf_params.salt);
+        assert_ne!(migrated.cipher_params.nonce, legacy.cipher_params.nonce);
+        let (recovered_secret, _) =
+            raw_decrypt(&migrated, b"migration-test", MAX_CIPHERTEXT_HEX_LEN).unwrap();
+        assert_eq!(recovered_secret.as_slice(), secret_key);
+        let recovered = decrypt_any(&migrated, b"migration-test").unwrap();
+        assert_eq!(recovered.sig_type(), signer.sig_type());
+        let message = b"migration preserves signing identity";
+        let signature = recovered.sign(message).unwrap();
+        assert!(shell_crypto::verify_signature(
+            signer.sig_type(),
+            signer.public_key(),
+            message,
+            &signature.data
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn migration_preserves_legacy_dilithium_keys() {
+        let signer = DilithiumSigner::generate();
+        assert_legacy_migration(&signer, signer.secret_key_bytes(), "dilithium3");
+    }
+
+    #[test]
+    fn migration_preserves_legacy_mldsa_keys() {
+        let signer = MlDsaSigner::generate();
+        assert_legacy_migration(&signer, signer.secret_key_bytes(), "mldsa65");
+    }
+
+    #[test]
+    fn migration_preserves_legacy_sphincs_keys() {
+        let signer = SphincsSigner::generate();
+        assert_legacy_migration(&signer, signer.secret_key_bytes(), "sphincs-sha2-256f");
+    }
+
+    #[test]
+    fn migration_keeps_canonical_payload_and_updates_legacy_address() {
+        let signer = DilithiumSigner::generate();
+        let original = migration_fixture("", signer.secret_key_bytes(), signer.public_key());
+        let migrated = migrate_keystore(&original, b"migration-test").unwrap();
+        assert_eq!(migrated.key_type, "dilithium3");
+        assert_eq!(migrated.public_key, original.public_key);
+        assert_eq!(
+            migrated.address,
+            Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()).to_string()
+        );
+        assert_eq!(
+            decrypt(&migrated, b"migration-test")
+                .unwrap()
+                .secret_key_bytes()
+                .as_slice(),
+            signer.secret_key_bytes().as_slice()
+        );
+    }
+
+    #[test]
+    fn migration_rejects_malformed_or_mismatched_legacy_payloads() {
+        let signer = MlDsaSigner::generate();
+        let mut plaintext = Zeroizing::new(signer.secret_key_bytes().to_vec());
+        plaintext.extend_from_slice(signer.public_key());
+        let mut legacy = migration_fixture("mldsa65", &plaintext, signer.public_key());
+        assert!(matches!(
+            migrate_keystore(&legacy, b"wrong-password"),
+            Err(KeystoreError::Decryption)
+        ));
+        let other = MlDsaSigner::generate();
+        legacy.public_key = hex::encode(other.public_key());
+        assert!(matches!(
+            migrate_keystore(&legacy, b"migration-test"),
+            Err(KeystoreError::InvalidKey(message)) if message.contains("public key does not match")
+        ));
+        plaintext.push(0);
+        let legacy = migration_fixture("mldsa65", &plaintext, signer.public_key());
+        assert!(matches!(
+            migrate_keystore(&legacy, b"migration-test"),
+            Err(KeystoreError::Crypto(
+                CryptoError::InvalidSecretKeyLength { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn migration_preserves_envelope_and_work_limits() {
+        let signer = MlDsaSigner::generate();
+        let mut legacy =
+            migration_fixture("mldsa65", signer.secret_key_bytes(), signer.public_key());
+        legacy.ciphertext = "0".repeat(MAX_MIGRATION_CIPHERTEXT_HEX_LEN + 2);
+        assert!(matches!(
+            migrate_keystore(&legacy, b"migration-test"),
+            Err(KeystoreError::InvalidKey(message)) if message.contains("ciphertext is too large")
+        ));
+        legacy.ciphertext.clear();
+        legacy.kdf_params.m_cost = MAX_KDF_MEMORY_KIB + 1;
+        assert!(matches!(
+            migrate_keystore(&legacy, b"migration-test"),
+            Err(KeystoreError::InvalidKey(message)) if message.contains("memory cost")
+        ));
+        legacy.key_type = "hd-seed".into();
+        assert!(matches!(
+            migrate_keystore(&legacy, b"migration-test"),
+            Err(KeystoreError::InvalidKey(message)) if message.contains("unsupported key_type")
+        ));
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -604,21 +813,21 @@ mod tests {
             public_key: String::new(),
         };
         assert!(matches!(
-            validate_keystore_metadata(&encrypted),
+            validate_keystore_metadata(&encrypted, MAX_CIPHERTEXT_HEX_LEN),
             Err(KeystoreError::InvalidKey(_))
         ));
 
         encrypted.version = 1;
         encrypted.kdf = "unknown".into();
         assert!(matches!(
-            validate_keystore_metadata(&encrypted),
+            validate_keystore_metadata(&encrypted, MAX_CIPHERTEXT_HEX_LEN),
             Err(KeystoreError::InvalidKey(_))
         ));
 
         encrypted.kdf = "argon2id".into();
         encrypted.cipher = "unknown".into();
         assert!(matches!(
-            validate_keystore_metadata(&encrypted),
+            validate_keystore_metadata(&encrypted, MAX_CIPHERTEXT_HEX_LEN),
             Err(KeystoreError::InvalidKey(_))
         ));
     }
@@ -643,7 +852,7 @@ mod tests {
         };
 
         assert!(matches!(
-            validate_keystore_metadata(&encrypted),
+            validate_keystore_metadata(&encrypted, MAX_CIPHERTEXT_HEX_LEN),
             Err(KeystoreError::InvalidKey(_))
         ));
     }
