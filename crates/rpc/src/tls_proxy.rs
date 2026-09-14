@@ -10,11 +10,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct TlsProxyHandle {
     pub public_addr: SocketAddr,
@@ -69,14 +72,20 @@ pub async fn start_tls_proxy(
                             let acceptor = acceptor.clone();
                             connections.spawn(async move {
                                 let _permit = permit;
-                                match acceptor.accept(tcp_stream).await {
-                                    Ok(tls_stream) => {
+                                match tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(tcp_stream),
+                                ).await {
+                                    Ok(Ok(tls_stream)) => {
                                         if let Err(e) = forward_connection(tls_stream, backend_addr).await {
                                             debug!("TLS proxy forward error from {peer_addr}: {e}");
                                         }
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         warn!("TLS handshake error from {peer_addr}: {e}");
+                                    }
+                                    Err(_) => {
+                                        debug!("TLS handshake timed out from {peer_addr}");
                                     }
                                 }
                             });
@@ -169,10 +178,7 @@ mod tests {
         assert_listener_released(proxy.public_addr).await;
     }
 
-    #[tokio::test]
-    async fn stopping_proxy_closes_forwarded_connections() {
-        use tokio::io::AsyncReadExt;
-
+    fn tls_configs() -> (Arc<rustls::ServerConfig>, tokio_rustls::TlsConnector) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -192,7 +198,72 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let server_config = Arc::new(server_config);
+        (Arc::new(server_config), connector)
+    }
+
+    #[tokio::test]
+    async fn stalled_handshake_expires_without_closing_forwarded_connections() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let (server_config, connector) = tls_configs();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = start_tls_proxy(
+            "127.0.0.1:0".parse().unwrap(),
+            backend.local_addr().unwrap(),
+            server_config,
+            2,
+        )
+        .await
+        .unwrap();
+        let (mut active, mut forwarded) = tokio::time::timeout(Duration::from_secs(2), async {
+            let tcp = TcpStream::connect(proxy.public_addr).await.unwrap();
+            let active = connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+                .unwrap();
+            let (forwarded, _) = backend.accept().await.unwrap();
+            (active, forwarded)
+        })
+        .await
+        .unwrap();
+        let mut stalled = TcpStream::connect(proxy.public_addr).await.unwrap();
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT + Duration::from_secs(2),
+            stalled.read(&mut byte),
+        )
+        .await
+        .expect("idle TLS handshake retained its connection slot")
+        .unwrap();
+        assert_eq!(read, 0);
+
+        // The handshake deadline must not expire an established connection.
+        active.write_all(b"ping").await.unwrap();
+        let mut ping = [0; 4];
+        tokio::time::timeout(Duration::from_secs(2), forwarded.read_exact(&mut ping))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ping, b"ping");
+
+        // A fresh handshake can use the slot released by the idle connection.
+        let _replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            let tcp = TcpStream::connect(proxy.public_addr).await.unwrap();
+            connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("expired handshake did not release connection capacity");
+    }
+
+    #[tokio::test]
+    async fn stopping_proxy_closes_forwarded_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let (server_config, connector) = tls_configs();
 
         for drop_handle in [false, true] {
             let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
