@@ -492,7 +492,12 @@ mod tests {
     use super::*;
     use shell_crypto::Signer;
 
-    fn migration_fixture(key_type: &str, plaintext: &[u8], public_key: &[u8]) -> EncryptedKey {
+    fn migration_fixture(
+        key_type: &str,
+        plaintext: &[u8],
+        public_key: &[u8],
+        password: &[u8],
+    ) -> EncryptedKey {
         let salt = rand::random::<[u8; 32]>();
         let nonce = rand::random::<[u8; 24]>();
         let kdf_params = KdfParams {
@@ -501,7 +506,7 @@ mod tests {
             p_cost: 1,
             salt: hex::encode(salt),
         };
-        let key = Zeroizing::new(derive_key(b"migration-test", &salt, &kdf_params).unwrap());
+        let key = Zeroizing::new(derive_key(password, &salt, &kdf_params).unwrap());
         let ciphertext = XChaCha20Poly1305::new((&*key).into())
             .encrypt((&nonce).into(), plaintext)
             .unwrap();
@@ -521,12 +526,13 @@ mod tests {
     }
 
     fn assert_legacy_migration(signer: &dyn Signer, secret_key: &[u8], key_type: &str) {
+        let password = rand::random::<[u8; 32]>();
         let mut plaintext = Zeroizing::new(secret_key.to_vec());
         plaintext.extend_from_slice(signer.public_key());
-        let legacy = migration_fixture(key_type, &plaintext, signer.public_key());
-        assert!(decrypt_any(&legacy, b"migration-test").is_err());
+        let legacy = migration_fixture(key_type, &plaintext, signer.public_key(), &password);
+        assert!(decrypt_any(&legacy, &password).is_err());
 
-        let migrated = migrate_keystore(&legacy, b"migration-test").unwrap();
+        let migrated = migrate_keystore(&legacy, &password).unwrap();
         assert_eq!(migrated.ciphertext.len(), (secret_key.len() + 16) * 2);
         assert_eq!(migrated.key_type, key_type);
         assert_eq!(migrated.public_key, legacy.public_key);
@@ -537,9 +543,9 @@ mod tests {
         assert_ne!(migrated.kdf_params.salt, legacy.kdf_params.salt);
         assert_ne!(migrated.cipher_params.nonce, legacy.cipher_params.nonce);
         let (recovered_secret, _) =
-            raw_decrypt(&migrated, b"migration-test", MAX_CIPHERTEXT_HEX_LEN).unwrap();
+            raw_decrypt(&migrated, &password, MAX_CIPHERTEXT_HEX_LEN).unwrap();
         assert_eq!(recovered_secret.as_slice(), secret_key);
-        let recovered = decrypt_any(&migrated, b"migration-test").unwrap();
+        let recovered = decrypt_any(&migrated, &password).unwrap();
         assert_eq!(recovered.sig_type(), signer.sig_type());
         let message = b"migration preserves signing identity";
         let signature = recovered.sign(message).unwrap();
@@ -572,9 +578,15 @@ mod tests {
 
     #[test]
     fn migration_keeps_canonical_payload_and_updates_legacy_address() {
+        let password = rand::random::<[u8; 32]>();
         let signer = DilithiumSigner::generate();
-        let original = migration_fixture("", signer.secret_key_bytes(), signer.public_key());
-        let migrated = migrate_keystore(&original, b"migration-test").unwrap();
+        let original = migration_fixture(
+            "",
+            signer.secret_key_bytes(),
+            signer.public_key(),
+            &password,
+        );
+        let migrated = migrate_keystore(&original, &password).unwrap();
         assert_eq!(migrated.key_type, "dilithium3");
         assert_eq!(migrated.public_key, original.public_key);
         assert_eq!(
@@ -582,7 +594,7 @@ mod tests {
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()).to_string()
         );
         assert_eq!(
-            decrypt(&migrated, b"migration-test")
+            decrypt(&migrated, &password)
                 .unwrap()
                 .secret_key_bytes()
                 .as_slice(),
@@ -592,24 +604,27 @@ mod tests {
 
     #[test]
     fn migration_rejects_malformed_or_mismatched_legacy_payloads() {
+        let password = rand::random::<[u8; 32]>();
         let signer = MlDsaSigner::generate();
         let mut plaintext = Zeroizing::new(signer.secret_key_bytes().to_vec());
         plaintext.extend_from_slice(signer.public_key());
-        let mut legacy = migration_fixture("mldsa65", &plaintext, signer.public_key());
+        let mut legacy = migration_fixture("mldsa65", &plaintext, signer.public_key(), &password);
+        let mut wrong_password = password;
+        wrong_password[0] ^= 1;
         assert!(matches!(
-            migrate_keystore(&legacy, b"wrong-password"),
+            migrate_keystore(&legacy, &wrong_password),
             Err(KeystoreError::Decryption)
         ));
         let other = MlDsaSigner::generate();
         legacy.public_key = hex::encode(other.public_key());
         assert!(matches!(
-            migrate_keystore(&legacy, b"migration-test"),
+            migrate_keystore(&legacy, &password),
             Err(KeystoreError::InvalidKey(message)) if message.contains("public key does not match")
         ));
         plaintext.push(0);
-        let legacy = migration_fixture("mldsa65", &plaintext, signer.public_key());
+        let legacy = migration_fixture("mldsa65", &plaintext, signer.public_key(), &password);
         assert!(matches!(
-            migrate_keystore(&legacy, b"migration-test"),
+            migrate_keystore(&legacy, &password),
             Err(KeystoreError::Crypto(
                 CryptoError::InvalidSecretKeyLength { .. }
             ))
@@ -618,23 +633,28 @@ mod tests {
 
     #[test]
     fn migration_preserves_envelope_and_work_limits() {
+        let password = rand::random::<[u8; 32]>();
         let signer = MlDsaSigner::generate();
-        let mut legacy =
-            migration_fixture("mldsa65", signer.secret_key_bytes(), signer.public_key());
+        let mut legacy = migration_fixture(
+            "mldsa65",
+            signer.secret_key_bytes(),
+            signer.public_key(),
+            &password,
+        );
         legacy.ciphertext = "0".repeat(MAX_MIGRATION_CIPHERTEXT_HEX_LEN + 2);
         assert!(matches!(
-            migrate_keystore(&legacy, b"migration-test"),
+            migrate_keystore(&legacy, &password),
             Err(KeystoreError::InvalidKey(message)) if message.contains("ciphertext is too large")
         ));
         legacy.ciphertext.clear();
         legacy.kdf_params.m_cost = MAX_KDF_MEMORY_KIB + 1;
         assert!(matches!(
-            migrate_keystore(&legacy, b"migration-test"),
+            migrate_keystore(&legacy, &password),
             Err(KeystoreError::InvalidKey(message)) if message.contains("memory cost")
         ));
         legacy.key_type = "hd-seed".into();
         assert!(matches!(
-            migrate_keystore(&legacy, b"migration-test"),
+            migrate_keystore(&legacy, &password),
             Err(KeystoreError::InvalidKey(message)) if message.contains("unsupported key_type")
         ));
     }
