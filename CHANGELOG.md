@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore explicit `key migrate` support for legacy secret-key-plus-public-key
+  payloads, preserving signing identity and normal decryption limits.
+
 - Close RPC TLS handshakes that do not finish within ten seconds, releasing
   connection capacity while preserving established HTTP and WebSocket streams.
 - Do not attribute unknown proof challenge hashes to an unrelated block proposer

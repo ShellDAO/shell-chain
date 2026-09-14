@@ -3,9 +3,7 @@
 use std::path::PathBuf;
 
 use shell_crypto::{DilithiumSigner, MlDsaSigner, SignatureType, Signer};
-use shell_keystore::{
-    decrypt, decrypt_mldsa, decrypt_sphincs, encrypt, encrypt_mldsa, encrypt_sphincs, EncryptedKey,
-};
+use shell_keystore::{encrypt, encrypt_mldsa, migrate_keystore, EncryptedKey};
 use shell_primitives::Address;
 
 use tracing::info;
@@ -123,24 +121,8 @@ pub fn key_migrate(
 
     // Re-encrypt using the canonical v1 sk-only format + 0x address (same password).
     info!("Re-encrypting in v1 sk-only format with 0x address...");
-    let new_encrypted = match key_type.as_str() {
-        "mldsa65" => {
-            let signer = decrypt_mldsa(&encrypted, password.as_bytes())
-                .map_err(|e| format!("decryption failed: {e}"))?;
-            encrypt_mldsa(&signer, password.as_bytes())?
-        }
-        "sphincs-sha2-256f" => {
-            let signer = decrypt_sphincs(&encrypted, password.as_bytes())
-                .map_err(|e| format!("decryption failed: {e}"))?;
-            encrypt_sphincs(&signer, password.as_bytes())?
-        }
-        "dilithium3" | "" => {
-            let signer = decrypt(&encrypted, password.as_bytes())
-                .map_err(|e| format!("decryption failed: {e}"))?;
-            encrypt(&signer, password.as_bytes())?
-        }
-        other => return Err(format!("unsupported keystore algorithm: {other}").into()),
-    };
+    let new_encrypted = migrate_keystore(&encrypted, password.as_bytes())
+        .map_err(|e| format!("keystore migration failed: {e}"))?;
 
     let new_json = serde_json::to_string_pretty(&new_encrypted)?;
     write_sensitive_file_new(&output, &new_json)?;
