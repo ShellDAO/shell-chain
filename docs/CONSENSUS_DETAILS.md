@@ -307,7 +307,10 @@ Challenges are tracked in-process with the following status machine:
 | `Resolved` | a valid response was received before timeout | `ChallengeResponse` verifies successfully |
 | `Slashed` | the prover failed to answer within the timeout | automatic at `T_c = 7200` blocks |
 
-A timed-out challenge slashes the prover responsible for the amendment unless the prover could not be identified from the amendment/block context.
+A timed-out challenge slashes the prover responsible for the amendment unless
+the prover could not be identified from a stored amendment or block matching the
+challenged hash. The challenge's block number is only a logging and routing hint;
+it does not identify a prover when that hash is unknown.
 
 ### Challenge flow
 

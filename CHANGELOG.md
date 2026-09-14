@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Do not attribute unknown proof challenge hashes to an unrelated block proposer
+  using the challenge's claimed height when applying timeout penalties.
 - Import first-start checkpoints before publishing a genesis head, and stream
   downloads into the snapshot file while preserving local genesis validation.
 - Persist or reuse the default genesis authority key during `init` so a subsequent

@@ -266,12 +266,8 @@ impl NodeTaskLifecycle {
 }
 
 impl<S: KvStore + 'static> Node<S> {
-    fn track_open_challenge(
-        &self,
-        challenge_id: ShellHash,
-        block_number: u64,
-        challenger: Address,
-    ) {
+    fn track_open_challenge(&self, challenge_id: ShellHash, challenger: Address) {
+        // A peer-supplied height cannot identify the prover of a different hash.
         let prover = self
             .amendment_store
             .get_amendment(&challenge_id)
@@ -285,13 +281,6 @@ impl<S: KvStore + 'static> Node<S> {
             .or_else(|| {
                 self.chain_store
                     .get_block_by_hash(&challenge_id)
-                    .ok()
-                    .flatten()
-                    .map(|block| block.header.proposer)
-            })
-            .or_else(|| {
-                self.chain_store
-                    .get_block_by_number(block_number)
                     .ok()
                     .flatten()
                     .map(|block| block.header.proposer)
@@ -1769,7 +1758,6 @@ impl<S: KvStore + 'static> Node<S> {
                                     debug!(%peer, block = challenge.block_number, reason = %challenge.reason, "I2: received ProofChallenge");
                                     self.track_open_challenge(
                                         challenge.block_hash,
-                                        challenge.block_number,
                                         challenge.challenger,
                                     );
                                     if let Ok(Some(proof_bytes)) = self.amendment_store.get_amendment(&challenge.block_hash) {
@@ -2952,6 +2940,107 @@ fn track_body_response_sequence(
         if block_number >= expected {
             *expected_next = block_number.checked_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use super::*;
+    use shell_consensus::{PoaConfig, PoaEngine};
+    use shell_mempool::MempoolConfig;
+    use shell_storage::MemoryDb;
+
+    fn node_with_canonical_block() -> (Node<MemoryDb>, Block) {
+        let proposer = Address::from([0x11; 32]);
+        let db = Arc::new(MemoryDb::new());
+        let chain_store = Arc::new(ChainStore::new(db.clone()));
+        let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
+        let consensus = Arc::new(RwLock::new(PoaEngine::new(
+            PoaConfig::new(vec![proposer], 1).with_weights(vec![100]),
+        )));
+        let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+        let node = Node::new(
+            NodeConfig::dev(proposer),
+            db,
+            chain_store,
+            world_state,
+            tx_pool,
+            consensus,
+        );
+        let block = Block {
+            header: BlockHeader {
+                number: 1,
+                proposer,
+                ..BlockHeader::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        node.chain_store.put_block(&block).unwrap();
+        node.chain_store
+            .set_canonical(block.number(), &block.hash())
+            .unwrap();
+        (node, block)
+    }
+
+    #[test]
+    fn unknown_challenge_hash_does_not_slash_proposer_at_claimed_height() {
+        let (node, block) = node_with_canonical_block();
+        let unknown_hash = ShellHash::from([0x22; 32]);
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&unknown_hash)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            node.chain_store
+                .get_block_by_number(block.number())
+                .unwrap(),
+            Some(block.clone())
+        );
+        let weights = node.consensus.read().validator_weights();
+
+        node.track_open_challenge(unknown_hash, Address::from([0x33; 32]));
+        node.slash_timed_out_challenges(node.head_number() + CHALLENGE_TIMEOUT_BLOCKS);
+
+        assert_eq!(node.consensus.read().validator_weights(), weights);
+        assert_eq!(
+            node.challenge_lifecycle
+                .lock()
+                .get(&unknown_hash)
+                .unwrap()
+                .prover,
+            Address::ZERO
+        );
+    }
+
+    #[test]
+    fn known_challenge_hash_slashes_only_after_timeout() {
+        let (node, block) = node_with_canonical_block();
+        let weights = node.consensus.read().validator_weights();
+        node.track_open_challenge(block.hash(), Address::from([0x33; 32]));
+        assert_eq!(
+            node.challenge_lifecycle
+                .lock()
+                .get(&block.hash())
+                .unwrap()
+                .prover,
+            block.header.proposer
+        );
+
+        node.slash_timed_out_challenges(node.head_number() + CHALLENGE_TIMEOUT_BLOCKS - 1);
+        assert_eq!(node.consensus.read().validator_weights(), weights);
+        node.slash_timed_out_challenges(node.head_number() + CHALLENGE_TIMEOUT_BLOCKS);
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            90
+        );
+        node.slash_timed_out_challenges(node.head_number() + CHALLENGE_TIMEOUT_BLOCKS + 1);
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            90
+        );
     }
 }
 
