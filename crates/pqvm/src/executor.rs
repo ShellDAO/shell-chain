@@ -462,6 +462,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut last_revert_data: Vec<u8> = Vec::new();
 
         for inner in &bundle.inner_calls {
+            // Resolve every explicit account at the revm boundary using its
+            // full Shell address, including the inner fee beneficiary.
+            self.state_db.register_pq_address(sender);
+            self.state_db.register_pq_address(header.proposer);
+            if let Some(to) = inner.to {
+                self.state_db.register_pq_address(to);
+            }
             let kind = match &inner.to {
                 Some(addr) => TxKind::Call((*addr).into()),
                 None => TxKind::Create,
@@ -497,6 +504,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
             let exec_outcome = evm.transact(tx_env);
             drop(evm);
+            let address_registry = self.state_db.address_registry_snapshot();
+            // The local snapshot is enough for commit; clear live mappings
+            // before any revert or error can leave this inner call.
+            self.state_db.clear_address_registry();
 
             let result_and_state = match exec_outcome {
                 Ok(r) => r,
@@ -560,9 +571,8 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                                 )
                             })?
                     };
-                    // Build a minimal result for commit_pqvm_state; no PQ addresses in AA
-                    // inner calls (they use EVM-canonical addresses), no nonce advance here
-                    // as outer tx handles it.
+                    // Commit with this inner call's address mappings. The
+                    // outer bundle advances the sender nonce exactly once.
                     let inner_result = TxExecutionResult {
                         receipt: empty_receipt(),
                         state_changes: state,
@@ -573,7 +583,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         is_system_tx: false,
                         system_contract_effects: SystemContractEffects::default(),
                     };
-                    commit_pqvm_state(&inner_result, &mut self.state_db)?;
+                    let (world_state, chain_store) = self.state_db.world_state_and_chain_store();
+                    commit_pqvm_state_raw(
+                        &inner_result,
+                        world_state,
+                        chain_store,
+                        &address_registry,
+                    )?;
                 }
                 ExecutionResult::Revert { output, .. } => {
                     atomic_failure = true;
@@ -3720,9 +3736,9 @@ mod tests {
         use shell_primitives::Bytes as PBytes;
 
         let mut evm = setup_evm();
-        let sender = ShellAddress::from([0x42; 20]);
-        let dst1 = ShellAddress::from([0xAA; 20]);
-        let dst2 = ShellAddress::from([0xBB; 20]);
+        let sender = ShellAddress::from([0x42; 32]);
+        let dst1 = ShellAddress::from([0xAA; 32]);
+        let dst2 = ShellAddress::from([0xBB; 32]);
 
         fund_account(&mut evm, &sender, U256::from(10_000_000u64));
 
@@ -3742,13 +3758,30 @@ mod tests {
         ];
         let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
 
-        let header = sample_header();
+        let mut header = sample_header();
+        header.proposer = ShellAddress::from([0x99; 32]);
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
 
         assert_eq!(get_balance(&mut evm, &dst1), U256::from(1u64));
         assert_eq!(get_balance(&mut evm, &dst2), U256::from(1u64));
         assert_eq!(get_nonce(&mut evm, &sender), 1);
+        for recipient in [dst1, dst2] {
+            assert_eq!(
+                get_balance(&mut evm, &ShellAddress::from(recipient.to_alloy())),
+                U256::ZERO
+            );
+        }
         assert_eq!(res.receipt.status, 1);
+        assert!(evm.state_db().address_registry_snapshot().is_empty());
+        assert_eq!(
+            get_balance(&mut evm, &ShellAddress::from(sender.to_alloy())),
+            U256::ZERO
+        );
+        assert_eq!(
+            get_balance(&mut evm, &ShellAddress::from(header.proposer.to_alloy())),
+            U256::ZERO
+        );
+        assert!(get_balance(&mut evm, &header.proposer) > U256::ZERO);
         assert!(res.gas_used > 0, "gas_used should be non-zero");
     }
 
@@ -3834,9 +3867,9 @@ mod tests {
         use shell_primitives::Bytes as PBytes;
 
         let mut evm = setup_evm();
-        let sender = ShellAddress::from([0x42; 20]);
-        let dst1 = ShellAddress::from([0xAA; 20]);
-        let dst2 = ShellAddress::from([0xBB; 20]);
+        let sender = ShellAddress::from([0x42; 32]);
+        let dst1 = ShellAddress::from([0xAA; 32]);
+        let dst2 = ShellAddress::from([0xBB; 32]);
 
         fund_account(&mut evm, &sender, U256::from(5_000_000u64));
 
@@ -3866,6 +3899,7 @@ mod tests {
         assert_eq!(get_balance(&mut evm, &dst2), U256::ZERO);
         assert_eq!(get_nonce(&mut evm, &sender), 1);
         assert_eq!(res.receipt.status, 0);
+        assert!(evm.state_db().address_registry_snapshot().is_empty());
         let post_bal = get_balance(&mut evm, &sender);
         let charged = pre_bal - post_bal;
         assert!(
@@ -3880,9 +3914,9 @@ mod tests {
         use shell_primitives::Bytes as PBytes;
 
         let mut evm = setup_evm();
-        let sender = ShellAddress::from([0x42; 20]);
-        let paymaster = ShellAddress::from([0x77; 20]);
-        let dst = ShellAddress::from([0xAA; 20]);
+        let sender = ShellAddress::from([0x42; 32]);
+        let paymaster = ShellAddress::from([0x77; 32]);
+        let dst = ShellAddress::from([0xAA; 32]);
 
         fund_account(&mut evm, &sender, U256::from(10u64));
         fund_account(&mut evm, &paymaster, U256::from(10_000_000u64));
@@ -3897,10 +3931,21 @@ mod tests {
 
         let sender_pre = get_balance(&mut evm, &sender);
         let paymaster_pre = get_balance(&mut evm, &paymaster);
-        let header = sample_header();
+        let mut header = sample_header();
+        header.proposer = ShellAddress::from([0x99; 32]);
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
 
         assert_eq!(res.receipt.status, 1);
+        assert!(evm.state_db().address_registry_snapshot().is_empty());
+        assert_eq!(
+            get_balance(&mut evm, &ShellAddress::from(sender.to_alloy())),
+            U256::ZERO
+        );
+        assert_eq!(
+            get_balance(&mut evm, &ShellAddress::from(header.proposer.to_alloy())),
+            U256::ZERO
+        );
+        assert!(get_balance(&mut evm, &header.proposer) > U256::ZERO);
         assert_eq!(get_balance(&mut evm, &dst), U256::from(5u64));
         let sender_post = get_balance(&mut evm, &sender);
         assert_eq!(
@@ -3918,6 +3963,10 @@ mod tests {
             "paymaster charge should not exceed gas_limit * max_fee"
         );
         assert_eq!(get_nonce(&mut evm, &sender), 1);
+        assert_eq!(
+            get_balance(&mut evm, &ShellAddress::from(dst.to_alloy())),
+            U256::ZERO
+        );
     }
 
     #[test]

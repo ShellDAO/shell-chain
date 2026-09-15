@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve full 32-byte sender, recipient, and proposer addresses during AA
+  inner execution and scope address mappings to each inner call.
+
 - Restore explicit `key migrate` support for legacy secret-key-plus-public-key
   payloads, preserving signing identity and normal decryption limits.
 
