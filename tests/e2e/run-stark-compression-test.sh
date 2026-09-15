@@ -80,6 +80,7 @@ REPORT="$TESTDIR/stark-compression-report.txt"
 NODE1_PID=""; NODE2_PID=""; NODE3_PID=""
 
 cleanup() {
+  local exit_status=$?
   info "Shutting down nodes..."
   [[ -n "$NODE1_PID" ]] && kill "$NODE1_PID" 2>/dev/null || true
   [[ -n "$NODE2_PID" ]] && kill "$NODE2_PID" 2>/dev/null || true
@@ -89,6 +90,10 @@ cleanup() {
   find "$TESTDIR" -name 'dev-authority.json' -delete 2>/dev/null || true
   find "$TESTDIR" -name 'libp2p.key' -delete 2>/dev/null || true
   info "Logs saved to: $TESTDIR"
+  if [[ $exit_status -ne 0 ]]; then
+    echo -e "${RED}FAILED (exit status $exit_status; $FAILURES recorded failures)${NC}"
+    exit "$exit_status"
+  fi
   if [[ $FAILURES -gt 0 ]]; then
     echo -e "${RED}FAILED ($FAILURES failures)${NC}"
     exit 1

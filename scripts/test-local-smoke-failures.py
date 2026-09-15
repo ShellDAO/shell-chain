@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise restart-smoke failure reporting without starting validator nodes."""
+"""Exercise local smoke failure reporting without starting validator nodes."""
 
 import os
 from pathlib import Path
@@ -8,11 +8,15 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "tests/e2e/run-local-restart-recovery.sh"
+SCRIPTS = (
+    ("run-local-restart-recovery.sh", "key1.log"),
+    ("run-stark-compression-test.sh", "keygen.log"),
+)
+E2E_DIR = Path(__file__).resolve().parents[1] / "tests/e2e"
 
 
-class RestartRecoveryFailureTests(unittest.TestCase):
-    def run_failure(self, missing_binary=False):
+class LocalSmokeFailureTests(unittest.TestCase):
+    def run_failure(self, script, key_log, missing_binary=False):
         with tempfile.TemporaryDirectory(prefix="restart-report-test-") as temporary:
             root = Path(temporary)
             mock_bin = root / "bin"
@@ -27,10 +31,14 @@ class RestartRecoveryFailureTests(unittest.TestCase):
             mktemp.chmod(0o755)
             node = mock_bin / "node"
             if not missing_binary:
-                node.write_text("#!/usr/bin/env bash\nexit 23\n")
+                node.write_text(
+                    '#!/usr/bin/env bash\n'
+                    'if [[ "$*" == "run --help" ]]; then\n'
+                    '  echo "enable-stark"\n  exit 0\nfi\nexit 23\n'
+                )
                 node.chmod(0o755)
             result = subprocess.run(
-                ["bash", str(SCRIPT)],
+                ["bash", str(E2E_DIR / script)],
                 env={
                     **os.environ,
                     "PATH": f"{mock_bin}{os.pathsep}{os.environ['PATH']}",
@@ -50,13 +58,17 @@ class RestartRecoveryFailureTests(unittest.TestCase):
             self.assertFalse((runs[0] / "node1-validator.json").exists())
             self.assertFalse((runs[0] / "node2-validator.json").exists())
             if not missing_binary:
-                self.assertTrue((runs[0] / "key1.log").is_file())
+                self.assertTrue((runs[0] / key_log).is_file())
 
     def test_unexpected_key_generation_failure(self):
-        self.run_failure()
+        for script, key_log in SCRIPTS:
+            with self.subTest(script=script):
+                self.run_failure(script, key_log)
 
     def test_explicit_preflight_failure(self):
-        self.run_failure(missing_binary=True)
+        for script, key_log in SCRIPTS:
+            with self.subTest(script=script):
+                self.run_failure(script, key_log, missing_binary=True)
 
 
 if __name__ == "__main__":
