@@ -406,6 +406,12 @@ fn submit_tx(
 
     let result = rpc_post(rpc_url, &body)?;
     let tx_hash = rpc_result_str(&result, "eth_sendRawTransaction")?;
+    let expected_hash = signed.hash().to_string();
+    if !tx_hash.eq_ignore_ascii_case(&expected_hash) {
+        return Err(format!(
+            "RPC returned an unexpected transaction hash; transaction {expected_hash} may already have been submitted; check its status before retrying"
+        ).into());
+    }
     Ok(tx_hash.to_string())
 }
 
@@ -511,6 +517,115 @@ fn parse_rpc_quantity(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn submit_with_reply(
+        reply: impl FnOnce(&str) -> serde_json::Value,
+    ) -> (Result<String, Box<dyn std::error::Error>>, String) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let signer = shell_crypto::MlDsaSigner::generate();
+        let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let tx = Transaction {
+            chain_id: 1337,
+            gas_limit: 21_000,
+            to: Some(Address::from([0x22; 32])),
+            nonce: 0,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 0,
+            value: U256::ZERO,
+            data: Bytes::default(),
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signature = signer
+            .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+            .unwrap();
+        let signed =
+            SignedTransaction::with_pubkey(from, tx, signature, signer.public_key().to_vec());
+        let expected = signed.hash().to_string();
+        let expected_payload = format!("0x{}", hex::encode(alloy_rlp::encode(&signed)));
+        let mut response = reply(&expected);
+        response["jsonrpc"] = serde_json::json!("2.0");
+        response["id"] = serde_json::json!(1);
+        let response = response.to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["method"], "eth_sendRawTransaction");
+            assert_eq!(request["params"], serde_json::json!([expected_payload]));
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let result = submit_tx(&url, &signed);
+        server.join().unwrap();
+        (result, expected)
+    }
+
+    #[test]
+    fn submit_tx_rejects_invalid_acknowledgement_hashes() {
+        for invalid in [
+            "0x".to_string() + &"11".repeat(32),
+            "not-a-hash".into(),
+            "".into(),
+            "0x01".into(),
+        ] {
+            let (result, expected) = submit_with_reply(|_| serde_json::json!({"result": invalid}));
+            assert!(result.is_err(), "accepted acknowledgement {invalid:?}");
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(&expected));
+            assert!(error.contains("may already have been submitted"));
+        }
+    }
+
+    #[test]
+    fn submit_tx_accepts_matching_hash_in_either_hex_case() {
+        for uppercase in [false, true] {
+            let (result, expected) = submit_with_reply(|expected| {
+                let hash = if uppercase {
+                    format!("0x{}", expected[2..].to_ascii_uppercase())
+                } else {
+                    expected.to_string()
+                };
+                serde_json::json!({"result": hash})
+            });
+            assert!(result.unwrap().eq_ignore_ascii_case(&expected));
+        }
+    }
+
+    #[test]
+    fn submit_tx_preserves_rpc_rejection() {
+        let (result, _) = submit_with_reply(
+            |_| serde_json::json!({"error": {"code": -32000, "message": "rejected"}}),
+        );
+        assert!(result.unwrap_err().to_string().contains("rejected"));
+    }
 
     #[test]
     fn automatic_nonce_includes_pending_transactions() {
