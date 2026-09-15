@@ -167,6 +167,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // it when revm queries by the 20-byte truncated form.
         self.state_db.register_pq_address(signed_tx.from);
 
+        // Preserve the full beneficiary key when revm reads and credits fees.
+        self.state_db.register_pq_address(header.proposer);
+
         // Build revm TxEnv
         let kind = match &tx.to {
             Some(addr) => TxKind::Call((*addr).into()),
@@ -4228,7 +4231,8 @@ mod tests {
         let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xAA; 100]);
         let signed = SignedTransaction::new(sender, tx, sig);
 
-        let header = sample_header();
+        let mut header = sample_header();
+        header.proposer = ShellAddress::from([0x99; 32]);
         let result = evm.execute_tx(&signed, &header, 0, 0);
         assert!(result.is_ok(), "execute_tx failed: {:?}", result.err());
         let tx_result = result.unwrap();
@@ -4237,6 +4241,13 @@ mod tests {
         // Commit state to WorldState — execute_tx returns changes but does not
         // persist them; the caller must drive commit_pqvm_state.
         commit_pqvm_state(&tx_result, evm.state_db_mut()).expect("commit_pqvm_state failed");
+
+        let proposer_balance = get_balance(&mut evm, &header.proposer);
+        let proposer_alias_balance =
+            get_balance(&mut evm, &ShellAddress::from(header.proposer.to_alloy()));
+        assert_eq!(proposer_balance, U256::from(tx_result.gas_used));
+        assert_eq!(proposer_alias_balance, U256::ZERO);
+        assert!(evm.state_db().address_registry_snapshot().is_empty());
 
         // The balance must be stored at the CORRECT full 32-byte address.
         let correct_balance = evm

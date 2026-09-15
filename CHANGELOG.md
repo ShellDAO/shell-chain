@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve the full 32-byte proposer address when ordinary transactions read
+  and credit the execution fee beneficiary.
+
 - Preserve full 32-byte sender, recipient, and proposer addresses during AA
   inner execution and scope address mappings to each inner call.
 
