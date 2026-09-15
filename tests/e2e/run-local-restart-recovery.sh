@@ -44,6 +44,7 @@ chmod 600 "$PW"
 NODE1_PID=""; NODE2_PID=""
 
 cleanup() {
+  local exit_status=$?
   info "Shutting down local nodes..."
   [[ -n "$NODE1_PID" ]] && kill "$NODE1_PID" 2>/dev/null || true
   [[ -n "$NODE2_PID" ]] && kill "$NODE2_PID" 2>/dev/null || true
@@ -51,6 +52,10 @@ cleanup() {
   rm -f "$PW" "$KEY1" "$KEY2"
   find "$TESTDIR" -name 'libp2p.key' -delete 2>/dev/null || true
   info "Artifacts saved to: $TESTDIR"
+  if [[ $exit_status -ne 0 ]]; then
+    echo -e "${RED}FAILED (exit status $exit_status; $FAILURES recorded failures)${NC}"
+    exit "$exit_status"
+  fi
   if [[ $FAILURES -gt 0 ]]; then
     echo -e "${RED}FAILED ($FAILURES failures)${NC}"
     exit 1
