@@ -28,6 +28,8 @@ jobs:
         run: scripts/test-release-preflight.sh
       - name: Test release binary build wrapper
         run: scripts/test-build-release-binary.sh
+      - name: Test restart recovery failure reporting
+        run: python3 scripts/test-local-restart-recovery.py
       - name: Test CLI revision watch paths
         run: scripts/test-cli-git-hash-watch.sh
       - name: Check Dockerfile base image pins
