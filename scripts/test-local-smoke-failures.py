@@ -16,7 +16,7 @@ E2E_DIR = Path(__file__).resolve().parents[1] / "tests/e2e"
 
 
 class LocalSmokeFailureTests(unittest.TestCase):
-    def run_failure(self, script, key_log, missing_binary=False):
+    def run_failure(self, script, key_log, missing_binary=False, large_help=False):
         with tempfile.TemporaryDirectory(prefix="restart-report-test-") as temporary:
             root = Path(temporary)
             mock_bin = root / "bin"
@@ -34,7 +34,9 @@ class LocalSmokeFailureTests(unittest.TestCase):
                 node.write_text(
                     '#!/usr/bin/env bash\n'
                     'if [[ "$*" == "run --help" ]]; then\n'
-                    '  echo "enable-stark"\n  exit 0\nfi\nexit 23\n'
+                    '  echo "enable-stark"\n'
+                    + ("  printf '%262144s\\n' help || exit $?\n" if large_help else "")
+                    + '  exit 0\nfi\nexit 23\n'
                 )
                 node.chmod(0o755)
             result = subprocess.run(
@@ -64,6 +66,9 @@ class LocalSmokeFailureTests(unittest.TestCase):
         for script, key_log in SCRIPTS:
             with self.subTest(script=script):
                 self.run_failure(script, key_log)
+
+    def test_large_help_output_reaches_key_generation(self):
+        self.run_failure("run-stark-compression-test.sh", "keygen.log", large_help=True)
 
     def test_explicit_preflight_failure(self):
         for script, key_log in SCRIPTS:
