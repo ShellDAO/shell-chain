@@ -112,7 +112,8 @@ fi
 pass "Node binary: $NODE_BIN"
 
 # Check --enable-stark-aggregation is supported
-if ! "$NODE_BIN" run --help 2>&1 | grep -q "enable-stark"; then
+# Drain help output so pipefail does not mistake SIGPIPE for missing support.
+if ! "$NODE_BIN" run --help 2>&1 | grep "enable-stark" >/dev/null; then
   fail "Binary does not support --enable-stark-aggregation (please rebuild)"
   exit 1
 fi
