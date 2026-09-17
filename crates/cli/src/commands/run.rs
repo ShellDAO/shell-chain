@@ -362,6 +362,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             // the destination: snapshot import requires an empty chain.
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
+                log_address_activation_height: genesis_config.log_address_activation_height,
                 bloom_activation_height: genesis_config.bloom_activation_height,
                 fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
                 chain_id,
@@ -405,6 +406,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             .as_ref()
             .and_then(|config| config.bloom_activation_height)
             != genesis_config.bloom_activation_height
+        || stored
+            .as_ref()
+            .and_then(|config| config.log_address_activation_height)
+            != genesis_config.log_address_activation_height
     {
         let stored = stored.ok_or("stored chain configuration is missing")?;
         let trusted_genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
@@ -415,6 +420,7 @@ async fn initialize_chain<S: KvStore + 'static>(
         }
         let desired = shell_storage::ChainConfig {
             fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
+            log_address_activation_height: genesis_config.log_address_activation_height,
             bloom_activation_height: genesis_config.bloom_activation_height,
             ..stored
         };
@@ -616,6 +622,7 @@ async fn run_with_store<S: KvStore + 'static>(
         );
 
         let config = GenesisConfig {
+            log_address_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: args.chain_id,
@@ -1162,6 +1169,7 @@ mod tests {
 
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
+            log_address_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
@@ -1385,6 +1393,7 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
+            log_address_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: config.chain_id,
@@ -1434,7 +1443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bloom_activation_scheduling_is_independent_atomic_and_persistent() {
+    async fn protocol_activation_scheduling_is_independent_atomic_and_persistent() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemoryDb::new());
         let mut config = test_genesis(Address::from([7u8; 20]));
@@ -1461,6 +1470,18 @@ mod tests {
         .is_err());
         assert_eq!(store.scan_prefix(b"").unwrap(), before);
         config.bloom_activation_height = Some(3);
+        config.log_address_activation_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.log_address_activation_height = Some(4);
         initialize_chain(
             Arc::clone(&store),
             &config,
@@ -1483,9 +1504,24 @@ mod tests {
         let persisted = chain.get_chain_config().unwrap().unwrap();
         assert_eq!(persisted.fee_accounting_activation_height, Some(2));
         assert_eq!(persisted.bloom_activation_height, Some(3));
+        assert_eq!(persisted.log_address_activation_height, Some(4));
         let before = store.scan_prefix(b"").unwrap();
         for conflicting in [None, Some(4)] {
             config.bloom_activation_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        config.bloom_activation_height = Some(3);
+        for conflicting in [None, Some(5)] {
+            config.log_address_activation_height = conflicting;
             assert!(initialize_chain(
                 Arc::clone(&store),
                 &config,
@@ -1618,6 +1654,7 @@ mod tests {
             .commit_genesis_block(
                 &genesis,
                 &ChainConfig {
+                    log_address_activation_height: None,
                     bloom_activation_height: None,
                     fee_accounting_activation_height: None,
                     chain_id: config.chain_id,

@@ -131,6 +131,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         .commit_genesis_block(
             &block,
             &ChainConfig {
+                log_address_activation_height: config.log_address_activation_height,
                 bloom_activation_height: config.bloom_activation_height,
                 fee_accounting_activation_height: config.fee_accounting_activation_height,
                 chain_id: config.chain_id,
@@ -288,6 +289,7 @@ mod tests {
         );
 
         GenesisConfig {
+            log_address_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,

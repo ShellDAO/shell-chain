@@ -32,6 +32,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore known full-width contract addresses in ordinary and AA logs after an
+  explicit `log_address_activation_height`, allowing full-address log queries
+  to match activated receipts while preserving historical log bytes.
+
 - Add an independent, default-off Bloom activation height. New blocks use standard
   bit ordering while historical bytes remain unchanged; log queries and filter
   polling select the correct format across the activation boundary. Persist both

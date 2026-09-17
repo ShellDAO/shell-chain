@@ -74,6 +74,23 @@ For normal transaction blocks, the reward rules are:
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.
 
+### Log emitter address activation
+
+The optional `log_address_activation_height` in `genesis.json` restores known
+full-width emitting contract addresses in ordinary and AA execution logs at
+and after the selected height. Execution uses the same address registry as
+state updates; AA resolves each inner call's logs from that call's saved registry.
+Addresses absent from the registry retain the existing zero-padding fallback.
+Reverted AA bundles discard their logs and per-call mappings.
+
+Before activation, logs retain the legacy zero-padded emitter values. The change
+therefore preserves historical receipts, Bloom bytes and hashes. Activated logs
+are discoverable by their recorded full Shell address through normal RPC log
+filters. This schedule is independent of the fee and Bloom schedules, is absent
+by default, and follows the same immutable startup and trusted snapshot rules.
+Existing networks require a coordinated future height; no deployment or
+activation is performed by adding this option.
+
 ### Log Bloom activation
 
 The optional `bloom_activation_height` in `genesis.json` independently selects
@@ -94,8 +111,8 @@ signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
 Both log-range queries and filter polling select the format for each queried
 block, including removed logs after a reorganization.
 
-The Bloom and fee schedules are independent persisted chain configuration.
-Startup validates both proposed schedules before publishing either one. A new
+The fee, Bloom and log emitter schedules are independent persisted chain configuration.
+Startup validates all proposed schedules before publishing any of them. A new
 schedule on an existing chain must be strictly above its canonical head; an
 existing schedule cannot be removed or changed. Restart and snapshot import
 require matching trusted schedules, and conflicting imports fail before writes.
