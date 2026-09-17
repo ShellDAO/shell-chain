@@ -1,7 +1,7 @@
 //! Log filter for `eth_getLogs` — supports address, topic, and bloom-based filtering.
 
 use serde::Deserialize;
-use shell_pqvm::bloom::{bloom_contains, Bloom, BLOOM_SIZE};
+use shell_pqvm::bloom::{bloom_contains_with_format, Bloom, BloomFormat, BLOOM_SIZE};
 use shell_primitives::{Address, ShellHash};
 
 /// Maximum number of blocks that can be queried in a single `eth_getLogs` call.
@@ -35,6 +35,11 @@ impl LogFilter {
     /// any of the filter's addresses/topics — in that case the block/receipt
     /// can be skipped entirely.
     pub fn matches_bloom(&self, bloom_bytes: &[u8]) -> bool {
+        self.matches_bloom_with_format(bloom_bytes, BloomFormat::Legacy)
+    }
+
+    /// Filter using the format of the block that committed these bytes.
+    pub fn matches_bloom_with_format(&self, bloom_bytes: &[u8], format: BloomFormat) -> bool {
         if bloom_bytes.len() != BLOOM_SIZE {
             // Malformed or empty bloom — fall through to exact matching.
             return true;
@@ -48,7 +53,9 @@ impl LogFilter {
             if addrs.is_empty() {
                 return false;
             }
-            let any_match = addrs.iter().any(|a| bloom_contains(bloom, a.as_bytes()));
+            let any_match = addrs
+                .iter()
+                .any(|a| bloom_contains_with_format(bloom, a.as_bytes(), format));
             if !any_match {
                 return false;
             }
@@ -60,7 +67,9 @@ impl LogFilter {
                 return false;
             }
 
-            let any_match = hashes.iter().any(|h| bloom_contains(bloom, h.as_bytes()));
+            let any_match = hashes
+                .iter()
+                .any(|h| bloom_contains_with_format(bloom, h.as_bytes(), format));
             if !any_match {
                 return false;
             }

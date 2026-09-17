@@ -1,4 +1,4 @@
-//! Ethereum logs bloom filter (EIP-2028 compatible).
+//! Height-selected log Bloom bit ordering with unchanged legacy encoding.
 //!
 //! A 2048-bit (256-byte) Bloom filter used for efficient log filtering.
 //! Each log entry's address and topics are inserted into the filter using
@@ -13,15 +13,45 @@ pub const BLOOM_SIZE: usize = 256;
 /// A 2048-bit Bloom filter.
 pub type Bloom = [u8; BLOOM_SIZE];
 
-/// Compute the bloom filter for a set of logs.
+/// Byte and bit order committed by a block's receipts and header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomFormat {
+    Legacy,
+    Standard,
+}
+
+impl BloomFormat {
+    /// Choose by the executed or queried block, never by the current tip.
+    pub fn at_height(activation: Option<u64>, number: u64) -> Self {
+        if activation.is_some_and(|height| number >= height) {
+            Self::Standard
+        } else {
+            Self::Legacy
+        }
+    }
+
+    fn bit_location(self, index: usize) -> (usize, usize) {
+        match self {
+            Self::Legacy => (index / 8, 7 - index % 8),
+            Self::Standard => (BLOOM_SIZE - 1 - index / 8, index % 8),
+        }
+    }
+}
+
+/// Compute the legacy bloom filter for a set of logs.
 ///
 /// For each log, the address and every topic are inserted into the filter.
 pub fn logs_bloom(logs: &[Log]) -> Bloom {
+    logs_bloom_with_format(logs, BloomFormat::Legacy)
+}
+
+/// Compute a Bloom using the selected order and full 32-byte Shell addresses.
+pub fn logs_bloom_with_format(logs: &[Log], format: BloomFormat) -> Bloom {
     let mut bloom = [0u8; BLOOM_SIZE];
     for log in logs {
-        bloom_insert(&mut bloom, log.address.as_bytes());
+        bloom_insert(&mut bloom, log.address.as_bytes(), format);
         for topic in &log.topics {
-            bloom_insert(&mut bloom, topic.as_bytes());
+            bloom_insert(&mut bloom, topic.as_bytes(), format);
         }
     }
     bloom
@@ -32,7 +62,7 @@ pub fn logs_bloom(logs: &[Log]) -> Bloom {
 /// Algorithm: Keccak-256 hash the data, then take three pairs of bytes
 /// at positions [0,1], [2,3], [4,5]. Each pair yields a bit index
 /// `(b0 << 8 | b1) & 0x7FF` (mod 2048), which is set in the filter.
-fn bloom_insert(bloom: &mut Bloom, data: &[u8]) {
+fn bloom_insert(bloom: &mut Bloom, data: &[u8], format: BloomFormat) {
     let hash = Keccak256::digest(data);
     let hash_bytes: &[u8] = hash.as_ref();
     for i in 0..3usize {
@@ -46,20 +76,24 @@ fn bloom_insert(bloom: &mut Bloom, data: &[u8]) {
             .copied()
             .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2+1 < 6"));
         let bit_index = ((b0 as usize) << 8 | b1 as usize) & 0x7FF;
-        let byte_index = bit_index.checked_div(8).unwrap_or(0);
-        let bit_position = 7usize.saturating_sub(bit_index.checked_rem(8).unwrap_or(0));
+        let (byte_index, bit_position) = format.bit_location(bit_index);
         if let Some(byte) = bloom.get_mut(byte_index) {
             *byte |= 1u8 << bit_position;
         }
     }
 }
 
-/// Check whether the bloom filter may contain an item.
+/// Check whether a legacy bloom filter may contain an item.
 ///
 /// Returns `true` if all three bit positions for `data` are set in `bloom`.
 /// A `true` result is a "maybe" — false positives are possible.
 /// A `false` result is definitive — the item was never inserted.
 pub fn bloom_contains(bloom: &Bloom, data: &[u8]) -> bool {
+    bloom_contains_with_format(bloom, data, BloomFormat::Legacy)
+}
+
+/// Check membership using the order committed at the queried block height.
+pub fn bloom_contains_with_format(bloom: &Bloom, data: &[u8], format: BloomFormat) -> bool {
     let hash = Keccak256::digest(data);
     let hash_bytes: &[u8] = hash.as_ref();
     for i in 0..3usize {
@@ -73,8 +107,7 @@ pub fn bloom_contains(bloom: &Bloom, data: &[u8]) -> bool {
             .copied()
             .unwrap_or_else(|| unreachable!("Keccak256 is 32 bytes; i < 3 so i*2+1 < 6"));
         let bit_index = ((b0 as usize) << 8 | b1 as usize) & 0x7FF;
-        let byte_index = bit_index.checked_div(8).unwrap_or(0);
-        let bit_position = 7usize.saturating_sub(bit_index.checked_rem(8).unwrap_or(0));
+        let (byte_index, bit_position) = format.bit_location(bit_index);
         if bloom
             .get(byte_index)
             .map(|b| b & (1u8 << bit_position) == 0)
@@ -111,6 +144,36 @@ pub fn bloom_union_bytes<'a>(blooms: impl IntoIterator<Item = &'a [u8]>) -> Bloo
 mod tests {
     use super::*;
     use shell_primitives::{Address, Bytes, ShellHash};
+
+    #[test]
+    fn bloom_activation_preserves_legacy_and_matches_independent_vectors() {
+        let topic = [0x11; 32];
+        for (format, entries) in [
+            (BloomFormat::Legacy, [(67, 4), (173, 64), (229, 4)]),
+            (BloomFormat::Standard, [(26, 32), (82, 2), (188, 32)]),
+        ] {
+            let mut expected = [0; BLOOM_SIZE];
+            for (index, byte) in entries {
+                expected[index] = byte;
+            }
+            let mut actual = [0; BLOOM_SIZE];
+            bloom_insert(&mut actual, &topic, format);
+            assert_eq!(actual, expected);
+            assert!(bloom_contains_with_format(&actual, &topic, format));
+        }
+        let address = Address::from([0x42; 32]);
+        let log = Log::new(address, vec![ShellHash::from(topic)], Bytes::new()).unwrap();
+        let mut reference = alloy_primitives::Bloom::ZERO;
+        reference.m3_2048(address.as_bytes());
+        reference.m3_2048(&topic);
+        assert_eq!(
+            logs_bloom_with_format(&[log], BloomFormat::Standard).as_slice(),
+            reference.as_slice()
+        );
+        assert_eq!(BloomFormat::at_height(None, u64::MAX), BloomFormat::Legacy);
+        assert_eq!(BloomFormat::at_height(Some(2), 1), BloomFormat::Legacy);
+        assert_eq!(BloomFormat::at_height(Some(2), 2), BloomFormat::Standard);
+    }
 
     #[test]
     fn empty_logs_produce_zero_bloom() {

@@ -142,6 +142,15 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             .is_some_and(|height| block_number >= height))
     }
 
+    fn bloom_format(&self, number: u64) -> Result<crate::bloom::BloomFormat, ExecutorError> {
+        let activation = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.bloom_activation_height);
+        Ok(crate::bloom::BloomFormat::at_height(activation, number))
+    }
+
     pub fn new(state_db: ShellStateDb<S>, chain_id: u64) -> Self {
         Self { state_db, chain_id }
     }
@@ -196,6 +205,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // ── Normal PQVM/revm execution path ──────────────────────────
         let tx = &signed_tx.tx;
         let reconciled_fees = self.reconciled_fees(header.number)?;
+        let bloom_format = self.bloom_format(header.number)?;
         let sender_shell_addr = signed_tx.from;
         let sender_nonce_after = next_sender_nonce(tx.nonce)?;
 
@@ -339,7 +349,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             cumulative_gas_used: new_cumulative,
             contract_address,
             logs_bloom: shell_primitives::Bytes::from(
-                crate::bloom::logs_bloom(&shell_logs).to_vec(),
+                crate::bloom::logs_bloom_with_format(&shell_logs, bloom_format).to_vec(),
             ),
             logs: shell_logs,
         };
@@ -404,6 +414,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
         let reconciled_fees = self.reconciled_fees(header.number)?;
+        let bloom_format = self.bloom_format(header.number)?;
         let max_fee = U256::from(tx.max_fee_per_gas);
         let base_fee = if reconciled_fees {
             header.base_fee_per_gas
@@ -491,7 +502,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 gas_used: 0,
                 cumulative_gas_used,
                 contract_address: None,
-                logs_bloom: shell_primitives::Bytes::from(crate::bloom::logs_bloom(&[]).to_vec()),
+                logs_bloom: shell_primitives::Bytes::from(
+                    crate::bloom::logs_bloom_with_format(&[], bloom_format).to_vec(),
+                ),
                 logs: vec![],
             };
             return Ok(TxExecutionResult {
@@ -818,7 +831,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             gas_used: total_gas_used,
             cumulative_gas_used: cumulative_gas_used.saturating_add(total_gas_used),
             contract_address: None,
-            logs_bloom: shell_primitives::Bytes::from(crate::bloom::logs_bloom(&logs).to_vec()),
+            logs_bloom: shell_primitives::Bytes::from(
+                crate::bloom::logs_bloom_with_format(&logs, bloom_format).to_vec(),
+            ),
             logs,
         };
 
@@ -873,6 +888,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let tx = &signed_tx.tx;
         let target = signed_tx.tx.to.unwrap_or_default();
         let input = signed_tx.tx.data.as_ref();
+        let bloom_format = self.bloom_format(header.number)?;
         let gas_price = if self.reconciled_fees(header.number)? {
             shell_core::effective_gas_price(
                 tx.max_fee_per_gas,
@@ -955,7 +971,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     cumulative_gas_used: new_cumulative,
                     contract_address: None,
                     logs_bloom: shell_primitives::Bytes::from(
-                        crate::bloom::logs_bloom(&shell_logs).to_vec(),
+                        crate::bloom::logs_bloom_with_format(&shell_logs, bloom_format).to_vec(),
                     ),
                     logs: shell_logs,
                 };
@@ -1168,6 +1184,7 @@ mod tests {
             .put_chain_config(&shell_storage::ChainConfig {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
+                bloom_activation_height: None,
                 fee_accounting_activation_height: height,
             })
             .unwrap();
@@ -1349,6 +1366,110 @@ mod tests {
                             U256::from(if revert { 10 } else { 5 })
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bloom_activation_ordinary_and_aa_receipts_use_executed_height() {
+        for activation in [None, Some(0), Some(2)] {
+            for number in [1, 2] {
+                for aa in [false, true] {
+                    let mut evm = setup_evm();
+                    evm.state_db()
+                        .chain_store()
+                        .put_chain_config(&shell_storage::ChainConfig {
+                            chain_id: 1337,
+                            genesis_hash: ShellHash::ZERO,
+                            fee_accounting_activation_height: None,
+                            bloom_activation_height: activation,
+                        })
+                        .unwrap();
+                    let sender = ShellAddress::from([0x42; 32]);
+                    let contract = ShellAddress::from([0x43; 32]);
+                    fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+                    let mut runtime = vec![0x7f];
+                    runtime.extend_from_slice(&[0x11; 32]);
+                    runtime.extend_from_slice(&[0x60, 0, 0x60, 0, 0xa1, 0]);
+                    let hash = shell_primitives::keccak256(&runtime);
+                    evm.state_db()
+                        .chain_store()
+                        .put_code(&hash, &runtime)
+                        .unwrap();
+                    evm.state_db_mut()
+                        .world_state_mut()
+                        .set_account(
+                            &contract,
+                            &Account {
+                                code_hash: Some(hash),
+                                ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                            },
+                        )
+                        .unwrap();
+                    let nonce = current_nonce(&mut evm, &sender);
+                    let signed = if aa {
+                        make_aa_signed(
+                            sender,
+                            nonce,
+                            200_000,
+                            10,
+                            vec![shell_core::InnerCall {
+                                to: Some(contract),
+                                value: U256::ZERO,
+                                data: shell_primitives::Bytes::new(),
+                                gas_limit: 50_000,
+                            }],
+                            None,
+                        )
+                    } else {
+                        SignedTransaction::new(
+                            sender,
+                            Transaction {
+                                chain_id: 1337,
+                                nonce,
+                                to: Some(contract),
+                                value: U256::ZERO,
+                                data: shell_primitives::Bytes::new(),
+                                gas_limit: 100_000,
+                                max_fee_per_gas: 10,
+                                max_priority_fee_per_gas: 0,
+                                access_list: None,
+                                tx_type: 2,
+                                max_fee_per_blob_gas: None,
+                                blob_versioned_hashes: None,
+                            },
+                            PQSignature::new(SignatureType::Dilithium3, vec![0; 1]),
+                        )
+                    };
+                    let mut header = sample_header();
+                    header.number = number;
+                    let result = if aa {
+                        evm.execute_aa_bundle(&signed, &header, 0, 0)
+                    } else {
+                        evm.execute_tx(&signed, &header, 0, 0)
+                    }
+                    .unwrap();
+                    assert_eq!(result.receipt.status, 1);
+                    assert_eq!(result.receipt.logs.len(), 1);
+                    // Preserve the existing EVM log address mapping across this format upgrade.
+                    assert_eq!(
+                        result.receipt.logs[0].address,
+                        ShellAddress::from(contract.to_alloy())
+                    );
+                    let expected = if activation.is_some_and(|height| number >= height) {
+                        let mut reference = alloy_primitives::Bloom::ZERO;
+                        for log in &result.receipt.logs {
+                            reference.m3_2048(log.address.as_bytes());
+                            for topic in &log.topics {
+                                reference.m3_2048(topic.as_bytes());
+                            }
+                        }
+                        reference.as_slice().to_vec()
+                    } else {
+                        crate::bloom::logs_bloom(&result.receipt.logs).to_vec()
+                    };
+                    assert_eq!(result.receipt.logs_bloom.as_ref(), expected.as_slice());
                 }
             }
         }
@@ -1804,38 +1925,61 @@ mod tests {
 
     #[test]
     fn system_tx_generates_event_logs() {
-        let mut evm = setup_evm();
-        let v1 = ShellAddress::from([0x01; 20]);
-        let new_val = ShellAddress::from([0x02; 20]);
-        evm.state_db_mut()
-            .world_state_mut()
-            .set_validators(&[v1])
-            .unwrap();
-        evm.state_db_mut()
-            .chain_store()
-            .put_pubkey(&new_val, &[0xAB; 32])
-            .unwrap();
+        for number in [1, 2] {
+            let mut evm = setup_evm();
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(&shell_storage::ChainConfig {
+                    chain_id: 1337,
+                    genesis_hash: ShellHash::ZERO,
+                    fee_accounting_activation_height: None,
+                    bloom_activation_height: Some(2),
+                })
+                .unwrap();
+            let v1 = ShellAddress::from([0x01; 20]);
+            let new_val = ShellAddress::from([0x02; 20]);
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_validators(&[v1])
+                .unwrap();
+            evm.state_db_mut()
+                .chain_store()
+                .put_pubkey(&new_val, &[0xAB; 32])
+                .unwrap();
 
-        let calldata = system_contracts::encode_add_validator_calldata(&new_val);
-        let signed = make_system_tx(v1, calldata);
-        let header = sample_header();
+            let calldata = system_contracts::encode_add_validator_calldata(&new_val);
+            let signed = make_system_tx(v1, calldata);
+            let mut header = sample_header();
+            header.number = number;
 
-        let tx_result = evm.execute_tx(&signed, &header, 0, 0).unwrap();
-        assert_eq!(tx_result.receipt.status, 1);
+            let tx_result = evm.execute_tx(&signed, &header, 0, 0).unwrap();
+            assert_eq!(tx_result.receipt.status, 1);
 
-        // Should have exactly one ValidatorAdded log
-        assert_eq!(tx_result.receipt.logs.len(), 1);
-        let log = &tx_result.receipt.logs[0];
-        assert_eq!(log.address, system_contracts::registry_address());
-        assert_eq!(log.topics.len(), 1);
-        assert_eq!(
-            log.topics[0],
-            ShellHash::from(system_contracts::validator_added_topic())
-        );
-        // Log data should be the ABI-encoded address
-        let mut expected_data = [0u8; 32];
-        expected_data[12..32].copy_from_slice(new_val.to_alloy().as_slice());
-        assert_eq!(log.data.as_ref(), &expected_data);
+            // Should have exactly one ValidatorAdded log
+            assert_eq!(tx_result.receipt.logs.len(), 1);
+            let log = &tx_result.receipt.logs[0];
+            assert_eq!(log.address, system_contracts::registry_address());
+            assert_eq!(log.topics.len(), 1);
+            assert_eq!(
+                log.topics[0],
+                ShellHash::from(system_contracts::validator_added_topic())
+            );
+            // Log data should be the ABI-encoded address
+            let mut expected_data = [0u8; 32];
+            expected_data[12..32].copy_from_slice(new_val.to_alloy().as_slice());
+            assert_eq!(log.data.as_ref(), &expected_data);
+            let expected = if number == 1 {
+                crate::bloom::logs_bloom(&tx_result.receipt.logs).to_vec()
+            } else {
+                let mut bloom = alloy_primitives::Bloom::ZERO;
+                bloom.m3_2048(log.address.as_bytes());
+                for topic in &log.topics {
+                    bloom.m3_2048(topic.as_bytes());
+                }
+                bloom.as_slice().to_vec()
+            };
+            assert_eq!(tx_result.receipt.logs_bloom.as_ref(), expected.as_slice());
+        }
     }
 
     #[test]

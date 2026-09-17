@@ -69,6 +69,7 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                     Arc::new(shell_storage::MemoryDb::new()),
                 )?;
                 shell_storage::ChainConfig {
+                    bloom_activation_height: genesis.bloom_activation_height,
                     fee_accounting_activation_height: genesis.fee_accounting_activation_height,
                     chain_id: genesis.chain_id,
                     genesis_hash: block.hash(),
@@ -123,6 +124,7 @@ mod tests {
         let mut genesis =
             shell_genesis::GenesisConfig::from_file(&datadir.join("genesis.json")).unwrap();
         genesis.fee_accounting_activation_height = activation;
+        genesis.bloom_activation_height = activation.map(|height| height + 1);
         std::fs::write(
             datadir.join("genesis.json"),
             genesis.to_json_pretty().unwrap(),
@@ -159,6 +161,9 @@ mod tests {
                 shell_storage::RocksDbStore::open_all(dir.path().join("db"), None).unwrap();
             let chain_store = ChainStore::new(Arc::new(stores.state));
             assert_eq!(chain_store.get_head_hash().unwrap(), Some(expected_head));
+            let config = chain_store.get_chain_config().unwrap().unwrap();
+            assert_eq!(config.fee_accounting_activation_height, Some(2));
+            assert_eq!(config.bloom_activation_height, Some(3));
         }
 
         let error = import_state(dir.path().to_path_buf(), snapshot).unwrap_err();
@@ -198,6 +203,28 @@ mod tests {
         let (mut genesis, _, snapshot) = prepare_snapshot(source.path(), Some(2));
         let destination = tempfile::tempdir().unwrap();
         genesis.fee_accounting_activation_height = Some(3);
+        std::fs::write(
+            destination.path().join("genesis.json"),
+            genesis.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        let error = import_state(destination.path().to_path_buf(), snapshot).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the trusted chain"));
+        let stores =
+            shell_storage::RocksDbStore::open_all(destination.path().join("db"), None).unwrap();
+        let chain_store = ChainStore::new(Arc::new(stores.state));
+        assert!(chain_store.get_head_hash().unwrap().is_none());
+        assert!(chain_store.get_chain_config().unwrap().is_none());
+    }
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn fresh_snapshot_import_rejects_conflicting_bloom_activation_without_writes() {
+        let source = tempfile::tempdir().unwrap();
+        let (mut genesis, _, snapshot) = prepare_snapshot(source.path(), Some(2));
+        let destination = tempfile::tempdir().unwrap();
+        genesis.bloom_activation_height = Some(4);
         std::fs::write(
             destination.path().join("genesis.json"),
             genesis.to_json_pretty().unwrap(),

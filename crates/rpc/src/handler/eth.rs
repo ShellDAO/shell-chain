@@ -129,7 +129,12 @@ fn append_filter_logs<S: KvStore + 'static>(
             header.number
         )));
     }
-    if !filter.matches_bloom(header.logs_bloom.as_ref()) {
+    let activation = chain_store
+        .get_chain_config()
+        .map_err(internal_err)?
+        .and_then(|config| config.bloom_activation_height);
+    let format = shell_pqvm::bloom::BloomFormat::at_height(activation, header.number);
+    if !filter.matches_bloom_with_format(header.logs_bloom.as_ref(), format) {
         return Ok(());
     }
 
@@ -963,6 +968,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             )));
         }
 
+        let activation = self
+            .chain_store
+            .get_chain_config()
+            .map_err(internal_err)?
+            .and_then(|config| config.bloom_activation_height);
         let mut results = Vec::new();
         let mut expected_parent = None;
 
@@ -987,7 +997,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             // Fast path: check block-level bloom filter.
             let block_hash = header.hash();
             expected_parent = Some(block_hash);
-            if !filter.matches_bloom(header.logs_bloom.as_ref()) {
+            let format = shell_pqvm::bloom::BloomFormat::at_height(activation, header.number);
+            if !filter.matches_bloom_with_format(header.logs_bloom.as_ref(), format) {
                 continue;
             }
 
@@ -1014,7 +1025,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             for (tx_idx, receipt) in receipts.into_iter().enumerate() {
                 // Per-receipt bloom fast path.
                 if receipt.logs_bloom.len() == BLOOM_SIZE
-                    && !filter.matches_bloom(receipt.logs_bloom.as_ref())
+                    && !filter.matches_bloom_with_format(receipt.logs_bloom.as_ref(), format)
                 {
                     global_log_index += receipt.logs.len() as u64;
                     continue;

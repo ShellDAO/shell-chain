@@ -540,6 +540,7 @@ mod tests {
                     .commit_genesis_block(
                         &block,
                         &ChainConfig {
+                            bloom_activation_height: None,
                             fee_accounting_activation_height: None,
                             chain_id: 1337,
                             genesis_hash: block.hash(),
@@ -760,6 +761,7 @@ mod tests {
                     .commit_genesis_block(
                         &block,
                         &ChainConfig {
+                            bloom_activation_height: None,
                             fee_accounting_activation_height: None,
                             chain_id: 1337,
                             genesis_hash: parent,

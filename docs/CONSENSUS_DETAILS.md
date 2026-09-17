@@ -74,6 +74,34 @@ For normal transaction blocks, the reward rules are:
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.
 
+### Log Bloom activation
+
+The optional `bloom_activation_height` in `genesis.json` independently selects
+standard Bloom bit ordering. Missing or null values retain legacy behavior at
+all heights. No existing network activates by default.
+
+Each address and topic uses three indices from the first six Keccak-256 hash
+bytes, masked to 2047. Before activation, index `k` sets byte `k / 8`, bit
+`7 - k % 8`. At and after activation, it sets byte `255 - k / 8`, bit `k % 8`,
+matching Ethereum/Alloy ordering. Address inputs remain the full 32 bytes of
+recorded Shell log addresses; this is not a change to log address encoding or
+a promise of 20-byte Ethereum address compatibility.
+
+Execution selects the format from the executed block height, including ordinary,
+AA and native transactions. Producers aggregate receipt blooms, and importers
+and fork replay verify the same committed bytes. Historical receipts, headers,
+signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
+Both log-range queries and filter polling select the format for each queried
+block, including removed logs after a reorganization.
+
+The Bloom and fee schedules are independent persisted chain configuration.
+Startup validates both proposed schedules before publishing either one. A new
+schedule on an existing chain must be strictly above its canonical head; an
+existing schedule cannot be removed or changed. Restart and snapshot import
+require matching trusted schedules, and conflicting imports fail before writes.
+Operators must coordinate node upgrades and a common activation height before
+using the new format on an existing network.
+
 ### Fee accounting activation
 
 The optional `fee_accounting_activation_height` in `genesis.json` selects the

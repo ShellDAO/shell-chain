@@ -3123,6 +3123,8 @@ mod tests {
             let (node, proposer_signer) = setup_node();
             let proposer = node.config.proposer_address.unwrap();
             let fork_node = setup_node_with_authority(proposer);
+            let imported = setup_node_with_authority(proposer);
+            imported.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
             node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
             fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
@@ -3131,16 +3133,29 @@ mod tests {
                 Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
             let receiver = Address::from([0xBE; 20]);
             let initial_balance = U256::from(100_000_000_000_000u64);
-            fund_account(&node, &sender, initial_balance);
-            fund_account(&fork_node, &sender, initial_balance);
-            store_consistent_genesis(&node);
-            store_consistent_genesis(&fork_node);
-            for participant in [&node, &fork_node] {
+            for participant in [&node, &fork_node, &imported] {
+                fund_account(participant, &sender, initial_balance);
+                let code = [0x60, 0x11, 0x60, 0, 0x60, 0, 0xa1, 0];
+                let code_hash = shell_primitives::keccak256(&code);
+                participant.chain_store.put_code(&code_hash, &code).unwrap();
+                participant
+                    .world_state
+                    .write()
+                    .set_account(
+                        &receiver,
+                        &shell_core::Account {
+                            code_hash: Some(code_hash),
+                            ..shell_core::Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+                store_consistent_genesis(participant);
                 participant
                     .chain_store
                     .put_chain_config(&shell_storage::ChainConfig {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        bloom_activation_height: activation,
                         fee_accounting_activation_height: activation,
                     })
                     .unwrap();
@@ -3156,7 +3171,7 @@ mod tests {
                 to: Some(receiver),
                 value: U256::from(1_000u64),
                 data: Bytes::new(),
-                gas_limit: 21_000,
+                gas_limit: 50_000,
                 max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
                 max_priority_fee_per_gas: 0,
                 access_list: None,
@@ -3174,6 +3189,12 @@ mod tests {
             submit_signed_tx(&fork_node, &tx_signer, sender, second);
             let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
             let side_two_hash = side_two.hash();
+            imported
+                .import_block(side_one.clone(), &MultiVerifier)
+                .unwrap();
+            imported
+                .import_block(side_two.clone(), &MultiVerifier)
+                .unwrap();
             // Stage the descendant before its competing parent trie is materialized;
             // adoption must re-execute both blocks from the common ancestor.
             node.chain_store.put_block(&side_two).unwrap();
@@ -3223,6 +3244,38 @@ mod tests {
                     .len(),
                 side_one.transactions.len() + side_one.system_transactions.len()
             );
+            for block in [&side_one, &side_two] {
+                let produced = fork_node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                let replayed = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                let received = imported
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(produced[0].logs.len(), 1);
+                assert_eq!(produced[0].logs_bloom, replayed[0].logs_bloom);
+                assert_eq!(produced[0].logs_bloom, received[0].logs_bloom);
+                let expected = if activation.is_some_and(|height| block.number() >= height) {
+                    // Standard ordering reverses both byte and bit order of legacy bytes.
+                    shell_pqvm::bloom::logs_bloom(&produced[0].logs)
+                        .iter()
+                        .rev()
+                        .map(|byte| byte.reverse_bits())
+                        .collect::<Vec<_>>()
+                } else {
+                    shell_pqvm::bloom::logs_bloom(&produced[0].logs).to_vec()
+                };
+                assert_eq!(produced[0].logs_bloom.as_ref(), expected.as_slice());
+                assert_eq!(block.header.logs_bloom.as_ref(), expected.as_slice());
+            }
             assert_eq!(current_state_root(&node), side_two.header.state_root);
             assert_eq!(
                 node.world_state.read().get_balance(&sender).unwrap(),
@@ -4783,6 +4836,7 @@ mod tests {
                         .put_chain_config(&shell_storage::ChainConfig {
                             chain_id: 1337,
                             genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                            bloom_activation_height: None,
                             fee_accounting_activation_height: activation,
                         })
                         .unwrap();
@@ -4873,6 +4927,7 @@ mod tests {
                     .put_chain_config(&shell_storage::ChainConfig {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        bloom_activation_height: None,
                         fee_accounting_activation_height: Some(0),
                     })
                     .unwrap();
