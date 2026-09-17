@@ -86,6 +86,7 @@ pub fn init(
             );
 
             GenesisConfig {
+                bloom_activation_height: None,
                 fee_accounting_activation_height: None,
                 chain_id,
                 chain_name: format!("shell-chain-{}", network_type.as_str()),

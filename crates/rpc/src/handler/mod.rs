@@ -3849,6 +3849,7 @@ mod tests {
             .put_chain_config(&shell_storage::ChainConfig {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
+                bloom_activation_height: None,
                 fee_accounting_activation_height: Some(5),
             })
             .unwrap();
@@ -3896,6 +3897,7 @@ mod tests {
             .put_chain_config(&shell_storage::ChainConfig {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
+                bloom_activation_height: None,
                 fee_accounting_activation_height: Some(0),
             })
             .unwrap();
@@ -4261,6 +4263,92 @@ mod tests {
     }
 
     // ── eth_getLogs tests ────────────────────────────────────────
+
+    async fn assert_bloom_activation_query(polling: bool) {
+        let handler = setup();
+        let genesis = store_block_with_logs(&handler, 0, vec![]);
+        let config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+            "chain_id": 1337,
+            "genesis_hash": genesis,
+            "bloom_activation_height": 2
+        }))
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        let topic = ShellHash::from([0x11; 32]);
+        let raw: crate::filter::RawLogFilter = serde_json::from_value(serde_json::json!({
+            "fromBlock": "0x1", "toBlock": "latest", "topics": [topic]
+        }))
+        .unwrap();
+        let id = EthApiServer::new_filter(&handler, raw.clone())
+            .await
+            .unwrap();
+        let mut committed = Vec::new();
+        for number in 1..=3 {
+            let log =
+                shell_core::Log::new(Address::from([0x42; 32]), vec![topic], Bytes::new()).unwrap();
+            let mut hash = store_block_with_logs(&handler, number, vec![vec![log.clone()]]);
+            if number >= 2 {
+                // Independent reference, retaining the full Shell address bytes.
+                let mut bloom = alloy_primitives::Bloom::ZERO;
+                bloom.m3_2048(log.address.as_bytes());
+                bloom.m3_2048(topic.as_bytes());
+                let mut block = handler
+                    .chain_store
+                    .get_block_by_hash(&hash)
+                    .unwrap()
+                    .unwrap();
+                let mut receipts = handler.chain_store.get_receipts(&hash).unwrap().unwrap();
+                block.header.logs_bloom = Bytes::copy_from_slice(bloom.as_slice());
+                receipts[0].logs_bloom = block.header.logs_bloom.clone();
+                hash = block.hash();
+                handler.chain_store.put_block(&block).unwrap();
+                handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+                handler.chain_store.set_canonical(number, &hash).unwrap();
+                handler.chain_store.set_head(&hash).unwrap();
+            }
+            let bytes = handler
+                .chain_store
+                .get_header_by_hash(&hash)
+                .unwrap()
+                .unwrap()
+                .logs_bloom;
+            committed.push((hash, bytes));
+        }
+        if polling {
+            let changes = EthApiServer::get_filter_changes(&handler, id)
+                .await
+                .unwrap();
+            assert_eq!(changes.as_array().unwrap().len(), 3);
+        } else {
+            let logs = EthApiServer::get_logs(&handler, raw).await.unwrap();
+            assert_eq!(logs.len(), 3);
+            let logs = EthApiServer::get_filter_logs(&handler, id).await.unwrap();
+            assert_eq!(logs.len(), 3);
+        }
+        for (hash, bytes) in committed {
+            let header = handler
+                .chain_store
+                .get_header_by_hash(&hash)
+                .unwrap()
+                .unwrap();
+            assert_eq!(header.hash(), hash);
+            assert_eq!(header.logs_bloom, bytes);
+            assert_eq!(
+                handler.chain_store.get_receipts(&hash).unwrap().unwrap()[0].logs_bloom,
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bloom_activation_mixed_height_get_logs() {
+        assert_bloom_activation_query(false).await;
+    }
+
+    #[tokio::test]
+    async fn bloom_activation_mixed_height_filter_polling() {
+        assert_bloom_activation_query(true).await;
+    }
 
     /// Helper: store a block with receipts that contain logs and return the block hash.
     fn store_block_with_logs(

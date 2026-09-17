@@ -20,6 +20,9 @@ pub struct ChainConfig {
     /// First block using reconciled execution fees. Missing means legacy rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_accounting_activation_height: Option<u64>,
+    /// First block using standard Bloom bit order; omitted for legacy networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bloom_activation_height: Option<u64>,
 }
 
 /// Maximum number of guardians per account.
@@ -1587,32 +1590,60 @@ impl<S: KvStore> ChainStore<S> {
         self.store.put(prefix::CHAIN_CONFIG, &data)
     }
 
-    /// Schedule the fee upgrade once, while holding the node's exclusive startup lock.
-    /// Existing canonical history must remain strictly below the activation height.
+    /// Schedule the fee upgrade while holding the node's exclusive startup lock.
     pub fn schedule_fee_accounting_activation(&self, height: u64) -> Result<(), StorageError> {
-        let mut config = self.get_chain_config()?.ok_or_else(|| {
+        let mut desired = self.get_chain_config()?.ok_or_else(|| {
             StorageError::State("fee activation requires a stored chain configuration".into())
         })?;
-        if let Some(stored_height) = config.fee_accounting_activation_height {
-            return if stored_height == height {
-                Ok(())
-            } else {
-                Err(StorageError::State(
-                    "stored fee activation cannot be changed".into(),
-                ))
-            };
-        }
-        let head = self.get_head_block()?.ok_or_else(|| {
-            StorageError::State("fee activation requires a canonical head".into())
+        desired.fee_accounting_activation_height = Some(height);
+        self.schedule_protocol_activations(&desired)
+    }
+
+    /// Schedule future rules atomically while holding the exclusive startup lock.
+    /// Existing schedules and canonical history cannot be changed.
+    pub fn schedule_protocol_activations(&self, desired: &ChainConfig) -> Result<(), StorageError> {
+        let stored = self.get_chain_config()?.ok_or_else(|| {
+            StorageError::State("activation requires a stored chain configuration".into())
         })?;
-        if height <= head.number() {
+        if stored.chain_id != desired.chain_id || stored.genesis_hash != desired.genesis_hash {
             return Err(StorageError::State(
-                "fee activation must be above the existing canonical head".into(),
+                "activation requires the original chain identity".into(),
             ));
         }
-        config.fee_accounting_activation_height = Some(height);
+        if stored == *desired {
+            return Ok(());
+        }
+        let head = self
+            .get_head_block()?
+            .ok_or_else(|| StorageError::State("activation requires a canonical head".into()))?;
+        for (name, previous, next) in [
+            (
+                "fee",
+                stored.fee_accounting_activation_height,
+                desired.fee_accounting_activation_height,
+            ),
+            (
+                "bloom",
+                stored.bloom_activation_height,
+                desired.bloom_activation_height,
+            ),
+        ] {
+            if previous == next {
+                continue;
+            }
+            if previous.is_some() || next.is_none() {
+                return Err(StorageError::State(format!(
+                    "stored {name} activation cannot be changed"
+                )));
+            }
+            if next.is_some_and(|height| height <= head.number()) {
+                return Err(StorageError::State(format!(
+                    "{name} activation must be above the existing canonical head"
+                )));
+            }
+        }
         let data =
-            serde_json::to_vec(&config).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            serde_json::to_vec(desired).map_err(|e| StorageError::Serialization(e.to_string()))?;
         self.store.put(prefix::CHAIN_CONFIG, &data)
     }
 
@@ -1827,6 +1858,9 @@ impl<S: KvStore> ChainStore<S> {
         let trusted = ChainConfig {
             chain_id: expected_chain_id,
             genesis_hash: *expected_genesis_hash,
+            bloom_activation_height: self
+                .get_chain_config()?
+                .and_then(|config| config.bloom_activation_height),
             fee_accounting_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.fee_accounting_activation_height),
@@ -1860,6 +1894,7 @@ impl<S: KvStore> ChainStore<S> {
         // Validate compatibility
         metadata.validate_compatibility(expected_chain_id, expected_genesis_hash)?;
         let trusted_fee_activation = trusted.fee_accounting_activation_height;
+        let trusted_bloom_activation = trusted.bloom_activation_height;
 
         // Validate the canonical head and its state root before writing any
         // snapshot entries. This prevents a semantic import failure from
@@ -1982,6 +2017,7 @@ impl<S: KvStore> ChainStore<S> {
                 if config.chain_id != expected_chain_id
                     || &config.genesis_hash != expected_genesis_hash
                     || config.fee_accounting_activation_height != trusted_fee_activation
+                    || config.bloom_activation_height != trusted_bloom_activation
                 {
                     return Err(StorageError::State(
                         "snapshot chain configuration does not match the trusted chain".into(),
@@ -2008,6 +2044,16 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted fee activation".into(),
+            ));
+        }
+
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.bloom_activation_height)
+            != trusted_bloom_activation
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted bloom activation".into(),
             ));
         }
 
@@ -2194,6 +2240,7 @@ impl<S: KvStore> ChainStore<S> {
         // Snapshots may omit the config entry. Publish the caller's validated
         // chain identity with the head so a fresh destination remains bootable.
         let config = ChainConfig {
+            bloom_activation_height: trusted_bloom_activation,
             fee_accounting_activation_height: trusted_fee_activation,
             chain_id: expected_chain_id,
             genesis_hash: *expected_genesis_hash,
@@ -3690,6 +3737,7 @@ mod tests {
         assert!(cs.get_chain_config().unwrap().is_none());
 
         let config = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: ShellHash::ZERO,
@@ -3706,12 +3754,14 @@ mod tests {
         let legacy = serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO});
         let config: ChainConfig = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(config.fee_accounting_activation_height, None);
+        assert_eq!(config.bloom_activation_height, None);
         assert_eq!(serde_json::to_value(&config).unwrap(), legacy);
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
         cs.put_chain_config(&config).unwrap();
         let restarted = ChainStore::new(store);
         let changed = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: Some(5),
             ..config.clone()
         };
@@ -3727,12 +3777,57 @@ mod tests {
             let trusted = ChainConfig {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
+                bloom_activation_height: None,
                 fee_accounting_activation_height: trusted_height,
             };
             cs.put_chain_config(&trusted).unwrap();
             let before = store.scan_prefix(b"").unwrap();
             let untrusted = ChainConfig {
+                bloom_activation_height: None,
                 fee_accounting_activation_height: Some(6),
+                ..trusted
+            };
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(
+                    prefix::CHAIN_CONFIG,
+                    &serde_json::to_vec(&untrusted).unwrap(),
+                )
+                .unwrap();
+            writer.finalize().unwrap();
+            let err = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(err.to_string().contains("does not match the trusted chain"));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn bloom_activation_snapshot_mismatch_is_rejected_before_writes() {
+        for trusted_height in [None, Some(5)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted = ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: trusted_height,
+            };
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let untrusted = ChainConfig {
+                fee_accounting_activation_height: None,
+                bloom_activation_height: Some(6),
                 ..trusted
             };
             let metadata = crate::SnapshotMetadata::new(
@@ -4042,11 +4137,13 @@ mod tests {
         let trusted_genesis = ShellHash::from([0x11; 32]);
         let mismatched_configs = [
             ChainConfig {
+                bloom_activation_height: None,
                 fee_accounting_activation_height: None,
                 chain_id: 9999,
                 genesis_hash: trusted_genesis,
             },
             ChainConfig {
+                bloom_activation_height: None,
                 fee_accounting_activation_height: None,
                 chain_id: 1337,
                 genesis_hash: ShellHash::from([0x22; 32]),
@@ -4094,6 +4191,7 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(store);
         let config = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: ShellHash::ZERO,
@@ -4206,6 +4304,7 @@ mod tests {
         assert_eq!(
             cs.get_chain_config().unwrap(),
             Some(ChainConfig {
+                bloom_activation_height: None,
                 fee_accounting_activation_height: None,
                 chain_id: 1337,
                 genesis_hash: ShellHash::default(),
@@ -5121,6 +5220,7 @@ mod tests {
         head.header.parent_hash = ShellHash::from([0x77; 32]);
         let head_hash = head.hash();
         let config = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,
@@ -5515,7 +5615,12 @@ mod tests {
 
     #[test]
     fn test_export_import_snapshot_roundtrip() {
-        for activation in [None, Some(0), Some(2)] {
+        for (activation, bloom_activation) in [
+            (None, None),
+            (Some(0), Some(2)),
+            (Some(2), Some(0)),
+            (None, Some(2)),
+        ] {
             let store = Arc::new(MemoryDb::new());
             let cs = ChainStore::new(store.clone());
 
@@ -5527,6 +5632,7 @@ mod tests {
             put_canonical(&cs, &b1);
 
             cs.put_chain_config(&ChainConfig {
+                bloom_activation_height: bloom_activation,
                 fee_accounting_activation_height: activation,
                 chain_id: 1337,
                 genesis_hash: b0.hash(),
@@ -5558,6 +5664,7 @@ mod tests {
             // Verify chain metadata and canonical data were restored.
             let loaded_cfg = cs2.get_chain_config().unwrap().unwrap();
             assert_eq!(loaded_cfg.fee_accounting_activation_height, activation);
+            assert_eq!(loaded_cfg.bloom_activation_height, bloom_activation);
             assert_eq!(loaded_cfg.chain_id, 1337);
             assert_eq!(loaded_cfg.genesis_hash, b0.hash());
             assert_eq!(
@@ -5576,6 +5683,7 @@ mod tests {
         let b0 = empty_block(0);
         put_canonical(&cs, &b0);
         cs.put_chain_config(&ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: b0.hash(),
@@ -5626,6 +5734,7 @@ mod tests {
         let genesis = empty_block(0);
         put_canonical(&cs, &genesis);
         cs.put_chain_config(&ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: genesis.hash(),
@@ -6731,6 +6840,7 @@ mod tests {
         let block = empty_block(0);
         let genesis_hash = block.hash();
         let config = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,
@@ -6753,6 +6863,7 @@ mod tests {
         let block = empty_block(0);
         let genesis_hash = block.hash();
         let config = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,

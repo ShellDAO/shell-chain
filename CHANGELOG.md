@@ -32,6 +32,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add an independent, default-off Bloom activation height. New blocks use standard
+  bit ordering while historical bytes remain unchanged; log queries and filter
+  polling select the correct format across the activation boundary. Persist both
+  protocol schedules atomically and validate them on restart and snapshot import.
+
 - Add an optional, persisted fee accounting activation height. Activated blocks
   charge effective execution fees once, distribute them through the block gas
   reward, and bill gas after refunds across ordinary, AA, and native calls.

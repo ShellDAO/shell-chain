@@ -362,6 +362,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             // the destination: snapshot import requires an empty chain.
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
+                bloom_activation_height: genesis_config.bloom_activation_height,
                 fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
                 chain_id,
                 genesis_hash: genesis.hash(),
@@ -395,35 +396,29 @@ async fn initialize_chain<S: KvStore + 'static>(
         info!("Chain already has a canonical head, skipping checkpoint sync");
     }
 
-    let stored_activation = chain_store
-        .get_chain_config()?
-        .and_then(|config| config.fee_accounting_activation_height);
-    if stored_activation != genesis_config.fee_accounting_activation_height {
-        match (
-            stored_activation,
-            genesis_config.fee_accounting_activation_height,
-        ) {
-            (None, Some(height)) => {
-                let trusted_genesis =
-                    initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
-                let stored = chain_store
-                    .get_chain_config()?
-                    .ok_or("stored chain configuration is missing")?;
-                if stored.chain_id != genesis_config.chain_id
-                    || stored.genesis_hash != trusted_genesis.hash()
-                {
-                    return Err(
-                        "fee activation requires the original local genesis configuration".into(),
-                    );
-                }
-                chain_store.schedule_fee_accounting_activation(height)?;
-            }
-            _ => {
-                return Err(
-                    "stored fee activation does not match local genesis configuration".into(),
-                )
-            }
+    let stored = chain_store.get_chain_config()?;
+    if stored
+        .as_ref()
+        .and_then(|config| config.fee_accounting_activation_height)
+        != genesis_config.fee_accounting_activation_height
+        || stored
+            .as_ref()
+            .and_then(|config| config.bloom_activation_height)
+            != genesis_config.bloom_activation_height
+    {
+        let stored = stored.ok_or("stored chain configuration is missing")?;
+        let trusted_genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
+        if stored.chain_id != genesis_config.chain_id
+            || stored.genesis_hash != trusted_genesis.hash()
+        {
+            return Err("activation requires the original local genesis configuration".into());
         }
+        let desired = shell_storage::ChainConfig {
+            fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
+            bloom_activation_height: genesis_config.bloom_activation_height,
+            ..stored
+        };
+        chain_store.schedule_protocol_activations(&desired)?;
     }
     initialize_authority_pubkeys(genesis_config, &chain_store)?;
     Ok(())
@@ -621,6 +616,7 @@ async fn run_with_store<S: KvStore + 'static>(
         );
 
         let config = GenesisConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: args.chain_id,
             chain_name: format!("shell-chain-{}", args.network),
@@ -1166,6 +1162,7 @@ mod tests {
 
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: 1337,
             chain_name: "shell-chain-test".into(),
@@ -1322,7 +1319,7 @@ mod tests {
     async fn first_start_checkpoint_does_not_replace_an_existing_head() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_genesis(Address::from([7u8; 20]));
-        for height in [0, 1] {
+        for (height, has_config) in [(0, true), (1, true), (0, false), (1, false)] {
             let store = Arc::new(MemoryDb::new());
             let genesis = initialize_genesis(&config, Arc::clone(&store)).unwrap();
             let chain = ChainStore::new(Arc::clone(&store));
@@ -1333,6 +1330,10 @@ mod tests {
                         None,
                     )
                     .unwrap();
+            }
+            if !has_config {
+                store.delete(b"CFG").unwrap();
+                assert!(chain.get_chain_config().unwrap().is_none());
             }
             let before = store.scan_prefix(b"").unwrap();
             initialize_chain(
@@ -1384,6 +1385,7 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
+            bloom_activation_height: None,
             fee_accounting_activation_height: None,
             chain_id: config.chain_id,
             genesis_hash: ShellHash::from([0xAB; 32]),
@@ -1429,6 +1431,72 @@ mod tests {
         initialize_genesis(&test_genesis(authority), Arc::clone(&store)).unwrap();
 
         validate_transaction_protocol(&ChainStore::new(store)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bloom_activation_scheduling_is_independent_atomic_and_persistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let mut config = test_genesis(Address::from([7u8; 20]));
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        config.fee_accounting_activation_height = Some(2);
+        config.bloom_activation_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.bloom_activation_height = Some(3);
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let chain = ChainStore::new(Arc::clone(&store));
+        let persisted = chain.get_chain_config().unwrap().unwrap();
+        assert_eq!(persisted.fee_accounting_activation_height, Some(2));
+        assert_eq!(persisted.bloom_activation_height, Some(3));
+        let before = store.scan_prefix(b"").unwrap();
+        for conflicting in [None, Some(4)] {
+            config.bloom_activation_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
     }
 
     #[tokio::test]
@@ -1550,6 +1618,7 @@ mod tests {
             .commit_genesis_block(
                 &genesis,
                 &ChainConfig {
+                    bloom_activation_height: None,
                     fee_accounting_activation_height: None,
                     chain_id: config.chain_id,
                     genesis_hash: legacy_hash,
