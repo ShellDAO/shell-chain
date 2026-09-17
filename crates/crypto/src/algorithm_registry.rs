@@ -244,6 +244,24 @@ pub fn with_algorithm_registry_override<T>(
     operation()
 }
 
+/// Mutate the current branch override, or the canonical registry when no override exists.
+/// The callback receives an owned branch snapshot so registry reads remain reentrant.
+pub fn with_algorithm_registry_mut<T>(operation: impl FnOnce(&mut AlgorithmRegistry) -> T) -> T {
+    let local = REGISTRY_OVERRIDES.with(|overrides| overrides.borrow().last().cloned());
+    if let Some(mut registry) = local {
+        let result = operation(&mut registry);
+        REGISTRY_OVERRIDES.with(|overrides| {
+            *overrides
+                .borrow_mut()
+                .last_mut()
+                .expect("registry override remains active") = registry;
+        });
+        result
+    } else {
+        operation(&mut AlgorithmRegistry::global_mut())
+    }
+}
+
 /// Convenience function: check whether `algo` is allowed according to the
 /// global compile-time registry.
 ///

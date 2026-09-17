@@ -13,8 +13,8 @@ mod sphincs;
 mod verifier;
 
 pub use algorithm_registry::{
-    is_algorithm_allowed, with_algorithm_registry_override, AlgorithmEntry, AlgorithmRegistry,
-    AlgorithmStatus,
+    is_algorithm_allowed, with_algorithm_registry_mut, with_algorithm_registry_override,
+    AlgorithmEntry, AlgorithmRegistry, AlgorithmStatus,
 };
 #[cfg(feature = "batch")]
 pub use batch::{BatchVerifier, PreVerified, VerifyItem};

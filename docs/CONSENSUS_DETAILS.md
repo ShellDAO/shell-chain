@@ -296,6 +296,19 @@ prefers the chain with:
 In the base PoA engine, validator weights are uniform, making rule 2 equivalent
 to longest-chain.
 
+Before validating transactions in a side-fork descendant, the node reconstructs
+its parent's state from the retained common ancestor in a disposable overlay.
+Canonical address metadata is rolled back in that overlay and the known branch
+prefix is replayed with its own public keys, block mappings and algorithm policy.
+The path must remain above finality and have complete, continuous retained blocks.
+Replay work scales with the unfinalized branch prefix; no branch cache is persisted.
+
+Governance calls and scheduled algorithm changes during this replay use a
+thread-local registry. They cannot publish policy to concurrent canonical
+validation. Invalid descendants leave canonical state and metadata unchanged.
+Empty transaction lists require no account validation. Preferred-fork adoption
+continues to replay and verify the selected branch before committing it.
+
 ---
 
 ## Slashing

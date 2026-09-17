@@ -32,6 +32,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Validate stateful side-fork descendants against reconstructed parent state,
+  restoring branch public keys and isolating governance changes from canonical
+  validation while retaining finality and replay checks.
+
 - Restore known full-width contract addresses in ordinary and AA logs after an
   explicit `log_address_activation_height`, allowing full-address log queries
   to match activated receipts while preserving historical log bytes.

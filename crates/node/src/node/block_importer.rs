@@ -357,23 +357,112 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    /// Reconstruct only the retained, unfinalized branch prefix in a disposable overlay.
+    /// Provisional validation must not publish branch state or governance policy.
+    fn side_fork_parent_store(
+        &self,
+        parent: &Block,
+    ) -> Result<Arc<shell_storage::OverlayStore<S>>, NodeError> {
+        let head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        let (ancestor_hash, old_hashes, new_hashes) = {
+            let choice = self.fork_choice.read();
+            let ancestor = choice
+                .find_common_ancestor(&head.hash(), &parent.hash())
+                .ok_or_else(|| {
+                    NodeError::Startup("side-fork parent has no retained common ancestor".into())
+                })?;
+            (
+                ancestor,
+                choice.chain_between(&head.hash(), &ancestor),
+                choice.chain_between(&parent.hash(), &ancestor),
+            )
+        };
+        let ancestor = self
+            .chain_store
+            .get_block_by_hash(&ancestor_hash)?
+            .ok_or_else(|| NodeError::Startup("side-fork ancestor is missing".into()))?;
+        let finality = self.finality.read();
+        if ancestor.number() < finality.last_finalized_number()
+            || (finality.last_finalized_number() > 0
+                && ancestor.number() == finality.last_finalized_number()
+                && ancestor_hash != *finality.last_finalized_hash())
+        {
+            return Err(Self::invalid_fork(
+                parent.hash(),
+                "side-fork parent crosses finality",
+            ));
+        }
+        drop(finality);
+        if self
+            .chain_store
+            .get_block_hash_by_number(ancestor.number())?
+            != Some(ancestor_hash)
+        {
+            return Err(NodeError::Startup(
+                "side-fork ancestor is not canonical".into(),
+            ));
+        }
+        let old_chain = self.load_fork_segment(
+            "side-fork rollback",
+            ancestor_hash,
+            ancestor.number(),
+            &old_hashes,
+            true,
+        )?;
+        let new_chain = self.load_fork_segment(
+            "side-fork prefix",
+            ancestor_hash,
+            ancestor.number(),
+            &new_hashes,
+            false,
+        )?;
+        let overlay = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        let chain = ChainStore::new(overlay.clone());
+        chain.restore_address_metadata(&old_chain)?;
+        let state = WorldState::at_root(overlay.clone(), &ancestor.header.state_root)?;
+        let mut registry = load_algorithm_registry(&state).map_err(|error| {
+            NodeError::Startup(format!(
+                "failed to load side-fork ancestor registry: {error}"
+            ))
+        })?;
+        let mut previous = ancestor;
+        for block in new_chain {
+            chain.set_head(&previous.hash())?;
+            self.replay_fork_block_with_registry(
+                &block,
+                previous.header.state_root,
+                overlay.clone(),
+                &mut registry,
+            )?;
+            chain.set_canonical(block.number(), &block.hash())?;
+            previous = block;
+        }
+        if previous.hash() != parent.hash() {
+            return Err(NodeError::Startup(
+                "side-fork prefix does not reach parent".into(),
+            ));
+        }
+        Ok(overlay)
+    }
+
     fn validate_side_fork_transactions(
         &self,
         block: &Block,
         parent: &Block,
     ) -> Result<(), NodeError> {
-        let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        if block.transactions.is_empty() {
+            return Ok(());
+        }
+        let import_store = self.side_fork_parent_store(parent)?;
         let import_cs = ChainStore::new(import_store.clone());
         import_cs.set_head(&parent.hash())?;
         let mut world_state = WorldState::at_root(import_store, &parent.header.state_root)?;
-        // A side-fork parent's full trie is not guaranteed to be materialized
-        // until adoption replay. Use the compile-time registry for provisional
-        // cryptographic validation so canonical governance state cannot reject
-        // a competing candidate. Keep that policy thread-local so concurrent
-        // canonical validation continues to enforce governance state. Adoption
-        // replay reloads the ancestor registry and enforces every stateful
-        // algorithm transition before commit.
-        let provisional_registry = AlgorithmRegistry::default();
+        let provisional_registry = load_algorithm_registry(&world_state).map_err(|error| {
+            NodeError::Startup(format!("failed to load side-fork parent registry: {error}"))
+        })?;
         let verifier = MultiVerifier;
         let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
@@ -482,6 +571,38 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn replay_preferred_fork_block(
+        &self,
+        block: &Block,
+        parent_state_root: ShellHash,
+        replay_store: Arc<shell_storage::OverlayStore<S>>,
+    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+        let mut registry = AlgorithmRegistry::global().clone();
+        let result = self.replay_fork_block_with_registry(
+            block,
+            parent_state_root,
+            replay_store,
+            &mut registry,
+        )?;
+        *AlgorithmRegistry::global_mut() = registry;
+        Ok(result)
+    }
+
+    fn replay_fork_block_with_registry(
+        &self,
+        block: &Block,
+        parent_state_root: ShellHash,
+        replay_store: Arc<shell_storage::OverlayStore<S>>,
+        registry: &mut AlgorithmRegistry,
+    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+        let validation_registry = registry.clone();
+        with_algorithm_registry_override(&validation_registry, || {
+            let result = self.replay_fork_block_inner(block, parent_state_root, replay_store);
+            *registry = shell_crypto::with_algorithm_registry_mut(|current| current.clone());
+            result
+        })
+    }
+
+    fn replay_fork_block_inner(
         &self,
         block: &Block,
         parent_state_root: ShellHash,
@@ -811,15 +932,14 @@ impl<S: KvStore + 'static> Node<S> {
                     format!("block {} system transactions mismatch", block.number()),
                 ));
             }
-            {
-                let mut registry = AlgorithmRegistry::global_mut();
+            shell_crypto::with_algorithm_registry_mut(|registry| {
                 apply_pending_activations(
                     block.number(),
                     evm.state_db_mut().world_state_mut(),
-                    &mut registry,
+                    registry,
                     "preferred-fork replay",
-                )?;
-            }
+                )
+            })?;
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 || !block.system_transactions.is_empty() {
@@ -832,15 +952,14 @@ impl<S: KvStore + 'static> Node<S> {
                 ));
             }
             let mut world_state = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
-            {
-                let mut registry = AlgorithmRegistry::global_mut();
+            shell_crypto::with_algorithm_registry_mut(|registry| {
                 apply_pending_activations(
                     block.number(),
                     &mut world_state,
-                    &mut registry,
+                    registry,
                     "preferred-fork empty-block replay",
-                )?;
-            }
+                )
+            })?;
             world_state.state_root()?
         };
 

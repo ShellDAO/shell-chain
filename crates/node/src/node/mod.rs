@@ -3187,7 +3187,23 @@ mod tests {
 
             let mut second = side_one.transactions[0].tx.clone();
             second.nonce = 1;
-            submit_signed_tx(&fork_node, &tx_signer, sender, second);
+            let signature = tx_signer
+                .sign(second.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed = SignedTransaction::new(sender, second, signature);
+            assert!(matches!(
+                signed.pubkey_mode,
+                shell_core::PubkeyMode::Reference
+            ));
+            fork_node
+                .tx_pool
+                .insert(
+                    signed,
+                    &mut fork_node.world_state.write(),
+                    fork_node.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
             let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
             let side_two_hash = side_two.hash();
             imported
@@ -3196,12 +3212,44 @@ mod tests {
             imported
                 .import_block(side_two.clone(), &MultiVerifier)
                 .unwrap();
-            // Stage the descendant before its competing parent trie is materialized;
-            // adoption must re-execute both blocks from the common ancestor.
-            node.chain_store.put_block(&side_two).unwrap();
-            node.fork_choice
-                .write()
-                .add_block(side_two_hash, side_one_hash, 2, 0, false);
+            let canonical_root = current_state_root(&node);
+            let canonical_nonce = node.world_state.read().get_nonce(&sender).unwrap();
+            let canonical_pubkey = node.chain_store.get_pubkey(&sender).unwrap();
+            let before = node.store.scan_prefix(b"").unwrap();
+            let mut invalid = side_two.clone();
+            invalid.transactions[0].signature.data.clear();
+            invalid.header.extra_data = Bytes::from_static(b"invalid-side-descendant");
+            invalid.header.witness_root = None;
+            invalid.header.sig_aggregate_proof = None;
+            invalid.proposer_seal = Some(
+                proposer_signer
+                    .sign(invalid.header.hash().as_bytes())
+                    .unwrap(),
+            );
+            let error = node.import_block(invalid, &MultiVerifier).unwrap_err();
+            assert!(
+                error.to_string().contains("side-fork tx validation"),
+                "{error}"
+            );
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            node.import_block(side_two.clone(), &MultiVerifier).unwrap();
+            assert_eq!(current_state_root(&node), canonical_root);
+            assert_eq!(
+                node.world_state.read().get_nonce(&sender).unwrap(),
+                canonical_nonce
+            );
+            assert_eq!(
+                node.chain_store.get_pubkey(&sender).unwrap(),
+                canonical_pubkey
+            );
+            assert_eq!(
+                node.chain_store.get_head_hash().unwrap(),
+                Some(canonical_hash)
+            );
+            assert_eq!(
+                node.chain_store.get_block_hash_by_number(1).unwrap(),
+                Some(canonical_hash)
+            );
 
             let total_weight = node
                 .consensus
