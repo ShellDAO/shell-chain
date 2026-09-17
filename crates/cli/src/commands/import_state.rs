@@ -69,6 +69,7 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                     Arc::new(shell_storage::MemoryDb::new()),
                 )?;
                 shell_storage::ChainConfig {
+                    fee_accounting_activation_height: genesis.fee_accounting_activation_height,
                     chain_id: genesis.chain_id,
                     genesis_hash: block.hash(),
                 }
@@ -77,7 +78,7 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
 
         let file = std::fs::File::open(&snapshot)?;
         let reader = std::io::BufReader::new(file);
-        let metadata = chain_store.import_snapshot(reader, cfg.chain_id, &cfg.genesis_hash)?;
+        let metadata = chain_store.import_snapshot_with_config(reader, &cfg)?;
 
         eprintln!("✓ State imported successfully");
         eprintln!("  Block:   #{}", metadata.block_number);
@@ -116,10 +117,17 @@ mod tests {
     #[cfg(feature = "rocksdb")]
     fn prepare_snapshot(
         datadir: &std::path::Path,
+        activation: Option<u64>,
     ) -> (shell_genesis::GenesisConfig, ShellHash, PathBuf) {
         crate::commands::init(datadir.to_path_buf(), None, 1337, "dev".into()).unwrap();
-        let genesis =
+        let mut genesis =
             shell_genesis::GenesisConfig::from_file(&datadir.join("genesis.json")).unwrap();
+        genesis.fee_accounting_activation_height = activation;
+        std::fs::write(
+            datadir.join("genesis.json"),
+            genesis.to_json_pretty().unwrap(),
+        )
+        .unwrap();
         let store = Arc::new(MemoryDb::new());
         let block = shell_genesis::initialize_genesis(&genesis, Arc::clone(&store)).unwrap();
         let hash = block.hash();
@@ -143,7 +151,7 @@ mod tests {
     #[test]
     fn snapshot_import_works_after_init_without_starting_node() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, expected_head, snapshot) = prepare_snapshot(dir.path());
+        let (_, expected_head, snapshot) = prepare_snapshot(dir.path(), Some(2));
 
         import_state(dir.path().to_path_buf(), snapshot.clone()).unwrap();
         {
@@ -161,7 +169,7 @@ mod tests {
     #[test]
     fn fresh_snapshot_import_requires_matching_local_genesis() {
         let source = tempfile::tempdir().unwrap();
-        let (mut genesis, _, snapshot) = prepare_snapshot(source.path());
+        let (mut genesis, _, snapshot) = prepare_snapshot(source.path(), None);
         let destination = tempfile::tempdir().unwrap();
 
         let error = import_state(destination.path().to_path_buf(), snapshot.clone()).unwrap_err();
@@ -176,6 +184,29 @@ mod tests {
         let error = import_state(destination.path().to_path_buf(), snapshot).unwrap_err();
         assert!(error.to_string().contains("genesis"));
 
+        let stores =
+            shell_storage::RocksDbStore::open_all(destination.path().join("db"), None).unwrap();
+        let chain_store = ChainStore::new(Arc::new(stores.state));
+        assert!(chain_store.get_head_hash().unwrap().is_none());
+        assert!(chain_store.get_chain_config().unwrap().is_none());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn fresh_snapshot_import_rejects_conflicting_activation_without_writes() {
+        let source = tempfile::tempdir().unwrap();
+        let (mut genesis, _, snapshot) = prepare_snapshot(source.path(), Some(2));
+        let destination = tempfile::tempdir().unwrap();
+        genesis.fee_accounting_activation_height = Some(3);
+        std::fs::write(
+            destination.path().join("genesis.json"),
+            genesis.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        let error = import_state(destination.path().to_path_buf(), snapshot).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the trusted chain"));
         let stores =
             shell_storage::RocksDbStore::open_all(destination.path().join("db"), None).unwrap();
         let chain_store = ChainStore::new(Arc::new(stores.state));

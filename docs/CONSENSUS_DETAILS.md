@@ -74,6 +74,38 @@ For normal transaction blocks, the reward rules are:
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.
 
+### Fee accounting activation
+
+The optional `fee_accounting_activation_height` in `genesis.json` selects the
+first block with reconciled execution fees. Missing or `null` preserves legacy
+execution at every height. Existing genesis defaults and historical blocks are
+unchanged; height `0` is available for explicitly configured new test chains.
+
+At and after activation, ordinary execution charges
+`min(max_fee_per_gas, base_fee_per_gas + max_priority_fee_per_gas)` multiplied by
+gas consumed after permitted refunds. The receipt and block gas reward use that
+same billed gas. Revm's separate beneficiary credit is suppressed because the
+deterministic system reward pays the full execution fee once. AA charges its
+sender or paymaster at the same effective price, including the bundle overhead;
+native calls use that price on both success and failure. STARK minting and blob
+gas accounting remain separate. RPC gas-limit estimates use gas spent before
+refunds, since refunds cannot fund execution that has not finished.
+
+The rule is selected from the block being executed, including fork adoption and
+historical replay. Contract validation and simulation use their own block
+context, including the corresponding `BASEFEE`; a current tip cannot change an
+older block's execution rules.
+
+The activation height is persisted with chain configuration and checked on
+restart and snapshot import. To schedule an existing legacy chain, all validators
+must first coordinate a future height and run compatible software. At startup,
+an explicit height in the original genesis configuration may be installed once
+only if it is above the local canonical head. This preserves the genesis hash
+and existing history. A persisted height cannot be changed or removed through
+the genesis file. Snapshots with conflicting activation schedules are rejected
+before import; restore an older legacy snapshot with its original configuration
+before scheduling a future upgrade. No activation height is selected by default.
+
 ### Configuration
 
 ```toml

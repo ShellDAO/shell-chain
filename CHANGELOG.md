@@ -32,6 +32,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add an optional, persisted fee accounting activation height. Activated blocks
+  charge effective execution fees once, distribute them through the block gas
+  reward, and bill gas after refunds across ordinary, AA, and native calls.
+  Legacy heights retain their existing execution; no network activates by default.
+
 - Preserve the full 32-byte proposer address when ordinary transactions read
   and credit the execution fee beneficiary.
 

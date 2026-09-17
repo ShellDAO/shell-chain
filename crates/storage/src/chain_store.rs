@@ -12,11 +12,14 @@ use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
 const SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES: usize = 10_000;
 const SNAPSHOT_IMPORT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Persistent chain configuration (written once at genesis).
+/// Persistent chain identity and its explicitly scheduled protocol rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub genesis_hash: ShellHash,
+    /// First block using reconciled execution fees. Missing means legacy rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_accounting_activation_height: Option<u64>,
 }
 
 /// Maximum number of guardians per account.
@@ -1235,6 +1238,14 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         config: &ChainConfig,
     ) -> Result<(), StorageError> {
+        if self
+            .get_chain_config()?
+            .is_some_and(|stored| stored != *config)
+        {
+            return Err(StorageError::State(
+                "stored chain configuration cannot be changed".into(),
+            ));
+        }
         let genesis_hash = block.hash();
         let config_bytes =
             serde_json::to_vec(config).map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -1563,8 +1574,45 @@ impl<S: KvStore> ChainStore<S> {
     /// Persist the chain configuration (chain_id + genesis hash).
     /// Should be called exactly once after genesis initialization.
     pub fn put_chain_config(&self, config: &ChainConfig) -> Result<(), StorageError> {
+        if self
+            .get_chain_config()?
+            .is_some_and(|stored| stored != *config)
+        {
+            return Err(StorageError::State(
+                "stored chain configuration cannot be changed".into(),
+            ));
+        }
         let data =
             serde_json::to_vec(config).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.store.put(prefix::CHAIN_CONFIG, &data)
+    }
+
+    /// Schedule the fee upgrade once, while holding the node's exclusive startup lock.
+    /// Existing canonical history must remain strictly below the activation height.
+    pub fn schedule_fee_accounting_activation(&self, height: u64) -> Result<(), StorageError> {
+        let mut config = self.get_chain_config()?.ok_or_else(|| {
+            StorageError::State("fee activation requires a stored chain configuration".into())
+        })?;
+        if let Some(stored_height) = config.fee_accounting_activation_height {
+            return if stored_height == height {
+                Ok(())
+            } else {
+                Err(StorageError::State(
+                    "stored fee activation cannot be changed".into(),
+                ))
+            };
+        }
+        let head = self.get_head_block()?.ok_or_else(|| {
+            StorageError::State("fee activation requires a canonical head".into())
+        })?;
+        if height <= head.number() {
+            return Err(StorageError::State(
+                "fee activation must be above the existing canonical head".into(),
+            ));
+        }
+        config.fee_accounting_activation_height = Some(height);
+        let data =
+            serde_json::to_vec(&config).map_err(|e| StorageError::Serialization(e.to_string()))?;
         self.store.put(prefix::CHAIN_CONFIG, &data)
     }
 
@@ -1776,11 +1824,42 @@ impl<S: KvStore> ChainStore<S> {
     where
         S: 'static,
     {
+        let trusted = ChainConfig {
+            chain_id: expected_chain_id,
+            genesis_hash: *expected_genesis_hash,
+            fee_accounting_activation_height: self
+                .get_chain_config()?
+                .and_then(|config| config.fee_accounting_activation_height),
+        };
+        self.import_snapshot_with_config(reader, &trusted)
+    }
+
+    /// Import with a locally trusted configuration without publishing it before validation.
+    pub fn import_snapshot_with_config<R: Read + Seek>(
+        &self,
+        reader: R,
+        trusted: &ChainConfig,
+    ) -> Result<crate::SnapshotMetadata, StorageError>
+    where
+        S: 'static,
+    {
+        let expected_chain_id = trusted.chain_id;
+        let expected_genesis_hash = &trusted.genesis_hash;
+        if self
+            .get_chain_config()?
+            .is_some_and(|stored| stored != *trusted)
+        {
+            return Err(StorageError::State(
+                "trusted snapshot configuration conflicts with the stored chain configuration"
+                    .into(),
+            ));
+        }
         let mut snap_reader = crate::SnapshotReader::new(reader)?;
         let metadata = snap_reader.metadata().clone();
 
         // Validate compatibility
         metadata.validate_compatibility(expected_chain_id, expected_genesis_hash)?;
+        let trusted_fee_activation = trusted.fee_accounting_activation_height;
 
         // Validate the canonical head and its state root before writing any
         // snapshot entries. This prevents a semantic import failure from
@@ -1902,6 +1981,7 @@ impl<S: KvStore> ChainStore<S> {
                 })?;
                 if config.chain_id != expected_chain_id
                     || &config.genesis_hash != expected_genesis_hash
+                    || config.fee_accounting_activation_height != trusted_fee_activation
                 {
                     return Err(StorageError::State(
                         "snapshot chain configuration does not match the trusted chain".into(),
@@ -1919,6 +1999,16 @@ impl<S: KvStore> ChainStore<S> {
                     )));
                 }
             }
+        }
+
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.fee_accounting_activation_height)
+            != trusted_fee_activation
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted fee activation".into(),
+            ));
         }
 
         if snapshot_metadata_undo_pruned_finalized.unwrap_or(0)
@@ -2104,6 +2194,7 @@ impl<S: KvStore> ChainStore<S> {
         // Snapshots may omit the config entry. Publish the caller's validated
         // chain identity with the head so a fresh destination remains bootable.
         let config = ChainConfig {
+            fee_accounting_activation_height: trusted_fee_activation,
             chain_id: expected_chain_id,
             genesis_hash: *expected_genesis_hash,
         };
@@ -3599,6 +3690,7 @@ mod tests {
         assert!(cs.get_chain_config().unwrap().is_none());
 
         let config = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: ShellHash::ZERO,
         };
@@ -3607,6 +3699,65 @@ mod tests {
         let loaded = cs.get_chain_config().unwrap().unwrap();
         assert_eq!(loaded.chain_id, 1337);
         assert_eq!(loaded.genesis_hash, ShellHash::ZERO);
+    }
+
+    #[test]
+    fn fee_activation_config_defaults_to_legacy_and_cannot_change_on_restart() {
+        let legacy = serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO});
+        let config: ChainConfig = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(config.fee_accounting_activation_height, None);
+        assert_eq!(serde_json::to_value(&config).unwrap(), legacy);
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        cs.put_chain_config(&config).unwrap();
+        let restarted = ChainStore::new(store);
+        let changed = ChainConfig {
+            fee_accounting_activation_height: Some(5),
+            ..config.clone()
+        };
+        assert!(restarted.put_chain_config(&changed).is_err());
+        assert_eq!(restarted.get_chain_config().unwrap(), Some(config));
+    }
+
+    #[test]
+    fn fee_activation_snapshot_mismatch_is_rejected_before_writes() {
+        for trusted_height in [None, Some(5)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted = ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: trusted_height,
+            };
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let untrusted = ChainConfig {
+                fee_accounting_activation_height: Some(6),
+                ..trusted
+            };
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(
+                    prefix::CHAIN_CONFIG,
+                    &serde_json::to_vec(&untrusted).unwrap(),
+                )
+                .unwrap();
+            writer.finalize().unwrap();
+            let err = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(err.to_string().contains("does not match the trusted chain"));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
     }
 
     #[test]
@@ -3891,10 +4042,12 @@ mod tests {
         let trusted_genesis = ShellHash::from([0x11; 32]);
         let mismatched_configs = [
             ChainConfig {
+                fee_accounting_activation_height: None,
                 chain_id: 9999,
                 genesis_hash: trusted_genesis,
             },
             ChainConfig {
+                fee_accounting_activation_height: None,
                 chain_id: 1337,
                 genesis_hash: ShellHash::from([0x22; 32]),
             },
@@ -3941,6 +4094,7 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(store);
         let config = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: ShellHash::ZERO,
         };
@@ -4052,6 +4206,7 @@ mod tests {
         assert_eq!(
             cs.get_chain_config().unwrap(),
             Some(ChainConfig {
+                fee_accounting_activation_height: None,
                 chain_id: 1337,
                 genesis_hash: ShellHash::default(),
             })
@@ -4966,6 +5121,7 @@ mod tests {
         head.header.parent_hash = ShellHash::from([0x77; 32]);
         let head_hash = head.hash();
         let config = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,
         };
@@ -5359,51 +5515,57 @@ mod tests {
 
     #[test]
     fn test_export_import_snapshot_roundtrip() {
-        let store = Arc::new(MemoryDb::new());
-        let cs = ChainStore::new(store.clone());
+        for activation in [None, Some(0), Some(2)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(store.clone());
 
-        // Store some real chain data.
-        let b0 = empty_block(0);
-        put_canonical(&cs, &b0);
-        let mut b1 = empty_block(1);
-        b1.header.parent_hash = b0.hash();
-        put_canonical(&cs, &b1);
+            // Store some real chain data.
+            let b0 = empty_block(0);
+            put_canonical(&cs, &b0);
+            let mut b1 = empty_block(1);
+            b1.header.parent_hash = b0.hash();
+            put_canonical(&cs, &b1);
 
-        cs.put_chain_config(&ChainConfig {
-            chain_id: 1337,
-            genesis_hash: b0.hash(),
-        })
-        .unwrap();
-
-        // Export snapshot.
-        let meta =
-            crate::SnapshotMetadata::new(1337, 1, b1.hash(), ShellHash::default(), b0.hash());
-        let mut buf = Vec::new();
-        let exported = cs
-            .export_snapshot(meta, std::io::Cursor::new(&mut buf))
+            cs.put_chain_config(&ChainConfig {
+                fee_accounting_activation_height: activation,
+                chain_id: 1337,
+                genesis_hash: b0.hash(),
+            })
             .unwrap();
-        assert_eq!(exported.chain_id, 1337);
-        assert_eq!(exported.block_number, 1);
-        assert!(exported.entry_count > 0);
 
-        // Import into a fresh store.
-        let store2 = Arc::new(MemoryDb::new());
-        let cs2 = ChainStore::new(store2.clone());
+            // Export snapshot.
+            let meta =
+                crate::SnapshotMetadata::new(1337, 1, b1.hash(), ShellHash::default(), b0.hash());
+            let mut buf = Vec::new();
+            let exported = cs
+                .export_snapshot(meta, std::io::Cursor::new(&mut buf))
+                .unwrap();
+            assert_eq!(exported.chain_id, 1337);
+            assert_eq!(exported.block_number, 1);
+            assert!(exported.entry_count > 0);
 
-        let imported = cs2
-            .import_snapshot(std::io::Cursor::new(&buf), 1337, &b0.hash())
-            .unwrap();
-        assert_eq!(imported.entry_count, exported.entry_count);
+            // Import into a fresh store.
+            let store2 = Arc::new(MemoryDb::new());
+            let cs2 = ChainStore::new(store2.clone());
+            cs2.put_chain_config(&cs.get_chain_config().unwrap().unwrap())
+                .unwrap();
 
-        // Verify chain metadata and canonical data were restored.
-        let loaded_cfg = cs2.get_chain_config().unwrap().unwrap();
-        assert_eq!(loaded_cfg.chain_id, 1337);
-        assert_eq!(loaded_cfg.genesis_hash, b0.hash());
-        assert_eq!(
-            cs2.get_block_by_number(1).unwrap().unwrap().hash(),
-            b1.hash()
-        );
-        assert_eq!(cs2.get_head_block().unwrap().unwrap().hash(), b1.hash());
+            let imported = cs2
+                .import_snapshot(std::io::Cursor::new(&buf), 1337, &b0.hash())
+                .unwrap();
+            assert_eq!(imported.entry_count, exported.entry_count);
+
+            // Verify chain metadata and canonical data were restored.
+            let loaded_cfg = cs2.get_chain_config().unwrap().unwrap();
+            assert_eq!(loaded_cfg.fee_accounting_activation_height, activation);
+            assert_eq!(loaded_cfg.chain_id, 1337);
+            assert_eq!(loaded_cfg.genesis_hash, b0.hash());
+            assert_eq!(
+                cs2.get_block_by_number(1).unwrap().unwrap().hash(),
+                b1.hash()
+            );
+            assert_eq!(cs2.get_head_block().unwrap().unwrap().hash(), b1.hash());
+        }
     }
 
     #[test]
@@ -5414,6 +5576,7 @@ mod tests {
         let b0 = empty_block(0);
         put_canonical(&cs, &b0);
         cs.put_chain_config(&ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: b0.hash(),
         })
@@ -5463,6 +5626,7 @@ mod tests {
         let genesis = empty_block(0);
         put_canonical(&cs, &genesis);
         cs.put_chain_config(&ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash: genesis.hash(),
         })
@@ -6567,6 +6731,7 @@ mod tests {
         let block = empty_block(0);
         let genesis_hash = block.hash();
         let config = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,
         };
@@ -6588,6 +6753,7 @@ mod tests {
         let block = empty_block(0);
         let genesis_hash = block.hash();
         let config = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             genesis_hash,
         };

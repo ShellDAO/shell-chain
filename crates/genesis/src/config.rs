@@ -153,6 +153,9 @@ pub struct NetworkParams {
 pub struct GenesisConfig {
     /// Unique chain identifier.
     pub chain_id: u64,
+    /// First block using reconciled execution fees; omitted for legacy networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_accounting_activation_height: Option<u64>,
     /// Human-readable chain name.
     #[serde(default = "default_chain_name")]
     pub chain_name: String,

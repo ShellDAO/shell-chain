@@ -186,6 +186,7 @@ async fn snapshot_export_import_roundtrip() {
     let genesis_hash = genesis.hash();
     env.chain_store
         .put_chain_config(&ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: TEST_CHAIN_ID,
             genesis_hash,
         })

@@ -589,7 +589,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             ));
         }
 
-        Ok((result.output.clone(), result.gas_used))
+        Ok((result.output.clone(), result.gas_spent))
     }
 
     /// Parse a block number string with finality awareness.
@@ -3830,6 +3830,94 @@ mod tests {
             format!("0x{:064x}{:064x}{:064x}", 42, 1_700_000_123, 6_000_000)
         );
         assert!(EthApiServer::estimate_gas(&handler, request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fee_activation_eth_call_preserves_legacy_base_fee_and_does_not_charge() {
+        let handler = setup();
+        let address = test_address(b"base-fee-contract");
+        let code = hex::decode("4860005260206000f3").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, code_hash)
+            .unwrap();
+        handler
+            .chain_store
+            .put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: Some(5),
+            })
+            .unwrap();
+        for number in [4, 5] {
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.base_fee_per_gas = 3;
+            handler.chain_store.put_block(&block).unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+            let before = handler.world_state.write().state_root().unwrap();
+            let request = crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: None,
+                access_list: None,
+            };
+            let output = EthApiServer::call(&handler, request, Some("latest".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                output,
+                format!("0x{:064x}", if number == 5 { 3 } else { 0 })
+            );
+            assert_eq!(handler.world_state.write().state_root().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_activation_gas_estimate_can_execute_a_refunding_call() {
+        let handler = setup();
+        let address = test_address(b"refunding-contract");
+        let code = hex::decode("600060005500").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        {
+            let mut ws = handler.world_state.write();
+            ws.set_code_hash(&address, code_hash).unwrap();
+            ws.set_storage(&address, &ShellHash::ZERO, &ShellHash::from([1; 32]))
+                .unwrap();
+        }
+        handler
+            .chain_store
+            .put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: Some(0),
+            })
+            .unwrap();
+        let mut request = crate::types::CallRequest {
+            from: None,
+            to: Some(address),
+            data: None,
+            value: None,
+            gas: None,
+            access_list: None,
+        };
+        request.gas = Some(
+            EthApiServer::estimate_gas(&handler, request.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            EthApiServer::call(&handler, request, Some("latest".into()))
+                .await
+                .unwrap(),
+            "0x"
+        );
     }
 
     #[tokio::test]

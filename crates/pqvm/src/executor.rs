@@ -5,11 +5,13 @@
 //! full blocks.
 
 use alloy_primitives::{Bytes as AlBytes, B256, U256};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{EVMError, ExecutionResult, HaltReason, ResultAndState};
 use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
 use revm::context_interface::transaction::{AccessList, AccessListItem as RevmAccessListItem};
+use revm::context_interface::{ContextSetters, ContextTr, JournalTr};
 use revm::handler::instructions::EthInstructions;
-use revm::handler::{ExecuteEvm, MainnetContext};
+use revm::handler::{EvmTr, EvmTrError, ExecuteEvm, FrameResult, FrameTr, Handler, MainnetContext};
+use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{
     instructions::control, interpreter_types::InterpreterTypes, Host, Instruction,
 };
@@ -62,6 +64,8 @@ pub struct TxExecutionResult {
     pub sender_nonce_after: u64,
     /// Gas actually used by this transaction.
     pub gas_used: u64,
+    /// Gas spent before refunds, for simulation gas-limit estimates.
+    pub gas_spent: u64,
     /// Raw output bytes returned by execution (return data or revert reason).
     pub output: Vec<u8>,
     /// True if this was a system contract transaction whose state changes
@@ -83,6 +87,28 @@ pub struct ShellPqvm<S: KvStore + 'static> {
 
 const OPCODE_CALLCODE: u8 = 0xF2;
 const OPCODE_SELFDESTRUCT: u8 = 0xFF;
+
+/// Revm debits the effective fee; the block's system reward distributes it once.
+struct SystemRewardHandler<EVM, ERROR, FRAME>(std::marker::PhantomData<(EVM, ERROR, FRAME)>);
+
+impl<EVM, ERROR, FRAME> Handler for SystemRewardHandler<EVM, ERROR, FRAME>
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState>>, Frame = FRAME>,
+    ERROR: EvmTrError<EVM>,
+    FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
+{
+    type Evm = EVM;
+    type Error = ERROR;
+    type HaltReason = HaltReason;
+
+    fn reward_beneficiary(
+        &self,
+        _evm: &mut Self::Evm,
+        _result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 fn next_sender_nonce(nonce: u64) -> Result<u64, ExecutorError> {
     nonce.checked_add(1).ok_or(ExecutorError::NonceOverflow)
@@ -107,6 +133,15 @@ where
 }
 
 impl<S: KvStore + 'static> ShellPqvm<S> {
+    fn reconciled_fees(&self, block_number: u64) -> Result<bool, ExecutorError> {
+        Ok(self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.fee_accounting_activation_height)
+            .is_some_and(|height| block_number >= height))
+    }
+
     pub fn new(state_db: ShellStateDb<S>, chain_id: u64) -> Self {
         Self { state_db, chain_id }
     }
@@ -160,6 +195,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
         // ── Normal PQVM/revm execution path ──────────────────────────
         let tx = &signed_tx.tx;
+        let reconciled_fees = self.reconciled_fees(header.number)?;
         let sender_shell_addr = signed_tx.from;
         let sender_nonce_after = next_sender_nonce(tx.nonce)?;
 
@@ -206,7 +242,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             beneficiary: header.proposer.into(),
             timestamp: U256::from(header.timestamp),
             gas_limit: header.gas_limit,
-            basefee: 0,
+            basefee: if reconciled_fees {
+                header.base_fee_per_gas
+            } else {
+                0
+            },
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
             blob_excess_gas_and_price: None,
@@ -235,15 +275,28 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
         // Execute
-        let result_and_state = evm
-            .transact(tx_env)
-            .map_err(|e| ExecutorError::Revm(format!("{e:?}")))?;
+        let result_and_state = if reconciled_fees {
+            evm.ctx.set_tx(tx_env);
+            let mut handler =
+                SystemRewardHandler::<_, EVMError<StateDbError>, _>(std::marker::PhantomData);
+            handler
+                .run(&mut evm)
+                .map(|result| ResultAndState::new(result, evm.finalize()))
+        } else {
+            evm.transact(tx_env)
+        }
+        .map_err(|e| ExecutorError::Revm(format!("{e:?}")))?;
 
         let exec_result = result_and_state.result;
         let state = result_and_state.state;
 
         // Build receipt
-        let gas_used = exec_result.gas().spent();
+        let gas_spent = exec_result.gas().spent();
+        let gas_used = if reconciled_fees {
+            exec_result.gas().used()
+        } else {
+            exec_result.gas().spent()
+        };
         let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
 
         let (status, logs, contract_address, output_bytes) = match exec_result {
@@ -297,6 +350,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             sender_shell_addr,
             sender_nonce_after,
             gas_used,
+            gas_spent,
             output: output_bytes,
             is_system_tx: false,
             system_contract_effects: SystemContractEffects::default(),
@@ -349,10 +403,23 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let tx = &signed_tx.tx;
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
+        let reconciled_fees = self.reconciled_fees(header.number)?;
         let max_fee = U256::from(tx.max_fee_per_gas);
-        // Inner calls run as EIP-1559 transactions against a zero-base-fee
-        // block, so revm debits the sender at this effective price.
-        let revm_gas_price = U256::from(tx.max_fee_per_gas.min(tx.max_priority_fee_per_gas));
+        let base_fee = if reconciled_fees {
+            header.base_fee_per_gas
+        } else {
+            0
+        };
+        let revm_gas_price = U256::from(shell_core::effective_gas_price(
+            tx.max_fee_per_gas,
+            tx.max_priority_fee_per_gas,
+            base_fee,
+        ));
+        let settlement_price = if reconciled_fees {
+            revm_gas_price
+        } else {
+            max_fee
+        };
         let is_sponsored = payer != sender;
         let declared_value = tx.value;
         let Some(inner_value_sum) = bundle.checked_inner_value_sum() else {
@@ -433,6 +500,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 sender_shell_addr: ShellAddress::default(),
                 sender_nonce_after: 0,
                 gas_used: 0,
+                gas_spent: 0,
                 output: b"aa: payer balance shortfall at execution".to_vec(),
                 is_system_tx: true,
                 system_contract_effects: SystemContractEffects::default(),
@@ -445,7 +513,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             beneficiary: header.proposer.into(),
             timestamp: U256::from(header.timestamp),
             gas_limit: header.gas_limit,
-            basefee: 0,
+            basefee: base_fee,
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
             blob_excess_gas_and_price: None,
@@ -460,6 +528,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             crate::tx_validation::compute_intrinsic_gas(tx.data.as_ref(), false, &tx.access_list)
                 .checked_add(bundle.intrinsic_gas_surcharge())
                 .ok_or_else(|| ExecutorError::Revm("aa bundle intrinsic gas overflow".into()))?;
+        let mut total_gas_spent = total_gas_used;
         let mut all_logs: Vec<shell_core::Log> = Vec::new();
         let mut atomic_failure = false;
         let mut last_revert_data: Vec<u8> = Vec::new();
@@ -505,7 +574,16 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
             remove_legacy_opcodes(&mut instructions);
             let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
-            let exec_outcome = evm.transact(tx_env);
+            let exec_outcome = if reconciled_fees {
+                evm.ctx.set_tx(tx_env);
+                let mut handler =
+                    SystemRewardHandler::<_, EVMError<StateDbError>, _>(std::marker::PhantomData);
+                handler
+                    .run(&mut evm)
+                    .map(|result| ResultAndState::new(result, evm.finalize()))
+            } else {
+                evm.transact(tx_env)
+            };
             drop(evm);
             let address_registry = self.state_db.address_registry_snapshot();
             // The local snapshot is enough for commit; clear live mappings
@@ -524,6 +602,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             let exec_result = result_and_state.result;
             let mut state = result_and_state.state;
             let inner_gas = exec_result.gas().used();
+            total_gas_spent = total_gas_spent.saturating_add(exec_result.gas().spent());
             total_gas_used = total_gas_used.saturating_add(inner_gas);
 
             match &exec_result {
@@ -582,6 +661,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         sender_shell_addr: ShellAddress::default(),
                         sender_nonce_after: 0,
                         gas_used: 0,
+                        gas_spent: 0,
                         output: vec![],
                         is_system_tx: false,
                         system_contract_effects: SystemContractEffects::default(),
@@ -607,7 +687,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         }
 
         // ── Settlement ─────────────────────────────────────────
-        let gas_cost = U256::from(total_gas_used).saturating_mul(max_fee);
+        let gas_cost = U256::from(total_gas_used).saturating_mul(settlement_price);
 
         // Reserve the AA gas charge after successful execution. An inner call
         // may mutate the payer's balance, but it may not spend the gas reserve.
@@ -626,7 +706,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
         // revm applies every successful inner call directly to live state. On
         // success, preserve those balance deltas and charge the AA payer at the
-        // outer transaction's max fee.
+        // outer transaction's applicable settlement price.
         if atomic_failure {
             // Wipe all inner-call state mutations.
             self.state_db
@@ -748,6 +828,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             sender_shell_addr: ShellAddress::default(),
             sender_nonce_after: 0,
             gas_used: total_gas_used,
+            gas_spent: total_gas_spent,
             output,
             is_system_tx: true,
             system_contract_effects: SystemContractEffects::default(),
@@ -792,6 +873,15 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let tx = &signed_tx.tx;
         let target = signed_tx.tx.to.unwrap_or_default();
         let input = signed_tx.tx.data.as_ref();
+        let gas_price = if self.reconciled_fees(header.number)? {
+            shell_core::effective_gas_price(
+                tx.max_fee_per_gas,
+                tx.max_priority_fee_per_gas,
+                header.base_fee_per_gas,
+            )
+        } else {
+            tx.max_fee_per_gas
+        };
         let (ws, chain_store) = self.state_db.world_state_and_chain_store();
         let result = if tx.value != U256::ZERO {
             Err(crate::system_contracts::SystemContractError::AbiDecode(
@@ -811,7 +901,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 let gas_used = outcome.gas_used;
                 ws.sub_balance(
                     caller,
-                    U256::from(gas_used).saturating_mul(U256::from(tx.max_fee_per_gas)),
+                    U256::from(gas_used).saturating_mul(U256::from(gas_price)),
                 )?;
                 let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
 
@@ -876,6 +966,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     sender_shell_addr: ShellAddress::default(),
                     sender_nonce_after: 0,
                     gas_used,
+                    gas_spent: gas_used,
                     output,
                     is_system_tx: true,
                     system_contract_effects: outcome.effects,
@@ -889,7 +980,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 let gas_used = SYSTEM_CALL_BASE_GAS;
                 ws.sub_balance(
                     caller,
-                    U256::from(gas_used).saturating_mul(U256::from(tx.max_fee_per_gas)),
+                    U256::from(gas_used).saturating_mul(U256::from(gas_price)),
                 )?;
                 let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
                 let revert_msg = e.to_string().into_bytes();
@@ -912,6 +1003,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     sender_shell_addr: ShellAddress::default(),
                     sender_nonce_after: 0,
                     gas_used,
+                    gas_spent: gas_used,
                     output: revert_msg,
                     is_system_tx: true,
                     system_contract_effects: effects,
@@ -1068,6 +1160,198 @@ mod tests {
         let cs = ChainStore::new(Arc::new(MemoryDb::new()));
         let state_db = ShellStateDb::new(ws, cs);
         ShellPqvm::new(state_db, 1337)
+    }
+
+    fn configure_fee_activation(evm: &ShellPqvm<MemoryDb>, height: Option<u64>) {
+        evm.state_db()
+            .chain_store()
+            .put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: height,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn reconciled_fees_charge_refunded_gas_and_preserve_revert_and_alias_balances() {
+        for (runtime, status, billed_gas) in [
+            (vec![0x00], 1, 21_000),
+            (vec![0x60, 0x00, 0x60, 0x00, 0xfd], 0, 21_006),
+            (vec![0xfe], 0, 100_000),
+            // Clear a nonzero slot: 26,006 spent minus the 4,800 refund.
+            (vec![0x60, 0x00, 0x60, 0x00, 0x55, 0x00], 1, 21_206),
+        ] {
+            for sender_is_proposer in [false, true] {
+                let mut evm = setup_evm();
+                configure_fee_activation(&evm, Some(1));
+                let sender = ShellAddress::from([0x42; 32]);
+                let contract = ShellAddress::from([0x43; 32]);
+                let initial = U256::from(10_000_000u64);
+                fund_account(&mut evm, &sender, initial);
+                let hash = shell_primitives::keccak256(&runtime);
+                evm.state_db()
+                    .chain_store()
+                    .put_code(&hash, &runtime)
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(
+                        &contract,
+                        &Account {
+                            code_hash: Some(hash),
+                            ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_storage(&contract, &ShellHash::ZERO, &ShellHash::from([1; 32]))
+                    .unwrap();
+                let mut header = sample_header();
+                header.base_fee_per_gas = 3;
+                header.proposer = if sender_is_proposer {
+                    sender
+                } else {
+                    ShellAddress::from([0x44; 32])
+                };
+                let tx = Transaction {
+                    chain_id: 1337,
+                    nonce: 0,
+                    to: Some(contract),
+                    value: U256::ZERO,
+                    data: shell_primitives::Bytes::new(),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: 10,
+                    max_priority_fee_per_gas: 2,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let signed = SignedTransaction::new(
+                    sender,
+                    tx,
+                    PQSignature::new(SignatureType::Dilithium3, vec![0; 1]),
+                );
+                let result = evm.execute_tx(&signed, &header, 0, 100).unwrap();
+                assert_eq!(result.receipt.status, status);
+                assert_eq!(result.gas_used, billed_gas);
+                assert_eq!(result.receipt.cumulative_gas_used, 100 + billed_gas);
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                assert_eq!(
+                    initial - get_balance(&mut evm, &sender),
+                    U256::from(billed_gas * 5)
+                );
+                if !sender_is_proposer {
+                    assert_eq!(get_balance(&mut evm, &header.proposer), U256::ZERO);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fee_activation_native_success_and_revert_use_effective_price() {
+        for height in [None, Some(1), Some(2)] {
+            for valid in [false, true] {
+                let mut evm = setup_evm();
+                configure_fee_activation(&evm, height);
+                let sender = ShellAddress::from([0x42; 32]);
+                let initial = U256::from(10_000_000u64);
+                fund_account(&mut evm, &sender, initial);
+                let input = if valid {
+                    system_contracts::GET_VALIDATORS_SELECTOR.to_vec()
+                } else {
+                    vec![0xff; 4]
+                };
+                let mut signed = make_system_tx(sender, input);
+                signed.tx.max_fee_per_gas = 10;
+                signed.tx.max_priority_fee_per_gas = 2;
+                let mut header = sample_header();
+                header.base_fee_per_gas = 3;
+                let result = evm.execute_tx(&signed, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(valid));
+                let price = if height == Some(1) { 5 } else { 10 };
+                assert_eq!(
+                    initial - get_balance(&mut evm, &sender),
+                    U256::from(result.gas_used * price)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fee_activation_aa_sponsored_and_self_paid_charge_once() {
+        for sponsored in [false, true] {
+            for revert in [false, true] {
+                for payer_is_proposer in [false, true] {
+                    let mut evm = setup_evm();
+                    configure_fee_activation(&evm, Some(1));
+                    let sender = ShellAddress::from([0x42; 32]);
+                    let paymaster = ShellAddress::from([0x77; 32]);
+                    let destination = ShellAddress::from([0xAA; 32]);
+                    let payer = if sponsored { paymaster } else { sender };
+                    fund_account(&mut evm, &sender, U256::from(10u64));
+                    fund_account(&mut evm, &payer, U256::from(10_000_000u64));
+                    if revert {
+                        let code = [0x60, 0x00, 0x60, 0x00, 0xfd];
+                        let hash = shell_primitives::keccak256(&code);
+                        evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+                        evm.state_db_mut()
+                            .world_state_mut()
+                            .set_account(
+                                &destination,
+                                &Account {
+                                    code_hash: Some(hash),
+                                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                                },
+                            )
+                            .unwrap();
+                    }
+                    let signed = make_aa_signed(
+                        sender,
+                        0,
+                        200_000,
+                        10,
+                        vec![shell_core::InnerCall {
+                            to: Some(destination),
+                            value: U256::from(5u64),
+                            data: shell_primitives::Bytes::new(),
+                            gas_limit: 50_000,
+                        }],
+                        sponsored.then_some(paymaster),
+                    );
+                    let before = get_balance(&mut evm, &payer);
+                    let mut header = sample_header();
+                    header.base_fee_per_gas = 3;
+                    header.proposer = if payer_is_proposer {
+                        payer
+                    } else {
+                        ShellAddress::from([0x99; 32])
+                    };
+                    let result = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+                    assert_eq!(result.receipt.status, u8::from(!revert));
+                    let value = if !sponsored && !revert { 5 } else { 0 };
+                    assert_eq!(
+                        before - get_balance(&mut evm, &payer),
+                        U256::from(result.gas_used * 4 + value)
+                    );
+                    assert_eq!(
+                        get_balance(&mut evm, &destination),
+                        U256::from(if revert { 0 } else { 5 })
+                    );
+                    if !payer_is_proposer {
+                        assert_eq!(get_balance(&mut evm, &header.proposer), U256::ZERO);
+                    }
+                    if sponsored {
+                        assert_eq!(
+                            get_balance(&mut evm, &sender),
+                            U256::from(if revert { 10 } else { 5 })
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn sample_header() -> BlockHeader {
@@ -1686,6 +1970,7 @@ mod tests {
             sender_shell_addr: ShellAddress::default(),
             sender_nonce_after: 0,
             gas_used: 0,
+            gas_spent: 0,
             output: vec![],
             is_system_tx: false,
             system_contract_effects: SystemContractEffects::default(),
