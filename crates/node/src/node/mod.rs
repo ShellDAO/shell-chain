@@ -3131,7 +3131,7 @@ mod tests {
             let tx_signer = DilithiumSigner::generate();
             let sender =
                 Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-            let receiver = Address::from([0xBE; 20]);
+            let receiver = Address::from([0xBE; 32]);
             let initial_balance = U256::from(100_000_000_000_000u64);
             for participant in [&node, &fork_node, &imported] {
                 fund_account(participant, &sender, initial_balance);
@@ -3155,6 +3155,7 @@ mod tests {
                     .put_chain_config(&shell_storage::ChainConfig {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        log_address_activation_height: activation,
                         bloom_activation_height: activation,
                         fee_accounting_activation_height: activation,
                     })
@@ -3261,6 +3262,14 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(produced[0].logs.len(), 1);
+                assert_eq!(
+                    produced[0].logs[0].address,
+                    if activation.is_some_and(|height| block.number() >= height) {
+                        receiver
+                    } else {
+                        Address::from(receiver.to_alloy())
+                    }
+                );
                 assert_eq!(produced[0].logs_bloom, replayed[0].logs_bloom);
                 assert_eq!(produced[0].logs_bloom, received[0].logs_bloom);
                 let expected = if activation.is_some_and(|height| block.number() >= height) {
@@ -4810,6 +4819,180 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn log_address_activation_is_discoverable_by_full_address() {
+        use shell_rpc::api::EthApiServer;
+        for (activation, bloom_activation, fee_activation) in [
+            (None, None, None),
+            (Some(0), None, Some(2)),
+            (Some(2), Some(0), Some(0)),
+            (Some(1), Some(2), None),
+        ] {
+            for aa in [false, true] {
+                let (node, proposer_signer) = setup_node();
+                let authority = node.config.proposer_address.unwrap();
+                let follower = setup_node_with_authority(authority);
+                let signer = DilithiumSigner::generate();
+                let sender =
+                    Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+                let contracts = [
+                    Address::from([0x43; 32]),
+                    Address::from([0x44; 32]),
+                    Address::from([0x45; 20]),
+                ];
+                let runtime = [0x60, 0x11, 0x60, 0, 0x60, 0, 0xa1, 0];
+                let code_hash = shell_primitives::keccak256(&runtime);
+                for participant in [&node, &follower] {
+                    participant.register_authority_pubkey(
+                        authority,
+                        proposer_signer.public_key().to_vec(),
+                    );
+                    fund_account(participant, &sender, U256::from(10_000_000_000_000_000u64));
+                    participant
+                        .chain_store
+                        .put_code(&code_hash, &runtime)
+                        .unwrap();
+                    for contract in contracts {
+                        participant
+                            .world_state
+                            .write()
+                            .set_account(
+                                &contract,
+                                &shell_core::Account {
+                                    code_hash: Some(code_hash),
+                                    ..shell_core::Account::new_user_account(
+                                        ShellHash::ZERO,
+                                        U256::ZERO,
+                                    )
+                                },
+                            )
+                            .unwrap();
+                    }
+                    store_consistent_genesis(participant);
+                    participant
+                        .chain_store
+                        .put_chain_config(&shell_storage::ChainConfig {
+                            chain_id: 1337,
+                            genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                            fee_accounting_activation_height: fee_activation,
+                            bloom_activation_height: bloom_activation,
+                            log_address_activation_height: activation,
+                        })
+                        .unwrap();
+                }
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let handler = shell_rpc::RpcHandler::new(
+                    Arc::clone(&node.chain_store),
+                    Arc::clone(&node.world_state),
+                    Arc::clone(&node.tx_pool),
+                    1337,
+                    None,
+                    events,
+                    Arc::new(RwLock::new(0)),
+                    Arc::new(RwLock::new(FinalityState::new())),
+                );
+                for number in 1..=2 {
+                    let nonce = node.world_state.read().get_nonce(&sender).unwrap();
+                    let tx = Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: if aa { None } else { Some(contracts[0]) },
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 300_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 0,
+                        access_list: None,
+                        tx_type: if aa { AA_BUNDLE_TX_TYPE } else { 2 },
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    };
+                    let signature = PQSignature::new(signer.sig_type(), vec![]);
+                    let mut signed = if aa {
+                        SignedTransaction::with_aa_bundle(
+                            sender,
+                            tx,
+                            signature,
+                            PubkeyMode::Embedded(signer.public_key().to_vec()),
+                            AaBundle {
+                                inner_calls: contracts
+                                    .iter()
+                                    .map(|contract| InnerCall {
+                                        to: Some(*contract),
+                                        value: U256::ZERO,
+                                        data: Bytes::new(),
+                                        gas_limit: 50_000,
+                                    })
+                                    .collect(),
+                                ..AaBundle::default()
+                            },
+                        )
+                        .unwrap()
+                    } else {
+                        SignedTransaction::with_pubkey(
+                            sender,
+                            tx,
+                            signature,
+                            signer.public_key().to_vec(),
+                        )
+                    };
+                    signed.signature = signer
+                        .sign(signed.sender_signing_hash().as_bytes())
+                        .unwrap();
+                    node.tx_pool
+                        .insert(
+                            signed,
+                            &mut node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                    let block = node.produce_block(&proposer_signer, 10).unwrap();
+                    assert_eq!(block.number(), number);
+                    assert_eq!(block.transactions.len(), 1);
+                    follower
+                        .import_block(block.clone(), &MultiVerifier)
+                        .unwrap();
+                    assert_eq!(current_state_root(&follower), block.header.state_root);
+                    let receipts = node
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    let imported = follower
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(receipts, imported);
+                    assert_eq!(receipts[0].status, 1);
+                    let count = if aa { contracts.len() } else { 1 };
+                    assert_eq!(receipts[0].logs.len(), count);
+                    let active = activation.is_some_and(|height| number >= height);
+                    for (index, contract) in contracts.iter().take(count).enumerate() {
+                        let expected = if active {
+                            *contract
+                        } else {
+                            Address::from(contract.to_alloy())
+                        };
+                        assert_eq!(receipts[0].logs[index].address, expected);
+                        let filter: shell_rpc::filter::RawLogFilter = serde_json::from_value(serde_json::json!({
+                            "fromBlock":format!("0x{number:x}"), "toBlock":format!("0x{number:x}"), "address":contract
+                        })).unwrap();
+                        let matched = EthApiServer::get_logs(&handler, filter).await.unwrap();
+                        assert_eq!(
+                            matched.len(),
+                            usize::from(active || *contract == Address::from(contract.to_alloy()))
+                        );
+                        if active {
+                            assert_eq!(matched[0].address, *contract);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn fee_activation_preserves_legacy_and_reconciles_producer_and_importer() {
         for activation in [None, Some(0), Some(2)] {
@@ -4836,6 +5019,7 @@ mod tests {
                         .put_chain_config(&shell_storage::ChainConfig {
                             chain_id: 1337,
                             genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                            log_address_activation_height: None,
                             bloom_activation_height: None,
                             fee_accounting_activation_height: activation,
                         })
@@ -4927,6 +5111,7 @@ mod tests {
                     .put_chain_config(&shell_storage::ChainConfig {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        log_address_activation_height: None,
                         bloom_activation_height: None,
                         fee_accounting_activation_height: Some(0),
                     })

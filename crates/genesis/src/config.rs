@@ -159,6 +159,9 @@ pub struct GenesisConfig {
     /// First block using standard Bloom bit order; omitted for legacy networks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bloom_activation_height: Option<u64>,
+    /// First block restoring known full-width log emitters; omitted for legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_address_activation_height: Option<u64>,
     /// Human-readable chain name.
     #[serde(default = "default_chain_name")]
     pub chain_name: String,

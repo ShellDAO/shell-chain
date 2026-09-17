@@ -142,13 +142,18 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             .is_some_and(|height| block_number >= height))
     }
 
-    fn bloom_format(&self, number: u64) -> Result<crate::bloom::BloomFormat, ExecutorError> {
-        let activation = self
-            .state_db
-            .chain_store()
-            .get_chain_config()?
-            .and_then(|config| config.bloom_activation_height);
-        Ok(crate::bloom::BloomFormat::at_height(activation, number))
+    fn log_rules(&self, number: u64) -> Result<(crate::bloom::BloomFormat, bool), ExecutorError> {
+        let config = self.state_db.chain_store().get_chain_config()?;
+        let bloom = crate::bloom::BloomFormat::at_height(
+            config
+                .as_ref()
+                .and_then(|config| config.bloom_activation_height),
+            number,
+        );
+        let full_addresses = config
+            .and_then(|config| config.log_address_activation_height)
+            .is_some_and(|height| number >= height);
+        Ok((bloom, full_addresses))
     }
 
     pub fn new(state_db: ShellStateDb<S>, chain_id: u64) -> Self {
@@ -205,7 +210,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // ── Normal PQVM/revm execution path ──────────────────────────
         let tx = &signed_tx.tx;
         let reconciled_fees = self.reconciled_fees(header.number)?;
-        let bloom_format = self.bloom_format(header.number)?;
+        let (bloom_format, full_log_addresses) = self.log_rules(header.number)?;
         let sender_shell_addr = signed_tx.from;
         let sender_nonce_after = next_sender_nonce(tx.nonce)?;
 
@@ -297,6 +302,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         }
         .map_err(|e| ExecutorError::Revm(format!("{e:?}")))?;
 
+        drop(evm);
         let exec_result = result_and_state.result;
         let state = result_and_state.state;
 
@@ -332,7 +338,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             .iter()
             .filter_map(|log| {
                 shell_core::Log::new(
-                    ShellAddress::from(log.address),
+                    if full_log_addresses {
+                        self.state_db.resolve_address(&log.address)
+                    } else {
+                        ShellAddress::from(log.address)
+                    },
                     log.topics().iter().map(|t| ShellHash::from(*t)).collect(),
                     shell_primitives::Bytes::from(log.data.data.to_vec()),
                 )
@@ -414,7 +424,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
         let reconciled_fees = self.reconciled_fees(header.number)?;
-        let bloom_format = self.bloom_format(header.number)?;
+        let (bloom_format, full_log_addresses) = self.log_rules(header.number)?;
         let max_fee = U256::from(tx.max_fee_per_gas);
         let base_fee = if reconciled_fees {
             header.base_fee_per_gas
@@ -622,7 +632,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 ExecutionResult::Success { logs, .. } => {
                     for log in logs {
                         if let Ok(l) = shell_core::Log::new(
-                            ShellAddress::from(log.address),
+                            if full_log_addresses {
+                                address_registry
+                                    .get(&log.address)
+                                    .copied()
+                                    .unwrap_or_else(|| ShellAddress::from(log.address))
+                            } else {
+                                ShellAddress::from(log.address)
+                            },
                             log.topics().iter().map(|t| ShellHash::from(*t)).collect(),
                             shell_primitives::Bytes::from(log.data.data.to_vec()),
                         ) {
@@ -888,7 +905,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let tx = &signed_tx.tx;
         let target = signed_tx.tx.to.unwrap_or_default();
         let input = signed_tx.tx.data.as_ref();
-        let bloom_format = self.bloom_format(header.number)?;
+        let (bloom_format, _) = self.log_rules(header.number)?;
         let gas_price = if self.reconciled_fees(header.number)? {
             shell_core::effective_gas_price(
                 tx.max_fee_per_gas,
@@ -1184,6 +1201,7 @@ mod tests {
             .put_chain_config(&shell_storage::ChainConfig {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
+                log_address_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: height,
             })
@@ -1372,6 +1390,66 @@ mod tests {
     }
 
     #[test]
+    fn log_address_activation_aa_revert_discards_logs_and_registry() {
+        let mut evm = setup_evm();
+        evm.state_db()
+            .chain_store()
+            .put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: Some(0),
+                log_address_activation_height: Some(0),
+            })
+            .unwrap();
+        let sender = ShellAddress::from([0x42; 32]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+        let emit = ShellAddress::from([0x43; 32]);
+        let revert = ShellAddress::from([0x44; 32]);
+        for (address, code) in [
+            (emit, vec![0x60, 0x11, 0x60, 0, 0x60, 0, 0xa1, 0]),
+            (revert, vec![0x60, 0, 0x60, 0, 0xfd]),
+        ] {
+            let hash = shell_primitives::keccak256(&code);
+            evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &address,
+                    &Account {
+                        code_hash: Some(hash),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+        }
+        let nonce = current_nonce(&mut evm, &sender);
+        let signed = make_aa_signed(
+            sender,
+            nonce,
+            200_000,
+            10,
+            [emit, revert]
+                .iter()
+                .map(|address| shell_core::InnerCall {
+                    to: Some(*address),
+                    value: U256::ZERO,
+                    data: shell_primitives::Bytes::new(),
+                    gas_limit: 50_000,
+                })
+                .collect(),
+            None,
+        );
+        let result = evm
+            .execute_aa_bundle(&signed, &sample_header(), 0, 0)
+            .unwrap();
+        assert_eq!(result.receipt.status, 0);
+        assert!(result.receipt.logs.is_empty());
+        assert!(result.receipt.logs_bloom.0.iter().all(|byte| *byte == 0));
+        assert!(evm.state_db().address_registry_snapshot().is_empty());
+    }
+
+    #[test]
     fn bloom_activation_ordinary_and_aa_receipts_use_executed_height() {
         for activation in [None, Some(0), Some(2)] {
             for number in [1, 2] {
@@ -1383,6 +1461,7 @@ mod tests {
                             chain_id: 1337,
                             genesis_hash: ShellHash::ZERO,
                             fee_accounting_activation_height: None,
+                            log_address_activation_height: None,
                             bloom_activation_height: activation,
                         })
                         .unwrap();
@@ -1933,6 +2012,7 @@ mod tests {
                     chain_id: 1337,
                     genesis_hash: ShellHash::ZERO,
                     fee_accounting_activation_height: None,
+                    log_address_activation_height: None,
                     bloom_activation_height: Some(2),
                 })
                 .unwrap();
