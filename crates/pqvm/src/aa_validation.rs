@@ -39,27 +39,45 @@ fn validation_block_env<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
     validation_header: Option<&BlockHeader>,
     default_gas_limit: u64,
-) -> Result<(u64, u64, u64, u64), AaValidationError> {
-    if let Some(header) = validation_header {
-        return Ok((
-            header.number,
-            header.timestamp,
-            header.gas_limit,
-            header.excess_blob_gas,
-        ));
-    }
-
-    Ok(chain_store
-        .get_head_block()?
-        .map(|block| {
+) -> Result<(u64, u64, u64, u64, u64), AaValidationError> {
+    let (number, timestamp, gas_limit, excess_blob_gas, base_fee) =
+        if let Some(header) = validation_header {
             (
-                validation_block_number(Some(block.header.number)),
-                block.header.timestamp,
-                block.header.gas_limit,
-                block.header.excess_blob_gas,
+                header.number,
+                header.timestamp,
+                header.gas_limit,
+                header.excess_blob_gas,
+                header.base_fee_per_gas,
             )
-        })
-        .unwrap_or((0, 0, default_gas_limit, 0)))
+        } else {
+            chain_store
+                .get_head_block()?
+                .map(|block| {
+                    (
+                        validation_block_number(Some(block.header.number)),
+                        block.header.timestamp,
+                        block.header.gas_limit,
+                        block.header.excess_blob_gas,
+                        shell_core::calculate_base_fee(
+                            block.header.gas_used,
+                            block.header.gas_limit,
+                            block.header.base_fee_per_gas,
+                        ),
+                    )
+                })
+                .unwrap_or((0, 0, default_gas_limit, 0, 0))
+        };
+    let active = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.fee_accounting_activation_height)
+        .is_some_and(|height| number >= height);
+    Ok((
+        number,
+        timestamp,
+        gas_limit,
+        excess_blob_gas,
+        if active { base_fee } else { 0 },
+    ))
 }
 
 #[derive(Debug)]
@@ -440,7 +458,7 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
         validation_code_hash,
     );
 
-    let (number, timestamp, gas_limit, excess_blob_gas) =
+    let (number, timestamp, gas_limit, excess_blob_gas, base_fee) =
         validation_block_env(chain_store, validation_header, VALIDATION_GAS_CAP)?;
 
     let tx_env = TxEnv::builder()
@@ -460,7 +478,7 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
         beneficiary: Address::ZERO.into(),
         timestamp: alloy_primitives::U256::from(timestamp),
         gas_limit,
-        basefee: 0,
+        basefee: base_fee,
         difficulty: alloy_primitives::U256::ZERO,
         prevrandao: Some(alloy_primitives::B256::ZERO),
         blob_excess_gas_and_price: None,
@@ -792,7 +810,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         paymaster_validation_wrapper_code(paymaster),
     );
 
-    let (number, timestamp, gas_limit, excess_blob_gas) =
+    let (number, timestamp, gas_limit, excess_blob_gas, base_fee) =
         validation_block_env(chain_store, validation_header, PAYMASTER_VALIDATE_GAS_CAP)?;
 
     let tx_env = TxEnv::builder()
@@ -812,7 +830,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         beneficiary: Address::ZERO.into(),
         timestamp: alloy_primitives::U256::from(timestamp),
         gas_limit,
-        basefee: 0,
+        basefee: base_fee,
         difficulty: alloy_primitives::U256::ZERO,
         prevrandao: Some(alloy_primitives::B256::ZERO),
         blob_excess_gas_and_price: None,
@@ -1526,6 +1544,60 @@ mod tests {
         ));
         call_paymaster_validate(&signed, &bundle, &paymaster, &[1], &ws, &cs, Some(&header))
             .unwrap();
+    }
+
+    #[test]
+    fn fee_activation_validation_contracts_observe_candidate_base_fee() {
+        let signer = DilithiumSigner::generate();
+        let (mut ws, cs) = setup_stores();
+        let paymaster = Address::from([0x77; 20]);
+        let mut code = validator_accepts_at_timestamp(3);
+        code[0] = 0x48; // BASEFEE instead of TIMESTAMP.
+        install_paymaster(&mut ws, &cs, paymaster, code.clone());
+        cs.put_chain_config(&shell_storage::ChainConfig {
+            chain_id: 1337,
+            genesis_hash: ShellHash::ZERO,
+            fee_accounting_activation_height: Some(5),
+        })
+        .unwrap();
+        set_head_number(&cs, 9);
+        let from = signer_address(&signer);
+        let code_hash = keccak256(&code);
+        cs.put_code(&code_hash, &code).unwrap();
+        let mut account = Account::new_user_account(ShellHash::ZERO, U256::from(1_000_000u64));
+        account.validation_code_hash = Some(code_hash);
+        ws.set_account(&from, &account).unwrap();
+        let signed = SignedTransaction::new(
+            from,
+            base_tx(1337, ws.get_nonce(&from).unwrap()),
+            PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
+        );
+        let bundle = test_contract_paymaster_bundle(paymaster);
+        for number in [4, 5] {
+            let header = BlockHeader {
+                number,
+                base_fee_per_gas: 3,
+                gas_limit: VALIDATION_GAS_CAP,
+                ..BlockHeader::default()
+            };
+            assert_eq!(
+                call_paymaster_validate(
+                    &signed,
+                    &bundle,
+                    &paymaster,
+                    &[1],
+                    &ws,
+                    &cs,
+                    Some(&header)
+                )
+                .is_ok(),
+                number == 5
+            );
+            assert_eq!(
+                validate_aa_tx_at_block(&signed, &ws, &cs, &DilithiumVerifier, &header).is_ok(),
+                number == 5
+            );
+        }
     }
 
     #[test]

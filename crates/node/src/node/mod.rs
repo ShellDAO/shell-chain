@@ -3119,91 +3119,116 @@ mod tests {
 
     #[test]
     fn stateful_preferred_fork_is_replayed_and_adopted_atomically() {
-        let (node, proposer_signer) = setup_node();
-        let proposer = node.config.proposer_address.unwrap();
-        let fork_node = setup_node_with_authority(proposer);
-        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
-        fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        for activation in [None, Some(1), Some(2)] {
+            let (node, proposer_signer) = setup_node();
+            let proposer = node.config.proposer_address.unwrap();
+            let fork_node = setup_node_with_authority(proposer);
+            node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+            fork_node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
 
-        let tx_signer = DilithiumSigner::generate();
-        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
-        let receiver = Address::from([0xBE; 20]);
-        let initial_balance = U256::from(100_000_000_000_000u64);
-        fund_account(&node, &sender, initial_balance);
-        fund_account(&fork_node, &sender, initial_balance);
-        store_consistent_genesis(&node);
-        store_consistent_genesis(&fork_node);
+            let tx_signer = DilithiumSigner::generate();
+            let sender =
+                Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+            let receiver = Address::from([0xBE; 20]);
+            let initial_balance = U256::from(100_000_000_000_000u64);
+            fund_account(&node, &sender, initial_balance);
+            fund_account(&fork_node, &sender, initial_balance);
+            store_consistent_genesis(&node);
+            store_consistent_genesis(&fork_node);
+            for participant in [&node, &fork_node] {
+                participant
+                    .chain_store
+                    .put_chain_config(&shell_storage::ChainConfig {
+                        chain_id: 1337,
+                        genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        fee_accounting_activation_height: activation,
+                    })
+                    .unwrap();
+            }
 
-        let canonical = make_block_at_1(&node, &proposer_signer, None);
-        let canonical_hash = canonical.hash();
-        node.import_block(canonical, &MultiVerifier).unwrap();
+            let canonical = make_block_at_1(&node, &proposer_signer, None);
+            let canonical_hash = canonical.hash();
+            node.import_block(canonical, &MultiVerifier).unwrap();
 
-        let transaction = Transaction {
-            chain_id: 1337,
-            nonce: 0,
-            to: Some(receiver),
-            value: U256::from(1_000u64),
-            data: Bytes::new(),
-            gas_limit: 21_000,
-            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
-            max_priority_fee_per_gas: 0,
-            access_list: None,
-            tx_type: 2,
-            max_fee_per_blob_gas: None,
-            blob_versioned_hashes: None,
-        };
-        submit_signed_tx(&fork_node, &tx_signer, sender, transaction);
-        let side_one = fork_node.produce_block(&proposer_signer, 100).unwrap();
-        let side_one_hash = side_one.hash();
-        node.import_block(side_one.clone(), &MultiVerifier).unwrap();
+            let transaction = Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(receiver),
+                value: U256::from(1_000u64),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            submit_signed_tx(&fork_node, &tx_signer, sender, transaction);
+            let side_one = fork_node.produce_block(&proposer_signer, 100).unwrap();
+            let side_one_hash = side_one.hash();
+            node.import_block(side_one.clone(), &MultiVerifier).unwrap();
 
-        let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
-        let side_two_hash = side_two.hash();
-        node.import_block(side_two.clone(), &MultiVerifier).unwrap();
+            let mut second = side_one.transactions[0].tx.clone();
+            second.nonce = 1;
+            submit_signed_tx(&fork_node, &tx_signer, sender, second);
+            let side_two = fork_node.produce_block(&proposer_signer, 100).unwrap();
+            let side_two_hash = side_two.hash();
+            // Stage the descendant before its competing parent trie is materialized;
+            // adoption must re-execute both blocks from the common ancestor.
+            node.chain_store.put_block(&side_two).unwrap();
+            node.fork_choice
+                .write()
+                .add_block(side_two_hash, side_one_hash, 2, 0, false);
 
-        let total_weight = node
-            .consensus
-            .read()
-            .validator_weights()
-            .values()
-            .copied()
-            .fold(0u64, u64::saturating_add);
-        node.fork_choice
-            .write()
-            .update_attested_weight(&side_two_hash, total_weight);
-        let plan = node
-            .preferred_fork_plan()
-            .unwrap()
-            .expect("stateful side fork should become preferred");
-
-        node.adopt_preferred_fork(&plan).unwrap();
-
-        assert_eq!(
-            node.chain_store.get_head_hash().unwrap(),
-            Some(side_two_hash)
-        );
-        assert_eq!(
-            node.chain_store.get_block_hash_by_number(1).unwrap(),
-            Some(side_one_hash)
-        );
-        assert_ne!(
-            node.chain_store.get_block_hash_by_number(1).unwrap(),
-            Some(canonical_hash)
-        );
-        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 1);
-        assert_eq!(
-            node.world_state.read().get_balance(&receiver).unwrap(),
-            U256::from(1_000u64)
-        );
-        assert_eq!(
-            node.chain_store
-                .get_receipts(&side_one_hash)
+            let total_weight = node
+                .consensus
+                .read()
+                .validator_weights()
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add);
+            node.fork_choice
+                .write()
+                .update_attested_weight(&side_two_hash, total_weight);
+            let plan = node
+                .preferred_fork_plan()
                 .unwrap()
-                .expect("replayed receipts")
-                .len(),
-            side_one.transactions.len() + side_one.system_transactions.len()
-        );
-        assert_eq!(current_state_root(&node), side_two.header.state_root);
+                .expect("stateful side fork should become preferred");
+
+            node.adopt_preferred_fork(&plan).unwrap();
+
+            assert_eq!(
+                node.chain_store.get_head_hash().unwrap(),
+                Some(side_two_hash)
+            );
+            assert_eq!(
+                node.chain_store.get_block_hash_by_number(1).unwrap(),
+                Some(side_one_hash)
+            );
+            assert_ne!(
+                node.chain_store.get_block_hash_by_number(1).unwrap(),
+                Some(canonical_hash)
+            );
+            assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 2);
+            assert_eq!(
+                node.world_state.read().get_balance(&receiver).unwrap(),
+                U256::from(2_000u64)
+            );
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&side_one_hash)
+                    .unwrap()
+                    .expect("replayed receipts")
+                    .len(),
+                side_one.transactions.len() + side_one.system_transactions.len()
+            );
+            assert_eq!(current_state_root(&node), side_two.header.state_root);
+            assert_eq!(
+                node.world_state.read().get_balance(&sender).unwrap(),
+                fork_node.world_state.read().get_balance(&sender).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -4730,6 +4755,213 @@ mod tests {
             U256::from(BASE / 2),
             "all-empty range must return minimum reward (1 × L1 mint), got {reward}"
         );
+    }
+
+    #[test]
+    fn fee_activation_preserves_legacy_and_reconciles_producer_and_importer() {
+        for activation in [None, Some(0), Some(2)] {
+            for priority in [0, 1] {
+                let (node, signer) = setup_node();
+                let authority = node.config.proposer_address.unwrap();
+                let follower = setup_node_with_authority(authority);
+                let tx_signer = DilithiumSigner::generate();
+                let sender =
+                    Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+                let balance = |node: &Node<MemoryDb>, address: &Address| {
+                    node.world_state
+                        .read()
+                        .get_account(address)
+                        .unwrap()
+                        .map_or(U256::ZERO, |account| account.balance)
+                };
+                for participant in [&node, &follower] {
+                    participant.register_authority_pubkey(authority, signer.public_key().to_vec());
+                    fund_account(participant, &sender, U256::from(1_000_000_000_000_000u64));
+                    store_consistent_genesis(participant);
+                    participant
+                        .chain_store
+                        .put_chain_config(&shell_storage::ChainConfig {
+                            chain_id: 1337,
+                            genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                            fee_accounting_activation_height: activation,
+                        })
+                        .unwrap();
+                }
+                for nonce in 0..3 {
+                    let tx = shell_core::Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: Some(Address::from([0xBB; 32])),
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 21_000,
+                        max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: priority,
+                        access_list: None,
+                        tx_type: 2,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    };
+                    let sig = tx_signer
+                        .sign(tx.signing_hash(tx_signer.sig_type().as_u8()).as_bytes())
+                        .unwrap();
+                    let signed = SignedTransaction::with_pubkey(
+                        sender,
+                        tx,
+                        sig,
+                        tx_signer.public_key().to_vec(),
+                    );
+                    node.tx_pool
+                        .insert(
+                            signed,
+                            &mut node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                    let sender_before = balance(&node, &sender);
+                    let proposer_before = balance(&node, &authority);
+                    let block = node.produce_block(&signer, 10).unwrap();
+                    assert_eq!(block.transactions.len(), 1);
+                    let reward = block
+                        .system_transactions
+                        .iter()
+                        .find(|tx| tx.kind == shell_core::SystemTxKind::BlockGasReward)
+                        .unwrap()
+                        .value;
+                    let active = activation.is_some_and(|height| block.number() >= height);
+                    let legacy_tip = U256::from(21_000 * priority);
+                    assert_eq!(
+                        sender_before - balance(&node, &sender),
+                        if active { reward } else { legacy_tip }
+                    );
+                    assert_eq!(
+                        balance(&node, &authority) - proposer_before,
+                        if active { reward } else { reward + legacy_tip }
+                    );
+                    follower
+                        .import_block(block.clone(), &MultiVerifier)
+                        .unwrap();
+                    assert_eq!(current_state_root(&follower), block.header.state_root);
+                    assert_eq!(balance(&follower, &sender), balance(&node, &sender));
+                    assert_eq!(balance(&follower, &authority), balance(&node, &authority));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fee_activation_all_transaction_paths_balance_with_one_system_reward() {
+        for sender_is_proposer in [false, true] {
+            let (node, signer) = setup_node();
+            let authority = node.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(authority);
+            let separate_signer = DilithiumSigner::generate();
+            let tx_signer = if sender_is_proposer {
+                &signer
+            } else {
+                &separate_signer
+            };
+            let sender =
+                Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+            for participant in [&node, &follower] {
+                participant.register_authority_pubkey(authority, signer.public_key().to_vec());
+                fund_account(participant, &sender, U256::from(10_000_000_000_000_000u64));
+                store_consistent_genesis(participant);
+                participant
+                    .chain_store
+                    .put_chain_config(&shell_storage::ChainConfig {
+                        chain_id: 1337,
+                        genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
+                        fee_accounting_activation_height: Some(0),
+                    })
+                    .unwrap();
+            }
+            for kind in 0..3 {
+                let tx = Transaction {
+                    chain_id: 1337,
+                    nonce: kind,
+                    value: U256::ZERO,
+                    to: if kind == 1 {
+                        Some(shell_pqvm::registry_address())
+                    } else if kind == 2 {
+                        None
+                    } else {
+                        Some(Address::from([0xBB; 32]))
+                    },
+                    data: if kind == 1 {
+                        Bytes::copy_from_slice(
+                            &shell_pqvm::system_contracts::GET_VALIDATORS_SELECTOR,
+                        )
+                    } else {
+                        Bytes::new()
+                    },
+                    gas_limit: 200_000,
+                    max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 1,
+                    access_list: None,
+                    tx_type: if kind == 2 { AA_BUNDLE_TX_TYPE } else { 2 },
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let sig = PQSignature::new(tx_signer.sig_type(), vec![]);
+                let mut signed = if kind == 2 {
+                    SignedTransaction::with_aa_bundle(
+                        sender,
+                        tx,
+                        sig,
+                        PubkeyMode::Embedded(tx_signer.public_key().to_vec()),
+                        AaBundle {
+                            inner_calls: vec![InnerCall {
+                                to: Some(Address::from([0xBB; 32])),
+                                value: U256::ZERO,
+                                data: Bytes::new(),
+                                gas_limit: 21_000,
+                            }],
+                            ..AaBundle::default()
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec())
+                };
+                signed.signature = tx_signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                node.tx_pool
+                    .insert(
+                        signed,
+                        &mut node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+                let before = node.world_state.read().get_balance(&sender).unwrap();
+                let proposer_before = node.world_state.read().get_balance(&authority).unwrap();
+                let block = node.produce_block(&signer, 10).unwrap();
+                assert_eq!(block.transactions.len(), 1);
+                let reward = block
+                    .system_transactions
+                    .iter()
+                    .find(|tx| tx.kind == shell_core::SystemTxKind::BlockGasReward)
+                    .unwrap()
+                    .value;
+                let after = node.world_state.read().get_balance(&sender).unwrap();
+                if sender_is_proposer {
+                    assert_eq!(after, before);
+                } else {
+                    assert_eq!(before - after, reward);
+                    assert_eq!(
+                        node.world_state.read().get_balance(&authority).unwrap() - proposer_before,
+                        reward
+                    );
+                }
+                follower
+                    .import_block(block.clone(), &MultiVerifier)
+                    .unwrap();
+                assert_eq!(current_state_root(&follower), block.header.state_root);
+            }
+        }
     }
 
     /// Empty (0-tx) canonical blocks must NOT appear in `settled_stark_sources`

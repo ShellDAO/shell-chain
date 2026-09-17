@@ -362,14 +362,12 @@ async fn initialize_chain<S: KvStore + 'static>(
             // the destination: snapshot import requires an empty chain.
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
+                fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
                 chain_id,
                 genesis_hash: genesis.hash(),
             };
             match chain_store.get_chain_config()? {
-                Some(existing)
-                    if existing.chain_id != trusted.chain_id
-                        || existing.genesis_hash != trusted.genesis_hash =>
-                {
+                Some(existing) if existing != trusted => {
                     return Err(
                         "stored chain config does not match local checkpoint trust anchor".into(),
                     );
@@ -397,6 +395,36 @@ async fn initialize_chain<S: KvStore + 'static>(
         info!("Chain already has a canonical head, skipping checkpoint sync");
     }
 
+    let stored_activation = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.fee_accounting_activation_height);
+    if stored_activation != genesis_config.fee_accounting_activation_height {
+        match (
+            stored_activation,
+            genesis_config.fee_accounting_activation_height,
+        ) {
+            (None, Some(height)) => {
+                let trusted_genesis =
+                    initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
+                let stored = chain_store
+                    .get_chain_config()?
+                    .ok_or("stored chain configuration is missing")?;
+                if stored.chain_id != genesis_config.chain_id
+                    || stored.genesis_hash != trusted_genesis.hash()
+                {
+                    return Err(
+                        "fee activation requires the original local genesis configuration".into(),
+                    );
+                }
+                chain_store.schedule_fee_accounting_activation(height)?;
+            }
+            _ => {
+                return Err(
+                    "stored fee activation does not match local genesis configuration".into(),
+                )
+            }
+        }
+    }
     initialize_authority_pubkeys(genesis_config, &chain_store)?;
     Ok(())
 }
@@ -593,6 +621,7 @@ async fn run_with_store<S: KvStore + 'static>(
         );
 
         let config = GenesisConfig {
+            fee_accounting_activation_height: None,
             chain_id: args.chain_id,
             chain_name: format!("shell-chain-{}", args.network),
             network_type,
@@ -1137,6 +1166,7 @@ mod tests {
 
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             chain_name: "shell-chain-test".into(),
             timestamp: 1_700_000_000,
@@ -1354,6 +1384,7 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
+            fee_accounting_activation_height: None,
             chain_id: config.chain_id,
             genesis_hash: ShellHash::from([0xAB; 32]),
         };
@@ -1400,6 +1431,108 @@ mod tests {
         validate_transaction_protocol(&ChainStore::new(store)).unwrap();
     }
 
+    #[tokio::test]
+    async fn fee_activation_restart_requires_the_persisted_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let mut config = test_genesis(Address::from([7u8; 20]));
+        config.fee_accounting_activation_height = Some(2);
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        for conflicting in [None, Some(0), Some(3)] {
+            config.fee_accounting_activation_height = conflicting;
+            let error = initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("stored fee activation"));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_activation_existing_chain_can_only_schedule_a_future_height_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let mut config = test_genesis(Address::from([7u8; 20]));
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let chain = ChainStore::new(Arc::clone(&store));
+        let genesis = chain.get_head_hash().unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        config.fee_accounting_activation_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("above the existing canonical head"));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.fee_accounting_activation_height = Some(3);
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chain.get_head_hash().unwrap(), genesis);
+        assert_eq!(
+            chain
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .fee_accounting_activation_height,
+            Some(3)
+        );
+        config.fee_accounting_activation_height = Some(4);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn transaction_protocol_rejects_legacy_genesis() {
         let authority = Address::from([7u8; 20]);
@@ -1417,6 +1550,7 @@ mod tests {
             .commit_genesis_block(
                 &genesis,
                 &ChainConfig {
+                    fee_accounting_activation_height: None,
                     chain_id: config.chain_id,
                     genesis_hash: legacy_hash,
                 },

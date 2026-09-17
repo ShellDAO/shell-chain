@@ -131,6 +131,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         .commit_genesis_block(
             &block,
             &ChainConfig {
+                fee_accounting_activation_height: config.fee_accounting_activation_height,
                 chain_id: config.chain_id,
                 genesis_hash,
             },
@@ -286,6 +287,7 @@ mod tests {
         );
 
         GenesisConfig {
+            fee_accounting_activation_height: None,
             chain_id: 1337,
             chain_name: "test-chain".to_string(),
             network_type: crate::config::NetworkType::Dev,
