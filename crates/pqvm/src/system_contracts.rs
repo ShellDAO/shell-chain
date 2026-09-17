@@ -236,8 +236,9 @@ pub fn execute_system_contract<S: KvStore + 'static>(
     input: &[u8],
     world_state: &mut WorldState<S>,
 ) -> Result<(Vec<u8>, u64), SystemContractError> {
-    let mut registry = AlgorithmRegistry::global_mut();
-    execute_validator_registry_with_registry(caller, input, world_state, None, &mut registry)
+    shell_crypto::with_algorithm_registry_mut(|registry| {
+        execute_validator_registry_with_registry(caller, input, world_state, None, registry)
+    })
 }
 
 /// Execute any native system contract and return both the ABI output and the
@@ -250,14 +251,15 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
 ) -> Result<SystemContractOutcome, SystemContractError> {
     if *target == registry_address() {
-        let mut registry = AlgorithmRegistry::global_mut();
-        let (output, gas_used) = execute_validator_registry_with_registry(
-            caller,
-            input,
-            world_state,
-            Some(chain_store),
-            &mut registry,
-        )?;
+        let (output, gas_used) = shell_crypto::with_algorithm_registry_mut(|registry| {
+            execute_validator_registry_with_registry(
+                caller,
+                input,
+                world_state,
+                Some(chain_store),
+                registry,
+            )
+        })?;
         let mut effects = SystemContractEffects::default();
         let selector = decode_selector(input)?;
         if (selector == ADD_VALIDATOR_SELECTOR
@@ -3255,6 +3257,43 @@ mod tests {
             .unwrap(),
             encode_algorithm_status(AlgorithmStatus::Deprecated)
         );
+    }
+
+    #[test]
+    fn governance_calls_keep_branch_registry_mutations_local() {
+        let algorithm = SignatureType::SphincsSha2256f;
+        let canonical_allowed = AlgorithmRegistry::global().is_allowed(algorithm);
+        for routed in [false, true] {
+            let validator = Address::from([0x11; 20]);
+            let mut ws = setup_with_validators(&[validator]);
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            let calldata = encode_deprecate_algorithm_calldata(algorithm);
+            shell_crypto::with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+                if routed {
+                    execute_system_contract_call(
+                        &registry_address(),
+                        &validator,
+                        &calldata,
+                        &mut ws,
+                        &cs,
+                    )
+                    .unwrap();
+                } else {
+                    execute_system_contract(&validator, &calldata, &mut ws).unwrap();
+                }
+                assert!(!shell_crypto::is_algorithm_allowed(algorithm));
+                assert_eq!(
+                    std::thread::spawn(move || shell_crypto::is_algorithm_allowed(algorithm))
+                        .join()
+                        .unwrap(),
+                    canonical_allowed
+                );
+            });
+            assert_eq!(
+                AlgorithmRegistry::global().is_allowed(algorithm),
+                canonical_allowed
+            );
+        }
     }
 
     // ── removeValidator ────────────────────────────────────────
