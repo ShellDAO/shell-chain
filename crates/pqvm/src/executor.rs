@@ -1217,7 +1217,7 @@ mod tests {
                 };
                 let tx = Transaction {
                     chain_id: 1337,
-                    nonce: 0,
+                    nonce: current_nonce(&mut evm, &sender),
                     to: Some(contract),
                     value: U256::ZERO,
                     data: shell_primitives::Bytes::new(),
@@ -1310,7 +1310,7 @@ mod tests {
                     }
                     let signed = make_aa_signed(
                         sender,
-                        0,
+                        current_nonce(&mut evm, &sender),
                         200_000,
                         10,
                         vec![shell_core::InnerCall {

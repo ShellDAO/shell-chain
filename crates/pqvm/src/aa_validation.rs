@@ -1569,7 +1569,7 @@ mod tests {
         ws.set_account(&from, &account).unwrap();
         let signed = SignedTransaction::new(
             from,
-            base_tx(1337, 0),
+            base_tx(1337, ws.get_nonce(&from).unwrap()),
             PQSignature::new(SignatureType::MlDsa65, vec![0xaa; 64]),
         );
         let bundle = test_contract_paymaster_bundle(paymaster);
