@@ -215,6 +215,11 @@ shell-node [GLOBAL FLAGS] tx <send|deploy|call|receipt> [OPTIONS]
 Send flags include `--keystore`, `--to`, `--value`, `--rpc-url`, `--gas-limit`,
 `--nonce`, and optional `--chain-id`. Use each subcommand's `--help` for its flags.
 
+For send and deploy, `--value` accepts decimal wei or `0x`-prefixed hexadecimal
+with at least one digit. A bare `0x` or an empty amount is rejected before
+loading the keystore or contacting the node. Use `0` or `0x0` for an explicit
+zero value; omitting the optional deploy value still defaults to zero.
+
 After submission, query the returned transaction hash without a keystore:
 
 ```bash

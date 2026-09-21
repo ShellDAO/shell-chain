@@ -38,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject empty transaction amounts and bare hexadecimal prefixes in CLI send
+  and deploy commands before keystore access or RPC, instead of interpreting
+  them as zero-value transactions.
+
 - Reject EOF without input for `--password-stdin`, so a closed or empty pipe
   cannot silently create a keystore with an empty password. Preserve supplied
   password lines, including input without a trailing newline.
