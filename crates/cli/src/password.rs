@@ -64,10 +64,13 @@ pub fn resolve_password(
     if args.password_stdin {
         let stdin = io::stdin();
         let mut line = String::new();
-        stdin
+        let bytes_read = stdin
             .lock()
             .read_line(&mut line)
             .map_err(|e| format!("cannot read password from stdin: {e}"))?;
+        if bytes_read == 0 {
+            return Err("no password received from stdin (end of input)".into());
+        }
         let password = line
             .trim_end_matches('\n')
             .trim_end_matches('\r')

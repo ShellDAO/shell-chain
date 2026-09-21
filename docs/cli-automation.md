@@ -38,6 +38,11 @@ shell-node --password-file /run/secrets/keystore-password key generate --output 
 
 ### 1.2 stdin
 
+If stdin closes before supplying any bytes, the command fails instead of using
+an empty password. This catches empty input and failed password-producing pipes
+before key generation. A supplied password need not end with a newline. An
+explicit blank line retains the existing empty-password behavior.
+
 ```bash
 echo "my-secure-password" | shell-node --password-stdin key generate --output validator.json
 ```
