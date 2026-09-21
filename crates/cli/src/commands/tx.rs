@@ -34,7 +34,7 @@ pub enum TxCommand {
         #[arg(long)]
         to: String,
 
-        /// Value to transfer (decimal wei).
+        /// Value to transfer (decimal wei or 0x-prefixed hex).
         #[arg(long)]
         value: String,
 
@@ -77,7 +77,7 @@ pub enum TxCommand {
         #[arg(long)]
         chain_id: Option<u64>,
 
-        /// Value to send with deployment (decimal wei).
+        /// Value to send with deployment (decimal wei or 0x-prefixed hex).
         #[arg(long)]
         value: Option<String>,
     },
@@ -197,6 +197,7 @@ fn cmd_send(
         gas_limit,
     } = args;
 
+    let value_u256 = parse_u256(&value)?;
     let signer = load_keystore(&keystore, password_args)?;
     let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
     let to_addr = parse_address(&to)?;
@@ -210,8 +211,6 @@ fn cmd_send(
         None => rpc_get_nonce(&rpc_url, &from)?,
     };
     let gas_price = rpc_gas_price(&rpc_url)?;
-
-    let value_u256 = parse_u256(&value)?;
 
     let tx = Transaction {
         chain_id,
@@ -258,6 +257,10 @@ fn cmd_deploy(
     value: Option<String>,
     password_args: &PasswordArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let value_u256 = match &value {
+        Some(v) => parse_u256(v)?,
+        None => U256::ZERO,
+    };
     let signer = load_keystore(&keystore, password_args)?;
     let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
 
@@ -269,10 +272,6 @@ fn cmd_deploy(
     let gas_price = rpc_gas_price(&rpc_url)?;
 
     let code_bytes = parse_hex_bytes(&code)?;
-    let value_u256 = match &value {
-        Some(v) => parse_u256(v)?,
-        None => U256::ZERO,
-    };
 
     let estimated_gas = rpc_estimate_gas(&rpc_url, &from, None, &value_u256, &code_bytes)?;
 
@@ -371,6 +370,9 @@ fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error>> {
 fn parse_u256(s: &str) -> Result<U256, Box<dyn std::error::Error>> {
     if let Some(hex_str) = s.strip_prefix("0x") {
         // Hex input
+        if hex_str.is_empty() {
+            return Err("hex value must contain at least one digit".into());
+        }
         if hex_str.len() > 64 {
             return Err("hex value too large for U256".into());
         }
@@ -379,6 +381,9 @@ fn parse_u256(s: &str) -> Result<U256, Box<dyn std::error::Error>> {
         Ok(U256::from_be_slice(&bytes))
     } else {
         // Decimal input
+        if !s.bytes().any(|byte| byte.is_ascii_digit()) {
+            return Err("decimal value must contain at least one digit".into());
+        }
         let val =
             U256::from_str_radix(s, 10).map_err(|e| format!("invalid decimal value '{s}': {e}"))?;
         Ok(val)
@@ -820,6 +825,22 @@ mod tests {
     fn parse_u256_hex() {
         let val = parse_u256("0xff").unwrap();
         assert_eq!(val, U256::from(255u64));
+    }
+
+    #[test]
+    fn empty_hex_amount_is_rejected_while_explicit_zero_remains_valid() {
+        for invalid in ["0x", "", "_"] {
+            assert!(parse_u256(invalid).is_err(), "accepted {invalid:?}");
+        }
+        for zero in ["0", "0x0", "0x00"] {
+            assert_eq!(parse_u256(zero).unwrap(), U256::ZERO);
+        }
+        assert_eq!(parse_u256("0xf").unwrap(), U256::from(15));
+        assert_eq!(
+            parse_u256(&format!("0x{}", "f".repeat(64))).unwrap(),
+            U256::MAX
+        );
+        assert!(parse_u256(&format!("0x1{}", "0".repeat(64))).is_err());
     }
 
     #[test]
