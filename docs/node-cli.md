@@ -12,7 +12,7 @@
    - [init](#22-init---initialize-data-directory)
    - [key generate](#23-key-generate---create-keystore)
    - [key inspect](#24-key-inspect---show-address)
-   - [tx send / deploy / call](#25-tx-subcommands)
+   - [tx send / deploy / call / receipt](#25-tx-subcommands)
    - [account list / balance / nonce](#26-account-subcommands)
    - [wallet](#27-wallet-subcommands)
    - [backup create / restore](#28-backup-subcommands)
@@ -202,16 +202,36 @@ shell-node key inspect validator.json
 ### 2.5 `tx` Subcommands
 
 ```
-shell-node [GLOBAL FLAGS] tx <send|deploy|call> [OPTIONS]
+shell-node [GLOBAL FLAGS] tx <send|deploy|call|receipt> [OPTIONS]
 ```
 
 | Subcommand | Description |
 |-----------|-------------|
 | `tx send` | Send a transfer or generic transaction |
 | `tx deploy` | Deploy a smart contract |
-| `tx call` | Call a contract (read-only or state-changing) |
+| `tx call` | Make a read-only contract call |
+| `tx receipt <HASH>` | Query a transaction receipt as JSON |
 
-Common flags include `--keystore`, `--to`, `--value`, `--rpc-url`, `--gas`, `--gas-price`, `--nonce`, and optional `--chain-id`.
+Send flags include `--keystore`, `--to`, `--value`, `--rpc-url`, `--gas-limit`,
+`--nonce`, and optional `--chain-id`. Use each subcommand's `--help` for its flags.
+
+After submission, query the returned transaction hash without a keystore:
+
+```bash
+shell-node tx receipt <HASH> --rpc-url http://127.0.0.1:8545
+```
+
+`<HASH>` must contain `0x` followed by 64 hexadecimal digits. The command makes
+one `eth_getTransactionReceipt` request and prints the receipt object, including
+its `status`, or JSON `null` when no receipt is available. `null` does not
+distinguish a pending transaction from an unknown transaction. A receipt reports
+block inclusion, not finality.
+
+Exit code 0 means the query succeeded, including `null` and a reverted receipt
+(`status: "0x0"`). Scripts must inspect `status` to distinguish successful execution
+(`"0x1"`) from a revert. Invalid input, transport failures, RPC errors, and a
+receipt for a different transaction return a nonzero exit code. The command
+never signs, resubmits, or waits for confirmation.
 
 ---
 

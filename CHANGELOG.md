@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add `shell-node tx receipt <HASH>` to query transaction receipts as JSON
+  without a keystore. Unavailable receipts print `null`; RPC errors and mismatched
+  transaction hashes fail without resubmitting the transaction.
+
 ### Breaking Changes
 
 - Commit access lists to transaction signing hashes. Existing databases use
