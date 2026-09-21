@@ -38,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject EOF without input for `--password-stdin`, so a closed or empty pipe
+  cannot silently create a keystore with an empty password. Preserve supplied
+  password lines, including input without a trailing newline.
+
 - Validate stateful side-fork descendants against reconstructed parent state,
   restoring branch public keys and isolating governance changes from canonical
   validation while retaining finality and replay checks.
