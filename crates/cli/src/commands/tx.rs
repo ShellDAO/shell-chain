@@ -18,6 +18,16 @@ use super::rpc::rpc_post;
 
 #[derive(Subcommand)]
 pub enum TxCommand {
+    /// Query a transaction receipt and print JSON (null when unavailable).
+    Receipt {
+        /// Transaction hash (`0x` + 64 hex digits).
+        hash: String,
+
+        /// JSON-RPC endpoint URL.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc_url: String,
+    },
+
     /// Send a value transfer transaction.
     Send {
         /// Recipient address (`0x` + 64 lowercase hex).
@@ -94,6 +104,7 @@ pub fn execute(
     password_args: PasswordArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
+        TxCommand::Receipt { hash, rpc_url } => cmd_receipt(hash, rpc_url),
         TxCommand::Send {
             to,
             value,
@@ -123,6 +134,39 @@ pub fn execute(
         } => cmd_deploy(code, keystore, rpc_url, chain_id, value, &password_args),
         TxCommand::Call { to, data, rpc_url } => cmd_call(to, data, rpc_url),
     }
+}
+
+/// Query once without signing or resubmitting the transaction.
+fn cmd_receipt(hash: String, rpc_url: String) -> Result<(), Box<dyn std::error::Error>> {
+    let digits = hash
+        .strip_prefix("0x")
+        .filter(|digits| digits.len() == 64 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("transaction hash must be 0x-prefixed with exactly 64 hexadecimal digits")?;
+    let hash = format!("0x{}", digits.to_ascii_lowercase());
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionReceipt",
+        "params": [hash],
+        "id": 1
+    });
+    let response = rpc_post(&rpc_url, &body)?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("RPC error from eth_getTransactionReceipt: {error}").into());
+    }
+    let receipt = response
+        .get("result")
+        .filter(|result| result.is_null() || result.is_object())
+        .ok_or("unexpected eth_getTransactionReceipt response")?;
+    if !receipt.is_null()
+        && !receipt
+            .get("transactionHash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|returned| returned.eq_ignore_ascii_case(&hash))
+    {
+        return Err("RPC returned a receipt for an unexpected transaction hash".into());
+    }
+    println!("{}", serde_json::to_string_pretty(receipt)?);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
