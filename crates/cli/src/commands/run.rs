@@ -393,8 +393,18 @@ async fn initialize_chain<S: KvStore + 'static>(
                 genesis_block.header.state_root
             );
         }
-    } else if checkpoint_url.is_some() {
-        info!("Chain already has a canonical head, skipping checkpoint sync");
+    } else {
+        if let Some(stored) = chain_store.get_chain_config()? {
+            let trusted_genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
+            if stored.chain_id != genesis_config.chain_id
+                || stored.genesis_hash != trusted_genesis.hash()
+            {
+                return Err("database does not match the local genesis configuration".into());
+            }
+        }
+        if checkpoint_url.is_some() {
+            info!("Chain already has a canonical head, skipping checkpoint sync");
+        }
     }
 
     let stored = chain_store.get_chain_config()?;
@@ -412,12 +422,6 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.log_address_activation_height
     {
         let stored = stored.ok_or("stored chain configuration is missing")?;
-        let trusted_genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
-        if stored.chain_id != genesis_config.chain_id
-            || stored.genesis_hash != trusted_genesis.hash()
-        {
-            return Err("activation requires the original local genesis configuration".into());
-        }
         let desired = shell_storage::ChainConfig {
             fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
             log_address_activation_height: genesis_config.log_address_activation_height,
@@ -1431,6 +1435,63 @@ mod tests {
         .await;
         assert!(result.unwrap_err().to_string().contains("chain ID"));
         assert!(store.scan_prefix(b"").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_changed_genesis_identity_without_activation_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = test_genesis(Address::from([7u8; 20]));
+        let mut accepted = Vec::new();
+        for changed_field in ["chain_id", "timestamp", "allocation", "authority"] {
+            let store = Arc::new(MemoryDb::new());
+            initialize_genesis(&original, Arc::clone(&store)).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut changed = original.clone();
+            match changed_field {
+                "chain_id" => changed.chain_id += 1,
+                "timestamp" => changed.timestamp += 1,
+                "allocation" => changed.alloc.values_mut().next().unwrap().balance += U256::ONE,
+                "authority" => changed = test_genesis(Address::from([8u8; 20])),
+                _ => unreachable!(),
+            }
+            let result = initialize_chain(
+                Arc::clone(&store),
+                &changed,
+                dir.path(),
+                changed.chain_id,
+                None,
+            )
+            .await;
+            match result {
+                Ok(()) => accepted.push(changed_field),
+                Err(error) => assert!(error.to_string().contains("genesis configuration")),
+            }
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        assert!(
+            accepted.is_empty(),
+            "restart accepted changed fields: {accepted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_accepts_matching_genesis_with_changed_bootnodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let mut config = test_genesis(Address::from([7u8; 20]));
+        initialize_genesis(&config, Arc::clone(&store)).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        config.boot_nodes.push("/ip4/127.0.0.1/tcp/30333".into());
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
     }
 
     #[test]

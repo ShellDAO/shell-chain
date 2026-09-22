@@ -38,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Reject a mismatched local genesis when restarting an existing database with
+  persisted chain configuration, even when protocol activation heights are
+  unchanged. Validate identity before updating authority keys or activations.
+
 - Preserve existing genesis files and symbolic links when `init` is repeated.
   New genesis files are fully written before publication without replacing an
   existing destination.

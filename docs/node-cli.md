@@ -95,6 +95,12 @@ genesis and the selected chain ID. An existing canonical head, including a
 genesis-only database, causes checkpoint sync to be skipped. A failed download
 or validation does not publish a head, so the same database can retry the import.
 
+When restarting an existing database with persisted chain configuration, the
+local genesis must match its chain ID and genesis hash. A mismatch stops startup
+before authority-key registration or protocol activation updates. Restore the
+original genesis configuration, or use a separate data directory for another
+chain. Bootnode changes do not change genesis identity.
+
 **Network Profile Defaults:**
 
 | Profile | Block Time | Chain ID default |
