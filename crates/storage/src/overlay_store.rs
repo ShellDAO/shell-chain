@@ -202,6 +202,16 @@ mod tests {
     use crate::MemoryDb;
 
     #[test]
+    fn address_history_range_scan_contract() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"a/1", b"old").unwrap();
+        base.put(b"a/removed", b"old").unwrap();
+        let store = OverlayStore::new(base);
+        store.delete(b"a/removed").unwrap();
+        crate::kv_store::assert_address_history_range_scan(&store);
+    }
+
+    #[test]
     fn changes_are_private_until_commit() {
         let base = Arc::new(MemoryDb::new());
         base.put(b"item/a", b"old").unwrap();

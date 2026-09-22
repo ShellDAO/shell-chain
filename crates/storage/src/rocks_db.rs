@@ -404,6 +404,35 @@ impl KvStore for RocksDbStore {
         Ok(results)
     }
 
+    fn scan_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let start = start.max(prefix);
+        if end.is_some_and(|end| start >= end) {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange(prefix));
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            opts,
+            rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+            if !key.starts_with(prefix) || end.is_some_and(|end| key.as_ref() >= end) {
+                break;
+            }
+            entries.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(entries)
+    }
+
     fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
         let cf = self.cf();
         let mut opts = rocksdb::ReadOptions::default();
@@ -496,6 +525,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stores = RocksDbStore::open_all(dir.path(), None).unwrap();
         (dir, stores)
+    }
+
+    #[test]
+    fn address_history_range_scan_contract() {
+        let (_dir, stores) = open_temp();
+        let store = stores.chain;
+        crate::kv_store::assert_address_history_range_scan(&store);
     }
 
     #[test]

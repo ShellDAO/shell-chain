@@ -96,6 +96,32 @@ impl KvStore for MemoryDb {
         Ok(results)
     }
 
+    fn scan_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if end.is_some_and(|end| start >= end) {
+            return Ok(Vec::new());
+        }
+        let data = self
+            .data
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut entries: Vec<_> = data
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with(prefix)
+                    && key.as_slice() >= start
+                    && end.is_none_or(|end| key.as_slice() < end)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
     fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
         let data = self
             .data
@@ -137,6 +163,12 @@ impl KvStore for MemoryDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_history_range_scan_contract() {
+        let store = MemoryDb::new();
+        crate::kv_store::assert_address_history_range_scan(&store);
+    }
 
     #[test]
     fn put_get_roundtrip() {

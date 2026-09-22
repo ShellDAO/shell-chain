@@ -1379,6 +1379,23 @@ impl<S: KvStore> ChainStore<S> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    fn scan_address_tx_range(
+        &self,
+        prefix: &[u8],
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        let start = [prefix, &from_block.to_be_bytes()].concat();
+        let end = to_block
+            .checked_add(1)
+            .map(|height| [prefix, &height.to_be_bytes()].concat());
+        self.store.scan_prefix_range(prefix, &start, end.as_deref())
+    }
+
     /// Get transaction hashes involving a given address, with pagination.
     ///
     /// Scans the address→tx index for `address` within the specified block range.
@@ -1396,7 +1413,7 @@ impl<S: KvStore> ChainStore<S> {
         }
 
         let prefix = Self::addr_tx_prefix(address);
-        let entries = self.store.scan_prefix(&prefix)?;
+        let entries = self.scan_address_tx_range(&prefix, from_block, to_block)?;
 
         let mut matches = Vec::new();
         for (key, value) in entries {
@@ -1431,7 +1448,7 @@ impl<S: KvStore> ChainStore<S> {
         to_block: u64,
     ) -> Result<u64, StorageError> {
         let prefix = Self::addr_tx_prefix(address);
-        let entries = self.store.scan_prefix(&prefix)?;
+        let entries = self.scan_address_tx_range(&prefix, from_block, to_block)?;
 
         let total = entries
             .iter()
@@ -3255,6 +3272,7 @@ mod tests {
         max_batch_bytes: AtomicUsize,
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
+        scanned_entries: AtomicUsize,
     }
 
     impl FailingBatchStore {
@@ -3267,6 +3285,7 @@ mod tests {
                 max_batch_bytes: AtomicUsize::new(0),
                 fail_put_after: AtomicUsize::new(usize::MAX),
                 put_calls: AtomicUsize::new(0),
+                scanned_entries: AtomicUsize::new(0),
             }
         }
 
@@ -3326,7 +3345,22 @@ mod tests {
         }
 
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-            self.inner.scan_prefix(prefix)
+            let entries = self.inner.scan_prefix(prefix)?;
+            self.scanned_entries
+                .fetch_add(entries.len(), Ordering::SeqCst);
+            Ok(entries)
+        }
+
+        fn scan_prefix_range(
+            &self,
+            prefix: &[u8],
+            start: &[u8],
+            end: Option<&[u8]>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            let entries = self.inner.scan_prefix_range(prefix, start, end)?;
+            self.scanned_entries
+                .fetch_add(entries.len(), Ordering::SeqCst);
+            Ok(entries)
         }
     }
 
@@ -5463,6 +5497,109 @@ mod tests {
         assert!(error
             .to_string()
             .contains("multiple canonical head mappings"));
+    }
+
+    #[test]
+    fn address_history_range_preserves_boundaries_and_order() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&store));
+        let address = Address::from([0x44; 20]);
+        for (height, index, value) in [(0, 0, 1), (1, 2, 2), (1, 0, 3), (u64::MAX, u32::MAX, 4)] {
+            store
+                .put(
+                    &ChainStore::<MemoryDb>::addr_tx_key(&address, height, index),
+                    ShellHash::from([value; 32]).as_bytes(),
+                )
+                .unwrap();
+        }
+        // Existing readers also accept a trailing byte after the index.
+        let mut extended = ChainStore::<MemoryDb>::addr_tx_key(&address, u64::MAX, u32::MAX);
+        extended.push(0);
+        store
+            .put(&extended, ShellHash::from([5; 32]).as_bytes())
+            .unwrap();
+        let mut short = ChainStore::<MemoryDb>::addr_tx_prefix(&address);
+        short.extend_from_slice(&1u64.to_be_bytes());
+        store
+            .put(&short, ShellHash::from([6; 32]).as_bytes())
+            .unwrap();
+        store
+            .put(
+                &ChainStore::<MemoryDb>::addr_tx_key(&address, 1, 1),
+                b"invalid hash",
+            )
+            .unwrap();
+        assert_eq!(cs.count_txs_by_address(&address, 0, u64::MAX).unwrap(), 5);
+        assert_eq!(
+            cs.count_txs_by_address(&address, u64::MAX, u64::MAX)
+                .unwrap(),
+            2
+        );
+        assert_eq!(cs.count_txs_by_address(&address, 2, 1).unwrap(), 0);
+        assert!(cs
+            .get_txs_by_address(&address, 2, 1, 0, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            cs.get_txs_by_address(&address, 0, 1, 0, 10).unwrap(),
+            vec![
+                ShellHash::from([3; 32]),
+                ShellHash::from([2; 32]),
+                ShellHash::from([1; 32])
+            ]
+        );
+        assert_eq!(
+            cs.get_txs_by_address(&address, 0, 1, 1, 1).unwrap(),
+            vec![ShellHash::from([2; 32])]
+        );
+        assert!(cs
+            .get_txs_by_address(&address, 0, 1, 10, 10)
+            .unwrap()
+            .is_empty());
+        assert!(cs
+            .get_txs_by_address(&address, 0, 1, 0, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn address_history_range_materialization() {
+        let mut observations = Vec::new();
+        for history_len in [100u64, 10_000] {
+            let store = Arc::new(FailingBatchStore::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let address = Address::from([0x55; 20]);
+            for height in 0..history_len {
+                store
+                    .put(
+                        &ChainStore::<MemoryDb>::addr_tx_key(&address, height, 0),
+                        ShellHash::from([1; 32]).as_bytes(),
+                    )
+                    .unwrap();
+            }
+            let height = history_len / 2;
+            let start = std::time::Instant::now();
+            assert_eq!(
+                cs.count_txs_by_address(&address, height, height).unwrap(),
+                1
+            );
+            assert_eq!(
+                cs.get_txs_by_address(&address, height, height, 0, 1)
+                    .unwrap(),
+                vec![ShellHash::from([1; 32])]
+            );
+            let rows = store.scanned_entries.load(Ordering::SeqCst);
+            eprintln!(
+                "address history: {history_len} rows; materialized={rows}; elapsed_us={}",
+                start.elapsed().as_micros()
+            );
+            observations.push(rows);
+        }
+        assert_eq!(
+            observations,
+            vec![2, 2],
+            "narrow queries must not materialize unrelated history"
+        );
     }
 
     #[test]
