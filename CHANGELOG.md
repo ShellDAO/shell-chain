@@ -38,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve existing genesis files and symbolic links when `init` is repeated.
+  New genesis files are fully written before publication without replacing an
+  existing destination.
+
 - Reject empty transaction amounts and bare hexadecimal prefixes in CLI send
   and deploy commands before keystore access or RPC, instead of interpreting
   them as zero-value transactions.

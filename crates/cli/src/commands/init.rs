@@ -1,6 +1,7 @@
 //! `shell-node init` — initialize genesis and data directory.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +40,19 @@ pub fn init(
         std::fs::create_dir_all(&datadir)?;
         datadir.canonicalize()?
     };
+
+    let genesis_file = datadir.join("genesis.json");
+    match std::fs::symlink_metadata(&genesis_file) {
+        Ok(_) => {
+            return Err(format!(
+                "genesis.json already exists in {}; refusing to replace it",
+                datadir.display()
+            )
+            .into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
 
     let genesis_config = match genesis_path {
         Some(path) => {
@@ -117,8 +131,14 @@ pub fn init(
     let genesis_block = initialize_genesis(&genesis_config, store)?;
 
     let genesis_json = serde_json::to_string_pretty(&genesis_config)?;
-    let genesis_file = datadir.join("genesis.json");
-    std::fs::write(&genesis_file, &genesis_json)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&datadir)?;
+    temp.write_all(genesis_json.as_bytes())?;
+    temp.as_file().sync_all()?;
+    // Another initializer may have published a genesis since the early check.
+    temp.persist_noclobber(&genesis_file)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(&datadir)?.sync_all()?;
 
     info!(
         "Genesis block #{} written (state_root: {:?})",

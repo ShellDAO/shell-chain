@@ -144,6 +144,11 @@ shell-node [GLOBAL FLAGS] init [OPTIONS]
 | `--chain-id <ID>` | `1337` | Chain ID |
 | `--network <PROFILE>` | `dev` | Network profile |
 
+`init` creates a new genesis configuration. If `genesis.json` already exists
+in the data directory, including as a symbolic link, the command fails before
+generating an authority key and preserves the existing path. Use a fresh data
+directory to initialize another chain.
+
 **Example:**
 
 ```bash
