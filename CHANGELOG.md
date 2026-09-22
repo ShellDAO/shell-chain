@@ -38,6 +38,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Stop startup on a dangling genesis link instead of generating development
+  configuration through it. Publish newly generated development genesis files
+  without overwriting a concurrently created destination.
+
 - Reject a mismatched local genesis when restarting an existing database with
   persisted chain configuration, even when protocol activation heights are
   unchanged. Validate identity before updating authority keys or activations.

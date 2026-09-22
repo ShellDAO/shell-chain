@@ -1,5 +1,6 @@
 //! `shell-node run` — start the node.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -598,9 +599,16 @@ async fn run_with_store<S: KvStore + 'static>(
 
     // Load genesis config.
     let genesis_file = args.datadir.join("genesis.json");
-    let genesis_config = if genesis_file.exists() {
+    let genesis_exists = match std::fs::symlink_metadata(&genesis_file) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let genesis_config = if genesis_exists {
         // F-082: Validate genesis file before loading.
-        let file_size = std::fs::metadata(&genesis_file)?.len();
+        let file_size = std::fs::metadata(&genesis_file)
+            .map_err(|error| format!("cannot read genesis configuration: {error}"))?
+            .len();
         if file_size > MAX_GENESIS_FILE_SIZE {
             return Err(format!(
                 "genesis file too large: {} bytes (max {} bytes)",
@@ -653,7 +661,14 @@ async fn run_with_store<S: KvStore + 'static>(
         // Persist dev genesis for future restarts.
         std::fs::create_dir_all(&args.datadir)?;
         let json = serde_json::to_string_pretty(&config)?;
-        std::fs::write(&genesis_file, &json)?;
+        let mut temp = tempfile::NamedTempFile::new_in(&args.datadir)?;
+        temp.write_all(json.as_bytes())?;
+        temp.as_file().sync_all()?;
+        // Preserve a configuration published since the initial existence check.
+        temp.persist_noclobber(&genesis_file)
+            .map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(&args.datadir)?.sync_all()?;
         info!("Dev genesis written to {}", genesis_file.display());
 
         config

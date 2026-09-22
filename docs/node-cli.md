@@ -101,6 +101,12 @@ before authority-key registration or protocol activation updates. Restore the
 original genesis configuration, or use a separate data directory for another
 chain. Bootnode changes do not change genesis identity.
 
+If `genesis.json` is absent, `run` creates a development genesis. An existing
+but unreadable configuration, including a dangling symbolic link, causes an
+error instead of generating a replacement. Valid links to readable genesis
+files remain supported. New development genesis files are fully written before
+publication and never replace a destination created concurrently.
+
 **Network Profile Defaults:**
 
 | Profile | Block Time | Chain ID default |
