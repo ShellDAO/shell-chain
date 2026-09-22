@@ -24,6 +24,10 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- Restrict address-history index materialization to the requested block range
+  in RocksDB and MemoryDb for legacy pagination and exact totals, preserving
+  transaction ordering.
+
 - Count canonical witness-bundle bytes directly from borrowed transactions
   instead of cloning complete block payloads and witness material.
 - Build signature-batch STARK traces directly in the prover table instead of

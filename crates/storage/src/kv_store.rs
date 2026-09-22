@@ -74,6 +74,28 @@ pub trait KvStore: Send + Sync {
     #[allow(clippy::type_complexity)]
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
 
+    /// Scan matching keys from inclusive `start` to exclusive `end`, in ascending
+    /// byte order. No end means the remainder of the prefix. Backends can avoid
+    /// materializing entries outside the range.
+    #[allow(clippy::type_complexity)]
+    fn scan_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if end.is_some_and(|end| start >= end) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .scan_prefix(prefix)?
+            .into_iter()
+            .filter(|(key, _)| {
+                key.as_slice() >= start && end.is_none_or(|end| key.as_slice() < end)
+            })
+            .collect())
+    }
+
     /// Sum the byte lengths of keys and values matching `prefix`.
     ///
     /// Backends may override this to stream entries without materializing the
@@ -126,6 +148,34 @@ pub trait KvStore: Send + Sync {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_address_history_range_scan(store: &impl KvStore) {
+    for key in [b"a/0".as_slice(), b"a/1", b"a/2", b"a/\xff", b"b/0"] {
+        store.put(key, key).unwrap();
+    }
+    let keys = |start: &[u8], end: Option<&[u8]>| {
+        store
+            .scan_prefix_range(b"a/", start, end)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(b"a/1", Some(b"a/2")), vec![b"a/1".to_vec()]);
+    assert_eq!(
+        keys(b"a/2", None),
+        vec![b"a/2".to_vec(), b"a/\xff".to_vec()]
+    );
+    assert_eq!(keys(b"", Some(b"a/1")), vec![b"a/0".to_vec()]);
+    assert!(keys(b"a/2", Some(b"a/1")).is_empty());
+    assert!(keys(b"a/1", Some(b"a/1")).is_empty());
+    assert!(keys(b"b/", None).is_empty());
+    assert!(store
+        .scan_prefix_range(b"missing/", b"", None)
+        .unwrap()
+        .is_empty());
 }
 
 #[cfg(test)]
