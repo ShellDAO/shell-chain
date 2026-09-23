@@ -27,6 +27,7 @@ struct TokenBucket {
     refill_per_sec: u64,
     capacity: u64,
     last_refill: Instant,
+    refill_remainder: u128,
 }
 
 impl TokenBucket {
@@ -37,6 +38,7 @@ impl TokenBucket {
             refill_per_sec,
             capacity,
             last_refill: Instant::now(),
+            refill_remainder: 0,
         }
     }
 
@@ -46,19 +48,20 @@ impl TokenBucket {
             return;
         }
 
-        let refill = elapsed_nanos.saturating_mul(self.refill_per_sec as u128)
-            / Duration::from_secs(1).as_nanos();
-        if refill == 0 {
-            return;
-        }
-
-        let refill = refill.min(u64::MAX as u128) as u64;
-        self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
-
-        let consumed_nanos =
-            refill as u128 * Duration::from_secs(1).as_nanos() / self.refill_per_sec as u128;
-        let consumed_nanos = consumed_nanos.min(u64::MAX as u128) as u64;
-        self.last_refill += Duration::from_nanos(consumed_nanos);
+        let nanos_per_sec = Duration::from_secs(1).as_nanos();
+        let credit = elapsed_nanos
+            .saturating_mul(self.refill_per_sec as u128)
+            .saturating_add(self.refill_remainder);
+        let refill = credit / nanos_per_sec;
+        self.tokens = (self.tokens as u128 + refill).min(self.capacity as u128) as u64;
+        // Consume elapsed time once, retaining only the fractional token credit.
+        // Idle time beyond the burst capacity must not fund later requests.
+        self.refill_remainder = if self.tokens == self.capacity {
+            0
+        } else {
+            credit % nanos_per_sec
+        };
+        self.last_refill = now;
     }
 
     fn allow(&mut self, bytes: u64, now: Instant) -> bool {
@@ -360,6 +363,39 @@ mod tests {
 
         assert!(tracker.record_inbound(150));
         assert!(!tracker.record_inbound(151));
+    }
+
+    #[test]
+    fn token_bucket_cannot_reuse_elapsed_time_at_high_rates() {
+        for rate in [1_250_000_000, 1_500_000_000, 2_000_000_000, 2_500_000_000] {
+            let mut bucket = TokenBucket::new(rate);
+            let start = bucket.last_refill;
+            assert!(bucket.allow(rate, start));
+            let now = start + Duration::from_nanos(1);
+            let admitted = (0..16).filter(|_| bucket.allow(1, now)).count();
+            assert_eq!(admitted as u64, rate / 1_000_000_000, "rate={rate}");
+        }
+    }
+
+    #[test]
+    fn token_bucket_retains_fractional_refill_credit() {
+        let mut bucket = TokenBucket::new(3);
+        let start = bucket.last_refill;
+        assert!(bucket.allow(3, start));
+        for millis in 1..=1000 {
+            let allowed = bucket.allow(1, start + Duration::from_millis(millis));
+            assert_eq!(allowed, matches!(millis, 334 | 667 | 1000));
+        }
+    }
+
+    #[test]
+    fn token_bucket_discards_excess_idle_credit_at_maximum_rate() {
+        let mut bucket = TokenBucket::new(u64::MAX);
+        let start = bucket.last_refill;
+        assert!(bucket.allow(u64::MAX, start));
+        let now = start + Duration::from_secs(10);
+        assert!(bucket.allow(u64::MAX, now));
+        assert!(!bucket.allow(1, now));
     }
 
     #[test]

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Consume P2P bandwidth refill time once at high configured rates, preserving
+  fractional token credit without allowing repeated use of elapsed time or
+  excess idle credit beyond the burst limit.
+
 - Stop startup on a dangling genesis link instead of generating development
   configuration through it. Publish newly generated development genesis files
   without overwriting a concurrently created destination.
