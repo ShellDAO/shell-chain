@@ -73,22 +73,22 @@ pub fn key_inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("invalid public_key in keystore: {e}"))?;
     let address = Address::from_public_key(&pubkey_bytes, sig_type.as_u8());
 
-    eprintln!("Keystore: {}", path.display());
-    eprintln!("  Version:    {}", encrypted.version);
-    eprintln!("  Algorithm:  {}", encrypted.key_type);
-    eprintln!("  Address:    {address}");
+    println!("Keystore: {}", path.display());
+    println!("  Version:    {}", encrypted.version);
+    println!("  Algorithm:  {}", encrypted.key_type);
+    println!("  Address:    {address}");
     if encrypted.address != address.to_string() {
         eprintln!(
             "  ⚠ Legacy address field: {} → run `key migrate` to update",
             encrypted.address
         );
     }
-    eprintln!("  KDF:        {}", encrypted.kdf);
-    eprintln!("  Cipher:     {}", encrypted.cipher);
+    println!("  KDF:        {}", encrypted.kdf);
+    println!("  Cipher:     {}", encrypted.cipher);
     if encrypted.public_key.len() <= 32 {
-        eprintln!("  Public key: 0x{}", encrypted.public_key);
+        println!("  Public key: 0x{}", encrypted.public_key);
     } else {
-        eprintln!(
+        println!(
             "  Public key: 0x{}...{}",
             &encrypted.public_key[..16],
             &encrypted.public_key[encrypted.public_key.len() - 16..]
