@@ -206,17 +206,28 @@ RECIPIENT=$(shell-node key inspect recipient-key.json | awk '/Address:/ {print $
 Send 1 ETH (1000000000000000000 wei) from your funded account:
 
 ```bash
-shell-node tx send \
+TX_HASH=$(shell-node tx send \
   --to "$RECIPIENT" \
   --value 1000000000000000000 \
   --keystore my-key.json \
   --password-file .quickstart-password \
-  --rpc-url http://127.0.0.1:8545
+  --rpc-url http://127.0.0.1:8545)
 ```
 
-Enter your keystore password when prompted. The command outputs the transaction hash.
+The password file unlocks the keystore. The command stores the submitted
+transaction hash in `TX_HASH`.
 
-Verify the recipient received the funds:
+Query its receipt to check inclusion and execution:
+
+```bash
+shell-node tx receipt "$TX_HASH" --rpc-url http://127.0.0.1:8545
+```
+
+If the result is `null`, wait for a block and repeat the receipt query. A receipt
+with `status: "0x1"` confirms successful execution; `status: "0x0"` means execution
+failed. Receipt queries are read-only and can be repeated with the same hash.
+
+After a successful receipt, verify the recipient received the funds:
 
 ```bash
 shell-node account balance "$RECIPIENT" --rpc-url http://127.0.0.1:8545
