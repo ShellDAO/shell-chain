@@ -31,11 +31,17 @@ operations; a failed transaction or frame does not imply those writes committed.
 
 ## Limits and follow-up
 
-Native system contracts also read address metadata outside the state trie.
-Their undo journals are pruned at finality, so parent trie state alone is not
-sufficient for faithful replay. Refuse native transactions and prefixes requiring
-them until historical metadata is reconstructed or execution traces are retained.
-This keeps that capability gap explicit while delivering real contract tracing.
+AccountManager `rotateKey` and `clearValidationCode` read only state-trie data
+and can be replayed from the parent root, including as earlier transactions in
+the same block. Rotation's address-keyed public-key write stays in the private
+overlay; it never reads or replaces the live public key. Native calls return the
+executor's actual output, gas and success/error status without opcode logs.
+
+Other native methods can read address metadata outside the state trie, and
+recovery methods also use the chain-head height. Their undo journals are pruned
+at finality. Refuse those native transactions and prefixes until their historical
+metadata and chain context are reconstructed or execution traces are retained.
+Keep the state-only selector list conservative when native implementations change.
 
 The OpenEthereum-shaped `trace_` methods use this same replay path and flatten
 observed call/creation frames on the blocking worker. Each entry preserves its
@@ -44,6 +50,7 @@ results; creations expose init code, deployed code and address. AA bundles use
 an explicit `callType: "batch"` root extension. Serialized flattened responses
 are bounded both per transaction and across the whole block.
 
-SELFDESTRUCT balance-transfer events remain a separate capture gap. This does
-not claim full externality tracing, full Geth tracer compatibility, retained
-pruned history, or a transaction validation replay.
+PQVM removes SELFDESTRUCT and CALLCODE under the white-paper opcode rules;
+there are no successful SELFDESTRUCT balance-transfer events to capture. This
+does not claim full Geth tracer compatibility, retained pruned history, or a
+transaction validation replay.

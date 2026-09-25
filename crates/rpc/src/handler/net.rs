@@ -143,15 +143,22 @@ fn replay_block_traces<S: KvStore + 'static>(
             if target.is_some_and(|target| index > target) {
                 break;
             }
-            // Native execution also reads address-keyed metadata outside the state
-            // trie. Its historical undo journals may already have been pruned.
-            // Do not execute it against today's metadata or invent a call frame.
+            // Rotation and clearing validation code read only trie state. Rotation
+            // writes the public key into this private overlay without reading the
+            // current address-keyed value. Other native methods may read guardian
+            // metadata or the live chain head, so still require historical context.
+            let state_only_native = tx.tx.to == Some(shell_pqvm::account_manager_address())
+                && tx.tx.data.as_ref().get(..4).is_some_and(|selector| {
+                    selector == shell_pqvm::system_contracts::ROTATE_KEY_SELECTOR
+                        || selector == shell_pqvm::system_contracts::CLEAR_VALIDATION_CODE_SELECTOR
+                });
             if tx
                 .tx
                 .to
                 .as_ref()
                 .is_some_and(shell_pqvm::is_system_contract)
                 && !tx.is_aa_bundle()
+                && !state_only_native
             {
                 return Err(server_error(
                     "native system-contract tracing requires historical address metadata",
