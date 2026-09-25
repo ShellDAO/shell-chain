@@ -488,25 +488,42 @@ pub struct TraceOptions {
     pub disable_storage: Option<bool>,
 }
 
-/// OpenEthereum-compatible trace action.
+/// OpenEthereum call and contract-creation actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OeTraceAction {
-    /// Call type: "call", "create", "staticcall", "delegatecall"
-    pub call_type: Option<String>,
-    pub from: Address,
-    pub to: Option<Address>,
-    pub gas: String,
-    pub value: String,
-    pub input: String,
+#[serde(untagged)]
+pub enum OeTraceAction {
+    Call {
+        #[serde(rename = "callType")]
+        call_type: String,
+        from: Address,
+        to: Address,
+        gas: String,
+        value: String,
+        input: String,
+    },
+    Create {
+        from: Address,
+        gas: String,
+        value: String,
+        init: String,
+    },
 }
 
-/// OpenEthereum-compatible trace result (return data + gas).
+/// Successful call output or deployed contract code and address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OeTraceOutput {
-    pub gas_used: String,
-    pub output: String,
+#[serde(untagged)]
+pub enum OeTraceOutput {
+    Call {
+        #[serde(rename = "gasUsed")]
+        gas_used: String,
+        output: String,
+    },
+    Create {
+        #[serde(rename = "gasUsed")]
+        gas_used: String,
+        code: String,
+        address: Address,
+    },
 }
 
 /// Single OpenEthereum-compatible trace entry.

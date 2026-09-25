@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Replay `trace_transaction` and `trace_block` against historical state and
+  return executed nested calls, creation results and per-frame errors with
+  OpenEthereum trace paths. Register the documented `trace_oeTransaction`
+  alias. Reject unavailable history instead of returning receipt summaries.
+
 - Replay `debug_traceTransaction` and `debug_traceBlockByNumber` against isolated
   parent state, including earlier transactions in the block. Return executed
   nested calls, creation output, revert data, and bounded opcode observations

@@ -283,7 +283,7 @@ pub trait TraceApi {
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
     /// Returns traces for a single transaction (OpenEthereum format).
-    #[method(name = "transaction")]
+    #[method(name = "transaction", aliases = ["trace_oeTransaction"])]
     async fn trace_oe_transaction(
         &self,
         tx_hash: String,

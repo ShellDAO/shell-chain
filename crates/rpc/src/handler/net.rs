@@ -1,7 +1,13 @@
 use super::*;
 
 const MAX_CONCURRENT_TRACE_REPLAYS: usize = 2;
-const MAX_TRACE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_TRACE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(super) enum TraceFormat {
+    Debug,
+    OpenEthereum,
+}
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> Web3ApiServer for RpcHandler<S> {
@@ -51,7 +57,7 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         let options = parse_trace_options(opts)?;
         let (block, _, _, tx_index) = self.lookup_tx_with_block(&tx_hash)?;
         let mut traces = self
-            .replay_traces(block, Some(tx_index as usize), options)
+            .replay_traces(block, Some(tx_index as usize), options, TraceFormat::Debug)
             .await?;
         traces
             .pop()
@@ -66,17 +72,19 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         let options = parse_trace_options(opts)?;
         let block = self.resolve_block(&block_number)?;
         Ok(serde_json::Value::Array(
-            self.replay_traces(block, None, options).await?,
+            self.replay_traces(block, None, options, TraceFormat::Debug)
+                .await?,
         ))
     }
 }
 
 impl<S: KvStore + 'static> RpcHandler<S> {
-    async fn replay_traces(
+    pub(super) async fn replay_traces(
         &self,
         block: Block,
         target: Option<usize>,
         options: TraceOptions,
+        format: TraceFormat,
     ) -> Result<Vec<serde_json::Value>, ErrorObjectOwned> {
         static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
         let permit = SLOTS
@@ -89,7 +97,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         let chain_id = self.chain_id;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            replay_block_traces(chain, chain_id, block, target, options)
+            replay_block_traces(chain, chain_id, block, target, options, format)
         })
         .await
         .map_err(|error| internal_err(format!("trace task failed: {error}")))?
@@ -102,6 +110,7 @@ fn replay_block_traces<S: KvStore + 'static>(
     block: Block,
     target: Option<usize>,
     options: TraceOptions,
+    format: TraceFormat,
 ) -> Result<Vec<serde_json::Value>, ErrorObjectOwned> {
     if block.transactions.is_empty() {
         return Ok(Vec::new());
@@ -172,13 +181,24 @@ fn replay_block_traces<S: KvStore + 'static>(
                     .map_err(internal_err)?;
             }
             if let Some(trace) = trace {
-                let value = serde_json::to_value(trace).map_err(internal_err)?;
-                response_bytes = response_bytes
-                    .saturating_add(serde_json::to_vec(&value).map_err(internal_err)?.len());
-                if response_bytes > MAX_TRACE_RESPONSE_BYTES {
-                    return Err(server_error("trace response exceeds 16 MiB limit"));
+                let values = match format {
+                    TraceFormat::Debug => vec![serde_json::to_value(trace).map_err(internal_err)?],
+                    TraceFormat::OpenEthereum => super::debug::flatten_oe_trace(
+                        trace.result.frame,
+                        block.header.number,
+                        block.hash(),
+                        tx.hash(),
+                        index as u64,
+                    )?,
+                };
+                for value in values {
+                    response_bytes = response_bytes
+                        .saturating_add(serde_json::to_vec(&value).map_err(internal_err)?.len());
+                    if response_bytes > MAX_TRACE_RESPONSE_BYTES {
+                        return Err(server_error("trace response exceeds 16 MiB limit"));
+                    }
+                    traces.push(value);
                 }
-                traces.push(value);
             }
         }
         Ok(traces)

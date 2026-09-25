@@ -679,64 +679,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             }
         }
     }
-
-    /// Build an OpenEthereum-compatible trace entry for a single transaction.
-    fn build_oe_trace(
-        &self,
-        tx: &SignedTransaction,
-        receipt: Option<&shell_core::TransactionReceipt>,
-        block_number: u64,
-        block_hash: ShellHash,
-        tx_position: u64,
-    ) -> OeTrace {
-        let is_create = tx.tx.to.is_none();
-        let trace_type = if is_create { "create" } else { "call" };
-        let call_type = if is_create {
-            None
-        } else {
-            Some("call".to_string())
-        };
-
-        let action = OeTraceAction {
-            call_type,
-            from: tx.sender(),
-            to: tx.tx.to,
-            gas: hex_u64(tx.tx.gas_limit),
-            value: hex_u256(tx.tx.value),
-            input: hex_bytes(tx.tx.data.as_ref()),
-        };
-
-        let (result, error) = match receipt {
-            Some(r) if r.succeeded() => {
-                let output = OeTraceOutput {
-                    gas_used: hex_u64(r.gas_used),
-                    output: "0x".to_string(),
-                };
-                (Some(output), None)
-            }
-            Some(r) => {
-                let output = OeTraceOutput {
-                    gas_used: hex_u64(r.gas_used),
-                    output: "0x".to_string(),
-                };
-                (Some(output), Some("execution reverted".to_string()))
-            }
-            None => (None, Some("receipt not available".to_string())),
-        };
-
-        OeTrace {
-            action,
-            result,
-            error,
-            subtraces: 0,
-            trace_address: vec![],
-            trace_type: trace_type.to_string(),
-            block_number,
-            block_hash,
-            transaction_hash: tx.hash(),
-            transaction_position: tx_position,
-        }
-    }
 }
 
 /// Convert a storage error into a JSON-RPC internal error.
@@ -7769,62 +7711,112 @@ mod tests {
     #[tokio::test]
     async fn trace_block_returns_oe_format() {
         let handler = setup();
-        let (block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
-
-        let result = TraceApiServer::trace_block(&handler, "0x0".into())
+        let (block, _, _) = store_executed_trace_block(&handler, false, true);
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let result = TraceApiServer::trace_block(&handler, "0x1".into())
             .await
             .unwrap();
-
         let traces = result.as_array().unwrap();
-        assert_eq!(traces.len(), 1);
-
-        let t = &traces[0];
-        assert_eq!(t["type"], "call");
-        assert_eq!(t["subtraces"], 0);
-        assert_eq!(t["traceAddress"], serde_json::json!([]));
-        assert_eq!(t["blockNumber"], 0);
-        assert_eq!(t["transactionPosition"], 0);
-        assert_eq!(t["blockHash"], serde_json::to_value(block_hash).unwrap());
-        assert_eq!(t["transactionHash"], serde_json::to_value(tx_hash).unwrap());
-        // Action fields
-        assert!(t["action"]["from"].is_string());
-        assert!(t["action"]["gas"].is_string());
-        // Result fields
-        assert!(t["result"]["gasUsed"].is_string());
+        assert_eq!(traces.len(), 4);
+        for (index, pair) in traces.chunks(2).enumerate() {
+            assert_eq!(pair[0]["type"], "call");
+            assert_eq!(pair[0]["subtraces"], 1);
+            assert_eq!(pair[0]["traceAddress"], serde_json::json!([]));
+            assert_eq!(pair[1]["traceAddress"], serde_json::json!([0]));
+            for t in pair {
+                assert_eq!(t["blockNumber"], 1);
+                assert_eq!(t["transactionPosition"], index);
+                assert_eq!(t["blockHash"], serde_json::to_value(block.hash()).unwrap());
+                assert_eq!(
+                    t["transactionHash"],
+                    serde_json::to_value(block.transactions[index].hash()).unwrap()
+                );
+                assert_eq!(t["result"]["output"], format!("0x{:064x}", index + 1));
+            }
+        }
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
     }
 
     #[tokio::test]
     async fn trace_oe_transaction_returns_oe_format() {
         let handler = setup();
-        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
-
+        let (block, _, child) = store_executed_trace_block(&handler, false, true);
+        {
+            let mut live = handler.world_state.write();
+            live.rollback_to_root(&block.header.state_root).unwrap();
+            live.set_storage(
+                &child,
+                &ShellHash::ZERO,
+                &ShellHash::from(U256::from(99).to_be_bytes::<32>()),
+            )
+            .unwrap();
+            live.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
         let result = TraceApiServer::trace_oe_transaction(
             &handler,
-            format!("0x{}", hex::encode(tx_hash.as_bytes())),
+            format!("{}", block.transactions[1].hash()),
         )
         .await
         .unwrap();
-
         let traces = result.as_array().unwrap();
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0]["type"], "call");
-        assert!(traces[0]["error"].is_null());
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0]["subtraces"], 1);
+        assert_eq!(
+            traces[1]["action"]["to"],
+            serde_json::to_value(child).unwrap()
+        );
+        assert_eq!(traces[1]["result"]["output"], format!("0x{:064x}", 2));
+        assert!(traces[0].get("error").is_none());
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
     }
 
     #[tokio::test]
     async fn trace_oe_transaction_reverted_has_error() {
         let handler = setup();
-        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, false);
-
+        let (block, _, _) = store_executed_trace_block(&handler, true, false);
         let result = TraceApiServer::trace_oe_transaction(
             &handler,
-            format!("0x{}", hex::encode(tx_hash.as_bytes())),
+            format!("{}", block.transactions[0].hash()),
         )
         .await
         .unwrap();
+        assert_eq!(result[0]["error"], "execution reverted");
+        assert!(result[0].get("result").is_none());
+    }
 
-        let traces = result.as_array().unwrap();
-        assert_eq!(traces[0]["error"], "execution reverted");
+    #[tokio::test]
+    async fn trace_oe_transaction_rejects_receipt_mismatch() {
+        let handler = setup();
+        let (block, mut receipts, _) = store_executed_trace_block(&handler, false, false);
+        receipts[0].gas_used += 1;
+        handler
+            .chain_store
+            .put_receipts(&block.hash(), &receipts)
+            .unwrap();
+        let error = TraceApiServer::trace_oe_transaction(
+            &handler,
+            format!("{}", block.transactions[0].hash()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message().contains("disagrees with stored receipt"));
+    }
+
+    #[tokio::test]
+    async fn trace_oe_transaction_rejects_missing_history() {
+        let handler = setup();
+        let (_, hash) = store_block_with_tx(&handler, 0, true);
+        let error = TraceApiServer::trace_oe_transaction(&handler, format!("{hash}"))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("parent header unavailable"));
     }
 
     #[tokio::test]
