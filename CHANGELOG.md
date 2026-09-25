@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Allow historical `debug_` and `trace_` replay of AccountManager key rotation
+  and validation-code clearing, including same-block prefixes. Native output
+  and gas come from execution, with all metadata writes isolated from live
+  accounts. Native methods needing historical metadata remain unavailable.
+
 - Replay `trace_transaction` and `trace_block` against historical state and
   return executed nested calls, creation results and per-frame errors with
   OpenEthereum trace paths. Register the documented `trace_oeTransaction`

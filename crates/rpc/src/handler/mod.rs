@@ -7523,6 +7523,158 @@ mod tests {
         (block, receipts, child)
     }
 
+    fn store_native_trace_block(handler: &RpcHandler<MemoryDb>, invalid: bool) -> Block {
+        let (parent, _, _) = store_executed_trace_block(handler, false, false);
+        let from = parent.transactions[0].from;
+        let store = Arc::clone(handler.chain_store.store());
+        let state = WorldState::at_root(Arc::clone(&store), &parent.header.state_root).unwrap();
+        handler.chain_store.put_pubkey(&from, &[0x11; 32]).unwrap();
+        let mut executor = ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(store)), 42);
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                number: 2,
+                ..parent.header.clone()
+            },
+            transactions: Vec::new(),
+            system_transactions: Vec::new(),
+            proposer_seal: None,
+        };
+        let calls = [
+            (
+                shell_pqvm::account_manager_address(),
+                shell_pqvm::encode_rotate_key_calldata(&[0x22; 32], if invalid { 99 } else { 0 }),
+            ),
+            (
+                shell_pqvm::account_manager_address(),
+                shell_pqvm::encode_clear_validation_code_calldata(),
+            ),
+            (parent.transactions[0].tx.to.unwrap(), vec![]),
+        ];
+        let mut receipts = Vec::new();
+        let mut cumulative = 0;
+        for (index, (to, data)) in calls.into_iter().enumerate() {
+            let mut tx = parent.transactions[0].tx.clone();
+            tx.nonce = executor
+                .state_db_mut()
+                .world_state_mut()
+                .get_account(&from)
+                .unwrap()
+                .unwrap()
+                .nonce;
+            tx.to = Some(to);
+            tx.data = Bytes::from(data);
+            let signed = SignedTransaction::new(
+                from,
+                tx,
+                shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+            );
+            let result = executor
+                .execute_tx(&signed, &block.header, index as u32, cumulative)
+                .unwrap();
+            cumulative = result.receipt.cumulative_gas_used;
+            if !result.is_system_tx {
+                shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
+            }
+            receipts.push(result.receipt);
+            block.transactions.push(signed);
+        }
+        block.header.gas_used = cumulative;
+        block.header.state_root = executor
+            .state_db_mut()
+            .world_state_mut()
+            .state_root()
+            .unwrap();
+        handler.chain_store.put_block(&block).unwrap();
+        handler
+            .chain_store
+            .put_receipts(&block.hash(), &receipts)
+            .unwrap();
+        handler.chain_store.set_canonical(2, &block.hash()).unwrap();
+        handler.chain_store.set_head(&block.hash()).unwrap();
+        block
+    }
+
+    #[tokio::test]
+    async fn debug_native_rotation_trace_preserves_current_pubkey_and_state() {
+        let handler = setup();
+        let block = store_native_trace_block(&handler, false);
+        let from = block.transactions[0].from;
+        // Simulate a subsequent key change. Historical replay must not overwrite it.
+        handler.chain_store.put_pubkey(&from, &[0x33; 32]).unwrap();
+        handler
+            .chain_store
+            .prune_finalized_address_metadata_undo(2)
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let result = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[0].hash()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["output"], format!("0x{:064x}", 1));
+        assert_eq!(result["from"], serde_json::to_value(from).unwrap());
+        assert_eq!(
+            result["to"],
+            serde_json::to_value(shell_pqvm::account_manager_address()).unwrap()
+        );
+        assert_eq!(result["structLogs"], serde_json::json!([]));
+        let clear = TraceApiServer::trace_oe_transaction(
+            &handler,
+            format!("{}", block.transactions[1].hash()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(clear[0]["result"]["output"], format!("0x{:064x}", 1));
+        let after_native_prefix = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[2].hash()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_native_prefix["failed"], false);
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+        assert_eq!(
+            handler.chain_store.get_pubkey(&from).unwrap().unwrap(),
+            vec![0x33; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_native_rotation_trace_returns_executed_failure() {
+        let handler = setup();
+        let block = store_native_trace_block(&handler, true);
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let result = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[0].hash()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["failed"], true);
+        assert_eq!(result["error"], "execution reverted");
+        let output = hex::decode(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("99"));
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn debug_trace_replays_prefix_and_nested_calls_without_changing_live_state() {
         let handler = setup();

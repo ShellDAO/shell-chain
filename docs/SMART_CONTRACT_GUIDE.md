@@ -366,10 +366,12 @@ optional second parameter to omit those payloads; nested calls remain included.
 Tracing requires the parent state to be retained. Capture is limited to 50,000
 instructions and 8 MiB per transaction, with a 16 MiB block response limit and
 two concurrent replays. Missing state, receipt mismatches, or exhausted limits
-return an error rather than a partial successful trace. Native system-contract
-transactions and prefixes containing them also return an error until their
-historical address metadata can be reconstructed safely; ordinary contract
-calls, deployments, and AA execution are replayed through the normal executor.
+return an error rather than a partial successful trace. AccountManager
+`rotateKey` and `clearValidationCode` can also be replayed, including as prefixes;
+they return actual native output and gas with empty `structLogs`. Other native
+methods remain unavailable until their historical address metadata and chain
+context can be reconstructed safely. Ordinary contract calls, deployments,
+and AA execution are replayed through the normal executor.
 
 
 ---

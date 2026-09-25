@@ -1415,11 +1415,14 @@ counts its immediate children. Calls include actual return data; creations use
 and omit `result`. AA bundles use a root call with `callType: "batch"` and their
 executed calls as children; this is a Shell-specific extension.
 
-Replay requires retained parent state and matching receipts. Missing history,
-native system-contract transactions or prefixes, and capture/response limits
-return an RPC error instead of a receipt-derived approximation. SELFDESTRUCT
-balance-transfer events are not yet included; this is not a full externality
-trace. The same capture and concurrency bounds as `debug_` apply.
+Replay requires retained parent state and matching receipts. AccountManager
+`rotateKey` and `clearValidationCode` are replayable and return actual native
+output and gas without opcode logs. Other native transactions or prefixes that
+require historical address metadata or chain-head context remain unavailable.
+Missing history and capture/response limits return an RPC error instead of a
+receipt-derived approximation. PQVM removes SELFDESTRUCT and CALLCODE, so they
+do not produce successful externality events. The same capture and concurrency
+bounds as `debug_` apply.
 
 > **Note:** Like `debug`, the `trace` namespace must be explicitly enabled via `--rpc-api`.
 
