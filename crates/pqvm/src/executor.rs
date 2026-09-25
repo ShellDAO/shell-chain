@@ -4379,7 +4379,7 @@ mod tests {
             }
             let tx = make_aa_signed(
                 sender,
-                0,
+                get_nonce(&mut plain, &sender),
                 200_000,
                 10,
                 vec![
