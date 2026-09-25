@@ -22,10 +22,53 @@ For retained non-cryptographic opcodes, Shell-Chain keeps EVM-familiar behavior.
 
 ## Prerequisites
 
-- **Node.js** 18+ (for Hardhat)
-- **Hardhat** or **Foundry** installed
-- A running shell-chain node (see [Quickstart](QUICKSTART.md))
+- **Node.js** 20+
+- A **matching shell-sdk source build** for compilation, PQ-native signing, Shell 32-byte address handling, and contract calls
+- **solc 0.8.30+** for Node-side Solidity compilation, plus **tsx** to run the TypeScript examples
+- A running local shell-chain node built from the verified revision below (see [Quickstart](QUICKSTART.md))
 - A funded account (pre-allocated in genesis or received via transfer)
+
+### Match the node and SDK
+
+The npm release `shell-sdk@0.13.0` uses the V1 transaction signing format.
+The current node source requires V2, which also commits the transaction's
+access list. Mixing these versions fails with `PQ signature verification failed`.
+The SDK source already implements V2; use the verified source pair for this
+local tutorial until a compatible npm release is available:
+
+| Component | Verified source revision |
+|-----------|--------------------------|
+| shell-chain | [`e5e759c`](https://github.com/ShellDAO/shell-chain/commit/e5e759c68948e30ccff671bfe9cb7041f0bbec10) |
+| shell-sdk | [`86c5b68`](https://github.com/ShellDAO/shell-sdk/commit/86c5b689ecaeb41c3cdc883af865cac4e30bab07) |
+
+Build the node from that revision using the Quickstart, then create a separate
+SDK checkout and local example project:
+
+```bash
+git clone --no-checkout https://github.com/ShellDAO/shell-sdk.git
+cd shell-sdk
+git checkout 86c5b689ecaeb41c3cdc883af865cac4e30bab07
+npm ci
+npm run build
+npm pack
+cd ..
+
+mkdir shell-counter
+cd shell-counter
+npm init -y
+npm pkg set type=module
+npm install ../shell-sdk/shell-sdk-0.13.0.tgz
+npm install --save-dev solc@^0.8.30 tsx
+mkdir -p contracts scripts
+```
+
+The source archive still has `0.13.0` in its filename; it contains the pinned
+source revision above and is different from the npm registry release.
+The SDK's compiler dependency is optional so browser applications can use the
+runtime helpers without bundling Solidity tooling. Install `solc` explicitly
+for the compiler and CLI examples below. Use the funded `my-key.json` from the
+Quickstart, or set `SHELL_KEYSTORE_PATH` to its location; keep the keystore and
+password out of source control.
 
 ---
 
@@ -40,70 +83,19 @@ The local endpoint is the default JSON-RPC server started by `shell-node run`. T
 
 ---
 
-## Hardhat Setup
+## Deployment tools and signing
 
-### Install Hardhat
+Use the Shell SDK or `shell-node tx deploy` for deployment. Both produce
+post-quantum signatures and submit the native transaction format. The complete
+Counter example below compiles, deploys, waits for confirmation, writes state,
+and reads the result.
 
-```bash
-mkdir my-shell-project && cd my-shell-project
-npm init -y
-npm install --save-dev hardhat @nomicfoundation/hardhat-toolbox
-npx hardhat init
-```
-
-### Configure networks
-
-```js
-// hardhat.config.js
-module.exports = {
-  solidity: "0.8.26",
-  networks: {
-    shell: {
-      url: "http://localhost:8545",
-      chainId: 1337,
-    },
-    shellAlpha: {
-      url: "https://testnet-rpc.shell.org",
-      chainId: 10,
-    }
-  }
-};
-```
-
-Deploy to a local node:
-
-```bash
-npx hardhat run scripts/deploy.js --network shell
-```
-
-Deploy to the alpha testnet:
-
-```bash
-npx hardhat run scripts/deploy.js --network shellAlpha
-```
-
----
-
-## Foundry Setup
-
-### Install Foundry
-
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-```
-
-### Deploy with Foundry
-
-```bash
-forge create --rpc-url http://localhost:8545 --chain-id 1337 src/Counter.sol:Counter
-```
-
-For the alpha testnet:
-
-```bash
-forge create --rpc-url https://testnet-rpc.shell.org --chain-id 10 src/Counter.sol:Counter
-```
+Hardhat, Foundry, and Remix can help compile Solidity or inspect artifacts.
+Their default Ethereum signer/deployment flows do not provide Shell-native
+signing or 32-byte address handling. Configure any custom integration to use
+the Shell SDK for transactions; an RPC URL and chain ID alone are insufficient.
+For a standalone Hardhat project, use its current `npx hardhat --init` command
+and supported configuration; it is not a prerequisite for this tutorial.
 
 ---
 
@@ -141,6 +133,8 @@ Use the 32-byte precompile address `0x0000...000N` (31 zero bytes + 1 index byte
 
 ### 1. Write the contract
 
+Save this as `contracts/Counter.sol`:
+
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
@@ -172,38 +166,85 @@ contract Counter {
 }
 ```
 
-### 2. Deploy with Hardhat
+### 2. Compile and deploy with Shell SDK
 
-Create `scripts/deploy.js`:
+Create `scripts/deploy-counter.ts`:
 
-```js
-const hre = require("hardhat");
+```ts
+import { readFile } from "node:fs/promises";
+import { createShellProvider, decryptKeystore } from "shell-sdk";
+import { deployContract, readContract, writeContract } from "shell-sdk/contracts";
+import { compileSolidity } from "shell-sdk/contracts/compiler";
 
-async function main() {
-  const Counter = await hre.ethers.getContractFactory("Counter");
-  const counter = await Counter.deploy();
-  await counter.waitForDeployment();
-  console.log("Counter deployed to:", await counter.getAddress());
+const rpcHttpUrl = process.env.SHELL_RPC_URL ?? "http://127.0.0.1:8545";
+const chainId = Number(process.env.SHELL_CHAIN_ID ?? 1337);
+const keystorePath = process.env.SHELL_KEYSTORE_PATH ?? "my-key.json";
+const password = process.env.SHELL_KEYSTORE_PASSWORD;
+
+if (!password) {
+  throw new Error("Set SHELL_KEYSTORE_PASSWORD before deploying");
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
+const provider = createShellProvider({ rpcHttpUrl });
+const keystore = JSON.parse(await readFile(keystorePath, "utf8"));
+const signer = await decryptKeystore(keystore, password);
+
+const artifact = await compileSolidity({
+  sources: [{ path: "contracts/Counter.sol" }],
+  contractName: "Counter",
+  outputPath: "artifacts/Counter.json",
 });
+
+const deployed = await deployContract({
+  provider,
+  signer,
+  chainId,
+  artifact,
+  gasLimit: 1_500_000,
+  wait: true,
+});
+
+console.log("contract:", deployed.contractAddress);
+
+await writeContract({
+  provider,
+  signer,
+  chainId,
+  address: deployed.contractAddress!,
+  abi: artifact.abi,
+  functionName: "increment",
+  gasLimit: 120_000,
+  wait: true,
+});
+
+const count = await readContract({
+  provider,
+  address: deployed.contractAddress!,
+  abi: artifact.abi,
+  functionName: "get",
+});
+
+console.log("count:", count);
 ```
+
+Run it against a local node:
 
 ```bash
-npx hardhat run scripts/deploy.js --network shell
+SHELL_RPC_URL=http://127.0.0.1:8545 \
+SHELL_CHAIN_ID=1337 \
+SHELL_KEYSTORE_PATH=my-key.json \
+SHELL_KEYSTORE_PASSWORD=dev-password \
+npx tsx scripts/deploy-counter.ts
 ```
 
-### 3. Deploy with Foundry
+The script should print a 32-byte contract address and `count: 1n`: deployment
+and the increment transaction have both confirmed, and the read returns the
+updated state.
 
-```bash
-forge create \
-  --rpc-url http://localhost:8545 \
-  --chain-id 1337 \
-  src/Counter.sol:Counter
-```
+For public testnet, first confirm that the deployed node and SDK use the same
+signing format; the source pair above is verified against a local node only.
+Then set `SHELL_RPC_URL=https://testnet-rpc.shell.org`, `SHELL_CHAIN_ID=10`,
+and use a funded Shell keystore.
 
 ---
 
@@ -228,78 +269,65 @@ curl -s http://localhost:8545 \
   }'
 ```
 
-Or with Hardhat:
+Use the SDK CLI to read the same value (replace `0x...` with the complete
+32-byte address printed by deployment):
 
-> **Compatibility note:** Shell-native EOA and contract addresses use canonical 32-byte `0x...` format. Tooling that hardcodes 20-byte hex inputs (e.g., default Hardhat scripts) will fail at the Shell RPC boundary; use 32-byte hex addresses end-to-end.
-
-```js
-const counter = await hre.ethers.getContractAt("Counter", "0x...YOUR_CONTRACT_ADDRESS");
-const count = await counter.get();
-console.log("Current count:", count.toString());
+```bash
+npx shell-sdk contract read --artifact artifacts/Counter.json --address 0x... --function get
 ```
 
 ### Write calls (submits a transaction)
 
-Use `eth_sendRawTransaction` or `shell_sendTransaction` to modify state:
+Use the same funded keystore as deployment. Set `SHELL_KEYSTORE_PASSWORD` in
+your shell to its password first; the inline assignment for the earlier
+TypeScript command does not persist. The SDK CLI waits for a successful receipt
+before returning:
 
 ```bash
-# Increment the counter (selector: 0xd09de08a)
-curl -s http://localhost:8545 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc":"2.0",
-    "method":"eth_sendRawTransaction",
-    "params":["0x...signed_tx_bytes..."],
-    "id":1
-  }'
+npx shell-sdk contract write --artifact artifacts/Counter.json --address 0x... --function increment --keystore my-key.json --password "$SHELL_KEYSTORE_PASSWORD"
+npx shell-sdk contract read --artifact artifacts/Counter.json --address 0x... --function get
 ```
 
-Or with Hardhat:
-
-```js
-const counter = await hre.ethers.getContractAt("Counter", "0x...YOUR_CONTRACT_ADDRESS");
-const tx = await counter.increment();
-await tx.wait();
-console.log("Incremented! New count:", (await counter.get()).toString());
-```
+After the TypeScript example's first increment, this additional increment should
+produce a successful receipt and a read of `"2"`. A write that reverts must not
+be treated as successful just because its transaction was submitted.
 
 ---
 
-## Using PQ Signatures for Deployment
+## Using the node CLI for deployment
 
-Shell-Chain uses post-quantum Dilithium3 signatures instead of ECDSA. To deploy contracts using PQ signatures, use the `shell_sendTransaction` RPC method:
+The node CLI can deploy the same compiled artifact. Supply its full init bytecode
+and a password file for the funded keystore:
 
 ```bash
-# Sign the deployment transaction with the shell-node CLI
-shell-node tx deploy \
-  --code 0x608060405234801561001057600080fd5b50... \
+CODE=$(node --input-type=module -e 'import fs from "node:fs"; console.log(JSON.parse(fs.readFileSync("artifacts/Counter.json", "utf8")).bytecode)')
+TX_HASH=$(shell-node --password-file .quickstart-password tx deploy \
+  --code "$CODE" \
   --keystore my-key.json \
-  --rpc-url http://127.0.0.1:8545
-
-# Or submit via JSON-RPC
-curl -s http://localhost:8545 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc":"2.0",
-    "method":"shell_sendTransaction",
-    "params":[{
-      "from": "0xYOUR_ADDRESS",
-      "data": "0x608060405234801561001057600080fd5b50...",
-      "gas": "0x100000",
-      "maxFeePerGas": "0x5f7609",
-      "maxPriorityFeePerGas": "0x0",
-      "nonce": "0x0",
-      "pqSignature": "0x...dilithium3_signature...",
-      "pqPubkey": "0x...dilithium3_pubkey..."
-    }],
-    "id":1
-  }'
+  --chain-id 1337 \
+  --rpc-url http://127.0.0.1:8545)
 ```
 
-> **Fee note:** `maxFeePerGas` is only an example. In real deployments, query
-> `eth_gasPrice` and use a value greater than or equal to the current base fee.
->
-> **Note:** Standard Ethereum wallets (MetaMask, etc.) use ECDSA signatures. For full PQ security, use the `shell-node` CLI or PQ-aware SDKs. See [PQ Crypto Guide](PQ_CRYPTO_GUIDE.md) for details.
+Use the password file created in the [Quickstart](QUICKSTART.md), or provide the
+correct password file for your keystore. Keep it out of source control.
+Submission returns a transaction hash, not a confirmation. Query its receipt:
+
+```bash
+shell-node tx receipt "$TX_HASH" --rpc-url http://127.0.0.1:8545
+```
+
+A `null` receipt is still pending. Poll the same hash until a receipt is
+available, require `status: "0x1"`, and use its `contractAddress` for reads.
+A failed receipt must not be treated as a deployed contract. This fresh Counter
+starts at zero; it is a separate deployment from the SDK example.
+
+```bash
+shell-node tx call --to 0x... --data 0x6d4ce63c --rpc-url http://127.0.0.1:8545
+```
+
+The read returns a zero-filled 32-byte ABI word. `shell_sendTransaction` expects
+a fully signed native transaction envelope; use these helpers to construct it
+instead of submitting a flat object with `pqSignature`/`pqPubkey` placeholder fields.
 
 ---
 
