@@ -4,13 +4,17 @@
 //! provides a high-level API for executing individual transactions and
 //! full blocks.
 
+use crate::execution_tracer::{ExecutionTrace, ExecutionTracer, TraceConfig};
 use alloy_primitives::{Bytes as AlBytes, B256, U256};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, ResultAndState};
 use revm::context::{BlockEnv, CfgEnv, Context, Evm, TxEnv};
 use revm::context_interface::transaction::{AccessList, AccessListItem as RevmAccessListItem};
 use revm::context_interface::{ContextSetters, ContextTr, JournalTr};
 use revm::handler::instructions::EthInstructions;
+use revm::handler::EthFrame;
 use revm::handler::{EvmTr, EvmTrError, ExecuteEvm, FrameResult, FrameTr, Handler, MainnetContext};
+use revm::inspector::{InspectEvm, Inspector, InspectorEvmTr, InspectorHandler};
+use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{
     instructions::control, interpreter_types::InterpreterTypes, Host, Instruction,
@@ -83,6 +87,7 @@ pub struct TxExecutionResult {
 pub struct ShellPqvm<S: KvStore + 'static> {
     state_db: ShellStateDb<S>,
     chain_id: u64,
+    tracer: Option<ExecutionTracer>,
 }
 
 const OPCODE_CALLCODE: u8 = 0xF2;
@@ -108,6 +113,18 @@ where
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+}
+
+impl<EVM, ERROR> InspectorHandler for SystemRewardHandler<EVM, ERROR, EthFrame<EthInterpreter>>
+where
+    EVM: InspectorEvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type IT = EthInterpreter;
 }
 
 fn next_sender_nonce(nonce: u64) -> Result<u64, ExecutorError> {
@@ -157,7 +174,78 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
     }
 
     pub fn new(state_db: ShellStateDb<S>, chain_id: u64) -> Self {
-        Self { state_db, chain_id }
+        Self {
+            state_db,
+            chain_id,
+            tracer: None,
+        }
+    }
+
+    /// Execute with bounded tracing. Use an isolated state database for RPC replay.
+    /// Normal block execution does not allocate or collect trace events.
+    pub fn trace_transaction(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        tx_index: u32,
+        cumulative_gas_used: u64,
+        config: TraceConfig,
+    ) -> Result<(TxExecutionResult, ExecutionTrace), ExecutorError> {
+        self.tracer = Some(ExecutionTracer::new(config));
+        let result = if signed_tx.is_aa_bundle() {
+            self.execute_aa_bundle(signed_tx, header, tx_index, cumulative_gas_used)
+        } else {
+            self.execute_tx(signed_tx, header, tx_index, cumulative_gas_used)
+        };
+        let tracer = self.tracer.take().expect("tracer installed for execution");
+        let result = result?;
+        if tracer.exceeded {
+            return Err(ExecutorError::Revm(
+                "trace exceeds 50000 instructions or 8 MiB capture limit".into(),
+            ));
+        }
+        let mut roots = tracer.roots;
+        let mut frame = if !signed_tx.is_aa_bundle() && roots.len() == 1 {
+            roots.pop().expect("one root")
+        } else {
+            let mut root = crate::CallFrame::new(
+                if signed_tx.is_aa_bundle() {
+                    "BATCH"
+                } else if signed_tx.tx.to.is_none() {
+                    "CREATE"
+                } else {
+                    "CALL"
+                },
+                signed_tx.from,
+                signed_tx.tx.to.unwrap_or_default(),
+                signed_tx.tx.gas_limit,
+                signed_tx.tx.data.clone(),
+            )
+            .with_value(signed_tx.tx.value);
+            root.calls = roots;
+            root
+        };
+        frame.from = signed_tx.from;
+        frame.gas = signed_tx.tx.gas_limit;
+        frame.gas_used = result.gas_used;
+        frame.output = Some(shell_primitives::Bytes::from(result.output.clone()));
+        if let Some(address) = result.receipt.contract_address {
+            frame.to = address;
+        }
+        if !result.receipt.succeeded() {
+            frame
+                .error
+                .get_or_insert_with(|| "execution reverted".into());
+            frame.revert_reason = crate::decode_revert_reason(&result.output);
+        }
+        let trace = ExecutionTrace {
+            result: crate::TraceResult {
+                frame,
+                failed: !result.receipt.succeeded(),
+            },
+            struct_logs: tracer.steps,
+        };
+        Ok((result, trace))
     }
 
     /// Execute a single transaction that has already been validated.
@@ -290,7 +378,21 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
         // Execute
-        let result_and_state = if reconciled_fees {
+        let result_and_state = if let Some(tracer) = self.tracer.as_mut() {
+            let mut inspected = evm.with_inspector(tracer);
+            let result = if reconciled_fees {
+                inspected.ctx.set_tx(tx_env);
+                let mut handler =
+                    SystemRewardHandler::<_, EVMError<StateDbError>, _>(std::marker::PhantomData);
+                handler
+                    .inspect_run(&mut inspected)
+                    .map(|result| ResultAndState::new(result, inspected.finalize()))
+            } else {
+                inspected.inspect_tx(tx_env)
+            };
+            evm = inspected.with_inspector(());
+            result
+        } else if reconciled_fees {
             evm.ctx.set_tx(tx_env);
             let mut handler =
                 SystemRewardHandler::<_, EVMError<StateDbError>, _>(std::marker::PhantomData);
@@ -597,7 +699,22 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
             remove_legacy_opcodes(&mut instructions);
             let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
-            let exec_outcome = if reconciled_fees {
+            let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
+                let mut inspected = evm.with_inspector(tracer);
+                let result = if reconciled_fees {
+                    inspected.ctx.set_tx(tx_env);
+                    let mut handler = SystemRewardHandler::<_, EVMError<StateDbError>, _>(
+                        std::marker::PhantomData,
+                    );
+                    handler
+                        .inspect_run(&mut inspected)
+                        .map(|result| ResultAndState::new(result, inspected.finalize()))
+                } else {
+                    inspected.inspect_tx(tx_env)
+                };
+                evm = inspected.with_inspector(());
+                result
+            } else if reconciled_fees {
                 evm.ctx.set_tx(tx_env);
                 let mut handler =
                     SystemRewardHandler::<_, EVMError<StateDbError>, _>(std::marker::PhantomData);
@@ -1270,6 +1387,13 @@ mod tests {
                     PQSignature::new(SignatureType::Dilithium3, vec![0; 1]),
                 );
                 let result = evm.execute_tx(&signed, &header, 0, 100).unwrap();
+                let (observed, trace) = evm
+                    .trace_transaction(&signed, &header, 0, 100, TraceConfig::default())
+                    .unwrap();
+                assert_eq!(observed.receipt, result.receipt);
+                assert_eq!(observed.output, result.output);
+                assert_eq!(trace.result.frame.gas_used, result.gas_used);
+                assert_eq!(trace.result.failed, !result.receipt.succeeded());
                 assert_eq!(result.receipt.status, status);
                 assert_eq!(result.gas_used, billed_gas);
                 assert_eq!(result.receipt.cumulative_gas_used, 100 + billed_gas);
@@ -4240,6 +4364,172 @@ mod tests {
             .unwrap()
             .map(|a| a.nonce)
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn trace_aa_bundle_preserves_execution_and_full_addresses() {
+        for activation in [None, Some(1)] {
+            let sender = ShellAddress::from([0x42; 32]);
+            let recipient = ShellAddress::from([0x43; 32]);
+            let mut plain = setup_evm();
+            let mut traced = setup_evm();
+            for evm in [&mut plain, &mut traced] {
+                configure_fee_activation(evm, activation);
+                fund_account(evm, &sender, U256::from(10_000_000u64));
+            }
+            let tx = make_aa_signed(
+                sender,
+                0,
+                200_000,
+                10,
+                vec![
+                    shell_core::InnerCall {
+                        to: Some(recipient),
+                        value: U256::from(1),
+                        data: shell_primitives::Bytes::new(),
+                        gas_limit: 50_000
+                    };
+                    2
+                ],
+                None,
+            );
+            let mut header = sample_header();
+            header.base_fee_per_gas = 3;
+            let expected = plain.execute_aa_bundle(&tx, &header, 0, 0).unwrap();
+            let (result, trace) = traced
+                .trace_transaction(&tx, &header, 0, 0, TraceConfig::default())
+                .unwrap();
+            assert_eq!(result.receipt, expected.receipt);
+            assert_eq!(trace.result.frame.call_type, "BATCH");
+            assert_eq!(trace.result.frame.calls.len(), 2);
+            assert!(trace
+                .result
+                .frame
+                .calls
+                .iter()
+                .all(|call| call.from == sender && call.to == recipient));
+            assert_eq!(
+                get_balance(&mut plain, &sender),
+                get_balance(&mut traced, &sender)
+            );
+            assert_eq!(
+                get_balance(&mut plain, &recipient),
+                get_balance(&mut traced, &recipient)
+            );
+            assert_eq!(
+                get_nonce(&mut plain, &sender),
+                get_nonce(&mut traced, &sender)
+            );
+        }
+    }
+
+    #[test]
+    fn trace_delegatecall_uses_executing_contract_as_caller() {
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 32]);
+        let contract = ShellAddress::from([0x43; 20]);
+        let library = ShellAddress::from([0x44; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+        let code = hex::decode(format!("600060006000600073{}61fffff400", "44".repeat(20))).unwrap();
+        for (address, code) in [(contract, code), (library, vec![0x00])] {
+            let hash = shell_primitives::keccak256(&code);
+            evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &address,
+                    &Account {
+                        code_hash: Some(hash),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = make_system_tx_to(sender, contract, vec![]);
+        tx.tx.gas_limit = 100_000;
+        let (_, trace) = evm
+            .trace_transaction(&tx, &sample_header(), 0, 0, TraceConfig::default())
+            .unwrap();
+        assert!(!trace.result.failed);
+        let nested = &trace.result.frame.calls[0];
+        assert_eq!(nested.call_type, "DELEGATECALL");
+        assert_eq!(nested.from, contract);
+        assert_eq!(nested.to, library);
+    }
+
+    #[test]
+    fn trace_failed_sload_does_not_report_an_unread_storage_value() {
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 32]);
+        let contract = ShellAddress::from([0x43; 20]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+        let code = hex::decode("60005400").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+        evm.state_db_mut()
+            .world_state_mut()
+            .set_account(
+                &contract,
+                &Account {
+                    code_hash: Some(hash),
+                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                },
+            )
+            .unwrap();
+        evm.state_db_mut()
+            .world_state_mut()
+            .set_storage(
+                &contract,
+                &ShellHash::ZERO,
+                &ShellHash::from(U256::from(123).to_be_bytes::<32>()),
+            )
+            .unwrap();
+        let mut tx = make_system_tx_to(sender, contract, vec![]);
+        tx.tx.gas_limit = 21_003;
+        let (_, trace) = evm
+            .trace_transaction(&tx, &sample_header(), 0, 0, TraceConfig::default())
+            .unwrap();
+        assert!(trace.result.failed);
+        let load = trace.struct_logs.last().unwrap();
+        assert_eq!(load.op, "SLOAD");
+        assert!(load.storage.is_none(), "failed SLOAD never read a value");
+    }
+
+    #[test]
+    fn trace_instruction_limit_returns_error_without_partial_success() {
+        let mut evm = setup_evm();
+        let sender = ShellAddress::from([0x42; 32]);
+        let contract = ShellAddress::from([0x43; 32]);
+        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+        let code = hex::decode("5b600056").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+        evm.state_db_mut()
+            .world_state_mut()
+            .set_account(
+                &contract,
+                &Account {
+                    code_hash: Some(hash),
+                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                },
+            )
+            .unwrap();
+        let mut tx = make_system_tx_to(sender, contract, vec![]);
+        tx.tx.gas_limit = 1_000_000;
+        tx.tx.max_fee_per_gas = 1;
+        let result = evm.trace_transaction(
+            &tx,
+            &sample_header(),
+            0,
+            0,
+            TraceConfig {
+                disable_memory: true,
+                disable_stack: true,
+                disable_storage: true,
+            },
+        );
+        assert!(result.err().unwrap().to_string().contains("capture limit"));
+        assert!(evm.tracer.is_none());
     }
 
     #[test]

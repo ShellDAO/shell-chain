@@ -7465,10 +7465,219 @@ mod tests {
         (block_hash, tx_hash)
     }
 
+    fn store_executed_trace_block(
+        handler: &RpcHandler<MemoryDb>,
+        reverted: bool,
+        nested: bool,
+    ) -> (Block, Vec<TransactionReceipt>, Address) {
+        let store = Arc::clone(handler.chain_store.store());
+        let from = Address::from([0x77; 32]);
+        let contract = Address::from([0x88; 20]);
+        let child = Address::from([0x99; 20]);
+        let mut state = WorldState::new(Arc::clone(&store));
+        state
+            .set_account(
+                &from,
+                &shell_core::Account {
+                    balance: U256::from(1_000_000_000u64),
+                    ..shell_core::Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                },
+            )
+            .unwrap();
+        let code = if reverted {
+            hex::decode("60006000fd").unwrap()
+        } else if nested {
+            hex::decode(format!(
+                "6020600060006000600073{}61fffff15060206000f3",
+                "99".repeat(20)
+            ))
+            .unwrap()
+        } else {
+            vec![0x00]
+        };
+        for (address, code) in [
+            (contract, code),
+            (
+                child,
+                hex::decode("6000546001018060005560005260206000f3").unwrap(),
+            ),
+        ] {
+            let hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&hash, &code).unwrap();
+            state
+                .set_account(
+                    &address,
+                    &shell_core::Account {
+                        code_hash: Some(hash),
+                        ..shell_core::Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+        }
+        let root = state.state_root().unwrap();
+        let mut parent = make_genesis_block();
+        parent.header.state_root = root;
+        handler.chain_store.put_block(&parent).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &parent.hash())
+            .unwrap();
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                number: 1,
+                base_fee_per_gas: 0,
+                ..parent.header.clone()
+            },
+            transactions: Vec::new(),
+            system_transactions: Vec::new(),
+            proposer_seal: None,
+        };
+        let mut executor = ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(store)), 42);
+        let mut receipts = Vec::new();
+        let count = if nested { 2 } else { 1 };
+        let mut cumulative = 0;
+        for nonce in 0..count {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce,
+                max_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                gas_limit: 200_000,
+                to: Some(contract),
+                value: U256::ZERO,
+                data: Bytes::default(),
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signed = SignedTransaction::new(
+                from,
+                tx,
+                shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+            );
+            let result = executor
+                .execute_tx(&signed, &block.header, nonce as u32, cumulative)
+                .unwrap();
+            cumulative = result.receipt.cumulative_gas_used;
+            shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
+            receipts.push(result.receipt);
+            block.transactions.push(signed);
+        }
+        block.header.gas_used = cumulative;
+        block.header.state_root = executor
+            .state_db_mut()
+            .world_state_mut()
+            .state_root()
+            .unwrap();
+        handler.chain_store.put_block(&block).unwrap();
+        handler
+            .chain_store
+            .put_receipts(&block.hash(), &receipts)
+            .unwrap();
+        handler.chain_store.set_canonical(1, &block.hash()).unwrap();
+        handler.chain_store.set_head(&block.hash()).unwrap();
+        (block, receipts, child)
+    }
+
+    #[tokio::test]
+    async fn debug_trace_replays_prefix_and_nested_calls_without_changing_live_state() {
+        let handler = setup();
+        let (block, _, child) = store_executed_trace_block(&handler, false, true);
+        // A later live-state change must not leak into historical execution.
+        {
+            let mut live = handler.world_state.write();
+            live.rollback_to_root(&block.header.state_root).unwrap();
+            live.set_storage(
+                &child,
+                &ShellHash::ZERO,
+                &ShellHash::from(U256::from(99).to_be_bytes::<32>()),
+            )
+            .unwrap();
+            live.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let options = serde_json::json!({"disableStack":true,"disableMemory":true});
+        let trace = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[1].hash()),
+            Some(options),
+        )
+        .await
+        .unwrap();
+        assert_eq!(trace["output"], format!("0x{:064x}", 2));
+        assert_eq!(
+            trace["calls"][0]["to"],
+            serde_json::to_value(child).unwrap()
+        );
+        assert_eq!(trace["calls"][0]["output"], format!("0x{:064x}", 2));
+        let steps = trace["structLogs"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s["op"] == "SLOAD"
+            && s["storage"][format!("0x{:064x}", 0)] == format!("0x{:064x}", 1)));
+        assert!(steps
+            .iter()
+            .any(|s| s["op"] == "SSTORE" && s["gasCost"].as_u64().unwrap() > 0));
+        assert!(steps
+            .iter()
+            .all(|s| s.get("stack").is_none() && s.get("memory").is_none()));
+        let all = DebugApiServer::trace_block_by_number(&handler, "0x1".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(all[0]["output"], format!("0x{:064x}", 1));
+        assert_eq!(all[1]["output"], format!("0x{:064x}", 2));
+        let omitted = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[1].hash()),
+            Some(serde_json::json!({"disableStorage":true})),
+        )
+        .await
+        .unwrap();
+        assert!(omitted["structLogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step.get("storage").is_none()));
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(&[]).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_trace_refuses_missing_parent_instead_of_fabricating_a_receipt_trace() {
+        let handler = setup();
+        let (_, hash) = store_block_with_tx(&handler, 0, true);
+        let error = DebugApiServer::trace_transaction(&handler, format!("{hash}"), None)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("parent header unavailable"));
+    }
+
+    #[tokio::test]
+    async fn debug_trace_refuses_receipt_mismatch() {
+        let handler = setup();
+        let (block, mut receipts, _) = store_executed_trace_block(&handler, false, false);
+        receipts[0].gas_used += 1;
+        handler
+            .chain_store
+            .put_receipts(&block.hash(), &receipts)
+            .unwrap();
+        let error = DebugApiServer::trace_transaction(
+            &handler,
+            format!("{}", block.transactions[0].hash()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message().contains("disagrees with stored receipt"));
+    }
+
     #[tokio::test]
     async fn debug_trace_transaction_returns_call_frame() {
         let handler = setup();
-        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
+        let (block, _, _) = store_executed_trace_block(&handler, false, false);
+        let tx_hash = block.transactions[0].hash();
 
         let result = DebugApiServer::trace_transaction(
             &handler,
@@ -7487,7 +7696,8 @@ mod tests {
     #[tokio::test]
     async fn debug_trace_transaction_reverted() {
         let handler = setup();
-        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, false);
+        let (block, _, _) = store_executed_trace_block(&handler, true, false);
+        let tx_hash = block.transactions[0].hash();
 
         let result = DebugApiServer::trace_transaction(
             &handler,
@@ -7527,9 +7737,9 @@ mod tests {
     #[tokio::test]
     async fn debug_trace_block_by_number_returns_traces() {
         let handler = setup();
-        store_block_with_tx(&handler, 0, true);
+        store_executed_trace_block(&handler, false, false);
 
-        let result = DebugApiServer::trace_block_by_number(&handler, "0x0".into(), None)
+        let result = DebugApiServer::trace_block_by_number(&handler, "0x1".into(), None)
             .await
             .unwrap();
 
@@ -7642,7 +7852,8 @@ mod tests {
     #[tokio::test]
     async fn debug_trace_transaction_with_options() {
         let handler = setup();
-        let (_block_hash, tx_hash) = store_block_with_tx(&handler, 0, true);
+        let (block, _, _) = store_executed_trace_block(&handler, false, false);
+        let tx_hash = block.transactions[0].hash();
 
         let opts = serde_json::json!({ "tracer": "callTracer" });
         let result = DebugApiServer::trace_transaction(
