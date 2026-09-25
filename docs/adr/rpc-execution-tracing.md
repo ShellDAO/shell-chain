@@ -37,6 +37,13 @@ sufficient for faithful replay. Refuse native transactions and prefixes requirin
 them until historical metadata is reconstructed or execution traces are retained.
 This keeps that capability gap explicit while delivering real contract tracing.
 
-The separate OpenEthereum-shaped `trace_` methods still need to migrate from
-receipt summaries to the replay result. This change does not claim full Geth
-tracer compatibility, retained pruned history, or a transaction validation replay.
+The OpenEthereum-shaped `trace_` methods use this same replay path and flatten
+observed call/creation frames on the blocking worker. Each entry preserves its
+transaction identity and child-index path. Failed actions omit successful
+results; creations expose init code, deployed code and address. AA bundles use
+an explicit `callType: "batch"` root extension. Serialized flattened responses
+are bounded both per transaction and across the whole block.
+
+SELFDESTRUCT balance-transfer events remain a separate capture gap. This does
+not claim full externality tracing, full Geth tracer compatibility, retained
+pruned history, or a transaction validation replay.

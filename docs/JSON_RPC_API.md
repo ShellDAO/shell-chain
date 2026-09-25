@@ -1407,7 +1407,19 @@ curl -s http://localhost:8545 \
 
 ## trace_ Namespace
 
-OpenEthereum-compatible trace format.
+OpenEthereum-shaped call and creation traces from isolated historical execution.
+`trace_transaction` and its `trace_oeTransaction` alias return the root and nested
+frames in depth-first order. `traceAddress` identifies each frame; `subtraces`
+counts its immediate children. Calls include actual return data; creations use
+`action.init` and `result.code`/`result.address`. Failed frames contain `error`
+and omit `result`. AA bundles use a root call with `callType: "batch"` and their
+executed calls as children; this is a Shell-specific extension.
+
+Replay requires retained parent state and matching receipts. Missing history,
+native system-contract transactions or prefixes, and capture/response limits
+return an RPC error instead of a receipt-derived approximation. SELFDESTRUCT
+balance-transfer events are not yet included; this is not a full externality
+trace. The same capture and concurrency bounds as `debug_` apply.
 
 > **Note:** Like `debug`, the `trace` namespace must be explicitly enabled via `--rpc-api`.
 
@@ -1432,14 +1444,14 @@ curl -s http://localhost:8545 \
 
 ### trace_oeTransaction
 
-Returns the trace for a specific transaction in OpenEthereum format.
+Alias for `trace_transaction`, with the same parameters and executed frame list.
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Transaction hash |
 
-**Returns:** `Array` — Single-element array with the transaction trace.
+**Returns:** `Array` — Root and nested call/creation traces for the transaction.
 
 ```bash
 curl -s http://localhost:8545 \
