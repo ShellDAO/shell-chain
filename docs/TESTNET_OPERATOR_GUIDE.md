@@ -75,10 +75,12 @@ cd shell-chain
 ### 3. Build the release binary
 
 ```bash
-cargo build --release -p shell-cli --bin shell-node
+cargo build --release -p shell-cli --bin shell-node --features libp2p
 ```
 
-The binary is produced at `target/release/shell-node`.
+The binary is produced at `target/release/shell-node`. The `libp2p` feature is
+required for the `--p2p` validator and RPC-only node commands in this guide.
+A build without that feature supports local operation but rejects `--p2p`.
 
 Optionally install it system-wide:
 
@@ -154,7 +156,19 @@ Shell Chain testnet is deployed using systemd on bare-metal Linux. See [Starting
 
 ### Joining the testnet
 
+Set `BOOTNODE` to the complete bootstrap multiaddr supplied by the node operator,
+including its `/p2p/<PEER_ID>` suffix. For example, the address has the form
+`/dns4/testnet.shell.org/tcp/30303/p2p/<PEER_ID>`; replace `<PEER_ID>` with the
+operator's actual libp2p peer ID, not a validator account address.
+
+For a bootstrap node you operate, start it with `--log-level info` and copy the
+`Listening on .../p2p/...` address from its startup log. If that address uses an
+unspecified or loopback host, use the node's reachable host when connecting from
+another machine while preserving its transport, port and peer ID. A host and
+port without the peer ID are rejected as a bootstrap address.
+
 ```bash
+: "${BOOTNODE:?Set BOOTNODE to a full multiaddr ending in /p2p/PEER_ID}"
 shell-node --datadir /var/lib/shell-chain \
   --password-file /etc/shell-chain/validator-password \
   run \
@@ -162,7 +176,7 @@ shell-node --datadir /var/lib/shell-chain \
   --keystore /etc/shell-chain/validator-key.json \
   --max-idle-interval 0 \
   --p2p \
-  --bootnode /dns4/testnet.shell.org/tcp/30303 \
+  --bootnode "$BOOTNODE" \
   --rpc-addr 0.0.0.0:8545 \
   --ws --ws-port 8546 \
   --rpc-api eth,net,web3,shell \
@@ -188,7 +202,7 @@ the coordinated genesis configuration for every validator.
 sudo systemctl stop shell-node
 
 git pull origin main
-cargo build --release -p shell-cli --bin shell-node
+cargo build --release -p shell-cli --bin shell-node --features libp2p
 sudo install -m 0755 target/release/shell-node /usr/local/bin/shell-node
 
 shell-node --datadir /var/lib/shell-chain removedb --force
@@ -211,7 +225,7 @@ configuration for every validator.
 sudo systemctl stop shell-node
 
 git pull origin main
-cargo build --release -p shell-cli --bin shell-node
+cargo build --release -p shell-cli --bin shell-node --features libp2p
 sudo install -m 0755 target/release/shell-node /usr/local/bin/shell-node
 
 shell-node --datadir /var/lib/shell-chain removedb --force
@@ -233,7 +247,7 @@ sudo systemctl stop shell-node
 
 # Pull and build
 git pull origin main
-cargo build --release -p shell-cli --bin shell-node
+cargo build --release -p shell-cli --bin shell-node --features libp2p
 sudo install -m 0755 target/release/shell-node /usr/local/bin/shell-node
 
 # Only for v0.23.x -> v0.24.x incompatible database upgrades:
@@ -560,6 +574,9 @@ This displays the address associated with the keystore without requiring the pas
     "authorities": [
       "0x<YOUR_VALIDATOR_ADDRESS_64_HEX>"
     ],
+    "authority_pubkeys": [
+      "0x<YOUR_VALIDATOR_PUBLIC_KEY_HEX>"
+    ],
     "block_time_secs": 2,
     "epoch_length": 0
   },
@@ -572,7 +589,28 @@ This displays the address associated with the keystore without requiring the pas
 }
 ```
 
-The `authorities` array lists the initial validator addresses (derived from keystores). The `alloc` section pre-funds accounts with an initial balance (in wei, hex-encoded).
+The `authorities` array lists the initial validator addresses (derived from
+keystores). The `authority_pubkeys` array contains their full PQ public keys in
+the same order. Followers need these keys to verify block seals from their first
+import; an address alone is insufficient. The `alloc` section pre-funds accounts
+with an initial balance (in wei, hex-encoded).
+
+Read the full public key for the corresponding validator without decrypting its
+secret key:
+
+```bash
+python3 - <<'PYKEY'
+import json
+from pathlib import Path
+
+key = json.loads(Path("my-validator-key.json").read_text())
+print("0x" + key["public_key"].removeprefix("0x"))
+PYKEY
+```
+
+Replace both placeholders with the matching address and public key. Every node
+in a private network must use the same genesis file. When joining an existing
+public network, use its operator-supplied genesis rather than a new local one.
 
 ### 2. Initialize the data directory
 
@@ -610,15 +648,17 @@ You will be prompted for the keystore password on startup.
 
 ### RPC-only node
 
-An RPC node syncs the chain but does not produce blocks. Omit `--keystore`:
+An RPC node syncs the chain but does not produce blocks. Omit `--keystore`
+and set `BOOTNODE` to the validator's complete multiaddr, including its peer ID:
 
 ```bash
+: "${BOOTNODE:?Set BOOTNODE to a full multiaddr ending in /p2p/PEER_ID}"
 shell-node --datadir shell-data run \
   --config examples/config-rpc.toml \
   --db rocksdb \
   --p2p \
   --p2p-addr 0.0.0.0:30303 \
-  --bootnode /dns4/validator1.example.com/tcp/30303 \
+  --bootnode "$BOOTNODE" \
   --rpc-addr 0.0.0.0:8545 \
   --ws --ws-port 8546 \
   --rpc-api eth,net,web3,shell,debug,trace \
@@ -725,7 +765,7 @@ The pre-built **Shell Chain Overview** dashboard (`monitoring/grafana/dashboards
 ```bash
 cd shell-chain
 git pull origin main
-cargo build --release
+cargo build --release -p shell-cli --bin shell-node --features libp2p
 # Stop the running node, replace the binary, restart
 sudo systemctl restart shell-node
 ```
@@ -831,7 +871,7 @@ curl -s http://localhost:8545 \
 
 - Ensure port 30303/tcp is open and reachable.
 - Verify `--p2p` flag is enabled.
-- Check `--bootnode` multiaddr is correct (format: `/dns4/<host>/tcp/30303` or `/ip4/<ip>/tcp/30303`).
+- Check `--bootnode` multiaddr is correct (format: `/dns4/<host>/tcp/30303/p2p/<PEER_ID>` or `/ip4/<ip>/tcp/30303/p2p/<PEER_ID>`).
 - In cloud environments, disable mDNS (`enable_mdns = false`) and use explicit bootnodes.
 
 ### RPC not responding
