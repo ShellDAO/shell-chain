@@ -477,7 +477,7 @@ pub struct TraceOptions {
     /// Tracer type (only "callTracer" is supported).
     #[serde(default)]
     pub tracer: Option<String>,
-    /// Whether to include only the top-level call (no nested calls).
+    /// Whether to exclude operand stacks from opcode observations.
     #[serde(default)]
     pub disable_stack: Option<bool>,
     /// Whether to exclude memory from the result.

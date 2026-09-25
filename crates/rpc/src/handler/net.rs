@@ -1,5 +1,8 @@
 use super::*;
 
+const MAX_CONCURRENT_TRACE_REPLAYS: usize = 2;
+const MAX_TRACE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> Web3ApiServer for RpcHandler<S> {
     async fn client_version(&self) -> Result<String, ErrorObjectOwned> {
@@ -45,44 +48,14 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         tx_hash: String,
         opts: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let _trace_opts = parse_trace_options(opts)?;
-
-        let (_block, tx, receipt, _tx_index) = self.lookup_tx_with_block(&tx_hash)?;
-
-        let to_addr = tx.tx.to.unwrap_or(Address::ZERO);
-        let call_type = if tx.tx.to.is_none() { "CREATE" } else { "CALL" };
-
-        let mut frame = shell_pqvm::CallFrame::new(
-            call_type,
-            tx.sender(),
-            to_addr,
-            tx.tx.gas_limit,
-            tx.tx.data.clone(),
-        );
-        if !tx.tx.value.is_zero() {
-            frame = frame.with_value(tx.tx.value);
-        }
-        frame.gas_used = receipt.gas_used;
-
-        if receipt.succeeded() {
-            frame.output = Some(Bytes::default());
-        } else {
-            frame.error = Some("execution reverted".to_string());
-        }
-
-        // Populate output/revert_reason from contract address if CREATE
-        if tx.tx.to.is_none() {
-            if let Some(addr) = receipt.contract_address {
-                frame.to = addr;
-            }
-        }
-
-        let trace = shell_pqvm::TraceResult {
-            frame,
-            failed: !receipt.succeeded(),
-        };
-
-        serde_json::to_value(&trace).map_err(|e| internal_err(format!("serialization error: {e}")))
+        let options = parse_trace_options(opts)?;
+        let (block, _, _, tx_index) = self.lookup_tx_with_block(&tx_hash)?;
+        let mut traces = self
+            .replay_traces(block, Some(tx_index as usize), options)
+            .await?;
+        traces
+            .pop()
+            .ok_or_else(|| internal_err("transaction trace missing"))
     }
 
     async fn trace_block_by_number(
@@ -90,55 +63,126 @@ impl<S: KvStore + 'static> DebugApiServer for RpcHandler<S> {
         block_number: String,
         opts: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let _trace_opts = parse_trace_options(opts)?;
-
+        let options = parse_trace_options(opts)?;
         let block = self.resolve_block(&block_number)?;
-        let block_hash = block.hash();
-
-        let receipts = self
-            .chain_store
-            .get_receipts(&block_hash)
-            .map_err(internal_err)?
-            .unwrap_or_default();
-
-        let mut traces = Vec::with_capacity(block.transactions.len());
-        for (i, tx) in block.transactions.iter().enumerate() {
-            let receipt = receipts.get(i);
-            let to_addr = tx.tx.to.unwrap_or(Address::ZERO);
-            let call_type = if tx.tx.to.is_none() { "CREATE" } else { "CALL" };
-
-            let mut frame = shell_pqvm::CallFrame::new(
-                call_type,
-                tx.sender(),
-                to_addr,
-                tx.tx.gas_limit,
-                tx.tx.data.clone(),
-            );
-            if !tx.tx.value.is_zero() {
-                frame = frame.with_value(tx.tx.value);
-            }
-
-            if let Some(r) = receipt {
-                frame.gas_used = r.gas_used;
-                if r.succeeded() {
-                    frame.output = Some(Bytes::default());
-                } else {
-                    frame.error = Some("execution reverted".to_string());
-                }
-                if tx.tx.to.is_none() {
-                    if let Some(addr) = r.contract_address {
-                        frame.to = addr;
-                    }
-                }
-            }
-
-            let failed = receipt.map(|r| !r.succeeded()).unwrap_or(true);
-            let trace = shell_pqvm::TraceResult { frame, failed };
-            traces.push(trace);
-        }
-
-        serde_json::to_value(&traces).map_err(|e| internal_err(format!("serialization error: {e}")))
+        Ok(serde_json::Value::Array(
+            self.replay_traces(block, None, options).await?,
+        ))
     }
+}
+
+impl<S: KvStore + 'static> RpcHandler<S> {
+    async fn replay_traces(
+        &self,
+        block: Block,
+        target: Option<usize>,
+        options: TraceOptions,
+    ) -> Result<Vec<serde_json::Value>, ErrorObjectOwned> {
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let permit = SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACE_REPLAYS)))
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| server_error("trace replay unavailable"))?;
+        let chain = Arc::clone(&self.chain_store);
+        let chain_id = self.chain_id;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            replay_block_traces(chain, chain_id, block, target, options)
+        })
+        .await
+        .map_err(|error| internal_err(format!("trace task failed: {error}")))?
+    }
+}
+
+fn replay_block_traces<S: KvStore + 'static>(
+    chain: Arc<ChainStore<S>>,
+    chain_id: u64,
+    block: Block,
+    target: Option<usize>,
+    options: TraceOptions,
+) -> Result<Vec<serde_json::Value>, ErrorObjectOwned> {
+    if block.transactions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parent = chain
+        .get_header_by_hash(&block.header.parent_hash)
+        .map_err(internal_err)?
+        .ok_or_else(|| server_error("trace parent header unavailable"))?;
+    let overlay = Arc::new(shell_storage::OverlayStore::new(Arc::clone(chain.store())));
+    let state = WorldState::at_root(Arc::clone(&overlay), &parent.state_root)
+        .map_err(|error| server_error(format!("trace parent state unavailable: {error}")))?;
+    let registry = shell_pqvm::load_algorithm_registry(&state).map_err(internal_err)?;
+    let receipts = chain
+        .get_receipts(&block.hash())
+        .map_err(internal_err)?
+        .ok_or_else(|| server_error("trace receipts unavailable"))?;
+    let mut executor = ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(overlay)), chain_id);
+    let config = shell_pqvm::TraceConfig {
+        disable_stack: options.disable_stack.unwrap_or(false),
+        disable_memory: options.disable_memory.unwrap_or(false),
+        disable_storage: options.disable_storage.unwrap_or(false),
+    };
+    // No commit of the overlay, and registry changes stay on this worker thread.
+    // Historical signatures have already been verified during canonical import.
+    shell_crypto::with_algorithm_registry_override(&registry, || {
+        let mut traces = Vec::new();
+        let mut cumulative = 0;
+        let mut response_bytes = 0usize;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if target.is_some_and(|target| index > target) {
+                break;
+            }
+            // Native execution also reads address-keyed metadata outside the state
+            // trie. Its historical undo journals may already have been pruned.
+            // Do not execute it against today's metadata or invent a call frame.
+            if tx
+                .tx
+                .to
+                .as_ref()
+                .is_some_and(shell_pqvm::is_system_contract)
+                && !tx.is_aa_bundle()
+            {
+                return Err(server_error(
+                    "native system-contract tracing requires historical address metadata",
+                ));
+            }
+            let selected = target.is_none_or(|target| target == index);
+            let (result, trace) = if selected {
+                let (result, trace) = executor
+                    .trace_transaction(tx, &block.header, index as u32, cumulative, config)
+                    .map_err(|error| server_error(format!("trace replay failed: {error}")))?;
+                (result, Some(trace))
+            } else {
+                let result = if tx.is_aa_bundle() {
+                    executor.execute_aa_bundle(tx, &block.header, index as u32, cumulative)
+                } else {
+                    executor.execute_tx(tx, &block.header, index as u32, cumulative)
+                }
+                .map_err(|error| server_error(format!("trace prefix replay failed: {error}")))?;
+                (result, None)
+            };
+            if receipts.get(index) != Some(&result.receipt) {
+                return Err(server_error("trace replay disagrees with stored receipt"));
+            }
+            cumulative = result.receipt.cumulative_gas_used;
+            if !result.is_system_tx {
+                shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut())
+                    .map_err(internal_err)?;
+            }
+            if let Some(trace) = trace {
+                let value = serde_json::to_value(trace).map_err(internal_err)?;
+                response_bytes = response_bytes
+                    .saturating_add(serde_json::to_vec(&value).map_err(internal_err)?.len());
+                if response_bytes > MAX_TRACE_RESPONSE_BYTES {
+                    return Err(server_error("trace response exceeds 16 MiB limit"));
+                }
+                traces.push(value);
+            }
+        }
+        Ok(traces)
+    })
 }
 
 fn parse_trace_options(opts: Option<serde_json::Value>) -> Result<TraceOptions, ErrorObjectOwned> {

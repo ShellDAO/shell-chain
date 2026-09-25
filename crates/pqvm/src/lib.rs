@@ -11,7 +11,9 @@
 
 mod aa_validation;
 pub mod bloom;
+mod execution_tracer;
 mod executor;
+pub use execution_tracer::{ExecutionTrace, TraceConfig};
 mod parallel;
 pub mod pqvm_opcodes;
 mod precompiles;

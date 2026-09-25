@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Replay `debug_traceTransaction` and `debug_traceBlockByNumber` against isolated
+  parent state, including earlier transactions in the block. Return executed
+  nested calls, creation output, revert data, and bounded opcode observations
+  instead of reconstructing a top-level frame from receipts. Reject unavailable
+  historical state, receipt mismatches, and traces exceeding capture limits.
+
 - Add `shell-node tx receipt <HASH>` to query transaction receipts as JSON
   without a keystore. Unavailable receipts print `null`; RPC errors and mismatched
   transaction hashes fail without resubmitting the transaction.

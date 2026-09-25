@@ -346,13 +346,31 @@ curl -s http://localhost:8545 \
   }' | python3 -m json.tool
 ```
 
-The trace shows the full call tree including:
+The trace replays the transaction from its block’s parent state, including earlier
+transactions in that block. It returns the executed call tree and `structLogs`
+opcode observations, including:
 - `CREATE` / `CREATE2` frames for contract deployment
 - Gas consumption per opcode
 - Storage reads and writes
 - Internal calls between contracts
 
 > **Note:** The `debug` namespace must be enabled on the node with `--rpc-api eth,net,web3,shell,debug`.
+
+The call tree includes actual return or revert bytes; failed nested calls remain
+visible even when their state changes are rolled back. `structLogs` records
+`pc`, `op`, `gas`, `gasCost`, `depth`, operand `stack`, hexadecimal `memory`, and
+accessed `storage` slots for `SLOAD` / `SSTORE`. The trace does not commit changes
+to the node. Use `disableStack`, `disableMemory`, or `disableStorage` in an
+optional second parameter to omit those payloads; nested calls remain included.
+
+Tracing requires the parent state to be retained. Capture is limited to 50,000
+instructions and 8 MiB per transaction, with a 16 MiB block response limit and
+two concurrent replays. Missing state, receipt mismatches, or exhausted limits
+return an error rather than a partial successful trace. Native system-contract
+transactions and prefixes containing them also return an error until their
+historical address metadata can be reconstructed safely; ordinary contract
+calls, deployments, and AA execution are replayed through the normal executor.
+
 
 ---
 
