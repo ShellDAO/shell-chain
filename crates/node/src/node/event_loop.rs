@@ -367,6 +367,14 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         self.recover_unfinalized_head()?;
+        // Normal restarts may not rewind any blocks. Restore policy from the
+        // recovered canonical state before exposing RPC or admitting transactions.
+        let registry = load_algorithm_registry(&self.world_state.read()).map_err(|error| {
+            NodeError::Startup(format!(
+                "failed to restore algorithm registry during startup: {error}"
+            ))
+        })?;
+        *AlgorithmRegistry::global_mut() = registry;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
