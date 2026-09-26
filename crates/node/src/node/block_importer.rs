@@ -71,8 +71,17 @@ fn batch_signing_pubkey<S: KvStore>(
     let address_bound = ALLOWED_ALGORITHMS
         .iter()
         .any(|algorithm| Address::from_public_key(root_pubkey, algorithm.as_u8()) == tx.from);
+    // A prior confirmed rotation preserves the address. Once scheduled, use
+    // the registered root binding also checked by sequential AA validation.
+    let registered_binding = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.session_registered_root_height)
+        .is_some_and(|height| block_number >= height)
+        && !address_bound
+        && chain_store.get_pubkey(&tx.from)?.as_deref() == Some(root_pubkey);
     if infer_signature_type_from_address(root_pubkey, &tx.from).is_none()
         && !(registered_upgrade && address_bound)
+        && !registered_binding
     {
         return Err(NodeError::Startup(format!(
             "block {} tx {} sender {} does not match resolved root pubkey",
@@ -2184,6 +2193,18 @@ mod tests {
                 assert!(batch_signing_pubkey(10, &signed, session.public_key(), &cs).is_err());
                 let legacy = ChainStore::new(Arc::new(MemoryDb::new()));
                 legacy.put_pubkey(&from, root.public_key()).unwrap();
+                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &legacy).is_err());
+                // Repairing rotated-key binding must not bypass the separate
+                // algorithm policy of an original address-derived root.
+                legacy
+                    .put_chain_config(
+                        &serde_json::from_value(serde_json::json!({
+                            "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                            "session_registered_root_height":0
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
                 assert!(batch_signing_pubkey(10, &signed, root.public_key(), &legacy).is_err());
             });
             registry.propose_activation(root.sig_type());
