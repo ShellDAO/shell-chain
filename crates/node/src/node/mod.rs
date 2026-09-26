@@ -8191,6 +8191,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_algorithm_registry_restores_canonical_state_before_serving() {
+        const TEST_NAME: &str =
+            "node::tests::startup_algorithm_registry_restores_canonical_state_before_serving";
+        if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_REGISTRY_STARTUP") {
+            return;
+        }
+        use shell_crypto::{AlgorithmStatus, MlDsaSigner, SignatureType};
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        for (persisted, finalized) in [(true, None), (true, Some(0)), (false, None)] {
+            let signer = MlDsaSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let mut original = setup_node_with_authority(authority);
+            original.config.rpc_enabled = false;
+            original.config.metrics.enabled = false;
+            if persisted {
+                let mut ws = original.world_state.write();
+                let address = shell_pqvm::system_contracts::registry_address();
+                for (prefix, algo, value) in [
+                    (
+                        "algorithm_status:",
+                        SignatureType::Dilithium3,
+                        U256::from(2).to_be_bytes::<32>(),
+                    ),
+                    (
+                        "algorithm_status:",
+                        SignatureType::MlDsa65,
+                        U256::from(1).to_be_bytes::<32>(),
+                    ),
+                    (
+                        "algorithm_status:",
+                        SignatureType::SphincsSha2256f,
+                        U256::from(3).to_be_bytes::<32>(),
+                    ),
+                    (
+                        "algorithm_activation_height:",
+                        SignatureType::SphincsSha2256f,
+                        U256::from(1_000_000).to_be_bytes::<32>(),
+                    ),
+                    (
+                        "algorithm_verifier_hash:",
+                        SignatureType::SphincsSha2256f,
+                        [0x45; 32],
+                    ),
+                ] {
+                    let mut input = prefix.as_bytes().to_vec();
+                    input.push(algo.as_u8());
+                    ws.set_storage(
+                        &address,
+                        &shell_primitives::keccak256(&input),
+                        &ShellHash::from(value),
+                    )
+                    .unwrap();
+                }
+            }
+            store_consistent_genesis(&original);
+            if let Some(number) = finalized {
+                original.chain_store.set_finalized_number(number).unwrap();
+            }
+            let root = original
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .header
+                .state_root;
+            let expected = load_algorithm_registry(&original.world_state.read()).unwrap();
+            original.config.proposer_address = None;
+            let (node, _) =
+                crate::builder::NodeBuilder::new(original.config.clone(), original.store.clone())
+                    .build()
+                    .unwrap();
+            // Simulate a new process or stale policy left by a previous node.
+            *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+            if !persisted {
+                AlgorithmRegistry::global_mut().deprecate(SignatureType::MlDsa65);
+            }
+            let node = Arc::new(node);
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let task = tokio::spawn({
+                let node = Arc::clone(&node);
+                async move { node.run(Arc::new(signer), &mut network).await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.runtime_signer.read().is_none() {
+                    assert!(!task.is_finished(), "node failed before startup");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("startup timed out");
+            node.shutdown();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *AlgorithmRegistry::global(),
+                expected,
+                "persisted={persisted}, finalized={finalized:?}"
+            );
+            assert_eq!(
+                current_state_root(&node),
+                root,
+                "startup must not rewrite governance state"
+            );
+            assert!(shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65));
+            if persisted {
+                assert!(!shell_crypto::is_algorithm_allowed(
+                    SignatureType::Dilithium3
+                ));
+                assert!(!shell_crypto::is_algorithm_allowed(
+                    SignatureType::SphincsSha2256f
+                ));
+                let registry = AlgorithmRegistry::global();
+                let pending = registry
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.algo == SignatureType::SphincsSha2256f)
+                    .unwrap();
+                assert_eq!(pending.status, AlgorithmStatus::PendingActivation);
+                let spec = pending.spec.as_ref().unwrap();
+                assert_eq!(spec.activation_height, 1_000_000);
+                assert_eq!(spec.verifier_hash, [0x45; 32]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_algorithm_registry_rejects_corruption_before_serving() {
+        const TEST_NAME: &str =
+            "node::tests::startup_algorithm_registry_rejects_corruption_before_serving";
+        if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_REGISTRY_STARTUP_INVALID") {
+            return;
+        }
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+        let (mut original, signer) = setup_node();
+        original.config.rpc_enabled = false;
+        original.config.metrics.enabled = false;
+        let mut input = b"algorithm_status:".to_vec();
+        input.push(shell_crypto::SignatureType::MlDsa65.as_u8());
+        original
+            .world_state
+            .write()
+            .set_storage(
+                &shell_pqvm::system_contracts::registry_address(),
+                &shell_primitives::keccak256(&input),
+                &ShellHash::from(U256::from(99).to_be_bytes::<32>()),
+            )
+            .unwrap();
+        store_consistent_genesis(&original);
+        original.config.proposer_address = None;
+        let (node, _) =
+            crate::builder::NodeBuilder::new(original.config.clone(), original.store.clone())
+                .build()
+                .unwrap();
+        let before = node.store.scan_prefix(&[]).unwrap();
+        let registry_before = AlgorithmRegistry::global().clone();
+        let node = Arc::new(node);
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            Arc::clone(&node).run(Arc::new(signer), &mut network),
+        )
+        .await
+        .expect("malformed registry must fail before startup")
+        .expect_err("corrupt status must reject startup");
+        assert!(error
+            .to_string()
+            .contains("failed to restore algorithm registry during startup"));
+        assert!(node.runtime_signer.read().is_none());
+        assert_eq!(node.store.scan_prefix(&[]).unwrap(), before);
+        assert_eq!(*AlgorithmRegistry::global(), registry_before);
+    }
+
+    #[tokio::test]
     async fn event_loop_rejects_zero_block_time_before_startup() {
         use shell_network::{NetworkBus, NetworkConfig};
 

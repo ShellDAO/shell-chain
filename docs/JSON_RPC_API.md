@@ -1491,6 +1491,14 @@ curl -s http://localhost:8545 \
 
 Returns the live algorithm registry as an array of objects: `{ algo, status, description }`.
 
+Status is `active`, `deprecated`, or `pending_activation`. At startup, the node
+restores this registry from the recovered canonical world state before starting
+RPC and transaction admission. Restarting does not activate pending algorithms,
+reset deprecated entries, or change saved proposal heights and verifier hashes.
+Malformed persisted registry state prevents startup instead of falling back to
+the compile-time active allowlist. Chains without governance entries retain the
+initial allowlist.
+
 **Parameters:** None
 
 **Returns:** `Array` — one entry per registered signature algorithm.

@@ -77,6 +77,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore the algorithm registry from recovered canonical state on every node
+  startup, including restarts that do not rewind blocks. Preserve pending
+  activation heights and verifier hashes, keep deprecated algorithms disabled,
+  and reject malformed registry state before starting RPC or transaction admission.
+
+
 - Consume P2P bandwidth refill time once at high configured rates, preserving
   fractional token credit without allowing repeated use of elapsed time or
   excess idle credit beyond the burst limit.
