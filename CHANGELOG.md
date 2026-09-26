@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `algorithm_voting_window_activation_height`: newly staged algorithm
+  proposals accept votes only before their persisted seven-day nominal block
+  deadline. Freeze the effective genesis interval with the schedule, reject
+  expiry and overflow without changing live policy, and preserve pre-upgrade
+  proposals. Validate staging prerequisites, immutable startup configuration and
+  trusted snapshot imports. Default behavior is unchanged; expired proposal retry
+  and full proposal identity remain separate limitations.
+
 - Add optional `algorithm_proposal_staging_height`: new proposals keep candidate
   parameters separate from live algorithm policy until quorum. Preserve active
   or deprecated status before approval, including across restart and replay;

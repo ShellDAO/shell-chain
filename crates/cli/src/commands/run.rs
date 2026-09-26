@@ -364,6 +364,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
                 log_address_activation_height: genesis_config.log_address_activation_height,
+                algorithm_voting_window: genesis_config.algorithm_voting_window()?,
                 algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: genesis_config
                     .algorithm_quorum_activation_height,
@@ -428,6 +429,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.log_address_activation_height
         || stored
             .as_ref()
+            .and_then(|config| config.algorithm_voting_window)
+            != genesis_config.algorithm_voting_window()?
+        || stored
+            .as_ref()
             .and_then(|config| config.algorithm_proposal_staging_height)
             != genesis_config.algorithm_proposal_staging_height
         || stored
@@ -443,6 +448,7 @@ async fn initialize_chain<S: KvStore + 'static>(
         let desired = shell_storage::ChainConfig {
             fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
             log_address_activation_height: genesis_config.log_address_activation_height,
+            algorithm_voting_window: genesis_config.algorithm_voting_window()?,
             algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
             algorithm_quorum_activation_height: genesis_config.algorithm_quorum_activation_height,
             algorithm_timelock_activation_height: genesis_config
@@ -656,6 +662,7 @@ async fn run_with_store<S: KvStore + 'static>(
 
         let config = GenesisConfig {
             log_address_activation_height: None,
+            algorithm_voting_window_activation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1213,6 +1220,7 @@ mod tests {
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
             log_address_activation_height: None,
+            algorithm_voting_window_activation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1440,6 +1448,7 @@ mod tests {
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1624,6 +1633,18 @@ mod tests {
         .is_err());
         assert_eq!(store.scan_prefix(b"").unwrap(), before);
         config.algorithm_proposal_staging_height = Some(7);
+        config.algorithm_voting_window_activation_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.algorithm_voting_window_activation_height = Some(8);
         initialize_chain(
             Arc::clone(&store),
             &config,
@@ -1650,6 +1671,13 @@ mod tests {
         assert_eq!(persisted.algorithm_timelock_activation_height, Some(5));
         assert_eq!(persisted.algorithm_quorum_activation_height, Some(6));
         assert_eq!(persisted.algorithm_proposal_staging_height, Some(7));
+        assert_eq!(
+            persisted.algorithm_voting_window,
+            Some(shell_storage::AlgorithmVotingWindow {
+                activation_height: 8,
+                block_time_secs: 2
+            })
+        );
         let before = store.scan_prefix(b"").unwrap();
         for conflicting in [None, Some(4)] {
             config.bloom_activation_height = conflicting;
@@ -1720,6 +1748,39 @@ mod tests {
             .is_err());
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
         }
+        config.algorithm_proposal_staging_height = Some(7);
+        for conflicting in [None, Some(9)] {
+            config.algorithm_voting_window_activation_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        config.algorithm_voting_window_activation_height = Some(8);
+        match &mut config.consensus {
+            shell_genesis::ConsensusConfig::PoA {
+                block_time_secs, ..
+            }
+            | shell_genesis::ConsensusConfig::WPoA {
+                block_time_secs, ..
+            } => *block_time_secs = 3,
+        }
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
     }
 
     #[tokio::test]
@@ -1842,6 +1903,7 @@ mod tests {
                 &genesis,
                 &ChainConfig {
                     log_address_activation_height: None,
+                    algorithm_voting_window: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,

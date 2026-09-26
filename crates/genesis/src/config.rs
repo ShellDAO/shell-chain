@@ -162,6 +162,9 @@ pub struct GenesisConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// Optional seven-day voting-window upgrade; absent preserves legacy proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_voting_window_activation_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -406,6 +409,24 @@ pub struct AllocEntry {
 }
 
 impl GenesisConfig {
+    /// Freeze the consensus interval with the optional voting-window schedule.
+    pub fn algorithm_voting_window(
+        &self,
+    ) -> Result<Option<shell_storage::AlgorithmVotingWindow>, GenesisError> {
+        self.algorithm_voting_window_activation_height
+            .map(|activation_height| {
+                let window = shell_storage::AlgorithmVotingWindow {
+                    activation_height,
+                    block_time_secs: self.effective_block_time_secs(),
+                };
+                window
+                    .validate(self.algorithm_proposal_staging_height)
+                    .map_err(|error| GenesisError::Validation(error.to_string()))?;
+                Ok(window)
+            })
+            .transpose()
+    }
+
     /// Parse genesis configuration from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)

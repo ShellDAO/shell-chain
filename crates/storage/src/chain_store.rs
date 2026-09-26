@@ -12,6 +12,41 @@ use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
 const SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES: usize = 10_000;
 const SNAPSHOT_IMPORT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// Seven nominal days, converted to a fixed block count when a proposal opens.
+pub const ALGORITHM_VOTING_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Immutable activation and nominal interval for algorithm voting expiry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlgorithmVotingWindow {
+    pub activation_height: u64,
+    pub block_time_secs: u64,
+}
+
+impl AlgorithmVotingWindow {
+    pub fn duration_blocks(&self) -> Result<u64, StorageError> {
+        let blocks = ALGORITHM_VOTING_WINDOW_SECONDS
+            .checked_div(self.block_time_secs)
+            .filter(|blocks| *blocks > 0)
+            .ok_or_else(|| {
+                StorageError::State(
+                    "algorithm voting interval must be between one second and seven days".into(),
+                )
+            })?;
+        Ok(blocks)
+    }
+
+    pub fn validate(&self, staging_height: Option<u64>) -> Result<(), StorageError> {
+        self.duration_blocks()?;
+        if staging_height.is_none_or(|height| height > self.activation_height) {
+            return Err(StorageError::State(
+                "algorithm voting window requires proposal staging no later than its activation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Persistent chain identity and its explicitly scheduled protocol rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -26,6 +61,9 @@ pub struct ChainConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// Optional seven-day voting-window upgrade; absent preserves legacy proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_voting_window: Option<AlgorithmVotingWindow>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -1257,6 +1295,10 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         config: &ChainConfig,
     ) -> Result<(), StorageError> {
+        if let Some(window) = config.algorithm_voting_window {
+            window.validate(config.algorithm_proposal_staging_height)?;
+        }
+
         if self
             .get_chain_config()?
             .is_some_and(|stored| stored != *config)
@@ -1610,6 +1652,9 @@ impl<S: KvStore> ChainStore<S> {
     /// Persist the chain configuration (chain_id + genesis hash).
     /// Should be called exactly once after genesis initialization.
     pub fn put_chain_config(&self, config: &ChainConfig) -> Result<(), StorageError> {
+        if let Some(window) = config.algorithm_voting_window {
+            window.validate(config.algorithm_proposal_staging_height)?;
+        }
         if self
             .get_chain_config()?
             .is_some_and(|stored| stored != *config)
@@ -1635,6 +1680,9 @@ impl<S: KvStore> ChainStore<S> {
     /// Schedule future rules atomically while holding the exclusive startup lock.
     /// Existing schedules and canonical history cannot be changed.
     pub fn schedule_protocol_activations(&self, desired: &ChainConfig) -> Result<(), StorageError> {
+        if let Some(window) = desired.algorithm_voting_window {
+            window.validate(desired.algorithm_proposal_staging_height)?;
+        }
         let stored = self.get_chain_config()?.ok_or_else(|| {
             StorageError::State("activation requires a stored chain configuration".into())
         })?;
@@ -1649,6 +1697,23 @@ impl<S: KvStore> ChainStore<S> {
         let head = self
             .get_head_block()?
             .ok_or_else(|| StorageError::State("activation requires a canonical head".into()))?;
+        if stored.algorithm_voting_window != desired.algorithm_voting_window {
+            if stored.algorithm_voting_window.is_some() || desired.algorithm_voting_window.is_none()
+            {
+                return Err(StorageError::State(
+                    "stored algorithm voting window cannot be changed".into(),
+                ));
+            }
+            if desired
+                .algorithm_voting_window
+                .is_some_and(|window| window.activation_height <= head.number())
+            {
+                return Err(StorageError::State(
+                    "algorithm voting window activation must be above the existing canonical head"
+                        .into(),
+                ));
+            }
+        }
         for (name, previous, next) in [
             (
                 "fee",
@@ -1920,6 +1985,9 @@ impl<S: KvStore> ChainStore<S> {
             algorithm_proposal_staging_height: self
                 .get_chain_config()?
                 .and_then(|config| config.algorithm_proposal_staging_height),
+            algorithm_voting_window: self
+                .get_chain_config()?
+                .and_then(|config| config.algorithm_voting_window),
             log_address_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.log_address_activation_height),
@@ -1942,6 +2010,9 @@ impl<S: KvStore> ChainStore<S> {
     where
         S: 'static,
     {
+        if let Some(window) = trusted.algorithm_voting_window {
+            window.validate(trusted.algorithm_proposal_staging_height)?;
+        }
         let expected_chain_id = trusted.chain_id;
         let expected_genesis_hash = &trusted.genesis_hash;
         if self
@@ -1961,6 +2032,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_fee_activation = trusted.fee_accounting_activation_height;
         let trusted_bloom_activation = trusted.bloom_activation_height;
         let trusted_log_address_activation = trusted.log_address_activation_height;
+        let trusted_algorithm_voting_window = trusted.algorithm_voting_window;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
         let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
         let trusted_algorithm_timelock_activation = trusted.algorithm_timelock_activation_height;
@@ -2088,6 +2160,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.fee_accounting_activation_height != trusted_fee_activation
                     || config.bloom_activation_height != trusted_bloom_activation
                     || config.log_address_activation_height != trusted_log_address_activation
+                    || config.algorithm_voting_window != trusted_algorithm_voting_window
                     || config.algorithm_proposal_staging_height
                         != trusted_algorithm_proposal_staging
                     || config.algorithm_quorum_activation_height
@@ -2170,6 +2243,16 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted algorithm proposal staging activation".into(),
+            ));
+        }
+
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.algorithm_voting_window)
+            != trusted_algorithm_voting_window
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted algorithm voting window".into(),
             ));
         }
 
@@ -2357,6 +2440,7 @@ impl<S: KvStore> ChainStore<S> {
         // chain identity with the head so a fresh destination remains bootable.
         let config = ChainConfig {
             log_address_activation_height: trusted_log_address_activation,
+            algorithm_voting_window: trusted_algorithm_voting_window,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
             algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
             algorithm_timelock_activation_height: trusted_algorithm_timelock_activation,
@@ -3916,6 +4000,7 @@ mod tests {
 
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -3941,6 +4026,7 @@ mod tests {
         assert_eq!(config.algorithm_timelock_activation_height, None);
         assert_eq!(config.algorithm_quorum_activation_height, None);
         assert_eq!(config.algorithm_proposal_staging_height, None);
+        assert_eq!(config.algorithm_voting_window, None);
         assert_eq!(serde_json::to_value(&config).unwrap(), legacy);
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
@@ -3948,6 +4034,7 @@ mod tests {
         let restarted = ChainStore::new(store);
         let changed = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -3968,6 +4055,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -3978,6 +4066,7 @@ mod tests {
             let before = store.scan_prefix(b"").unwrap();
             let untrusted = ChainConfig {
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4020,6 +4109,7 @@ mod tests {
                 genesis_hash: ShellHash::ZERO,
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4030,6 +4120,7 @@ mod tests {
             let untrusted = ChainConfig {
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4072,6 +4163,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: trusted_height,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4082,6 +4174,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: Some(6),
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4123,6 +4216,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: trusted_height,
@@ -4133,6 +4227,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: Some(6),
@@ -4170,6 +4265,108 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_voting_window_validates_nominal_interval_and_staging() {
+        for (seconds, expected) in [
+            (1, 604_800),
+            (2, 302_400),
+            (30, 20_160),
+            (11, 54_981),
+            (604_800, 1),
+        ] {
+            let window = AlgorithmVotingWindow {
+                activation_height: 5,
+                block_time_secs: seconds,
+            };
+            assert_eq!(window.duration_blocks().unwrap(), expected);
+            assert!(window.validate(Some(5)).is_ok());
+            assert!(window.validate(Some(6)).is_err());
+            assert!(window.validate(None).is_err());
+        }
+        for seconds in [0, 604_801, u64::MAX] {
+            assert!(AlgorithmVotingWindow {
+                activation_height: 5,
+                block_time_secs: seconds
+            }
+            .duration_blocks()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn algorithm_voting_window_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, snapshot_interval, include_config) in [
+            (None, Some(3), true),
+            (Some(5), Some(3), true),
+            (Some(5), None, true),
+            (Some(5), None, false),
+        ] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted = ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_voting_window: trusted_height.map(|activation_height| {
+                    AlgorithmVotingWindow {
+                        activation_height,
+                        block_time_secs: 2,
+                    }
+                }),
+                algorithm_quorum_activation_height: None,
+                algorithm_proposal_staging_height: Some(0),
+                algorithm_timelock_activation_height: None,
+            };
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let untrusted = ChainConfig {
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_voting_window: snapshot_interval.map(|block_time_secs| {
+                    AlgorithmVotingWindow {
+                        activation_height: 5,
+                        block_time_secs,
+                    }
+                }),
+                algorithm_quorum_activation_height: None,
+                algorithm_proposal_staging_height: Some(0),
+                algorithm_timelock_activation_height: None,
+                ..trusted
+            };
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let err = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(err.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted algorithm proposal staging activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn algorithm_proposal_staging_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -4180,6 +4377,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_proposal_staging_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -4190,6 +4388,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_proposal_staging_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -4237,6 +4436,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -4247,6 +4447,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -4566,6 +4767,7 @@ mod tests {
         let mismatched_configs = [
             ChainConfig {
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4576,6 +4778,7 @@ mod tests {
             },
             ChainConfig {
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4628,6 +4831,7 @@ mod tests {
         let cs = ChainStore::new(store);
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -4745,6 +4949,7 @@ mod tests {
             cs.get_chain_config().unwrap(),
             Some(ChainConfig {
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5665,6 +5870,7 @@ mod tests {
         let head_hash = head.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -6191,6 +6397,10 @@ mod tests {
 
             cs.put_chain_config(&ChainConfig {
                 log_address_activation_height: log_activation,
+                algorithm_voting_window: quorum_activation.map(|height| AlgorithmVotingWindow {
+                    activation_height: height + 1,
+                    block_time_secs: 2,
+                }),
                 algorithm_proposal_staging_height: quorum_activation,
                 algorithm_quorum_activation_height: quorum_activation,
                 algorithm_timelock_activation_height: timelock_activation,
@@ -6240,6 +6450,13 @@ mod tests {
                 loaded_cfg.algorithm_proposal_staging_height,
                 quorum_activation
             );
+            assert_eq!(
+                loaded_cfg.algorithm_voting_window,
+                quorum_activation.map(|height| AlgorithmVotingWindow {
+                    activation_height: height + 1,
+                    block_time_secs: 2
+                })
+            );
             assert_eq!(loaded_cfg.chain_id, 1337);
             assert_eq!(loaded_cfg.genesis_hash, b0.hash());
             assert_eq!(
@@ -6259,6 +6476,7 @@ mod tests {
         put_canonical(&cs, &b0);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -6314,6 +6532,7 @@ mod tests {
         put_canonical(&cs, &genesis);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -7424,6 +7643,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -7451,6 +7671,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_voting_window: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
