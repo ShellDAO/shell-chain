@@ -368,6 +368,8 @@ async fn initialize_chain<S: KvStore + 'static>(
                 algorithm_proposal_identity_height: genesis_config
                     .algorithm_proposal_identity_height,
                 algorithm_deprecation_height: genesis_config.algorithm_deprecation_height,
+                algorithm_session_deprecation_height: genesis_config
+                    .algorithm_session_deprecation_height,
                 algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: genesis_config
                     .algorithm_quorum_activation_height,
@@ -444,6 +446,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.algorithm_deprecation_height
         || stored
             .as_ref()
+            .and_then(|config| config.algorithm_session_deprecation_height)
+            != genesis_config.algorithm_session_deprecation_height
+        || stored
+            .as_ref()
             .and_then(|config| config.algorithm_proposal_staging_height)
             != genesis_config.algorithm_proposal_staging_height
         || stored
@@ -462,6 +468,8 @@ async fn initialize_chain<S: KvStore + 'static>(
             algorithm_voting_window: genesis_config.algorithm_voting_window()?,
             algorithm_proposal_identity_height: genesis_config.algorithm_proposal_identity_height,
             algorithm_deprecation_height: genesis_config.algorithm_deprecation_height,
+            algorithm_session_deprecation_height: genesis_config
+                .algorithm_session_deprecation_height,
             algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
             algorithm_quorum_activation_height: genesis_config.algorithm_quorum_activation_height,
             algorithm_timelock_activation_height: genesis_config
@@ -678,6 +686,7 @@ async fn run_with_store<S: KvStore + 'static>(
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
+            algorithm_session_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1238,6 +1247,7 @@ mod tests {
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
+            algorithm_session_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1468,6 +1478,7 @@ mod tests {
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
+            algorithm_session_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1780,6 +1791,55 @@ mod tests {
             assert_eq!(store.scan_prefix(b"").unwrap(), unchanged);
         }
         config.algorithm_deprecation_height = Some(10);
+        config.algorithm_session_deprecation_height = Some(0);
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.algorithm_session_deprecation_height = Some(11);
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let chain = ChainStore::new(Arc::clone(&store));
+        let persisted = chain.get_chain_config().unwrap().unwrap();
+        assert_eq!(persisted.algorithm_session_deprecation_height, Some(11));
+        let unchanged = store.scan_prefix(b"").unwrap();
+        for conflicting in [None, Some(12)] {
+            config.algorithm_session_deprecation_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), unchanged);
+        }
+        config.algorithm_session_deprecation_height = Some(11);
         assert_eq!(persisted.fee_accounting_activation_height, Some(2));
         assert_eq!(persisted.bloom_activation_height, Some(3));
         assert_eq!(persisted.log_address_activation_height, Some(4));
@@ -2021,6 +2081,7 @@ mod tests {
                     algorithm_voting_window: None,
                     algorithm_proposal_identity_height: None,
                     algorithm_deprecation_height: None,
+                    algorithm_session_deprecation_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,

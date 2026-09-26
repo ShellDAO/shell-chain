@@ -30,10 +30,11 @@ pub(crate) use shell_core::{
     BlockHeader, SignedTransaction, SystemTransaction, SystemTxKind, TransactionReceipt,
     WitnessBundle, MAX_BLOB_GAS_PER_BLOCK,
 };
+#[cfg(test)]
+pub(crate) use shell_crypto::PQSignature;
 pub(crate) use shell_crypto::{
     infer_signature_type_from_address, with_algorithm_registry_override, AlgorithmRegistry,
-    BatchVerifier, MultiVerifier, PQSignature, PreVerified, Signer, Verifier, VerifyItem,
-    ALLOWED_ALGORITHMS,
+    BatchVerifier, MultiVerifier, PreVerified, Signer, Verifier, VerifyItem, ALLOWED_ALGORITHMS,
 };
 pub(crate) use shell_mempool::TxPool;
 pub(crate) use shell_network::{NetworkMessage, NetworkService};
@@ -3159,6 +3160,7 @@ mod tests {
                         algorithm_voting_window: None,
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,
+                        algorithm_session_deprecation_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -4934,6 +4936,7 @@ mod tests {
                             algorithm_voting_window: None,
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
+                            algorithm_session_deprecation_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5083,6 +5086,7 @@ mod tests {
                             algorithm_voting_window: None,
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
+                            algorithm_session_deprecation_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5181,6 +5185,7 @@ mod tests {
                         algorithm_voting_window: None,
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,
+                        algorithm_session_deprecation_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,

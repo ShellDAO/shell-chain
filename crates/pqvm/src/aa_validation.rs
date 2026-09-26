@@ -318,7 +318,7 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
                 session_auth,
                 &pubkey,
                 bundle.inner_calls.as_slice(),
-                &tx_hash,
+                chain_store,
                 verifier,
                 validation_block,
             )?;
@@ -676,12 +676,12 @@ fn is_magic_valid(output: &[u8]) -> bool {
 /// 5. Session sig: verify `session_auth.session_signature` (signed by `session_pubkey`)
 ///    over the tx `sender_signing_hash()`. The outer `signed_tx.signature` MUST equal
 ///    `session_auth.session_signature` (same bytes and algo) to prevent injection.
-fn validate_session_auth<V: Verifier>(
+fn validate_session_auth<S: KvStore, V: Verifier>(
     signed_tx: &SignedTransaction,
     session_auth: &SessionAuth,
     root_pubkey: &[u8],
     inner_calls: &[InnerCall],
-    tx_hash: &ShellHash,
+    chain_store: &ChainStore<S>,
     verifier: &V,
     validation_block: u64,
 ) -> Result<(), AaValidationError> {
@@ -726,19 +726,14 @@ fn validate_session_auth<V: Verifier>(
         }
     }
 
-    // 4. Root authorization: root_signature over session_auth.auth_hash(chain_id).
-    //
-    // Key rotation preserves the account address without persisting the new
-    // algorithm, so every active algorithm must be considered. Filtering the
-    // compile-time list is required for runtime deprecation to take effect.
-    let auth_hash = session_auth.auth_hash(signed_tx.tx.chain_id);
-    let root_valid = verify_session_root_signature(
+    // Root authorization and import batching share the same registry policy.
+    let root_valid = verify_session_root_authorization(
+        signed_tx,
         root_pubkey,
-        &auth_hash,
-        session_auth.root_signature.as_ref(),
+        chain_store,
+        validation_block,
         verifier,
-        is_algorithm_allowed,
-    );
+    )?;
     if !root_valid {
         return Err(AaValidationError::SessionRootSignatureInvalid);
     }
@@ -766,7 +761,7 @@ fn validate_session_auth<V: Verifier>(
     );
     let session_valid = verifier.verify(
         session_auth.session_pubkey.as_ref(),
-        tx_hash.as_bytes(),
+        signed_tx.sender_signing_hash().as_bytes(),
         &session_sig,
     )?;
     if !session_valid {
@@ -774,6 +769,72 @@ fn validate_session_auth<V: Verifier>(
     }
 
     Ok(())
+}
+
+/// Whether this registered key may use the separately scheduled session-root rule.
+/// Resolving an embedded key alone never establishes an existing account.
+pub fn registered_session_root_deprecation_enabled<S: KvStore>(
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+    from: &Address,
+    root_pubkey: &[u8],
+) -> Result<bool, StorageError> {
+    let enabled = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.algorithm_session_deprecation_height)
+        .is_some_and(|height| block_number >= height);
+    Ok(enabled && chain_store.get_pubkey(from)?.as_deref() == Some(root_pubkey))
+}
+
+/// Verify a session's root authorization using the candidate block's policy.
+/// The upgraded rule binds an original root to its address algorithm so a
+/// compatibility verifier cannot silently substitute another registry entry.
+pub fn verify_session_root_authorization<S: KvStore, V: Verifier>(
+    signed_tx: &SignedTransaction,
+    root_pubkey: &[u8],
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+    verifier: &V,
+) -> Result<bool, StorageError> {
+    let Some(auth) = signed_tx
+        .aa_bundle()
+        .and_then(|bundle| bundle.session_auth.as_ref())
+    else {
+        return Ok(false);
+    };
+    let bound_algorithm = if registered_session_root_deprecation_enabled(
+        chain_store,
+        block_number,
+        &signed_tx.from,
+        root_pubkey,
+    )? {
+        ALLOWED_ALGORITHMS.iter().copied().find(|algorithm| {
+            Address::from_public_key(root_pubkey, algorithm.as_u8()) == signed_tx.from
+        })
+    } else {
+        None
+    };
+    // Rotated keys do not persist an algorithm identifier. Keep their legacy
+    // active-only verification; the deprecation exception is address-bound.
+    Ok(verify_session_root_signature(
+        root_pubkey,
+        &auth.auth_hash(signed_tx.tx.chain_id),
+        auth.root_signature.as_ref(),
+        verifier,
+        |algorithm| match bound_algorithm {
+            Some(bound) => {
+                algorithm == bound
+                    && matches!(
+                        shell_crypto::algorithm_status(algorithm),
+                        Some(
+                            shell_crypto::AlgorithmStatus::Active
+                                | shell_crypto::AlgorithmStatus::Deprecated
+                        )
+                    )
+            }
+            None => is_algorithm_allowed(algorithm),
+        },
+    ))
 }
 
 fn verify_session_root_signature<V, F>(
@@ -1583,6 +1644,7 @@ mod tests {
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
+            algorithm_session_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1714,6 +1776,203 @@ mod tests {
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    fn signed_session(
+        root: &dyn Signer,
+        session: &dyn Signer,
+        mut tx: Transaction,
+    ) -> SignedTransaction {
+        let from = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
+        let mut auth = SessionAuth {
+            session_pubkey: Bytes::from(session.public_key().to_vec()),
+            session_algo: session.sig_type().as_u8(),
+            target: tx.to,
+            value_cap: U256::ZERO,
+            expiry_block: 20,
+            root_signature: Bytes::new(),
+            session_signature: Bytes::from(vec![1]),
+        };
+        auth.root_signature = Bytes::from(
+            root.sign(auth.auth_hash(tx.chain_id).as_bytes())
+                .unwrap()
+                .data,
+        );
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        tx.gas_limit = 100_000;
+        let inner_call = InnerCall {
+            to: tx.to,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 50_000,
+        };
+        let mut signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            PQSignature::new(session.sig_type(), vec![1]),
+            PubkeyMode::Embedded(root.public_key().to_vec()),
+            AaBundle {
+                inner_calls: vec![inner_call],
+                session_auth: Some(auth),
+                ..AaBundle::default()
+            },
+        )
+        .unwrap();
+        signed.signature = session
+            .sign(signed.sender_signing_hash().as_bytes())
+            .unwrap();
+        signed
+            .aa_bundle
+            .as_mut()
+            .unwrap()
+            .session_auth
+            .as_mut()
+            .unwrap()
+            .session_signature = Bytes::from(signed.signature.data.clone());
+        signed
+    }
+
+    #[test]
+    fn registered_session_root_survives_deprecation_upgrade() {
+        use crate::tx_validation::validate_tx;
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
+        let roots: Vec<Box<dyn Signer>> = vec![
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ];
+        for root in roots {
+            let session: Box<dyn Signer> = if root.sig_type() == SignatureType::MlDsa65 {
+                Box::new(DilithiumSigner::generate())
+            } else {
+                Box::new(MlDsaSigner::generate())
+            };
+            let from = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
+            let (mut ws, cs) = setup_stores();
+            fund_account(&mut ws, &from);
+            cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                    "algorithm_session_deprecation_height":10
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let nonce = ws.get_nonce(&from).unwrap();
+            let signed = signed_session(root.as_ref(), session.as_ref(), base_tx(1337, nonce));
+            let mut registry = AlgorithmRegistry::default();
+            with_algorithm_registry_override(&registry, || {
+                validate_tx(&signed, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+            });
+            assert_eq!(
+                cs.get_pubkey(&from).unwrap().as_deref(),
+                Some(root.public_key())
+            );
+            registry.deprecate(root.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                // Legacy ML-DSA can also verify through the active Dilithium compatibility path.
+                let legacy_accepts = root.sig_type() == SignatureType::MlDsa65;
+                for height in [9, 10, 11] {
+                    let header = BlockHeader {
+                        number: height,
+                        ..BlockHeader::default()
+                    };
+                    assert_eq!(
+                        validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header).is_ok(),
+                        height >= 10 || legacy_accepts
+                    );
+                }
+                set_head_number(&cs, 9);
+                validate_tx(&signed, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+                let mut reference = signed.clone();
+                reference.pubkey_mode = PubkeyMode::Reference;
+                validate_tx(&reference, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+                let before = ws.get_account(&from).unwrap();
+                let mut bad = signed.clone();
+                bad.aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap()
+                    .root_signature = Bytes::from(vec![1]);
+                assert!(matches!(
+                    validate_aa_tx(&bad, &ws, &cs, &MultiVerifier),
+                    Err(AaValidationError::SessionRootSignatureInvalid)
+                ));
+                let mut bad = signed.clone();
+                bad.signature.data[0] ^= 1;
+                bad.aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap()
+                    .session_signature = Bytes::from(bad.signature.data.clone());
+                assert!(validate_aa_tx(&bad, &ws, &cs, &MultiVerifier).is_err());
+                let mut bad = signed.clone();
+                bad.pubkey_mode = PubkeyMode::Embedded(vec![42; root.public_key().len()]);
+                assert!(matches!(
+                    validate_aa_tx(&bad, &ws, &cs, &MultiVerifier),
+                    Err(AaValidationError::PubkeyConflict)
+                ));
+                let mut bad = signed.clone();
+                bad.aa_bundle.as_mut().unwrap().inner_calls[0].value = U256::from(1);
+                assert!(matches!(
+                    validate_aa_tx(&bad, &ws, &cs, &MultiVerifier),
+                    Err(AaValidationError::SessionValueCapExceeded { .. })
+                ));
+                let mut bad = signed.clone();
+                bad.aa_bundle.as_mut().unwrap().inner_calls[0].to = Some(Address::ZERO);
+                assert!(matches!(
+                    validate_aa_tx(&bad, &ws, &cs, &MultiVerifier),
+                    Err(AaValidationError::SessionTargetMismatch { .. })
+                ));
+                assert!(matches!(
+                    validate_aa_tx_at_block(
+                        &signed,
+                        &ws,
+                        &cs,
+                        &MultiVerifier,
+                        &BlockHeader {
+                            number: 20,
+                            ..BlockHeader::default()
+                        }
+                    ),
+                    Err(AaValidationError::SessionKeyExpired { .. })
+                ));
+                assert_eq!(ws.get_account(&from).unwrap(), before);
+                let (mut fresh_ws, fresh_cs) = setup_stores();
+                fund_account(&mut fresh_ws, &from);
+                fresh_cs
+                    .put_chain_config(&cs.get_chain_config().unwrap().unwrap())
+                    .unwrap();
+                set_head_number(&fresh_cs, 9);
+                assert!(
+                    validate_tx(&signed, &mut fresh_ws, &fresh_cs, &MultiVerifier, 1337).is_err()
+                );
+                assert!(fresh_cs.get_pubkey(&from).unwrap().is_none());
+                let (legacy_ws, legacy_cs) = setup_stores();
+                legacy_cs.put_pubkey(&from, root.public_key()).unwrap();
+                set_head_number(&legacy_cs, 9);
+                assert_eq!(
+                    validate_aa_tx(&signed, &legacy_ws, &legacy_cs, &MultiVerifier).is_ok(),
+                    legacy_accepts
+                );
+            });
+            registry.propose_activation(root.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                assert!(matches!(
+                    validate_aa_tx(&signed, &ws, &cs, &MultiVerifier),
+                    Err(AaValidationError::SessionRootSignatureInvalid)
+                ));
+            });
+            let mut session_registry = AlgorithmRegistry::default();
+            session_registry.deprecate(session.sig_type());
+            with_algorithm_registry_override(&session_registry, || {
+                assert!(validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_err());
+            });
+        }
     }
 
     #[test]

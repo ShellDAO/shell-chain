@@ -295,7 +295,23 @@ Offline address derivation is a pure calculation, not account registration.
 Omitting the schedule retains the legacy rejection of deprecated signatures.
 Operators must coordinate activation; source availability does not enable the
 rule on a running network. See [the compatibility decision](adr/algorithm-deprecation-migration.md).
-The whitepaper's broader requirement that existing accounts remain fully
-operational is still open for session-key authorization, paymaster verification
-and validator consensus signatures; this change implements direct root-key
-transactions without claiming those other paths are complete.
+A separate optional `algorithm_session_deprecation_height` extends this behavior
+to session authorization by an account's original registered root key. At its
+activation block, an active session key can submit transactions authorized by a
+deprecated root. The root key must still derive the account address under its
+original algorithm, and the session must satisfy its signature, expiry, value
+cap and target restrictions. New accounts and pending root algorithms remain
+rejected. Admission and block import use the same root-signature policy.
+
+This session schedule is independent of `algorithm_deprecation_height`. Omitting
+it preserves legacy session verification, including the ML-DSA compatibility
+fallback through an active Dilithium verifier. Once enabled for a registered
+original root, verification binds to its address algorithm, so a pending entry
+cannot pass through that fallback. Configure and coordinate a future height on
+all participating nodes; a stored schedule cannot be changed or removed.
+
+Session authorization after root-key rotation remains outside this exception:
+rotation does not persist the new algorithm identifier, and block import still
+requires the root key to derive the sender address. Paymaster verification,
+custom-validator cryptographic operations and validator consensus signatures
+also remain separate parts of the whitepaper's full operational guarantee.

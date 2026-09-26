@@ -18,6 +18,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add independent optional `algorithm_session_deprecation_height` for session
+  authorization by original registered root keys after algorithm deprecation.
+  Share root verification between admission and block import, bind upgraded
+  verification to the address algorithm, and retain session restrictions and
+  rejection of unregistered or pending roots. Persist the immutable activation
+  through restart and trusted snapshot import. Rotated session roots remain
+  outside this exception.
+
 - Add optional `algorithm_deprecation_height` so registered accounts can keep
   sending transactions with their root key after its algorithm is deprecated.
   New public-key registrations and pending algorithms remain rejected. Preserve
