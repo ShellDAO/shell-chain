@@ -140,10 +140,10 @@ pub const SYSTEM_CALL_OP_GAS: u64 = 5_000;
 /// headroom for future algorithms without allowing calldata-sized values to be persisted.
 pub const MAX_ACCOUNT_PUBLIC_KEY_BYTES: usize = 4_096;
 
-/// Minimum blocks between proposal and activation (≈ 30 days at 2 s/block per WP §6.5).
-///
-/// The plan locks this at 500 000 blocks to match the governance decision.
+/// Legacy 500,000-block minimum, retained for historical validation.
 pub const ALGO_GOVERNANCE_DELTA_MIN: u64 = 500_000;
+/// Target minimum delay: 30 days at the protocol's two-second slot time.
+pub const ALGO_GOVERNANCE_TARGET_DELTA_MIN: u64 = 1_296_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemContractEffects {
@@ -237,7 +237,7 @@ pub fn execute_system_contract<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
 ) -> Result<(Vec<u8>, u64), SystemContractError> {
     shell_crypto::with_algorithm_registry_mut(|registry| {
-        execute_validator_registry_with_registry(caller, input, world_state, None, registry)
+        execute_validator_registry_with_registry(caller, input, world_state, None, registry, None)
     })
 }
 
@@ -250,6 +250,34 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<SystemContractOutcome, SystemContractError> {
+    let block_number = if *target == registry_address() {
+        chain_store
+            .get_head_block()
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            .map(|block| block.number().saturating_add(1))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    execute_system_contract_call_at_block(
+        target,
+        caller,
+        input,
+        world_state,
+        chain_store,
+        block_number,
+    )
+}
+
+/// Execute with the candidate block height, including historical replay and simulation.
+pub fn execute_system_contract_call_at_block<S: KvStore + 'static>(
+    target: &Address,
+    caller: &Address,
+    input: &[u8],
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+) -> Result<SystemContractOutcome, SystemContractError> {
     if *target == registry_address() {
         let (output, gas_used) = shell_crypto::with_algorithm_registry_mut(|registry| {
             execute_validator_registry_with_registry(
@@ -258,6 +286,7 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
                 world_state,
                 Some(chain_store),
                 registry,
+                Some(block_number),
             )
         })?;
         let mut effects = SystemContractEffects::default();
@@ -292,6 +321,7 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
     chain_store: Option<&ChainStore<S>>,
     registry: &mut AlgorithmRegistry,
+    block_number: Option<u64>,
 ) -> Result<(Vec<u8>, u64), SystemContractError> {
     if input.len() < 4 {
         return Err(SystemContractError::InputTooShort);
@@ -346,7 +376,7 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
                 verifier_hash,
                 world_state,
                 registry,
-                chain_store,
+                algorithm_minimum_activation(chain_store, block_number)?,
             )?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
@@ -831,6 +861,37 @@ fn validate_validator_stake_total<S: KvStore + 'static>(
     Ok((old_stake, updated_total))
 }
 
+fn algorithm_minimum_activation<S: KvStore + 'static>(
+    chain_store: Option<&ChainStore<S>>,
+    block_number: Option<u64>,
+) -> Result<u64, SystemContractError> {
+    if let (Some(store), Some(number)) = (chain_store, block_number) {
+        let activation = store
+            .get_chain_config()
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            .and_then(|config| config.algorithm_timelock_activation_height);
+        if activation.is_some_and(|height| number >= height) {
+            return number
+                .checked_add(ALGO_GOVERNANCE_TARGET_DELTA_MIN)
+                .ok_or_else(|| {
+                    SystemContractError::AbiDecode(
+                        "algorithm timelock exceeds block height range".into(),
+                    )
+                });
+        }
+    }
+    // Preserve the exact legacy parent-head anchor and saturating arithmetic.
+    let current_height = match chain_store {
+        Some(store) => store
+            .get_head_block()
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            .map(|block| block.number())
+            .unwrap_or(0),
+        None => 0,
+    };
+    Ok(current_height.saturating_add(ALGO_GOVERNANCE_DELTA_MIN))
+}
+
 fn propose_algorithm_activation_op<S: KvStore + 'static>(
     caller: &Address,
     algo: SignatureType,
@@ -838,7 +899,7 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     verifier_hash: [u8; 32],
     world_state: &mut WorldState<S>,
     registry: &mut AlgorithmRegistry,
-    chain_store: Option<&ChainStore<S>>,
+    min_activation: u64,
 ) -> Result<bool, SystemContractError> {
     let validators = world_state
         .get_validators()
@@ -848,18 +909,8 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
         return Err(SystemContractError::Unauthorized);
     }
 
-    // Validate timelock: activation_height >= current_height + ALGO_GOVERNANCE_DELTA_MIN.
-    // SAFETY: SLH-DSA emergency path (WP §6.7) is a TODO; requires threading sig_type
-    // through execute_system_contract_call.
-    let current_height = match chain_store {
-        Some(chain_store) => chain_store
-            .get_head_block()
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?
-            .map(|block| block.header.number)
-            .unwrap_or(0),
-        None => 0,
-    };
-    let min_activation = current_height.saturating_add(ALGO_GOVERNANCE_DELTA_MIN);
+    // Each submitted vote must leave the applicable minimum delay. Previously
+    // accepted proposals are not rewritten when the protocol rule activates.
     if activation_height < min_activation {
         return Err(SystemContractError::InvalidActivationHeight(
             activation_height,
@@ -2901,6 +2952,71 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_timelock_boundaries_use_execution_height_and_reject_overflow() {
+        let caller = Address::from([1; 20]);
+        for (activation, number, proposed, accepted) in [
+            (None, 10, 499_999, false),
+            (None, 10, 500_000, true),
+            (Some(10), 9, 500_000, true),
+            (Some(10), 10, 1_296_009, false),
+            (Some(10), 10, 1_296_010, true),
+            (Some(10), 11, 1_296_010, false),
+            (Some(10), 11, 1_296_011, true),
+            (Some(0), 0, 1_295_999, false),
+            (Some(0), 0, 1_296_000, true),
+            (Some(0), u64::MAX, u64::MAX, false),
+        ] {
+            let mut ws = setup_with_validators(&[caller]);
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            cs.put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_timelock_activation_height: activation,
+            })
+            .unwrap();
+            let mut registry = AlgorithmRegistry::default();
+            registry.deprecate(SignatureType::MlDsa65);
+            let root = ws.state_root().unwrap();
+            let before = registry.clone();
+            let input = encode_propose_algorithm_activation_calldata(
+                SignatureType::MlDsa65,
+                proposed,
+                [0; 32],
+            );
+            let result = execute_validator_registry_with_registry(
+                &caller,
+                &input,
+                &mut ws,
+                Some(&cs),
+                &mut registry,
+                Some(number),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "activation={activation:?} block={number} proposed={proposed}"
+            );
+            if accepted {
+                assert_eq!(result.unwrap().0, encode_bool(true));
+                assert_eq!(
+                    ws.get_storage(
+                        &registry_address(),
+                        &algorithm_activation_height_key(SignatureType::MlDsa65)
+                    )
+                    .unwrap(),
+                    encode_u64_as_hash(proposed)
+                );
+            } else {
+                assert_eq!(ws.state_root().unwrap(), root);
+                assert_eq!(registry, before);
+            }
+        }
+    }
+
+    #[test]
     fn propose_algorithm_activation_requires_validator_quorum() {
         let v1 = Address::from([0x01; 20]);
         let v2 = Address::from([0x02; 20]);
@@ -2918,9 +3034,15 @@ mod tests {
             verifier_hash,
         );
 
-        let (first_output, _) =
-            execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-                .unwrap();
+        let (first_output, _) = execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
         assert_eq!(first_output, encode_bool(false));
         // After first vote: PendingActivation in both registry and world state.
         assert_eq!(
@@ -2940,9 +3062,15 @@ mod tests {
             encode_algorithm_status(AlgorithmStatus::PendingActivation)
         );
 
-        let (second_output, _) =
-            execute_validator_registry_with_registry(&v2, &calldata, &mut ws, None, &mut registry)
-                .unwrap();
+        let (second_output, _) = execute_validator_registry_with_registry(
+            &v2,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
         // Quorum reached (2/3 votes with equal weight); true returned to signal quorum.
         assert_eq!(second_output, encode_bool(true));
         // Status remains PendingActivation — activation deferred to block activation_height.
@@ -3049,10 +3177,24 @@ mod tests {
         );
 
         // v1 + v2 vote → quorum; status stays PendingActivation
-        execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-            .unwrap();
-        execute_validator_registry_with_registry(&v2, &calldata, &mut ws, None, &mut registry)
-            .unwrap();
+        execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
+        execute_validator_registry_with_registry(
+            &v2,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
         assert!(!registry.is_allowed(SignatureType::MlDsa65));
 
         // Before activation height: nothing activated
@@ -3144,9 +3286,15 @@ mod tests {
             0, // invalid: must be >= 500_000
             [0u8; 32],
         );
-        let err =
-            execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-                .unwrap_err();
+        let err = execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, SystemContractError::InvalidActivationHeight(_, _)),
             "expected InvalidActivationHeight, got {err:?}"
@@ -3175,6 +3323,7 @@ mod tests {
             &mut ws,
             Some(&chain_store),
             &mut registry,
+            None,
         )
         .expect_err("head read failure must reject governance execution");
 
@@ -3216,13 +3365,26 @@ mod tests {
         );
 
         // First call is fine (stores proposal)
-        execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-            .unwrap();
+        execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
 
         // Second call with identical params must be rejected as a duplicate vote
-        let err =
-            execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-                .unwrap_err();
+        let err = execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, SystemContractError::DuplicateVote),
             "expected DuplicateVote, got {err:?}"
@@ -3238,15 +3400,27 @@ mod tests {
         let mut registry = AlgorithmRegistry::default();
         let calldata = encode_deprecate_algorithm_calldata(SignatureType::SphincsSha2256f);
 
-        let (first_output, _) =
-            execute_validator_registry_with_registry(&v1, &calldata, &mut ws, None, &mut registry)
-                .unwrap();
+        let (first_output, _) = execute_validator_registry_with_registry(
+            &v1,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
         assert_eq!(first_output, encode_bool(false));
         assert!(registry.is_allowed(SignatureType::SphincsSha2256f));
 
-        let (second_output, _) =
-            execute_validator_registry_with_registry(&v2, &calldata, &mut ws, None, &mut registry)
-                .unwrap();
+        let (second_output, _) = execute_validator_registry_with_registry(
+            &v2,
+            &calldata,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
         assert_eq!(second_output, encode_bool(true));
         assert!(!registry.is_allowed(SignatureType::SphincsSha2256f));
         assert_eq!(

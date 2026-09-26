@@ -3156,6 +3156,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: activation,
+                        algorithm_timelock_activation_height: None,
                         bloom_activation_height: activation,
                         fee_accounting_activation_height: activation,
                     })
@@ -4925,6 +4926,7 @@ mod tests {
                             fee_accounting_activation_height: fee_activation,
                             bloom_activation_height: bloom_activation,
                             log_address_activation_height: activation,
+                            algorithm_timelock_activation_height: None,
                         })
                         .unwrap();
                 }
@@ -5068,6 +5070,7 @@ mod tests {
                             chain_id: 1337,
                             genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                             log_address_activation_height: None,
+                            algorithm_timelock_activation_height: None,
                             bloom_activation_height: None,
                             fee_accounting_activation_height: activation,
                         })
@@ -5160,6 +5163,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: None,
+                        algorithm_timelock_activation_height: None,
                         bloom_activation_height: None,
                         fee_accounting_activation_height: Some(0),
                     })

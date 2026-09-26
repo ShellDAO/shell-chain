@@ -29,7 +29,7 @@ use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 use crate::precompiles::ShellPrecompiles;
 use crate::state_db::{ShellStateDb, StateDbError};
 use crate::system_contracts::{
-    self, execute_system_contract_call, SystemContractEffects, SYSTEM_CALL_BASE_GAS,
+    self, execute_system_contract_call_at_block, SystemContractEffects, SYSTEM_CALL_BASE_GAS,
 };
 
 /// Errors returned during PQVM/revm execution.
@@ -1038,7 +1038,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 "system contracts do not accept value".into(),
             ))
         } else {
-            execute_system_contract_call(&target, caller, input, ws, chain_store)
+            execute_system_contract_call_at_block(
+                &target,
+                caller,
+                input,
+                ws,
+                chain_store,
+                header.number,
+            )
         };
 
         match result {
@@ -1319,6 +1326,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: height,
             })
@@ -1524,6 +1532,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: Some(0),
                 log_address_activation_height: Some(0),
+                algorithm_timelock_activation_height: None,
             })
             .unwrap();
         let sender = ShellAddress::from([0x42; 32]);
@@ -1586,6 +1595,7 @@ mod tests {
                             genesis_hash: ShellHash::ZERO,
                             fee_accounting_activation_height: None,
                             log_address_activation_height: None,
+                            algorithm_timelock_activation_height: None,
                             bloom_activation_height: activation,
                         })
                         .unwrap();
@@ -2137,6 +2147,7 @@ mod tests {
                     genesis_hash: ShellHash::ZERO,
                     fee_accounting_activation_height: None,
                     log_address_activation_height: None,
+                    algorithm_timelock_activation_height: None,
                     bloom_activation_height: Some(2),
                 })
                 .unwrap();

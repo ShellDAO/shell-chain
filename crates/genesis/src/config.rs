@@ -162,6 +162,9 @@ pub struct GenesisConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// First block enforcing the target algorithm governance timelock; absent means legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_timelock_activation_height: Option<u64>,
     /// Human-readable chain name.
     #[serde(default = "default_chain_name")]
     pub chain_name: String,
