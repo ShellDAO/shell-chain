@@ -392,10 +392,18 @@ Finality is safety-critical:
 - Validators ignore stale or conflicting votes for finalized heights.
 - Producers refuse to build from a parent that conflicts with the finalized
   chain.
+- If a quorum certificate arrives before the next block, the node retains at
+  most one verified certificate for that next height. After canonical block
+  import it rechecks the certificate against the imported state and canonical
+  hash before advancing durable and RPC finality. Invalid certificates and
+  certificates for later heights cannot replace that entry; a conflicting
+  imported block cannot be finalized by it. This bounded buffer handles live
+  gossip ordering; longer gaps continue through block synchronization.
 - Sync responses include available commit-certificate sidecars. A node that
   receives a valid certificate verifies signer membership, PQ signatures, and
   weighted quorum, then fast-finalizes the block without waiting to recollect
-  votes.
+  votes. The synchronized finality is also published to the RPC finalized
+  cursor, including after restart.
 
 RPC block tags map to these states:
 | Tag | Meaning |

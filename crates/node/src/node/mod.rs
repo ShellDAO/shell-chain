@@ -12713,6 +12713,99 @@ mod tests {
             );
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn event_loop_finalizes_certificate_received_before_block() {
+            use shell_network::{NetworkBus, NetworkConfig, NetworkMessage, NetworkService};
+            use std::time::Duration;
+
+            let (producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let mut follower = setup_node_with_authority(authority);
+            follower.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                store_consistent_genesis(node);
+            }
+            let block = producer.produce_block(&signer, 10).unwrap();
+            let block_hash = block.hash();
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            follower.config.proposer_address = None;
+            follower.config.rpc_enabled = false;
+            follower.config.metrics.enabled = false;
+            let follower = Arc::new(follower);
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let sender = bus.join(&NetworkConfig::default());
+            let handle = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(Arc::new(signer), &mut network).await }
+            });
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: block.number(),
+                    certificate: certificate.clone(),
+                })
+                .await
+                .unwrap();
+            // An invalid follow-up must not replace an already verified early certificate.
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: block.number(),
+                    certificate: vec![0],
+                })
+                .await
+                .unwrap();
+            // A certificate for a later height must not evict the next-block entry.
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: block.number() + 1,
+                    certificate: certificate.clone(),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(follower.head_number(), 0);
+            assert_eq!(follower.finality.read().last_finalized_number(), 0);
+            sender
+                .broadcast(NetworkMessage::NewBlock(Box::new(block)))
+                .await
+                .unwrap();
+            let finalized = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if follower.finality.read().last_finalized_number() == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            follower.shutdown();
+            handle.await.unwrap().unwrap();
+            assert_eq!(follower.head_number(), 1, "the block itself must import");
+            finalized.expect("early quorum certificate must finalize after canonical import");
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap(),
+                Some(certificate)
+            );
+            assert_eq!(
+                follower.chain_store.get_finalized_number().unwrap(),
+                Some(1)
+            );
+        }
+
         #[test]
         fn fast_finalize_rejects_certificate_sig_type_mismatch() {
             let (node, signer) = setup_wpoa_node();

@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Retain a verified next-height wPoA commit certificate that arrives before its
+  block, then revalidate it after canonical import. Followers now advance
+  finalized state when certificate gossip precedes block gossip. Buffering is
+  limited to one certificate and cannot finalize an unimported block. Also
+  publish finality from synchronized certificates to the RPC finalized cursor,
+  so restart catch-up does not leave the finalized block tag stale.
+
 - Remove the Dilithium-only debug assertion in embedded-key transaction
   construction that aborted SLH-DSA transaction execution in development builds.
   Algorithm-specific key validation remains in the cryptographic verifier.
