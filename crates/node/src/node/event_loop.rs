@@ -8,6 +8,43 @@ const FORK_ADOPTION_RETRY_BASE_SECS: u64 = 5;
 const FORK_ADOPTION_RETRY_MAX_SECS: u64 = 30;
 const BODY_BACKFILL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A quorum certificate may arrive before its block on a different gossip topic.
+/// Keep only the next height, so unimported network data cannot grow a backlog.
+#[derive(Default)]
+struct EarlyCommitCertificate {
+    pending: Option<(u64, ShellHash, Vec<u8>)>,
+}
+
+impl EarlyCommitCertificate {
+    fn retain<S: KvStore + 'static>(
+        &mut self,
+        node: &Node<S>,
+        number: u64,
+        hash: ShellHash,
+        certificate: Vec<u8>,
+    ) {
+        if node.head_number().checked_add(1) == Some(number)
+            && node.verify_commit_certificate(number, hash, &certificate)
+        {
+            self.pending = Some((number, hash, certificate));
+        }
+    }
+
+    fn finalize_imported<S: KvStore + 'static>(&mut self, node: &Node<S>) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|(number, _, _)| *number > node.head_number())
+        {
+            return false;
+        }
+        let (number, hash, certificate) = self.pending.take().expect("pending certificate checked");
+        // Revalidate against the imported state and canonical hash. Retention alone
+        // must never make an unvalidated or conflicting block final.
+        node.fast_finalize_with_certificate(number, hash, &certificate)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ForkAdoptionRetry {
     preferred_head: Option<ShellHash>,
@@ -521,6 +558,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Track whether we are catching up so we don't spam requests.
         let mut sync_requested = false;
         let mut sync_request: Option<BlockRequestState> = None;
+        let mut early_commit_certificate = EarlyCommitCertificate::default();
         let mut body_request: Option<BodyRequestState> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
@@ -1121,6 +1159,10 @@ impl<S: KvStore + 'static> Node<S> {
                                                 sync_requested = false;
                                                 sync_request = None;
                                             }
+                                            if early_commit_certificate.finalize_imported(&self) {
+                                                let fin = self.finality.read().last_finalized_number();
+                                                *finalized_number.write() = fin;
+                                            }
                                             sync_retry_attempts_without_progress = 0;
                                             sync_retry_timer.reset_after(Duration::from_secs(
                                                 SYNC_RETRY_BASE_INTERVAL_SECS,
@@ -1412,6 +1454,10 @@ impl<S: KvStore + 'static> Node<S> {
                                                     );
                                                     continue;
                                                 }
+                                                if early_commit_certificate.finalize_imported(&self) {
+                                                    let fin = self.finality.read().last_finalized_number();
+                                                    *finalized_number.write() = fin;
+                                                }
                                                 last_ok = Some(num);
                                                 production_readiness.note_import_progress(num);
                                                 self.metrics.blocks_imported.inc();
@@ -1423,9 +1469,12 @@ impl<S: KvStore + 'static> Node<S> {
                                                 debug!(number = num, "synced block");
                                                 self.slash_timed_out_challenges(num);
                                                 if let Some(cert) = verified_certificate {
-                                                    self.fast_finalize_with_certificate(
+                                                    if self.fast_finalize_with_certificate(
                                                         num, bhash, cert,
-                                                    );
+                                                    ) {
+                                                        let fin = self.finality.read().last_finalized_number();
+                                                        *finalized_number.write() = fin;
+                                                    }
                                                     self.metrics.update_finality(
                                                         num,
                                                         self.finality.read().last_finalized_number(),
@@ -1999,6 +2048,10 @@ impl<S: KvStore + 'static> Node<S> {
                                         if fin > *fn_w {
                                             *fn_w = fin;
                                         }
+                                    } else {
+                                        early_commit_certificate.retain(
+                                            &self, block_number, block_hash, certificate,
+                                        );
                                     }
                                 }
                                 // W.5: Receive a signed wPoA view-change vote from a peer validator.
