@@ -364,6 +364,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
                 log_address_activation_height: genesis_config.log_address_activation_height,
+                algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: genesis_config
                     .algorithm_quorum_activation_height,
                 algorithm_timelock_activation_height: genesis_config
@@ -427,6 +428,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.log_address_activation_height
         || stored
             .as_ref()
+            .and_then(|config| config.algorithm_proposal_staging_height)
+            != genesis_config.algorithm_proposal_staging_height
+        || stored
+            .as_ref()
             .and_then(|config| config.algorithm_quorum_activation_height)
             != genesis_config.algorithm_quorum_activation_height
         || stored
@@ -438,6 +443,7 @@ async fn initialize_chain<S: KvStore + 'static>(
         let desired = shell_storage::ChainConfig {
             fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
             log_address_activation_height: genesis_config.log_address_activation_height,
+            algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
             algorithm_quorum_activation_height: genesis_config.algorithm_quorum_activation_height,
             algorithm_timelock_activation_height: genesis_config
                 .algorithm_timelock_activation_height,
@@ -650,6 +656,7 @@ async fn run_with_store<S: KvStore + 'static>(
 
         let config = GenesisConfig {
             log_address_activation_height: None,
+            algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
@@ -1206,6 +1213,7 @@ mod tests {
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
             log_address_activation_height: None,
+            algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
@@ -1432,6 +1440,7 @@ mod tests {
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
             log_address_activation_height: None,
+            algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
@@ -1603,6 +1612,18 @@ mod tests {
         .is_err());
         assert_eq!(store.scan_prefix(b"").unwrap(), before);
         config.algorithm_quorum_activation_height = Some(6);
+        config.algorithm_proposal_staging_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.algorithm_proposal_staging_height = Some(7);
         initialize_chain(
             Arc::clone(&store),
             &config,
@@ -1628,6 +1649,7 @@ mod tests {
         assert_eq!(persisted.log_address_activation_height, Some(4));
         assert_eq!(persisted.algorithm_timelock_activation_height, Some(5));
         assert_eq!(persisted.algorithm_quorum_activation_height, Some(6));
+        assert_eq!(persisted.algorithm_proposal_staging_height, Some(7));
         let before = store.scan_prefix(b"").unwrap();
         for conflicting in [None, Some(4)] {
             config.bloom_activation_height = conflicting;
@@ -1673,6 +1695,20 @@ mod tests {
         config.algorithm_timelock_activation_height = Some(5);
         for conflicting in [None, Some(7)] {
             config.algorithm_quorum_activation_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        config.algorithm_quorum_activation_height = Some(6);
+        for conflicting in [None, Some(8)] {
+            config.algorithm_proposal_staging_height = conflicting;
             assert!(initialize_chain(
                 Arc::clone(&store),
                 &config,
@@ -1806,6 +1842,7 @@ mod tests {
                 &genesis,
                 &ChainConfig {
                     log_address_activation_height: None,
+                    algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
                     bloom_activation_height: None,

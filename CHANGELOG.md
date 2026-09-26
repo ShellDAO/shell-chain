@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `algorithm_proposal_staging_height`: new proposals keep candidate
+  parameters separate from live algorithm policy until quorum. Preserve active
+  or deprecated status before approval, including across restart and replay;
+  publish the pending specification only when a vote reaches quorum. Existing
+  pending proposals and absent configuration retain legacy behavior.
+
 - Add optional `algorithm_quorum_activation_height`: proposals created under
   the upgrade activate only after recorded quorum approval. Persist approval
   across restart and validator changes, and enforce it in production and import.

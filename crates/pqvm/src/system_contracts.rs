@@ -864,6 +864,7 @@ fn validate_validator_stake_total<S: KvStore + 'static>(
 struct AlgorithmActivationRules {
     minimum_height: u64,
     require_quorum: bool,
+    stage_proposals: bool,
 }
 
 fn algorithm_activation_rules<S: KvStore + 'static>(
@@ -890,6 +891,11 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
             .as_ref()
             .and_then(|config| config.algorithm_quorum_activation_height),
     );
+    let stage_proposals = activated(
+        config
+            .as_ref()
+            .and_then(|config| config.algorithm_proposal_staging_height),
+    );
     let minimum_height = if target_delay {
         block_number
             .unwrap_or(0)
@@ -914,6 +920,7 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
     Ok(AlgorithmActivationRules {
         minimum_height,
         require_quorum,
+        stage_proposals,
     })
 }
 
@@ -967,6 +974,76 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     let is_pending =
         current_status_hash == encode_algorithm_status(AlgorithmStatus::PendingActivation);
 
+    if rules.stage_proposals && !is_pending {
+        // Candidate parameters are separate from the live registry until quorum.
+        // Legacy pending proposals keep their already-published semantics.
+        let height_key = algorithm_proposal_height_key(algo);
+        let verifier_key = algorithm_proposal_verifier_key(algo);
+        let stored_height = world_state
+            .get_storage(&registry_address(), &height_key)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        if stored_height == ShellHash::ZERO {
+            world_state
+                .set_storage(
+                    &registry_address(),
+                    &height_key,
+                    &encode_u64_as_hash(activation_height),
+                )
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+            world_state
+                .set_storage(
+                    &registry_address(),
+                    &verifier_key,
+                    &ShellHash::from(verifier_hash),
+                )
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        } else {
+            if stored_height != encode_u64_as_hash(activation_height) {
+                return Err(SystemContractError::HeightMismatch(
+                    activation_height,
+                    decode_u64_from_hash(&stored_height),
+                ));
+            }
+            let stored_verifier = world_state
+                .get_storage(&registry_address(), &verifier_key)
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+            if stored_verifier != ShellHash::from(verifier_hash) {
+                return Err(SystemContractError::GovernanceConflict);
+            }
+        }
+        if !record_algorithm_vote(
+            world_state,
+            AlgorithmGovernanceOp::ProposeActivation,
+            algo,
+            caller,
+            &validators,
+        )? {
+            return Ok(false);
+        }
+        publish_algorithm_proposal(
+            world_state,
+            registry,
+            algo,
+            activation_height,
+            verifier_hash,
+        )?;
+        // Staged proposals always carry approval, independently of the older guard.
+        for key in [
+            algorithm_quorum_required_key(algo),
+            algorithm_quorum_approved_key(algo),
+        ] {
+            world_state
+                .set_storage(&registry_address(), &key, &encode_u64_as_hash(1))
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        }
+        for key in [height_key, verifier_key] {
+            world_state
+                .set_storage(&registry_address(), &key, &ShellHash::ZERO)
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        }
+        return Ok(true);
+    }
+
     if is_pending {
         // Proposal already open — verify the new vote's params match the stored proposal
         // to prevent someone from sneaking in a different activation_height mid-vote.
@@ -1005,26 +1082,13 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
                 )
                 .map_err(|e| SystemContractError::Storage(e.to_string()))?;
         }
-        registry.propose_activation_with_spec(algo, activation_height, verifier_hash);
-        store_algorithm_status(world_state, algo, AlgorithmStatus::PendingActivation)?;
-
-        // Store activation_height for the block-height trigger.
-        world_state
-            .set_storage(
-                &registry_address(),
-                &algorithm_activation_height_key(algo),
-                &encode_u64_as_hash(activation_height),
-            )
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-
-        // Store verifier_hash so nodes can validate their local verifier at activation.
-        world_state
-            .set_storage(
-                &registry_address(),
-                &algorithm_verifier_hash_key(algo),
-                &ShellHash::from(verifier_hash),
-            )
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        publish_algorithm_proposal(
+            world_state,
+            registry,
+            algo,
+            activation_height,
+            verifier_hash,
+        )?;
     }
 
     // Record this validator's vote; return early if quorum not yet reached.
@@ -1058,6 +1122,36 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     // The algorithm will be activated at block `activation_height` by
     // `process_pending_activations` which is called after every block commit.
     Ok(true)
+}
+
+fn publish_algorithm_proposal<S: KvStore + 'static>(
+    world_state: &mut WorldState<S>,
+    registry: &mut AlgorithmRegistry,
+    algo: SignatureType,
+    activation_height: u64,
+    verifier_hash: [u8; 32],
+) -> Result<(), SystemContractError> {
+    registry.propose_activation_with_spec(algo, activation_height, verifier_hash);
+    store_algorithm_status(world_state, algo, AlgorithmStatus::PendingActivation)?;
+
+    // Store activation_height for the block-height trigger.
+    world_state
+        .set_storage(
+            &registry_address(),
+            &algorithm_activation_height_key(algo),
+            &encode_u64_as_hash(activation_height),
+        )
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+
+    // Store verifier_hash so nodes can validate their local verifier at activation.
+    world_state
+        .set_storage(
+            &registry_address(),
+            &algorithm_verifier_hash_key(algo),
+            &ShellHash::from(verifier_hash),
+        )
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 fn deprecate_algorithm_op<S: KvStore + 'static>(
@@ -1170,6 +1264,18 @@ fn algorithm_vote_key(
     }
     bytes.extend_from_slice(b":");
     bytes.extend_from_slice(voter.as_bytes());
+    keccak256(&bytes)
+}
+
+fn algorithm_proposal_height_key(algo: SignatureType) -> ShellHash {
+    let mut bytes = b"algorithm_proposal_height:".to_vec();
+    bytes.push(algo.as_u8());
+    keccak256(&bytes)
+}
+
+fn algorithm_proposal_verifier_key(algo: SignatureType) -> ShellHash {
+    let mut bytes = b"algorithm_proposal_verifier:".to_vec();
+    bytes.push(algo.as_u8());
     keccak256(&bytes)
 }
 
@@ -3056,6 +3162,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
             })
@@ -3100,6 +3207,145 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_proposal_staging_preserves_policy_until_quorum() {
+        let voters = [
+            Address::from([1; 20]),
+            Address::from([2; 20]),
+            Address::from([3; 20]),
+        ];
+        for (activation, staged) in [
+            (None, false),
+            (Some(2), false),
+            (Some(1), true),
+            (Some(0), true),
+        ] {
+            for deprecated in [false, true] {
+                let mut ws = setup_with_validators(&voters);
+                let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+                cs.put_chain_config(&shell_storage::ChainConfig {
+                    chain_id: 1337,
+                    genesis_hash: ShellHash::ZERO,
+                    fee_accounting_activation_height: None,
+                    bloom_activation_height: None,
+                    log_address_activation_height: None,
+                    algorithm_timelock_activation_height: None,
+                    algorithm_quorum_activation_height: None,
+                    algorithm_proposal_staging_height: activation,
+                })
+                .unwrap();
+                let algo = SignatureType::SphincsSha2256f;
+                let mut registry = AlgorithmRegistry::default();
+                if deprecated {
+                    registry.deprecate(algo);
+                    store_algorithm_status(&mut ws, algo, AlgorithmStatus::Deprecated).unwrap();
+                }
+                let original = registry.clone();
+                let height = 2_000_000;
+                let call = encode_propose_algorithm_activation_calldata(algo, height, [0x44; 32]);
+                let (result, _) = execute_validator_registry_with_registry(
+                    &voters[0],
+                    &call,
+                    &mut ws,
+                    Some(&cs),
+                    &mut registry,
+                    Some(1),
+                )
+                .unwrap();
+                assert_eq!(result, encode_bool(false));
+                if staged {
+                    assert_eq!(registry, original);
+                    assert_eq!(load_algorithm_registry(&ws).unwrap(), original);
+                    assert_eq!(
+                        ws.get_storage(&registry_address(), &algorithm_activation_height_key(algo))
+                            .unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert_eq!(
+                        ws.get_storage(&registry_address(), &algorithm_verifier_hash_key(algo))
+                            .unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert!(process_pending_activations(height, &mut ws, &mut registry)
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(registry, original);
+                } else {
+                    assert!(!registry.is_allowed(algo));
+                    assert_ne!(registry, original);
+                }
+                let root = ws.state_root().unwrap();
+                let duplicate = execute_validator_registry_with_registry(
+                    &voters[0],
+                    &call,
+                    &mut ws,
+                    Some(&cs),
+                    &mut registry,
+                    Some(2),
+                )
+                .unwrap_err();
+                assert!(matches!(duplicate, SystemContractError::DuplicateVote));
+                for (bad_height, hash) in [(height + 1, [0x44; 32]), (height, [0x55; 32])] {
+                    let wrong =
+                        encode_propose_algorithm_activation_calldata(algo, bad_height, hash);
+                    assert!(execute_validator_registry_with_registry(
+                        &voters[1],
+                        &wrong,
+                        &mut ws,
+                        Some(&cs),
+                        &mut registry,
+                        Some(2)
+                    )
+                    .is_err());
+                    assert_eq!(ws.state_root().unwrap(), root);
+                }
+                registry = load_algorithm_registry(&ws).unwrap();
+                let (result, _) = execute_validator_registry_with_registry(
+                    &voters[1],
+                    &call,
+                    &mut ws,
+                    Some(&cs),
+                    &mut registry,
+                    Some(2),
+                )
+                .unwrap();
+                assert_eq!(result, encode_bool(true));
+                assert!(!registry.is_allowed(algo));
+                let entry = registry.entries().iter().find(|e| e.algo == algo).unwrap();
+                assert_eq!(entry.status, AlgorithmStatus::PendingActivation);
+                assert_eq!(entry.spec.as_ref().unwrap().activation_height, height);
+                assert_eq!(entry.spec.as_ref().unwrap().verifier_hash, [0x44; 32]);
+                assert_eq!(
+                    ws.get_storage(&registry_address(), &algorithm_proposal_height_key(algo))
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(
+                    ws.get_storage(&registry_address(), &algorithm_proposal_verifier_key(algo))
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(
+                    ws.get_storage(&registry_address(), &algorithm_quorum_approved_key(algo))
+                        .unwrap()
+                        != ShellHash::ZERO,
+                    staged
+                );
+                registry = load_algorithm_registry(&ws).unwrap();
+                assert!(
+                    process_pending_activations(height - 1, &mut ws, &mut registry)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    process_pending_activations(height, &mut ws, &mut registry).unwrap(),
+                    vec![algo]
+                );
+                assert!(registry.is_allowed(algo));
+            }
+        }
+    }
+
+    #[test]
     fn algorithm_quorum_guard_blocks_unapproved_activation_and_survives_restart() {
         for (activation, guarded) in [
             (None, false),
@@ -3120,6 +3366,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
             })
