@@ -126,7 +126,10 @@ For activation enforcement, the optional `algorithm_quorum_activation_height`
 requires recorded approval for proposals created at or after the configured block.
 Legacy pending proposals retain their previous behavior; without this upgrade,
 maturity processing can activate a proposal that has not reached quorum. The
-first-vote pending transition is unchanged. See
+first-vote pending transition is unchanged unless the independent
+`algorithm_proposal_staging_height` is configured. With staging, sub-quorum
+candidates leave live policy intact; the quorum-reaching vote publishes pending
+parameters. See [proposal staging](CONSENSUS_DETAILS.md#algorithm-proposal-staging) and
 [quorum compatibility and remaining limitations](CONSENSUS_DETAILS.md#algorithm-activation-quorum-guard).
 The unique identifier above is a protocol target; full proposal identity and
 seven-day voting expiry are not implemented by this guard.

@@ -132,6 +132,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
             &block,
             &ChainConfig {
                 log_address_activation_height: config.log_address_activation_height,
+                algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: config.algorithm_quorum_activation_height,
                 algorithm_timelock_activation_height: config.algorithm_timelock_activation_height,
                 bloom_activation_height: config.bloom_activation_height,
@@ -292,6 +293,7 @@ mod tests {
 
         GenesisConfig {
             log_address_activation_height: None,
+            algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,

@@ -541,6 +541,7 @@ mod tests {
                         &block,
                         &ChainConfig {
                             log_address_activation_height: None,
+                            algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
                             bloom_activation_height: None,
@@ -765,6 +766,7 @@ mod tests {
                         &block,
                         &ChainConfig {
                             log_address_activation_height: None,
+                            algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
                             bloom_activation_height: None,

@@ -109,6 +109,34 @@ explicitly configured fresh test chain, height zero enables the rule immediately
 Coordinate a client rollout before choosing an activation height on a live network.
 See [the compatibility decision](adr/algorithm-governance-timelock.md).
 
+### Algorithm proposal staging
+
+The independent optional `algorithm_proposal_staging_height` in `genesis.json`
+preserves live algorithm policy until a new proposal reaches quorum. At and after
+that height, a first vote stores candidate height and verifier hash separately
+from the registry. A sub-quorum vote returns false without changing live status,
+activation height or verifier hash. An active algorithm therefore remains usable
+for signatures; a deprecated algorithm remains disabled. Restart and historical
+replay retain the same distinction.
+
+The quorum-reaching vote publishes the candidate as `pending_activation`, stores
+approval for the maturity processor, and clears the staged parameters. Activation
+still waits for the proposal height. Staged proposals always receive the approval
+guard, even when `algorithm_quorum_activation_height` is absent. Quorum arithmetic,
+duplicate-vote handling and the independently selected per-vote timelock remain
+unchanged. Conflicting height or verifier hash is rejected before recording a vote.
+
+Missing configuration and pre-upgrade blocks preserve legacy behavior. Already
+pending proposals are not restaged when execution crosses the boundary. The
+schedule follows immutable, future-only startup and trusted snapshot rules;
+height zero is for explicitly configured fresh test chains. No existing network
+changes automatically. Coordinate the rollout before selecting a live height.
+
+This change only postpones publication until approval. Approved pending algorithms
+still reject new signatures until maturity, and seven-day expiry, complete
+proposal identity, verifier-hash matching and emergency policy remain separate
+requirements. See [the compatibility decision](adr/algorithm-proposal-staging.md).
+
 ### Algorithm activation quorum guard
 
 The independent optional `algorithm_quorum_activation_height` in `genesis.json`
@@ -128,8 +156,9 @@ future-only startup scheduling and trusted snapshot checks as the other upgrades
 height zero is available for explicitly configured fresh test chains. No existing
 network activates this change automatically.
 
-The first vote still marks an algorithm pending before quorum, which disables it
-for new signatures. This guard only fixes activation without approval; it does
+Without the independent proposal-staging upgrade, the first vote still marks an
+algorithm pending before quorum, which disables it for new signatures. This guard
+only fixes activation without approval; it does
 not complete proposal lifecycle, seven-day voting expiry, full proposal identity,
 verifier-hash validation, or emergency signature policy. The timelock schedule is
 separate and continues to validate every vote. See
@@ -172,7 +201,7 @@ signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
 Both log-range queries and filter polling select the format for each queried
 block, including removed logs after a reorganization.
 
-The fee, Bloom, log emitter, algorithm timelock and algorithm quorum schedules
+The fee, Bloom, log emitter, algorithm timelock, quorum and proposal-staging schedules
 are independent persisted chain configuration.
 Startup validates all proposed schedules before publishing any of them. A new
 schedule on an existing chain must be strictly above its canonical head; an
