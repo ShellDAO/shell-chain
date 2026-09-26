@@ -268,15 +268,24 @@ pub fn with_algorithm_registry_mut<T>(operation: impl FnOnce(&mut AlgorithmRegis
 /// Callers that cannot easily obtain a `&AlgorithmRegistry` reference should
 /// use this instead of reaching for `ALLOWED_ALGORITHMS` directly.
 pub fn is_algorithm_allowed(algo: SignatureType) -> bool {
-    if let Some(allowed) = REGISTRY_OVERRIDES.with(|overrides| {
-        overrides
-            .borrow()
-            .last()
-            .map(|registry| registry.is_allowed(algo))
-    }) {
-        return allowed;
+    algorithm_status(algo).is_some_and(AlgorithmStatus::is_accepted)
+}
+
+/// Read lifecycle status from the current branch override or canonical registry.
+/// This does not grant permission to create a new account or accept a signature.
+pub fn algorithm_status(algo: SignatureType) -> Option<AlgorithmStatus> {
+    let status = |registry: &AlgorithmRegistry| {
+        registry
+            .entries()
+            .iter()
+            .find(|entry| entry.algo == algo)
+            .map(|entry| entry.status)
+    };
+    if let Some(local) = REGISTRY_OVERRIDES.with(|overrides| overrides.borrow().last().map(status))
+    {
+        return local;
     }
-    AlgorithmRegistry::global().is_allowed(algo)
+    status(&AlgorithmRegistry::global())
 }
 
 // ── SignatureType registry descriptions ──────────────────────────────────────

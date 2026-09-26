@@ -10,7 +10,20 @@ All notable changes to this project will be documented in this file.
   target height and verifier hash. Explain calldata word order and distinguish
   a successful vote receipt from quorum approval and eventual activation.
 
+### Fixed
+
+- Remove the Dilithium-only debug assertion in embedded-key transaction
+  construction that aborted SLH-DSA transaction execution in development builds.
+  Algorithm-specific key validation remains in the cryptographic verifier.
+
 ### Added
+
+- Add optional `algorithm_deprecation_height` so registered accounts can keep
+  sending transactions with their root key after its algorithm is deprecated.
+  New public-key registrations and pending algorithms remain rejected. Preserve
+  default legacy behavior and persist the immutable schedule across restarts and
+  trusted snapshot imports. Session, paymaster and consensus policies are separate
+  remaining parts of the whitepaper's full deprecation target.
 
 - Add opt-in `algorithm_proposal_identity_height` and native complete-spec
   submission, explicit proposal-ID voting and record lookup. Bind identities to

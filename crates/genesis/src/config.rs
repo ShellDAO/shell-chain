@@ -168,6 +168,9 @@ pub struct GenesisConfig {
     /// First block requiring explicit complete proposal identities and ID-bound votes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_identity_height: Option<u64>,
+    /// First block allowing registered root-key accounts to use deprecated algorithms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_deprecation_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,

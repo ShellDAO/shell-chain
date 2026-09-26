@@ -1601,12 +1601,8 @@ impl SignedTransaction {
         signature: PQSignature,
         pubkey: Vec<u8>,
     ) -> Self {
-        debug_assert_eq!(
-            pubkey.len(),
-            DILITHIUM3_PUBKEY_LEN,
-            "PubkeyMode::Embedded: expected {DILITHIUM3_PUBKEY_LEN} bytes, got {}",
-            pubkey.len()
-        );
+        // Key length belongs to the selected verifier, not this infallible
+        // envelope constructor: SLH-DSA keys are shorter than ML-DSA keys.
         Self {
             from,
             tx,
@@ -2373,15 +2369,20 @@ mod tests {
 
     #[test]
     fn signed_tx_rlp_roundtrip_with_pubkey() {
-        let tx = sample_tx();
-        let from = Address::from([0x42; 20]);
-        let sig = PQSignature::new(SignatureType::Dilithium3, vec![0xBB; 50]);
-        let signed = SignedTransaction::with_pubkey(from, tx, sig, vec![0xCC; 1952]);
-
-        let mut buf = Vec::new();
-        signed.encode(&mut buf);
-        let decoded = SignedTransaction::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(signed, decoded);
+        for (algorithm, pubkey_len) in [
+            (SignatureType::Dilithium3, 1952),
+            (SignatureType::MlDsa65, 1952),
+            (SignatureType::SphincsSha2256f, 64),
+        ] {
+            let tx = sample_tx();
+            let from = Address::from([0x42; 20]);
+            let sig = PQSignature::new(algorithm, vec![0xBB; 50]);
+            let signed = SignedTransaction::with_pubkey(from, tx, sig, vec![0xCC; pubkey_len]);
+            let mut buf = Vec::new();
+            signed.encode(&mut buf);
+            let decoded = SignedTransaction::decode(&mut buf.as_slice()).unwrap();
+            assert_eq!(signed, decoded);
+        }
     }
 
     #[test]

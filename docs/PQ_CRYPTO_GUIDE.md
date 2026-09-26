@@ -295,11 +295,20 @@ The live algorithm registry is process-global and is exposed through `shell_getA
 
 | Operation | Resulting status | Meaning |
 |-----------|------------------|---------|
-| `proposeAlgorithmActivation(uint8)` | `pending_activation` | announce an algorithm before it is accepted for new transactions |
+| `proposeAlgorithmActivation(uint8,uint64,bytes32)` | `pending_activation` | announce an algorithm before it is accepted for new transactions |
 | activation commit | `active` | the algorithm is accepted for new signatures |
-| `deprecateAlgorithm(uint8)` | `deprecated` | keep registry visibility but reject new signatures |
+| `deprecateAlgorithm(uint8)` | `deprecated` | reject new registrations; registered root-key transactions may continue after the opt-in deprecation upgrade |
 
 This lets the network phase algorithms in or out without changing the transaction container format.
+
+Without `algorithm_deprecation_height`, deprecated signatures retain the legacy
+rejection policy. With the schedule active, registered accounts can sign ordinary
+transactions and AA bundles with their root key, including transfers to a new
+account under an active algorithm. Pending algorithms remain rejected. This
+implements the direct migration path; the broader whitepaper guarantee for
+session, paymaster and consensus signatures remains separate work. See
+[account migration](ACCOUNT_ABSTRACTION_GUIDE.md#algorithm-deprecation-and-migration)
+and the [current native governance ABI](SYSTEM_CONTRACTS.md).
 
 ### Governance quorum rules
 

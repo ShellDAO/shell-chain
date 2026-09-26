@@ -235,9 +235,31 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
     }
 
     if !is_algorithm_allowed(signed_tx.signature.sig_type) {
-        return Err(AaValidationError::DisallowedAlgorithm(
-            signed_tx.signature.sig_type,
-        ));
+        // The exception is for an existing root-key account, never a new
+        // address or a session key. Pending activation remains fail-closed.
+        let registered_root = registered_pubkey.is_some()
+            && signed_tx
+                .aa_bundle()
+                .is_none_or(|bundle| bundle.session_auth.is_none());
+        let deprecated = shell_crypto::algorithm_status(signed_tx.signature.sig_type)
+            == Some(shell_crypto::AlgorithmStatus::Deprecated);
+        let enabled = if registered_root && deprecated {
+            let block_number = match validation_header {
+                Some(header) => header.number,
+                None => validation_block_number(chain_store.get_head_block()?.map(|b| b.number())),
+            };
+            chain_store
+                .get_chain_config()?
+                .and_then(|config| config.algorithm_deprecation_height)
+                .is_some_and(|height| block_number >= height)
+        } else {
+            false
+        };
+        if !enabled {
+            return Err(AaValidationError::DisallowedAlgorithm(
+                signed_tx.signature.sig_type,
+            ));
+        }
     }
 
     let pubkey = resolve_pubkey(
@@ -1560,6 +1582,7 @@ mod tests {
             log_address_activation_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
+            algorithm_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1814,6 +1837,156 @@ mod tests {
         );
 
         assert!(!verified);
+    }
+
+    #[test]
+    fn deprecated_registered_account_can_transfer_after_upgrade() {
+        use crate::tx_validation::{validate_tx, TxValidationError};
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
+        let signers: Vec<Box<dyn Signer>> = vec![
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ];
+        for signer in signers {
+            let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let (mut ws, cs) = setup_stores();
+            fund_account(&mut ws, &from);
+            let configure = |activation: Option<u64>| {
+                cs.put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                        "algorithm_deprecation_height":activation
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            };
+            configure(Some(10));
+            set_head_number(&cs, 8);
+            let account_nonce = ws.get_nonce(&from).unwrap();
+            let make_tx = |embedded| {
+                let tx = base_tx(1337, account_nonce);
+                let sig = signer
+                    .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                    .unwrap();
+                if embedded {
+                    SignedTransaction::with_pubkey(from, tx, sig, signer.public_key().to_vec())
+                } else {
+                    SignedTransaction::new(from, tx, sig)
+                }
+            };
+            let embedded = make_tx(true);
+            let referenced = make_tx(false);
+            let mut registry = AlgorithmRegistry::default();
+            with_algorithm_registry_override(&registry, || {
+                validate_tx(&embedded, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+            });
+            assert_eq!(
+                cs.get_pubkey(&from).unwrap().as_deref(),
+                Some(signer.public_key())
+            );
+            registry.deprecate(signer.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                // Block 9 is before the scheduled upgrade.
+                assert!(matches!(
+                    validate_tx(&referenced, &mut ws, &cs, &MultiVerifier, 1337),
+                    Err(TxValidationError::DisallowedAlgorithm(_))
+                ));
+                set_head_number(&cs, 9);
+                for signed in [&embedded, &referenced] {
+                    validate_tx(signed, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+                }
+                let mut tx = base_tx(1337, account_nonce);
+                tx.tx_type = AA_BUNDLE_TX_TYPE;
+                tx.gas_limit = 100_000;
+                let mut bundle_tx = SignedTransaction::with_aa_bundle(
+                    from,
+                    tx,
+                    PQSignature::new(signer.sig_type(), vec![1]),
+                    PubkeyMode::Reference,
+                    AaBundle {
+                        inner_calls: vec![InnerCall {
+                            to: Some(Address::from([0x01; 20])),
+                            value: U256::ZERO,
+                            data: Bytes::new(),
+                            gas_limit: 50_000,
+                        }],
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                bundle_tx.signature = signer
+                    .sign(bundle_tx.sender_signing_hash().as_bytes())
+                    .unwrap();
+                validate_tx(&bundle_tx, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
+                // The explicit candidate height wins over the current canonical head.
+                for number in [9, 10, 11] {
+                    let header = BlockHeader {
+                        number,
+                        ..BlockHeader::default()
+                    };
+                    assert_eq!(
+                        validate_aa_tx_at_block(&referenced, &ws, &cs, &MultiVerifier, &header)
+                            .is_ok(),
+                        number >= 10
+                    );
+                }
+                let mut bad = referenced.clone();
+                bad.signature.data[0] ^= 1;
+                assert!(validate_tx(&bad, &mut ws, &cs, &MultiVerifier, 1337).is_err());
+                let mut conflict = embedded.clone();
+                conflict.pubkey_mode = PubkeyMode::Embedded(vec![0x42; signer.public_key().len()]);
+                assert!(matches!(
+                    validate_tx(&conflict, &mut ws, &cs, &MultiVerifier, 1337),
+                    Err(TxValidationError::PubkeyConflict)
+                ));
+                // Funding an address alone never grants the existing-account exception.
+                let (mut fresh_ws, fresh_cs) = setup_stores();
+                fund_account(&mut fresh_ws, &from);
+                fresh_cs
+                    .put_chain_config(&cs.get_chain_config().unwrap().unwrap())
+                    .unwrap();
+                set_head_number(&fresh_cs, 9);
+                assert!(matches!(
+                    validate_tx(&embedded, &mut fresh_ws, &fresh_cs, &MultiVerifier, 1337),
+                    Err(TxValidationError::DisallowedAlgorithm(_))
+                ));
+                assert!(fresh_cs.get_pubkey(&from).unwrap().is_none());
+                let (mut legacy_ws, legacy_cs) = setup_stores();
+                fund_account(&mut legacy_ws, &from);
+                legacy_cs.put_pubkey(&from, signer.public_key()).unwrap();
+                set_head_number(&legacy_cs, 9);
+                assert!(matches!(
+                    validate_tx(
+                        &referenced,
+                        &mut legacy_ws,
+                        &legacy_cs,
+                        &MultiVerifier,
+                        1337
+                    ),
+                    Err(TxValidationError::DisallowedAlgorithm(_))
+                ));
+            });
+            registry.propose_activation(signer.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                assert!(matches!(
+                    validate_tx(&referenced, &mut ws, &cs, &MultiVerifier, 1337),
+                    Err(TxValidationError::DisallowedAlgorithm(_))
+                ));
+            });
+            // Registration and policy reads do not replace the account's key binding.
+            registry.deprecate(signer.sig_type());
+            let mut account = ws.get_account(&from).unwrap().unwrap();
+            account.pq_pubkey_hash = ShellHash::from([0x99; 32]);
+            ws.set_account(&from, &account).unwrap();
+            with_algorithm_registry_override(&registry, || {
+                assert!(matches!(
+                    validate_tx(&referenced, &mut ws, &cs, &MultiVerifier, 1337),
+                    Err(TxValidationError::PubkeyConflict)
+                ));
+            });
+        }
     }
 
     #[test]

@@ -279,3 +279,23 @@ Shell-Chain's AA model combines:
 
 The goal is to make account abstraction the default account model, not an
 optional overlay.
+
+## Algorithm deprecation and migration
+
+With `algorithm_deprecation_height` explicitly scheduled, a registered account
+can continue using its root key from that block onward when governance marks the
+algorithm `Deprecated`. This covers ordinary transactions and root-signed AA
+bundles: an account can transfer funds to a replacement account using an active
+algorithm. Both embedded and reference public keys use the same registered-key
+binding and real signature checks. An existing balance alone does not qualify;
+the public key must already be registered. New registrations under a deprecated
+algorithm remain rejected, as do signatures using a `PendingActivation` entry.
+Offline address derivation is a pure calculation, not account registration.
+
+Omitting the schedule retains the legacy rejection of deprecated signatures.
+Operators must coordinate activation; source availability does not enable the
+rule on a running network. See [the compatibility decision](adr/algorithm-deprecation-migration.md).
+The whitepaper's broader requirement that existing accounts remain fully
+operational is still open for session-key authorization, paymaster verification
+and validator consensus signatures; this change implements direct root-key
+transactions without claiming those other paths are complete.
