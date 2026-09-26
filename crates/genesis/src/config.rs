@@ -165,6 +165,9 @@ pub struct GenesisConfig {
     /// Optional seven-day voting-window upgrade; absent preserves legacy proposals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_voting_window_activation_height: Option<u64>,
+    /// First block requiring explicit complete proposal identities and ID-bound votes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_proposal_identity_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -413,6 +416,14 @@ impl GenesisConfig {
     pub fn algorithm_voting_window(
         &self,
     ) -> Result<Option<shell_storage::AlgorithmVotingWindow>, GenesisError> {
+        if let Some(identity_height) = self.algorithm_proposal_identity_height {
+            if self
+                .algorithm_voting_window_activation_height
+                .is_none_or(|height| height > identity_height)
+            {
+                return Err(GenesisError::Validation("algorithm proposal identity requires voting window no later than its activation".into()));
+            }
+        }
         self.algorithm_voting_window_activation_height
             .map(|activation_height| {
                 let window = shell_storage::AlgorithmVotingWindow {

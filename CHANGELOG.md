@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add opt-in `algorithm_proposal_identity_height` and native complete-spec
+  submission, explicit proposal-ID voting and record lookup. Bind identities to
+  the installed descriptor, target height and registered proposer key; reject
+  reused IDs, isolate votes between rounds and allow expired candidates to be
+  replaced. Preserve legacy rounds and historical execution, validate immutable
+  schedule prerequisites, and keep live policy unchanged until quorum.
+
 - Add optional `algorithm_voting_window_activation_height`: newly staged algorithm
   proposals accept votes only before their persisted seven-day nominal block
   deadline. Freeze the effective genesis interval with the schedule, reject

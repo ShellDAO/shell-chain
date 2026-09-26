@@ -134,6 +134,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
             &ChainConfig {
                 log_address_activation_height: config.log_address_activation_height,
                 algorithm_voting_window: config.algorithm_voting_window()?,
+                algorithm_proposal_identity_height: config.algorithm_proposal_identity_height,
                 algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: config.algorithm_quorum_activation_height,
                 algorithm_timelock_activation_height: config.algorithm_timelock_activation_height,
@@ -296,6 +297,7 @@ mod tests {
         GenesisConfig {
             log_address_activation_height: None,
             algorithm_voting_window_activation_height: None,
+            algorithm_proposal_identity_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

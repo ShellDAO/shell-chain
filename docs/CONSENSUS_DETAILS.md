@@ -134,8 +134,8 @@ changes automatically. Coordinate the rollout before selecting a live height.
 
 This change only postpones publication until approval. Approved pending algorithms
 still reject new signatures until maturity. Voting expiry requires the separate
-[window upgrade](#algorithm-voting-window); complete proposal identity,
-verifier-hash matching and emergency policy remain separate requirements. See [the compatibility decision](adr/algorithm-proposal-staging.md).
+[window upgrade](#algorithm-voting-window), and explicit proposal IDs require the
+[identity upgrade](#algorithm-proposal-identity). Verifier-hash matching and emergency policy remain separate requirements. See [the compatibility decision](adr/algorithm-proposal-staging.md).
 
 ### Algorithm voting window
 
@@ -159,8 +159,8 @@ publishes the pending specification, records approval and clears the candidate
 and deadline; subsequent maturity still uses the stored activation height. Existing
 per-vote timelock, weighted quorum and duplicate-vote checks remain in force.
 Expired candidates and existing votes are retained, and cannot publish or mature.
-There is no reset or reproposal mechanism in this upgrade: full proposal identity
-and retry handling remain separate work.
+This window upgrade alone provides no reset or reproposal mechanism. The separate
+[identity upgrade](#algorithm-proposal-identity) adds ID-bound voting and retry.
 
 Proposals staged before the window activates have no deadline and retain their
 previous voting behavior, as do already-published pending proposals. Rollout must
@@ -546,3 +546,14 @@ Node A cannot verify ProofAmendment for block #N
                       │
                       └─► Node A retries verification with raw proof bytes
 ```
+
+### Algorithm proposal identity
+
+The optional `algorithm_proposal_identity_height` requires the voting-window
+upgrade no later than its activation. It enables explicit full-spec submission,
+ID-bound voting and expired-candidate replacement. Historical calls retain their
+original behavior; only pre-upgrade legacy rounds may continue using the old
+selector after activation. See the [native ABI and compatibility rules](SYSTEM_CONTRACTS.md#explicit-algorithm-proposal-identity)
+and [encoding decision](adr/algorithm-proposal-identity.md). Omitted configuration
+keeps the new selectors disabled. This rule does not automatically activate on
+an existing network.

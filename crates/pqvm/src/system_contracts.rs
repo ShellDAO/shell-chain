@@ -28,6 +28,12 @@
 //! | AccountManager | `executeRecovery(address)` | anyone (post-maturity) |
 //! | AccountManager | `cancelRecovery(address)` | account owner |
 
+mod algorithm_proposals;
+pub use algorithm_proposals::{
+    GET_ALGORITHM_PROPOSAL_SELECTOR, SUBMIT_ALGORITHM_PROPOSAL_SELECTOR,
+    VOTE_ALGORITHM_PROPOSAL_SELECTOR,
+};
+
 use shell_core::Account;
 use shell_crypto::{AlgorithmRegistry, AlgorithmStatus, SignatureType, ALLOWED_ALGORITHMS};
 use shell_primitives::{blake3_hash, keccak256, Address, ShellHash, U256};
@@ -368,6 +374,19 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
             let applied = unbond_validator_stake(caller, &addr, amount, world_state)?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
+        }
+        s if s == SUBMIT_ALGORITHM_PROPOSAL_SELECTOR
+            || s == VOTE_ALGORITHM_PROPOSAL_SELECTOR
+            || s == GET_ALGORITHM_PROPOSAL_SELECTOR =>
+        {
+            algorithm_proposals::execute(
+                caller,
+                input,
+                world_state,
+                chain_store,
+                registry,
+                block_number,
+            )
         }
         s if s == PROPOSE_ALGORITHM_ACTIVATION_SELECTOR => {
             let (algo, activation_height, verifier_hash) = decode_algo_activation_params(params)?;
@@ -868,6 +887,7 @@ struct AlgorithmActivationRules {
     require_quorum: bool,
     stage_proposals: bool,
     voting_window: Option<(u64, u64)>,
+    proposal_identity: bool,
 }
 
 fn algorithm_activation_rules<S: KvStore + 'static>(
@@ -893,6 +913,11 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
         config
             .as_ref()
             .and_then(|config| config.algorithm_quorum_activation_height),
+    );
+    let proposal_identity = activated(
+        config
+            .as_ref()
+            .and_then(|config| config.algorithm_proposal_identity_height),
     );
     let stage_proposals = activated(
         config
@@ -936,6 +961,7 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
         require_quorum,
         stage_proposals,
         voting_window,
+        proposal_identity,
     })
 }
 
@@ -954,6 +980,10 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
 
     if !validators.contains(caller) {
         return Err(SystemContractError::Unauthorized);
+    }
+
+    if rules.proposal_identity {
+        algorithm_proposals::guard_legacy(world_state, algo)?;
     }
 
     // Each submitted vote must leave the applicable minimum delay. Previously
@@ -3232,6 +3262,7 @@ mod tests {
                 bloom_activation_height: None,
                 log_address_activation_height: None,
                 algorithm_voting_window: None,
+                algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3304,6 +3335,7 @@ mod tests {
                 log_address_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: None,
+                algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3395,6 +3427,7 @@ mod tests {
             log_address_activation_height: None,
             algorithm_timelock_activation_height: None,
             algorithm_quorum_activation_height: None,
+            algorithm_proposal_identity_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3451,6 +3484,7 @@ mod tests {
                     algorithm_voting_window: None,
                     algorithm_timelock_activation_height: None,
                     algorithm_quorum_activation_height: None,
+                    algorithm_proposal_identity_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -3588,6 +3622,7 @@ mod tests {
                 bloom_activation_height: None,
                 log_address_activation_height: None,
                 algorithm_voting_window: None,
+                algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
