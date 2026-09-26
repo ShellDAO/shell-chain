@@ -28,6 +28,10 @@ pub struct ChainConfig {
     pub log_address_activation_height: Option<u64>,
 }
 
+/// Bounded recent native replay history, independent of consensus finality.
+pub const ADDRESS_METADATA_HISTORY_BLOCKS: u64 = 128;
+const MAX_NATIVE_REPLAY_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Maximum number of guardians per account.
 pub const MAX_GUARDIANS: usize = 5;
 /// Minimum timelock in blocks between recovery initiation and execution.
@@ -2355,9 +2359,44 @@ impl<S: KvStore> ChainStore<S> {
     ///
     /// Journals are keyed by block hash, so pruning validates the corresponding
     /// header before deleting all eligible entries in one atomic batch.
+    ///
+    /// Keep recent finalized journals for native replay while retaining all
+    /// unfinalized journals required by reorganization handling.
+    pub fn prune_address_metadata_history(
+        &self,
+        finalized_number: u64,
+    ) -> Result<u64, StorageError> {
+        self.prune_address_metadata_undo(finalized_number, ADDRESS_METADATA_HISTORY_BLOCKS)
+    }
+
+    /// Freeze mutable native metadata, the head pointer and its undo journals
+    /// together. Headers and trie nodes remain content-addressed base reads.
+    pub fn native_replay_overlay(&self) -> Result<OverlayStore<S>, StorageError> {
+        OverlayStore::with_snapshot_prefixes(
+            Arc::clone(&self.store),
+            &[
+                prefix::PUBKEY_BY_ADDR,
+                prefix::GUARDIAN_CONFIG,
+                prefix::RECOVERY_PROPOSAL,
+                prefix::HEAD_BLOCK,
+                prefix::ADDRESS_METADATA_UNDO,
+            ],
+            MAX_NATIVE_REPLAY_SNAPSHOT_BYTES,
+        )
+    }
+
+    /// Prune all journals through finality without retaining replay history.
     pub fn prune_finalized_address_metadata_undo(
         &self,
         finalized_number: u64,
+    ) -> Result<u64, StorageError> {
+        self.prune_address_metadata_undo(finalized_number, 0)
+    }
+
+    fn prune_address_metadata_undo(
+        &self,
+        finalized_number: u64,
+        keep_recent: u64,
     ) -> Result<u64, StorageError> {
         let pruned_finalized = match self
             .store
@@ -2387,6 +2426,12 @@ impl<S: KvStore> ChainStore<S> {
             )));
         }
 
+        let cutoff = finalized_number.saturating_sub(keep_recent);
+        // An upgraded database may already have pruned farther than the new
+        // retention boundary. Do not regress its cursor or reject that upgrade.
+        if pruned_finalized >= cutoff {
+            return Ok(0);
+        }
         let mut batch = WriteBatch::new();
         let mut pruned = 0u64;
 
@@ -2405,7 +2450,7 @@ impl<S: KvStore> ChainStore<S> {
                 ))
             })?;
 
-            if header.number <= finalized_number {
+            if header.number <= cutoff {
                 batch.delete(key);
                 pruned = pruned.saturating_add(1);
             }
@@ -2413,7 +2458,7 @@ impl<S: KvStore> ChainStore<S> {
 
         batch.put(
             prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED.to_vec(),
-            finalized_number.to_be_bytes().to_vec(),
+            cutoff.to_be_bytes().to_vec(),
         );
         self.store.write_batch(batch)?;
         Ok(pruned)
@@ -7298,5 +7343,38 @@ mod tests {
         js.put(&job).unwrap();
         js.put(&job).unwrap();
         assert_eq!(js.all_jobs().unwrap().len(), 1);
+    }
+    #[test]
+    fn native_history_retains_recent_finalized_and_all_unfinalized_journals() {
+        let db = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(Arc::clone(&db));
+        for number in 1..=132 {
+            ChainStore::new(Arc::new(OverlayStore::new(Arc::clone(&db))))
+                .commit_canonical_overlay(&empty_block(number), None)
+                .unwrap();
+        }
+        assert_eq!(chain.prune_address_metadata_history(130).unwrap(), 2);
+        assert!(db
+            .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                &empty_block(2).hash()
+            ))
+            .unwrap()
+            .is_none());
+        for number in 3..=132 {
+            assert!(db
+                .get(&ChainStore::<MemoryDb>::address_metadata_undo_key(
+                    &empty_block(number).hash()
+                ))
+                .unwrap()
+                .is_some());
+        }
+        // A database upgraded from immediate-finality pruning keeps its cursor.
+        chain.prune_finalized_address_metadata_undo(131).unwrap();
+        assert_eq!(chain.prune_address_metadata_history(132).unwrap(), 0);
+        assert_eq!(
+            db.get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)
+                .unwrap(),
+            Some(131u64.to_be_bytes().to_vec())
+        );
     }
 }

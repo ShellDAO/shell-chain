@@ -384,6 +384,37 @@ impl KvStore for RocksDbStore {
             .map_err(|e| StorageError::Database(e.to_string()))
     }
 
+    fn snapshot_prefixes(
+        &self,
+        prefixes: &[&[u8]],
+        max_bytes: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+        let snapshot = self.db.snapshot();
+        let cf = self.cf();
+        let mut entries = std::collections::BTreeMap::new();
+        let mut bytes = 0;
+        for prefix in prefixes {
+            let iter = snapshot.iterator_cf(
+                &cf,
+                rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            );
+            for item in iter {
+                let (key, value) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                crate::kv_store::insert_snapshot_entry(
+                    &mut entries,
+                    &mut bytes,
+                    max_bytes,
+                    &key,
+                    &value,
+                )?;
+            }
+        }
+        Ok(entries)
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let cf = self.cf();
         let mut opts = rocksdb::ReadOptions::default();

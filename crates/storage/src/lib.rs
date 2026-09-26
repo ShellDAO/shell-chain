@@ -18,7 +18,7 @@ pub use body_pruner::{BodyPruneResult, BodyPruner, DEFAULT_BODY_RETENTION};
 pub use chain_store::{
     BlockAvailability, ChainConfig, ChainStore, GuardianConfig, L2AggregationJob, L2InputIndex,
     L2JobStatus, L2JobStore, ProofAmendmentStore, RecoveryProposal, SettledSourceIndex,
-    WitnessStore, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
+    WitnessStore, ADDRESS_METADATA_HISTORY_BLOCKS, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
 };
 pub use error::StorageError;
 pub use kv_store::{EntryVisitor, KvStore, WriteBatch, WriteBatchOp};

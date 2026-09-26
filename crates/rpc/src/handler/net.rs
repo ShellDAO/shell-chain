@@ -104,6 +104,65 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     }
 }
 
+// These selectors never read address-keyed metadata or the chain head.
+fn state_only_account_call(tx: &SignedTransaction) -> bool {
+    tx.tx.to == Some(shell_pqvm::account_manager_address())
+        && tx.tx.data.as_ref().get(..4).is_some_and(|selector| {
+            selector == shell_pqvm::system_contracts::ROTATE_KEY_SELECTOR
+                || selector == shell_pqvm::system_contracts::CLEAR_VALIDATION_CODE_SELECTOR
+        })
+}
+
+fn historical_native_overlay<S: KvStore>(
+    chain: &ChainStore<S>,
+    block: &Block,
+) -> Result<shell_storage::OverlayStore<S>, ErrorObjectOwned> {
+    let overlay =
+        Arc::new(chain.native_replay_overlay().map_err(|error| {
+            server_error(format!("trace native snapshot unavailable: {error}"))
+        })?);
+    let replay = ChainStore::new(Arc::clone(&overlay));
+    let mut cursor = replay
+        .get_head_block()
+        .map_err(internal_err)?
+        .ok_or_else(|| server_error("trace native head unavailable"))?;
+    if cursor.header.number < block.header.number
+        || cursor.header.number.saturating_sub(block.header.number)
+            >= shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS
+    {
+        return Err(server_error(
+            "trace native history exceeds 128-block window",
+        ));
+    }
+    loop {
+        if cursor.header.number == block.header.number && cursor.hash() != block.hash() {
+            return Err(server_error(
+                "trace block is not an ancestor of captured head",
+            ));
+        }
+        replay
+            .restore_address_metadata(std::slice::from_ref(&cursor))
+            .map_err(|error| server_error(format!("trace native history unavailable: {error}")))?;
+        if cursor.hash() == block.hash() {
+            break;
+        }
+        let parent = replay
+            .get_block_by_hash(&cursor.header.parent_hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| server_error("trace native ancestor unavailable"))?;
+        if parent.header.number.checked_add(1) != Some(cursor.header.number) {
+            return Err(server_error("trace native ancestry is inconsistent"));
+        }
+        cursor = parent;
+    }
+    // Native recovery observes the canonical parent throughout block execution.
+    replay
+        .set_head(&block.header.parent_hash)
+        .map_err(internal_err)?;
+    drop(replay);
+    Arc::try_unwrap(overlay).map_err(|_| internal_err("trace overlay still shared"))
+}
+
 fn replay_block_traces<S: KvStore + 'static>(
     chain: Arc<ChainStore<S>>,
     chain_id: u64,
@@ -119,7 +178,21 @@ fn replay_block_traces<S: KvStore + 'static>(
         .get_header_by_hash(&block.header.parent_hash)
         .map_err(internal_err)?
         .ok_or_else(|| server_error("trace parent header unavailable"))?;
-    let overlay = Arc::new(shell_storage::OverlayStore::new(Arc::clone(chain.store())));
+    let requires_metadata = block
+        .transactions
+        .iter()
+        .enumerate()
+        .take_while(|(index, _)| target.is_none_or(|target| *index <= target))
+        .any(|(_, tx)| {
+            !tx.is_aa_bundle()
+                && tx.tx.to == Some(shell_pqvm::account_manager_address())
+                && !state_only_account_call(tx)
+        });
+    let overlay = Arc::new(if requires_metadata {
+        historical_native_overlay(&chain, &block)?
+    } else {
+        shell_storage::OverlayStore::new(Arc::clone(chain.store()))
+    });
     let state = WorldState::at_root(Arc::clone(&overlay), &parent.state_root)
         .map_err(|error| server_error(format!("trace parent state unavailable: {error}")))?;
     let registry = shell_pqvm::load_algorithm_registry(&state).map_err(internal_err)?;
@@ -143,25 +216,16 @@ fn replay_block_traces<S: KvStore + 'static>(
             if target.is_some_and(|target| index > target) {
                 break;
             }
-            // Rotation and clearing validation code read only trie state. Rotation
-            // writes the public key into this private overlay without reading the
-            // current address-keyed value. Other native methods may read guardian
-            // metadata or the live chain head, so still require historical context.
-            let state_only_native = tx.tx.to == Some(shell_pqvm::account_manager_address())
-                && tx.tx.data.as_ref().get(..4).is_some_and(|selector| {
-                    selector == shell_pqvm::system_contracts::ROTATE_KEY_SELECTOR
-                        || selector == shell_pqvm::system_contracts::CLEAR_VALIDATION_CODE_SELECTOR
-                });
             if tx
                 .tx
                 .to
                 .as_ref()
                 .is_some_and(shell_pqvm::is_system_contract)
                 && !tx.is_aa_bundle()
-                && !state_only_native
+                && tx.tx.to != Some(shell_pqvm::account_manager_address())
             {
                 return Err(server_error(
-                    "native system-contract tracing requires historical address metadata",
+                    "native system-contract tracing requires historical address metadata and validated context",
                 ));
             }
             let selected = target.is_none_or(|target| target == index);

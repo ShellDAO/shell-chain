@@ -368,10 +368,13 @@ instructions and 8 MiB per transaction, with a 16 MiB block response limit and
 two concurrent replays. Missing state, receipt mismatches, or exhausted limits
 return an error rather than a partial successful trace. AccountManager
 `rotateKey` and `clearValidationCode` can also be replayed, including as prefixes;
-they return actual native output and gas with empty `structLogs`. Other native
-methods remain unavailable until their historical address metadata and chain
-context can be reconstructed safely. Ordinary contract calls, deployments,
-and AA execution are replayed through the normal executor.
+they return actual native output and gas with empty `structLogs`. Guardian,
+recovery and validation-code changes additionally require a consistent native
+metadata snapshot (up to 64 MiB) and undo history within the latest 128 blocks.
+Recovery replay uses the original parent height, even if the current proposal
+or guardian set has changed. Already-pruned history remains unavailable after
+upgrading. ValidatorRegistry native calls remain unavailable. Ordinary contract
+calls, deployments, and AA execution are replayed through the normal executor.
 
 
 ---

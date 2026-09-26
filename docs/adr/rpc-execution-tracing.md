@@ -37,11 +37,25 @@ the same block. Rotation's address-keyed public-key write stays in the private
 overlay; it never reads or replaces the live public key. Native calls return the
 executor's actual output, gas and success/error status without opcode logs.
 
-Other native methods can read address metadata outside the state trie, and
-recovery methods also use the chain-head height. Their undo journals are pruned
-at finality. Refuse those native transactions and prefixes until their historical
-metadata and chain context are reconstructed or execution traces are retained.
-Keep the state-only selector list conservative when native implementations change.
+AccountManager guardian configuration, recovery and validation-code changes
+also replay address metadata outside the trie. Freeze public keys, guardian
+configurations, recovery proposals, the head pointer and undo journals in one
+MemoryDb read lock or RocksDB snapshot. Missing keys in these namespaces remain
+missing even if canonical import concurrently creates them. Rewind canonical
+journals from that captured head through the target block and set the private
+head to its parent, matching the height observed during native execution.
+Reject a target outside that ancestry. Frozen overlays cannot be committed.
+
+Retain the latest 128 finalized blocks' journals, as well as all unfinalized
+journals needed for reorganization. Native metadata replay is limited to the
+latest 128 blocks relative to the captured head and a 64 MiB snapshot budget
+including encoded entries and an allocation allowance. Large metadata sets can
+exceed this budget even for recent blocks. Missing/pruned journals or trie data,
+unsupported snapshot backends and exceeded limits return explicit errors.
+Upgrading does not recreate previously pruned journals. State-only selectors do
+not require metadata history; keep this exemption conservative as methods change.
+ValidatorRegistry native transactions and prefixes still require separately
+validated historical context and remain unavailable.
 
 The OpenEthereum-shaped `trace_` methods use this same replay path and flatten
 observed call/creation frames on the blocking worker. Each entry preserves its
