@@ -54,8 +54,16 @@ exceed this budget even for recent blocks. Missing/pruned journals or trie data,
 unsupported snapshot backends and exceeded limits return explicit errors.
 Upgrading does not recreate previously pruned journals. State-only selectors do
 not require metadata history; keep this exemption conservative as methods change.
-ValidatorRegistry native transactions and prefixes still require separately
-validated historical context and remain unavailable.
+ValidatorRegistry native transactions and prefixes use the same bounded context:
+validator admission observes historical public-key registration, and algorithm
+activation proposals observe the original parent height. Validator membership,
+weights, votes and algorithm status come from the parent trie and earlier
+transactions. Registry mutation helpers honor the worker-local override; tracing
+must not change the live process registry. Pending activations occur after block
+transactions during normal import, so replay begins with the parent registry
+and does not activate future entries before tracing the block's transactions.
+This reproduces executed governance behavior without changing its validation,
+voting rules or activation schedule.
 
 The OpenEthereum-shaped `trace_` methods use this same replay path and flatten
 observed call/creation frames on the blocking worker. Each entry preserves its

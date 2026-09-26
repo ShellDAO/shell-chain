@@ -185,7 +185,11 @@ fn replay_block_traces<S: KvStore + 'static>(
         .take_while(|(index, _)| target.is_none_or(|target| *index <= target))
         .any(|(_, tx)| {
             !tx.is_aa_bundle()
-                && tx.tx.to == Some(shell_pqvm::account_manager_address())
+                && tx
+                    .tx
+                    .to
+                    .as_ref()
+                    .is_some_and(shell_pqvm::is_system_contract)
                 && !state_only_account_call(tx)
         });
     let overlay = Arc::new(if requires_metadata {
@@ -215,18 +219,6 @@ fn replay_block_traces<S: KvStore + 'static>(
         for (index, tx) in block.transactions.iter().enumerate() {
             if target.is_some_and(|target| index > target) {
                 break;
-            }
-            if tx
-                .tx
-                .to
-                .as_ref()
-                .is_some_and(shell_pqvm::is_system_contract)
-                && !tx.is_aa_bundle()
-                && tx.tx.to != Some(shell_pqvm::account_manager_address())
-            {
-                return Err(server_error(
-                    "native system-contract tracing requires historical address metadata and validated context",
-                ));
             }
             let selected = target.is_none_or(|target| target == index);
             let (result, trace) = if selected {

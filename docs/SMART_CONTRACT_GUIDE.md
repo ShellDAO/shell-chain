@@ -373,8 +373,10 @@ recovery and validation-code changes additionally require a consistent native
 metadata snapshot (up to 64 MiB) and undo history within the latest 128 blocks.
 Recovery replay uses the original parent height, even if the current proposal
 or guardian set has changed. Already-pruned history remains unavailable after
-upgrading. ValidatorRegistry native calls remain unavailable. Ordinary contract
-calls, deployments, and AA execution are replayed through the normal executor.
+upgrading. ValidatorRegistry governance calls use the same bounded historical
+context, with algorithm-registry changes isolated to the replay worker.
+Ordinary contract calls, deployments, and AA execution are replayed through the
+normal executor.
 
 
 ---

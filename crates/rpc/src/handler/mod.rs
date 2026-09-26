@@ -7595,6 +7595,219 @@ mod tests {
         block
     }
 
+    fn store_validator_trace_history(handler: &RpcHandler<MemoryDb>) -> Vec<Block> {
+        use shell_pqvm::system_contracts::{
+            encode_add_validator_calldata, encode_deprecate_algorithm_calldata,
+            encode_propose_algorithm_activation_calldata, ALGO_GOVERNANCE_DELTA_MIN,
+        };
+        let store = Arc::clone(handler.chain_store.store());
+        let owner = Address::from([0xa1; 32]);
+        let target = Address::from([0xb2; 32]);
+        let mut state = WorldState::new(Arc::clone(&store));
+        state
+            .set_account(
+                &owner,
+                &shell_core::Account::new_user_account(ShellHash::ZERO, U256::from(1_000_000)),
+            )
+            .unwrap();
+        state.set_validators(&[owner]).unwrap();
+        let mut parent = make_genesis_block();
+        parent.header.state_root = state.state_root().unwrap();
+        handler
+            .chain_store
+            .commit_canonical_block(&parent, None)
+            .unwrap();
+        let registry_address = shell_pqvm::system_contracts::registry_address();
+        let algo = shell_crypto::SignatureType::SphincsSha2256f;
+        let mut blocks = Vec::new();
+        for number in 1..=2 {
+            let overlay = Arc::new(shell_storage::OverlayStore::new(Arc::clone(&store)));
+            let chain = ChainStore::new(Arc::clone(&overlay));
+            let state =
+                WorldState::at_root(Arc::clone(&overlay), &parent.header.state_root).unwrap();
+            let registry = shell_pqvm::load_algorithm_registry(&state).unwrap();
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number,
+                    base_fee_per_gas: 0,
+                    ..parent.header.clone()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let calls = if number == 1 {
+                vec![(registry_address, encode_add_validator_calldata(&target))]
+            } else {
+                // This key is registered only after the failed admission.
+                chain.put_pubkey(&target, &[0x22; 32]).unwrap();
+                vec![
+                    (registry_address, encode_deprecate_algorithm_calldata(algo)),
+                    (
+                        registry_address,
+                        encode_propose_algorithm_activation_calldata(
+                            algo,
+                            ALGO_GOVERNANCE_DELTA_MIN + parent.header.number,
+                            [0x33; 32],
+                        ),
+                    ),
+                    (target, vec![]),
+                ]
+            };
+            let mut executor =
+                ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(overlay)), 42);
+            let mut receipts = Vec::new();
+            let mut cumulative = 0;
+            shell_crypto::with_algorithm_registry_override(&registry, || {
+                for (index, (to, data)) in calls.into_iter().enumerate() {
+                    let nonce = executor
+                        .state_db_mut()
+                        .world_state_mut()
+                        .get_account(&owner)
+                        .unwrap()
+                        .unwrap()
+                        .nonce;
+                    let tx = SignedTransaction::new(
+                        owner,
+                        Transaction {
+                            chain_id: 42,
+                            nonce,
+                            max_fee_per_gas: 0,
+                            max_priority_fee_per_gas: 0,
+                            gas_limit: 200_000,
+                            to: Some(to),
+                            value: U256::ZERO,
+                            data: Bytes::from(data),
+                            access_list: None,
+                            tx_type: 2,
+                            max_fee_per_blob_gas: None,
+                            blob_versioned_hashes: None,
+                        },
+                        shell_crypto::PQSignature::new(
+                            shell_crypto::SignatureType::Dilithium3,
+                            vec![],
+                        ),
+                    );
+                    let result = executor
+                        .execute_tx(&tx, &block.header, index as u32, cumulative)
+                        .unwrap();
+                    assert_eq!(result.receipt.status, if number == 1 { 0 } else { 1 });
+                    cumulative = result.receipt.cumulative_gas_used;
+                    if !result.is_system_tx {
+                        shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
+                    }
+                    receipts.push(result.receipt);
+                    block.transactions.push(tx);
+                }
+            });
+            block.header.gas_used = cumulative;
+            block.header.state_root = executor
+                .state_db_mut()
+                .world_state_mut()
+                .state_root()
+                .unwrap();
+            chain
+                .commit_canonical_overlay(&block, Some(&receipts))
+                .unwrap();
+            parent = block.clone();
+            blocks.push(block);
+        }
+        while parent.header.number < 10 {
+            let block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number: parent.header.number + 1,
+                    gas_used: 0,
+                    ..parent.header.clone()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            handler
+                .chain_store
+                .commit_canonical_block(&block, Some(&[]))
+                .unwrap();
+            parent = block;
+        }
+        blocks
+    }
+
+    #[tokio::test]
+    async fn validator_trace_restores_pubkeys_head_and_isolates_algorithm_registry() {
+        let handler = setup();
+        let blocks = store_validator_trace_history(&handler);
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let registry_before = shell_crypto::AlgorithmRegistry::global().clone();
+        let missing = DebugApiServer::trace_transaction(
+            &handler,
+            blocks[0].transactions[0].hash().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing["failed"], true);
+        let output =
+            hex::decode(missing["output"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("pubkey is not registered"));
+        let block = &blocks[1];
+        for index in 0..block.transactions.len() {
+            let result = DebugApiServer::trace_transaction(
+                &handler,
+                block.transactions[index].hash().to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["failed"], false);
+            if index < 2 {
+                assert_eq!(result["output"], format!("0x{:064x}", 1));
+            }
+        }
+        let oe = TraceApiServer::trace_oe_transaction(
+            &handler,
+            block.transactions[1].hash().to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(oe[0]["result"]["output"], format!("0x{:064x}", 1));
+        let all = DebugApiServer::trace_block_by_number(&handler, "0x2".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 3);
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+        assert_eq!(registry_before, *shell_crypto::AlgorithmRegistry::global());
+    }
+
+    #[tokio::test]
+    async fn validator_trace_rejects_pruned_native_history() {
+        let handler = setup();
+        let blocks = store_validator_trace_history(&handler);
+        handler
+            .chain_store
+            .prune_finalized_address_metadata_undo(10)
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let error = DebugApiServer::trace_transaction(
+            &handler,
+            blocks[0].transactions[0].hash().to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message().contains("undo journal unavailable"));
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+    }
+
     fn store_recovery_trace_history(handler: &RpcHandler<MemoryDb>) -> Vec<Block> {
         use shell_pqvm::system_contracts::{
             encode_cancel_recovery_calldata, encode_execute_recovery_calldata,
