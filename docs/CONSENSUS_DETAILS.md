@@ -116,8 +116,9 @@ preserves live algorithm policy until a new proposal reaches quorum. At and afte
 that height, a first vote stores candidate height and verifier hash separately
 from the registry. A sub-quorum vote returns false without changing live status,
 activation height or verifier hash. An active algorithm therefore remains usable
-for signatures; a deprecated algorithm remains disabled. Restart and historical
-replay retain the same distinction.
+for signatures; a deprecated algorithm keeps its existing policy, including the
+separately scheduled [registered-account exception](#registered-account-deprecation-migration).
+Restart and historical replay retain the same distinction.
 
 The quorum-reaching vote publishes the candidate as `pending_activation`, stores
 approval for the maturity processor, and clears the staged parameters. Activation
@@ -557,3 +558,14 @@ selector after activation. See the [native ABI and compatibility rules](SYSTEM_C
 and [encoding decision](adr/algorithm-proposal-identity.md). Omitted configuration
 keeps the new selectors disabled. This rule does not automatically activate on
 an existing network.
+
+### Registered-account deprecation migration
+
+The independent optional `algorithm_deprecation_height` permits root-signed
+transactions from already registered accounts after algorithm deprecation.
+Validation uses the candidate block height, or the next canonical height at
+mempool admission. The rule does not permit new registrations or pending
+algorithms, and leaves custom account validators and session policy unchanged.
+The schedule is immutable once configured; adding it to an existing chain
+requires a future height. Snapshot imports require the same trusted schedule.
+See [scope and compatibility](adr/algorithm-deprecation-migration.md).

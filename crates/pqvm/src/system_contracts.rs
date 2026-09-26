@@ -3263,6 +3263,7 @@ mod tests {
                 log_address_activation_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
+                algorithm_deprecation_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3336,6 +3337,7 @@ mod tests {
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_proposal_identity_height: None,
+                algorithm_deprecation_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3428,6 +3430,7 @@ mod tests {
             algorithm_timelock_activation_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_proposal_identity_height: None,
+            algorithm_deprecation_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3485,6 +3488,7 @@ mod tests {
                     algorithm_timelock_activation_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_proposal_identity_height: None,
+                    algorithm_deprecation_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -3623,6 +3627,7 @@ mod tests {
                 log_address_activation_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
+                algorithm_deprecation_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
