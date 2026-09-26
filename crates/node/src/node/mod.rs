@@ -3156,6 +3156,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: activation,
+                        algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
                         bloom_activation_height: activation,
                         fee_accounting_activation_height: activation,
@@ -4926,6 +4927,7 @@ mod tests {
                             fee_accounting_activation_height: fee_activation,
                             bloom_activation_height: bloom_activation,
                             log_address_activation_height: activation,
+                            algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
                         })
                         .unwrap();
@@ -5070,6 +5072,7 @@ mod tests {
                             chain_id: 1337,
                             genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                             log_address_activation_height: None,
+                            algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
                             bloom_activation_height: None,
                             fee_accounting_activation_height: activation,
@@ -5163,6 +5166,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: None,
+                        algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
                         bloom_activation_height: None,
                         fee_accounting_activation_height: Some(0),
@@ -7927,6 +7931,56 @@ mod tests {
             AlgorithmRegistry::global().is_allowed(shell_crypto::SignatureType::SphincsSha2256f),
             "rejected imports must restore process-global algorithm status"
         );
+    }
+
+    #[test]
+    fn algorithm_quorum_activation_matches_production_and_import() {
+        const TEST_NAME: &str =
+            "node::tests::algorithm_quorum_activation_matches_production_and_import";
+        if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_QUORUM_IMPORT") {
+            return;
+        }
+        let algo = shell_crypto::SignatureType::SphincsSha2256f;
+        // Seed maturity at block one; native-call tests cover proposal creation
+        // and the real governance delay without mining hundreds of thousands of blocks.
+        for (required, approved) in [(false, false), (true, false), (true, true)] {
+            *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+            let (leader, signer) = setup_node();
+            let proposer = leader.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(proposer);
+            for node in [&leader, &follower] {
+                configure_pending_activation(node, 1, algo);
+                for (prefix, value) in [
+                    ("algorithm_status:", 3u64),
+                    ("algorithm_quorum_required:", u64::from(required)),
+                    ("algorithm_quorum_approved:", u64::from(approved)),
+                ] {
+                    let mut material = prefix.as_bytes().to_vec();
+                    material.push(algo.as_u8());
+                    let mut encoded = [0; 32];
+                    encoded[24..].copy_from_slice(&value.to_be_bytes());
+                    node.world_state
+                        .write()
+                        .set_storage(
+                            &shell_pqvm::registry_address(),
+                            &shell_primitives::keccak256(&material),
+                            &ShellHash::from(encoded),
+                        )
+                        .unwrap();
+                }
+                store_consistent_genesis(node);
+            }
+            let before = AlgorithmRegistry::global().clone();
+            let block = leader.produce_block(&signer, 100).unwrap();
+            let root = block.header.state_root;
+            let expected = !required || approved;
+            assert_eq!(AlgorithmRegistry::global().is_allowed(algo), expected);
+            *AlgorithmRegistry::global_mut() = before;
+            follower.register_authority_pubkey(proposer, signer.public_key().to_vec());
+            follower.import_block(block, &MultiVerifier).unwrap();
+            assert_eq!(AlgorithmRegistry::global().is_allowed(algo), expected);
+            assert_eq!(follower.world_state.write().state_root().unwrap(), root);
+        }
     }
 
     #[test]

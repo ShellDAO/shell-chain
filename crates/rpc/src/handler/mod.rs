@@ -3792,6 +3792,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: Some(5),
@@ -3842,6 +3843,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: Some(0),
@@ -7636,6 +7638,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
             })
             .unwrap();

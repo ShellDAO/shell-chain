@@ -376,7 +376,7 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
                 verifier_hash,
                 world_state,
                 registry,
-                algorithm_minimum_activation(chain_store, block_number)?,
+                algorithm_activation_rules(chain_store, block_number)?,
             )?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
@@ -861,35 +861,60 @@ fn validate_validator_stake_total<S: KvStore + 'static>(
     Ok((old_stake, updated_total))
 }
 
-fn algorithm_minimum_activation<S: KvStore + 'static>(
+struct AlgorithmActivationRules {
+    minimum_height: u64,
+    require_quorum: bool,
+}
+
+fn algorithm_activation_rules<S: KvStore + 'static>(
     chain_store: Option<&ChainStore<S>>,
     block_number: Option<u64>,
-) -> Result<u64, SystemContractError> {
-    if let (Some(store), Some(number)) = (chain_store, block_number) {
-        let activation = store
-            .get_chain_config()
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?
-            .and_then(|config| config.algorithm_timelock_activation_height);
-        if activation.is_some_and(|height| number >= height) {
-            return number
-                .checked_add(ALGO_GOVERNANCE_TARGET_DELTA_MIN)
-                .ok_or_else(|| {
-                    SystemContractError::AbiDecode(
-                        "algorithm timelock exceeds block height range".into(),
-                    )
-                });
-        }
-    }
-    // Preserve the exact legacy parent-head anchor and saturating arithmetic.
-    let current_height = match chain_store {
-        Some(store) => store
-            .get_head_block()
-            .map_err(|e| SystemContractError::Storage(e.to_string()))?
-            .map(|block| block.number())
-            .unwrap_or(0),
-        None => 0,
+) -> Result<AlgorithmActivationRules, SystemContractError> {
+    let config = chain_store
+        .map(|store| store.get_chain_config())
+        .transpose()
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?
+        .flatten();
+    let activated = |height: Option<u64>| {
+        height
+            .zip(block_number)
+            .is_some_and(|(activation, number)| number >= activation)
     };
-    Ok(current_height.saturating_add(ALGO_GOVERNANCE_DELTA_MIN))
+    let target_delay = activated(
+        config
+            .as_ref()
+            .and_then(|config| config.algorithm_timelock_activation_height),
+    );
+    let require_quorum = activated(
+        config
+            .as_ref()
+            .and_then(|config| config.algorithm_quorum_activation_height),
+    );
+    let minimum_height = if target_delay {
+        block_number
+            .unwrap_or(0)
+            .checked_add(ALGO_GOVERNANCE_TARGET_DELTA_MIN)
+            .ok_or_else(|| {
+                SystemContractError::AbiDecode(
+                    "algorithm timelock exceeds block height range".into(),
+                )
+            })?
+    } else {
+        // Preserve the exact legacy parent-head anchor and saturating arithmetic.
+        let current_height = match chain_store {
+            Some(store) => store
+                .get_head_block()
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?
+                .map(|block| block.number())
+                .unwrap_or(0),
+            None => 0,
+        };
+        current_height.saturating_add(ALGO_GOVERNANCE_DELTA_MIN)
+    };
+    Ok(AlgorithmActivationRules {
+        minimum_height,
+        require_quorum,
+    })
 }
 
 fn propose_algorithm_activation_op<S: KvStore + 'static>(
@@ -899,7 +924,7 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     verifier_hash: [u8; 32],
     world_state: &mut WorldState<S>,
     registry: &mut AlgorithmRegistry,
-    min_activation: u64,
+    rules: AlgorithmActivationRules,
 ) -> Result<bool, SystemContractError> {
     let validators = world_state
         .get_validators()
@@ -911,10 +936,10 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
 
     // Each submitted vote must leave the applicable minimum delay. Previously
     // accepted proposals are not rewritten when the protocol rule activates.
-    if activation_height < min_activation {
+    if activation_height < rules.minimum_height {
         return Err(SystemContractError::InvalidActivationHeight(
             activation_height,
-            min_activation,
+            rules.minimum_height,
         ));
     }
 
@@ -962,6 +987,24 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
         }
     } else {
         // First vote: create the proposal.
+        if rules.require_quorum {
+            // Scope the guard to proposals created under the upgrade. Legacy
+            // pending proposals retain their original validation and state roots.
+            world_state
+                .set_storage(
+                    &registry_address(),
+                    &algorithm_quorum_required_key(algo),
+                    &encode_u64_as_hash(1),
+                )
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+            world_state
+                .set_storage(
+                    &registry_address(),
+                    &algorithm_quorum_approved_key(algo),
+                    &ShellHash::ZERO,
+                )
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        }
         registry.propose_activation_with_spec(algo, activation_height, verifier_hash);
         store_algorithm_status(world_state, algo, AlgorithmStatus::PendingActivation)?;
 
@@ -993,6 +1036,22 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
         &validators,
     )? {
         return Ok(false);
+    }
+
+    if world_state
+        .get_storage(&registry_address(), &algorithm_quorum_required_key(algo))
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        != ShellHash::ZERO
+    {
+        // Approval survives later validator changes. Pending proposal parameters
+        // are immutable, and a new guarded proposal clears this marker first.
+        world_state
+            .set_storage(
+                &registry_address(),
+                &algorithm_quorum_approved_key(algo),
+                &encode_u64_as_hash(1),
+            )
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
     }
 
     // Quorum reached: keep PendingActivation — do NOT activate immediately.
@@ -1111,6 +1170,18 @@ fn algorithm_vote_key(
     }
     bytes.extend_from_slice(b":");
     bytes.extend_from_slice(voter.as_bytes());
+    keccak256(&bytes)
+}
+
+fn algorithm_quorum_required_key(algo: SignatureType) -> ShellHash {
+    let mut bytes = b"algorithm_quorum_required:".to_vec();
+    bytes.push(algo.as_u8());
+    keccak256(&bytes)
+}
+
+fn algorithm_quorum_approved_key(algo: SignatureType) -> ShellHash {
+    let mut bytes = b"algorithm_quorum_approved:".to_vec();
+    bytes.push(algo.as_u8());
     keccak256(&bytes)
 }
 
@@ -1339,6 +1410,17 @@ pub fn process_pending_activations<S: KvStore + 'static>(
         let act_height = decode_u64_from_hash(&act_height_hash);
         // activation_height == 0 means no timelock was stored (pre-governance entry); skip.
         if act_height > 0 && act_height <= current_height {
+            let required = world_state
+                .get_storage(&registry_address(), &algorithm_quorum_required_key(algo))
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+            if required != ShellHash::ZERO {
+                let approved = world_state
+                    .get_storage(&registry_address(), &algorithm_quorum_approved_key(algo))
+                    .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+                if approved == ShellHash::ZERO {
+                    continue;
+                }
+            }
             activated.push(algo);
         }
     }
@@ -2974,6 +3056,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
             })
             .unwrap();
@@ -3014,6 +3097,195 @@ mod tests {
                 assert_eq!(registry, before);
             }
         }
+    }
+
+    #[test]
+    fn algorithm_quorum_guard_blocks_unapproved_activation_and_survives_restart() {
+        for (activation, guarded) in [
+            (None, false),
+            (Some(2), false),
+            (Some(1), true),
+            (Some(0), true),
+        ] {
+            let voters = [
+                Address::from([1; 20]),
+                Address::from([2; 20]),
+                Address::from([3; 20]),
+            ];
+            let mut ws = setup_with_validators(&voters);
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            cs.put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
+                algorithm_quorum_activation_height: activation,
+            })
+            .unwrap();
+            let algo = SignatureType::SphincsSha2256f;
+            let mut registry = AlgorithmRegistry::default();
+            let height = 2_000_000;
+            let call = encode_propose_algorithm_activation_calldata(algo, height, [0x44; 32]);
+            if guarded {
+                // A previous proposal's approval must not authorize a new proposal.
+                ws.set_storage(
+                    &registry_address(),
+                    &algorithm_quorum_approved_key(algo),
+                    &encode_u64_as_hash(1),
+                )
+                .unwrap();
+            }
+            let (output, _) = execute_validator_registry_with_registry(
+                &voters[0],
+                &call,
+                &mut ws,
+                Some(&cs),
+                &mut registry,
+                Some(1),
+            )
+            .unwrap();
+            assert_eq!(output, encode_bool(false));
+            assert_eq!(
+                ws.get_storage(&registry_address(), &algorithm_quorum_required_key(algo))
+                    .unwrap()
+                    != ShellHash::ZERO,
+                guarded
+            );
+            registry = load_algorithm_registry(&ws).unwrap();
+            if guarded {
+                assert_eq!(
+                    ws.get_storage(&registry_address(), &algorithm_quorum_approved_key(algo))
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                let root = ws.state_root().unwrap();
+                assert!(process_pending_activations(height, &mut ws, &mut registry)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(ws.state_root().unwrap(), root);
+                assert!(!registry.is_allowed(algo));
+            }
+            let (output, _) = execute_validator_registry_with_registry(
+                &voters[1],
+                &call,
+                &mut ws,
+                Some(&cs),
+                &mut registry,
+                Some(2),
+            )
+            .unwrap();
+            assert_eq!(output, encode_bool(true));
+            assert_eq!(
+                ws.get_storage(&registry_address(), &algorithm_quorum_approved_key(algo))
+                    .unwrap()
+                    != ShellHash::ZERO,
+                guarded
+            );
+            // An already-approved proposal remains approved if the validator set changes.
+            ws.set_validators(&[voters[2]]).unwrap();
+            registry = load_algorithm_registry(&ws).unwrap();
+            assert!(
+                process_pending_activations(height - 1, &mut ws, &mut registry)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                process_pending_activations(height, &mut ws, &mut registry).unwrap(),
+                vec![algo]
+            );
+            assert!(registry.is_allowed(algo));
+            assert!(
+                process_pending_activations(height + 1, &mut ws, &mut registry)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_algorithm_activation_preserves_pre_upgrade_behavior() {
+        let voters = [
+            Address::from([1; 20]),
+            Address::from([2; 20]),
+            Address::from([3; 20]),
+        ];
+        let mut ws = setup_with_validators(&voters);
+        let mut registry = AlgorithmRegistry::default();
+        let algo = SignatureType::SphincsSha2256f;
+        registry.deprecate(algo);
+        let height = 2_000_000;
+        let call = encode_propose_algorithm_activation_calldata(algo, height, [0x44; 32]);
+        let (output, _) = execute_validator_registry_with_registry(
+            &voters[0],
+            &call,
+            &mut ws,
+            None,
+            &mut registry,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            encode_bool(false),
+            "one of three votes is below quorum"
+        );
+        // Legacy compatibility: the old activation processor does not check approval.
+        assert_eq!(
+            process_pending_activations(height, &mut ws, &mut registry).unwrap(),
+            vec![algo]
+        );
+        assert!(registry.is_allowed(algo));
+    }
+
+    #[test]
+    fn legacy_algorithm_vote_accepts_after_seven_day_window() {
+        let voters = [
+            Address::from([1; 20]),
+            Address::from([2; 20]),
+            Address::from([3; 20]),
+        ];
+        let mut ws = setup_with_validators(&voters);
+        let mut registry = AlgorithmRegistry::default();
+        let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+        let call = encode_propose_algorithm_activation_calldata(
+            SignatureType::SphincsSha2256f,
+            2_000_000,
+            [0x44; 32],
+        );
+        let (output, _) = execute_validator_registry_with_registry(
+            &voters[0],
+            &call,
+            &mut ws,
+            Some(&cs),
+            &mut registry,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(output, encode_bool(false));
+        // Advance the stored parent beyond seven days at two seconds per block.
+        let parent = shell_core::Block {
+            header: shell_core::BlockHeader {
+                number: 302_401,
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        cs.put_block(&parent).unwrap();
+        cs.set_head(&parent.hash()).unwrap();
+        let (output, _) = execute_validator_registry_with_registry(
+            &voters[1],
+            &call,
+            &mut ws,
+            Some(&cs),
+            &mut registry,
+            Some(302_402),
+        )
+        .unwrap();
+        assert_eq!(output, encode_bool(true), "legacy votes do not expire");
     }
 
     #[test]
