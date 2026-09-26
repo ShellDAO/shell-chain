@@ -188,6 +188,7 @@ async fn snapshot_export_import_roundtrip() {
         .put_chain_config(&ChainConfig {
             log_address_activation_height: None,
             algorithm_voting_window: None,
+            algorithm_proposal_identity_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

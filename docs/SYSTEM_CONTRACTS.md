@@ -158,11 +158,13 @@ first-vote pending transition is unchanged unless the independent
 candidates leave live policy intact; the quorum-reaching vote publishes pending
 parameters. See [proposal staging](CONSENSUS_DETAILS.md#algorithm-proposal-staging) and
 [quorum compatibility and remaining limitations](CONSENSUS_DETAILS.md#algorithm-activation-quorum-guard).
-The unique identifier above remains a protocol target. The separate optional
+The separate optional
 `algorithm_voting_window_activation_height` adds seven-day nominal block expiry
 for newly staged candidates; see [voting windows](CONSENSUS_DETAILS.md#algorithm-voting-window).
-Older proposals retain their previous behavior. Full proposal identity and retry
-after expiration remain unimplemented.
+Older proposals retain their previous behavior. The independent
+`algorithm_proposal_identity_height` enables complete installed-spec submission,
+explicit ID-bound votes, duplicate-ID rejection and expired-candidate replacement.
+See [proposal identity](#explicit-algorithm-proposal-identity) for the native ABI.
 
 The white-paper target is **Δ_min = 30 days** (1,296,000 blocks at 2 s/block).
 It is enforced from the explicitly configured `algorithm_timelock_activation_height`:
@@ -175,6 +177,80 @@ This timelock upgrade does not complete the separate voting-window and emergency
 signature-policy requirements.
 
 ---
+
+## Explicit algorithm proposal identity
+
+`algorithm_proposal_identity_height` is optional and disabled when omitted.
+Its height must be at or after `algorithm_voting_window_activation_height`,
+which itself requires proposal staging. Schedules are immutable once recorded;
+existing databases accept only future activation heights. This changes no
+network configuration automatically.
+
+After activation, use these native ValidatorRegistry calls:
+
+```solidity
+function submitAlgorithmProposal(
+    uint8 algo, bytes32 name, uint32 pkSize, uint32 sigSize,
+    uint64 verifyGas, uint64 batchGas, bytes32 verifierHash,
+    uint64 activationHeight
+) external returns (bytes32 proposalId);
+function voteAlgorithmProposal(uint8 algo, bytes32 proposalId)
+    external returns (bool approved);
+function getAlgorithmProposal(bytes32 proposalId) external view returns (
+    uint8 algo, bytes32 name, uint32 pkSize, uint32 sigSize,
+    uint64 verifyGas, uint64 batchGas, bytes32 verifierHash,
+    uint64 activationHeight, uint64 deadline, bool approved
+);
+```
+
+The native ABI requires exactly eight, two and one 32-byte argument words,
+respectively, with zero-padded unsigned integers. Names are ASCII, right-padded
+with zero bytes to 32 bytes. The accepted installed descriptors are:
+
+| ID | Name | Public key bytes | Signature bytes | Verify gas | Batch gas per signature |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 0 | Dilithium3 | 1952 | 3309 | 46000 | 12000 |
+| 1 | ML-DSA-65 | 1952 | 3309 | 46000 | 12000 |
+| 2 | SLH-DSA-SHA2-256f | 64 | 49856 | 2300000 | 0 (no batch entry point) |
+
+Other descriptors and zero verifier hashes are rejected. This flow describes
+installed algorithms; adding a new primitive or changing their execution costs
+still requires a compatible client implementation. The verifier hash is bound
+and stored, but matching it against reference verifier bytecode remains a
+separate implementation requirement. Emergency dual-key signing policy and
+signature admission for approved-but-not-yet-active algorithms are also separate
+from this upgrade.
+
+The proposal ID hashes the following concatenation with BLAKE3. All integers
+use big-endian encoding, and there are no separators or ABI padding:
+
+```text
+algo:u8 || name:32 bytes || pkSize:u32 || sigSize:u32 ||
+verifyGas:u64 || batchGas:u64 || verifierHash:32 bytes ||
+requestedStatus:u8(Active=0) || activationHeight:u64 || proposerPublicKey:bytes
+```
+
+The key comes from the submitting validator's registered key in the executed
+state. Submission opens a window and returns the ID without casting a vote or
+changing live policy. Each active validator explicitly votes for that ID at most
+once. Quorum is the ceiling of two thirds of current validator weight; votes of
+removed validators do not count. Approval is persisted and is not recalculated
+after validator changes. Each vote also enforces the applicable timelock.
+
+At the exclusive deadline, voting fails. A different ID can replace the expired
+candidate; changing the target height or proposer key changes the ID. Previously
+used IDs remain rejected, and their votes never count toward the replacement.
+Only one unexpired candidate per algorithm can be open. Once quorum publishes a
+pending activation, replacement waits until that pending entry has matured or
+been deprecated. The getter preserves full records and approval status even
+after expiry or replacement; unknown IDs revert.
+
+Before activation these selectors remain unknown. Legacy pending or staged
+rounds can finish through their original ABI after activation, subject to their
+existing deadline and timelock. An expired legacy staged round can be replaced
+by a new explicit proposal. New unbound rounds are rejected after activation;
+legacy calldata cannot vote on an explicit proposal. See the
+[compatibility and encoding decision](adr/algorithm-proposal-identity.md).
 
 ## AccountManager
 
