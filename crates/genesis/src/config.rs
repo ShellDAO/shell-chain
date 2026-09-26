@@ -162,6 +162,9 @@ pub struct GenesisConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// First block whose new algorithm proposals require recorded quorum before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_quorum_activation_height: Option<u64>,
     /// First block enforcing the target algorithm governance timelock; absent means legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_timelock_activation_height: Option<u64>,

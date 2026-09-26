@@ -109,6 +109,32 @@ explicitly configured fresh test chain, height zero enables the rule immediately
 Coordinate a client rollout before choosing an activation height on a live network.
 See [the compatibility decision](adr/algorithm-governance-timelock.md).
 
+### Algorithm activation quorum guard
+
+The independent optional `algorithm_quorum_activation_height` in `genesis.json`
+requires recorded quorum approval before newly created proposals can activate.
+Missing or null preserves legacy behavior. A proposal first created in block `N`
+at or after this schedule stores a quorum-required marker in canonical state.
+The vote that reaches the existing weighted quorum records approval. At maturity,
+production and import leave an unapproved guarded proposal pending. Restart and
+historical replay use the same persisted markers; later validator changes do not
+revoke approval that was already obtained.
+
+Pending proposals created before the upgrade retain legacy activation behavior,
+including activation at maturity without recorded quorum approval. Complete or
+otherwise account for those proposals before a coordinated rollout. New guarded
+proposals clear any old approval marker. This option uses the same immutable,
+future-only startup scheduling and trusted snapshot checks as the other upgrades;
+height zero is available for explicitly configured fresh test chains. No existing
+network activates this change automatically.
+
+The first vote still marks an algorithm pending before quorum, which disables it
+for new signatures. This guard only fixes activation without approval; it does
+not complete proposal lifecycle, seven-day voting expiry, full proposal identity,
+verifier-hash validation, or emergency signature policy. The timelock schedule is
+separate and continues to validate every vote. See
+[the compatibility decision](adr/algorithm-activation-quorum.md).
+
 ### Log emitter address activation
 
 The optional `log_address_activation_height` in `genesis.json` restores known
@@ -146,7 +172,8 @@ signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
 Both log-range queries and filter polling select the format for each queried
 block, including removed logs after a reorganization.
 
-The fee, Bloom, log emitter and algorithm timelock schedules are independent persisted chain configuration.
+The fee, Bloom, log emitter, algorithm timelock and algorithm quorum schedules
+are independent persisted chain configuration.
 Startup validates all proposed schedules before publishing any of them. A new
 schedule on an existing chain must be strictly above its canonical head; an
 existing schedule cannot be removed or changed. Restart and snapshot import

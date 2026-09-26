@@ -314,6 +314,15 @@ proposal_id = BLAKE3(algo_id ‖ spec_bytes ‖ activation_height ‖ proposer_p
 ```
 This prevents replay of old proposals at a later block height.
 
+For activation enforcement, the optional `algorithm_quorum_activation_height`
+requires recorded approval for proposals created at or after the configured block.
+Legacy pending proposals retain their previous behavior; without this upgrade,
+maturity processing can activate a proposal that has not reached quorum. The
+first-vote pending transition is unchanged. See
+[quorum compatibility and remaining limitations](CONSENSUS_DETAILS.md#algorithm-activation-quorum-guard).
+The unique identifier above is a protocol target; full proposal identity and
+seven-day voting expiry are not implemented by this guard.
+
 The white-paper target is **Δ_min = 30 days** (1,296,000 blocks at 2 s/block).
 It is enforced from the explicitly configured `algorithm_timelock_activation_height`:
 a vote in block `N` requires an algorithm activation height of at least

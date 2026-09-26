@@ -26,6 +26,9 @@ pub struct ChainConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// First block whose new algorithm proposals require recorded quorum before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_quorum_activation_height: Option<u64>,
     /// First block enforcing the target algorithm governance timelock; absent means legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_timelock_activation_height: Option<u64>,
@@ -1664,6 +1667,11 @@ impl<S: KvStore> ChainStore<S> {
                 stored.algorithm_timelock_activation_height,
                 desired.algorithm_timelock_activation_height,
             ),
+            (
+                "algorithm quorum",
+                stored.algorithm_quorum_activation_height,
+                desired.algorithm_quorum_activation_height,
+            ),
         ] {
             if previous == next {
                 continue;
@@ -1898,6 +1906,9 @@ impl<S: KvStore> ChainStore<S> {
             algorithm_timelock_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.algorithm_timelock_activation_height),
+            algorithm_quorum_activation_height: self
+                .get_chain_config()?
+                .and_then(|config| config.algorithm_quorum_activation_height),
             log_address_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.log_address_activation_height),
@@ -1939,6 +1950,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_fee_activation = trusted.fee_accounting_activation_height;
         let trusted_bloom_activation = trusted.bloom_activation_height;
         let trusted_log_address_activation = trusted.log_address_activation_height;
+        let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
         let trusted_algorithm_timelock_activation = trusted.algorithm_timelock_activation_height;
 
         // Validate the canonical head and its state root before writing any
@@ -2064,6 +2076,8 @@ impl<S: KvStore> ChainStore<S> {
                     || config.fee_accounting_activation_height != trusted_fee_activation
                     || config.bloom_activation_height != trusted_bloom_activation
                     || config.log_address_activation_height != trusted_log_address_activation
+                    || config.algorithm_quorum_activation_height
+                        != trusted_algorithm_quorum_activation
                     || config.algorithm_timelock_activation_height
                         != trusted_algorithm_timelock_activation
                 {
@@ -2122,6 +2136,16 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted algorithm timelock activation".into(),
+            ));
+        }
+
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.algorithm_quorum_activation_height)
+            != trusted_algorithm_quorum_activation
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted algorithm quorum activation".into(),
             ));
         }
 
@@ -2309,6 +2333,7 @@ impl<S: KvStore> ChainStore<S> {
         // chain identity with the head so a fresh destination remains bootable.
         let config = ChainConfig {
             log_address_activation_height: trusted_log_address_activation,
+            algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
             algorithm_timelock_activation_height: trusted_algorithm_timelock_activation,
             bloom_activation_height: trusted_bloom_activation,
             fee_accounting_activation_height: trusted_fee_activation,
@@ -3866,6 +3891,7 @@ mod tests {
 
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -3887,6 +3913,7 @@ mod tests {
         assert_eq!(config.bloom_activation_height, None);
         assert_eq!(config.log_address_activation_height, None);
         assert_eq!(config.algorithm_timelock_activation_height, None);
+        assert_eq!(config.algorithm_quorum_activation_height, None);
         assert_eq!(serde_json::to_value(&config).unwrap(), legacy);
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&store));
@@ -3894,6 +3921,7 @@ mod tests {
         let restarted = ChainStore::new(store);
         let changed = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: Some(5),
@@ -3912,6 +3940,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: trusted_height,
@@ -3920,6 +3949,7 @@ mod tests {
             let before = store.scan_prefix(b"").unwrap();
             let untrusted = ChainConfig {
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: Some(6),
@@ -3960,6 +3990,7 @@ mod tests {
                 genesis_hash: ShellHash::ZERO,
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: trusted_height,
             };
@@ -3968,6 +3999,7 @@ mod tests {
             let untrusted = ChainConfig {
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: Some(6),
                 ..trusted
@@ -4008,6 +4040,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: trusted_height,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
             };
             cs.put_chain_config(&trusted).unwrap();
@@ -4016,6 +4049,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: Some(6),
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 ..trusted
             };
@@ -4055,6 +4089,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: trusted_height,
             };
             cs.put_chain_config(&trusted).unwrap();
@@ -4063,6 +4098,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: Some(6),
                 ..trusted
             };
@@ -4092,6 +4128,61 @@ mod tests {
                 "does not match the trusted chain"
             } else {
                 "missing the trusted algorithm timelock activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn algorithm_quorum_activation_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted = ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_quorum_activation_height: trusted_height,
+                algorithm_timelock_activation_height: None,
+            };
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let untrusted = ChainConfig {
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_quorum_activation_height: Some(6),
+                algorithm_timelock_activation_height: None,
+                ..trusted
+            };
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let err = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(err.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted algorithm quorum activation"
             }));
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
         }
@@ -4380,6 +4471,7 @@ mod tests {
         let mismatched_configs = [
             ChainConfig {
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: None,
@@ -4388,6 +4480,7 @@ mod tests {
             },
             ChainConfig {
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: None,
@@ -4438,6 +4531,7 @@ mod tests {
         let cs = ChainStore::new(store);
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -4553,6 +4647,7 @@ mod tests {
             cs.get_chain_config().unwrap(),
             Some(ChainConfig {
                 log_address_activation_height: None,
+                algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: None,
@@ -5471,6 +5566,7 @@ mod tests {
         let head_hash = head.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -5970,12 +6066,18 @@ mod tests {
 
     #[test]
     fn test_export_import_snapshot_roundtrip() {
-        for (activation, bloom_activation, log_activation, timelock_activation) in [
-            (None, None, None, None),
-            (Some(0), Some(2), Some(3), Some(4)),
-            (Some(2), Some(0), None, None),
-            (None, Some(2), Some(0), Some(0)),
-            (None, None, Some(2), Some(2)),
+        for (
+            activation,
+            bloom_activation,
+            log_activation,
+            timelock_activation,
+            quorum_activation,
+        ) in [
+            (None, None, None, None, None),
+            (Some(0), Some(2), Some(3), Some(4), Some(5)),
+            (Some(2), Some(0), None, None, Some(0)),
+            (None, Some(2), Some(0), Some(0), None),
+            (None, None, Some(2), Some(2), Some(2)),
         ] {
             let store = Arc::new(MemoryDb::new());
             let cs = ChainStore::new(store.clone());
@@ -5989,6 +6091,7 @@ mod tests {
 
             cs.put_chain_config(&ChainConfig {
                 log_address_activation_height: log_activation,
+                algorithm_quorum_activation_height: quorum_activation,
                 algorithm_timelock_activation_height: timelock_activation,
                 bloom_activation_height: bloom_activation,
                 fee_accounting_activation_height: activation,
@@ -6028,6 +6131,10 @@ mod tests {
                 loaded_cfg.algorithm_timelock_activation_height,
                 timelock_activation
             );
+            assert_eq!(
+                loaded_cfg.algorithm_quorum_activation_height,
+                quorum_activation
+            );
             assert_eq!(loaded_cfg.chain_id, 1337);
             assert_eq!(loaded_cfg.genesis_hash, b0.hash());
             assert_eq!(
@@ -6047,6 +6154,7 @@ mod tests {
         put_canonical(&cs, &b0);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -6100,6 +6208,7 @@ mod tests {
         put_canonical(&cs, &genesis);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -7208,6 +7317,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
@@ -7233,6 +7343,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,

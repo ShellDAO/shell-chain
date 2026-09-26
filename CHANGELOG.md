@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `algorithm_quorum_activation_height`: proposals created under
+  the upgrade activate only after recorded quorum approval. Persist approval
+  across restart and validator changes, and enforce it in production and import.
+  Preserve legacy pending proposals and default behavior; validate the independent
+  schedule on startup and trusted snapshot import. Voting expiry and the
+  first-vote pending transition remain separate governance limitations.
+
 - Add optional `algorithm_timelock_activation_height` scheduling for the
   white-paper 1,296,000-block algorithm governance delay. Preserve historical
   500,000-block validation, reject target-height overflow, and verify the
