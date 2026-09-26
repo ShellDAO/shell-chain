@@ -70,6 +70,7 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                 )?;
                 shell_storage::ChainConfig {
                     log_address_activation_height: genesis.log_address_activation_height,
+                    algorithm_voting_window: genesis.algorithm_voting_window()?,
                     algorithm_proposal_staging_height: genesis.algorithm_proposal_staging_height,
                     algorithm_quorum_activation_height: genesis.algorithm_quorum_activation_height,
                     algorithm_timelock_activation_height: genesis

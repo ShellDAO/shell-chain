@@ -133,9 +133,49 @@ height zero is for explicitly configured fresh test chains. No existing network
 changes automatically. Coordinate the rollout before selecting a live height.
 
 This change only postpones publication until approval. Approved pending algorithms
-still reject new signatures until maturity, and seven-day expiry, complete
-proposal identity, verifier-hash matching and emergency policy remain separate
-requirements. See [the compatibility decision](adr/algorithm-proposal-staging.md).
+still reject new signatures until maturity. Voting expiry requires the separate
+[window upgrade](#algorithm-voting-window); complete proposal identity,
+verifier-hash matching and emergency policy remain separate requirements. See [the compatibility decision](adr/algorithm-proposal-staging.md).
+
+### Algorithm voting window
+
+The optional `algorithm_voting_window_activation_height` in `genesis.json`
+adds a seven-day **nominal block window** for newly staged algorithm proposals.
+It requires `algorithm_proposal_staging_height` at or below the window activation
+height. Missing or null preserves previous rules; no network activates by default.
+
+The first vote in block `N` stores the exclusive deadline
+`D = N + floor(604800 / block_time_secs)`. The interval is the effective consensus
+interval from genesis, persisted with the upgrade schedule, not the local CLI
+`--block-time` scheduling interval. For a two-second consensus interval the window
+is 302,400 blocks. Floor division avoids exceeding seven nominal days; the interval
+must be between one second and 604,800 seconds. This is not a wall-clock deadline:
+actual elapsed time depends on block production. Deadline overflow rejects the
+proposal before candidate state or votes are written.
+
+Matching votes in blocks `N` through `D - 1` can reach quorum; votes at `D` or later
+are rejected. Until approval, live algorithm policy remains unchanged. Quorum
+publishes the pending specification, records approval and clears the candidate
+and deadline; subsequent maturity still uses the stored activation height. Existing
+per-vote timelock, weighted quorum and duplicate-vote checks remain in force.
+Expired candidates and existing votes are retained, and cannot publish or mature.
+There is no reset or reproposal mechanism in this upgrade: full proposal identity
+and retry handling remain separate work.
+
+Proposals staged before the window activates have no deadline and retain their
+previous voting behavior, as do already-published pending proposals. Rollout must
+account for these grandfathered proposals. Production, import, simulation and
+historical replay use the executing block height and canonical candidate state;
+restart preserves the deadline. Snapshot import requires the trusted schedule and
+interval and rejects a mismatch before writing state.
+
+On an existing chain, the window must first be scheduled strictly above the
+canonical head. Once persisted, neither its height nor its nominal interval can
+be changed or removed. Stage activation must be scheduled no later than the
+window. Height zero is available for explicitly configured fresh test chains.
+Coordinate upgraded clients and configuration before choosing a live height.
+This implements expiry for new staged candidates, not the complete governance
+lifecycle or emergency signature policy. See [the compatibility decision](adr/algorithm-voting-window.md).
 
 ### Algorithm activation quorum guard
 
@@ -201,8 +241,9 @@ signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
 Both log-range queries and filter polling select the format for each queried
 block, including removed logs after a reorganization.
 
-The fee, Bloom, log emitter, algorithm timelock, quorum and proposal-staging schedules
-are independent persisted chain configuration.
+The fee, Bloom, log emitter, algorithm timelock, quorum, proposal-staging and voting
+window schedules are persisted chain configuration. The voting window additionally
+requires proposal staging no later than its activation; the other schedules are independent.
 Startup validates all proposed schedules before publishing any of them. A new
 schedule on an existing chain must be strictly above its canonical head; an
 existing schedule cannot be removed or changed. Restart and snapshot import

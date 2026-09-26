@@ -20,6 +20,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     store: std::sync::Arc<S>,
 ) -> Result<Block, GenesisError> {
     config.validate_economics()?;
+    config.algorithm_voting_window()?;
 
     let mut world_state = WorldState::new(std::sync::Arc::clone(&store));
 
@@ -132,6 +133,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
             &block,
             &ChainConfig {
                 log_address_activation_height: config.log_address_activation_height,
+                algorithm_voting_window: config.algorithm_voting_window()?,
                 algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: config.algorithm_quorum_activation_height,
                 algorithm_timelock_activation_height: config.algorithm_timelock_activation_height,
@@ -293,6 +295,7 @@ mod tests {
 
         GenesisConfig {
             log_address_activation_height: None,
+            algorithm_voting_window_activation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

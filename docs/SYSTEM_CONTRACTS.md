@@ -131,8 +131,11 @@ first-vote pending transition is unchanged unless the independent
 candidates leave live policy intact; the quorum-reaching vote publishes pending
 parameters. See [proposal staging](CONSENSUS_DETAILS.md#algorithm-proposal-staging) and
 [quorum compatibility and remaining limitations](CONSENSUS_DETAILS.md#algorithm-activation-quorum-guard).
-The unique identifier above is a protocol target; full proposal identity and
-seven-day voting expiry are not implemented by this guard.
+The unique identifier above remains a protocol target. The separate optional
+`algorithm_voting_window_activation_height` adds seven-day nominal block expiry
+for newly staged candidates; see [voting windows](CONSENSUS_DETAILS.md#algorithm-voting-window).
+Older proposals retain their previous behavior. Full proposal identity and retry
+after expiration remain unimplemented.
 
 The white-paper target is **Δ_min = 30 days** (1,296,000 blocks at 2 s/block).
 It is enforced from the explicitly configured `algorithm_timelock_activation_height`:

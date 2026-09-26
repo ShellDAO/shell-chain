@@ -196,6 +196,8 @@ pub enum SystemContractError {
     InvalidThreshold(usize, u8),
     #[error("timelock too short: minimum {0} blocks, got {1}")]
     TimelockTooShort(u64, u64),
+    #[error("algorithm voting window expired at block {0}")]
+    VotingWindowExpired(u64),
     #[error("activation height {0} is below minimum (current + delta_min = {1})")]
     InvalidActivationHeight(u64, u64),
     #[error("duplicate vote: this validator has already cast a vote for this proposal")]
@@ -865,6 +867,7 @@ struct AlgorithmActivationRules {
     minimum_height: u64,
     require_quorum: bool,
     stage_proposals: bool,
+    voting_window: Option<(u64, u64)>,
 }
 
 fn algorithm_activation_rules<S: KvStore + 'static>(
@@ -896,6 +899,17 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
             .as_ref()
             .and_then(|config| config.algorithm_proposal_staging_height),
     );
+    let voting_window = config
+        .as_ref()
+        .and_then(|config| config.algorithm_voting_window)
+        .filter(|window| activated(Some(window.activation_height)))
+        .map(|window| {
+            window
+                .duration_blocks()
+                .map(|blocks| (block_number.unwrap_or(0), blocks))
+        })
+        .transpose()
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?;
     let minimum_height = if target_delay {
         block_number
             .unwrap_or(0)
@@ -921,6 +935,7 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
         minimum_height,
         require_quorum,
         stage_proposals,
+        voting_window,
     })
 }
 
@@ -982,6 +997,38 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
         let stored_height = world_state
             .get_storage(&registry_address(), &height_key)
             .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        let deadline_key = algorithm_voting_deadline_key(algo);
+        let deadline = world_state
+            .get_storage(&registry_address(), &deadline_key)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        if stored_height != ShellHash::ZERO && deadline != ShellHash::ZERO {
+            let number = rules
+                .voting_window
+                .map(|(number, _)| number)
+                .ok_or_else(|| {
+                    SystemContractError::AbiDecode(
+                        "algorithm voting deadline requires execution context".into(),
+                    )
+                })?;
+            let deadline = decode_u64_from_hash(&deadline);
+            if number >= deadline {
+                return Err(SystemContractError::VotingWindowExpired(deadline));
+            }
+        }
+        let new_deadline = if stored_height == ShellHash::ZERO {
+            rules
+                .voting_window
+                .map(|(number, blocks)| {
+                    number.checked_add(blocks).ok_or_else(|| {
+                        SystemContractError::AbiDecode(
+                            "algorithm voting deadline exceeds block height range".into(),
+                        )
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
         if stored_height == ShellHash::ZERO {
             world_state
                 .set_storage(
@@ -1011,6 +1058,15 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
                 return Err(SystemContractError::GovernanceConflict);
             }
         }
+        if let Some(deadline) = new_deadline {
+            world_state
+                .set_storage(
+                    &registry_address(),
+                    &deadline_key,
+                    &encode_u64_as_hash(deadline),
+                )
+                .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+        }
         if !record_algorithm_vote(
             world_state,
             AlgorithmGovernanceOp::ProposeActivation,
@@ -1036,7 +1092,14 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
                 .set_storage(&registry_address(), &key, &encode_u64_as_hash(1))
                 .map_err(|e| SystemContractError::Storage(e.to_string()))?;
         }
-        for key in [height_key, verifier_key] {
+        for key in [
+            Some(height_key),
+            Some(verifier_key),
+            (deadline != ShellHash::ZERO || new_deadline.is_some()).then_some(deadline_key),
+        ]
+        .into_iter()
+        .flatten()
+        {
             world_state
                 .set_storage(&registry_address(), &key, &ShellHash::ZERO)
                 .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -1264,6 +1327,12 @@ fn algorithm_vote_key(
     }
     bytes.extend_from_slice(b":");
     bytes.extend_from_slice(voter.as_bytes());
+    keccak256(&bytes)
+}
+
+fn algorithm_voting_deadline_key(algo: SignatureType) -> ShellHash {
+    let mut bytes = b"algorithm_voting_deadline:".to_vec();
+    bytes.push(algo.as_u8());
     keccak256(&bytes)
 }
 
@@ -3162,6 +3231,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3207,6 +3277,156 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_voting_window_boundaries_and_legacy_proposals() {
+        for (activation, interval, first, second, expires) in [
+            (None, 2, 1, 302_401, false),
+            (Some(2), 2, 1, 302_401, false),
+            (Some(1), 2, 1, 302_400, false),
+            (Some(1), 2, 1, 302_401, true),
+            (Some(0), 2, 1, 302_402, true),
+            (Some(0), 30, 1, 20_160, false),
+            (Some(0), 30, 1, 20_161, true),
+            (Some(0), 604_800, 1, 1, false),
+            (Some(0), 604_800, 1, 2, true),
+        ] {
+            let voters = [
+                Address::from([1; 20]),
+                Address::from([2; 20]),
+                Address::from([3; 20]),
+            ];
+            let mut ws = setup_with_validators(&voters);
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            cs.put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
+                algorithm_quorum_activation_height: None,
+                algorithm_proposal_staging_height: Some(0),
+                algorithm_voting_window: activation.map(|activation_height| {
+                    shell_storage::AlgorithmVotingWindow {
+                        activation_height,
+                        block_time_secs: interval,
+                    }
+                }),
+            })
+            .unwrap();
+            let algo = SignatureType::SphincsSha2256f;
+            let mut registry = AlgorithmRegistry::default();
+            let original = registry.clone();
+            let call = encode_propose_algorithm_activation_calldata(algo, 2_000_000, [0x44; 32]);
+            let (result, _) = execute_validator_registry_with_registry(
+                &voters[0],
+                &call,
+                &mut ws,
+                Some(&cs),
+                &mut registry,
+                Some(first),
+            )
+            .unwrap();
+            assert_eq!(result, encode_bool(false));
+            assert_eq!(registry, original);
+            let deadline = ws
+                .get_storage(&registry_address(), &algorithm_voting_deadline_key(algo))
+                .unwrap();
+            let guarded = activation.is_some_and(|height| first >= height);
+            assert_eq!(
+                decode_u64_from_hash(&deadline),
+                if guarded {
+                    first + 604_800 / interval
+                } else {
+                    0
+                }
+            );
+            registry = load_algorithm_registry(&ws).unwrap();
+            let root = ws.state_root().unwrap();
+            let result = execute_validator_registry_with_registry(
+                &voters[1],
+                &call,
+                &mut ws,
+                Some(&cs),
+                &mut registry,
+                Some(second),
+            );
+            if expires {
+                assert!(
+                    matches!(result, Err(SystemContractError::VotingWindowExpired(height)) if height == decode_u64_from_hash(&deadline))
+                );
+                assert_eq!(ws.state_root().unwrap(), root);
+                assert_eq!(registry, original);
+                assert_eq!(load_algorithm_registry(&ws).unwrap(), original);
+                assert!(
+                    process_pending_activations(2_000_000, &mut ws, &mut registry)
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(result.unwrap().0, encode_bool(true));
+                assert!(!registry.is_allowed(algo));
+                assert_eq!(
+                    ws.get_storage(&registry_address(), &algorithm_voting_deadline_key(algo))
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(
+                    process_pending_activations(2_000_000, &mut ws, &mut registry).unwrap(),
+                    vec![algo]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn algorithm_voting_window_overflow_rejects_before_candidate_writes() {
+        let voters = [
+            Address::from([1; 20]),
+            Address::from([2; 20]),
+            Address::from([3; 20]),
+        ];
+        let mut ws = setup_with_validators(&voters);
+        let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+        cs.put_chain_config(&shell_storage::ChainConfig {
+            chain_id: 1337,
+            genesis_hash: ShellHash::ZERO,
+            fee_accounting_activation_height: None,
+            bloom_activation_height: None,
+            log_address_activation_height: None,
+            algorithm_timelock_activation_height: None,
+            algorithm_quorum_activation_height: None,
+            algorithm_proposal_staging_height: Some(0),
+            algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
+                activation_height: 0,
+                block_time_secs: 2,
+            }),
+        })
+        .unwrap();
+        let mut registry = AlgorithmRegistry::default();
+        let original = registry.clone();
+        let root = ws.state_root().unwrap();
+        let call = encode_propose_algorithm_activation_calldata(
+            SignatureType::SphincsSha2256f,
+            u64::MAX,
+            [0x44; 32],
+        );
+        let error = execute_validator_registry_with_registry(
+            &voters[0],
+            &call,
+            &mut ws,
+            Some(&cs),
+            &mut registry,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("deadline exceeds block height range"));
+        assert_eq!(ws.state_root().unwrap(), root);
+        assert_eq!(registry, original);
+    }
+
+    #[test]
     fn algorithm_proposal_staging_preserves_policy_until_quorum() {
         let voters = [
             Address::from([1; 20]),
@@ -3228,6 +3448,7 @@ mod tests {
                     fee_accounting_activation_height: None,
                     bloom_activation_height: None,
                     log_address_activation_height: None,
+                    algorithm_voting_window: None,
                     algorithm_timelock_activation_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_proposal_staging_height: activation,
@@ -3366,6 +3587,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                algorithm_voting_window: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
