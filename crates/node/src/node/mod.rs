@@ -3161,6 +3161,7 @@ mod tests {
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,
                         algorithm_session_deprecation_height: None,
+                        session_registered_root_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -4937,6 +4938,7 @@ mod tests {
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
                             algorithm_session_deprecation_height: None,
+                            session_registered_root_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5087,6 +5089,7 @@ mod tests {
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
                             algorithm_session_deprecation_height: None,
+                            session_registered_root_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5186,6 +5189,7 @@ mod tests {
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,
                         algorithm_session_deprecation_height: None,
+                        session_registered_root_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -10795,6 +10799,298 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(node.fork_choice.read().contains(&side_fork_hash));
+    }
+
+    #[test]
+    fn import_rotated_session_preserves_registered_identity() {
+        for (activation, embedded) in [
+            (None, false),
+            (Some(3), false),
+            (Some(2), false),
+            (Some(2), true),
+        ] {
+            for algorithm in [
+                SignatureType::Dilithium3,
+                SignatureType::MlDsa65,
+                SignatureType::SphincsSha2256f,
+            ] {
+                let (node, proposer_signer) = setup_node();
+                let proposer = node.config.proposer_address.unwrap();
+                node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+
+                let old_root = MlDsaSigner::generate();
+                let root: Box<dyn Signer> = match algorithm {
+                    SignatureType::Dilithium3 => Box::new(DilithiumSigner::generate()),
+                    SignatureType::MlDsa65 => Box::new(MlDsaSigner::generate()),
+                    SignatureType::SphincsSha2256f => {
+                        Box::new(shell_crypto::SphincsSigner::generate())
+                    }
+                };
+                let session = DilithiumSigner::generate();
+                let sender =
+                    Address::from_public_key(old_root.public_key(), old_root.sig_type().as_u8());
+                let follower = setup_node_with_authority(proposer);
+                for peer in [&node, &follower] {
+                    peer.world_state
+                        .write()
+                        .set_account(
+                            &sender,
+                            &shell_core::Account::new_user_account(
+                                shell_primitives::blake3_hash(old_root.public_key()),
+                                U256::from(1_000_000_000_000_000u64),
+                            ),
+                        )
+                        .unwrap();
+                    peer.chain_store
+                        .put_pubkey(&sender, old_root.public_key())
+                        .unwrap();
+                    peer.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "genesis_hash":ShellHash::ZERO, "session_registered_root_height":activation
+            })).unwrap()).unwrap();
+                    store_consistent_genesis(peer);
+                    peer.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                }
+                let rotation = Transaction {
+                    chain_id: 1337,
+                    nonce: node.world_state.read().get_nonce(&sender).unwrap(),
+                    to: Some(shell_pqvm::account_manager_address()),
+                    value: U256::ZERO,
+                    data: Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                        root.public_key(),
+                        root.sig_type().as_u8(),
+                    )),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let rotation_sig = old_root
+                    .sign(
+                        rotation
+                            .signing_hash(old_root.sig_type().as_u8())
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                let rotation_tx = SignedTransaction::with_pubkey(
+                    sender,
+                    rotation,
+                    rotation_sig,
+                    old_root.public_key().to_vec(),
+                );
+                node.tx_pool
+                    .insert(
+                        rotation_tx,
+                        &mut node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+                let rotation_block = node.produce_block(&proposer_signer, 100).unwrap();
+                follower
+                    .import_block(rotation_block, &MultiVerifier)
+                    .unwrap();
+                for peer in [&node, &follower] {
+                    assert_eq!(
+                        peer.chain_store.get_pubkey(&sender).unwrap().as_deref(),
+                        Some(root.public_key())
+                    );
+                }
+
+                let recipient = Address::from([0x45; 20]);
+                let transaction = Transaction {
+                    chain_id: 1337,
+                    nonce: node.world_state.read().get_nonce(&sender).unwrap(),
+                    to: Some(recipient),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: 1_000_000_000,
+                    max_priority_fee_per_gas: 100_000_000,
+                    access_list: None,
+                    tx_type: AA_BUNDLE_TX_TYPE,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let inner_call = InnerCall {
+                    to: Some(recipient),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 50_000,
+                };
+                let mut session_auth = SessionAuth {
+                    session_pubkey: Bytes::from(session.public_key().to_vec()),
+                    session_algo: session.sig_type().as_u8(),
+                    target: Some(recipient),
+                    value_cap: U256::ZERO,
+                    expiry_block: 10,
+                    root_signature: Bytes::new(),
+                    session_signature: Bytes::from(vec![1]),
+                };
+                session_auth.root_signature = Bytes::from(
+                    root.sign(session_auth.auth_hash(transaction.chain_id).as_bytes())
+                        .unwrap()
+                        .data,
+                );
+                let placeholder = session.sign(b"placeholder").unwrap();
+                let unsigned = SignedTransaction::with_aa_bundle(
+                    sender,
+                    transaction.clone(),
+                    placeholder,
+                    if embedded {
+                        PubkeyMode::Embedded(root.public_key().to_vec())
+                    } else {
+                        PubkeyMode::Reference
+                    },
+                    AaBundle {
+                        inner_calls: vec![inner_call.clone()],
+                        session_auth: Some(session_auth.clone()),
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                let session_signature = session
+                    .sign(unsigned.sender_signing_hash().as_bytes())
+                    .unwrap();
+                session_auth.session_signature = Bytes::from(session_signature.data.clone());
+                let signed = SignedTransaction::with_aa_bundle(
+                    sender,
+                    transaction,
+                    session_signature,
+                    if embedded {
+                        PubkeyMode::Embedded(root.public_key().to_vec())
+                    } else {
+                        PubkeyMode::Reference
+                    },
+                    AaBundle {
+                        inner_calls: vec![inner_call],
+                        session_auth: Some(session_auth),
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                let header = BlockHeader {
+                    number: 2,
+                    ..BlockHeader::default()
+                };
+                let mut bad = signed.clone();
+                bad.aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap()
+                    .root_signature = Bytes::from(vec![1]);
+                assert!(shell_pqvm::validate_tx_for_import_at_block(
+                    &bad,
+                    &mut follower.world_state.write(),
+                    follower.chain_store.as_ref(),
+                    &MultiVerifier,
+                    1337,
+                    None,
+                    &header
+                )
+                .is_err());
+                let mut stale = signed.clone();
+                stale.pubkey_mode = PubkeyMode::Embedded(old_root.public_key().to_vec());
+                let auth = stale
+                    .aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap();
+                auth.root_signature =
+                    Bytes::from(old_root.sign(auth.auth_hash(1337).as_bytes()).unwrap().data);
+                stale.signature = session
+                    .sign(stale.sender_signing_hash().as_bytes())
+                    .unwrap();
+                stale
+                    .aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap()
+                    .session_signature = Bytes::from(stale.signature.data.clone());
+                assert!(matches!(
+                    shell_pqvm::validate_tx_for_import_at_block(
+                        &stale,
+                        &mut follower.world_state.write(),
+                        follower.chain_store.as_ref(),
+                        &MultiVerifier,
+                        1337,
+                        None,
+                        &header
+                    ),
+                    Err(TxValidationError::PubkeyConflict)
+                ));
+                {
+                    let mut world_state = node.world_state.write();
+                    node.tx_pool
+                        .insert(
+                            signed,
+                            &mut world_state,
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                }
+
+                let canonical = node.produce_block(&proposer_signer, 101).unwrap();
+                let root_before = current_state_root(&follower);
+                let head_before = follower.chain_store.get_head_hash().unwrap();
+                let account_before = follower.world_state.read().get_account(&sender).unwrap();
+                if activation != Some(2) {
+                    let error = follower
+                        .import_block(canonical, &MultiVerifier)
+                        .unwrap_err();
+                    assert!(error
+                        .to_string()
+                        .contains("does not match resolved root pubkey"));
+                    assert_eq!(current_state_root(&follower), root_before);
+                    assert_eq!(follower.chain_store.get_head_hash().unwrap(), head_before);
+                    assert_eq!(
+                        follower.world_state.read().get_account(&sender).unwrap(),
+                        account_before
+                    );
+                    assert_eq!(
+                        follower.chain_store.get_pubkey(&sender).unwrap().as_deref(),
+                        Some(root.public_key())
+                    );
+                    continue;
+                }
+                follower
+                    .import_block(canonical.clone(), &MultiVerifier)
+                    .unwrap();
+                assert_eq!(current_state_root(&follower), canonical.header.state_root);
+                assert_eq!(
+                    follower.world_state.read().get_nonce(&sender).unwrap(),
+                    node.world_state.read().get_nonce(&sender).unwrap()
+                );
+
+                let mut side_fork = canonical.clone();
+                side_fork.header.extra_data = Bytes::from_static(b"session-side-fork");
+                side_fork.header.witness_root = None;
+                side_fork.proposer_seal = Some(
+                    proposer_signer
+                        .sign(side_fork.header.hash().as_bytes())
+                        .unwrap(),
+                );
+                let side_fork_hash = side_fork.hash();
+
+                node.import_block(side_fork, &MultiVerifier).unwrap();
+
+                assert!(node
+                    .chain_store
+                    .get_block_by_hash(&side_fork_hash)
+                    .unwrap()
+                    .is_some());
+                assert!(node.fork_choice.read().contains(&side_fork_hash));
+            }
+        }
     }
 
     #[test]

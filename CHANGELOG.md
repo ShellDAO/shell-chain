@@ -18,6 +18,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `session_registered_root_height` so block import can accept
+  session transactions after a root-key rotation confirmed in an earlier block.
+  Use the current registered key while retaining account-hash and real signature
+  validation. Cover canonical import and side-fork validation, preserve legacy
+  behavior when omitted, and persist the immutable activation across startup and
+  trusted snapshots. Same-block rotation and rotated-root algorithm lifecycle
+  binding remain separate work.
+
 - Add independent optional `algorithm_session_deprecation_height` for session
   authorization by original registered root keys after algorithm deprecation.
   Share root verification between admission and block import, bind upgraded

@@ -60,3 +60,23 @@ root verification and import's address-binding restriction remain in place for
 rotated keys. Persisting a rotation algorithm and defining its upgrade semantics
 requires a separate implementation. This bounded step does not close that gap,
 change paymaster or validator policy, or activate a live network.
+
+## Import binding after a confirmed key rotation
+
+A separate `session_registered_root_height` repairs the mismatch between AA
+validation, which uses the registered key, and import batching, which previously
+required that key to derive the sender address. At and after activation, import
+may use an exact match with the current branch's registered public key. Full AA
+validation still checks the account public-key hash and both session signatures.
+Canonical import and fork replay call the same batch helper.
+
+This schedule is independent of the original-root deprecation exception. Before
+activation, and when omitted, import retains its historical address check. Store
+and validate the immutable schedule using the existing future-only startup and
+trusted snapshot rules. Coordinate activation across participating nodes.
+
+The bounded change covers rotations confirmed in a prior block. It neither
+persists an algorithm identifier for rotated keys nor changes their existing
+active-verifier fallback policy. Same-block rotation may still be rejected by
+parent-state batch/prevalidation; supporting it requires a separate validation
+ordering change. Full network activation is not implied by source availability.

@@ -102,10 +102,19 @@ At this stage the chain no longer needs to re-derive the address from the new
 public key, which is what makes **key rotation without address changes**
 possible.
 
-Session root signatures follow the same rotation model. Because the rotated
-key's algorithm is not stored separately, nodes try each algorithm that is
-currently active in the runtime registry. Deprecated and pending algorithms are
-not accepted for new session authorizations.
+Session root signatures follow the same rotation model in transaction
+validation. For block import, configure `session_registered_root_height` to
+apply registered-key binding from a coordinated candidate height. A replacement
+root confirmed in an earlier block then works with either embedded or reference
+keys. The node still checks the account key hash, root authorization and session
+signature; possession of an unrelated key cannot claim the stable address.
+
+Because a rotated key's algorithm is not stored separately, verification tries
+the currently active installed verifiers, including their compatibility
+fallbacks. This schedule changes address binding only. It does not add a unique
+algorithm binding or a deprecated-algorithm exception for rotated roots. An
+omitted schedule preserves the legacy import address check. Rotating and using
+the replacement key within the same block remains a separate limitation.
 
 ### 3.3 Layer 3 — custom validator path
 
@@ -310,8 +319,11 @@ original root, verification binds to its address algorithm, so a pending entry
 cannot pass through that fallback. Configure and coordinate a future height on
 all participating nodes; a stored schedule cannot be changed or removed.
 
-Session authorization after root-key rotation remains outside this exception:
-rotation does not persist the new algorithm identifier, and block import still
-requires the root key to derive the sender address. Paymaster verification,
-custom-validator cryptographic operations and validator consensus signatures
-also remain separate parts of the whitepaper's full operational guarantee.
+Session authorization after root-key rotation remains outside the deprecation
+exception: rotation does not persist the new algorithm identifier. The separate
+`session_registered_root_height` repairs import binding for keys accepted by the
+existing active-verifier policy, as described in section 3.2. Both schedules
+are immutable once stored; an existing chain may add only a future activation.
+Paymaster verification, custom-validator cryptographic operations and validator
+consensus signatures also remain separate parts of the whitepaper's full
+operational guarantee.
