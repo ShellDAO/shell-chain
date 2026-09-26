@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- Correct the native algorithm activation interface and selector to include the
+  target height and verifier hash. Explain calldata word order and distinguish
+  a successful vote receipt from quorum approval and eventual activation.
+
 ### Added
 
 - Add optional `algorithm_voting_window_activation_height`: newly staged algorithm
