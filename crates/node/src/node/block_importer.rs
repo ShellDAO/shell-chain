@@ -41,10 +41,11 @@ fn validate_import_tx_in_current_state<S: KvStore + 'static>(
     )
 }
 
-fn batch_signing_pubkey(
+fn batch_signing_pubkey<S: KvStore>(
     block_number: u64,
     tx: &SignedTransaction,
     root_pubkey: &[u8],
+    chain_store: &ChainStore<S>,
 ) -> Result<Vec<u8>, NodeError> {
     if tx.signature.data.is_empty() {
         return Err(NodeError::Startup(format!(
@@ -61,7 +62,18 @@ fn batch_signing_pubkey(
         return Ok(root_pubkey.to_vec());
     };
 
-    if infer_signature_type_from_address(root_pubkey, &tx.from).is_none() {
+    let registered_upgrade = shell_pqvm::registered_session_root_deprecation_enabled(
+        chain_store,
+        block_number,
+        &tx.from,
+        root_pubkey,
+    )?;
+    let address_bound = ALLOWED_ALGORITHMS
+        .iter()
+        .any(|algorithm| Address::from_public_key(root_pubkey, algorithm.as_u8()) == tx.from);
+    if infer_signature_type_from_address(root_pubkey, &tx.from).is_none()
+        && !(registered_upgrade && address_bound)
+    {
         return Err(NodeError::Startup(format!(
             "block {} tx {} sender {} does not match resolved root pubkey",
             block_number,
@@ -78,13 +90,13 @@ fn batch_signing_pubkey(
             tx.hash(),
         )));
     }
-    let auth_hash = session_auth.auth_hash(tx.tx.chain_id);
-    let root_valid = verify_import_session_root_signature(
+    let root_valid = shell_pqvm::verify_session_root_authorization(
+        tx,
         root_pubkey,
-        &auth_hash,
-        session_auth.root_signature.as_ref(),
+        chain_store,
+        block_number,
         &MultiVerifier,
-    );
+    )?;
     if !root_valid {
         return Err(NodeError::Startup(format!(
             "block {} tx {} session root signature is invalid",
@@ -94,24 +106,6 @@ fn batch_signing_pubkey(
     }
 
     Ok(session_auth.session_pubkey.as_ref().to_vec())
-}
-
-fn verify_import_session_root_signature<V: Verifier>(
-    root_pubkey: &[u8],
-    auth_hash: &ShellHash,
-    root_signature: &[u8],
-    verifier: &V,
-) -> bool {
-    ALLOWED_ALGORITHMS
-        .iter()
-        .copied()
-        .filter(|algorithm| shell_crypto::is_algorithm_allowed(*algorithm))
-        .any(|algorithm| {
-            let signature = PQSignature::new(algorithm, root_signature.to_vec());
-            verifier
-                .verify(root_pubkey, auth_hash.as_bytes(), &signature)
-                .unwrap_or(false)
-        })
 }
 
 impl<S: KvStore + 'static> Node<S> {
@@ -717,7 +711,7 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 };
                 signing_pubkeys.push(Some(
-                    batch_signing_pubkey(block.number(), tx, &root_pubkey)
+                    batch_signing_pubkey(block.number(), tx, &root_pubkey, &replay_cs)
                         .map_err(|error| Self::classify_fork_error(block.hash(), error))?,
                 ));
             }
@@ -1662,6 +1656,7 @@ impl<S: KvStore + 'static> Node<S> {
                     block.number(),
                     tx,
                     &root_pubkey,
+                    &import_cs,
                 )?));
             }
             let verify_items: Vec<VerifyItem> = block
@@ -2069,7 +2064,7 @@ impl<S: KvStore + 'static> Node<S> {
 mod tests {
     use super::*;
     use shell_core::{Account, PubkeyMode, Transaction};
-    use shell_crypto::{CryptoError, DilithiumSigner, SignatureType, Signer};
+    use shell_crypto::{DilithiumSigner, SignatureType, Signer};
     use shell_storage::{MemoryDb, StorageError};
 
     fn transaction() -> Transaction {
@@ -2089,44 +2084,113 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct AlgorithmOnlyVerifier(SignatureType);
-
-    impl Verifier for AlgorithmOnlyVerifier {
-        fn verify(
-            &self,
-            _pubkey: &[u8],
-            _message: &[u8],
-            signature: &PQSignature,
-        ) -> Result<bool, CryptoError> {
-            Ok(signature.sig_type == self.0)
-        }
-
-        fn sig_type(&self) -> SignatureType {
-            self.0
-        }
-    }
-
     #[test]
-    fn import_session_root_signature_skips_deprecated_algorithms() {
-        let root_pubkey = [0x42; 64];
-        let auth_hash = ShellHash::from([0x24; 32]);
-        let verifier = AlgorithmOnlyVerifier(SignatureType::MlDsa65);
-        assert!(verify_import_session_root_signature(
-            &root_pubkey,
-            &auth_hash,
-            &[1],
-            &verifier,
-        ));
-
-        let mut registry = AlgorithmRegistry::default();
-        registry.deprecate(SignatureType::MlDsa65);
-
-        let verified = with_algorithm_registry_override(&registry, || {
-            verify_import_session_root_signature(&root_pubkey, &auth_hash, &[1], &verifier)
-        });
-
-        assert!(!verified);
+    fn import_session_root_deprecation_requires_registered_bound_key_and_activation() {
+        use shell_core::{AaBundle, InnerCall, SessionAuth, AA_BUNDLE_TX_TYPE};
+        use shell_crypto::{MlDsaSigner, SphincsSigner};
+        let roots: Vec<Box<dyn Signer>> = vec![
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ];
+        for root in roots {
+            let session: Box<dyn Signer> = if root.sig_type() == SignatureType::MlDsa65 {
+                Box::new(DilithiumSigner::generate())
+            } else {
+                Box::new(MlDsaSigner::generate())
+            };
+            let cs = ChainStore::new(Arc::new(MemoryDb::new()));
+            cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                    "algorithm_session_deprecation_height":10
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let from = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
+            let mut tx = transaction();
+            tx.tx_type = AA_BUNDLE_TX_TYPE;
+            let mut auth = SessionAuth {
+                session_pubkey: Bytes::from(session.public_key().to_vec()),
+                session_algo: session.sig_type().as_u8(),
+                target: None,
+                value_cap: U256::ZERO,
+                expiry_block: 20,
+                root_signature: Bytes::new(),
+                session_signature: Bytes::from(vec![1]),
+            };
+            auth.root_signature = Bytes::from(
+                root.sign(auth.auth_hash(tx.chain_id).as_bytes())
+                    .unwrap()
+                    .data,
+            );
+            let mut signed = SignedTransaction::with_aa_bundle(
+                from,
+                tx,
+                PQSignature::new(session.sig_type(), vec![1]),
+                PubkeyMode::Embedded(root.public_key().to_vec()),
+                AaBundle {
+                    inner_calls: vec![InnerCall {
+                        to: Some(Address::ZERO),
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 21_000,
+                    }],
+                    session_auth: Some(auth),
+                    ..AaBundle::default()
+                },
+            )
+            .unwrap();
+            signed.signature = session
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            signed
+                .aa_bundle
+                .as_mut()
+                .unwrap()
+                .session_auth
+                .as_mut()
+                .unwrap()
+                .session_signature = Bytes::from(signed.signature.data.clone());
+            let mut registry = AlgorithmRegistry::default();
+            with_algorithm_registry_override(&registry, || {
+                assert_eq!(
+                    batch_signing_pubkey(9, &signed, root.public_key(), &cs).unwrap(),
+                    session.public_key()
+                );
+            });
+            registry.deprecate(root.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                // An earlier embedded key alone does not grant the registered-account exception.
+                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &cs).is_err());
+                cs.put_pubkey(&from, root.public_key()).unwrap();
+                assert!(batch_signing_pubkey(9, &signed, root.public_key(), &cs).is_err());
+                for number in [10, 11] {
+                    assert_eq!(
+                        batch_signing_pubkey(number, &signed, root.public_key(), &cs).unwrap(),
+                        session.public_key()
+                    );
+                }
+                let mut bad = signed.clone();
+                bad.aa_bundle
+                    .as_mut()
+                    .unwrap()
+                    .session_auth
+                    .as_mut()
+                    .unwrap()
+                    .root_signature = Bytes::from(vec![1]);
+                assert!(batch_signing_pubkey(10, &bad, root.public_key(), &cs).is_err());
+                assert!(batch_signing_pubkey(10, &signed, session.public_key(), &cs).is_err());
+                let legacy = ChainStore::new(Arc::new(MemoryDb::new()));
+                legacy.put_pubkey(&from, root.public_key()).unwrap();
+                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &legacy).is_err());
+            });
+            registry.propose_activation(root.sig_type());
+            with_algorithm_registry_override(&registry, || {
+                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &cs).is_err());
+            });
+        }
     }
 
     #[test]

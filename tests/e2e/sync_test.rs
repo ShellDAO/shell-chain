@@ -190,6 +190,7 @@ async fn snapshot_export_import_roundtrip() {
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
+            algorithm_session_deprecation_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

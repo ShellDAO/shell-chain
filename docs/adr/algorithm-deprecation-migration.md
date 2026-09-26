@@ -35,3 +35,28 @@ complete the whitepaper's broader operational guarantee. Do not globally mark
 `Deprecated` as accepted: callers without account context could otherwise admit
 new accounts. This schedule neither changes live network activation nor declares
 the full algorithm-agility protocol implemented.
+
+## Session authorization by original registered roots
+
+Use a separate, default-off `algorithm_session_deprecation_height` so the
+root-transaction schedule retains its original meaning. At activation, authorize
+an active session under an original registered root whose address algorithm is
+`Active` or `Deprecated`. Resolve the root algorithm from the registered key and
+account address before verifying its signature. This prevents ML-DSA's legacy
+Dilithium compatibility fallback from masking a pending ML-DSA registry entry.
+Preserve that historical fallback before activation and when the schedule is
+absent. New addresses still require an active root algorithm.
+
+Share root verification between AA validation and both canonical and fork block
+import. Only the actual branch-local registered key qualifies; an earlier
+embedded key collected during batch preparation alone is insufficient. Keep
+session algorithm status, signature binding, expiry, value cap and target checks.
+Apply the same immutable, future-only scheduling and trusted snapshot checks as
+the direct-root upgrade, using the explicit candidate height for replay.
+
+The exception covers address-derived original roots. Rotation preserves the
+address without recording the new algorithm identifier; legacy active-only
+root verification and import's address-binding restriction remain in place for
+rotated keys. Persisting a rotation algorithm and defining its upgrade semantics
+requires a separate implementation. This bounded step does not close that gap,
+change paymaster or validator policy, or activate a live network.

@@ -24,7 +24,8 @@ pub mod tracer;
 mod tx_validation;
 
 pub use aa_validation::{
-    validate_aa_tx, validate_aa_tx_at_block, AaValidationError, AaValidationOutcome,
+    registered_session_root_deprecation_enabled, validate_aa_tx, validate_aa_tx_at_block,
+    verify_session_root_authorization, AaValidationError, AaValidationOutcome,
     PAYMASTER_VALIDATE_GAS_CAP, VALIDATION_GAS_CAP,
 };
 pub use executor::{
