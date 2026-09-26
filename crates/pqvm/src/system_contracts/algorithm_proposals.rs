@@ -253,7 +253,7 @@ fn submit<S: KvStore + 'static>(
     }
     // All semantic rejection checks precede writes. Old records and votes stay
     // immutable so duplicate IDs remain rejected after expiry and replacement.
-    for (field, word) in params.chunks_exact(32).enumerate() {
+    for (field, word) in params.as_chunks::<32>().0.iter().enumerate() {
         write(
             ws,
             &field_key(&id, field as u8),
