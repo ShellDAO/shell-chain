@@ -70,6 +70,8 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                 )?;
                 shell_storage::ChainConfig {
                     log_address_activation_height: genesis.log_address_activation_height,
+                    algorithm_timelock_activation_height: genesis
+                        .algorithm_timelock_activation_height,
                     bloom_activation_height: genesis.bloom_activation_height,
                     fee_accounting_activation_height: genesis.fee_accounting_activation_height,
                     chain_id: genesis.chain_id,
@@ -127,6 +129,7 @@ mod tests {
         genesis.fee_accounting_activation_height = activation;
         genesis.bloom_activation_height = activation.map(|height| height + 1);
         genesis.log_address_activation_height = activation.map(|height| height + 2);
+        genesis.algorithm_timelock_activation_height = activation.map(|height| height + 3);
         std::fs::write(
             datadir.join("genesis.json"),
             genesis.to_json_pretty().unwrap(),
@@ -167,6 +170,7 @@ mod tests {
             assert_eq!(config.fee_accounting_activation_height, Some(2));
             assert_eq!(config.bloom_activation_height, Some(3));
             assert_eq!(config.log_address_activation_height, Some(4));
+            assert_eq!(config.algorithm_timelock_activation_height, Some(5));
         }
 
         let error = import_state(dir.path().to_path_buf(), snapshot).unwrap_err();

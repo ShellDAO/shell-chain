@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `algorithm_timelock_activation_height` scheduling for the
+  white-paper 1,296,000-block algorithm governance delay. Preserve historical
+  500,000-block validation, reject target-height overflow, and verify the
+  schedule on restart and snapshot import. Existing networks remain unchanged
+  until an explicit coordinated activation; finish pending shorter-delay voting
+  rounds before upgrading.
+
 - Replay ValidatorRegistry governance transactions and prefixes using historical
   public keys and parent height, with algorithm-registry changes confined to the
   replay worker. Preserve executed admission, authorization and duplicate-vote

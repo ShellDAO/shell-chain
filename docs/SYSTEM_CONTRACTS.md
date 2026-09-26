@@ -122,9 +122,15 @@ Each proposal has a unique ID derived as:
 proposal_id = BLAKE3(algo_id ‖ spec_bytes ‖ activation_height ‖ proposer_pk)
 ```
 
-The minimum delay between proposal and activation is **Δ_min = 30 days** (approximately
-1,296,000 blocks at 2 s/block). This prevents rapid algorithm switches that could
-destabilise the network.
+The white-paper target is **Δ_min = 30 days** (1,296,000 blocks at 2 s/block).
+It is enforced from the explicitly configured `algorithm_timelock_activation_height`:
+a vote in block `N` requires an algorithm activation height of at least
+`N + 1,296,000`. Missing configuration and historical blocks before that upgrade
+retain the legacy parent-height-plus-500,000 rule. The delay is checked for each
+vote; finish shorter-delay voting rounds before upgrading. See
+[activation and compatibility rules](CONSENSUS_DETAILS.md#algorithm-governance-timelock-activation).
+This timelock upgrade does not complete the separate voting-window and emergency
+signature-policy requirements.
 
 ---
 

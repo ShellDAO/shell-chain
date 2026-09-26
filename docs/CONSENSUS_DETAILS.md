@@ -74,6 +74,41 @@ For normal transaction blocks, the reward rules are:
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.
 
+### Algorithm governance timelock activation
+
+The optional `algorithm_timelock_activation_height` in `genesis.json` selects
+when algorithm activation votes enforce the white-paper minimum of 1,296,000
+blocks (30 days at a two-second slot time). Missing or null keeps legacy rules;
+no existing network changes automatically. This is a block count, not a wall-clock
+deadline when a network uses a different block interval.
+
+For a vote executed in block `N` at or after the configured height, the proposed
+algorithm activation must be at least `N + 1,296,000`. Equality is accepted;
+one block less and arithmetic overflow are rejected without applying the vote.
+Before the upgrade, validation retains the exact legacy rule: canonical parent
+height plus 500,000 blocks, including its original saturating arithmetic.
+Production, import, simulation and historical replay select the rule from the
+executed block header, rather than the current tip. Already accepted proposals
+keep their recorded activation heights; the scheduled activation processor is
+unchanged.
+
+The delay is checked on **every submitted vote**, as in the legacy implementation.
+Complete pending voting rounds before the upgrade, or choose an activation height
+that leaves the new minimum delay for all votes after the boundary. An incomplete
+legacy proposal with a shorter delay cannot receive further votes under the new
+rule. Existing proposal identity, quorum and duplicate-vote behavior is unchanged.
+This option does not implement the separate seven-day voting-window or emergency
+signature-policy requirements in the white paper.
+
+The schedule is independent of the fee, Bloom and log emitter schedules. It is
+persisted and checked on restart and trusted snapshot import. On an existing
+chain, configure the same future height on every upgraded node using its original
+genesis configuration; startup requires that height to be strictly above the
+canonical head. Once saved, the height cannot be changed or removed. For an
+explicitly configured fresh test chain, height zero enables the rule immediately.
+Coordinate a client rollout before choosing an activation height on a live network.
+See [the compatibility decision](adr/algorithm-governance-timelock.md).
+
 ### Log emitter address activation
 
 The optional `log_address_activation_height` in `genesis.json` restores known
@@ -111,7 +146,7 @@ signing payloads and hashes are preserved. RPC returns their stored Bloom bytes.
 Both log-range queries and filter polling select the format for each queried
 block, including removed logs after a reorganization.
 
-The fee, Bloom and log emitter schedules are independent persisted chain configuration.
+The fee, Bloom, log emitter and algorithm timelock schedules are independent persisted chain configuration.
 Startup validates all proposed schedules before publishing any of them. A new
 schedule on an existing chain must be strictly above its canonical head; an
 existing schedule cannot be removed or changed. Restart and snapshot import

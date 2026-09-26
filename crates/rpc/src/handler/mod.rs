@@ -3792,6 +3792,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: Some(5),
             })
@@ -3841,6 +3842,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: Some(0),
             })
@@ -7596,9 +7598,18 @@ mod tests {
     }
 
     fn store_validator_trace_history(handler: &RpcHandler<MemoryDb>) -> Vec<Block> {
+        store_validator_trace_history_with_timelock(handler, None, 500_001, 1)
+    }
+
+    fn store_validator_trace_history_with_timelock(
+        handler: &RpcHandler<MemoryDb>,
+        activation: Option<u64>,
+        proposed: u64,
+        proposal_status: u8,
+    ) -> Vec<Block> {
         use shell_pqvm::system_contracts::{
             encode_add_validator_calldata, encode_deprecate_algorithm_calldata,
-            encode_propose_algorithm_activation_calldata, ALGO_GOVERNANCE_DELTA_MIN,
+            encode_propose_algorithm_activation_calldata,
         };
         let store = Arc::clone(handler.chain_store.store());
         let owner = Address::from([0xa1; 32]);
@@ -7616,6 +7627,17 @@ mod tests {
         handler
             .chain_store
             .commit_canonical_block(&parent, None)
+            .unwrap();
+        handler
+            .chain_store
+            .put_chain_config(&shell_storage::ChainConfig {
+                chain_id: 42,
+                genesis_hash: parent.hash(),
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_timelock_activation_height: activation,
+            })
             .unwrap();
         let registry_address = shell_pqvm::system_contracts::registry_address();
         let algo = shell_crypto::SignatureType::SphincsSha2256f;
@@ -7646,11 +7668,7 @@ mod tests {
                     (registry_address, encode_deprecate_algorithm_calldata(algo)),
                     (
                         registry_address,
-                        encode_propose_algorithm_activation_calldata(
-                            algo,
-                            ALGO_GOVERNANCE_DELTA_MIN + parent.header.number,
-                            [0x33; 32],
-                        ),
+                        encode_propose_algorithm_activation_calldata(algo, proposed, [0x33; 32]),
                     ),
                     (target, vec![]),
                 ]
@@ -7692,7 +7710,16 @@ mod tests {
                     let result = executor
                         .execute_tx(&tx, &block.header, index as u32, cumulative)
                         .unwrap();
-                    assert_eq!(result.receipt.status, if number == 1 { 0 } else { 1 });
+                    assert_eq!(
+                        result.receipt.status,
+                        if number == 1 {
+                            0
+                        } else if index == 1 {
+                            proposal_status
+                        } else {
+                            1
+                        }
+                    );
                     cumulative = result.receipt.cumulative_gas_used;
                     if !result.is_system_tx {
                         shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
@@ -7783,6 +7810,49 @@ mod tests {
             handler.chain_store.store().scan_prefix(&[]).unwrap()
         );
         assert_eq!(registry_before, *shell_crypto::AlgorithmRegistry::global());
+    }
+
+    #[tokio::test]
+    async fn algorithm_timelock_trace_preserves_pre_and_post_activation_results() {
+        for (activation, proposed, expected_status) in [
+            (None, 500_001, 1),
+            (Some(3), 500_001, 1),
+            (Some(2), 500_001, 0),
+            (Some(2), 1_296_001, 0),
+            (Some(2), 1_296_002, 1),
+            (Some(0), 1_296_002, 1),
+        ] {
+            let handler = setup();
+            let blocks = store_validator_trace_history_with_timelock(
+                &handler,
+                activation,
+                proposed,
+                expected_status,
+            );
+            let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+            let registry_before = shell_crypto::AlgorithmRegistry::global().clone();
+            let trace = DebugApiServer::trace_transaction(
+                &handler,
+                blocks[1].transactions[1].hash().to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(trace["failed"], expected_status == 0);
+            if expected_status == 1 {
+                assert_eq!(trace["output"], format!("0x{:064x}", 1));
+            } else {
+                let output =
+                    hex::decode(trace["output"].as_str().unwrap().trim_start_matches("0x"))
+                        .unwrap();
+                assert!(String::from_utf8(output).unwrap().contains("1296002"));
+            }
+            assert_eq!(
+                before,
+                handler.chain_store.store().scan_prefix(&[]).unwrap()
+            );
+            assert_eq!(registry_before, *shell_crypto::AlgorithmRegistry::global());
+        }
     }
 
     #[tokio::test]

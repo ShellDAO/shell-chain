@@ -101,6 +101,7 @@ pub fn init(
 
             GenesisConfig {
                 log_address_activation_height: None,
+                algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: None,
                 chain_id,
