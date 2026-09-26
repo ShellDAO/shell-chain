@@ -32,7 +32,9 @@ interface IValidatorRegistry {
     function addValidator(address validator) external;
     function removeValidator(address validator) external;
     function setValidatorWeight(address validator, uint64 weight) external;
-    function proposeAlgorithmActivation(uint8 algo) external;
+    function proposeAlgorithmActivation(
+        uint8 algo, uint64 activationHeight, bytes32 verifierHash
+    ) external returns (bool approved);
     function deprecateAlgorithm(uint8 algo) external;
 
     // ── Read (anyone) ───────────────────────────────────────────────────────
@@ -48,10 +50,35 @@ interface IValidatorRegistry {
 | `addValidator(address)` | `0x4d238c8e` | validators only |
 | `removeValidator(address)` | `0x40a141ff` | validators only |
 | `setValidatorWeight(address,uint64)` | `0xa6d5d626` | validators only |
-| `proposeAlgorithmActivation(uint8)` | `0x487aee59` | validators only |
+| `proposeAlgorithmActivation(uint8,uint64,bytes32)` | `0x1b7520b8` | validators only |
 | `deprecateAlgorithm(uint8)` | `0xa4b88278` | validators only |
 | `getValidators()` | `0xb7ab4db5` | anyone |
 | `isValidator(address)` | `0xfacd743b` | anyone |
+
+### Submitting an algorithm activation vote
+
+Send a signed native transaction to `ValidatorRegistry` with selector
+`0x1b7520b8`, followed by three 32-byte ABI words in this order:
+
+1. `algo`: the installed algorithm identifier (`uint8`, left-padded with zeros).
+2. `activationHeight`: the proposed activation block (`uint64`, left-padded with zeros).
+3. `verifierHash`: the candidate verifier hash (`bytes32`).
+
+The one-argument `proposeAlgorithmActivation(uint8)` interface is not supported.
+Every vote on the same candidate must use matching height and verifier hash, and
+the height must satisfy the applicable [timelock rules](CONSENSUS_DETAILS.md#algorithm-governance-timelock-activation).
+The method returns ABI `false` for an accepted vote below quorum and `true` when
+that vote reaches quorum. A successful transaction receipt therefore does not by
+itself mean the proposal was approved. The executed return value is available in
+`debug_traceTransaction` output when the node enables debug RPC and retains the
+required history; receipts do not contain native return values.
+
+With [proposal staging](CONSENSUS_DETAILS.md#algorithm-proposal-staging) enabled,
+a sub-quorum vote leaves live algorithm policy unchanged. The quorum-reaching
+vote publishes a pending entry; actual activation still waits for the target
+height. The separate [voting window](CONSENSUS_DETAILS.md#algorithm-voting-window)
+can reject expired votes. These optional upgrades and their legacy behavior are
+specified in the linked activation rules.
 
 ### Calling from Solidity
 
