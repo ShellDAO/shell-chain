@@ -1422,7 +1422,9 @@ changes also support replay, including earlier transactions in the same block,
 using a consistent metadata snapshot and the original parent height. These
 methods require history within the latest 128 blocks, retained undo journals,
 and a native metadata snapshot no larger than 64 MiB. Upgrades do not restore
-already-pruned journals. ValidatorRegistry native calls remain unavailable.
+already-pruned journals. ValidatorRegistry governance calls use the same native
+history bounds. Replay uses historical validator/public-key state and parent
+height; algorithm changes stay in the worker's private registry.
 Missing history and capture/response limits return an RPC error instead of a
 receipt-derived approximation. PQVM removes SELFDESTRUCT and CALLCODE, so they
 do not produce successful externality events. The same capture and concurrency

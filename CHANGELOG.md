@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Replay ValidatorRegistry governance transactions and prefixes using historical
+  public keys and parent height, with algorithm-registry changes confined to the
+  replay worker. Preserve executed admission, authorization and duplicate-vote
+  failures after live state changes; use the existing bounded native history.
+
 - Replay AccountManager guardian and recovery transactions using a consistent
   historical metadata snapshot and the original parent height. Preserve early
   recovery failures after the live head passes maturity, without changing live
