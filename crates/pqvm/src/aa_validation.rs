@@ -1864,8 +1864,9 @@ mod tests {
             };
             configure(Some(10));
             set_head_number(&cs, 8);
+            let account_nonce = ws.get_nonce(&from).unwrap();
             let make_tx = |embedded| {
-                let tx = base_tx(1337, 0);
+                let tx = base_tx(1337, account_nonce);
                 let sig = signer
                     .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
                     .unwrap();
@@ -1896,7 +1897,7 @@ mod tests {
                 for signed in [&embedded, &referenced] {
                     validate_tx(signed, &mut ws, &cs, &MultiVerifier, 1337).unwrap();
                 }
-                let mut tx = base_tx(1337, 0);
+                let mut tx = base_tx(1337, account_nonce);
                 tx.tx_type = AA_BUNDLE_TX_TYPE;
                 tx.gas_limit = 100_000;
                 let mut bundle_tx = SignedTransaction::with_aa_bundle(
