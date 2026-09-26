@@ -82,6 +82,32 @@ impl KvStore for MemoryDb {
         Ok(())
     }
 
+    fn snapshot_prefixes(
+        &self,
+        prefixes: &[&[u8]],
+        max_bytes: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut entries = std::collections::BTreeMap::new();
+        let mut bytes = 0;
+        for (key, value) in data
+            .iter()
+            .filter(|(key, _)| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+        {
+            crate::kv_store::insert_snapshot_entry(
+                &mut entries,
+                &mut bytes,
+                max_bytes,
+                key,
+                value,
+            )?;
+        }
+        Ok(entries)
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let data = self
             .data

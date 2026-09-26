@@ -1621,7 +1621,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         match self
             .chain_store
-            .prune_finalized_address_metadata_undo(finalized_number)
+            .prune_address_metadata_history(finalized_number)
         {
             Ok(pruned) if pruned > 0 => {
                 tracing::debug!(

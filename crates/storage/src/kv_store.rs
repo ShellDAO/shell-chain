@@ -64,6 +64,19 @@ pub trait KvStore: Send + Sync {
     fn flush(&self) -> Result<(), StorageError>;
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError>;
 
+    /// Copy selected prefixes from one consistent read view, bounded by estimated
+    /// entry storage. Implementations must not combine independently timed reads.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_prefixes(
+        &self,
+        _prefixes: &[&[u8]],
+        _max_bytes: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+        Err(StorageError::Database(
+            "consistent prefix snapshots unavailable".into(),
+        ))
+    }
+
     /// Check if a key exists without reading the full value.
     fn contains(&self, key: &[u8]) -> Result<bool, StorageError> {
         Ok(self.get(key)?.is_some())
@@ -148,6 +161,32 @@ pub trait KvStore: Send + Sync {
         }
         Ok(())
     }
+}
+
+/// Include a conservative allocation allowance in addition to encoded bytes.
+const SNAPSHOT_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+pub(crate) fn insert_snapshot_entry(
+    entries: &mut std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    bytes: &mut usize,
+    max_bytes: usize,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), StorageError> {
+    if entries.contains_key(key) {
+        return Ok(());
+    }
+    *bytes = bytes
+        .saturating_add(key.len())
+        .saturating_add(value.len())
+        .saturating_add(SNAPSHOT_ENTRY_OVERHEAD_BYTES);
+    if *bytes > max_bytes {
+        return Err(StorageError::Database(
+            "prefix snapshot exceeds memory limit".into(),
+        ));
+    }
+    entries.insert(key.to_vec(), value.to_vec());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,5 +355,54 @@ mod tests {
     #[test]
     fn entry_length_saturates() {
         assert_eq!(saturating_entry_len(usize::MAX, usize::MAX), u64::MAX);
+    }
+    fn assert_consistent_snapshot<S: KvStore + 'static>(store: std::sync::Arc<S>) {
+        let put_pair = |n: u64| {
+            let mut batch = WriteBatch::new();
+            batch.put(b"a/x".to_vec(), n.to_be_bytes().to_vec());
+            batch.put(b"b/x".to_vec(), n.to_be_bytes().to_vec());
+            store.write_batch(batch).unwrap();
+        };
+        put_pair(0);
+        store.put(b"excluded", b"value").unwrap();
+        let snapshot = store
+            .snapshot_prefixes(&[b"a/", b"a/x", b"b/"], 278)
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(store.snapshot_prefixes(&[b"a/", b"b/"], 277).is_err());
+        let writer_store = std::sync::Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            for n in 1u64..1000 {
+                let mut batch = WriteBatch::new();
+                batch.put(b"a/x".to_vec(), n.to_be_bytes().to_vec());
+                batch.put(b"b/x".to_vec(), n.to_be_bytes().to_vec());
+                writer_store.write_batch(batch).unwrap();
+            }
+        });
+        for _ in 0..1000 {
+            let current = store.snapshot_prefixes(&[b"a/", b"b/"], 278).unwrap();
+            assert_eq!(
+                current.get(b"a/x".as_slice()),
+                current.get(b"b/x".as_slice())
+            );
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            snapshot.get(b"a/x".as_slice()).unwrap(),
+            &0u64.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_is_bounded_and_consistent() {
+        assert_consistent_snapshot(std::sync::Arc::new(crate::MemoryDb::new()));
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocks_snapshot_is_bounded_and_consistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let stores = crate::RocksDbStore::open_all(directory.path(), None).unwrap();
+        assert_consistent_snapshot(std::sync::Arc::new(stores.chain));
     }
 }

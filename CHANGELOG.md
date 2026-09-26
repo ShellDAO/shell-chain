@@ -6,10 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Replay AccountManager guardian and recovery transactions using a consistent
+  historical metadata snapshot and the original parent height. Preserve early
+  recovery failures after the live head passes maturity, without changing live
+  accounts. Retain 128 finalized blocks of metadata journals; native history
+  older than 128 head-relative blocks, pruned prerequisites, and snapshots over
+  64 MiB remain explicitly unavailable.
+
 - Allow historical `debug_` and `trace_` replay of AccountManager key rotation
   and validation-code clearing, including same-block prefixes. Native output
   and gas come from execution, with all metadata writes isolated from live
-  accounts. Native methods needing historical metadata remain unavailable.
+  accounts.
 
 - Replay `trace_transaction` and `trace_block` against historical state and
   return executed nested calls, creation results and per-frame errors with

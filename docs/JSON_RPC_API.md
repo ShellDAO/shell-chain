@@ -1417,8 +1417,12 @@ executed calls as children; this is a Shell-specific extension.
 
 Replay requires retained parent state and matching receipts. AccountManager
 `rotateKey` and `clearValidationCode` are replayable and return actual native
-output and gas without opcode logs. Other native transactions or prefixes that
-require historical address metadata or chain-head context remain unavailable.
+output and gas without opcode logs. Guardian, recovery and validation-code
+changes also support replay, including earlier transactions in the same block,
+using a consistent metadata snapshot and the original parent height. These
+methods require history within the latest 128 blocks, retained undo journals,
+and a native metadata snapshot no larger than 64 MiB. Upgrades do not restore
+already-pruned journals. ValidatorRegistry native calls remain unavailable.
 Missing history and capture/response limits return an RPC error instead of a
 receipt-derived approximation. PQVM removes SELFDESTRUCT and CALLCODE, so they
 do not produce successful externality events. The same capture and concurrency

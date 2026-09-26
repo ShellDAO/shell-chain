@@ -9,6 +9,7 @@ use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 /// [`commit`](Self::commit) is called.
 pub struct OverlayStore<S: KvStore> {
     base: Arc<S>,
+    frozen_prefixes: Vec<Vec<u8>>,
     changes: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
 }
 
@@ -16,8 +17,30 @@ impl<S: KvStore> OverlayStore<S> {
     pub fn new(base: Arc<S>) -> Self {
         Self {
             base,
+            frozen_prefixes: Vec::new(),
             changes: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Freeze selected namespaces at one bounded consistent snapshot. Missing
+    /// keys in these namespaces must not fall through to later base-store writes.
+    /// This view is for read-only replay and cannot be committed.
+    pub fn with_snapshot_prefixes(
+        base: Arc<S>,
+        prefixes: &[&[u8]],
+        max_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let entries = base.snapshot_prefixes(prefixes, max_bytes)?;
+        Ok(Self {
+            base,
+            frozen_prefixes: prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
+            changes: RwLock::new(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, Some(value)))
+                    .collect(),
+            ),
+        })
     }
 
     /// Atomically apply all pending changes to the base store.
@@ -96,6 +119,11 @@ impl<S: KvStore> OverlayStore<S> {
     /// Additional operations are appended after overlay changes, so explicit
     /// commit metadata wins if both batches contain the same key.
     pub fn commit_with_batch(&self, additional: WriteBatch) -> Result<(), StorageError> {
+        if !self.frozen_prefixes.is_empty() {
+            return Err(StorageError::Database(
+                "cannot commit a frozen replay overlay".into(),
+            ));
+        }
         let mut changes = self
             .changes
             .write()
@@ -120,8 +148,23 @@ impl<S: KvStore> OverlayStore<S> {
 
     #[allow(clippy::type_complexity)]
     fn merged_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        let mut entries: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.base.scan_prefix(prefix)?.into_iter().collect();
+        let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = if self
+            .frozen_prefixes
+            .iter()
+            .any(|frozen| prefix.starts_with(frozen))
+        {
+            Vec::new()
+        } else {
+            self.base.scan_prefix(prefix)?
+        }
+        .into_iter()
+        .filter(|(key, _)| {
+            !self
+                .frozen_prefixes
+                .iter()
+                .any(|frozen| key.starts_with(frozen))
+        })
+        .collect();
         let changes = self
             .changes
             .read()
@@ -149,6 +192,13 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
             .get(key)
         {
             return Ok(value.clone());
+        }
+        if self
+            .frozen_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Ok(None);
         }
         self.base.get(key)
     }
@@ -297,5 +347,32 @@ mod tests {
             Some(&Some(b"config".to_vec()))
         );
         assert!(!checkpoint.contains_key(b"state/account-a".as_slice()));
+    }
+    #[test]
+    fn frozen_snapshot_hides_later_base_writes_and_cannot_commit() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"meta/old", b"before").unwrap();
+        let overlay =
+            OverlayStore::with_snapshot_prefixes(Arc::clone(&base), &[b"meta/"], 1024).unwrap();
+        base.delete(b"meta/old").unwrap();
+        base.put(b"meta/new", b"after").unwrap();
+        base.put(b"other", b"live").unwrap();
+        assert_eq!(overlay.get(b"meta/old").unwrap(), Some(b"before".to_vec()));
+        assert_eq!(overlay.get(b"meta/new").unwrap(), None);
+        assert_eq!(overlay.get(b"other").unwrap(), Some(b"live".to_vec()));
+        assert_eq!(
+            overlay.scan_prefix(b"meta/").unwrap(),
+            vec![(b"meta/old".to_vec(), b"before".to_vec())]
+        );
+        assert_eq!(overlay.scan_prefix(b"").unwrap().len(), 2);
+        overlay.put(b"meta/new", b"private").unwrap();
+        overlay.delete(b"meta/old").unwrap();
+        assert_eq!(
+            overlay.scan_prefix(b"meta/").unwrap(),
+            vec![(b"meta/new".to_vec(), b"private".to_vec())]
+        );
+        assert!(overlay.commit().is_err());
+        assert!(overlay.commit_with_batch(WriteBatch::new()).is_err());
+        assert_eq!(base.get(b"meta/new").unwrap(), Some(b"after".to_vec()));
     }
 }

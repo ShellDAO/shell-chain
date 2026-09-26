@@ -7595,6 +7595,205 @@ mod tests {
         block
     }
 
+    fn store_recovery_trace_history(handler: &RpcHandler<MemoryDb>) -> Vec<Block> {
+        use shell_pqvm::system_contracts::{
+            encode_cancel_recovery_calldata, encode_execute_recovery_calldata,
+            encode_set_guardians_calldata, encode_submit_recovery_calldata,
+        };
+        let store = Arc::clone(handler.chain_store.store());
+        let owner = Address::from([0xa1; 32]);
+        let guardian = Address::from([0xb2; 32]);
+        let mut state = WorldState::new(Arc::clone(&store));
+        for address in [owner, guardian] {
+            state
+                .set_account(
+                    &address,
+                    &shell_core::Account::new_user_account(ShellHash::ZERO, U256::from(1_000_000)),
+                )
+                .unwrap();
+        }
+        let mut parent = make_genesis_block();
+        parent.header.state_root = state.state_root().unwrap();
+        handler
+            .chain_store
+            .commit_canonical_block(&parent, None)
+            .unwrap();
+        let calls = [
+            (owner, encode_set_guardians_calldata(&[guardian], 1, 100)),
+            (
+                guardian,
+                encode_submit_recovery_calldata(&owner, &[0x33; 32], 0),
+            ),
+            (guardian, encode_execute_recovery_calldata(&owner)),
+            (owner, encode_cancel_recovery_calldata(&owner)),
+            (
+                owner,
+                encode_set_guardians_calldata(&[Address::from([0xc3; 32])], 1, 100),
+            ),
+        ];
+        let mut blocks = Vec::new();
+        for (index, (from, data)) in calls.into_iter().enumerate() {
+            let overlay = Arc::new(shell_storage::OverlayStore::new(Arc::clone(&store)));
+            let chain = ChainStore::new(Arc::clone(&overlay));
+            let state =
+                WorldState::at_root(Arc::clone(&overlay), &parent.header.state_root).unwrap();
+            let nonce = state.get_account(&from).unwrap().unwrap().nonce;
+            let signed = SignedTransaction::new(
+                from,
+                Transaction {
+                    chain_id: 42,
+                    nonce,
+                    max_fee_per_gas: 0,
+                    max_priority_fee_per_gas: 0,
+                    gas_limit: 200_000,
+                    to: Some(shell_pqvm::account_manager_address()),
+                    value: U256::ZERO,
+                    data: Bytes::from(data),
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+                shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+            );
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number: parent.header.number + 1,
+                    base_fee_per_gas: 0,
+                    ..parent.header.clone()
+                },
+                transactions: vec![signed.clone()],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let mut executor =
+                ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(overlay)), 42);
+            let result = executor.execute_tx(&signed, &block.header, 0, 0).unwrap();
+            assert_eq!(result.receipt.status, if index == 2 { 0 } else { 1 });
+            block.header.gas_used = result.receipt.cumulative_gas_used;
+            block.header.state_root = executor
+                .state_db_mut()
+                .world_state_mut()
+                .state_root()
+                .unwrap();
+            chain
+                .commit_canonical_overlay(&block, Some(&[result.receipt]))
+                .unwrap();
+            parent = block.clone();
+            blocks.push(block);
+        }
+        // Head passes the original proposal's maturity after it has been cancelled
+        // and the owner has replaced the guardian set.
+        while parent.header.number < 110 {
+            let block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number: parent.header.number + 1,
+                    gas_used: 0,
+                    ..parent.header.clone()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            handler
+                .chain_store
+                .commit_canonical_block(&block, Some(&[]))
+                .unwrap();
+            parent = block;
+        }
+        blocks
+    }
+
+    #[tokio::test]
+    async fn recovery_trace_uses_historical_guardians_proposal_and_parent_height() {
+        let handler = setup();
+        let blocks = store_recovery_trace_history(&handler);
+        handler
+            .chain_store
+            .prune_address_metadata_history(110)
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        for (index, block) in blocks.iter().enumerate() {
+            let result = DebugApiServer::trace_transaction(
+                &handler,
+                block.transactions[0].hash().to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["failed"], index == 2);
+            if index == 2 {
+                let output =
+                    hex::decode(result["output"].as_str().unwrap().trim_start_matches("0x"))
+                        .unwrap();
+                assert!(String::from_utf8(output).unwrap().contains("101"));
+            } else {
+                assert_eq!(result["output"], format!("0x{:064x}", 1));
+            }
+            let oe = TraceApiServer::trace_oe_transaction(
+                &handler,
+                block.transactions[0].hash().to_string(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(oe[0].get("error").is_some(), index == 2);
+        }
+        let trace = DebugApiServer::trace_block_by_number(&handler, "0x2".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(trace[0]["failed"], false);
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_trace_rejects_pruned_history_old_blocks_and_non_ancestors() {
+        let handler = setup();
+        let blocks = store_recovery_trace_history(&handler);
+        let mut fork = blocks[1].clone();
+        fork.header.timestamp += 1;
+        let error = handler
+            .replay_traces(fork, None, TraceOptions::default(), net::TraceFormat::Debug)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("not an ancestor"));
+        handler
+            .chain_store
+            .prune_finalized_address_metadata_undo(110)
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(&[]).unwrap();
+        let error = DebugApiServer::trace_transaction(
+            &handler,
+            blocks[1].transactions[0].hash().to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message().contains("undo journal unavailable"));
+        assert_eq!(
+            before,
+            handler.chain_store.store().scan_prefix(&[]).unwrap()
+        );
+        let mut head = blocks[4].clone();
+        head.header.number = 130;
+        handler.chain_store.put_block(&head).unwrap();
+        handler.chain_store.set_head(&head.hash()).unwrap();
+        let error = handler
+            .replay_traces(
+                blocks[1].clone(),
+                None,
+                TraceOptions::default(),
+                net::TraceFormat::Debug,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("128-block window"));
+    }
+
     #[tokio::test]
     async fn debug_native_rotation_trace_preserves_current_pubkey_and_state() {
         let handler = setup();
