@@ -371,6 +371,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
         // Build revm context + EVM.
         // Use CANCUN spec for transient storage (EIP-1153) and MCOPY (EIP-5656).
+        let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_native_registry_view(
+            self.state_db.world_state(),
+            self.state_db.chain_store(),
+            header.number,
+        )?;
         let ctx: MainnetContext<&mut ShellStateDb<S>> =
             Context::new(&mut self.state_db, SpecId::CANCUN)
                 .modify_block_chained(|b| *b = block_env)
@@ -384,7 +389,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         // Wire PQVM native opcodes (0xB0–0xB2) into the instruction table.
         install_pqvm_instructions(&mut instructions);
-        let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
+        let mut evm = Evm::new(ctx, instructions, precompiles);
 
         // Execute
         let result_and_state = if let Some(tracer) = self.tracer.as_mut() {
@@ -897,6 +902,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 .chain_id(Some(self.chain_id))
                 .build_fill();
 
+            let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_native_registry_view(
+                self.state_db.world_state(),
+                self.state_db.chain_store(),
+                header.number,
+            )?;
             let ctx: MainnetContext<&mut ShellStateDb<S>> =
                 Context::new(&mut self.state_db, SpecId::CANCUN)
                     .modify_block_chained(|b| *b = block_env.clone())
@@ -912,7 +922,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             let spec = SpecId::CANCUN;
             let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
             install_pqvm_instructions(&mut instructions);
-            let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
+            let mut evm = Evm::new(ctx, instructions, precompiles);
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
                 let result = if reconciled_fees {
@@ -1556,6 +1566,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                native_registry_view_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1776,6 +1787,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                native_registry_view_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1853,6 +1865,7 @@ mod tests {
                             registered_key_algorithm_height: None,
                             aa_account_manager_height: None,
                             aa_validator_registry_height: None,
+                            native_registry_view_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -2419,6 +2432,7 @@ mod tests {
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
+                    native_registry_view_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -4695,6 +4709,109 @@ mod tests {
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(data),
             gas_limit: 100_000,
+        }
+    }
+
+    #[test]
+    fn native_registry_view_contract_call_activation_and_aa_snapshot() {
+        let owner = ShellAddress::from([0xa8; 32]);
+        let next = ShellAddress::from([0xa9; 32]);
+        let contract = ShellAddress::from([0x91; 32]);
+        // Forward calldata through STATICCALL to 2^32+1 and return raw bytes.
+        let runtime =
+            hex::decode("366000600037600060003660006401000000015afa503d600060003e3d6000f3")
+                .unwrap();
+        for activation in [None, Some(10)] {
+            for height in [9, 10, 11] {
+                let mut evm = setup_native_aa_evm();
+                fund_account(&mut evm, &owner, U256::from(100_000_000));
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(&[owner])
+                    .unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(
+                        &serde_json::from_value(serde_json::json!({
+                            "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                            "native_registry_view_height":activation,
+                            "aa_validator_registry_height":0
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let hash = shell_primitives::keccak256(&runtime);
+                evm.state_db()
+                    .chain_store()
+                    .put_code(&hash, &runtime)
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(
+                        &contract,
+                        &Account {
+                            code_hash: Some(hash),
+                            ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+                let mut tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    500_000,
+                    10,
+                    vec![shell_core::InnerCall {
+                        to: Some(contract),
+                        value: U256::ZERO,
+                        data: system_contracts::GET_VALIDATORS_SELECTOR.to_vec().into(),
+                        gas_limit: 100_000,
+                    }],
+                    None,
+                );
+                let header = BlockHeader {
+                    number: height,
+                    ..sample_header()
+                };
+                let (result, trace) = evm
+                    .trace_transaction(&tx, &header, 0, 0, TraceConfig::default())
+                    .unwrap();
+                assert!(result.receipt.succeeded());
+                let expected = if activation.is_some_and(|at| height >= at) {
+                    system_contracts::encode_address_array(&[owner])
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    trace.result.frame.calls[0]
+                        .output
+                        .as_ref()
+                        .unwrap()
+                        .as_ref(),
+                    expected
+                );
+                // A later execution must see the current state, not a stale provider snapshot.
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(&[next])
+                    .unwrap();
+                tx.tx.nonce = current_nonce(&mut evm, &owner);
+                let (_, trace) = evm
+                    .trace_transaction(&tx, &header, 0, 0, TraceConfig::default())
+                    .unwrap();
+                let expected = if activation.is_some_and(|at| height >= at) {
+                    system_contracts::encode_address_array(&[next])
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    trace.result.frame.calls[0]
+                        .output
+                        .as_ref()
+                        .unwrap()
+                        .as_ref(),
+                    expected
+                );
+            }
         }
     }
 

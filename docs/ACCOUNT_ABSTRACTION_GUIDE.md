@@ -476,8 +476,9 @@ metadata and is subject to the existing 128-block window.
 
 See [the atomic execution decision](adr/aa-account-manager.md) for scope,
 compatibility and reproducible regression commands. ValidatorRegistry has its
-own activation schedule described below. Native calls from contract bytecode
-remain separate follow-up work.
+own activation schedule described below. Contract bytecode can read the independently activated
+[NativeRegistryView](SYSTEM_CONTRACTS.md#calling-from-solidity); contract-originated
+native writes remain separate follow-up work.
 
 
 ### Reproduce the native AccountManager lifecycle

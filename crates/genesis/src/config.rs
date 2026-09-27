@@ -198,6 +198,9 @@ pub struct GenesisConfig {
     /// First block executing native ValidatorRegistry calls atomically inside AA bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_validator_registry_height: Option<u64>,
+    /// First block enabling the non-overlapping native Registry view for contract calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_registry_view_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,

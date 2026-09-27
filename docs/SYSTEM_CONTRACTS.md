@@ -89,33 +89,79 @@ specified in the linked activation rules.
 
 ### Calling from Solidity
 
-Shell-Chain system contracts live in the native 32-byte address space. When calling
-from Solidity tooling that still models `address` as 20 bytes, use the alloy/EVM shim:
-the last 20 bytes of the native 32-byte address are passed into the contract constant below.
+Use the independently activated **NativeRegistryView** at full address
+`0x0000000000000000000000000000000000000000000000000000000100000001`
+(ID `2^32 + 1`). It is outside the reserved PQ precompile range. Contract calls
+to low address `0x01` invoke ML-DSA verification, even though direct native
+Registry transactions use that address. Routing depends on the execution entry;
+the two interfaces must not be interchanged.
+
+The optional `native_registry_view_height` enables this view at and after the
+configured block. It defaults to disabled and is independent of both native AA
+schedules. Existing databases accept only a future activation; persisted schedules
+are immutable and trusted snapshots must match. At activation the view address
+is reserved for the protocol; operators must account for that reservation when
+choosing a genesis allocation or upgrade schedule.
+
+The view exposes `getValidators()` and `isValidator(bytes32)`, accepts zero-value
+CALL/STATICCALL, and rejects writes, unknown/malformed calldata, attached value
+and delegate calls. It uses the native read gas cost of 21,000 plus ordinary
+PQVM call overhead. Each PQVM execution captures the current bounded validator
+set, including changes made by preceding native AA operations. Historical calls
+use the historical world-state root. Validation and paymaster execution use the
+same height gate and read-only surface.
+
+Solidity `address` is only 20 bytes. Represent validator members as `bytes32`,
+including function arguments and arrays; zero-padding `msg.sender` cannot
+recover a truncated PQ address. Pass the complete account identifier explicitly.
 
 ```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-interface IValidatorRegistry {
-    function getValidators() external view returns (address[] memory);
-    function isValidator(address account) external view returns (bool);
+interface INativeRegistryView {
+    function getValidators() external view returns (bytes32[] memory);
+    function isValidator(bytes32 account) external view returns (bool);
 }
 
 contract ValidatorCheck {
-    // Shell-Chain addresses are 32 bytes; use the last 20 bytes for the alloy/EVM shim
-    IValidatorRegistry constant REGISTRY =
-        IValidatorRegistry(0x0000000000000000000000000000000001);
+    INativeRegistryView constant REGISTRY =
+        INativeRegistryView(address(uint160(0x100000001)));
 
-    function currentValidators() external view returns (address[] memory) {
+    function currentValidators() external view returns (bytes32[] memory) {
         return REGISTRY.getValidators();
     }
 
-    function amIAValidator() external view returns (bool) {
-        return REGISTRY.isValidator(msg.sender);
+    function isActiveValidator(bytes32 account) external view returns (bool) {
+        return REGISTRY.isValidator(account);
     }
 }
 ```
+
+The complete [compilable example](../tests/e2e/fixtures/native-registry-view.sol)
+uses Solidity `^0.8.24`. Native writes continue through direct transactions or
+the independently activated AA native dispatcher; this view does not implement
+contract-originated governance or AccountManager writes.
+
+### Reproduce the contract view
+
+Build with `cargo build -p shell-cli --features libp2p`. Use Node.js 20 or later,
+a compatible source `shell-sdk` exposing transaction wire format v2
+(`0.14.0-rc.1` tested), and a local `solc` package (`0.8.35` tested). From the
+node repository:
+
+```sh
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+SOLC_ENTRY=/path/to/solc/index.js \
+node tests/e2e/native-registry-view.mjs
+```
+
+The script compiles the example for Cancun and exercises real signed deployment,
+activation-boundary reads, full-address membership, rejection paths and AA
+calls on an isolated producer and follower. It also verifies unchanged valid
+and tampered ML-DSA behavior at the original precompile, historical nonmutation,
+finality and follower restart catch-up. Child processes stop on exit; fresh
+keys and node data remain in the private temporary report directory. The fixture
+uses one authority, not multiple-authority quorum, and does not prove public
+SDK availability or live network activation. See the
+[design decision](adr/native-registry-view.md).
 
 ### Events
 

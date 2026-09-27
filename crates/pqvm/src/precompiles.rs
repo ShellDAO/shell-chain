@@ -15,10 +15,13 @@ use alloy_primitives::{address, Address, Bytes};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::ContextTr;
 use revm::handler::PrecompileProvider;
-use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
+use revm::interpreter::{
+    CallInput, CallInputs, CallScheme, Gas, InstructionResult, InterpreterResult,
+};
 use revm::primitives::hardfork::SpecId;
 use shell_crypto::{verify_signature, SignatureType};
 use shell_primitives::Address as ShellAddress;
+use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
 use std::boxed::Box;
 
 pub const PQ_MLDSA65_VERIFY_ADDR: Address = address!("0x0000000000000000000000000000000000000001");
@@ -29,6 +32,12 @@ pub const PQ_MLDSA65_BATCH_VERIFY_ADDR: Address =
 pub const PQ_BLAKE3_256_ADDR: Address = address!("0x0000000000000000000000000000000000000004");
 pub const PQ_BLAKE3_512_ADDR: Address = address!("0x0000000000000000000000000000000000000005");
 pub const PQ_ADDRESS_DERIVE_ADDR: Address = address!("0x0000000000000000000000000000000000000006");
+
+/// Contract-only read surface outside the whitepaper's [0, 2^32) PQ range.
+pub const NATIVE_REGISTRY_VIEW_ADDR: Address =
+    address!("0x0000000000000000000000000000000100000001");
+pub const IS_NATIVE_VALIDATOR_SELECTOR: [u8; 4] =
+    crate::system_contracts::compute_selector(b"isValidator(bytes32)");
 
 const PQ_PRECOMPILE_ADDRS: [Address; 6] = [
     PQ_MLDSA65_VERIFY_ADDR,
@@ -58,6 +67,7 @@ const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
 pub struct ShellPrecompiles {
     spec: SpecId,
     allow_deprecated: bool,
+    native_validators: Option<Vec<ShellAddress>>,
 }
 
 impl ShellPrecompiles {
@@ -65,6 +75,7 @@ impl ShellPrecompiles {
         Self {
             spec,
             allow_deprecated: false,
+            native_validators: None,
         }
     }
 
@@ -73,8 +84,27 @@ impl ShellPrecompiles {
         self
     }
 
+    pub(crate) fn with_native_registry_view<S: KvStore>(
+        mut self,
+        world: &WorldState<S>,
+        chain: &ChainStore<S>,
+        height: u64,
+    ) -> Result<Self, StorageError> {
+        if chain
+            .get_chain_config()?
+            .and_then(|config| config.native_registry_view_height)
+            .is_some_and(|activation| height >= activation)
+        {
+            // The set is bounded by WorldState::MAX_VALIDATORS and immutable
+            // within one PQVM execution. Rebuild after each native AA inner call.
+            self.native_validators = Some(world.get_validators()?);
+        }
+        Ok(self)
+    }
+
     pub fn is_precompile(&self, address: &Address) -> bool {
         is_pq_precompile(address)
+            || (self.native_validators.is_some() && *address == NATIVE_REGISTRY_VIEW_ADDR)
     }
 }
 
@@ -97,11 +127,21 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
     ) -> Result<Option<Self::Output>, String> {
         let target = &inputs.bytecode_address;
 
-        if is_pq_precompile(target) {
+        if self.is_precompile(target) {
             return Ok(Some(if self.allow_deprecated {
-                run_pq_precompile::<_, true>(target, inputs, context)
+                run_pq_precompile::<_, true>(
+                    target,
+                    inputs,
+                    context,
+                    self.native_validators.as_deref(),
+                )
             } else {
-                run_pq_precompile::<_, false>(target, inputs, context)
+                run_pq_precompile::<_, false>(
+                    target,
+                    inputs,
+                    context,
+                    self.native_validators.as_deref(),
+                )
             }));
         }
 
@@ -109,11 +149,17 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
     }
 
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        Box::new(PQ_PRECOMPILE_ADDRS.into_iter())
+        Box::new(
+            PQ_PRECOMPILE_ADDRS.into_iter().chain(
+                self.native_validators
+                    .is_some()
+                    .then_some(NATIVE_REGISTRY_VIEW_ADDR),
+            ),
+        )
     }
 
     fn contains(&self, address: &Address) -> bool {
-        is_pq_precompile(address)
+        self.is_precompile(address)
     }
 }
 
@@ -125,6 +171,7 @@ fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
     target: &Address,
     inputs: &CallInputs,
     context: &mut CTX,
+    native_validators: Option<&[ShellAddress]>,
 ) -> InterpreterResult {
     // Hold the shared-memory guard through execution so precompiles can read
     // calldata in place instead of cloning it into a temporary buffer.
@@ -141,6 +188,11 @@ fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
         CallInput::Bytes(bytes) => bytes.as_ref(),
     };
 
+    if *target == NATIVE_REGISTRY_VIEW_ADDR {
+        if let Some(validators) = native_validators {
+            return run_native_registry_view(inputs, input, validators);
+        }
+    }
     match *target {
         PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify::<ALLOW_DEPRECATED>(inputs.gas_limit, input),
         PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => {
@@ -158,6 +210,44 @@ fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
             output: Bytes::new(),
         },
     }
+}
+
+fn run_native_registry_view(
+    inputs: &CallInputs,
+    input: &[u8],
+    validators: &[ShellAddress],
+) -> InterpreterResult {
+    use crate::system_contracts::{
+        encode_address_array, encode_bool, GET_VALIDATORS_SELECTOR, SYSTEM_CALL_BASE_GAS,
+    };
+    let mut result = base_result(inputs.gas_limit);
+    if !charge_gas(&mut result, SYSTEM_CALL_BASE_GAS) {
+        return result;
+    }
+    if inputs.transfers_value()
+        || !matches!(inputs.scheme, CallScheme::Call | CallScheme::StaticCall)
+    {
+        result.result = InstructionResult::Revert;
+        result.output =
+            Bytes::from_static(b"native Registry view requires a zero-value CALL or STATICCALL");
+        return result;
+    }
+    let output = if input == GET_VALIDATORS_SELECTOR {
+        Some(encode_address_array(validators))
+    } else if input.len() == 36 && input[..4] == IS_NATIVE_VALIDATOR_SELECTOR {
+        let address = ShellAddress::try_from_slice(&input[4..]).expect("exact 32-byte word");
+        Some(encode_bool(validators.contains(&address)))
+    } else {
+        None
+    };
+    match output {
+        Some(output) => result.output = output.into(),
+        None => {
+            result.result = InstructionResult::Revert;
+            result.output = Bytes::from_static(b"unknown or malformed native Registry view method");
+        }
+    }
+    result
 }
 
 fn base_result(gas_limit: u64) -> InterpreterResult {
@@ -423,6 +513,113 @@ fn bool_output(valid: bool) -> Bytes {
 mod tests {
     use super::*;
     use shell_crypto::{DilithiumSigner, Signer, SphincsSigner};
+
+    fn view_inputs(scheme: CallScheme, value: u64, gas_limit: u64) -> CallInputs {
+        CallInputs {
+            input: CallInput::Bytes(Bytes::new()),
+            return_memory_offset: 0..0,
+            gas_limit,
+            bytecode_address: NATIVE_REGISTRY_VIEW_ADDR,
+            known_bytecode: None,
+            target_address: NATIVE_REGISTRY_VIEW_ADDR,
+            caller: Address::ZERO,
+            value: revm::interpreter::CallValue::Transfer(alloy_primitives::U256::from(value)),
+            scheme,
+            is_static: scheme == CallScheme::StaticCall,
+        }
+    }
+
+    #[test]
+    fn native_registry_view_full_address_abi_and_rejections() {
+        use crate::system_contracts::{
+            encode_address_array, GET_VALIDATORS_SELECTOR, SYSTEM_CALL_BASE_GAS,
+        };
+        let validator = ShellAddress::from([0xa7; 32]);
+        let validators = [validator];
+        for scheme in [CallScheme::Call, CallScheme::StaticCall] {
+            let inputs = view_inputs(scheme, 0, SYSTEM_CALL_BASE_GAS);
+            let output = run_native_registry_view(&inputs, &GET_VALIDATORS_SELECTOR, &validators);
+            assert_eq!(output.result, InstructionResult::Return);
+            assert_eq!(output.output.as_ref(), encode_address_array(&validators));
+            assert_eq!(output.gas.spent(), SYSTEM_CALL_BASE_GAS);
+            for address in [validator, ShellAddress::from(Address::from(validator))] {
+                let mut input = IS_NATIVE_VALIDATOR_SELECTOR.to_vec();
+                input.extend_from_slice(address.as_bytes());
+                let result = run_native_registry_view(&inputs, &input, &validators);
+                assert_eq!(result.result, InstructionResult::Return);
+                assert_eq!(result.output[31], u8::from(address == validator));
+            }
+            for input in [
+                vec![],
+                vec![0xff; 4],
+                GET_VALIDATORS_SELECTOR.into_iter().chain([0]).collect(),
+                IS_NATIVE_VALIDATOR_SELECTOR.to_vec(),
+            ] {
+                assert_eq!(
+                    run_native_registry_view(&inputs, &input, &validators).result,
+                    InstructionResult::Revert
+                );
+            }
+        }
+        for (scheme, value) in [
+            (CallScheme::Call, 1),
+            (CallScheme::DelegateCall, 0),
+            (CallScheme::CallCode, 0),
+        ] {
+            assert_eq!(
+                run_native_registry_view(
+                    &view_inputs(scheme, value, SYSTEM_CALL_BASE_GAS),
+                    &GET_VALIDATORS_SELECTOR,
+                    &validators
+                )
+                .result,
+                InstructionResult::Revert
+            );
+        }
+        assert_eq!(
+            run_native_registry_view(
+                &view_inputs(CallScheme::StaticCall, 0, SYSTEM_CALL_BASE_GAS - 1),
+                &GET_VALIDATORS_SELECTOR,
+                &validators
+            )
+            .result,
+            InstructionResult::PrecompileOOG
+        );
+    }
+
+    #[test]
+    fn native_registry_view_activation_preserves_pq_precompile_addresses() {
+        use shell_storage::MemoryDb;
+        use std::sync::Arc;
+        for activation in [None, Some(10)] {
+            let db = Arc::new(MemoryDb::new());
+            let world = WorldState::new(Arc::clone(&db));
+            let chain = ChainStore::new(db);
+            chain
+                .put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id":1337, "genesis_hash":shell_primitives::ShellHash::ZERO,
+                        "native_registry_view_height": activation
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            for height in [9, 10, 11] {
+                let provider = ShellPrecompiles::new(SpecId::CANCUN)
+                    .with_native_registry_view(&world, &chain, height)
+                    .unwrap();
+                assert_eq!(
+                    provider.is_precompile(&NATIVE_REGISTRY_VIEW_ADDR),
+                    activation.is_some_and(|at| height >= at)
+                );
+                for target in PQ_PRECOMPILE_ADDRS {
+                    assert!(provider.is_precompile(&target));
+                }
+                assert!(!provider
+                    .is_precompile(&address!("0x0000000000000000000000000000000100000002")));
+            }
+        }
+    }
 
     #[test]
     fn validation_precompiles_preserve_real_signature_checks_after_deprecation() {
