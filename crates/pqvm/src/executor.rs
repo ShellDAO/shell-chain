@@ -528,28 +528,82 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         tx_index: u32,
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
-        let native_account_manager = self
-            .state_db
-            .chain_store()
-            .get_chain_config()?
-            .and_then(|config| config.aa_account_manager_height)
-            .is_some_and(|height| header.number >= height)
-            && signed_tx.aa_bundle().is_some_and(|bundle| {
+        let config = self.state_db.chain_store().get_chain_config()?;
+        let has_target = |target| {
+            signed_tx.aa_bundle().is_some_and(|bundle| {
                 bundle
                     .inner_calls
                     .iter()
-                    .any(|inner| inner.to == Some(system_contracts::account_manager_address()))
-            });
-        if !native_account_manager {
+                    .any(|inner| inner.to == Some(target))
+            })
+        };
+        let native_account_manager = config
+            .as_ref()
+            .and_then(|config| config.aa_account_manager_height)
+            .is_some_and(|height| header.number >= height)
+            && has_target(system_contracts::account_manager_address());
+        let native_validator_registry = config
+            .as_ref()
+            .and_then(|config| config.aa_validator_registry_height)
+            .is_some_and(|height| header.number >= height)
+            && has_target(system_contracts::registry_address());
+        if !native_account_manager && !native_validator_registry {
             return self.execute_aa_bundle_inner(
                 signed_tx,
                 header,
                 tx_index,
                 cumulative_gas_used,
                 false,
+                false,
             );
         }
+        if native_validator_registry {
+            // Keep provisional algorithm policy on a nested branch. Publish it
+            // only after both account state and native metadata have committed.
+            // The outer registry mutation serializes callers without a branch override.
+            return shell_crypto::with_algorithm_registry_mut(|registry| {
+                let (result, next_registry) =
+                    shell_crypto::with_algorithm_registry_override(registry, || {
+                        let result = self.execute_native_aa_bundle(
+                            signed_tx,
+                            header,
+                            tx_index,
+                            cumulative_gas_used,
+                            native_account_manager,
+                            true,
+                        );
+                        let next =
+                            shell_crypto::with_algorithm_registry_mut(|current| current.clone());
+                        (result, next)
+                    });
+                if result
+                    .as_ref()
+                    .is_ok_and(|result| result.receipt.succeeded())
+                {
+                    *registry = next_registry;
+                }
+                result
+            });
+        }
+        self.execute_native_aa_bundle(
+            signed_tx,
+            header,
+            tx_index,
+            cumulative_gas_used,
+            native_account_manager,
+            false,
+        )
+    }
 
+    fn execute_native_aa_bundle(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        tx_index: u32,
+        cumulative_gas_used: u64,
+        native_account_manager: bool,
+        native_validator_registry: bool,
+    ) -> Result<TxExecutionResult, ExecutorError> {
         if !Arc::ptr_eq(
             self.state_db.world_state().store(),
             self.state_db.chain_store().store(),
@@ -570,8 +624,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             self.chain_id,
         );
         staged.tracer = self.tracer.take();
-        let result =
-            staged.execute_aa_bundle_inner(signed_tx, header, tx_index, cumulative_gas_used, true);
+        let result = staged.execute_aa_bundle_inner(
+            signed_tx,
+            header,
+            tx_index,
+            cumulative_gas_used,
+            native_account_manager,
+            native_validator_registry,
+        );
         self.tracer = staged.tracer.take();
         let result = result?;
         if result.receipt.succeeded() {
@@ -602,6 +662,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         tx_index: u32,
         cumulative_gas_used: u64,
         native_account_manager: bool,
+        native_validator_registry: bool,
     ) -> Result<TxExecutionResult, ExecutorError> {
         let bundle = signed_tx
             .aa_bundle()
@@ -744,10 +805,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut native_effects = SystemContractEffects::default();
 
         for inner in &bundle.inner_calls {
-            if native_account_manager
-                && inner.to == Some(system_contracts::account_manager_address())
-            {
-                let target = system_contracts::account_manager_address();
+            if let Some(target) = inner.to.filter(|target| {
+                (native_account_manager && *target == system_contracts::account_manager_address())
+                    || (native_validator_registry
+                        && *target == system_contracts::registry_address())
+            }) {
                 let remaining = tx.gas_limit.saturating_sub(total_gas_used);
                 let budget = inner.gas_limit.min(remaining);
                 let (world, chain) = self.state_db.world_state_and_chain_store();
@@ -777,6 +839,8 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 total_gas_spent = total_gas_spent.saturating_add(used);
                 let (output, failed) = match outcome {
                     Ok(outcome) if required_gas <= budget => {
+                        native_effects.validator_set_changed |=
+                            outcome.effects.validator_set_changed;
                         for address in outcome.effects.updated_accounts {
                             if !native_effects.updated_accounts.contains(&address) {
                                 native_effects.updated_accounts.push(address);
@@ -1491,6 +1555,7 @@ mod tests {
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
+                aa_validator_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1710,6 +1775,7 @@ mod tests {
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
+                aa_validator_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1786,6 +1852,7 @@ mod tests {
                             paymaster_registered_root_height: None,
                             registered_key_algorithm_height: None,
                             aa_account_manager_height: None,
+                            aa_validator_registry_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -2351,6 +2418,7 @@ mod tests {
                     paymaster_registered_root_height: None,
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
+                    aa_validator_registry_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -4605,6 +4673,184 @@ mod tests {
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(data),
             gas_limit,
+        }
+    }
+
+    fn configure_registry_aa(evm: &ShellPqvm<MemoryDb>, height: Option<u64>) {
+        evm.state_db()
+            .chain_store()
+            .put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                    "aa_validator_registry_height": height
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn registry_inner(data: Vec<u8>) -> shell_core::InnerCall {
+        shell_core::InnerCall {
+            to: Some(system_contracts::registry_address()),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::from(data),
+            gas_limit: 100_000,
+        }
+    }
+
+    #[test]
+    fn aa_validator_registry_activation_and_native_output() {
+        for activation in [None, Some(10)] {
+            for number in [9, 10, 11] {
+                let mut evm = setup_native_aa_evm();
+                let owner = ShellAddress::from([0x81; 32]);
+                fund_account(&mut evm, &owner, U256::from(10_000_000));
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(&[owner])
+                    .unwrap();
+                configure_registry_aa(&evm, activation);
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    200_000,
+                    10,
+                    vec![registry_inner(
+                        system_contracts::GET_VALIDATORS_SELECTOR.to_vec(),
+                    )],
+                    None,
+                );
+                let header = BlockHeader {
+                    number,
+                    ..sample_header()
+                };
+                let (result, trace) = evm
+                    .trace_transaction(&tx, &header, 0, 0, TraceConfig::default())
+                    .unwrap();
+                assert_eq!(result.receipt.status, 1);
+                let mut expected = vec![0u8; 64];
+                expected[31] = 32;
+                expected[63] = 1;
+                expected.extend_from_slice(owner.as_bytes());
+                let output = trace.result.frame.calls[0]
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .as_ref();
+                if activation.is_some_and(|height| number >= height) {
+                    assert_eq!(output, expected);
+                } else {
+                    assert_eq!(output, [0u8; 32]);
+                }
+                assert_eq!(get_nonce(&mut evm, &owner), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn aa_validator_registry_weight_effects_and_failed_batch_are_atomic() {
+        for fail in [false, true] {
+            for authorized in [false, true] {
+                let mut evm = setup_native_aa_evm();
+                let owner = ShellAddress::from([0x82; 32]);
+                let stranger = ShellAddress::from([0x83; 32]);
+                for address in [owner, stranger] {
+                    fund_account(&mut evm, &address, U256::from(10_000_000));
+                }
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(&[owner])
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validator_weight(&owner, 1)
+                    .unwrap();
+                configure_registry_aa(&evm, Some(0));
+                let mut calls = vec![registry_inner(
+                    system_contracts::encode_set_validator_weight_calldata(&owner, 2),
+                )];
+                if fail {
+                    calls.push(registry_inner(vec![0xff; 4]));
+                }
+                let sender = if authorized { owner } else { stranger };
+                let tx = make_aa_signed(
+                    sender,
+                    current_nonce(&mut evm, &sender),
+                    500_000,
+                    10,
+                    calls,
+                    None,
+                );
+                let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+                let success = authorized && !fail;
+                assert_eq!(result.receipt.status, u8::from(success));
+                assert_eq!(
+                    evm.state_db()
+                        .world_state()
+                        .get_validator_weight(&owner)
+                        .unwrap(),
+                    if success { 2 } else { 1 }
+                );
+                assert_eq!(
+                    result.system_contract_effects.validator_set_changed,
+                    success
+                );
+                assert_eq!(get_nonce(&mut evm, &sender), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn aa_validator_registry_algorithm_policy_rolls_back_with_metadata() {
+        use shell_crypto::{
+            algorithm_status, with_algorithm_registry_override, AlgorithmRegistry, AlgorithmStatus,
+        };
+        let algorithm = SignatureType::SphincsSha2256f;
+        for fail in [false, true] {
+            with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+                let mut evm = setup_native_aa_evm();
+                let owner = ShellAddress::from([0x84; 32]);
+                fund_account(&mut evm, &owner, U256::from(10_000_000));
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(&[owner])
+                    .unwrap();
+                configure_registry_aa(&evm, Some(0));
+                let mut calls = vec![registry_inner(
+                    system_contracts::encode_deprecate_algorithm_calldata(algorithm),
+                )];
+                if fail {
+                    calls.push(registry_inner(vec![0xff; 4]));
+                }
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    500_000,
+                    10,
+                    calls,
+                    None,
+                );
+                let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(!fail));
+                let expected = if fail {
+                    AlgorithmStatus::Active
+                } else {
+                    AlgorithmStatus::Deprecated
+                };
+                assert_eq!(algorithm_status(algorithm), Some(expected));
+                let persisted =
+                    system_contracts::load_algorithm_registry(evm.state_db().world_state())
+                        .unwrap();
+                assert_eq!(
+                    persisted
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.algo == algorithm)
+                        .unwrap()
+                        .status,
+                    expected
+                );
+            });
         }
     }
 

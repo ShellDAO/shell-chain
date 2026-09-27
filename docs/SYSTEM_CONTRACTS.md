@@ -18,6 +18,13 @@ running bytecode.
 
 ## ValidatorRegistry
 
+Direct native transactions and AA inner calls have separate dispatch paths.
+AA dispatch requires the independent `aa_validator_registry_height` activation;
+`aa_account_manager_height` alone is insufficient. Once enabled, reads and
+writes use the same native methods and caller authorization, with batch-wide
+rollback of account state, native metadata and runtime algorithm policy.
+See [AA execution and acceptance](ACCOUNT_ABSTRACTION_GUIDE.md#native-validatorregistry-calls-in-aa-bundles).
+
 ### Purpose
 
 Maintains the canonical set of block-producing validators. All writes go through
