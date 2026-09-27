@@ -131,6 +131,15 @@ fn next_sender_nonce(nonce: u64) -> Result<u64, ExecutorError> {
     nonce.checked_add(1).ok_or(ExecutorError::NonceOverflow)
 }
 
+pub(crate) fn install_pqvm_instructions<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
+where
+    WIRE: InterpreterTypes,
+    H: Host,
+{
+    crate::pqvm_opcodes::install_pqvm_opcodes(instructions);
+    remove_legacy_opcodes(instructions);
+}
+
 fn remove_legacy_opcodes<WIRE, H>(instructions: &mut EthInstructions<WIRE, H>)
 where
     WIRE: InterpreterTypes,
@@ -373,8 +382,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let spec = SpecId::CANCUN;
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         // Wire PQVM native opcodes (0xB0–0xB2) into the instruction table.
-        crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
-        remove_legacy_opcodes(&mut instructions);
+        install_pqvm_instructions(&mut instructions);
         let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
         // Execute
@@ -696,8 +704,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     });
             let spec = SpecId::CANCUN;
             let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
-            crate::pqvm_opcodes::install_pqvm_opcodes(&mut instructions);
-            remove_legacy_opcodes(&mut instructions);
+            install_pqvm_instructions(&mut instructions);
             let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
@@ -1331,6 +1338,7 @@ mod tests {
                 algorithm_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
+                validation_pqvm_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -1545,6 +1553,7 @@ mod tests {
                 algorithm_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
+                validation_pqvm_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -1616,6 +1625,7 @@ mod tests {
                             algorithm_deprecation_height: None,
                             algorithm_session_deprecation_height: None,
                             algorithm_paymaster_deprecation_height: None,
+                            validation_pqvm_height: None,
                             session_registered_root_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
@@ -2176,6 +2186,7 @@ mod tests {
                     algorithm_deprecation_height: None,
                     algorithm_session_deprecation_height: None,
                     algorithm_paymaster_deprecation_height: None,
+                    validation_pqvm_height: None,
                     session_registered_root_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,

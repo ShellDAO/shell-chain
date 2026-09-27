@@ -139,6 +139,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
                 algorithm_session_deprecation_height: config.algorithm_session_deprecation_height,
                 algorithm_paymaster_deprecation_height: config
                     .algorithm_paymaster_deprecation_height,
+                validation_pqvm_height: config.validation_pqvm_height,
                 session_registered_root_height: config.session_registered_root_height,
                 algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: config.algorithm_quorum_activation_height,
@@ -306,6 +307,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            validation_pqvm_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,

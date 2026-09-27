@@ -30,6 +30,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `validation_pqvm_height` to use the normal PQVM instruction set
+  in custom-account and contract-paymaster validation. Native hash/address
+  checks now execute there; CALLCODE and SELFDESTRUCT remain unavailable under
+  the upgraded rules. Preserve legacy validation when omitted, and persist the
+  immutable future activation through startup and trusted snapshots.
+
 - Add optional `algorithm_paymaster_deprecation_height` so registered original-key
   EOA paymasters can sponsor transactions after their algorithm is deprecated.
   Bind the signature to the exact address algorithm and keep pending algorithms,
