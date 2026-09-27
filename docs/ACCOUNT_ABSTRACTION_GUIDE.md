@@ -477,3 +477,33 @@ metadata and is subject to the existing 128-block window.
 See [the atomic execution decision](adr/aa-account-manager.md) for scope,
 compatibility and reproducible regression commands. Native ValidatorRegistry AA
 dispatch and native calls from contract bytecode remain open follow-up work.
+
+
+### Reproduce the native AccountManager lifecycle
+
+Build the node with `cargo build -p shell-cli`. Use Node.js 20 or later and a
+compatible built `shell-sdk` checkout exposing transaction wire format v2
+(`0.14.0-rc.1` tested). Set `SHELL_SDK_ENTRY` to that checkout's `dist/index.js`;
+this source acceptance does not imply that the matching SDK is published on npm.
+From the node repository, run:
+
+```sh
+NODE_BIN=./target/debug/shell-node \
+SHELL_SDK_ENTRY="$SDK_CHECKOUT/dist/index.js" \
+node tests/e2e/native-aa-lifecycle.mjs
+```
+
+Set `SDK_CHECKOUT` to your compatible SDK checkout before running the command.
+The script creates fresh test accounts, a temporary validator keystore and an
+isolated RocksDB node on a loopback RPC port. It checks real signed AA batches:
+guardian voting and cancellation, recovery timing and atomic rollback, recovered
+key authorization, and custom validation code setting, replacement and clearing.
+Value-filter policies distinguish active validation behavior after failed batches,
+restarts and historical replay. These policies are test fixtures, not production
+authentication contracts.
+
+A failed assertion exits nonzero. The script stops its node on completion. The printed private temporary directory
+retains logs, isolated node data, the encrypted test validator key and its password
+for diagnosis and recovery. It uses development mining and synthetic
+timestamps to check block-height boundaries, not elapsed wall-clock time. Native
+AA is enabled only in this test genesis; no existing network configuration changes.
