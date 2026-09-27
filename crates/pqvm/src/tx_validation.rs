@@ -509,6 +509,7 @@ fn validate_tx_for_import_inner<S: KvStore + 'static, V: Verifier>(
 pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
     signed_tx: &SignedTransaction,
     paymaster: &Address,
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
     verifier: &V,
     block_number: u64,
@@ -531,6 +532,46 @@ pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
         .get_chain_config()?
         .and_then(|config| config.algorithm_paymaster_deprecation_height)
         .is_some_and(|height| block_number >= height);
+    let registered_root_enabled = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.paymaster_registered_root_height)
+        .is_some_and(|height| block_number >= height);
+    let address_bound = [
+        shell_crypto::SignatureType::MlDsa65,
+        shell_crypto::SignatureType::Dilithium3,
+        shell_crypto::SignatureType::SphincsSha2256f,
+    ]
+    .into_iter()
+    .any(|algorithm| Address::from_public_key(&pubkey, algorithm.as_u8()) == *paymaster);
+    if registered_root_enabled && !address_bound {
+        let registered = world_state.get_account(paymaster)?.is_some_and(|account| {
+            account.pq_pubkey_hash != shell_primitives::ShellHash::ZERO
+                && account.pq_pubkey_hash == shell_primitives::blake3_hash(&pubkey)
+        });
+        if !registered {
+            return Err(TxValidationError::PaymasterSignatureInvalid);
+        }
+        // Sponsor signatures have no algorithm tag, and rotated keys do not
+        // persist one. Match the existing session-root active-only policy;
+        // never extend the address-bound deprecation exception to this path.
+        for algorithm in [
+            shell_crypto::SignatureType::MlDsa65,
+            shell_crypto::SignatureType::Dilithium3,
+            shell_crypto::SignatureType::SphincsSha2256f,
+        ]
+        .into_iter()
+        .filter(|algorithm| shell_crypto::is_algorithm_allowed(*algorithm))
+        {
+            let signature = shell_crypto::PQSignature::new(algorithm, sig_bytes.as_ref().to_vec());
+            if verifier
+                .verify(&pubkey, hash.as_bytes(), &signature)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        return Err(TxValidationError::PaymasterSignatureInvalid);
+    }
     let paymaster_sig_type = if allow_deprecated {
         [
             shell_crypto::SignatureType::MlDsa65,

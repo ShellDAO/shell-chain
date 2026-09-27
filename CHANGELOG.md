@@ -41,6 +41,9 @@ All notable changes to this project will be documented in this file.
   the upgraded rules. Preserve legacy validation when omitted, and persist the
   immutable future activation through startup and trusted snapshots.
 
+- Add optional `paymaster_registered_root_height` so rotated EOA sponsors can
+  authorize transactions using their current registered key and account hash.
+  Omitted and preactivation rules remain unchanged; active algorithms only.
 - Add optional `algorithm_paymaster_deprecation_height` so registered original-key
   EOA paymasters can sponsor transactions after their algorithm is deprecated.
   Bind the signature to the exact address algorithm and keep pending algorithms,

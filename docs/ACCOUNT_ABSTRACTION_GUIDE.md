@@ -386,3 +386,18 @@ Gas budgets remain unchanged. The current 500,000 custom-validation cap cannot
 accommodate SLH-DSA's 2,300,000-gas verification, and the smaller contract-paymaster
 budget also limits signature policies. Lifecycle compatibility alone does not
 resolve these capacity gaps. See [the decision](adr/validation-deprecation.md).
+
+### Rotated EOA sponsors
+
+An EOA sponsor keeps its address after `rotateKey`. At or after the independently
+configured `paymaster_registered_root_height`, authorization uses the current
+registered public key and requires its hash to match the sponsor account state.
+The replacement key signs the existing paymaster signing hash; no transaction
+field changes. Only active algorithms are tried for this untagged signature,
+matching the existing session-root policy. This does not extend the original-key
+deprecation exception to rotated keys.
+
+The upgrade defaults to disabled and preserves earlier block validation. Its
+height is persisted, immutable once scheduled, and must match trusted snapshots.
+Operators must coordinate activation; merging this implementation does not
+activate it on an existing network. Contract-paymaster validation is unchanged.

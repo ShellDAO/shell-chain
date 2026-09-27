@@ -384,13 +384,20 @@ fn validate_paymaster_authorization<S: KvStore + 'static, V: Verifier>(
             Some(header) => header.number,
             None => validation_block_number(chain_store.get_head_block()?.map(|b| b.number())),
         };
-        verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier, block_number)
-            .map_err(|e| match e {
-                crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(addr) => {
-                    AaValidationError::PaymasterPubkeyNotFound(addr)
-                }
-                other => AaValidationError::PaymasterSignatureInvalid(other.to_string()),
-            })
+        verify_paymaster_signature(
+            signed_tx,
+            &paymaster,
+            world_state,
+            chain_store,
+            verifier,
+            block_number,
+        )
+        .map_err(|e| match e {
+            crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(addr) => {
+                AaValidationError::PaymasterPubkeyNotFound(addr)
+            }
+            other => AaValidationError::PaymasterSignatureInvalid(other.to_string()),
+        })
     }
 }
 
@@ -1696,6 +1703,7 @@ mod tests {
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
+            paymaster_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -2147,6 +2155,183 @@ mod tests {
         );
 
         assert!(!verified);
+    }
+
+    #[test]
+    fn rotated_paymaster_uses_registered_key() {
+        let sender = MlDsaSigner::generate();
+        let original = MlDsaSigner::generate();
+        let replacements: Vec<Box<dyn Signer>> = vec![
+            Box::new(MlDsaSigner::generate()),
+            Box::new(DilithiumSigner::generate()),
+            Box::new(shell_crypto::SphincsSigner::generate()),
+        ];
+        for replacement in replacements {
+            for activation in [None, Some(10)] {
+                let from = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
+                let paymaster =
+                    Address::from_public_key(original.public_key(), original.sig_type().as_u8());
+                let (mut ws, cs) = setup_stores();
+                fund_account(&mut ws, &from);
+                fund_account(&mut ws, &paymaster);
+                cs.put_pubkey(&paymaster, original.public_key()).unwrap();
+                cs.put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                        "paymaster_registered_root_height":activation
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                crate::system_contracts::execute_system_contract_call(
+                    &crate::system_contracts::account_manager_address(),
+                    &paymaster,
+                    &crate::system_contracts::encode_rotate_key_calldata(
+                        replacement.public_key(),
+                        replacement.sig_type().as_u8(),
+                    ),
+                    &mut ws,
+                    &cs,
+                )
+                .unwrap();
+                assert_eq!(
+                    ws.get_account(&paymaster).unwrap().unwrap().pq_pubkey_hash,
+                    shell_primitives::blake3_hash(replacement.public_key())
+                );
+                let mut tx = base_tx(1337, ws.get_nonce(&from).unwrap());
+                tx.tx_type = AA_BUNDLE_TX_TYPE;
+                tx.gas_limit = 300_000;
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    from,
+                    tx,
+                    PQSignature::new(sender.sig_type(), vec![1]),
+                    PubkeyMode::Embedded(sender.public_key().to_vec()),
+                    AaBundle {
+                        inner_calls: vec![InnerCall {
+                            to: Some(Address::from([0x17; 32])),
+                            value: U256::ZERO,
+                            data: Bytes::new(),
+                            gas_limit: 50_000,
+                        }],
+                        paymaster: Some(paymaster),
+                        paymaster_signature: Some(Bytes::from(vec![1])),
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.aa_bundle.as_mut().unwrap().paymaster_signature = Some(Bytes::from(
+                    replacement
+                        .sign(signed.paymaster_signing_hash().unwrap().as_bytes())
+                        .unwrap()
+                        .data,
+                ));
+                signed.signature = sender
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let before = (
+                    ws.get_account(&from).unwrap(),
+                    ws.get_account(&paymaster).unwrap(),
+                );
+                for number in [9, 10, 11] {
+                    let header = BlockHeader {
+                        number,
+                        gas_limit: 30_000_000,
+                        ..BlockHeader::default()
+                    };
+                    let expected = activation.is_some_and(|height| number >= height);
+                    assert_eq!(
+                        validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header).is_ok(),
+                        expected
+                    );
+                    assert_eq!(
+                        crate::tx_validation::validate_tx_for_import_at_block(
+                            &signed,
+                            &mut ws,
+                            &cs,
+                            &MultiVerifier,
+                            1337,
+                            None,
+                            &header
+                        )
+                        .is_ok(),
+                        expected
+                    );
+                }
+                set_head_number(&cs, 9);
+                assert_eq!(
+                    validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_ok(),
+                    activation.is_some()
+                );
+                if activation.is_some() {
+                    let resign_sender = |tx: &mut SignedTransaction| {
+                        tx.signature = sender.sign(tx.sender_signing_hash().as_bytes()).unwrap();
+                    };
+                    let mut stale = signed.clone();
+                    stale.aa_bundle.as_mut().unwrap().paymaster_signature = Some(Bytes::from(
+                        original
+                            .sign(stale.paymaster_signing_hash().unwrap().as_bytes())
+                            .unwrap()
+                            .data,
+                    ));
+                    resign_sender(&mut stale);
+                    assert!(validate_aa_tx(&stale, &ws, &cs, &MultiVerifier).is_err());
+                    let mut bad = signed.clone();
+                    let mut bytes = bad
+                        .aa_bundle
+                        .as_ref()
+                        .unwrap()
+                        .paymaster_signature
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .to_vec();
+                    bytes[0] ^= 1;
+                    bad.aa_bundle.as_mut().unwrap().paymaster_signature = Some(Bytes::from(bytes));
+                    resign_sender(&mut bad);
+                    assert!(validate_aa_tx(&bad, &ws, &cs, &MultiVerifier).is_err());
+                    let mut changed = signed.clone();
+                    changed.tx.max_fee_per_gas += 1;
+                    resign_sender(&mut changed);
+                    assert!(validate_aa_tx(&changed, &ws, &cs, &MultiVerifier).is_err());
+                    let saved = ws.get_account(&paymaster).unwrap().unwrap();
+                    let mut mismatched = saved.clone();
+                    mismatched.pq_pubkey_hash = ShellHash::ZERO;
+                    ws.set_account(&paymaster, &mismatched).unwrap();
+                    assert!(validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_err());
+                    mismatched.pq_pubkey_hash =
+                        shell_primitives::blake3_hash(original.public_key());
+                    ws.set_account(&paymaster, &mismatched).unwrap();
+                    assert!(validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_err());
+                    ws.set_account(&paymaster, &saved).unwrap();
+                    let mut inactive = shell_crypto::AlgorithmRegistry::default();
+                    for algo in ALLOWED_ALGORITHMS {
+                        inactive.deprecate(*algo);
+                    }
+                    shell_crypto::with_algorithm_registry_override(&inactive, || {
+                        assert!(verify_paymaster_signature(
+                            &signed,
+                            &paymaster,
+                            &ws,
+                            &cs,
+                            &MultiVerifier,
+                            10
+                        )
+                        .is_err());
+                    });
+                }
+                assert_eq!(
+                    (
+                        ws.get_account(&from).unwrap(),
+                        ws.get_account(&paymaster).unwrap()
+                    ),
+                    before
+                );
+                assert_eq!(
+                    cs.get_pubkey(&paymaster).unwrap().as_deref(),
+                    Some(replacement.public_key())
+                );
+            }
+        }
     }
 
     #[test]
