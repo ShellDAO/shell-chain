@@ -1186,7 +1186,7 @@ mod tests {
                 Err(TxValidationError::NonceMismatch { expected, got })
                     if expected == 0 && got == mismatched_sequence
             ),
-            "got {result:?}"
+            "expected a nonce mismatch"
         );
     }
 
@@ -1492,8 +1492,7 @@ mod tests {
         let result = validate_tx(&signed, &mut ws, &cs, &verifier, test_chain_id());
         assert!(
             matches!(result, Err(TxValidationError::InsufficientBalance { .. })),
-            "overflow should be caught, got: {:?}",
-            result
+            "overflow should be caught as insufficient balance"
         );
     }
 
@@ -2167,7 +2166,7 @@ mod tests {
                     got
                 }) if got == mismatched_sequence
             ),
-            "got {res:?}"
+            "expected a nonce mismatch"
         );
     }
 

@@ -3200,7 +3200,7 @@ mod tests {
 
         assert!(
             gas_clear < gas_set,
-            "clearing storage (gas={gas_clear}) should cost less than setting (gas={gas_set})"
+            "clearing storage should cost less than setting it"
         );
     }
 
@@ -3877,9 +3877,7 @@ mod tests {
 
         assert!(
             r1.gas_used > r2.gas_used,
-            "cold zero→nonzero ({}) should cost more than warm nonzero→nonzero ({})",
-            r1.gas_used,
-            r2.gas_used
+            "cold zero→nonzero should cost more than warm nonzero→nonzero"
         );
     }
 
@@ -3919,9 +3917,7 @@ mod tests {
 
         assert!(
             r_clear.gas_used < r_set.gas_used,
-            "clearing (gas={}) should cost less than setting (gas={})",
-            r_clear.gas_used,
-            r_set.gas_used
+            "clearing should cost less than setting"
         );
     }
 
@@ -3953,8 +3949,7 @@ mod tests {
         assert_eq!(result.receipt.status, 1);
         assert!(
             result.gas_used < 50_000,
-            "double SSTORE should be cheaper than 50k gas, got {}",
-            result.gas_used
+            "double SSTORE should be cheaper than 50k gas"
         );
     }
 
@@ -4013,7 +4008,7 @@ mod tests {
         let extra_gas = r2.gas_used - r1.gas_used;
         assert!(
             extra_gas < 500,
-            "second SLOAD (warm) should add ~100 gas, not {extra_gas}"
+            "second SLOAD should use the warm-access cost"
         );
     }
 
