@@ -34,6 +34,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add default-off `aa_account_manager_height` to execute native AccountManager
+  operations inside AA bundles. Successful batches publish account and native
+  metadata changes together; failed batches retain only outer fees and nonce
+  settlement. Include native call frames and historical metadata replay,
+  future-only activation scheduling and trusted snapshot checks.
+
 - Add default-off `registered_key_algorithm_height` to commit the selected
   algorithm during account key rotation and recovery. Direct signatures,
   session roots and EOA sponsors retain that identity through deprecation

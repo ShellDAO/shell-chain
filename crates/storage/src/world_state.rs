@@ -103,6 +103,11 @@ impl<S: KvStore + 'static> WorldState<S> {
         ))
     }
 
+    /// Backing store used to coordinate atomic native metadata and trie writes.
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
     /// Re-open the current world state at its latest root as an isolated snapshot.
     ///
     /// Useful for read-only simulations (e.g. RPC `eth_call`, AA validation

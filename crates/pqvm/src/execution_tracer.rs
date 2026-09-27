@@ -77,6 +77,20 @@ impl ExecutionTracer {
         }
     }
 
+    pub(crate) fn record_native_call(&mut self, frame: CallFrame) {
+        let bytes = TRACE_RECORD_OVERHEAD
+            .saturating_add(frame.input.len().saturating_mul(2))
+            .saturating_add(
+                frame
+                    .output
+                    .as_ref()
+                    .map_or(0, |output| output.len().saturating_mul(2)),
+            );
+        if self.reserve(bytes) {
+            self.roots.push(frame);
+        }
+    }
+
     fn reserve(&mut self, bytes: usize) -> bool {
         self.bytes = self.bytes.saturating_add(bytes);
         self.exceeded |=
