@@ -2198,7 +2198,7 @@ mod tests {
                     ws.get_account(&paymaster).unwrap().unwrap().pq_pubkey_hash,
                     shell_primitives::blake3_hash(replacement.public_key())
                 );
-                let mut tx = base_tx(1337, 0);
+                let mut tx = base_tx(1337, ws.get_nonce(&from).unwrap());
                 tx.tx_type = AA_BUNDLE_TX_TYPE;
                 tx.gas_limit = 300_000;
                 let mut signed = SignedTransaction::with_aa_bundle(
