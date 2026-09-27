@@ -84,6 +84,7 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                     registered_key_algorithm_height: genesis.registered_key_algorithm_height,
                     aa_account_manager_height: genesis.aa_account_manager_height,
                     aa_validator_registry_height: genesis.aa_validator_registry_height,
+                    native_registry_view_height: genesis.native_registry_view_height,
                     algorithm_proposal_staging_height: genesis.algorithm_proposal_staging_height,
                     algorithm_quorum_activation_height: genesis.algorithm_quorum_activation_height,
                     algorithm_timelock_activation_height: genesis

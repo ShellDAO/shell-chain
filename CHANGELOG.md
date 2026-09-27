@@ -34,6 +34,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add default-off `native_registry_view_height` for contract reads of the native
+  validator set at the distinct address `2^32 + 1`. Expose full `bytes32` members,
+  preserve the original PQ precompile addresses, and reject native writes,
+  malformed calldata, nonzero value and delegate calls. Apply the same height
+  gate in ordinary, AA, account-validation and paymaster execution; persist it
+  through startup and trusted snapshots. Include a compilable Solidity example
+  and signed two-node acceptance command.
+
 - Add default-off `aa_validator_registry_height` for native ValidatorRegistry
   calls inside AA bundles. Return actual native read data and preserve validator
   authorization. Commit account state, native metadata and runtime algorithm

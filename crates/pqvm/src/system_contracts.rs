@@ -117,7 +117,7 @@ pub const EXECUTE_RECOVERY_SELECTOR: [u8; 4] = compute_selector(b"executeRecover
 pub const CANCEL_RECOVERY_SELECTOR: [u8; 4] = compute_selector(b"cancelRecovery(address)");
 
 /// Compute a 4-byte function selector at compile time.
-const fn compute_selector(sig: &[u8]) -> [u8; 4] {
+pub(crate) const fn compute_selector(sig: &[u8]) -> [u8; 4] {
     let hash = const_keccak256(sig);
     [hash[0], hash[1], hash[2], hash[3]]
 }
@@ -3274,6 +3274,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                native_registry_view_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3357,6 +3358,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                native_registry_view_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3459,6 +3461,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            native_registry_view_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3526,6 +3529,7 @@ mod tests {
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
+                    native_registry_view_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -3674,6 +3678,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                native_registry_view_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
