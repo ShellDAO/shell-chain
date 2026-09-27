@@ -34,6 +34,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add default-off `aa_validator_registry_height` for native ValidatorRegistry
+  calls inside AA bundles. Return actual native read data and preserve validator
+  authorization. Commit account state, native metadata and runtime algorithm
+  policy together; failed batches retain only outer fee and nonce settlement.
+  Include historical replay, independent future-only scheduling and trusted
+  snapshot checks, plus a signed two-node acceptance command.
+
 - Add default-off `aa_account_manager_height` to execute native AccountManager
   operations inside AA bundles. Successful batches publish account and native
   metadata changes together; failed batches retain only outer fees and nonce

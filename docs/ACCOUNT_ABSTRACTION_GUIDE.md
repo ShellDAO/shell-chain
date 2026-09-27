@@ -475,8 +475,9 @@ activation or publish a compatible SDK. Historical tracing uses retained native
 metadata and is subject to the existing 128-block window.
 
 See [the atomic execution decision](adr/aa-account-manager.md) for scope,
-compatibility and reproducible regression commands. Native ValidatorRegistry AA
-dispatch and native calls from contract bytecode remain open follow-up work.
+compatibility and reproducible regression commands. ValidatorRegistry has its
+own activation schedule described below. Native calls from contract bytecode
+remain separate follow-up work.
 
 
 ### Reproduce the native AccountManager lifecycle
@@ -507,3 +508,44 @@ retains logs, isolated node data, the encrypted test validator key and its passw
 for diagnosis and recovery. It uses development mining and synthetic
 timestamps to check block-height boundaries, not elapsed wall-clock time. Native
 AA is enabled only in this test genesis; no existing network configuration changes.
+
+
+### Native ValidatorRegistry calls in AA bundles
+
+The independent, default-off `aa_validator_registry_height` enables native
+ValidatorRegistry dispatch in AA inner calls. Enabling AccountManager alone does
+not enable this path. Before activation, the legacy ordinary execution path can
+return a successful receipt with a zero word for `getValidators()`; a successful
+receipt alone does not verify the result. At and after activation the inner call
+returns the same native ABI data as a direct transaction. Inspect the inner
+`callTracer` frame for read results; the outer batch output is not the read value.
+
+The authenticated outer account remains the native caller, so registry writes
+retain validator authorization and existing governance rules. All account,
+registry metadata and runtime algorithm-policy changes commit only when the
+entire batch succeeds. A later native or ordinary call failure, insufficient
+inner gas or final fee-settlement failure discards the provisional changes.
+Ordinary outer fees and the single nonce increment still apply. Native methods
+reject attached value. Successful validator changes reach the normal consensus
+update path, and historical replay uses isolated native metadata and policy.
+
+The schedule is persisted and immutable; adding it to an existing database
+requires a future height. Trusted snapshots must match the configured schedule.
+This switch does not activate other algorithm-governance upgrades, define new
+consensus deprecation rules or schedule a live network upgrade.
+
+For a signed two-node acceptance, build with `cargo build -p shell-cli --features
+libp2p`, then use the compatible SDK and Node.js prerequisites above:
+
+```sh
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs
+```
+
+The script starts an isolated producer and non-authority follower, generates
+fresh keys, and verifies the activation boundary, returned validator data,
+permissions, gas/value rejection, failed-batch rollback, runtime policy,
+historical replay without live writes, finality and follower restart catch-up.
+It stops its child processes and prints the report path; node data and encrypted
+keys remain in its private temporary directory. It does not test multiple-authority
+quorum or prove public package availability. See the
+[execution decision](adr/aa-validator-registry.md) for the atomicity boundary.

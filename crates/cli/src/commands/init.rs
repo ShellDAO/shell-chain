@@ -112,6 +112,7 @@ pub fn init(
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
+                aa_validator_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,

@@ -178,10 +178,14 @@ fn replay_block_traces<S: KvStore + 'static>(
         .get_header_by_hash(&block.header.parent_hash)
         .map_err(internal_err)?
         .ok_or_else(|| server_error("trace parent header unavailable"))?;
-    let native_aa_enabled = chain
-        .get_chain_config()
-        .map_err(internal_err)?
+    let chain_config = chain.get_chain_config().map_err(internal_err)?;
+    let account_manager_enabled = chain_config
+        .as_ref()
         .and_then(|config| config.aa_account_manager_height)
+        .is_some_and(|height| block.header.number >= height);
+    let validator_registry_enabled = chain_config
+        .as_ref()
+        .and_then(|config| config.aa_validator_registry_height)
         .is_some_and(|height| block.header.number >= height);
     let requires_metadata = block
         .transactions
@@ -189,14 +193,14 @@ fn replay_block_traces<S: KvStore + 'static>(
         .enumerate()
         .take_while(|(index, _)| target.is_none_or(|target| *index <= target))
         .any(|(_, tx)| {
-            if native_aa_enabled
-                && tx.aa_bundle().is_some_and(|bundle| {
-                    bundle
-                        .inner_calls
-                        .iter()
-                        .any(|inner| inner.to == Some(shell_pqvm::account_manager_address()))
+            if tx.aa_bundle().is_some_and(|bundle| {
+                bundle.inner_calls.iter().any(|inner| {
+                    (account_manager_enabled
+                        && inner.to == Some(shell_pqvm::account_manager_address()))
+                        || (validator_registry_enabled
+                            && inner.to == Some(shell_pqvm::registry_address()))
                 })
-            {
+            }) {
                 return true;
             }
             !tx.is_aa_bundle()
