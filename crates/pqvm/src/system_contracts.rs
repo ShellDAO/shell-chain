@@ -5328,64 +5328,147 @@ mod tests {
 
     #[test]
     fn submit_recovery_and_execute_rotates_key() {
-        let owner = Address::from([0x40; 20]);
-        let g1 = Address::from([0x41; 20]);
-        let g2 = Address::from([0x42; 20]);
-        let (mut ws, cs) = setup_account_manager();
+        use shell_crypto::{MlDsaSigner, Signer};
 
-        // Set up guardian config with 2-of-2, timelock=100
-        let calldata = encode_set_guardians_calldata(&[g1, g2], 2, 100);
+        let owner = Address::from([0x40; 32]);
+        let g1 = Address::from([0x41; 32]);
+        let g2 = Address::from([0x42; 32]);
+        let g3 = Address::from([0x43; 32]);
+        let executor = Address::from([0x99; 32]);
+        let (mut ws, cs) = setup_account_manager();
+        let old_key = MlDsaSigner::generate();
+        let new_key = MlDsaSigner::generate();
+        let mut initial = account_with_balance(1_000_000);
+        initial.nonce = 7;
+        initial.pq_pubkey_hash = blake3_hash(old_key.public_key());
+        ws.set_account(&owner, &initial).unwrap();
+        cs.put_pubkey(&owner, old_key.public_key()).unwrap();
+
+        let set_head = |number| {
+            let block = shell_core::Block {
+                header: shell_core::BlockHeader {
+                    number,
+                    ..Default::default()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            cs.put_block(&block).unwrap();
+            cs.set_head(&block.hash()).unwrap();
+        };
+        set_head(10);
+        let calldata = encode_set_guardians_calldata(&[g1, g2, g3], 2, 100);
         execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
             .unwrap();
 
-        let new_pubkey = b"new_pq_pubkey_bytes".to_vec();
-        let new_algo = 1u8; // Dilithium3
-
-        // Vote 1 (g1)
-        let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
-        execute_system_contract_call(&account_manager_address(), &g1, &calldata, &mut ws, &cs)
-            .unwrap();
-
-        // Only 1 vote — maturity_block should still be 0
+        let vote = encode_submit_recovery_calldata(
+            &owner,
+            new_key.public_key(),
+            new_key.sig_type().as_u8(),
+        );
+        let execute = encode_execute_recovery_calldata(&owner);
+        for _ in 0..2 {
+            execute_system_contract_call(&account_manager_address(), &g1, &vote, &mut ws, &cs)
+                .unwrap();
+        }
         let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
-        assert_eq!(proposal.votes.len(), 1);
+        assert_eq!(proposal.votes, vec![g1]);
         assert_eq!(proposal.maturity_block, 0);
+        assert!(matches!(
+            execute_system_contract_call(
+                &account_manager_address(),
+                &executor,
+                &execute,
+                &mut ws,
+                &cs
+            ),
+            Err(SystemContractError::RecoveryNotMature(0))
+        ));
 
-        // Vote 2 (g2) — threshold reached
-        let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, new_algo);
-        execute_system_contract_call(&account_manager_address(), &g2, &calldata, &mut ws, &cs)
-            .unwrap();
-
+        // The second distinct vote executes in block 21 with parent head 20.
+        set_head(20);
+        execute_system_contract_call(&account_manager_address(), &g2, &vote, &mut ws, &cs).unwrap();
         let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
-        assert_eq!(proposal.votes.len(), 2);
-        // No head block → current_block=0 → maturity = 0 + 100 = 100
-        assert_eq!(proposal.maturity_block, 100);
+        assert_eq!(proposal.votes, vec![g1, g2]);
+        assert_eq!(proposal.maturity_block, 120);
 
-        // Cannot execute before maturity — head is at 0 but maturity=100
-        let calldata = encode_execute_recovery_calldata(&owner);
-        let err = execute_system_contract_call(
+        // Additional and repeated votes must not restart the delay.
+        set_head(30);
+        for guardian in [g3, g2] {
+            execute_system_contract_call(
+                &account_manager_address(),
+                &guardian,
+                &vote,
+                &mut ws,
+                &cs,
+            )
+            .unwrap();
+        }
+        let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
+        assert_eq!(proposal.votes, vec![g1, g2, g3]);
+        assert_eq!(proposal.maturity_block, 120);
+
+        // Block 120 is only 99 blocks after the threshold-reaching vote.
+        set_head(119);
+        assert!(matches!(
+            execute_system_contract_call(
+                &account_manager_address(),
+                &executor,
+                &execute,
+                &mut ws,
+                &cs
+            ),
+            Err(SystemContractError::RecoveryNotMature(120))
+        ));
+        assert_eq!(ws.get_account(&owner).unwrap().unwrap(), initial);
+        assert_eq!(
+            cs.get_pubkey(&owner).unwrap().unwrap(),
+            old_key.public_key()
+        );
+        assert_eq!(cs.get_recovery_proposal(&owner).unwrap().unwrap(), proposal);
+
+        // Block 121 is the first eligible execution block: exactly 100 later.
+        set_head(120);
+        let outcome = execute_system_contract_call(
             &account_manager_address(),
-            &Address::from([0x99; 20]),
-            &calldata,
+            &executor,
+            &execute,
             &mut ws,
             &cs,
         )
-        .unwrap_err();
-        assert!(matches!(err, SystemContractError::RecoveryNotMature(100)));
+        .unwrap();
+        assert_eq!(outcome.output, encode_bool(true));
+        assert_eq!(outcome.effects.updated_accounts, vec![owner]);
+        let mut expected = initial;
+        expected.pq_pubkey_hash = blake3_hash(new_key.public_key());
+        assert_eq!(ws.get_account(&owner).unwrap().unwrap(), expected);
+        assert_eq!(
+            cs.get_pubkey(&owner).unwrap().unwrap(),
+            new_key.public_key()
+        );
+        assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
+        assert!(matches!(
+            execute_system_contract_call(
+                &account_manager_address(), &executor, &execute, &mut ws, &cs
+            ),
+            Err(SystemContractError::NoRecoveryProposal(account)) if account == owner
+        ));
     }
 
     #[test]
     fn cancel_recovery_removes_proposal() {
-        let owner = Address::from([0x50; 20]);
-        let g1 = Address::from([0x51; 20]);
+        let owner = Address::from([0x50; 32]);
+        let g1 = Address::from([0x51; 32]);
+        let g2 = Address::from([0x52; 32]);
         let (mut ws, cs) = setup_account_manager();
 
         // Set guardians
-        let calldata = encode_set_guardians_calldata(&[g1], 1, 100);
+        let calldata = encode_set_guardians_calldata(&[g1, g2], 2, 100);
         execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
             .unwrap();
 
-        // Vote (threshold=1 so it immediately matures in test with no head block)
+        // Start a proposal without reaching its threshold.
         let new_pubkey = b"recovery_pubkey".to_vec();
         let calldata = encode_submit_recovery_calldata(&owner, &new_pubkey, 1);
         execute_system_contract_call(&account_manager_address(), &g1, &calldata, &mut ws, &cs)
@@ -5399,6 +5482,32 @@ mod tests {
             .unwrap();
 
         assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
+
+        // A new proposal must not inherit the cancelled guardian's vote.
+        let vote = encode_submit_recovery_calldata(&owner, &new_pubkey, 1);
+        execute_system_contract_call(&account_manager_address(), &g2, &vote, &mut ws, &cs).unwrap();
+        let proposal = cs.get_recovery_proposal(&owner).unwrap().unwrap();
+        assert_eq!(proposal.votes, vec![g2]);
+        assert_eq!(proposal.maturity_block, 0);
+        execute_system_contract_call(&account_manager_address(), &g1, &vote, &mut ws, &cs).unwrap();
+        assert_eq!(
+            cs.get_recovery_proposal(&owner)
+                .unwrap()
+                .unwrap()
+                .maturity_block,
+            100
+        );
+
+        // Cancellation also removes an already threshold-approved proposal.
+        execute_system_contract_call(&account_manager_address(), &owner, &calldata, &mut ws, &cs)
+            .unwrap();
+        assert!(cs.get_recovery_proposal(&owner).unwrap().is_none());
+        assert!(matches!(
+            execute_system_contract_call(
+                &account_manager_address(), &g2, &encode_execute_recovery_calldata(&owner), &mut ws, &cs
+            ),
+            Err(SystemContractError::NoRecoveryProposal(account)) if account == owner
+        ));
     }
 
     #[test]
