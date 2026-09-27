@@ -178,12 +178,27 @@ fn replay_block_traces<S: KvStore + 'static>(
         .get_header_by_hash(&block.header.parent_hash)
         .map_err(internal_err)?
         .ok_or_else(|| server_error("trace parent header unavailable"))?;
+    let native_aa_enabled = chain
+        .get_chain_config()
+        .map_err(internal_err)?
+        .and_then(|config| config.aa_account_manager_height)
+        .is_some_and(|height| block.header.number >= height);
     let requires_metadata = block
         .transactions
         .iter()
         .enumerate()
         .take_while(|(index, _)| target.is_none_or(|target| *index <= target))
         .any(|(_, tx)| {
+            if native_aa_enabled
+                && tx.aa_bundle().is_some_and(|bundle| {
+                    bundle
+                        .inner_calls
+                        .iter()
+                        .any(|inner| inner.to == Some(shell_pqvm::account_manager_address()))
+                })
+            {
+                return true;
+            }
             !tx.is_aa_bundle()
                 && tx
                     .tx

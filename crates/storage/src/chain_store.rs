@@ -91,6 +91,9 @@ pub struct ChainConfig {
     /// First block committing the selected algorithm in rotated account key hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_key_algorithm_height: Option<u64>,
+    /// First block executing native AccountManager calls atomically inside AA bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_account_manager_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -1824,6 +1827,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.registered_key_algorithm_height,
             ),
             (
+                "AA AccountManager",
+                stored.aa_account_manager_height,
+                desired.aa_account_manager_height,
+            ),
+            (
                 "algorithm proposal staging",
                 stored.algorithm_proposal_staging_height,
                 desired.algorithm_proposal_staging_height,
@@ -2092,6 +2100,9 @@ impl<S: KvStore> ChainStore<S> {
             registered_key_algorithm_height: self
                 .get_chain_config()?
                 .and_then(|config| config.registered_key_algorithm_height),
+            aa_account_manager_height: self
+                .get_chain_config()?
+                .and_then(|config| config.aa_account_manager_height),
             algorithm_proposal_staging_height: self
                 .get_chain_config()?
                 .and_then(|config| config.algorithm_proposal_staging_height),
@@ -2151,6 +2162,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_session_registered_root = trusted.session_registered_root_height;
         let trusted_paymaster_registered_root = trusted.paymaster_registered_root_height;
         let trusted_registered_key_algorithm = trusted.registered_key_algorithm_height;
+        let trusted_aa_account_manager = trusted.aa_account_manager_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
         let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
         let trusted_algorithm_timelock_activation = trusted.algorithm_timelock_activation_height;
@@ -2291,6 +2303,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.session_registered_root_height != trusted_session_registered_root
                     || config.paymaster_registered_root_height != trusted_paymaster_registered_root
                     || config.registered_key_algorithm_height != trusted_registered_key_algorithm
+                    || config.aa_account_manager_height != trusted_aa_account_manager
                     || config.algorithm_proposal_staging_height
                         != trusted_algorithm_proposal_staging
                     || config.algorithm_quorum_activation_height
@@ -2448,6 +2461,15 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted registered key algorithm activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.aa_account_manager_height)
+            != trusted_aa_account_manager
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted AA AccountManager activation".into(),
             ));
         }
 
@@ -2665,6 +2687,7 @@ impl<S: KvStore> ChainStore<S> {
             session_registered_root_height: trusted_session_registered_root,
             paymaster_registered_root_height: trusted_paymaster_registered_root,
             registered_key_algorithm_height: trusted_registered_key_algorithm,
+            aa_account_manager_height: trusted_aa_account_manager,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
             algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
             algorithm_timelock_activation_height: trusted_algorithm_timelock_activation,
@@ -4234,6 +4257,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -4278,6 +4302,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -4308,6 +4333,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4328,6 +4354,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4380,6 +4407,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4400,6 +4428,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4452,6 +4481,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4472,6 +4502,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4523,6 +4554,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: trusted_height,
@@ -4543,6 +4575,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: Some(6),
@@ -4639,6 +4672,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -4664,6 +4698,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -4721,6 +4756,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: trusted_height,
                 algorithm_timelock_activation_height: None,
             };
@@ -4741,6 +4777,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: Some(6),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -4801,6 +4838,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -4824,6 +4862,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -4883,6 +4922,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4906,6 +4946,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4965,6 +5006,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -4988,6 +5030,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5048,6 +5091,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5071,6 +5115,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5131,6 +5176,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5154,6 +5200,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5214,6 +5261,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5237,6 +5285,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5293,6 +5342,7 @@ mod tests {
                 session_registered_root_height: trusted_height,
                 paymaster_registered_root_height: trusted_height,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
@@ -5316,6 +5366,7 @@ mod tests {
                 session_registered_root_height: Some(6),
                 paymaster_registered_root_height: Some(6),
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
@@ -5375,6 +5426,7 @@ mod tests {
                 algorithm_quorum_activation_height: None,
                 paymaster_registered_root_height: trusted_height,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 session_registered_root_height: trusted_height,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -5398,6 +5450,7 @@ mod tests {
                 algorithm_quorum_activation_height: None,
                 paymaster_registered_root_height: Some(6),
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 session_registered_root_height: Some(6),
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -5441,6 +5494,51 @@ mod tests {
     }
 
     #[test]
+    fn aa_account_manager_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "aa_account_manager_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.aa_account_manager_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted AA AccountManager activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn registered_key_algorithm_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -5457,6 +5555,7 @@ mod tests {
                 }),
                 algorithm_quorum_activation_height: None,
                 registered_key_algorithm_height: trusted_height,
+                aa_account_manager_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -5480,6 +5579,7 @@ mod tests {
                 }),
                 algorithm_quorum_activation_height: None,
                 registered_key_algorithm_height: Some(6),
+                aa_account_manager_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -5544,6 +5644,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -5564,6 +5665,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -5893,6 +5995,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5913,6 +6016,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5975,6 +6079,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -6102,6 +6207,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -7032,6 +7138,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -7571,6 +7678,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
                 algorithm_quorum_activation_height: quorum_activation,
                 algorithm_timelock_activation_height: timelock_activation,
@@ -7661,6 +7769,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -7726,6 +7835,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -8846,6 +8956,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -8883,6 +8994,7 @@ mod tests {
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
             registered_key_algorithm_height: None,
+            aa_account_manager_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

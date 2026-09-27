@@ -24,7 +24,8 @@ use revm::primitives::{TxKind, KECCAK_EMPTY};
 use revm::state::EvmState;
 use shell_core::{Account, BlockHeader, TransactionReceipt};
 use shell_primitives::{Address as ShellAddress, ShellHash};
-use shell_storage::{ChainStore, KvStore, StorageError, WorldState};
+use shell_storage::{ChainStore, KvStore, OverlayStore, StorageError, WorldState};
+use std::sync::Arc;
 
 use crate::precompiles::ShellPrecompiles;
 use crate::state_db::{ShellStateDb, StateDbError};
@@ -527,6 +528,81 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         tx_index: u32,
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
+        let native_account_manager = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.aa_account_manager_height)
+            .is_some_and(|height| header.number >= height)
+            && signed_tx.aa_bundle().is_some_and(|bundle| {
+                bundle
+                    .inner_calls
+                    .iter()
+                    .any(|inner| inner.to == Some(system_contracts::account_manager_address()))
+            });
+        if !native_account_manager {
+            return self.execute_aa_bundle_inner(
+                signed_tx,
+                header,
+                tx_index,
+                cumulative_gas_used,
+                false,
+            );
+        }
+
+        if !Arc::ptr_eq(
+            self.state_db.world_state().store(),
+            self.state_db.chain_store().store(),
+        ) {
+            return Err(ExecutorError::Revm(
+                "native AA calls require a shared account and metadata store".into(),
+            ));
+        }
+        // Stage account trie writes and native metadata together. A failed
+        // bundle publishes only the ordinary outer nonce and gas settlement.
+        let root = self.state_db.world_state_mut().state_root()?;
+        let overlay = Arc::new(OverlayStore::new(Arc::clone(
+            self.state_db.chain_store().store(),
+        )));
+        let state = WorldState::at_root(Arc::clone(&overlay), &root)?;
+        let mut staged = ShellPqvm::new(
+            ShellStateDb::new(state, ChainStore::new(Arc::clone(&overlay))),
+            self.chain_id,
+        );
+        staged.tracer = self.tracer.take();
+        let result =
+            staged.execute_aa_bundle_inner(signed_tx, header, tx_index, cumulative_gas_used, true);
+        self.tracer = staged.tracer.take();
+        let result = result?;
+        if result.receipt.succeeded() {
+            let root = staged.state_db.world_state_mut().state_root()?;
+            overlay.commit()?;
+            self.state_db.world_state_mut().rollback_to_root(&root)?;
+        } else {
+            let sender = signed_tx.from;
+            let payer = signed_tx
+                .aa_bundle()
+                .and_then(|bundle| bundle.paymaster)
+                .unwrap_or(sender);
+            for address in [sender, payer] {
+                if let Some(account) = staged.state_db.world_state().get_account(&address)? {
+                    self.state_db
+                        .world_state_mut()
+                        .set_account(&address, &account)?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn execute_aa_bundle_inner(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        tx_index: u32,
+        cumulative_gas_used: u64,
+        native_account_manager: bool,
+    ) -> Result<TxExecutionResult, ExecutorError> {
         let bundle = signed_tx
             .aa_bundle()
             .ok_or_else(|| ExecutorError::Revm("execute_aa_bundle called on non-AA tx".into()))?;
@@ -665,8 +741,75 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut all_logs: Vec<shell_core::Log> = Vec::new();
         let mut atomic_failure = false;
         let mut last_revert_data: Vec<u8> = Vec::new();
+        let mut native_effects = SystemContractEffects::default();
 
         for inner in &bundle.inner_calls {
+            if native_account_manager
+                && inner.to == Some(system_contracts::account_manager_address())
+            {
+                let target = system_contracts::account_manager_address();
+                let remaining = tx.gas_limit.saturating_sub(total_gas_used);
+                let budget = inner.gas_limit.min(remaining);
+                let (world, chain) = self.state_db.world_state_and_chain_store();
+                let outcome = if inner.value != U256::ZERO {
+                    Err(system_contracts::SystemContractError::AbiDecode(
+                        "system contracts do not accept value".into(),
+                    ))
+                } else if budget < SYSTEM_CALL_BASE_GAS {
+                    Err(system_contracts::SystemContractError::AbiDecode(
+                        "native inner call out of gas".into(),
+                    ))
+                } else {
+                    execute_system_contract_call_at_block(
+                        &target,
+                        &sender,
+                        inner.data.as_ref(),
+                        world,
+                        chain,
+                        header.number,
+                    )
+                };
+                let required_gas = outcome
+                    .as_ref()
+                    .map_or(SYSTEM_CALL_BASE_GAS, |result| result.gas_used);
+                let used = required_gas.min(budget);
+                total_gas_used = total_gas_used.saturating_add(used);
+                total_gas_spent = total_gas_spent.saturating_add(used);
+                let (output, failed) = match outcome {
+                    Ok(outcome) if required_gas <= budget => {
+                        for address in outcome.effects.updated_accounts {
+                            if !native_effects.updated_accounts.contains(&address) {
+                                native_effects.updated_accounts.push(address);
+                            }
+                        }
+                        (outcome.output, false)
+                    }
+                    Ok(_) => (b"native inner call out of gas".to_vec(), true),
+                    Err(error) => (error.to_string().into_bytes(), true),
+                };
+                if let Some(tracer) = self.tracer.as_mut() {
+                    let mut frame = crate::CallFrame::new(
+                        "CALL",
+                        sender,
+                        target,
+                        inner.gas_limit,
+                        inner.data.clone(),
+                    )
+                    .with_value(inner.value);
+                    frame.gas_used = used;
+                    frame.output = Some(shell_primitives::Bytes::from(output.clone()));
+                    if failed {
+                        frame.error = Some(String::from_utf8_lossy(&output).into_owned());
+                    }
+                    tracer.record_native_call(frame);
+                }
+                if failed {
+                    atomic_failure = true;
+                    last_revert_data = output;
+                    break;
+                }
+                continue;
+            }
             // Resolve every explicit account at the revm boundary using its
             // full Shell address, including the inner fee beneficiary.
             self.state_db.register_pq_address(sender);
@@ -987,7 +1130,11 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             gas_spent: total_gas_spent,
             output,
             is_system_tx: true,
-            system_contract_effects: SystemContractEffects::default(),
+            system_contract_effects: if atomic_failure {
+                SystemContractEffects::default()
+            } else {
+                native_effects
+            },
         })
     }
 
@@ -1343,6 +1490,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1561,6 +1709,7 @@ mod tests {
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
                 registered_key_algorithm_height: None,
+                aa_account_manager_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1636,6 +1785,7 @@ mod tests {
                             session_registered_root_height: None,
                             paymaster_registered_root_height: None,
                             registered_key_algorithm_height: None,
+                            aa_account_manager_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -2200,6 +2350,7 @@ mod tests {
                     session_registered_root_height: None,
                     paymaster_registered_root_height: None,
                     registered_key_algorithm_height: None,
+                    aa_account_manager_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -4425,6 +4576,380 @@ mod tests {
             .unwrap()
             .map(|a| a.nonce)
             .unwrap_or_default()
+    }
+
+    fn setup_native_aa_evm() -> ShellPqvm<MemoryDb> {
+        let store = Arc::new(MemoryDb::new());
+        ShellPqvm::new(
+            ShellStateDb::new(WorldState::new(Arc::clone(&store)), ChainStore::new(store)),
+            1337,
+        )
+    }
+
+    fn configure_native_aa(evm: &ShellPqvm<MemoryDb>, height: Option<u64>) {
+        evm.state_db()
+            .chain_store()
+            .put_chain_config(
+                &serde_json::from_value(
+                    serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                "aa_account_manager_height":height}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn native_inner(data: Vec<u8>, gas_limit: u64) -> shell_core::InnerCall {
+        shell_core::InnerCall {
+            to: Some(system_contracts::account_manager_address()),
+            value: U256::ZERO,
+            data: shell_primitives::Bytes::from(data),
+            gas_limit,
+        }
+    }
+
+    #[test]
+    fn aa_account_manager_activation_and_trace() {
+        for activation in [None, Some(10)] {
+            for number in [9, 10, 11] {
+                let mut evm = setup_native_aa_evm();
+                let owner = ShellAddress::from([0x71; 32]);
+                let guardian = ShellAddress::from([0x72; 32]);
+                fund_account(&mut evm, &owner, U256::from(10_000_000));
+                configure_native_aa(&evm, activation);
+                let call = native_inner(
+                    system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
+                    100_000,
+                );
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    200_000,
+                    10,
+                    vec![call],
+                    None,
+                );
+                let header = BlockHeader {
+                    number,
+                    ..sample_header()
+                };
+                let (result, trace) = evm
+                    .trace_transaction(&tx, &header, 0, 0, TraceConfig::default())
+                    .unwrap();
+                let config = evm
+                    .state_db()
+                    .chain_store()
+                    .get_guardian_config(&owner)
+                    .unwrap();
+                let enabled = activation.is_some_and(|height| number >= height);
+                assert_eq!(config.is_some(), enabled);
+                if enabled {
+                    assert_eq!(result.receipt.status, 1);
+                    assert_eq!(config.unwrap().guardians, vec![guardian]);
+                    assert!(trace.struct_logs.is_empty());
+                    assert_eq!(
+                        result.gas_used,
+                        21_000
+                            + tx.aa_bundle().unwrap().intrinsic_gas_surcharge()
+                            + SYSTEM_CALL_BASE_GAS
+                            + system_contracts::SYSTEM_CALL_OP_GAS
+                    );
+                }
+                assert_eq!(get_nonce(&mut evm, &owner), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn aa_account_manager_rolls_back_keys_guardians_and_value() {
+        use shell_crypto::{MlDsaSigner, Signer};
+        let old = MlDsaSigner::generate();
+        let replacement = MlDsaSigner::generate();
+        for fail in [false, true] {
+            for sponsored in [false, true] {
+                let mut evm = setup_native_aa_evm();
+                let owner = ShellAddress::from([0x73; 32]);
+                let guardian = ShellAddress::from([0x74; 32]);
+                let payer = ShellAddress::from([0x75; 32]);
+                fund_account(&mut evm, &owner, U256::from(10_000_000));
+                fund_account(&mut evm, &payer, U256::from(10_000_000));
+                configure_native_aa(&evm, Some(0));
+                let (ws, cs) = evm.state_db_mut().world_state_and_chain_store();
+                system_contracts::execute_system_contract_call(
+                    &system_contracts::account_manager_address(),
+                    &owner,
+                    &system_contracts::encode_rotate_key_calldata(
+                        old.public_key(),
+                        old.sig_type().as_u8(),
+                    ),
+                    ws,
+                    cs,
+                )
+                .unwrap();
+                let initial = evm
+                    .state_db()
+                    .world_state()
+                    .get_account(&owner)
+                    .unwrap()
+                    .unwrap();
+                let mut calls = vec![
+                    native_inner(
+                        system_contracts::encode_rotate_key_calldata(
+                            replacement.public_key(),
+                            replacement.sig_type().as_u8(),
+                        ),
+                        100_000,
+                    ),
+                    native_inner(
+                        system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
+                        100_000,
+                    ),
+                    shell_core::InnerCall {
+                        to: Some(guardian),
+                        value: U256::from(7),
+                        data: shell_primitives::Bytes::new(),
+                        gas_limit: 50_000,
+                    },
+                ];
+                if fail {
+                    calls.push(shell_core::InnerCall {
+                        to: Some(guardian),
+                        value: U256::ZERO,
+                        data: shell_primitives::Bytes::new(),
+                        gas_limit: 100,
+                    });
+                }
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    500_000,
+                    10,
+                    calls,
+                    sponsored.then_some(payer),
+                );
+                let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(!fail));
+                let expected_key = if fail {
+                    old.public_key()
+                } else {
+                    replacement.public_key()
+                };
+                assert_eq!(
+                    evm.state_db()
+                        .chain_store()
+                        .get_pubkey(&owner)
+                        .unwrap()
+                        .unwrap(),
+                    expected_key
+                );
+                assert_eq!(
+                    evm.state_db()
+                        .chain_store()
+                        .get_guardian_config(&owner)
+                        .unwrap()
+                        .is_some(),
+                    !fail
+                );
+                let account = evm
+                    .state_db()
+                    .world_state()
+                    .get_account(&owner)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    account.pq_pubkey_hash,
+                    shell_primitives::blake3_hash(expected_key)
+                );
+                assert_eq!(account.nonce, 1);
+                let fee = U256::from(result.gas_used * 10);
+                let value = if fail { U256::ZERO } else { U256::from(7) };
+                assert_eq!(
+                    account.balance,
+                    initial.balance - value - if sponsored { U256::ZERO } else { fee }
+                );
+                assert_eq!(get_balance(&mut evm, &guardian), value);
+                assert_eq!(
+                    get_balance(&mut evm, &payer),
+                    U256::from(10_000_000) - if sponsored { fee } else { U256::ZERO }
+                );
+                assert_eq!(get_nonce(&mut evm, &payer), 0);
+                assert_eq!(
+                    result.system_contract_effects.updated_accounts.is_empty(),
+                    fail
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aa_account_manager_failed_proposals_and_cancellation_are_atomic() {
+        let mut evm = setup_native_aa_evm();
+        let owner = ShellAddress::from([0x76; 32]);
+        let guardian = ShellAddress::from([0x77; 32]);
+        for account in [owner, guardian] {
+            fund_account(&mut evm, &account, U256::from(10_000_000));
+        }
+        configure_native_aa(&evm, Some(0));
+        let settings = native_inner(
+            system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
+            100_000,
+        );
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![settings],
+            None,
+        );
+        assert_eq!(
+            evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .status,
+            1
+        );
+        let bad = native_inner(vec![0xff; 4], 100_000);
+        let proposal = native_inner(
+            system_contracts::encode_submit_recovery_calldata(&owner, &[0x55; 32], 1),
+            100_000,
+        );
+        let tx = make_aa_signed(
+            guardian,
+            current_nonce(&mut evm, &guardian),
+            500_000,
+            10,
+            vec![proposal.clone(), bad.clone()],
+            None,
+        );
+        assert_eq!(
+            evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .status,
+            0
+        );
+        assert!(evm
+            .state_db()
+            .chain_store()
+            .get_recovery_proposal(&owner)
+            .unwrap()
+            .is_none());
+        assert_eq!(get_nonce(&mut evm, &guardian), 1);
+        let tx = make_aa_signed(
+            guardian,
+            current_nonce(&mut evm, &guardian),
+            500_000,
+            10,
+            vec![proposal],
+            None,
+        );
+        assert_eq!(
+            evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .status,
+            1
+        );
+        let approved = evm
+            .state_db()
+            .chain_store()
+            .get_recovery_proposal(&owner)
+            .unwrap()
+            .unwrap();
+        let cancel = native_inner(
+            system_contracts::encode_cancel_recovery_calldata(&owner),
+            100_000,
+        );
+        assert_eq!(get_nonce(&mut evm, &owner), 1);
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![cancel.clone(), bad],
+            None,
+        );
+        assert_eq!(
+            evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .status,
+            0
+        );
+        assert_eq!(
+            evm.state_db()
+                .chain_store()
+                .get_recovery_proposal(&owner)
+                .unwrap()
+                .unwrap(),
+            approved
+        );
+        assert_eq!(get_nonce(&mut evm, &owner), 2);
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![cancel],
+            None,
+        );
+        assert_eq!(
+            evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .status,
+            1
+        );
+        assert!(evm
+            .state_db()
+            .chain_store()
+            .get_recovery_proposal(&owner)
+            .unwrap()
+            .is_none());
+        assert_eq!(get_nonce(&mut evm, &owner), 3);
+        assert_eq!(get_nonce(&mut evm, &guardian), 2);
+    }
+
+    #[test]
+    fn aa_account_manager_rejects_value_and_insufficient_inner_gas() {
+        for (gas, value) in [
+            (100, U256::ZERO),
+            (SYSTEM_CALL_BASE_GAS, U256::ZERO),
+            (100_000, U256::from(1)),
+        ] {
+            let mut evm = setup_native_aa_evm();
+            let owner = ShellAddress::from([0x78; 32]);
+            let guardian = ShellAddress::from([0x79; 32]);
+            fund_account(&mut evm, &owner, U256::from(10_000_000));
+            configure_native_aa(&evm, Some(0));
+            let mut call = native_inner(
+                system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
+                gas,
+            );
+            call.value = value;
+            let tx = make_aa_signed(
+                owner,
+                current_nonce(&mut evm, &owner),
+                200_000,
+                10,
+                vec![call],
+                None,
+            );
+            let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+            assert_eq!(result.receipt.status, 0);
+            assert!(evm
+                .state_db()
+                .chain_store()
+                .get_guardian_config(&owner)
+                .unwrap()
+                .is_none());
+            assert!(result.gas_used <= tx.tx.gas_limit);
+            assert_eq!(
+                get_balance(&mut evm, &system_contracts::account_manager_address()),
+                U256::ZERO
+            );
+        }
     }
 
     #[test]

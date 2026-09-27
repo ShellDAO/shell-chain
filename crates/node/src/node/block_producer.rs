@@ -191,10 +191,7 @@ impl<S: KvStore + 'static> Node<S> {
                         tx.tx.max_priority_fee_per_gas,
                         base_fee,
                     );
-                    if is_aa {
-                        // The AA dispatcher already mutated the isolated block
-                        // state in place, including atomic rollback on failure.
-                    } else if result.is_system_tx {
+                    if is_aa || result.is_system_tx {
                         // Native system-contract effects are already staged in
                         // the isolated world and chain stores.
                         Self::validate_system_contract_effects(

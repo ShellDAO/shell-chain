@@ -192,6 +192,9 @@ pub struct GenesisConfig {
     /// First block committing the selected algorithm in rotated account key hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_key_algorithm_height: Option<u64>,
+    /// First block executing native AccountManager calls atomically inside AA bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_account_manager_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,

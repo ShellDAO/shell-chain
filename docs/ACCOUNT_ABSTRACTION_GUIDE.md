@@ -448,3 +448,32 @@ They cover genuine signatures for all three installed algorithms, lifecycle
 rejection, rotation/recovery activation, import parent-state binding, transaction
 pool retention and snapshot mismatch rejection. They do not claim consensus-key
 migration or production activation.
+
+
+### Native AccountManager inner calls
+
+The optional `aa_account_manager_height` enables native AccountManager operations
+inside an AA bundle. This fixes the separate batch entry previously sending
+AccountManager calldata to the ordinary PQVM execution path. Use compatible SDK
+native encoders and the full 32-byte AccountManager address. The authenticated
+outer account is the caller for every inner operation.
+
+At activation, a batch can configure guardians, submit or cancel recovery,
+rotate its root key, and change its validation code through the native methods.
+Native calls reject attached value and honor both the inner gas limit and the
+remaining outer budget. All inner effects commit together: a later failure
+rolls back account state, registered public keys, guardian configuration and
+recovery proposals, while ordinary outer fees and the single nonce increment
+still apply. A replacement root signs later transactions after confirmation;
+changing a root within a batch does not change that batch's already authenticated
+caller. Custom validation policy is preserved unless explicitly changed.
+
+The schedule defaults to disabled. Historical blocks retain their earlier
+behavior; existing databases accept only a future activation and reject schedule
+changes or incompatible trusted snapshots. A source merge does not schedule
+activation or publish a compatible SDK. Historical tracing uses retained native
+metadata and is subject to the existing 128-block window.
+
+See [the atomic execution decision](adr/aa-account-manager.md) for scope,
+compatibility and reproducible regression commands. Native ValidatorRegistry AA
+dispatch and native calls from contract bytecode remain open follow-up work.
