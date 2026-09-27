@@ -13,6 +13,7 @@ mod aa_validation;
 pub mod bloom;
 mod execution_tracer;
 mod executor;
+mod key_binding;
 pub use execution_tracer::{ExecutionTrace, TraceConfig};
 mod parallel;
 pub mod pqvm_opcodes;

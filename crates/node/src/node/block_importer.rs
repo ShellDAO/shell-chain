@@ -45,6 +45,7 @@ fn batch_signing_pubkey<S: KvStore>(
     block_number: u64,
     tx: &SignedTransaction,
     root_pubkey: &[u8],
+    world_state: &WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<Vec<u8>, NodeError> {
     if tx.signature.data.is_empty() {
@@ -102,6 +103,7 @@ fn batch_signing_pubkey<S: KvStore>(
     let root_valid = shell_pqvm::verify_session_root_authorization(
         tx,
         root_pubkey,
+        world_state,
         chain_store,
         block_number,
         &MultiVerifier,
@@ -720,8 +722,14 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 };
                 signing_pubkeys.push(Some(
-                    batch_signing_pubkey(block.number(), tx, &root_pubkey, &replay_cs)
-                        .map_err(|error| Self::classify_fork_error(block.hash(), error))?,
+                    batch_signing_pubkey(
+                        block.number(),
+                        tx,
+                        &root_pubkey,
+                        &signature_state,
+                        &replay_cs,
+                    )
+                    .map_err(|error| Self::classify_fork_error(block.hash(), error))?,
                 ));
             }
             let verify_items = block
@@ -1665,6 +1673,7 @@ impl<S: KvStore + 'static> Node<S> {
                     block.number(),
                     tx,
                     &root_pubkey,
+                    &signature_state,
                     &import_cs,
                 )?));
             }
@@ -2094,6 +2103,116 @@ mod tests {
     }
 
     #[test]
+    fn registered_key_algorithm_import_uses_candidate_state_and_policy() {
+        use shell_core::{AaBundle, InnerCall, SessionAuth, AA_BUNDLE_TX_TYPE};
+        use shell_crypto::{MlDsaSigner, SphincsSigner};
+        let root = SphincsSigner::generate();
+        let session = MlDsaSigner::generate();
+        let from = Address::from([0x79; 32]);
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store.clone());
+        let mut ws = WorldState::new(store.clone());
+        cs.put_chain_config(
+            &serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "session_registered_root_height": 0,
+                "registered_key_algorithm_height": 10,
+                "algorithm_session_deprecation_height": 10
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        shell_pqvm::system_contracts::execute_system_contract_call_at_block(
+            &shell_pqvm::system_contracts::account_manager_address(),
+            &from,
+            &shell_pqvm::system_contracts::encode_rotate_key_calldata(
+                root.public_key(),
+                root.sig_type().as_u8(),
+            ),
+            &mut ws,
+            &cs,
+            10,
+        )
+        .unwrap();
+        let mut tx = transaction();
+        tx.tx_type = AA_BUNDLE_TX_TYPE;
+        let mut auth = SessionAuth {
+            session_pubkey: Bytes::from(session.public_key().to_vec()),
+            session_algo: session.sig_type().as_u8(),
+            target: None,
+            value_cap: U256::ZERO,
+            expiry_block: 20,
+            root_signature: Bytes::new(),
+            session_signature: Bytes::from(vec![1]),
+        };
+        auth.root_signature = Bytes::from(
+            root.sign(auth.auth_hash(tx.chain_id).as_bytes())
+                .unwrap()
+                .data,
+        );
+        let mut signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            PQSignature::new(session.sig_type(), vec![1]),
+            PubkeyMode::Reference,
+            AaBundle {
+                inner_calls: vec![InnerCall {
+                    to: Some(Address::ZERO),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 21_000,
+                }],
+                session_auth: Some(auth),
+                ..AaBundle::default()
+            },
+        )
+        .unwrap();
+        signed.signature = session
+            .sign(signed.sender_signing_hash().as_bytes())
+            .unwrap();
+        signed
+            .aa_bundle
+            .as_mut()
+            .unwrap()
+            .session_auth
+            .as_mut()
+            .unwrap()
+            .session_signature = Bytes::from(signed.signature.data.clone());
+        let mut registry = AlgorithmRegistry::default();
+        registry.deprecate(root.sig_type());
+        with_algorithm_registry_override(&registry, || {
+            assert!(batch_signing_pubkey(9, &signed, root.public_key(), &ws, &cs).is_err());
+            for height in [10, 11] {
+                assert_eq!(
+                    batch_signing_pubkey(height, &signed, root.public_key(), &ws, &cs).unwrap(),
+                    session.public_key()
+                );
+            }
+            // A different parent state cannot borrow the canonical key commitment.
+            let empty_parent = WorldState::new(store);
+            assert!(
+                batch_signing_pubkey(10, &signed, root.public_key(), &empty_parent, &cs).is_err()
+            );
+            let mut bad = signed.clone();
+            let auth = bad
+                .aa_bundle
+                .as_mut()
+                .unwrap()
+                .session_auth
+                .as_mut()
+                .unwrap();
+            let mut bytes = auth.root_signature.as_ref().to_vec();
+            bytes[0] ^= 1;
+            auth.root_signature = Bytes::from(bytes);
+            assert!(batch_signing_pubkey(10, &bad, root.public_key(), &ws, &cs).is_err());
+        });
+        registry.propose_activation(root.sig_type());
+        with_algorithm_registry_override(&registry, || {
+            assert!(batch_signing_pubkey(10, &signed, root.public_key(), &ws, &cs).is_err());
+        });
+    }
+
+    #[test]
     fn import_session_root_deprecation_requires_registered_bound_key_and_activation() {
         use shell_core::{AaBundle, InnerCall, SessionAuth, AA_BUNDLE_TX_TYPE};
         use shell_crypto::{MlDsaSigner, SphincsSigner};
@@ -2108,6 +2227,7 @@ mod tests {
             } else {
                 Box::new(MlDsaSigner::generate())
             };
+            let world_state = WorldState::new(Arc::new(MemoryDb::new()));
             let cs = ChainStore::new(Arc::new(MemoryDb::new()));
             cs.put_chain_config(
                 &serde_json::from_value(serde_json::json!({
@@ -2165,19 +2285,25 @@ mod tests {
             let mut registry = AlgorithmRegistry::default();
             with_algorithm_registry_override(&registry, || {
                 assert_eq!(
-                    batch_signing_pubkey(9, &signed, root.public_key(), &cs).unwrap(),
+                    batch_signing_pubkey(9, &signed, root.public_key(), &world_state, &cs).unwrap(),
                     session.public_key()
                 );
             });
             registry.deprecate(root.sig_type());
             with_algorithm_registry_override(&registry, || {
                 // An earlier embedded key alone does not grant the registered-account exception.
-                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &cs).is_err());
+                assert!(
+                    batch_signing_pubkey(10, &signed, root.public_key(), &world_state, &cs)
+                        .is_err()
+                );
                 cs.put_pubkey(&from, root.public_key()).unwrap();
-                assert!(batch_signing_pubkey(9, &signed, root.public_key(), &cs).is_err());
+                assert!(
+                    batch_signing_pubkey(9, &signed, root.public_key(), &world_state, &cs).is_err()
+                );
                 for number in [10, 11] {
                     assert_eq!(
-                        batch_signing_pubkey(number, &signed, root.public_key(), &cs).unwrap(),
+                        batch_signing_pubkey(number, &signed, root.public_key(), &world_state, &cs)
+                            .unwrap(),
                         session.public_key()
                     );
                 }
@@ -2189,11 +2315,23 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .root_signature = Bytes::from(vec![1]);
-                assert!(batch_signing_pubkey(10, &bad, root.public_key(), &cs).is_err());
-                assert!(batch_signing_pubkey(10, &signed, session.public_key(), &cs).is_err());
+                assert!(
+                    batch_signing_pubkey(10, &bad, root.public_key(), &world_state, &cs).is_err()
+                );
+                assert!(
+                    batch_signing_pubkey(10, &signed, session.public_key(), &world_state, &cs)
+                        .is_err()
+                );
                 let legacy = ChainStore::new(Arc::new(MemoryDb::new()));
                 legacy.put_pubkey(&from, root.public_key()).unwrap();
-                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &legacy).is_err());
+                assert!(batch_signing_pubkey(
+                    10,
+                    &signed,
+                    root.public_key(),
+                    &world_state,
+                    &legacy
+                )
+                .is_err());
                 // Repairing rotated-key binding must not bypass the separate
                 // algorithm policy of an original address-derived root.
                 legacy
@@ -2205,11 +2343,21 @@ mod tests {
                         .unwrap(),
                     )
                     .unwrap();
-                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &legacy).is_err());
+                assert!(batch_signing_pubkey(
+                    10,
+                    &signed,
+                    root.public_key(),
+                    &world_state,
+                    &legacy
+                )
+                .is_err());
             });
             registry.propose_activation(root.sig_type());
             with_algorithm_registry_override(&registry, || {
-                assert!(batch_signing_pubkey(10, &signed, root.public_key(), &cs).is_err());
+                assert!(
+                    batch_signing_pubkey(10, &signed, root.public_key(), &world_state, &cs)
+                        .is_err()
+                );
             });
         }
     }

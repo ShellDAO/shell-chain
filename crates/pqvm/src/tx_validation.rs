@@ -536,6 +536,34 @@ pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
         .get_chain_config()?
         .and_then(|config| config.paymaster_registered_root_height)
         .is_some_and(|height| block_number >= height);
+    if let Some(algorithm) = crate::key_binding::bound_algorithm(
+        world_state,
+        chain_store,
+        paymaster,
+        &pubkey,
+        block_number,
+    )? {
+        if !registered_root_enabled
+            && shell_primitives::Address::from_public_key(&pubkey, algorithm.as_u8()) != *paymaster
+        {
+            return Err(TxValidationError::PaymasterSignatureInvalid);
+        }
+        let allowed = shell_crypto::is_algorithm_allowed(algorithm)
+            || (allow_deprecated
+                && shell_crypto::algorithm_status(algorithm)
+                    == Some(shell_crypto::AlgorithmStatus::Deprecated));
+        let signature = shell_crypto::PQSignature::new(algorithm, sig_bytes.as_ref().to_vec());
+        return if allowed
+            && verifier
+                .verify(&pubkey, hash.as_bytes(), &signature)
+                .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(TxValidationError::PaymasterSignatureInvalid)
+        };
+    }
+
     let address_bound = [
         shell_crypto::SignatureType::MlDsa65,
         shell_crypto::SignatureType::Dilithium3,

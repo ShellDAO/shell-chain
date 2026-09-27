@@ -859,7 +859,12 @@ impl TxPool {
         let uses_default_validator = world_state
             .get_account(&tx.from)?
             .is_none_or(|account| account.validation_code_hash.is_none());
-        let validated_root_hash = uses_default_validator.then(|| blake3_hash(&validation.pubkey));
+        let account_key_hash = world_state
+            .get_account(&tx.from)?
+            .map(|account| account.pq_pubkey_hash)
+            .filter(|hash| *hash != ShellHash::ZERO);
+        let validated_root_hash = uses_default_validator
+            .then(|| account_key_hash.unwrap_or_else(|| blake3_hash(&validation.pubkey)));
         Ok((tx_size, base_fee_per_gas, validated_root_hash))
     }
 
@@ -2182,6 +2187,53 @@ mod tests {
 
         pool.remove_batch(&[h1, h2]);
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn registered_key_algorithm_binding_preserves_pending_transactions() {
+        let pool = TxPool::new(make_config());
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let from = test_address(signer.public_key());
+        cs.put_chain_config(
+            &serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "registered_key_algorithm_height": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        shell_pqvm::system_contracts::execute_system_contract_call(
+            &shell_pqvm::system_contracts::account_manager_address(),
+            &from,
+            &shell_pqvm::system_contracts::encode_rotate_key_calldata(
+                signer.public_key(),
+                signer.sig_type().as_u8(),
+            ),
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+        let nonce = ws.get_nonce(&from).unwrap();
+        let tx = make_signed_tx_with_signer(&signer, signer.public_key(), nonce, 100);
+        let hash = insert_rich(&pool, tx, &DilithiumVerifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.prune_rotated_roots(&ws), 0);
+        assert!(pool.contains(&hash));
+        let next = DilithiumSigner::generate();
+        shell_pqvm::system_contracts::execute_system_contract_call(
+            &shell_pqvm::system_contracts::account_manager_address(),
+            &from,
+            &shell_pqvm::system_contracts::encode_rotate_key_calldata(
+                next.public_key(),
+                next.sig_type().as_u8(),
+            ),
+            &mut ws,
+            &cs,
+        )
+        .unwrap();
+        assert_eq!(pool.prune_rotated_roots(&ws), 1);
+        assert!(!pool.contains(&hash));
+        assert!(indexed_reservation(&pool, &from).is_none());
     }
 
     #[test]

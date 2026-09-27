@@ -258,7 +258,7 @@ pub fn execute_system_contract_call<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
 ) -> Result<SystemContractOutcome, SystemContractError> {
-    let block_number = if *target == registry_address() {
+    let block_number = if *target == registry_address() || *target == account_manager_address() {
         chain_store
             .get_head_block()
             .map_err(|e| SystemContractError::Storage(e.to_string()))?
@@ -317,7 +317,7 @@ pub fn execute_system_contract_call_at_block<S: KvStore + 'static>(
     }
 
     if *target == account_manager_address() {
-        return execute_account_manager(caller, input, world_state, chain_store);
+        return execute_account_manager(caller, input, world_state, chain_store, block_number);
     }
 
     Err(SystemContractError::UnknownSystemContract(*target))
@@ -431,6 +431,7 @@ fn execute_account_manager<S: KvStore + 'static>(
     input: &[u8],
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
+    block_number: u64,
 ) -> Result<SystemContractOutcome, SystemContractError> {
     let selector = decode_selector(input)?;
     let params = input.get(4..).unwrap_or_default();
@@ -439,7 +440,14 @@ fn execute_account_manager<S: KvStore + 'static>(
     match selector {
         s if s == ROTATE_KEY_SELECTOR => {
             let (pubkey, algo_id) = decode_rotate_key_params(params)?;
-            rotate_key(caller, &pubkey, algo_id, world_state, chain_store)?;
+            rotate_key(
+                caller,
+                &pubkey,
+                algo_id,
+                world_state,
+                chain_store,
+                block_number,
+            )?;
             effects.updated_accounts.push(*caller);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
@@ -484,7 +492,7 @@ fn execute_account_manager<S: KvStore + 'static>(
         }
         s if s == EXECUTE_RECOVERY_SELECTOR => {
             let account = decode_address(params)?;
-            execute_recovery(&account, world_state, chain_store)?;
+            execute_recovery(&account, world_state, chain_store, block_number)?;
             effects.updated_accounts.push(account);
             Ok(SystemContractOutcome {
                 output: encode_bool(true),
@@ -1648,11 +1656,12 @@ fn rotate_key<S: KvStore + 'static>(
     algo_id: u8,
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
+    block_number: u64,
 ) -> Result<(), SystemContractError> {
     if pubkey.is_empty() {
         return Err(SystemContractError::EmptyPubkey);
     }
-    let Some(_algo) = SignatureType::from_u8(algo_id) else {
+    let Some(algo) = SignatureType::from_u8(algo_id) else {
         return Err(SystemContractError::InvalidAlgorithm(algo_id));
     };
 
@@ -1667,7 +1676,13 @@ fn rotate_key<S: KvStore + 'static>(
             code_hash: None,
             storage_root: ShellHash::ZERO,
         });
-    account.pq_pubkey_hash = blake3_hash(pubkey);
+    account.pq_pubkey_hash = if crate::key_binding::enabled(chain_store, block_number)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        crate::key_binding::algorithm_hash(pubkey, algo)
+    } else {
+        blake3_hash(pubkey)
+    };
     world_state
         .set_account(caller, &account)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -1944,6 +1959,7 @@ fn execute_recovery<S: KvStore + 'static>(
     account: &Address,
     world_state: &mut WorldState<S>,
     chain_store: &ChainStore<S>,
+    block_number: u64,
 ) -> Result<(), SystemContractError> {
     let proposal = chain_store
         .get_recovery_proposal(account)
@@ -1967,29 +1983,14 @@ fn execute_recovery<S: KvStore + 'static>(
         ));
     }
 
-    // Validate the new algo
-    SignatureType::from_u8(proposal.new_algo)
-        .ok_or(SystemContractError::InvalidAlgorithm(proposal.new_algo))?;
-
-    // Rotate the key
-    let mut acct = world_state
-        .get_account(account)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?
-        .unwrap_or(Account {
-            pq_pubkey_hash: ShellHash::ZERO,
-            nonce: 0,
-            balance: U256::ZERO,
-            validation_code_hash: None,
-            code_hash: None,
-            storage_root: ShellHash::ZERO,
-        });
-    acct.pq_pubkey_hash = blake3_hash(&proposal.new_pubkey);
-    world_state
-        .set_account(account, &acct)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
-    chain_store
-        .put_pubkey(account, &proposal.new_pubkey)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    rotate_key(
+        account,
+        &proposal.new_pubkey,
+        proposal.new_algo,
+        world_state,
+        chain_store,
+        block_number,
+    )?;
 
     // Clear the proposal
     chain_store
@@ -3270,6 +3271,7 @@ mod tests {
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
+                registered_key_algorithm_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3350,6 +3352,7 @@ mod tests {
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
+                registered_key_algorithm_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3449,6 +3452,7 @@ mod tests {
             validation_deprecation_height: None,
             session_registered_root_height: None,
             paymaster_registered_root_height: None,
+            registered_key_algorithm_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3513,6 +3517,7 @@ mod tests {
                     validation_deprecation_height: None,
                     session_registered_root_height: None,
                     paymaster_registered_root_height: None,
+                    registered_key_algorithm_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -3658,6 +3663,7 @@ mod tests {
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
                 paymaster_registered_root_height: None,
+                registered_key_algorithm_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
@@ -4338,6 +4344,110 @@ mod tests {
     }
 
     // ── AccountManager ──────────────────────────────────────────
+
+    #[test]
+    fn registered_key_algorithm_rotation_and_recovery_activation() {
+        use shell_crypto::{MlDsaSigner, Signer};
+        let signer = MlDsaSigner::generate();
+        let caller = Address::from([0x71; 32]);
+        for activation in [None, Some(10)] {
+            for height in [9, 10, 11] {
+                let (mut ws, cs) = setup_account_manager();
+                cs.put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                        "registered_key_algorithm_height": activation
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let initial = account_with_balance(1_000_000);
+                ws.set_account(&caller, &initial).unwrap();
+                let call =
+                    encode_rotate_key_calldata(signer.public_key(), signer.sig_type().as_u8());
+                // Reaffirming the same key migrates an old binding only at activation.
+                execute_system_contract_call_at_block(
+                    &account_manager_address(),
+                    &caller,
+                    &call,
+                    &mut ws,
+                    &cs,
+                    9,
+                )
+                .unwrap();
+                assert_eq!(
+                    ws.get_account(&caller).unwrap().unwrap().pq_pubkey_hash,
+                    blake3_hash(signer.public_key())
+                );
+                execute_system_contract_call_at_block(
+                    &account_manager_address(),
+                    &caller,
+                    &call,
+                    &mut ws,
+                    &cs,
+                    height,
+                )
+                .unwrap();
+                let typed = activation.is_some_and(|h| height >= h);
+                let expected = if typed {
+                    crate::key_binding::algorithm_hash(signer.public_key(), signer.sig_type())
+                } else {
+                    blake3_hash(signer.public_key())
+                };
+                let account = ws.get_account(&caller).unwrap().unwrap();
+                assert_eq!(account.pq_pubkey_hash, expected);
+                assert_eq!(account.balance, initial.balance);
+                assert_eq!(account.nonce, initial.nonce);
+                assert_eq!(
+                    crate::key_binding::bound_algorithm(
+                        &ws,
+                        &cs,
+                        &caller,
+                        signer.public_key(),
+                        height
+                    )
+                    .unwrap(),
+                    typed.then_some(signer.sig_type())
+                );
+
+                let parent = shell_core::Block {
+                    header: shell_core::BlockHeader {
+                        number: height - 1,
+                        ..Default::default()
+                    },
+                    transactions: vec![],
+                    system_transactions: vec![],
+                    proposer_seal: None,
+                };
+                cs.put_block(&parent).unwrap();
+                cs.set_head(&parent.hash()).unwrap();
+                cs.put_recovery_proposal(
+                    &caller,
+                    &serde_json::from_value(serde_json::json!({
+                        "new_pubkey": signer.public_key(), "new_algo": signer.sig_type().as_u8(),
+                        "votes": [caller], "maturity_block": height - 1
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                ws.set_account(&caller, &initial).unwrap();
+                execute_system_contract_call_at_block(
+                    &account_manager_address(),
+                    &Address::ZERO,
+                    &encode_execute_recovery_calldata(&caller),
+                    &mut ws,
+                    &cs,
+                    height,
+                )
+                .unwrap();
+                assert_eq!(
+                    ws.get_account(&caller).unwrap().unwrap().pq_pubkey_hash,
+                    expected
+                );
+                assert!(cs.get_recovery_proposal(&caller).unwrap().is_none());
+            }
+        }
+    }
 
     #[test]
     fn rotate_key_updates_caller_account_and_registry() {

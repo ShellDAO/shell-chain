@@ -95,7 +95,8 @@ This is the only stage where address derivation itself is re-checked.
 Once an account exists and uses the built-in validator path:
 
 1. the node resolves the sender public key
-2. it compares `blake3(pubkey)` with `account.pq_pubkey_hash`
+2. it checks the registered key against `account.pq_pubkey_hash` (legacy
+   `blake3(pubkey)`, or the algorithm-aware commitment described below)
 3. it verifies the PQ signature
 
 At this stage the chain no longer needs to re-derive the address from the new
@@ -109,11 +110,12 @@ root confirmed in an earlier block then works with either embedded or reference
 keys. The node still checks the account key hash, root authorization and session
 signature; possession of an unrelated key cannot claim the stable address.
 
-Because a rotated key's algorithm is not stored separately, verification tries
-the currently active installed verifiers, including their compatibility
-fallbacks. This schedule changes address binding only. It does not add a unique
-algorithm binding or a deprecated-algorithm exception for rotated roots. An
-omitted schedule preserves the legacy import address check. Rotating and using
+Legacy rotations do not retain their selected algorithm, so verification tries
+the currently active installed verifiers, including compatibility fallbacks.
+This address-binding schedule alone does not identify the algorithm or permit
+deprecated rotated roots. Use `registered_key_algorithm_height` below to persist
+that identity on subsequent rotations. Omitting the session binding schedule
+preserves the legacy import address check. Rotating and using
 the replacement key within the same block remains a separate limitation.
 
 ### 3.3 Layer 3 — custom validator path
@@ -326,11 +328,11 @@ original root, verification binds to its address algorithm, so a pending entry
 cannot pass through that fallback. Configure and coordinate a future height on
 all participating nodes; a stored schedule cannot be changed or removed.
 
-Session authorization after root-key rotation remains outside the deprecation
-exception: rotation does not persist the new algorithm identifier. The separate
-`session_registered_root_height` repairs import binding for keys accepted by the
-existing active-verifier policy, as described in section 3.2. Both schedules
-are immutable once stored; an existing chain may add only a future activation.
+For legacy rotations, session authorization retains the active-verifier policy.
+After an algorithm-aware rotation, the session deprecation schedule also applies
+to the persisted replacement algorithm. `session_registered_root_height` remains
+necessary for rotated-root block import. Each schedule is immutable once stored;
+an existing chain may add only a future activation.
 For EOA sponsorship, the independent `algorithm_paymaster_deprecation_height`
 allows an already registered original-key paymaster to keep paying transaction
 fees after its algorithm becomes `Deprecated`. At the scheduled candidate block,
@@ -342,9 +344,8 @@ the paymaster pays execution fees without consuming its own transaction nonce.
 Omitting this schedule preserves legacy active-only EOA authorization. Existing
 chains may add only a future activation, and a persisted schedule cannot change
 or be removed. Configure the same schedule on participating nodes. Contract
-paymaster validation is unchanged. Rotated paymaster keys, custom-validator
-cryptographic operations and validator consensus signatures remain separate
-parts of the whitepaper's full operational guarantee.
+paymaster validation is unchanged. Legacy rotated keys require the additional binding upgrade below. Custom-validator
+cryptographic operations and validator consensus signatures have separate policies.
 
 ## PQVM instructions in validation contracts
 
@@ -393,11 +394,57 @@ An EOA sponsor keeps its address after `rotateKey`. At or after the independentl
 configured `paymaster_registered_root_height`, authorization uses the current
 registered public key and requires its hash to match the sponsor account state.
 The replacement key signs the existing paymaster signing hash; no transaction
-field changes. Only active algorithms are tried for this untagged signature,
-matching the existing session-root policy. This does not extend the original-key
-deprecation exception to rotated keys.
+field changes. For legacy key bindings, only active algorithms are tried for this untagged
+signature. Algorithm-aware bindings select exactly the recorded algorithm and
+use `algorithm_paymaster_deprecation_height` for its deprecation exception.
 
 The upgrade defaults to disabled and preserves earlier block validation. Its
 height is persisted, immutable once scheduled, and must match trusted snapshots.
 Operators must coordinate activation; merging this implementation does not
 activate it on an existing network. Contract-paymaster validation is unchanged.
+
+
+### Persist the replacement algorithm
+
+At or after optional `registered_key_algorithm_height`, AccountManager
+`rotateKey(pubkey, algo_id)` and successful guardian recovery store
+`BLAKE3(algo_id || pubkey)` in `account.pq_pubkey_hash`, where `algo_id` is one
+byte. The registered public-key bytes must also match. The account address,
+account serialization and transaction signing domains do not change.
+
+Direct signatures must carry that exact algorithm tag. Session-root and EOA
+paymaster signatures use the same committed algorithm; an active compatibility
+verifier cannot substitute for a pending selected algorithm. An existing
+account can continue using a deprecated replacement root only when the relevant
+independent schedule is enabled:
+
+| Path | Additional schedule |
+| --- | --- |
+| Direct root signatures | `algorithm_deprecation_height` |
+| Session authorization | `algorithm_session_deprecation_height`; `session_registered_root_height` for import |
+| EOA sponsorship | `algorithm_paymaster_deprecation_height` and `paymaster_registered_root_height` |
+
+The new binding schedule defaults to disabled. Earlier rotations and recovery
+retain `BLAKE3(pubkey)` and their previous verification rules; enabling the
+schedule does not infer or rewrite historical algorithm identities. To migrate
+an existing binding, submit an authorized `rotateKey` with the current key and
+its intended algorithm at or after activation, wait for its successful receipt,
+and then use sessions or sponsorship. A deprecated existing direct root can
+perform this reaffirmation when its direct-root deprecation schedule is enabled.
+
+Coordinate an immutable future height across nodes before activation. Trusted
+snapshot imports require the same schedule. Source delivery does not imply
+public binary availability or network activation. See the
+[binding decision](adr/registered-key-algorithm.md).
+
+The source regressions can be run with:
+
+```sh
+cargo test -p shell-pqvm rotated_key_lifecycle_preserves_algorithm_identity
+cargo test -p shell-pqvm -p shell-node -p shell-mempool -p shell-storage registered_key_algorithm
+```
+
+They cover genuine signatures for all three installed algorithms, lifecycle
+rejection, rotation/recovery activation, import parent-state binding, transaction
+pool retention and snapshot mismatch rejection. They do not claim consensus-key
+migration or production activation.
