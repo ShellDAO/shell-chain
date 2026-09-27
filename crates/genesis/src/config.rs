@@ -180,6 +180,9 @@ pub struct GenesisConfig {
     /// First block using the PQVM instruction set for account/paymaster validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_pqvm_height: Option<u64>,
+    /// First block allowing deprecated algorithms inside existing validation policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_deprecation_height: Option<u64>,
     /// First block binding imported session roots to the current registered key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_registered_root_height: Option<u64>,

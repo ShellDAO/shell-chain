@@ -79,6 +79,9 @@ pub struct ChainConfig {
     /// First block using the PQVM instruction set for account/paymaster validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_pqvm_height: Option<u64>,
+    /// First block allowing deprecated algorithms inside existing validation policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_deprecation_height: Option<u64>,
     /// First block binding imported session roots to the current registered key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_registered_root_height: Option<u64>,
@@ -1795,6 +1798,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.validation_pqvm_height,
             ),
             (
+                "validation deprecation",
+                stored.validation_deprecation_height,
+                desired.validation_deprecation_height,
+            ),
+            (
                 "registered session root",
                 stored.session_registered_root_height,
                 desired.session_registered_root_height,
@@ -2056,6 +2064,9 @@ impl<S: KvStore> ChainStore<S> {
             validation_pqvm_height: self
                 .get_chain_config()?
                 .and_then(|config| config.validation_pqvm_height),
+            validation_deprecation_height: self
+                .get_chain_config()?
+                .and_then(|config| config.validation_deprecation_height),
             session_registered_root_height: self
                 .get_chain_config()?
                 .and_then(|config| config.session_registered_root_height),
@@ -2114,6 +2125,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_algorithm_paymaster_deprecation =
             trusted.algorithm_paymaster_deprecation_height;
         let trusted_validation_pqvm = trusted.validation_pqvm_height;
+        let trusted_validation_deprecation = trusted.validation_deprecation_height;
         let trusted_session_registered_root = trusted.session_registered_root_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
         let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
@@ -2251,6 +2263,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.algorithm_paymaster_deprecation_height
                         != trusted_algorithm_paymaster_deprecation
                     || config.validation_pqvm_height != trusted_validation_pqvm
+                    || config.validation_deprecation_height != trusted_validation_deprecation
                     || config.session_registered_root_height != trusted_session_registered_root
                     || config.algorithm_proposal_staging_height
                         != trusted_algorithm_proposal_staging
@@ -2372,6 +2385,15 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted validation PQVM activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.validation_deprecation_height)
+            != trusted_validation_deprecation
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted validation deprecation activation".into(),
             ));
         }
 
@@ -2595,6 +2617,7 @@ impl<S: KvStore> ChainStore<S> {
             algorithm_session_deprecation_height: trusted_algorithm_session_deprecation,
             algorithm_paymaster_deprecation_height: trusted_algorithm_paymaster_deprecation,
             validation_pqvm_height: trusted_validation_pqvm,
+            validation_deprecation_height: trusted_validation_deprecation,
             session_registered_root_height: trusted_session_registered_root,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
             algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
@@ -4161,6 +4184,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -4202,6 +4226,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -4229,6 +4254,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4246,6 +4272,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4295,6 +4322,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4312,6 +4340,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4361,6 +4390,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4378,6 +4408,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4426,6 +4457,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4443,6 +4475,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -4536,6 +4569,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4558,6 +4592,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4612,6 +4647,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -4629,6 +4665,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -4686,6 +4723,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4706,6 +4744,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -4762,6 +4801,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -4782,6 +4822,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -4838,6 +4879,7 @@ mod tests {
                 algorithm_session_deprecation_height: trusted_height,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
@@ -4858,6 +4900,7 @@ mod tests {
                 algorithm_session_deprecation_height: Some(6),
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
@@ -4914,6 +4957,7 @@ mod tests {
                 algorithm_quorum_activation_height: None,
                 algorithm_paymaster_deprecation_height: trusted_height,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_deprecation_height: None,
@@ -4934,6 +4978,7 @@ mod tests {
                 algorithm_quorum_activation_height: None,
                 algorithm_paymaster_deprecation_height: Some(6),
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_deprecation_height: None,
@@ -4974,6 +5019,85 @@ mod tests {
     }
 
     #[test]
+    fn validation_deprecation_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted = ChainConfig {
+                chain_id: 1337,
+                genesis_hash: ShellHash::ZERO,
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_voting_window: Some(AlgorithmVotingWindow {
+                    activation_height: 0,
+                    block_time_secs: 2,
+                }),
+                algorithm_quorum_activation_height: None,
+                validation_deprecation_height: trusted_height,
+                validation_pqvm_height: None,
+                algorithm_paymaster_deprecation_height: None,
+                algorithm_session_deprecation_height: None,
+                session_registered_root_height: None,
+                algorithm_deprecation_height: None,
+                algorithm_proposal_identity_height: None,
+                algorithm_proposal_staging_height: Some(0),
+                algorithm_timelock_activation_height: None,
+            };
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let untrusted = ChainConfig {
+                fee_accounting_activation_height: None,
+                bloom_activation_height: None,
+                log_address_activation_height: None,
+                algorithm_voting_window: Some(AlgorithmVotingWindow {
+                    activation_height: 0,
+                    block_time_secs: 2,
+                }),
+                algorithm_quorum_activation_height: None,
+                validation_deprecation_height: Some(6),
+                validation_pqvm_height: None,
+                algorithm_paymaster_deprecation_height: None,
+                algorithm_session_deprecation_height: None,
+                session_registered_root_height: None,
+                algorithm_deprecation_height: None,
+                algorithm_proposal_identity_height: None,
+                algorithm_proposal_staging_height: Some(0),
+                algorithm_timelock_activation_height: None,
+                ..trusted
+            };
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let err = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(err.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted validation deprecation activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn validation_pqvm_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -4990,6 +5114,7 @@ mod tests {
                 }),
                 algorithm_quorum_activation_height: None,
                 validation_pqvm_height: trusted_height,
+                validation_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 session_registered_root_height: None,
@@ -5010,6 +5135,7 @@ mod tests {
                 }),
                 algorithm_quorum_activation_height: None,
                 validation_pqvm_height: Some(6),
+                validation_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 session_registered_root_height: None,
@@ -5070,6 +5196,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5090,6 +5217,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5144,6 +5272,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: trusted_height,
@@ -5161,6 +5290,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: Some(6),
@@ -5487,6 +5617,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -5504,6 +5635,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -5563,6 +5695,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -5687,6 +5820,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
@@ -6614,6 +6748,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -7150,6 +7285,7 @@ mod tests {
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
+                validation_deprecation_height: None,
                 session_registered_root_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
                 algorithm_quorum_activation_height: quorum_activation,
@@ -7237,6 +7373,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -7299,6 +7436,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -8416,6 +8554,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -8450,6 +8589,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,

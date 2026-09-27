@@ -522,14 +522,32 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
 
     let spec = SpecId::CANCUN;
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
-    if chain_store
-        .get_chain_config()?
+    let config = chain_store.get_chain_config()?;
+    let pqvm_enabled = config
+        .as_ref()
         .and_then(|config| config.validation_pqvm_height)
-        .is_some_and(|height| number >= height)
-    {
+        .is_some_and(|height| number >= height);
+    if pqvm_enabled {
         crate::executor::install_pqvm_instructions(&mut instructions);
     }
-    let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
+    let allow_deprecated = config
+        .as_ref()
+        .and_then(|config| config.validation_deprecation_height)
+        .is_some_and(|height| number >= height);
+    if allow_deprecated && pqvm_enabled {
+        instructions.insert_instruction(
+            crate::pqvm_opcodes::OPCODE_PQVERIFY,
+            revm::interpreter::Instruction::new(
+                crate::pqvm_opcodes::pq_verify_with_policy::<_, _, true>,
+                0,
+            ),
+        );
+    }
+    let mut evm = Evm::new(
+        ctx,
+        instructions,
+        ShellPrecompiles::new(spec).with_deprecated_verification(allow_deprecated),
+    );
 
     let exec_result = evm
         .transact(tx_env)
@@ -939,14 +957,32 @@ fn call_paymaster_validate<S: KvStore + 'static>(
 
     let spec = SpecId::CANCUN;
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
-    if chain_store
-        .get_chain_config()?
+    let config = chain_store.get_chain_config()?;
+    let pqvm_enabled = config
+        .as_ref()
         .and_then(|config| config.validation_pqvm_height)
-        .is_some_and(|height| number >= height)
-    {
+        .is_some_and(|height| number >= height);
+    if pqvm_enabled {
         crate::executor::install_pqvm_instructions(&mut instructions);
     }
-    let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
+    let allow_deprecated = config
+        .as_ref()
+        .and_then(|config| config.validation_deprecation_height)
+        .is_some_and(|height| number >= height);
+    if allow_deprecated && pqvm_enabled {
+        instructions.insert_instruction(
+            crate::pqvm_opcodes::OPCODE_PQVERIFY,
+            revm::interpreter::Instruction::new(
+                crate::pqvm_opcodes::pq_verify_with_policy::<_, _, true>,
+                0,
+            ),
+        );
+    }
+    let mut evm = Evm::new(
+        ctx,
+        instructions,
+        ShellPrecompiles::new(spec).with_deprecated_verification(allow_deprecated),
+    );
 
     let exec_result = evm
         .transact(tx_env)
@@ -1658,6 +1694,7 @@ mod tests {
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
             validation_pqvm_height: None,
+            validation_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -2457,6 +2494,149 @@ mod tests {
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(!outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    #[test]
+    fn custom_signature_policy_respects_deprecation_activation() {
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
+        fn push(code: &mut Vec<u8>, value: usize) {
+            code.push(0x61);
+            code.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
+        }
+        for activation in [None, Some(10)] {
+            for signer in [
+                Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+                Box::new(MlDsaSigner::generate()),
+                Box::new(SphincsSigner::generate()),
+            ] {
+                // The embedded key is the account policy; calldata supplies the current
+                // transaction signing hash and signature, not an arbitrary challenge.
+                let mut code = vec![0x36, 0x5f, 0x5f, 0x37];
+                push(&mut code, signer.public_key().len());
+                let offset_patch = code.len() + 1;
+                push(&mut code, 0);
+                push(&mut code, 60_000);
+                code.push(0x39);
+                push(&mut code, signer.sig_type().as_u8().into());
+                push(&mut code, 32);
+                push(&mut code, 4);
+                push(&mut code, signer.public_key().len());
+                push(&mut code, 60_000);
+                push(&mut code, 388);
+                code.push(0x51);
+                push(&mut code, 420);
+                code.extend_from_slice(&[0xb0, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+                let offset = u16::try_from(code.len()).unwrap().to_be_bytes();
+                code[offset_patch..offset_patch + 2].copy_from_slice(&offset);
+                code.extend_from_slice(signer.public_key());
+                let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+                let (mut ws, cs) = setup_stores();
+                install_paymaster(&mut ws, &cs, from, code);
+                let mut account = ws.get_account(&from).unwrap().unwrap();
+                account.validation_code_hash = account.code_hash;
+                account.pq_pubkey_hash = blake3_hash(signer.public_key());
+                ws.set_account(&from, &account).unwrap();
+                cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,"validation_pqvm_height":0,"validation_deprecation_height":activation
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+                let mut tx = base_tx(1337, account.nonce);
+                tx.gas_limit = 3_000_000;
+                let mut signed = SignedTransaction::with_pubkey(
+                    from,
+                    tx,
+                    PQSignature::new(signer.sig_type(), vec![1]),
+                    signer.public_key().to_vec(),
+                );
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let header = BlockHeader {
+                    number: 10,
+                    gas_limit: 50_000_000,
+                    ..BlockHeader::default()
+                };
+                let mut registry = AlgorithmRegistry::default();
+                let active = with_algorithm_registry_override(&registry, || {
+                    validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header)
+                });
+
+                if signer.sig_type() != SignatureType::SphincsSha2256f {
+                    assert!(active.is_ok());
+                    let mut tampered = signed.clone();
+                    tampered.signature.data[0] ^= 1;
+                    assert!(
+                        validate_aa_tx_at_block(&tampered, &ws, &cs, &MultiVerifier, &header)
+                            .is_err()
+                    );
+                    let mut changed = signed.clone();
+                    changed.tx.value = U256::from(1);
+                    assert!(
+                        validate_aa_tx_at_block(&changed, &ws, &cs, &MultiVerifier, &header)
+                            .is_err()
+                    );
+                } else {
+                    assert!(active.is_err());
+                }
+                registry.deprecate(signer.sig_type());
+                for number in [9, 10, 11] {
+                    let header = BlockHeader {
+                        number,
+                        ..header.clone()
+                    };
+                    with_algorithm_registry_override(&registry, || {
+                        let expected = activation.is_some_and(|height| number >= height)
+                            && signer.sig_type() != SignatureType::SphincsSha2256f;
+                        let outcome =
+                            validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header);
+                        assert_eq!(
+                            outcome.is_ok(),
+                            expected,
+                            "{:?} {activation:?} {number}: {:?}",
+                            signer.sig_type(),
+                            outcome.err()
+                        );
+                        assert_eq!(
+                            crate::tx_validation::validate_tx_for_import_at_block(
+                                &signed,
+                                &mut ws,
+                                &cs,
+                                &MultiVerifier,
+                                1337,
+                                None,
+                                &header
+                            )
+                            .is_ok(),
+                            expected
+                        );
+                        assert_eq!(ws.get_account(&from).unwrap(), Some(account.clone()));
+                        let mut tampered = signed.clone();
+                        tampered.signature.data[0] ^= 1;
+                        assert!(validate_aa_tx_at_block(
+                            &tampered,
+                            &ws,
+                            &cs,
+                            &MultiVerifier,
+                            &header
+                        )
+                        .is_err());
+                        let mut changed = signed.clone();
+                        changed.tx.value = U256::from(1);
+                        assert!(validate_aa_tx_at_block(
+                            &changed,
+                            &ws,
+                            &cs,
+                            &MultiVerifier,
+                            &header
+                        )
+                        .is_err());
+                    });
+                }
+            }
+        }
     }
 
     #[test]

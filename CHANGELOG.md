@@ -30,6 +30,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `validation_deprecation_height` so existing custom-account and
+  contract-paymaster policies can verify deprecated signatures through PQVERIFY
+  and verification precompiles. Keep ordinary execution and preactivation rules,
+  pending-algorithm rejection, signature checks and validation gas limits.
+
 - Add optional `validation_pqvm_height` to use the normal PQVM instruction set
   in custom-account and contract-paymaster validation. Native hash/address
   checks now execute there; CALLCODE and SELFDESTRUCT remain unavailable under

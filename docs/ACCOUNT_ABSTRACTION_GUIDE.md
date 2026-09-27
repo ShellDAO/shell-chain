@@ -362,6 +362,27 @@ schedule cannot be changed or removed. Coordinate the same height on all nodes.
 Import and historical replay use the candidate header, while admission uses the
 next block. See [the instruction-set decision](adr/validation-pqvm-instructions.md).
 
-Instruction availability does not relax algorithm status or signature checks in
-PQ verification primitives, nor increase the gas available to a validation
-contract. Cryptographic policy and algorithm deprecation remain separate concerns.
+Instruction availability alone does not relax algorithm status or signature checks
+in PQ verification primitives, nor increase the gas available to a validation
+contract. The separate lifecycle schedule below controls deprecated verification.
+
+
+## Deprecated signatures in existing validation policies
+
+At `validation_deprecation_height`, custom-account and contract-paymaster
+validation may verify signatures from Active or Deprecated algorithms. This
+applies to the existing single/batch verification precompiles and, when
+`validation_pqvm_height` is also active, PQVERIFY. The contract still controls
+which keys and transaction fields authorize an operation; pending algorithms,
+invalid signatures and malformed inputs remain rejected. Ordinary contract
+execution keeps its existing algorithm policy.
+
+The new schedule is independent and defaults off. Configure the same future
+height on participating nodes; persisted schedules cannot change or be removed,
+and snapshot import must match trusted configuration. Admission uses the next
+candidate height; execution, import and replay use the explicit header.
+
+Gas budgets remain unchanged. The current 500,000 custom-validation cap cannot
+accommodate SLH-DSA's 2,300,000-gas verification, and the smaller contract-paymaster
+budget also limits signature policies. Lifecycle compatibility alone does not
+resolve these capacity gaps. See [the decision](adr/validation-deprecation.md).

@@ -22,13 +22,14 @@
 //! | PQHASH   | 30 + 6 × ⌈len/32⌉                                       |
 //! | PQADDR   | 200 + 6 × ⌈pk_len/32⌉                                  |
 
+use crate::precompiles::verify_contract_signature;
 use alloy_primitives::U256;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::{
     interpreter_types::{InterpreterTypes, MemoryTr, StackTr},
     Host, Instruction, InstructionContext, InstructionResult,
 };
-use shell_crypto::{verify_signature, SignatureType};
+use shell_crypto::SignatureType;
 
 use crate::precompiles::{
     derive_pq_address, pq_address_derive_gas, BLAKE3_BASE_GAS, BLAKE3_WORD_GAS,
@@ -91,6 +92,16 @@ fn u256_to_algo_id(v: U256) -> Option<u8> {
 /// `algo_id` determines the scheme (0x00 = Dilithium3, 0x01 = ML-DSA-65,
 /// 0x02 = SLH-DSA-SHA2-256f).
 pub fn pq_verify<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    pq_verify_with_policy::<WIRE, H, false>(context);
+}
+
+pub(crate) fn pq_verify_with_policy<
+    WIRE: InterpreterTypes,
+    H: Host + ?Sized,
+    const ALLOW_DEPRECATED: bool,
+>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     // Pop order matches LIFO: sig_ptr is on top.
@@ -243,15 +254,16 @@ pub fn pq_verify<WIRE: InterpreterTypes, H: Host + ?Sized>(
             } else {
                 SignatureType::Dilithium3
             };
-            verify_signature(sig_type, &pk_bytes, &msg_bytes, &sig_bytes).unwrap_or(false)
+            verify_contract_signature::<ALLOW_DEPRECATED>(
+                sig_type, &pk_bytes, &msg_bytes, &sig_bytes,
+            )
         }
-        ALGO_SLHDSA_SHA2_256F => verify_signature(
+        ALGO_SLHDSA_SHA2_256F => verify_contract_signature::<ALLOW_DEPRECATED>(
             SignatureType::SphincsSha2256f,
             &pk_bytes,
             &msg_bytes,
             &sig_bytes,
-        )
-        .unwrap_or(false),
+        ),
         _ => false,
     };
 
@@ -434,6 +446,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shell_crypto::verify_signature;
 
     // ── PQHASH logic tests (pure, no EVM harness needed) ─────────────────────
 
