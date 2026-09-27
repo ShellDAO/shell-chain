@@ -4621,7 +4621,14 @@ mod tests {
                     system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
                     100_000,
                 );
-                let tx = make_aa_signed(owner, 0, 200_000, 10, vec![call], None);
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    200_000,
+                    10,
+                    vec![call],
+                    None,
+                );
                 let header = BlockHeader {
                     number,
                     ..sample_header()
@@ -4712,7 +4719,14 @@ mod tests {
                         gas_limit: 100,
                     });
                 }
-                let tx = make_aa_signed(owner, 0, 500_000, 10, calls, sponsored.then_some(payer));
+                let tx = make_aa_signed(
+                    owner,
+                    current_nonce(&mut evm, &owner),
+                    500_000,
+                    10,
+                    calls,
+                    sponsored.then_some(payer),
+                );
                 let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
                 assert_eq!(result.receipt.status, u8::from(!fail));
                 let expected_key = if fail {
@@ -4780,7 +4794,14 @@ mod tests {
             system_contracts::encode_set_guardians_calldata(&[guardian], 1, 100),
             100_000,
         );
-        let tx = make_aa_signed(owner, 0, 500_000, 10, vec![settings], None);
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![settings],
+            None,
+        );
         assert_eq!(
             evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
                 .unwrap()
@@ -4795,7 +4816,7 @@ mod tests {
         );
         let tx = make_aa_signed(
             guardian,
-            0,
+            current_nonce(&mut evm, &guardian),
             500_000,
             10,
             vec![proposal.clone(), bad.clone()],
@@ -4814,7 +4835,15 @@ mod tests {
             .get_recovery_proposal(&owner)
             .unwrap()
             .is_none());
-        let tx = make_aa_signed(guardian, 1, 500_000, 10, vec![proposal], None);
+        assert_eq!(get_nonce(&mut evm, &guardian), 1);
+        let tx = make_aa_signed(
+            guardian,
+            current_nonce(&mut evm, &guardian),
+            500_000,
+            10,
+            vec![proposal],
+            None,
+        );
         assert_eq!(
             evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
                 .unwrap()
@@ -4832,7 +4861,15 @@ mod tests {
             system_contracts::encode_cancel_recovery_calldata(&owner),
             100_000,
         );
-        let tx = make_aa_signed(owner, 1, 500_000, 10, vec![cancel.clone(), bad], None);
+        assert_eq!(get_nonce(&mut evm, &owner), 1);
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![cancel.clone(), bad],
+            None,
+        );
         assert_eq!(
             evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
                 .unwrap()
@@ -4848,7 +4885,15 @@ mod tests {
                 .unwrap(),
             approved
         );
-        let tx = make_aa_signed(owner, 2, 500_000, 10, vec![cancel], None);
+        assert_eq!(get_nonce(&mut evm, &owner), 2);
+        let tx = make_aa_signed(
+            owner,
+            current_nonce(&mut evm, &owner),
+            500_000,
+            10,
+            vec![cancel],
+            None,
+        );
         assert_eq!(
             evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
                 .unwrap()
@@ -4862,6 +4907,8 @@ mod tests {
             .get_recovery_proposal(&owner)
             .unwrap()
             .is_none());
+        assert_eq!(get_nonce(&mut evm, &owner), 3);
+        assert_eq!(get_nonce(&mut evm, &guardian), 2);
     }
 
     #[test]
@@ -4881,7 +4928,14 @@ mod tests {
                 gas,
             );
             call.value = value;
-            let tx = make_aa_signed(owner, 0, 200_000, 10, vec![call], None);
+            let tx = make_aa_signed(
+                owner,
+                current_nonce(&mut evm, &owner),
+                200_000,
+                10,
+                vec![call],
+                None,
+            );
             let result = evm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
             assert_eq!(result.receipt.status, 0);
             assert!(evm
