@@ -521,11 +521,15 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
         });
 
     let spec = SpecId::CANCUN;
-    let mut evm = Evm::new(
-        ctx,
-        EthInstructions::new_mainnet_with_spec(spec),
-        ShellPrecompiles::new(spec),
-    );
+    let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+    if chain_store
+        .get_chain_config()?
+        .and_then(|config| config.validation_pqvm_height)
+        .is_some_and(|height| number >= height)
+    {
+        crate::executor::install_pqvm_instructions(&mut instructions);
+    }
+    let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
     let exec_result = evm
         .transact(tx_env)
@@ -934,11 +938,15 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         });
 
     let spec = SpecId::CANCUN;
-    let mut evm = Evm::new(
-        ctx,
-        EthInstructions::new_mainnet_with_spec(spec),
-        ShellPrecompiles::new(spec),
-    );
+    let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+    if chain_store
+        .get_chain_config()?
+        .and_then(|config| config.validation_pqvm_height)
+        .is_some_and(|height| number >= height)
+    {
+        crate::executor::install_pqvm_instructions(&mut instructions);
+    }
+    let mut evm = Evm::new(ctx, instructions, ShellPrecompiles::new(spec));
 
     let exec_result = evm
         .transact(tx_env)
@@ -1649,6 +1657,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            validation_pqvm_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -2448,6 +2457,114 @@ mod tests {
         assert_eq!(outcome.pubkey, signer.public_key());
         assert!(!outcome.should_register_pubkey);
         assert!(outcome.protocol_checks_nonce);
+    }
+
+    #[test]
+    fn validation_instruction_set_respects_activation_and_policy() {
+        // These policies check deterministic VM results, not transaction signatures.
+        let mut hash_code = vec![0x5f, 0x5f, 0x5f, 0xb1, 0x5f, 0x51, 0x7f];
+        hash_code.extend_from_slice(blake3_hash(b"").as_bytes());
+        hash_code.extend_from_slice(&[0x14, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+        let mut address_code = vec![0x60, 0x01, 0x5f, 0x5f, 0x5f, 0xb2, 0x5f, 0x51, 0x7f];
+        address_code.extend_from_slice(Address::from_public_key(b"", 1).as_bytes());
+        address_code.extend_from_slice(&[0x14, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+        let mut callcode = vec![
+            0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x61, 0x12, 0x34, 0x5f, 0xf2, 0x50,
+        ];
+        callcode.extend(validator_returns_true());
+        let mut wrong_hash = hash_code.clone();
+        wrong_hash[7] ^= 1;
+        for activation in [None, Some(10)] {
+            let signer = DilithiumSigner::generate();
+            let from = signer_address(&signer);
+            let paymaster = Address::from([0x77; 32]);
+            let (mut ws, cs) = setup_stores();
+            cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                    "validation_pqvm_height":activation
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            for (label, code, before, after) in [
+                ("pqhash", hash_code.clone(), false, true),
+                ("pqaddr", address_code.clone(), false, true),
+                ("wrong-hash", wrong_hash.clone(), false, false),
+                ("callcode", callcode.clone(), true, false),
+                ("ordinary", validator_returns_true(), true, true),
+            ] {
+                install_paymaster(&mut ws, &cs, from, code.clone());
+                let mut account = ws.get_account(&from).unwrap().unwrap();
+                account.validation_code_hash = account.code_hash;
+                ws.set_account(&from, &account).unwrap();
+                install_paymaster(&mut ws, &cs, paymaster, code);
+                let signed = sign_tx(&signer, base_tx(1337, ws.get_nonce(&from).unwrap()), true);
+                let bundle = test_contract_paymaster_bundle(paymaster);
+                let state_before = (
+                    ws.get_account(&from).unwrap(),
+                    ws.get_account(&paymaster).unwrap(),
+                );
+                for number in [9, 10, 11] {
+                    let expected = if activation.is_some_and(|height| number >= height) {
+                        after
+                    } else {
+                        before
+                    };
+                    let header = BlockHeader {
+                        number,
+                        gas_limit: VALIDATION_GAS_CAP,
+                        ..BlockHeader::default()
+                    };
+                    assert_eq!(
+                        validate_aa_tx_at_block(&signed, &ws, &cs, &DilithiumVerifier, &header)
+                            .is_ok(),
+                        expected,
+                        "custom {label} {activation:?} {number}"
+                    );
+                    assert_eq!(
+                        call_paymaster_validate(
+                            &signed,
+                            &bundle,
+                            &paymaster,
+                            &[1],
+                            &ws,
+                            &cs,
+                            Some(&header)
+                        )
+                        .is_ok(),
+                        expected,
+                        "paymaster {label} {activation:?} {number}"
+                    );
+                    assert_eq!(
+                        crate::tx_validation::validate_tx_for_import_at_block(
+                            &signed,
+                            &mut ws,
+                            &cs,
+                            &DilithiumVerifier,
+                            1337,
+                            None,
+                            &header
+                        )
+                        .is_ok(),
+                        expected,
+                        "import {label} {activation:?} {number}"
+                    );
+                }
+                set_head_number(&cs, 9);
+                assert_eq!(
+                    validate_aa_tx(&signed, &ws, &cs, &DilithiumVerifier).is_ok(),
+                    if activation.is_some() { after } else { before }
+                );
+                assert_eq!(
+                    (
+                        ws.get_account(&from).unwrap(),
+                        ws.get_account(&paymaster).unwrap()
+                    ),
+                    state_before
+                );
+            }
+        }
     }
 
     #[test]

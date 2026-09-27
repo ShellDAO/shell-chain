@@ -345,3 +345,23 @@ or be removed. Configure the same schedule on participating nodes. Contract
 paymaster validation is unchanged. Rotated paymaster keys, custom-validator
 cryptographic operations and validator consensus signatures remain separate
 parts of the whitepaper's full operational guarantee.
+
+## PQVM instructions in validation contracts
+
+With `validation_pqvm_height` explicitly scheduled, custom account validation
+and contract paymaster validation use the same instruction table as normal
+PQVM execution from that candidate block onward. A policy can use `PQHASH` or
+`PQADDR` to calculate and check native hashes or addresses. `CALLCODE` and
+`SELFDESTRUCT` are rejected, matching the normal execution rules. Existing
+validation gas limits, return-value checks, paymaster static-call restrictions
+and discarded validation-state writes remain in force.
+
+This independent schedule preserves historical validation behavior when omitted
+or before activation. Existing chains can add only a future height; a persisted
+schedule cannot be changed or removed. Coordinate the same height on all nodes.
+Import and historical replay use the candidate header, while admission uses the
+next block. See [the instruction-set decision](adr/validation-pqvm-instructions.md).
+
+Instruction availability does not relax algorithm status or signature checks in
+PQ verification primitives, nor increase the gas available to a validation
+contract. Cryptographic policy and algorithm deprecation remain separate concerns.
