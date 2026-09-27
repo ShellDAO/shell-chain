@@ -57,11 +57,20 @@ const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
 #[derive(Debug, Clone)]
 pub struct ShellPrecompiles {
     spec: SpecId,
+    allow_deprecated: bool,
 }
 
 impl ShellPrecompiles {
     pub fn new(spec: SpecId) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            allow_deprecated: false,
+        }
+    }
+
+    pub(crate) fn with_deprecated_verification(mut self, enabled: bool) -> Self {
+        self.allow_deprecated = enabled;
+        self
     }
 
     pub fn is_precompile(&self, address: &Address) -> bool {
@@ -89,7 +98,11 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
         let target = &inputs.bytecode_address;
 
         if is_pq_precompile(target) {
-            return Ok(Some(run_pq_precompile(target, inputs, context)));
+            return Ok(Some(if self.allow_deprecated {
+                run_pq_precompile::<_, true>(target, inputs, context)
+            } else {
+                run_pq_precompile::<_, false>(target, inputs, context)
+            }));
         }
 
         Ok(None)
@@ -108,7 +121,7 @@ fn is_pq_precompile(address: &Address) -> bool {
     PQ_PRECOMPILE_ADDRS.contains(address)
 }
 
-fn run_pq_precompile<CTX: ContextTr>(
+fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
     target: &Address,
     inputs: &CallInputs,
     context: &mut CTX,
@@ -129,9 +142,13 @@ fn run_pq_precompile<CTX: ContextTr>(
     };
 
     match *target {
-        PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify(inputs.gas_limit, input),
-        PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => run_slhdsa_sha2_256f_verify(inputs.gas_limit, input),
-        PQ_MLDSA65_BATCH_VERIFY_ADDR => run_mldsa65_batch_verify(inputs.gas_limit, input),
+        PQ_MLDSA65_VERIFY_ADDR => run_mldsa65_verify::<ALLOW_DEPRECATED>(inputs.gas_limit, input),
+        PQ_SLHDSA_SHA2_256F_VERIFY_ADDR => {
+            run_slhdsa_sha2_256f_verify::<ALLOW_DEPRECATED>(inputs.gas_limit, input)
+        }
+        PQ_MLDSA65_BATCH_VERIFY_ADDR => {
+            run_mldsa65_batch_verify::<ALLOW_DEPRECATED>(inputs.gas_limit, input)
+        }
         PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, input),
         PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, input),
         PQ_ADDRESS_DERIVE_ADDR => run_pq_address_derive(inputs.gas_limit, input),
@@ -159,25 +176,34 @@ fn charge_gas(result: &mut InterpreterResult, gas: u64) -> bool {
     true
 }
 
-fn run_mldsa65_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+fn run_mldsa65_verify<const ALLOW_DEPRECATED: bool>(
+    gas_limit: u64,
+    input: &[u8],
+) -> InterpreterResult {
     let mut result = base_result(gas_limit);
     if !charge_gas(&mut result, PQ_MLDSA65_VERIFY_GAS) {
         return result;
     }
-    result.output = bool_output(verify_mldsa65(input));
+    result.output = bool_output(verify_mldsa65::<ALLOW_DEPRECATED>(input));
     result
 }
 
-fn run_slhdsa_sha2_256f_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+fn run_slhdsa_sha2_256f_verify<const ALLOW_DEPRECATED: bool>(
+    gas_limit: u64,
+    input: &[u8],
+) -> InterpreterResult {
     let mut result = base_result(gas_limit);
     if !charge_gas(&mut result, PQ_SLHDSA_VERIFY_GAS) {
         return result;
     }
-    result.output = bool_output(verify_slhdsa_sha2_256f(input));
+    result.output = bool_output(verify_slhdsa_sha2_256f::<ALLOW_DEPRECATED>(input));
     result
 }
 
-fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+fn run_mldsa65_batch_verify<const ALLOW_DEPRECATED: bool>(
+    gas_limit: u64,
+    input: &[u8],
+) -> InterpreterResult {
     let mut result = base_result(gas_limit);
 
     // C-1: Parse count from the header BEFORE any verification work.
@@ -201,7 +227,7 @@ fn run_mldsa65_batch_verify(gas_limit: u64, input: &[u8]) -> InterpreterResult {
         return result;
     }
 
-    let (_, valid) = verify_mldsa65_batch(input);
+    let (_, valid) = verify_mldsa65_batch::<ALLOW_DEPRECATED>(input);
     result.output = bool_output(valid);
     result
 }
@@ -262,7 +288,29 @@ pub(crate) fn derive_pq_address(algo_id: u8, pubkey: &[u8]) -> Option<[u8; 32]> 
     Some(*ShellAddress::from_public_key(pubkey, algo_id).as_bytes())
 }
 
-fn verify_mldsa65(input: &[u8]) -> bool {
+pub(crate) fn verify_contract_signature<const ALLOW_DEPRECATED: bool>(
+    sig_type: SignatureType,
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    if ALLOW_DEPRECATED
+        && shell_crypto::algorithm_status(sig_type)
+            == Some(shell_crypto::AlgorithmStatus::Deprecated)
+    {
+        use shell_crypto::Verifier;
+        return shell_crypto::MultiVerifier
+            .verify(
+                public_key,
+                message,
+                &shell_crypto::PQSignature::new(sig_type, signature.to_vec()),
+            )
+            .unwrap_or(false);
+    }
+    verify_signature(sig_type, public_key, message, signature).unwrap_or(false)
+}
+
+fn verify_mldsa65<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> bool {
     // Wire format (length-prefixed) — ABI-stable across upgrades:
     // [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
     // Algorithm dispatch is Dilithium3/ML-DSA-65 (binary-compatible); the
@@ -284,13 +332,23 @@ fn verify_mldsa65(input: &[u8]) -> bool {
     let sig_bytes = &input[4 + pk_len + 4 + msg_len..];
     // Try ML-DSA-65 first (primary algorithm); fall back to Dilithium3 for
     // legacy wire-compatible signatures on the same wire shape.
-    if verify_signature(SignatureType::MlDsa65, public_key, message, sig_bytes).unwrap_or(false) {
+    if verify_contract_signature::<ALLOW_DEPRECATED>(
+        SignatureType::MlDsa65,
+        public_key,
+        message,
+        sig_bytes,
+    ) {
         return true;
     }
-    verify_signature(SignatureType::Dilithium3, public_key, message, sig_bytes).unwrap_or(false)
+    verify_contract_signature::<ALLOW_DEPRECATED>(
+        SignatureType::Dilithium3,
+        public_key,
+        message,
+        sig_bytes,
+    )
 }
 
-fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
+fn verify_slhdsa_sha2_256f<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> bool {
     if input.len() < SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES {
         return false;
     }
@@ -299,16 +357,15 @@ fn verify_slhdsa_sha2_256f(input: &[u8]) -> bool {
     let signature =
         &input[SPHINCS_PUBLIC_KEY_BYTES..SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES];
     let message = &input[SPHINCS_PUBLIC_KEY_BYTES + SPHINCS_SIGNATURE_BYTES..];
-    verify_signature(
+    verify_contract_signature::<ALLOW_DEPRECATED>(
         SignatureType::SphincsSha2256f,
         public_key,
         message,
         signature,
     )
-    .unwrap_or(false)
 }
 
-fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
+fn verify_mldsa65_batch<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> (usize, bool) {
     // Batch wire format:
     // [4-byte count][item_0][item_1]...
     // Each item: [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
@@ -349,7 +406,7 @@ fn verify_mldsa65_batch(input: &[u8]) -> (usize, bool) {
         // H-3: ML-DSA-65-first dispatch (ML-DSA-65 primary + Dilithium3 fallback)
         // matches the single-verify path so batch and single verification are consistent.
         let item = &input[item_start..item_end];
-        valid &= verify_mldsa65(item);
+        valid &= verify_mldsa65::<ALLOW_DEPRECATED>(item);
         cursor = item_end;
     }
 
@@ -366,6 +423,88 @@ fn bool_output(valid: bool) -> Bytes {
 mod tests {
     use super::*;
     use shell_crypto::{DilithiumSigner, Signer, SphincsSigner};
+
+    #[test]
+    fn validation_precompiles_preserve_real_signature_checks_after_deprecation() {
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, MlDsaSigner};
+        for signer in [
+            Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ] {
+            let message = b"validation policy challenge";
+            let signature = signer.sign(message).unwrap();
+            let slh = signer.sig_type() == SignatureType::SphincsSha2256f;
+            let mut input = Vec::new();
+            if slh {
+                input.extend_from_slice(signer.public_key());
+                input.extend_from_slice(&signature.data);
+                input.extend_from_slice(message);
+            } else {
+                input.extend_from_slice(&(signer.public_key().len() as u32).to_be_bytes());
+                input.extend_from_slice(signer.public_key());
+                input.extend_from_slice(&(message.len() as u32).to_be_bytes());
+                input.extend_from_slice(message);
+                input.extend_from_slice(&signature.data);
+            }
+            let mut registry = AlgorithmRegistry::default();
+            for stage in [0, 1, 2] {
+                for algorithm in shell_crypto::ALLOWED_ALGORITHMS {
+                    match stage {
+                        1 => registry.deprecate(*algorithm),
+                        2 => registry.propose_activation(*algorithm),
+                        _ => {}
+                    }
+                }
+                with_algorithm_registry_override(&registry, || {
+                    let legacy = if slh {
+                        verify_slhdsa_sha2_256f::<false>(&input)
+                    } else {
+                        verify_mldsa65::<false>(&input)
+                    };
+                    let upgraded = if slh {
+                        verify_slhdsa_sha2_256f::<true>(&input)
+                    } else {
+                        verify_mldsa65::<true>(&input)
+                    };
+                    assert_eq!(legacy, stage == 0);
+                    assert_eq!(upgraded, stage != 2);
+                    let mut bad = input.clone();
+                    let sig_index = if slh {
+                        signer.public_key().len()
+                    } else {
+                        8 + signer.public_key().len() + message.len()
+                    };
+                    bad[sig_index] ^= 1;
+                    assert!(
+                        !(if slh {
+                            verify_slhdsa_sha2_256f::<true>(&bad)
+                        } else {
+                            verify_mldsa65::<true>(&bad)
+                        })
+                    );
+                    let mut wrong_key = signer.public_key().to_vec();
+                    wrong_key[0] ^= 1;
+                    assert!(!verify_contract_signature::<true>(
+                        signer.sig_type(),
+                        &wrong_key,
+                        message,
+                        &signature.data
+                    ));
+                    if !slh {
+                        let mut batch = 1u32.to_be_bytes().to_vec();
+                        batch.extend_from_slice(&input);
+                        assert_eq!(verify_mldsa65_batch::<true>(&batch), (1, stage != 2));
+                        let result = run_mldsa65_batch_verify::<true>(
+                            PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG - 1,
+                            &batch,
+                        );
+                        assert_eq!(result.result, InstructionResult::PrecompileOOG);
+                    }
+                });
+            }
+        }
+    }
 
     #[test]
     fn pq_suite_addresses_match_spec() {
@@ -462,7 +601,7 @@ mod tests {
         input.extend_from_slice(message);
         input.extend_from_slice(&sig.data);
 
-        let output = run_mldsa65_verify(PQ_MLDSA65_VERIFY_GAS, &input);
+        let output = run_mldsa65_verify::<false>(PQ_MLDSA65_VERIFY_GAS, &input);
         let mut expected = [0u8; 32];
         expected[31] = 1;
         assert_eq!(output.output.as_ref(), &expected);
@@ -478,7 +617,7 @@ mod tests {
         input.extend_from_slice(&sig.data);
         input.extend_from_slice(message);
 
-        let output = run_slhdsa_sha2_256f_verify(PQ_SLHDSA_VERIFY_GAS, &input);
+        let output = run_slhdsa_sha2_256f_verify::<false>(PQ_SLHDSA_VERIFY_GAS, &input);
         let mut expected = [0u8; 32];
         expected[31] = 1;
         assert_eq!(output.output.as_ref(), &expected);
@@ -516,7 +655,7 @@ mod tests {
                                                         // No signature items — if the loop ran it would return false due to
                                                         // missing data, but it must never reach there with gas_limit=0.
 
-        let result = run_mldsa65_batch_verify(0, &input);
+        let result = run_mldsa65_batch_verify::<false>(0, &input);
         assert_eq!(
             result.result,
             InstructionResult::PrecompileOOG,
@@ -529,7 +668,7 @@ mod tests {
     fn batch_verify_rejects_oversized_count() {
         let mut input = Vec::new();
         input.extend_from_slice(&(MAX_BATCH_SIGNATURES + 1).to_be_bytes());
-        let result = run_mldsa65_batch_verify(u64::MAX, &input);
+        let result = run_mldsa65_batch_verify::<false>(u64::MAX, &input);
         assert_eq!(
             result.result,
             InstructionResult::PrecompileError,
@@ -540,7 +679,7 @@ mod tests {
     #[test]
     fn batch_verify_rejects_empty_batch() {
         let input = 0u32.to_be_bytes();
-        let result = run_mldsa65_batch_verify(0, &input);
+        let result = run_mldsa65_batch_verify::<false>(0, &input);
 
         assert_eq!(result.result, InstructionResult::PrecompileError);
         assert!(result.output.is_empty());
@@ -575,7 +714,7 @@ mod tests {
         input.extend(encode_batch_item(signer2.public_key(), msg2, &sig2.data));
 
         let gas = PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG * 2 + 1_000;
-        let result = run_mldsa65_batch_verify(gas, &input);
+        let result = run_mldsa65_batch_verify::<false>(gas, &input);
         let mut expected = [0u8; 32];
         expected[31] = 1;
         assert_eq!(
@@ -611,7 +750,7 @@ mod tests {
         ));
 
         let gas = PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG * 2 + 1_000;
-        let result = run_mldsa65_batch_verify(gas, &input);
+        let result = run_mldsa65_batch_verify::<false>(gas, &input);
         let expected_false = [0u8; 32];
         assert_eq!(
             result.output.as_ref(),
