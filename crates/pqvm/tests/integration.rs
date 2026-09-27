@@ -173,8 +173,7 @@ fn e2e_reject_invalid_signature() {
     );
     assert!(
         matches!(result, Err(TxValidationError::SignatureInvalid)),
-        "should reject forged signature, got: {:?}",
-        result
+        "should reject forged signature"
     );
 }
 

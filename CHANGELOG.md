@@ -30,6 +30,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add default-off `registered_key_algorithm_height` to commit the selected
+  algorithm during account key rotation and recovery. Direct signatures,
+  session roots and EOA sponsors retain that identity through deprecation
+  under their existing independent schedules; pending algorithms cannot use
+  another active verifier. Earlier bindings retain legacy behavior until an
+  authorized rotation reaffirms the intended algorithm.
+
 - Add optional `validation_deprecation_height` so existing custom-account and
   contract-paymaster policies can verify deprecated signatures through PQVERIFY
   and verification precompiles. Keep ordinary execution and preactivation rules,
