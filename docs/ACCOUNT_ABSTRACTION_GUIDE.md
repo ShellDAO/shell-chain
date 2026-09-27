@@ -331,6 +331,17 @@ exception: rotation does not persist the new algorithm identifier. The separate
 `session_registered_root_height` repairs import binding for keys accepted by the
 existing active-verifier policy, as described in section 3.2. Both schedules
 are immutable once stored; an existing chain may add only a future activation.
-Paymaster verification, custom-validator cryptographic operations and validator
-consensus signatures also remain separate parts of the whitepaper's full
-operational guarantee.
+For EOA sponsorship, the independent `algorithm_paymaster_deprecation_height`
+allows an already registered original-key paymaster to keep paying transaction
+fees after its algorithm becomes `Deprecated`. At the scheduled candidate block,
+the registered key must derive the paymaster address under the exact algorithm
+used to verify the signature. `PendingActivation`, missing keys, mismatched keys
+and invalid signatures remain rejected. The sender still pays transferred value;
+the paymaster pays execution fees without consuming its own transaction nonce.
+
+Omitting this schedule preserves legacy active-only EOA authorization. Existing
+chains may add only a future activation, and a persisted schedule cannot change
+or be removed. Configure the same schedule on participating nodes. Contract
+paymaster validation is unchanged. Rotated paymaster keys, custom-validator
+cryptographic operations and validator consensus signatures remain separate
+parts of the whitepaper's full operational guarantee.

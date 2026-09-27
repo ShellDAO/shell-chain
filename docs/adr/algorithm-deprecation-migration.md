@@ -80,3 +80,22 @@ persists an algorithm identifier for rotated keys nor changes their existing
 active-verifier fallback policy. Same-block rotation may still be rejected by
 parent-state batch/prevalidation; supporting it requires a separate validation
 ordering change. Full network activation is not implied by source availability.
+
+## EOA paymaster authorization by original registered roots
+
+Use an independent, default-off `algorithm_paymaster_deprecation_height` for
+sponsorship; prior root and session schedules retain their original behavior.
+At activation, infer the exact algorithm from the already registered paymaster
+key and address, then permit `Active` or `Deprecated` status while verifying the
+actual paymaster-domain signature. Never infer an alternate algorithm by trying
+compatible signature verifiers. Pending entries and unregistered keys do not
+qualify. Rotated keys that no longer derive the sponsor address remain outside
+this bounded exception because their algorithm binding is not persisted.
+
+Use the shared AA authorization path for admission, execution, canonical/fork
+import and historical replay. The explicit candidate header determines activation;
+admission uses the next block. Read status through the branch-local registry.
+Contract paymaster policy and fee/value allocation are unchanged. Persist the
+independent immutable schedule, require future-only additions to existing chains,
+and reject trusted snapshot schedule mismatches before writing imported state.
+Source availability does not activate this rule on any network.

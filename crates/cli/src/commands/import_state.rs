@@ -75,6 +75,8 @@ pub fn import_state(datadir: PathBuf, snapshot: PathBuf) -> Result<(), Box<dyn s
                     algorithm_deprecation_height: genesis.algorithm_deprecation_height,
                     algorithm_session_deprecation_height: genesis
                         .algorithm_session_deprecation_height,
+                    algorithm_paymaster_deprecation_height: genesis
+                        .algorithm_paymaster_deprecation_height,
                     session_registered_root_height: genesis.session_registered_root_height,
                     algorithm_proposal_staging_height: genesis.algorithm_proposal_staging_height,
                     algorithm_quorum_activation_height: genesis.algorithm_quorum_activation_height,

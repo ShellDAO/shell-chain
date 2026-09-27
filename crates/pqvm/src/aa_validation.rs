@@ -380,14 +380,17 @@ fn validate_paymaster_authorization<S: KvStore + 'static, V: Verifier>(
             validation_header,
         )
     } else {
-        verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier).map_err(
-            |e| match e {
+        let block_number = match validation_header {
+            Some(header) => header.number,
+            None => validation_block_number(chain_store.get_head_block()?.map(|b| b.number())),
+        };
+        verify_paymaster_signature(signed_tx, &paymaster, chain_store, verifier, block_number)
+            .map_err(|e| match e {
                 crate::tx_validation::TxValidationError::PaymasterPubkeyNotFound(addr) => {
                     AaValidationError::PaymasterPubkeyNotFound(addr)
                 }
                 other => AaValidationError::PaymasterSignatureInvalid(other.to_string()),
-            },
-        )
+            })
     }
 }
 
@@ -1645,6 +1648,7 @@ mod tests {
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
+            algorithm_paymaster_deprecation_height: None,
             session_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
@@ -2097,6 +2101,187 @@ mod tests {
         );
 
         assert!(!verified);
+    }
+
+    #[test]
+    fn registered_paymaster_survives_deprecation_upgrade() {
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
+        let sponsors: Vec<Box<dyn Signer>> = vec![
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ];
+        for sponsor in sponsors {
+            let sender: Box<dyn Signer> = if sponsor.sig_type() == SignatureType::MlDsa65 {
+                Box::new(DilithiumSigner::generate())
+            } else {
+                Box::new(MlDsaSigner::generate())
+            };
+            let from = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
+            let paymaster =
+                Address::from_public_key(sponsor.public_key(), sponsor.sig_type().as_u8());
+            for activation in [None, Some(10)] {
+                let (mut ws, cs) = setup_stores();
+                fund_account(&mut ws, &from);
+                fund_account(&mut ws, &paymaster);
+                cs.put_pubkey(&paymaster, sponsor.public_key()).unwrap();
+                let mut account = ws.get_account(&paymaster).unwrap().unwrap();
+                account.pq_pubkey_hash = shell_primitives::blake3_hash(sponsor.public_key());
+                ws.set_account(&paymaster, &account).unwrap();
+                cs.put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                        "algorithm_paymaster_deprecation_height":activation
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let mut tx = base_tx(1337, ws.get_nonce(&from).unwrap());
+                tx.tx_type = AA_BUNDLE_TX_TYPE;
+                tx.gas_limit = 300_000;
+                tx.value = U256::from(7u64);
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    from,
+                    tx,
+                    PQSignature::new(sender.sig_type(), vec![1]),
+                    PubkeyMode::Embedded(sender.public_key().to_vec()),
+                    AaBundle {
+                        inner_calls: vec![InnerCall {
+                            to: Some(Address::from([0x17; 32])),
+                            value: U256::from(7u64),
+                            data: Bytes::new(),
+                            gas_limit: 50_000,
+                        }],
+                        paymaster: Some(paymaster),
+                        paymaster_signature: Some(Bytes::from(vec![1])),
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.aa_bundle.as_mut().unwrap().paymaster_signature = Some(Bytes::from(
+                    sponsor
+                        .sign(signed.paymaster_signing_hash().unwrap().as_bytes())
+                        .unwrap()
+                        .data,
+                ));
+                signed.signature = sender
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let mut registry = AlgorithmRegistry::default();
+                let header = BlockHeader {
+                    number: 10,
+                    ..BlockHeader::default()
+                };
+                with_algorithm_registry_override(&registry, || {
+                    validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header).unwrap()
+                });
+                let before = (
+                    ws.get_account(&from).unwrap(),
+                    ws.get_account(&paymaster).unwrap(),
+                );
+                registry.deprecate(sponsor.sig_type());
+                with_algorithm_registry_override(&registry, || {
+                    for number in [9, 10, 11] {
+                        let header = BlockHeader {
+                            number,
+                            ..BlockHeader::default()
+                        };
+                        let expected = activation.is_some_and(|height| number >= height);
+                        assert_eq!(
+                            validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header)
+                                .is_ok(),
+                            expected,
+                            "sponsor={:?}, activation={activation:?}, candidate={number}",
+                            sponsor.sig_type()
+                        );
+                    }
+                    for number in [9, 10, 11] {
+                        let header = BlockHeader {
+                            number,
+                            ..BlockHeader::default()
+                        };
+                        assert_eq!(
+                            crate::tx_validation::validate_tx_for_import_at_block(
+                                &signed,
+                                &mut ws,
+                                &cs,
+                                &MultiVerifier,
+                                1337,
+                                None,
+                                &header
+                            )
+                            .is_ok(),
+                            activation.is_some_and(|height| number >= height)
+                        );
+                    }
+                    set_head_number(&cs, 9);
+                    assert_eq!(
+                        validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_ok(),
+                        activation.is_some()
+                    );
+                    if activation.is_some() {
+                        let mut tampered = signed.clone();
+                        let mut signature = tampered
+                            .aa_bundle
+                            .as_ref()
+                            .unwrap()
+                            .paymaster_signature
+                            .as_ref()
+                            .unwrap()
+                            .as_ref()
+                            .to_vec();
+                        signature[0] ^= 1;
+                        tampered.aa_bundle.as_mut().unwrap().paymaster_signature =
+                            Some(Bytes::from(signature));
+                        tampered.signature = sender
+                            .sign(tampered.sender_signing_hash().as_bytes())
+                            .unwrap();
+                        assert!(matches!(
+                            validate_aa_tx_at_block(&tampered, &ws, &cs, &MultiVerifier, &header),
+                            Err(AaValidationError::PaymasterSignatureInvalid(_))
+                        ));
+                        let (_, fresh_cs) = setup_stores();
+                        fresh_cs
+                            .put_chain_config(&cs.get_chain_config().unwrap().unwrap())
+                            .unwrap();
+                        assert!(matches!(
+                            validate_aa_tx_at_block(
+                                &signed,
+                                &ws,
+                                &fresh_cs,
+                                &MultiVerifier,
+                                &header
+                            ),
+                            Err(AaValidationError::PaymasterPubkeyNotFound(_))
+                        ));
+                        cs.put_pubkey(&paymaster, sender.public_key()).unwrap();
+                        assert!(matches!(
+                            validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header),
+                            Err(AaValidationError::PaymasterSignatureInvalid(_))
+                        ));
+                        cs.put_pubkey(&paymaster, sponsor.public_key()).unwrap();
+                    }
+                });
+                registry.propose_activation(sponsor.sig_type());
+                with_algorithm_registry_override(&registry, || {
+                    assert!(matches!(
+                        validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header),
+                        Err(AaValidationError::PaymasterSignatureInvalid(_))
+                    ));
+                });
+                assert_eq!(
+                    (
+                        ws.get_account(&from).unwrap(),
+                        ws.get_account(&paymaster).unwrap()
+                    ),
+                    before
+                );
+                assert_eq!(
+                    cs.get_pubkey(&paymaster).unwrap().as_deref(),
+                    Some(sponsor.public_key())
+                );
+            }
+        }
     }
 
     #[test]

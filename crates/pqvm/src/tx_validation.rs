@@ -511,6 +511,7 @@ pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
     paymaster: &Address,
     chain_store: &ChainStore<S>,
     verifier: &V,
+    block_number: u64,
 ) -> Result<(), TxValidationError> {
     let bundle = signed_tx
         .aa_bundle
@@ -526,13 +527,36 @@ pub(crate) fn verify_paymaster_signature<S: KvStore + 'static, V: Verifier>(
     let hash = signed_tx
         .paymaster_signing_hash()
         .ok_or_else(|| TxValidationError::InvalidAaBundle("no paymaster_signing_hash".into()))?;
-    let paymaster_sig_type =
-        infer_signature_type_from_address(&pubkey, paymaster).ok_or_else(|| {
-            TxValidationError::InvalidAaBundle(
-                "paymaster pubkey does not match the paymaster address under any allowed algorithm"
-                    .into(),
-            )
-        })?;
+    let allow_deprecated = chain_store
+        .get_chain_config()?
+        .and_then(|config| config.algorithm_paymaster_deprecation_height)
+        .is_some_and(|height| block_number >= height);
+    let paymaster_sig_type = if allow_deprecated {
+        [
+            shell_crypto::SignatureType::MlDsa65,
+            shell_crypto::SignatureType::Dilithium3,
+            shell_crypto::SignatureType::SphincsSha2256f,
+        ]
+        .into_iter()
+        .find(|algorithm| {
+            Address::from_public_key(&pubkey, algorithm.as_u8()) == *paymaster
+                && matches!(
+                    shell_crypto::algorithm_status(*algorithm),
+                    Some(
+                        shell_crypto::AlgorithmStatus::Active
+                            | shell_crypto::AlgorithmStatus::Deprecated
+                    )
+                )
+        })
+    } else {
+        infer_signature_type_from_address(&pubkey, paymaster)
+    }
+    .ok_or_else(|| {
+        TxValidationError::InvalidAaBundle(
+            "paymaster pubkey does not match the paymaster address under any allowed algorithm"
+                .into(),
+        )
+    })?;
     let pq_sig = shell_crypto::PQSignature::new(paymaster_sig_type, sig_bytes.as_ref().to_vec());
     let valid = verifier
         .verify(&pubkey, hash.as_bytes(), &pq_sig)
