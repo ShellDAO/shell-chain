@@ -305,6 +305,56 @@ in blocks. An account with an active recovery proposal must call
 `cancelRecovery` before replacing its guardian configuration so votes collected
 under the old configuration cannot remain executable.
 
+### Guardian recovery procedure
+
+Use native AccountManager calls with full 32-byte Shell addresses. The interface
+above lists selector signatures; use compatible SDK native calldata encoders,
+not an Ethereum encoder that truncates `address` arguments to 20 bytes.
+
+1. The account owner calls `setGuardians` with 1–5 distinct guardians, a required
+   vote count from 1 to the guardian count, and a delay of at least 100 blocks.
+   The owner cannot be one of its own guardians.
+2. Each guardian signs its own `submitRecovery` transaction for the **same**
+   target account, replacement public key, and algorithm. Use the intended
+   algorithm ID (`0` Dilithium3, `1` ML-DSA-65, `2` SPHINCS+-SHA2-256f).
+   One guardian submitting repeatedly contributes only one vote. A conflicting
+   replacement key or algorithm is rejected while the proposal is active.
+3. Wait for the threshold-reaching transaction's successful receipt. If it was
+   included in block `N` and the configured delay is `D`, execution is first
+   eligible in block `N + D`. The existing implementation stores the parent-head
+   marker `N - 1 + D` and compares it with the execution block's parent head;
+   do not interpret that marker as an eligible transaction inclusion height.
+   Additional votes do not restart the delay. A successful individual vote
+   receipt alone does not prove the threshold has been reached.
+4. Once the delay has elapsed, any funded account may submit
+   `executeRecovery(target)`. Confirm its successful receipt before using the
+   replacement key. The account address is unchanged, and the proposal is
+   removed. Subsequent transactions from the recovered account use its current
+   nonce and replacement key. Key commitment semantics follow
+   [the configured rotation activation](ACCOUNT_ABSTRACTION_GUIDE.md#persist-the-replacement-algorithm).
+5. The account itself may instead call `cancelRecovery(target)` before
+   execution, either below or above the voting threshold. Guardians cannot
+   cancel on its behalf. Cancelling removes all collected votes; a new proposal
+   starts from zero. Cancel an active proposal before changing guardians.
+
+Recovery rotates the registered root key; it preserves the account's balance,
+nonce, code and custom validation policy. Transaction fees and the submitting
+account's nonce still follow ordinary transaction processing. A custom validator
+must therefore authorize later transactions according to its own policy; root
+key recovery does not remove that policy.
+
+The native lifecycle regressions run in the existing test suite:
+
+```bash
+cargo test -p shell-pqvm submit_recovery_and_execute_rotates_key
+cargo test -p shell-pqvm cancel_recovery
+```
+
+These tests cover distinct votes, the exact elapsed-block boundary, unchanged
+account state on premature execution, successful key replacement, proposal
+removal and cancellation isolation. They do not establish public SDK package
+availability or activate a network upgrade.
+
 ### Key rotation example
 
 ```bash

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 
+- Explain the native guardian recovery voting, block-delay and cancellation
+  procedure. Complete the existing lifecycle regressions through successful
+  recovery and verify that cancelled votes cannot carry into a new proposal.
+
 - Correct the native algorithm activation interface and selector to include the
   target height and verifier hash. Explain calldata word order and distinguish
   a successful vote receipt from quorum approval and eventual activation.
