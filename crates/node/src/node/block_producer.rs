@@ -588,7 +588,7 @@ impl<S: KvStore + 'static> Node<S> {
         if pruned > 0 {
             debug!(
                 count = pruned,
-                "pruned stale nonce-too-low transactions after production"
+                "pruned transactions invalidated by canonical state after production"
             );
         }
 

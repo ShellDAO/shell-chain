@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Clear pending transactions authenticated by a replaced root after canonical
+  key rotation, including embedded and reference keys. Their nonce descendants
+  and reservations are released so replacement-key transactions do not need to
+  outbid invalid old-key entries. Custom-validator policy remains authoritative.
+
 - Retain a verified next-height wPoA commit certificate that arrives before its
   block, then revalidate it after canonical import. Followers now advance
   finalized state when certificate gossip precedes block gossip. Buffering is

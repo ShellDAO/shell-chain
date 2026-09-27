@@ -735,7 +735,7 @@ impl<'a, S: KvStore + 'static> MemPoolBoundary<'a, S> {
     fn remove_committed_hashes(&self, tx_hashes: &[ShellHash]) -> usize {
         self.tx_pool.remove_batch(tx_hashes);
         let ws = self.world_state.read();
-        self.tx_pool.prune_nonce_too_low(&ws)
+        self.tx_pool.prune_nonce_too_low(&ws) + self.tx_pool.prune_rotated_roots(&ws)
     }
 }
 
@@ -6404,6 +6404,225 @@ mod tests {
             node.chain_store.get_pubkey(&sender).unwrap().unwrap(),
             new_pubkey
         );
+    }
+
+    #[test]
+    fn confirmed_rotation_clears_old_root_pending_transactions() {
+        for embedded in [false, true] {
+            let (producer, proposer_signer) = setup_node();
+            let proposer = producer.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(proposer);
+            let old = MlDsaSigner::generate();
+            let replacement = shell_crypto::SphincsSigner::generate();
+            let sender = Address::from_public_key(old.public_key(), old.sig_type().as_u8());
+            let recipient = Address::from([0x78; 32]);
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                node.world_state
+                    .write()
+                    .set_account(
+                        &sender,
+                        &shell_core::Account::new_user_account(
+                            shell_primitives::blake3_hash(old.public_key()),
+                            U256::from(1_000_000_000_000_000_000u64),
+                        ),
+                    )
+                    .unwrap();
+                node.chain_store
+                    .put_pubkey(&sender, old.public_key())
+                    .unwrap();
+                store_consistent_genesis(node);
+            }
+            let nonce = producer.world_state.read().get_nonce(&sender).unwrap();
+            let sign = |signer: &dyn Signer, nonce, to, value, data, embedded| {
+                let transaction = Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(to),
+                    value,
+                    data,
+                    gas_limit: 1_000_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let signature = signer
+                    .sign(
+                        transaction
+                            .signing_hash(signer.sig_type().as_u8())
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                if embedded {
+                    SignedTransaction::with_pubkey(
+                        sender,
+                        transaction,
+                        signature,
+                        signer.public_key().to_vec(),
+                    )
+                } else {
+                    SignedTransaction::new(sender, transaction, signature)
+                }
+            };
+            let rotation = sign(
+                &old,
+                nonce,
+                shell_pqvm::account_manager_address(),
+                U256::ZERO,
+                Bytes::from(shell_pqvm::encode_rotate_key_calldata(
+                    replacement.public_key(),
+                    replacement.sig_type().as_u8(),
+                )),
+                true,
+            );
+            let stale = sign(
+                &old,
+                nonce + 1,
+                recipient,
+                U256::from(1u64),
+                Bytes::new(),
+                embedded,
+            );
+            let descendant = sign(
+                &old,
+                nonce + 2,
+                recipient,
+                U256::from(2u64),
+                Bytes::new(),
+                embedded,
+            );
+            let fresh = sign(
+                &replacement,
+                nonce + 1,
+                recipient,
+                U256::from(3u64),
+                Bytes::new(),
+                true,
+            );
+            let account_before = producer.world_state.read().get_account(&sender).unwrap();
+            let error = producer
+                .tx_pool
+                .insert(
+                    fresh.clone(),
+                    &mut producer.world_state.write(),
+                    producer.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap_err();
+            eprintln!("embedded={embedded} premature replacement rejection: {error}");
+            assert_eq!(
+                producer.world_state.read().get_account(&sender).unwrap(),
+                account_before
+            );
+            assert_eq!(
+                producer.chain_store.get_pubkey(&sender).unwrap().unwrap(),
+                old.public_key()
+            );
+            assert!(!producer.tx_pool.contains(&fresh.hash()));
+            for node in [&producer, &follower] {
+                for tx in [&rotation, &stale, &descendant] {
+                    node.tx_pool
+                        .insert(
+                            tx.clone(),
+                            &mut node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                }
+            }
+            let block = producer.produce_block(&proposer_signer, 100).unwrap();
+            assert_eq!(
+                block.transactions.len(),
+                1,
+                "stale transactions must not follow the rotation in the same block"
+            );
+            assert_eq!(block.transactions[0].hash(), rotation.hash());
+            assert!(!producer.tx_pool.contains(&stale.hash()));
+            assert!(!producer.tx_pool.contains(&descendant.hash()));
+            assert_eq!(
+                producer.world_state.read().get_nonce(&sender).unwrap(),
+                nonce + 1
+            );
+            assert_eq!(
+                producer.world_state.read().get_balance(&recipient).unwrap(),
+                U256::ZERO
+            );
+            assert_eq!(
+                producer.chain_store.get_pubkey(&sender).unwrap().unwrap(),
+                replacement.public_key()
+            );
+
+            let store_before = follower.store.scan_prefix(b"").unwrap();
+            let root_before = current_state_root(&follower);
+            let mut malicious = block.clone();
+            malicious.transactions.push(stale.clone());
+            malicious.header.witness_root = None;
+            malicious.header.sig_aggregate_proof = None;
+            malicious.proposer_seal = Some(
+                proposer_signer
+                    .sign(malicious.header.hash().as_bytes())
+                    .unwrap(),
+            );
+            let error = follower
+                .import_block(malicious, &MultiVerifier)
+                .unwrap_err();
+            eprintln!("embedded={embedded} stale block rejection: {error}");
+            assert!(
+                error.to_string().contains("sequential validation"),
+                "must reach current-state authorization: {error}"
+            );
+            assert_eq!(follower.head_number(), 0);
+            assert_eq!(current_state_root(&follower), root_before);
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), store_before);
+            assert_eq!(
+                follower.chain_store.get_pubkey(&sender).unwrap().unwrap(),
+                old.public_key()
+            );
+            assert!(
+                follower.tx_pool.contains(&stale.hash()),
+                "rejected block must not prune pending transactions"
+            );
+            follower.import_block(block, &MultiVerifier).unwrap();
+            assert_eq!(current_state_root(&follower), current_state_root(&producer));
+            assert!(follower.tx_pool.is_empty());
+            follower
+                .tx_pool
+                .insert(
+                    fresh.clone(),
+                    &mut follower.world_state.write(),
+                    follower.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            producer
+                .tx_pool
+                .insert(
+                    fresh,
+                    &mut producer.world_state.write(),
+                    producer.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            let replacement_block = producer.produce_block(&proposer_signer, 100).unwrap();
+            assert_eq!(replacement_block.transactions.len(), 1);
+            follower
+                .import_block(replacement_block, &MultiVerifier)
+                .unwrap();
+            assert_eq!(
+                producer.world_state.read().get_balance(&recipient).unwrap(),
+                U256::from(3u64)
+            );
+            assert_eq!(
+                producer.world_state.read().get_nonce(&sender).unwrap(),
+                nonce + 2
+            );
+            assert_eq!(current_state_root(&follower), current_state_root(&producer));
+            eprintln!("embedded={embedded}: same-block old-root exclusion, canonical rejection rollback, and confirmed replacement-key transfer passed");
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use shell_pqvm::{
     compute_intrinsic_gas, validate_aa_bundle_structure, validate_aa_tx, validate_transaction_type,
     AaValidationError, TxValidationError,
 };
-use shell_primitives::{Address, ShellHash, U256};
+use shell_primitives::{blake3_hash, Address, ShellHash, U256};
 use shell_storage::{ChainStore, KvStore, WorldState};
 
 use crate::{MempoolConfig, MempoolError};
@@ -129,6 +129,7 @@ struct PoolEntry {
     tx: Arc<SignedTransaction>,
     priority_key: PriorityKey,
     serialized_size: usize,
+    validated_root_hash: Option<ShellHash>,
 }
 
 /// Composite ordering key: higher fee first, then earlier arrival first.
@@ -170,7 +171,7 @@ impl TxPool {
         verifier: &V,
     ) -> Result<ShellHash, MempoolError> {
         // --- Stateless checks (before acquiring lock) ---
-        let (tx_size, base_fee_per_gas) =
+        let (tx_size, base_fee_per_gas, validated_root_hash) =
             self.validate_stateless(&tx, world_state, chain_store, verifier)?;
 
         // --- Balance floor check (F-020) ---
@@ -364,6 +365,7 @@ impl TxPool {
                 tx: Arc::new(tx),
                 priority_key,
                 serialized_size: tx_size,
+                validated_root_hash,
             },
         );
         inner.total_bytes = projected_bytes;
@@ -453,6 +455,52 @@ impl TxPool {
             inner.seq = 0;
         }
         pruned
+    }
+
+    /// Remove transactions authorized by a root that canonical state has replaced.
+    ///
+    /// Call only after canonical state commits, never against a speculative block.
+    /// Remembering the validated root also covers transactions with reference keys.
+    /// Custom validators own their authorization policy and are not pruned here.
+    pub fn prune_rotated_roots<S: KvStore + 'static>(&self, world_state: &WorldState<S>) -> usize {
+        let senders: Vec<Address> = self.inner.read().by_sender.keys().copied().collect();
+        let roots: HashMap<Address, ShellHash> = senders
+            .into_iter()
+            .filter_map(|sender| match world_state.get_account(&sender) {
+                Ok(Some(account))
+                    if account.validation_code_hash.is_none()
+                        && account.pq_pubkey_hash != ShellHash::ZERO =>
+                {
+                    Some((sender, account.pq_pubkey_hash))
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(?sender, %error, "root pruning could not read canonical account");
+                    None
+                }
+            })
+            .collect();
+        let mut inner = self.inner.write();
+        let stale: Vec<ShellHash> = inner
+            .by_hash
+            .iter()
+            .filter_map(|(hash, entry)| {
+                entry.validated_root_hash.and_then(|validated| {
+                    roots
+                        .get(&entry.tx.from)
+                        .filter(|canonical| **canonical != validated)
+                        .map(|_| *hash)
+                })
+            })
+            .collect();
+        let mut removed = 0;
+        for hash in stale {
+            removed += Self::remove_entry_and_descendants(&mut inner, &hash);
+        }
+        if inner.by_hash.is_empty() {
+            inner.seq = 0;
+        }
+        removed
     }
 
     /// Remove all transactions from the pool.
@@ -698,7 +746,7 @@ impl TxPool {
         world_state: &mut WorldState<S>,
         chain_store: &ChainStore<S>,
         verifier: &V,
-    ) -> Result<(usize, u64), MempoolError> {
+    ) -> Result<(usize, u64, Option<ShellHash>), MempoolError> {
         // Chain ID
         if tx.tx.chain_id != self.config.chain_id {
             return Err(MempoolError::ChainIdMismatch {
@@ -806,9 +854,13 @@ impl TxPool {
             )));
         }
 
-        validate_aa_tx(tx, world_state, chain_store, verifier)
+        let validation = validate_aa_tx(tx, world_state, chain_store, verifier)
             .map_err(|err| map_aa_validation_error(tx, err))?;
-        Ok((tx_size, base_fee_per_gas))
+        let uses_default_validator = world_state
+            .get_account(&tx.from)?
+            .is_none_or(|account| account.validation_code_hash.is_none());
+        let validated_root_hash = uses_default_validator.then(|| blake3_hash(&validation.pubkey));
+        Ok((tx_size, base_fee_per_gas, validated_root_hash))
     }
 
     /// Remove a single entry from all indexes. Caller holds write lock.
@@ -2130,6 +2182,50 @@ mod tests {
 
         pool.remove_batch(&[h1, h2]);
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn rotated_root_pruning_preserves_custom_policy_and_releases_reservations() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let from = test_address(&pubkey);
+        let nonce = ws.get_nonce(&from).unwrap();
+        for next in [nonce, nonce + 1] {
+            let tx = make_signed_tx_with_signer(&signer, &pubkey, next, 100);
+            insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
+        }
+        assert!(indexed_reservation(&pool, &from).is_some());
+        assert_eq!(
+            pool.prune_rotated_roots(&ws),
+            0,
+            "unbound account is not evidence of rotation"
+        );
+        let mut account = ws.get_account(&from).unwrap().unwrap();
+        account.pq_pubkey_hash = blake3_hash(&pubkey);
+        ws.set_account(&from, &account).unwrap();
+        assert_eq!(
+            pool.prune_rotated_roots(&ws),
+            0,
+            "unchanged root remains valid"
+        );
+        account.pq_pubkey_hash = blake3_hash(b"replacement-root");
+        account.validation_code_hash = Some(blake3_hash(b"custom-validation-policy"));
+        ws.set_account(&from, &account).unwrap();
+        assert_eq!(
+            pool.prune_rotated_roots(&ws),
+            0,
+            "custom policy owns authorization"
+        );
+        account.validation_code_hash = None;
+        ws.set_account(&from, &account).unwrap();
+        assert_eq!(pool.prune_rotated_roots(&ws), 2);
+        assert!(pool.is_empty());
+        assert_eq!(pool.inner.read().total_bytes, 0);
+        assert!(indexed_reservation(&pool, &from).is_none());
+        assert_eq!(pool.inner.read().seq, 0);
     }
 
     #[test]

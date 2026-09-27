@@ -223,6 +223,13 @@ That means a user can:
 
 without changing the account's on-chain identity.
 
+After a successful rotation receipt, sign subsequent transactions with the new
+key bound to the original address. Canonical production, import and fork adoption
+remove pending transactions admitted under a replaced default-validator root,
+along with their nonce descendants and reserved balance. The new key does not
+need to pay a replacement fee to dislodge an invalid old-key transaction.
+Transactions authorized by custom validator code retain that policy's semantics.
+
 ### Current status
 
 The validation dispatcher, AccountManager system-contract flow, and reference
