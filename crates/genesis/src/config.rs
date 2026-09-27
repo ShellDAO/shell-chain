@@ -174,6 +174,9 @@ pub struct GenesisConfig {
     /// First block preserving session authorization by registered address-derived roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_session_deprecation_height: Option<u64>,
+    /// First block preserving registered original-root EOA paymaster authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_paymaster_deprecation_height: Option<u64>,
     /// First block binding imported session roots to the current registered key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_registered_root_height: Option<u64>,

@@ -30,6 +30,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional `algorithm_paymaster_deprecation_height` so registered original-key
+  EOA paymasters can sponsor transactions after their algorithm is deprecated.
+  Bind the signature to the exact address algorithm and keep pending algorithms,
+  unregistered sponsors and invalid signatures rejected. Preserve legacy policy
+  when omitted; persist the immutable future schedule and check trusted snapshots.
+
 - Add optional `session_registered_root_height` so block import can accept
   session transactions after a root-key rotation confirmed in an earlier block.
   Use the current registered key while retaining account-hash and real signature
