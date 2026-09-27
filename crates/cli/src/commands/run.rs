@@ -375,6 +375,7 @@ async fn initialize_chain<S: KvStore + 'static>(
                 validation_pqvm_height: genesis_config.validation_pqvm_height,
                 validation_deprecation_height: genesis_config.validation_deprecation_height,
                 session_registered_root_height: genesis_config.session_registered_root_height,
+                paymaster_registered_root_height: genesis_config.paymaster_registered_root_height,
                 algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
                 algorithm_quorum_activation_height: genesis_config
                     .algorithm_quorum_activation_height,
@@ -471,6 +472,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.session_registered_root_height
         || stored
             .as_ref()
+            .and_then(|config| config.paymaster_registered_root_height)
+            != genesis_config.paymaster_registered_root_height
+        || stored
+            .as_ref()
             .and_then(|config| config.algorithm_proposal_staging_height)
             != genesis_config.algorithm_proposal_staging_height
         || stored
@@ -496,6 +501,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             validation_pqvm_height: genesis_config.validation_pqvm_height,
             validation_deprecation_height: genesis_config.validation_deprecation_height,
             session_registered_root_height: genesis_config.session_registered_root_height,
+            paymaster_registered_root_height: genesis_config.paymaster_registered_root_height,
             algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
             algorithm_quorum_activation_height: genesis_config.algorithm_quorum_activation_height,
             algorithm_timelock_activation_height: genesis_config
@@ -717,6 +723,7 @@ async fn run_with_store<S: KvStore + 'static>(
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
+            paymaster_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1282,6 +1289,7 @@ mod tests {
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
+            paymaster_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -1517,6 +1525,7 @@ mod tests {
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
+            paymaster_registered_root_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -2074,6 +2083,55 @@ mod tests {
             assert_eq!(store.scan_prefix(b"").unwrap(), unchanged);
         }
         config.session_registered_root_height = Some(12);
+        config.paymaster_registered_root_height = Some(0);
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.paymaster_registered_root_height = Some(13);
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let chain = ChainStore::new(Arc::clone(&store));
+        let persisted = chain.get_chain_config().unwrap().unwrap();
+        assert_eq!(persisted.paymaster_registered_root_height, Some(13));
+        let unchanged = store.scan_prefix(b"").unwrap();
+        for conflicting in [None, Some(14)] {
+            config.paymaster_registered_root_height = conflicting;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), unchanged);
+        }
+        config.paymaster_registered_root_height = Some(13);
         assert_eq!(persisted.fee_accounting_activation_height, Some(2));
         assert_eq!(persisted.bloom_activation_height, Some(3));
         assert_eq!(persisted.log_address_activation_height, Some(4));
@@ -2320,6 +2378,7 @@ mod tests {
                     validation_pqvm_height: None,
                     validation_deprecation_height: None,
                     session_registered_root_height: None,
+                    paymaster_registered_root_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,

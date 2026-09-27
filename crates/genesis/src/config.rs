@@ -186,6 +186,9 @@ pub struct GenesisConfig {
     /// First block binding imported session roots to the current registered key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_registered_root_height: Option<u64>,
+    /// First block binding rotated EOA paymasters to their registered account key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paymaster_registered_root_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,

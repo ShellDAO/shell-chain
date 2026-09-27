@@ -109,6 +109,7 @@ pub fn init(
                 validation_pqvm_height: None,
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
+                paymaster_registered_root_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
