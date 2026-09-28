@@ -955,7 +955,6 @@ impl<S: KvStore + 'static> Node<S> {
                                     block.number(),
                                     self.finality.read().last_finalized_number(),
                                 );
-                                self.metrics.tx_pool_size.set(self.tx_pool.len() as i64);
 
                                 let number = block.number();
                                 let tx_count = block.transactions.len();
@@ -1174,7 +1173,6 @@ impl<S: KvStore + 'static> Node<S> {
                                                 imported_number,
                                                 self.finality.read().last_finalized_number(),
                                             );
-                                            self.metrics.tx_pool_size.set(self.tx_pool.len() as i64);
                                             self.slash_timed_out_challenges(imported_number);
 
                                             // Notify eth_subscribe listeners.
@@ -1301,8 +1299,6 @@ impl<S: KvStore + 'static> Node<S> {
                                     let verifier = MultiVerifier;
                                     match self.handle_incoming_tx(*tx, &verifier) {
                                         Ok(hash) => {
-                                            self.metrics.txs_received.inc();
-                                            self.metrics.tx_pool_size.set(self.tx_pool.len() as i64);
                                             if let Some(rpc_handle) = rpc_handle.as_ref() {
                                                 rpc_handle.notify_pending_transaction(hash);
                                             }
