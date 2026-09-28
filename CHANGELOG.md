@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 
+- Replace nonexistent AccountManager encoding commands and unsigned RPC examples
+  with signed SDK transactions. Execute the documented rotation example in the
+  native lifecycle acceptance script, including replacement-key use, stale-key
+  rejection, restart persistence and historical replay without state mutation.
+
 - Explain the native guardian recovery voting, block-delay and cancellation
   procedure. Complete the existing lifecycle regressions through successful
   recovery and verify that cancelled votes cannot carry into a new proposal.

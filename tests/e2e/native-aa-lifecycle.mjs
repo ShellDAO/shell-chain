@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Real signed native-AA lifecycle acceptance against an isolated CLI/RocksDB node.
-// Run instructions and version requirements: docs/ACCOUNT_ABSTRACTION_GUIDE.md.
+// Real signed AccountManager lifecycle acceptance against an isolated CLI/RocksDB node.
+// Run instructions and version requirements: docs/SYSTEM_CONTRACTS.md.
 import assert from "node:assert/strict";
 import { readFile, writeFile, mkdtemp, mkdir } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
@@ -24,6 +24,7 @@ const {
   buildBatchTransaction,
   buildInnerCall,
   accountManagerAddress,
+  encodeRotateKeyCalldata,
   encodeSetGuardiansCalldata,
   encodeSubmitRecoveryCalldata,
   encodeExecuteRecoveryCalldata,
@@ -76,7 +77,23 @@ const old = fresh(),
     old.getAddress(),
   );
 const [g1, g2, g3, outsider] = [fresh(), fresh(), fresh(), fresh()];
-const signers = [miner, old, replacement, g1, g2, g3, outsider];
+const rotationOld = fresh();
+const rotationNew = new ShellSigner(
+  "MlDsa65",
+  MlDsa65Adapter.generate(),
+  rotationOld.getAddress(),
+);
+const signers = [
+  miner,
+  old,
+  replacement,
+  g1,
+  g2,
+  g3,
+  outsider,
+  rotationOld,
+  rotationNew,
+];
 const provider = createShellProvider({
     rpcHttpUrl: `http://127.0.0.1:${port}`,
   }),
@@ -621,6 +638,207 @@ try {
   assert.deepEqual(await snapshot(), finalState);
   await valueAllowed("builtin-after-clear-and-restart", 9n);
   result.customPolicySetReplaceClearRollbackVerified = true;
+  // Exercise the direct signed AccountManager path used by the system guide.
+  const rotatedAddress = rotationOld.getAddress();
+  assert.equal(rotationNew.getAddress(), rotatedAddress);
+  const rotationStart = result.transactions.length;
+  const ordinary = async (
+    signer,
+    data,
+    to = accountManagerAddress,
+    value = 0n,
+  ) => {
+    const nonce = Number(
+      BigInt(
+        await rpc("eth_getTransactionCount", [signer.getAddress(), "pending"]),
+      ),
+    );
+    const tx = buildTransaction({
+      chainId: 1337,
+      nonce,
+      to,
+      value,
+      data,
+      gasLimit: 3000000,
+    });
+    return signer.buildSignedTransaction({ tx, includePublicKey: true });
+  };
+  const directConfirmed = async (
+    label,
+    signer,
+    calldata,
+    to = accountManagerAddress,
+    value = 0n,
+  ) => {
+    const beforeBalance = BigInt(await rpc("eth_getBalance", [to, "latest"]));
+    const hash = await send(await ordinary(signer, calldata, to, value));
+    await mine();
+    const receipt = await rpc("eth_getTransactionReceipt", [hash]);
+    assert.equal(receipt?.status, "0x1", label);
+    assert.equal(Number(BigInt(receipt.blockNumber)), height);
+    assert.equal(
+      BigInt(await rpc("eth_getBalance", [to, "latest"])) - beforeBalance,
+      value,
+    );
+    result.transactions.push({
+      label,
+      hash,
+      receipt,
+      trace: await rpc("debug_traceTransaction", [hash]),
+    });
+  };
+  // Register the original key before replacing it, as for an existing account.
+  await directConfirmed(
+    "register-original-key",
+    rotationOld,
+    "0x",
+    outsider.getAddress(),
+  );
+  const beforeUnsigned = await snapshot();
+  let unsignedError;
+  try {
+    await rpc("shell_sendTransaction", [
+      {
+        from: rotatedAddress,
+        to: accountManagerAddress,
+        data: encodeRotateKeyCalldata(
+          rotationNew.getPublicKey(),
+          rotationNew.algorithmId,
+        ),
+        gas: "0x186a0",
+      },
+    ]);
+  } catch (e) {
+    unsignedError = String(e);
+  }
+  assert.match(unsignedError ?? "", /invalid|missing|signature|deserializ/i);
+  assert.deepEqual(await snapshot(), beforeUnsigned);
+  result.rejections.push({
+    label: "unsigned-guide-object-rejected",
+    error: unsignedError,
+    stateUnchanged: true,
+  });
+  // Run the guide's actual code block with real signers and paced RPC I/O.
+  const guide = await readFile(
+    new URL("../../docs/SYSTEM_CONTRACTS.md", import.meta.url),
+    "utf8",
+  );
+  const rotationSection = guide
+    .split("### Key rotation example")[1]
+    ?.split("### Custom validation code")[0];
+  const example = rotationSection?.match(/```javascript\n([\s\S]*?)```/)?.[1];
+  assert.ok(example, "rotation guide must contain its executable SDK example");
+  const body = example.replace(
+    /import\s*\{[\s\S]*?\}\s*from\s*"shell-sdk";/,
+    "",
+  );
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const submitDocumentedRotation = new AsyncFunction(
+    "accountManagerAddress",
+    "buildTransaction",
+    "encodeRotateKeyCalldata",
+    "provider",
+    "currentSigner",
+    "nextSigner",
+    body + "\nreturn hash;",
+  );
+  const rotationHash = await submitDocumentedRotation(
+    accountManagerAddress,
+    buildTransaction,
+    encodeRotateKeyCalldata,
+    {
+      client: { request: ({ method, params }) => rpc(method, params) },
+      sendTransaction: send,
+    },
+    rotationOld,
+    rotationNew,
+  );
+  await mine();
+  const rotationReceipt = await rpc("eth_getTransactionReceipt", [
+    rotationHash,
+  ]);
+  assert.equal(rotationReceipt?.status, "0x1");
+  result.transactions.push({
+    label: "documented-direct-key-rotation",
+    hash: rotationHash,
+    receipt: rotationReceipt,
+    trace: await rpc("debug_traceTransaction", [rotationHash]),
+  });
+  result.executedRotationExample = example;
+  const expectedKey =
+    "0x" + Buffer.from(rotationNew.getPublicKey()).toString("hex");
+  assert.equal(await rpc("shell_getPqPubkey", [rotatedAddress]), expectedKey);
+  const staleRejected = async (label) => {
+    const state = await snapshot();
+    let error;
+    try {
+      await send(await ordinary(rotationOld, "0x", outsider.getAddress()));
+    } catch (e) {
+      error = String(e);
+    }
+    assert.match(error ?? "", /pubkey|signature|key/i);
+    assert.deepEqual(await snapshot(), state);
+    result.rejections.push({ label, error, stateUnchanged: true });
+  };
+  await staleRejected("direct-rotation-old-key-rejected");
+  await directConfirmed(
+    "direct-replacement-key-usable",
+    rotationNew,
+    "0x",
+    outsider.getAddress(),
+  );
+  const rotatedState = await snapshot();
+  await stop();
+  await start(data, "direct-rotation-restart");
+  assert.deepEqual(await snapshot(), rotatedState);
+  assert.equal(await rpc("shell_getPqPubkey", [rotatedAddress]), expectedKey);
+  await staleRejected("direct-rotation-old-key-rejected-after-restart");
+  await directConfirmed(
+    "direct-replacement-key-after-restart",
+    rotationNew,
+    "0x",
+    outsider.getAddress(),
+  );
+  await directConfirmed("direct-set-policy", rotationNew, setA);
+  const beforeRejectedPolicy = await snapshot();
+  let policyError;
+  try {
+    await send(await ordinary(rotationNew, "0x", outsider.getAddress(), 7n));
+  } catch (e) {
+    policyError = String(e);
+  }
+  assert.match(policyError ?? "", /validation contract rejected/i);
+  assert.deepEqual(await snapshot(), beforeRejectedPolicy);
+  result.rejections.push({
+    label: "direct-policy-rejects-seven",
+    error: policyError,
+    stateUnchanged: true,
+  });
+  await directConfirmed(
+    "direct-policy-allows-nine",
+    rotationNew,
+    "0x",
+    outsider.getAddress(),
+    9n,
+  );
+  await directConfirmed("direct-clear-policy", rotationNew, clear);
+  await directConfirmed(
+    "direct-builtin-allows-seven-after-clear",
+    rotationNew,
+    "0x",
+    outsider.getAddress(),
+    7n,
+  );
+  result.directPolicySetClearVerified = true;
+  const afterRotation = await snapshot();
+  for (const t of result.transactions.slice(rotationStart))
+    assert.deepEqual(
+      await rpc("debug_traceTransaction", [t.hash]),
+      t.trace,
+      t.label + " history",
+    );
+  assert.deepEqual(await snapshot(), afterRotation);
+  result.directRotationAndUnsignedRejectionVerified = true;
   result.finalHeight = height;
   result.passed = true;
 } catch (e) {
