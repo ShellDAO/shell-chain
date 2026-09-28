@@ -410,42 +410,122 @@ availability or activate a network upgrade.
 
 ### Key rotation example
 
-```bash
-# Encode a rotateKey calldata with shell-node
-shell-node encode-rotate-key --pubkey /path/to/new_pubkey.bin --algo dilithium3
+Use a compatible `shell-sdk` native calldata encoder and a **signed** transaction.
+The node binary is `shell-node`; it has no `encode-rotate-key`,
+`encode-set-validation-code` or `encode-clear-validation-code` subcommands.
+`shell_sendTransaction` accepts the signed Shell transaction structure, not an
+unsigned Ethereum-style `{ from, to, data, gas }` object. The SDK constructs the
+signed wire format for you.
 
-# Submit via RPC
-curl -s http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc":"2.0",
-    "method":"shell_sendTransaction",
-    "params":[{
-      "from": "0xMYADDRESS",
-      "to":   "0x0000000000000000000000000000000000000000000000000000000000000002",
-      "data": "0x<rotateKey calldata>",
-      "gas":  "0x186a0"
-    }],
-    "id":1
-  }'
+Before broadcasting, securely store the replacement key. Load `currentSigner`
+from the account's current keystore and `nextSigner` from the replacement
+keystore, explicitly binding the replacement signer to the **existing full
+32-byte account address**. Deriving a new address from the new public key would
+create a different account. Construct the bound signer with
+`new ShellSigner(loadedReplacement.signatureType, loadedReplacement.adapter, currentSigner.getAddress())`,
+where `loadedReplacement` is the decrypted replacement signer and `ShellSigner`
+is imported from `shell-sdk`. Keep the replacement keystore unchanged and store
+the existing account address separately so you can restore this binding on reload.
+The two signer objects share the adapter; dispose them only after signing is done.
+This example assumes the existing account is funded and uses the built-in PQ
+validation policy; an installed custom policy must also authorize the operation.
+
+The following SDK code submits the rotation after `provider`, `currentSigner`
+and `nextSigner` have been initialized for the intended network:
+
+```javascript
+import {
+  accountManagerAddress,
+  buildTransaction,
+  encodeRotateKeyCalldata,
+} from "shell-sdk";
+
+const account = currentSigner.getAddress();
+if (nextSigner.getAddress() !== account) {
+  throw new Error("Bind the replacement signer to the existing account address");
+}
+const chainId = Number(BigInt(await provider.client.request({
+  method: "eth_chainId", params: [],
+})));
+const nonce = Number(BigInt(await provider.client.request({
+  method: "eth_getTransactionCount", params: [account, "pending"],
+})));
+const tx = buildTransaction({
+  chainId,
+  nonce,
+  to: accountManagerAddress,
+  value: 0n,
+  data: encodeRotateKeyCalldata(nextSigner.getPublicKey(), nextSigner.algorithmId),
+  gasLimit: 3000000,
+});
+const signed = await currentSigner.buildSignedTransaction({
+  tx,
+  includePublicKey: true,
+});
+const hash = await provider.sendTransaction(signed);
 ```
 
-After the transaction is included, future transactions from `0xMYADDRESS` are
-validated using the new key. The old key is invalidated immediately.
+Use the **current key** to authorize rotation. Poll `eth_getTransactionReceipt`
+for `hash` and require `status === "0x1"`; submission alone is not success.
+Then query `shell_getPqPubkey(account)` and compare it with the replacement public
+key. Only after successful inclusion should subsequent transactions use
+`nextSigner` and a freshly queried nonce. The address stays unchanged. With the
+built-in validation policy, the old key is rejected after replacement.
+
+The signed wire format must match the node version. Source SDK `0.14.0-rc.1`
+was used for this acceptance; availability from npm is a separate prerequisite.
+Algorithm binding, key commitments and legacy compatibility depend on the
+[configured rotation activation](ACCOUNT_ABSTRACTION_GUIDE.md#persist-the-replacement-algorithm). No network upgrade is activated
+by running these examples.
 
 ### Custom validation code
 
-Setting `validationCode` delegates transaction validation for this account to
-the contract at the specified code hash. This is the foundation of Shell-Chain's
-native account abstraction. See [ACCOUNT_ABSTRACTION_GUIDE.md](ACCOUNT_ABSTRACTION_GUIDE.md)
-for the full `IAccountValidator` interface and examples.
+The native `setValidationCode(bytes32)` method takes the **Keccak-256 hash of
+already deployed runtime bytecode**, not a contract address or creation bytecode
+hash. Use a policy that implements the account validation ABI and authorizes its
+own update or removal. A permissive test policy is not account authentication.
 
-```bash
-# Set validation code
-shell-node encode-set-validation-code --code-hash 0xabc123...
+Use the same signed transaction construction above, replacing `data` with one of
+these SDK encoder results:
 
-# Clear (revert to PQ default)
-shell-node encode-clear-validation-code
+```javascript
+import {
+  encodeSetValidationCodeCalldata,
+  encodeClearValidationCodeCalldata,
+} from "shell-sdk";
+
+const setData = encodeSetValidationCodeCalldata(validationCodeHash);
+const clearData = encodeClearValidationCodeCalldata();
 ```
+
+Submit each operation separately with the current signer and nonce, wait for a
+successful receipt, then verify the intended allowed and rejected behavior.
+Setting a policy does not change the root key; clearing it restores built-in PQ
+verification using the currently registered key. A policy that rejects its own
+clear operation cannot be bypassed merely by supplying that calldata. See the
+[account validation guide](ACCOUNT_ABSTRACTION_GUIDE.md) for the ABI and execution rules.
+
+### Reproduce the AccountManager lifecycle
+
+From a node checkout containing the
+[lifecycle acceptance script](../tests/e2e/native-aa-lifecycle.mjs), use Node.js 20 or later and a compatible built
+source SDK (`0.14.0-rc.1` tested):
+
+```sh
+cargo build -p shell-cli
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-lifecycle.mjs
+```
+
+This isolated test provisions fresh funded accounts, exercises direct signed
+rotation, rejects the unsigned request shape, verifies replacement-key success
+and stale-key rejection before and after restart, and replays historical
+transactions without changing current state. It also tests native AA guardian
+recovery and custom policy set/replace/clear, including rollback after a later
+inner call fails. Its value-filter policies are test-only and do not authenticate
+users. The test uses explicit dev mining and synthetic timestamps, stops its
+node on exit, and retains keys, node data and results in a private temporary
+directory. It does not demonstrate public SDK availability or network activation.
 
 ---
 
