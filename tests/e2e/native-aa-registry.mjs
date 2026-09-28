@@ -73,6 +73,8 @@ const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
+const epochScenario = process.argv.includes("--epoch-restart");
+let expectedConsensusWeight = 1;
 let expectedMembers = [miner.getAddress()];
 const providers = ports.map((port) =>
   createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${port}` }),
@@ -90,6 +92,7 @@ const nodes = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
+  scenario: epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -216,8 +219,8 @@ async function state(i) {
     consensus.validators.find(
       (v) => v.address.toLowerCase() === miner.getAddress().toLowerCase(),
     ).weight,
-    validator.weight,
-    "consensus weight follows registry",
+    epochScenario ? expectedConsensusWeight : validator.weight,
+    "consensus weight follows the last activated Registry state",
   );
   return {
     validator,
@@ -353,7 +356,7 @@ async function confirmed(
   await save();
   return entry;
 }
-try {
+async function runScenario() {
   const dirs = [join(out, "leader"), join(out, "follower")];
   for (const dir of dirs) await mkdir(dir);
   const followerKey = join(out, "follower-key.json");
@@ -397,7 +400,7 @@ try {
       stakes: [],
       block_time_secs: 2,
       max_future_secs: 300,
-      epoch_length: 0,
+      epoch_length: epochScenario ? 5 : 0,
     },
   };
   for (const signer of signers)
@@ -424,6 +427,73 @@ try {
   assert.ok(bootnode, "leader complete multiaddr");
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (epochScenario) {
+    const read = (label, signer = miner) =>
+      confirmed(label, signer, [], "0x1", true, true);
+    const write = (label, data) =>
+      confirmed(label, miner, [native(data)], "0x1", true, true);
+    const restart = async (entry) => {
+      await stop(1);
+      await start(1, dirs[1], followerKey, `epoch-restart-${height}`, bootnode);
+      await peerReady();
+      await compare(entry.hash);
+    };
+    await write("weight 3 pending", weight(3));
+    await read("register candidate identity", outsider);
+    await read("pre-boundary read 3");
+    await read("pre-boundary read 4");
+    expectedConsensusWeight = 3;
+    await read("weight 3 activates at boundary 5");
+    const pendingWeight = await write("weight 5 pending", weight(5));
+    const at7 = await read("mid-epoch read 7");
+    assert.equal((await state(0)).validator.weight, 5);
+    await restart(at7);
+    await read("pre-boundary read 8");
+    await read("pre-boundary read 9");
+    expectedConsensusWeight = 5;
+    await read("weight 5 activates at boundary 10");
+    const member = outsider.getAddress();
+    const pendingAdd = await write(
+      "member addition pending",
+      "0x4d238c8e" + member.slice(2),
+    );
+    const at12 = await read("mid-epoch read 12");
+    await restart(at12);
+    await read("pre-boundary read 13");
+    await read("pre-boundary read 14");
+    expectedMembers = [miner.getAddress(), member];
+    await read("member addition activates at boundary 15");
+    const pendingRemove = await write(
+      "member removal pending",
+      "0x40a141ff" + member.slice(2),
+    );
+    const at17 = await read("mid-epoch read 17");
+    await restart(at17);
+    await read("pre-boundary read 18");
+    await read("pre-boundary read 19");
+    expectedMembers = [miner.getAddress()];
+    await read("member removal activates at boundary 20");
+    const at21 = await read("mid-epoch read 21");
+    await restart(at21);
+    for (const entry of [pendingWeight, pendingAdd, pendingRemove]) {
+      for (let i = 0; i < 2; i++) {
+        const before = await state(i);
+        assert.deepEqual(
+          await rpc(i, "debug_traceTransaction", [
+            entry.hash,
+            { tracer: "callTracer" },
+          ]),
+          entry.trace,
+        );
+        assert.deepEqual(await state(i), before);
+      }
+    }
+    result.epochRestarts = [7, 12, 17, 21];
+    result.pendingGovernanceHistoryVerified = true;
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
   const expected = "0x" + word(32) + word(1) + miner.getAddress().slice(2);
   const before = await confirmed(
     "AA read before activation retains legacy output",
@@ -685,6 +755,9 @@ try {
   result.indexedNativeEventsVerified = true;
   result.finalHeight = height;
   result.passed = true;
+}
+try {
+  await runScenario();
 } catch (error) {
   result.error = String(error);
   throw error;

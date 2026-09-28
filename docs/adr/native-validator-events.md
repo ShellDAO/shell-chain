@@ -45,5 +45,6 @@ The idle-tip restart check also exposed a startup defect: the builder kept
 genesis authorities until another block triggered Registry reload. Startup now
 invokes the existing reload rule at the stored head. This covers epoch length
 zero and heads on configured boundaries without activating pending changes
-early. Recovery between boundaries in a nonzero epoch remains a separate
-historical-authority recovery task and is not covered by this acceptance.
+early. Recovery between boundaries in a nonzero epoch is covered separately by
+[epoch authority recovery](epoch-authority-recovery.md) and the Registry
+acceptance script's `--epoch-restart` mode.
