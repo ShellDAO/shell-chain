@@ -163,12 +163,28 @@ fn canonical_mapping_prune_boundary(
     })
 }
 
-fn state_trie_prune_boundary(finalized_number: u64, keep_recent: u64) -> Option<u64> {
+/// Latest Registry authority reload represented by this block's post-state.
+pub(crate) fn authority_reload_height(block_number: u64, epoch_length: u64) -> u64 {
+    if epoch_length == 0 {
+        block_number
+    } else {
+        block_number - block_number % epoch_length
+    }
+}
+
+fn state_trie_prune_boundary(
+    finalized_number: u64,
+    keep_recent: u64,
+    epoch_length: u64,
+) -> Option<u64> {
     if finalized_number == 0 || keep_recent == 0 {
         return None;
     }
 
-    let boundary = retention_cutoff(finalized_number, keep_recent);
+    // Keep the last finalized epoch state so restart and allowed reorgs can
+    // recover active authorities without applying pending Registry changes.
+    let boundary = retention_cutoff(finalized_number, keep_recent)
+        .min(authority_reload_height(finalized_number, epoch_length));
     (boundary > 0).then_some(boundary)
 }
 
@@ -1653,7 +1669,11 @@ impl<S: KvStore + 'static> Node<S> {
                     "state root eligible for pruning"
                 );
                 if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
-                    prune_keep_below = state_trie_prune_boundary(finalized_number, keep_recent);
+                    prune_keep_below = state_trie_prune_boundary(
+                        finalized_number,
+                        keep_recent,
+                        self.consensus.read().poa_config().epoch_length,
+                    );
                 }
             }
         }
@@ -9395,17 +9415,69 @@ mod tests {
 
     #[test]
     fn state_trie_pruning_is_bounded_by_finalized_height() {
-        assert_eq!(state_trie_prune_boundary(0, 4), None);
-        assert_eq!(state_trie_prune_boundary(3, 4), None);
-        assert_eq!(state_trie_prune_boundary(8, 4), Some(5));
+        assert_eq!(state_trie_prune_boundary(0, 4, 0), None);
+        assert_eq!(state_trie_prune_boundary(3, 4, 0), None);
+        assert_eq!(state_trie_prune_boundary(8, 4, 0), Some(5));
 
         // A high unfinalized head must not move the pruning boundary.
         let finalized = 8;
         let unfinalized_head = 100;
         assert_ne!(
-            state_trie_prune_boundary(finalized, 4),
+            state_trie_prune_boundary(finalized, 4, 0),
             Some(retention_cutoff(unfinalized_head, 4))
         );
+    }
+
+    #[test]
+    fn epoch_recovery_pruning_preserves_finalized_epoch_even_with_newer_head() {
+        assert_eq!(state_trie_prune_boundary(4, 1, 5), None);
+        assert_eq!(state_trie_prune_boundary(5, 1, 5), Some(5));
+        assert_eq!(state_trie_prune_boundary(18, 1, 10), Some(10));
+        assert_eq!(state_trie_prune_boundary(20, 1, 10), Some(20));
+        assert_eq!(state_trie_prune_boundary(18, 30, 10), None);
+        let (node, _) = setup_node_with_pruning(1);
+        node.consensus.write().poa_config_mut().epoch_length = 5;
+        let authority = node.config.proposer_address.unwrap();
+        let mut roots = Vec::new();
+        let mut parent = ShellHash::ZERO;
+        for number in 0..=10 {
+            let root = {
+                let mut state = node.world_state.write();
+                state.set_validators(&[authority]).unwrap();
+                state.set_validator_weight(&authority, number + 1).unwrap();
+                state.state_root().unwrap()
+            };
+            let block = Block {
+                header: BlockHeader {
+                    number,
+                    parent_hash: parent,
+                    state_root: root,
+                    ..BlockHeader::default()
+                },
+                transactions: Vec::new(),
+                system_transactions: Vec::new(),
+                proposer_seal: None,
+            };
+            parent = block.hash();
+            node.chain_store.put_block(&block).unwrap();
+            node.chain_store.set_canonical(number, &parent).unwrap();
+            node.chain_store.set_head(&parent).unwrap();
+            node.chain_store
+                .set_finalized_number(number.min(7))
+                .unwrap();
+            roots.push(root);
+            node.record_canonical_state_root(number, root);
+        }
+        // Head10 must not release boundary5 while a reorg to finalized7 is legal.
+        let mut boundary = WorldState::at_root(node.store.clone(), &roots[5]).unwrap();
+        boundary.validate().unwrap();
+        assert_eq!(boundary.get_validator_weight(&authority).unwrap(), 6);
+        assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 5);
+        node.chain_store.set_finalized_number(10).unwrap();
+        node.record_canonical_state_root(10, roots[10]);
+        assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 10);
+        let mut current = WorldState::at_root(node.store.clone(), &roots[10]).unwrap();
+        current.validate().unwrap();
     }
 
     #[test]

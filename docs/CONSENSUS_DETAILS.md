@@ -346,6 +346,43 @@ next epoch boundary.
 - Slashed validators are removed
 - Validator weights are recalculated
 
+The node's genesis consensus `epoch_length` selects Registry reload boundaries.
+Zero reloads after every canonical block. With a nonzero value, restarting
+between boundaries restores the active set and weights from the last boundary's
+canonical state, while the head Registry may already contain pending changes.
+For example, with length 5, a weight effective at block 5 remains active after a
+restart at block 7; a new weight written at block 6 activates at block 10.
+Restart must neither revert to genesis authorities nor apply that pending weight.
+
+Recovery uses the canonical boundary header and state; it does not require the
+old block body. Missing or inconsistent boundary data stops startup with an
+explicit recovery error. Restore a trusted snapshot containing that epoch state
+if an older database has already pruned it. Keep the same genesis consensus
+parameters when restarting or restoring a snapshot.
+
+Rolling state pruning retains the last finalized epoch and newer state, even
+when that exceeds `keep_recent`. Using finality rather than an unfinalized tip
+preserves authority recovery across permitted reorgs. Once the next boundary is
+finalized, normal pruning can release the preceding epoch. Archive/full policies
+and epoch-length-zero retention are unchanged. This Registry recovery does not
+persist off-chain slashing evidence or other transient consensus state.
+
+The existing two-node Registry acceptance covers pending weight, addition and
+removal changes, activation at subsequent boundaries, history and idle-tip
+restarts at heights 7, 12, 17 and 21:
+
+```sh
+cargo build -p shell-cli --features libp2p
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs --epoch-restart
+```
+
+Use Node.js 20 or later and a compatible built source SDK (`0.14.0-rc.1` tested).
+The script creates isolated nodes and fresh test keys. Its producer retains
+quorum weight when a candidate becomes active; it does not establish
+multi-authority availability or public SDK delivery. See the
+[recovery decision](adr/epoch-authority-recovery.md).
+
 ---
 
 ## Finality

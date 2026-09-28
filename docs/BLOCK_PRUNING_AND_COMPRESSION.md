@@ -179,11 +179,20 @@ instead of rescanning canonical mappings that may already have been removed.
 Logical snapshots carry both cursors and reject progress ahead of the snapshot's
 finalized height.
 
-### L3 — State trie pruning (experimental)
+### L3 — State trie pruning
 
-Controlled by `state_pruning_experimental = false` (default off).
+Rolling/light profiles prune state snapshots automatically when `keep_recent`
+is nonzero. `state_pruning_experimental` is a legacy compatibility field and
+does not gate this pruning.
 
-When enabled, `prune_state_trie()` walks canonical state roots below the light-profile retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
+During a pruning pass, `prune_state_trie()` walks canonical state roots below the light-profile retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
+
+For a nonzero consensus epoch length, pruning also retains the last finalized
+epoch boundary and newer state. This can exceed `keep_recent`, but preserves
+active-authority recovery on restart and after allowed reorgs. The next finalized
+boundary makes the preceding window eligible for pruning. Boundary headers are
+sufficient for recovery; their block bodies are not required. See
+[epoch authority recovery](adr/epoch-authority-recovery.md).
 
 Logical snapshots preserve the durable state-trie pruning cursor and publish it
 atomically with imported chain progress. Import clears a stale local cursor when
@@ -305,7 +314,7 @@ Default: **`full`**
 |---|---|---|---|---|---|
 | `archive` | 0 (forever) | 0 (forever) | u64::MAX (never delete) | 0 (forever) | Complete cryptographic audit trail; PQ signatures kept even after STARK proof |
 | `full` (**default**) | 0 (forever) | 128 | 0 (replace immediately) | 0 (forever) | Full node: TX history queryable forever; STARK proof replaces PQ signatures |
-| `light` | 4096 (~2.3 h) | 64 | 0 | 4096 | Light / embedded node; rolling ~2-hour window only |
+| `light` | 4096 (~2.3 h) | 64 | 0 | 4096 | Light / embedded node; rolling window plus epoch recovery state |
 
 ### Data volume estimates
 

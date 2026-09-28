@@ -21,6 +21,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore active Registry authorities from the last epoch boundary when restarting
+  mid-epoch, without activating pending membership or weight changes. Retain the
+  finalized epoch state during rolling pruning and fail clearly if recovery data
+  is missing.
+
 - Restore persisted Registry authorities and weights on startup at configured
   reload boundaries, including every block for epoch length zero. Idle-tip
   restarts no longer wait for a new block to refresh genesis weights.
