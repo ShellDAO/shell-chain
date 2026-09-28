@@ -165,10 +165,50 @@ SDK availability or live network activation. See the
 
 ### Events
 
+The optional `native_validator_events_height` enables the indexed event format
+below at and after the configured block. It defaults to disabled; existing
+schedules can only be added at a future height and cannot subsequently change.
+The same schedule must be used by producers, importers and historical replay;
+trusted snapshots must match. This upgrade changes receipt logs and blooms,
+so a source update alone does not activate it on any network.
+
+After activation, topic 0 is the signature hash and topic 1 is the **complete
+32-byte native validator identifier**; event data is empty. The signature keeps
+its native `address` spelling. Direct transactions and activated native AA calls
+use the same encoding. Only a quorum-reaching, committed membership change
+emits an event; an accepted pending vote, rejected operation or reverted AA
+bundle emits none. Log order follows successful inner-call order.
+
+Before activation, direct calls retain the legacy single-topic event with a
+zero-padded, truncated 20-byte member in the data word; AA calls retain their
+legacy lack of native membership logs. Historical receipts retain the format
+selected by their execution height. Do not query legacy events using topic 1.
+The new encoding preserves full native identities for `eth_getLogs` filters;
+standard Solidity address decoders cannot recover a native identity from a
+legacy truncated word.
+
 | Event | Signature | Emitted when |
 |-------|-----------|-------------|
-| `ValidatorAdded` | `ValidatorAdded(address indexed validator)` | `addValidator` succeeds |
-| `ValidatorRemoved` | `ValidatorRemoved(address indexed validator)` | `removeValidator` succeeds |
+| `ValidatorAdded` | `ValidatorAdded(address indexed validator)` | Addition reaches quorum and commits |
+| `ValidatorRemoved` | `ValidatorRemoved(address indexed validator)` | Removal reaches quorum and commits |
+
+The existing [two-node Registry acceptance](../tests/e2e/native-aa-registry.mjs)
+checks the event activation boundary, direct and AA full-address topics, failed
+batch rollback, filtered RPC logs, block/receipt agreement, finality, historical
+nonmutation and follower restart. Build with
+`cargo build -p shell-cli --features libp2p`, then run:
+
+```sh
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs
+```
+
+Use Node.js 20 or later and a compatible built source SDK (`0.14.0-rc.1` tested,
+including its `viem` dependency). The fixture uses isolated nodes and fresh test
+keys, stops child processes on exit and retains private test data. Its initially
+single-authority producer keeps quorum weight when a candidate is added; it is
+not a multi-authority availability test. Public SDK availability and network
+activation are separate requirements. See the [event format decision](adr/native-validator-events.md).
 
 ### Access control
 

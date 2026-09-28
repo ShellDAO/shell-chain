@@ -804,6 +804,12 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 .checked_add(bundle.intrinsic_gas_surcharge())
                 .ok_or_else(|| ExecutorError::Revm("aa bundle intrinsic gas overflow".into()))?;
         let mut total_gas_spent = total_gas_used;
+        let indexed_native_events = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.native_validator_events_height)
+            .is_some_and(|height| header.number >= height);
         let mut all_logs: Vec<shell_core::Log> = Vec::new();
         let mut atomic_failure = false;
         let mut last_revert_data: Vec<u8> = Vec::new();
@@ -844,6 +850,16 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 total_gas_spent = total_gas_spent.saturating_add(used);
                 let (output, failed) = match outcome {
                     Ok(outcome) if required_gas <= budget => {
+                        if indexed_native_events {
+                            if let Some(log) = validator_change_log(
+                                &target,
+                                inner.data.as_ref(),
+                                &outcome.effects,
+                                true,
+                            ) {
+                                all_logs.push(log);
+                            }
+                        }
                         native_effects.validator_set_changed |=
                             outcome.effects.validator_set_changed;
                         for address in outcome.effects.updated_accounts {
@@ -1260,6 +1276,12 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         } else {
             tx.max_fee_per_gas
         };
+        let indexed_native_events = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.native_validator_events_height)
+            .is_some_and(|height| header.number >= height);
         let (ws, chain_store) = self.state_db.world_state_and_chain_store();
         let result = if tx.value != U256::ZERO {
             Err(crate::system_contracts::SystemContractError::AbiDecode(
@@ -1290,46 +1312,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 )?;
                 let new_cumulative = cumulative_gas_used.saturating_add(gas_used);
 
-                // Build event logs for mutating operations
-                let mut shell_logs = Vec::new();
-                if outcome.effects.validator_set_changed {
-                    if let Ok(selector) = <[u8; 4]>::try_from(input.get(..4).unwrap_or_default()) {
-                        let registry_addr = system_contracts::registry_address();
-                        if selector == system_contracts::ADD_VALIDATOR_SELECTOR {
-                            if let Ok(addr) =
-                                system_contracts::decode_address(input.get(4..).unwrap_or_default())
-                            {
-                                let topic =
-                                    ShellHash::from(system_contracts::validator_added_topic());
-                                let mut addr_word = [0u8; 32];
-                                addr_word[12..32].copy_from_slice(addr.to_alloy().as_slice());
-                                if let Ok(log) = shell_core::Log::new(
-                                    registry_addr,
-                                    vec![topic],
-                                    shell_primitives::Bytes::from(addr_word.to_vec()),
-                                ) {
-                                    shell_logs.push(log);
-                                }
-                            }
-                        } else if selector == system_contracts::REMOVE_VALIDATOR_SELECTOR {
-                            if let Ok(addr) =
-                                system_contracts::decode_address(input.get(4..).unwrap_or_default())
-                            {
-                                let topic =
-                                    ShellHash::from(system_contracts::validator_removed_topic());
-                                let mut addr_word = [0u8; 32];
-                                addr_word[12..32].copy_from_slice(addr.to_alloy().as_slice());
-                                if let Ok(log) = shell_core::Log::new(
-                                    registry_addr,
-                                    vec![topic],
-                                    shell_primitives::Bytes::from(addr_word.to_vec()),
-                                ) {
-                                    shell_logs.push(log);
-                                }
-                            }
-                        }
-                    }
-                }
+                let shell_logs: Vec<_> =
+                    validator_change_log(&target, input, &outcome.effects, indexed_native_events)
+                        .into_iter()
+                        .collect();
 
                 let receipt = TransactionReceipt {
                     tx_hash: signed_tx.hash(),
@@ -1396,6 +1382,39 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             }
         }
     }
+}
+
+/// Emit only committed membership changes. Legacy direct-call encoding is retained
+/// until the independent activation; AA callers request only the indexed encoding.
+fn validator_change_log(
+    target: &ShellAddress,
+    input: &[u8],
+    effects: &SystemContractEffects,
+    indexed: bool,
+) -> Option<shell_core::Log> {
+    if *target != system_contracts::registry_address() || !effects.validator_set_changed {
+        return None;
+    }
+    let selector: [u8; 4] = input.get(..4)?.try_into().ok()?;
+    let topic = if selector == system_contracts::ADD_VALIDATOR_SELECTOR {
+        ShellHash::from(system_contracts::validator_added_topic())
+    } else if selector == system_contracts::REMOVE_VALIDATOR_SELECTOR {
+        ShellHash::from(system_contracts::validator_removed_topic())
+    } else {
+        return None;
+    };
+    let member = system_contracts::decode_address(input.get(4..)?).ok()?;
+    let (topics, data) = if indexed {
+        (
+            vec![topic, ShellHash::from_slice(member.as_bytes())],
+            Vec::new(),
+        )
+    } else {
+        let mut word = vec![0u8; 32];
+        word[12..].copy_from_slice(member.to_alloy().as_slice());
+        (vec![topic], word)
+    };
+    shell_core::Log::new(*target, topics, shell_primitives::Bytes::from(data)).ok()
 }
 
 fn empty_receipt() -> TransactionReceipt {
@@ -1567,6 +1586,7 @@ mod tests {
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
+                native_validator_events_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1788,6 +1808,7 @@ mod tests {
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
+                native_validator_events_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1866,6 +1887,7 @@ mod tests {
                             aa_account_manager_height: None,
                             aa_validator_registry_height: None,
                             native_registry_view_height: None,
+                            native_validator_events_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -2433,6 +2455,7 @@ mod tests {
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
                     native_registry_view_height: None,
+                    native_validator_events_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -4709,6 +4732,184 @@ mod tests {
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(data),
             gas_limit: 100_000,
+        }
+    }
+
+    #[test]
+    fn native_validator_events_activation_full_identity_and_atomic_rollback() {
+        for activation in [None, Some(2)] {
+            for number in [1, 2, 3] {
+                for aa in [false, true] {
+                    for fail in [false, true] {
+                        let mut evm = setup_native_aa_evm();
+                        let owner = ShellAddress::from([0x41; 32]);
+                        let member = ShellAddress::from([0x42; 32]);
+                        fund_account(&mut evm, &owner, U256::from(100_000_000));
+                        evm.state_db()
+                            .chain_store()
+                            .put_chain_config(
+                                &serde_json::from_value(serde_json::json!({
+                                    "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                                    "aa_validator_registry_height":0,
+                                    "native_validator_events_height":activation,
+                                    "bloom_activation_height":2
+                                }))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        evm.state_db_mut()
+                            .world_state_mut()
+                            .set_validators(&[owner])
+                            .unwrap();
+                        evm.state_db()
+                            .chain_store()
+                            .put_pubkey(&member, &[0xab; 32])
+                            .unwrap();
+                        let add = system_contracts::encode_add_validator_calldata(&member);
+                        let bad = vec![0xff; 4];
+                        let signed = if aa {
+                            let mut calls = vec![registry_inner(add)];
+                            if fail {
+                                calls.push(registry_inner(bad));
+                            }
+                            make_aa_signed(
+                                owner,
+                                current_nonce(&mut evm, &owner),
+                                500_000,
+                                1,
+                                calls,
+                                None,
+                            )
+                        } else {
+                            make_system_tx(owner, if fail { bad } else { add })
+                        };
+                        let header = BlockHeader {
+                            number,
+                            ..sample_header()
+                        };
+                        let result = if aa {
+                            evm.execute_aa_bundle(&signed, &header, 0, 0)
+                        } else {
+                            evm.execute_tx(&signed, &header, 0, 0)
+                        }
+                        .unwrap();
+                        assert_eq!(result.receipt.status, u8::from(!fail));
+                        assert_eq!(
+                            evm.state_db()
+                                .world_state()
+                                .get_validators()
+                                .unwrap()
+                                .contains(&member),
+                            !fail
+                        );
+                        let indexed = activation.is_some_and(|height| number >= height);
+                        if fail || (aa && !indexed) {
+                            assert!(result.receipt.logs.is_empty());
+                        } else {
+                            assert_eq!(result.receipt.logs.len(), 1);
+                            let log = &result.receipt.logs[0];
+                            assert_eq!(log.address, system_contracts::registry_address());
+                            assert_eq!(
+                                log.topics[0],
+                                ShellHash::from(system_contracts::validator_added_topic())
+                            );
+                            if indexed {
+                                assert_eq!(
+                                    log.topics,
+                                    vec![
+                                        ShellHash::from(system_contracts::validator_added_topic()),
+                                        ShellHash::from([0x42; 32])
+                                    ]
+                                );
+                                assert!(log.data.is_empty());
+                            } else {
+                                assert_eq!(log.topics.len(), 1);
+                                assert_eq!(&log.data.as_ref()[..12], &[0; 12]);
+                                assert_eq!(&log.data.as_ref()[12..], &[0x42; 20]);
+                            }
+                        }
+                        if number >= 2 && !fail {
+                            let mut bloom = alloy_primitives::Bloom::ZERO;
+                            for log in &result.receipt.logs {
+                                bloom.m3_2048(log.address.as_bytes());
+                                for topic in &log.topics {
+                                    bloom.m3_2048(topic.as_bytes());
+                                }
+                            }
+                            assert_eq!(result.receipt.logs_bloom.as_ref(), bloom.as_slice());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_validator_events_wait_for_membership_quorum() {
+        for aa in [false, true] {
+            let mut evm = setup_native_aa_evm();
+            let voters = [
+                ShellAddress::from([0x51; 32]),
+                ShellAddress::from([0x52; 32]),
+            ];
+            let member = ShellAddress::from([0x53; 32]);
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                        "aa_validator_registry_height":0, "native_validator_events_height":0
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_validators(&voters)
+                .unwrap();
+            evm.state_db()
+                .chain_store()
+                .put_pubkey(&member, &[0xab; 32])
+                .unwrap();
+            for (index, voter) in voters.into_iter().enumerate() {
+                fund_account(&mut evm, &voter, U256::from(100_000_000));
+                let add = system_contracts::encode_add_validator_calldata(&member);
+                let tx = if aa {
+                    make_aa_signed(
+                        voter,
+                        current_nonce(&mut evm, &voter),
+                        500_000,
+                        1,
+                        vec![registry_inner(add)],
+                        None,
+                    )
+                } else {
+                    make_system_tx(voter, add)
+                };
+                let result = if aa {
+                    evm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                } else {
+                    evm.execute_tx(&tx, &sample_header(), 0, 0)
+                }
+                .unwrap();
+                assert_eq!(result.receipt.status, 1);
+                let committed = index == 1;
+                assert_eq!(
+                    evm.state_db()
+                        .world_state()
+                        .get_validators()
+                        .unwrap()
+                        .contains(&member),
+                    committed
+                );
+                assert_eq!(result.receipt.logs.len(), usize::from(committed));
+                if committed {
+                    assert_eq!(
+                        result.receipt.logs[0].topics[1],
+                        ShellHash::from([0x53; 32])
+                    );
+                }
+            }
         }
     }
 

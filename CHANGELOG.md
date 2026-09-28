@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore persisted Registry authorities and weights on startup at configured
+  reload boundaries, including every block for epoch length zero. Idle-tip
+  restarts no longer wait for a new block to refresh genesis weights.
+
 - Clear pending transactions authenticated by a replaced root after canonical
   key rotation, including embedded and reference keys. Their nonce descendants
   and reservations are released so replacement-key transactions do not need to
@@ -38,6 +42,12 @@ All notable changes to this project will be documented in this file.
   Algorithm-specific key validation remains in the cryptographic verifier.
 
 ### Added
+
+- Add default-off `native_validator_events_height` for full indexed validator
+  membership events on direct and native AA calls. Preserve legacy receipts
+  before activation, discard logs on atomic failure, and persist the immutable
+  schedule through startup and trusted snapshots. Extend two-node acceptance
+  with event filtering, historical replay and follower restart checks.
 
 - Add default-off `native_registry_view_height` for contract reads of the native
   validator set at the distinct address `2^32 + 1`. Expose full `bytes32` members,

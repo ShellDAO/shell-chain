@@ -100,6 +100,7 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
             }
         }
 
+        let head_number = head.as_ref().map(|block| block.number());
         let cache_mb = self.config.state_cache_size_mb;
 
         // Resume from existing chain state if available.
@@ -145,6 +146,11 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
             tx_pool,
             consensus,
         );
+
+        if let Some(height) = head_number {
+            // Restore the same Registry authority set used after applying this block.
+            node.reload_authorities_if_boundary(height)?;
+        }
 
         Ok((node, store))
     }
@@ -207,6 +213,44 @@ mod tests {
         };
 
         assert!(matches!(err, NodeError::Storage(StorageError::Database(_))));
+    }
+
+    #[test]
+    fn build_restores_registry_authorities_at_reload_boundaries() {
+        use shell_consensus::{PoaConfig, WPoaConfig};
+        for (epoch_length, height) in [(0, 7), (5, 10)] {
+            let authority = Address::from([0x61; 32]);
+            let added = Address::from([0x62; 32]);
+            let mut config = NodeConfig::dev(authority);
+            config.consensus = ConsensusEngineConfig::WPoa(WPoaConfig::with_weights(
+                PoaConfig::new(vec![authority], 1).with_epoch_length(epoch_length),
+                vec![1],
+            ));
+            let store = Arc::new(MemoryDb::new());
+            let chain_store = ChainStore::new(store.clone());
+            let mut state = WorldState::new(store.clone());
+            state.set_validators(&[authority, added]).unwrap();
+            state
+                .set_validator_weights(&[authority, added], &[3, 1])
+                .unwrap();
+            let block = Block {
+                header: BlockHeader {
+                    number: height,
+                    state_root: state.state_root().unwrap(),
+                    ..BlockHeader::default()
+                },
+                transactions: Vec::new(),
+                system_transactions: Vec::new(),
+                proposer_seal: None,
+            };
+            chain_store.put_block(&block).unwrap();
+            chain_store.set_head(&block.hash()).unwrap();
+            let (node, _) = NodeBuilder::new(config, store).build().unwrap();
+            let weights = node.consensus.read().validator_weights();
+            assert_eq!(weights.len(), 2);
+            assert_eq!(weights.get(&authority), Some(&3));
+            assert_eq!(weights.get(&added), Some(&1));
+        }
     }
 
     #[test]
