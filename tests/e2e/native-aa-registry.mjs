@@ -2,6 +2,7 @@
 // Signed native Registry AA acceptance with independent producer and follower nodes.
 // Run instructions and version requirements: docs/ACCOUNT_ABSTRACTION_GUIDE.md.
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { readFile, writeFile, mkdtemp, mkdir } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -72,6 +73,7 @@ const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
+let expectedMembers = [miner.getAddress()];
 const providers = ports.map((port) =>
   createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${port}` }),
 );
@@ -205,9 +207,15 @@ async function state(i) {
     miner.getAddress(),
   ]);
   const consensus = await rpc(i, "shell_consensusInfo");
-  assert.equal(consensus.validators.length, 1);
+  assert.deepEqual(
+    consensus.validators.map((v) => v.address.toLowerCase()).sort(),
+    expectedMembers.map((address) => address.toLowerCase()).sort(),
+    "consensus membership follows committed governance",
+  );
   assert.equal(
-    consensus.validators[0].weight,
+    consensus.validators.find(
+      (v) => v.address.toLowerCase() === miner.getAddress().toLowerCase(),
+    ).weight,
     validator.weight,
     "consensus weight follows registry",
   );
@@ -305,7 +313,7 @@ async function confirmed(
         nonce: currentNonce,
         to: validatorRegistryAddress,
         value: 0n,
-        data: getValidators,
+        data: calls[0]?.data ?? getValidators,
         gasLimit: 3000000,
       })
     : batch.tx;
@@ -376,6 +384,8 @@ try {
     registered_key_algorithm_height: 0,
     aa_account_manager_height: 0,
     aa_validator_registry_height: 3,
+    native_validator_events_height: 16,
+    bloom_activation_height: 0,
     fee_accounting_activation_height: 0,
     consensus: {
       engine: "wpoa",
@@ -546,6 +556,133 @@ try {
     ]),
     deprecated.trace,
   );
+  // Native membership events preserve legacy receipts before block 16, then
+  // expose the complete indexed identifier on direct and AA execution paths.
+  const { keccak256, toHex } = createRequire(
+    resolve(process.env.SHELL_SDK_ENTRY),
+  )("viem");
+  const member = outsider.getAddress();
+  const add = "0x4d238c8e" + member.slice(2);
+  const remove = "0x40a141ff" + member.slice(2);
+  const addTopic = keccak256(toHex("ValidatorAdded(address)"));
+  const removeTopic = keccak256(toHex("ValidatorRemoved(address)"));
+  const eventStart = result.transactions.length;
+  expectedMembers = [miner.getAddress(), member];
+  const legacyAdd = await confirmed(
+    "legacy direct add event",
+    miner,
+    [native(add)],
+    "0x1",
+    true,
+    true,
+  );
+  expectedMembers = [miner.getAddress()];
+  const legacyRemove = await confirmed(
+    "legacy direct remove event",
+    miner,
+    [native(remove)],
+    "0x1",
+    true,
+    true,
+  );
+  for (const entry of [legacyAdd, legacyRemove]) {
+    assert.equal(entry.receipt.logs.length, 1);
+    assert.equal(entry.receipt.logs[0].topics.length, 1);
+    assert.equal(
+      entry.receipt.logs[0].data.toLowerCase(),
+      "0x" + "0".repeat(24) + member.slice(-40).toLowerCase(),
+    );
+  }
+  expectedMembers = [miner.getAddress(), member];
+  const indexedAdd = await confirmed("indexed AA add at activation", miner, [
+    native(add),
+  ]);
+  assert.equal(Number(BigInt(indexedAdd.receipt.blockNumber)), 16);
+  const failed = await confirmed(
+    "AA remove event rolls back with later failure",
+    miner,
+    [native(remove), bad],
+    "0x0",
+  );
+  assert.deepEqual(failed.receipt.logs, []);
+  assert.ok(
+    (await state(0)).consensusValidators.some(
+      (v) =>
+        (typeof v === "string" ? v : v.address)?.toLowerCase() ===
+        member.toLowerCase(),
+    ),
+  );
+  expectedMembers = [miner.getAddress()];
+  const indexedRemove = await confirmed("indexed AA remove", miner, [
+    native(remove),
+  ]);
+  expectedMembers = [miner.getAddress(), member];
+  const directAdd = await confirmed(
+    "indexed direct add",
+    miner,
+    [native(add)],
+    "0x1",
+    true,
+    true,
+  );
+  expectedMembers = [miner.getAddress()];
+  const directRemove = await confirmed(
+    "indexed direct remove",
+    miner,
+    [native(remove)],
+    "0x1",
+    true,
+    true,
+  );
+  const expectedEvents = [
+    [indexedAdd, addTopic],
+    [indexedRemove, removeTopic],
+    [directAdd, addTopic],
+    [directRemove, removeTopic],
+  ];
+  for (const [entry, topic] of expectedEvents) {
+    assert.equal(entry.receipt.logs.length, 1);
+    assert.equal(
+      entry.receipt.logs[0].address.toLowerCase(),
+      validatorRegistryAddress.toLowerCase(),
+    );
+    assert.deepEqual(
+      entry.receipt.logs[0].topics.map((v) => v.toLowerCase()),
+      [topic, member.toLowerCase()],
+    );
+    assert.equal(entry.receipt.logs[0].data, "0x");
+  }
+  const filter = {
+    fromBlock: "0x0",
+    toBlock: "latest",
+    address: validatorRegistryAddress,
+    topics: [null, member],
+  };
+  const logs = await rpc(0, "eth_getLogs", [filter]);
+  assert.deepEqual(
+    logs.map((l) => l.transactionHash),
+    expectedEvents.map(([e]) => e.hash),
+  );
+  assert.deepEqual(await rpc(1, "eth_getLogs", [filter]), logs);
+  for (const entry of result.transactions.slice(eventStart)) {
+    for (let i = 0; i < 2; i++) {
+      const before = await state(i);
+      assert.deepEqual(
+        await rpc(i, "debug_traceTransaction", [
+          entry.hash,
+          { tracer: "callTracer" },
+        ]),
+        entry.trace,
+      );
+      assert.deepEqual(await state(i), before);
+    }
+  }
+  await stop(1);
+  await start(1, dirs[1], followerKey, "event-follower-restart", bootnode);
+  await peerReady();
+  await compare(directRemove.hash);
+  assert.deepEqual(await rpc(1, "eth_getLogs", [filter]), logs);
+  result.indexedNativeEventsVerified = true;
   result.finalHeight = height;
   result.passed = true;
 } catch (error) {
