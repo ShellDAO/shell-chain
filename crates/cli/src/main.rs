@@ -251,7 +251,7 @@ enum Commands {
         #[arg(long, default_value = "disabled")]
         l2_stark_mode: String,
 
-        /// Consensus engine: "poa" (default) or "wpoa".
+        /// Consensus engine: "poa" or "wpoa" (default).
         #[arg(long)]
         consensus_engine: Option<String>,
 
@@ -696,6 +696,8 @@ async fn main() {
                 file_config.node.node_role,
             );
 
+            let effective_consensus_engine = consensus_engine.or(file_config.consensus.engine);
+
             let effective_chain_id =
                 config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
@@ -807,7 +809,7 @@ async fn main() {
                 body_retention,
                 enable_stark_aggregation,
                 l2_stark_mode,
-                consensus_engine,
+                consensus_engine: effective_consensus_engine,
                 node_role: effective_node_role,
                 password_args: password_args.clone(),
             })
