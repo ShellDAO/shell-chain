@@ -560,6 +560,14 @@ the challenge; this alone does not settle a reward or increment registration cou
 This response-admission correction is unreleased; verify the node build before
 relying on this behavior in an older binary.
 
+For a challenge to an earlier block in a stored proof range, a prover resolves the
+local proof pointer and returns the complete signed amendment for that range.
+The response retains the challenged block hash; the receiver checks that the
+amendment covers that hash before authentication and source verification. Missing
+or inconsistent pointer targets do not produce a response. This range-response
+correction is also unreleased; the stored, unsettled range flow is covered by
+`cargo test -p shell-node event_loop_authenticates_challenge_responses_before_storage`.
+
 ### ChallengeReason
 
 | Value | Description |

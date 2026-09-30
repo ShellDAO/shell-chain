@@ -253,9 +253,9 @@ fn decode_challenge_response_amendment(
 ) -> Result<ProofAmendment, String> {
     let amendment = ProofAmendment::from_json(payload)
         .map_err(|error| format!("invalid proof amendment payload: {error}"))?;
-    if amendment.block_hash != response_hash {
+    if !amendment.covered_hashes().contains(&response_hash) {
         return Err(format!(
-            "challenge response hash {response_hash} does not match amendment target {}",
+            "challenge response hash {response_hash} is not covered by amendment target {}",
             amendment.block_hash
         ));
     }
@@ -1816,7 +1816,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     self.consensus.write().slash_authority(&equivocation.offender);
                                 }
                                 // I2: Received a proof challenge from a peer.
-                                // If we hold the proof, respond with raw bytes.
+                                // Resolve local storage pointers to a full amendment before responding.
                                 NetworkMessage::ProofChallenge(challenge) => {
                                     // Bind admission to the transport peer, not the freely chosen
                                     // challenger address. This isolated bucket cannot consume proof
@@ -1831,16 +1831,29 @@ impl<S: KvStore + 'static> Node<S> {
                                         challenge.block_hash,
                                         challenge.challenger,
                                     );
-                                    if let Ok(Some(proof_bytes)) = self.amendment_store.get_amendment(&challenge.block_hash) {
-                                        use shell_consensus::ChallengeResponse;
-                                        if self.config.node_role.runs_prover() {
-                                            let resp = ChallengeResponse {
-                                                block_hash: challenge.block_hash,
-                                                proof_bytes,
-                                                responder: local_signer_address,
+                                    if self.config.node_role.runs_prover() {
+                                        if let (Ok(Some(bytes)), Ok(Some(header))) = (
+                                            self.amendment_store.get_amendment(&challenge.block_hash),
+                                            self.chain_store.get_header_by_hash(&challenge.block_hash),
+                                        ) {
+                                            let amendment = match self.load_stored_stark_amendment(
+                                                challenge.block_hash, header.number, &bytes,
+                                            ) {
+                                                Ok(amendment) => amendment,
+                                                Err(error) => {
+                                                    warn!(%error, "cannot resolve stored challenge proof");
+                                                    continue;
+                                                }
                                             };
-                                            let _ = network.broadcast(NetworkMessage::ProofChallengeResponse(Box::new(resp))).await;
-                                            debug!(block = challenge.block_number, "I2: sent ChallengeResponse");
+                                            if let Ok(proof_bytes) = amendment.to_json() {
+                                                let resp = shell_consensus::ChallengeResponse {
+                                                    block_hash: challenge.block_hash,
+                                                    proof_bytes,
+                                                    responder: local_signer_address,
+                                                };
+                                                let _ = network.broadcast(NetworkMessage::ProofChallengeResponse(Box::new(resp))).await;
+                                                debug!(block = header.number, "I2: sent ChallengeResponse");
+                                            }
                                         }
                                     }
                                 }
@@ -2730,7 +2743,7 @@ impl<S: KvStore + 'static> Node<S> {
                 if rejected_stored_payloads.contains(&payload_hash) {
                     self.amendment_store.delete_amendment(&hash)?;
                 } else {
-                    match self.load_stored_stark_amendment_for_recovery(hash, number, &bytes) {
+                    match self.load_stored_stark_amendment(hash, number, &bytes) {
                         Ok(amendment) => {
                             let covered_hashes = amendment.covered_hashes();
                             let recovered_is_valid = self
@@ -2865,7 +2878,7 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(queued)
     }
 
-    fn load_stored_stark_amendment_for_recovery(
+    fn load_stored_stark_amendment(
         &self,
         source_hash: ShellHash,
         source_block: u64,
@@ -3555,6 +3568,20 @@ mod cadence_tests {
         let payload = challenge_response_payload(ShellHash::from([0x55; 32]));
 
         assert!(decode_challenge_response_amendment(response_hash, &payload).is_err());
+    }
+
+    #[test]
+    fn challenge_response_binds_to_covered_range() {
+        let first = ShellHash::from([0x71; 32]);
+        let target = ShellHash::from([0x72; 32]);
+        let unrelated = ShellHash::from([0x73; 32]);
+        let mut amendment = ProofAmendment::from_json(&challenge_response_payload(target)).unwrap();
+        amendment.start_block = Some(6);
+        amendment.source_hashes = vec![first, target];
+        let payload = amendment.to_json().unwrap();
+        assert!(decode_challenge_response_amendment(first, &payload).is_ok());
+        assert!(decode_challenge_response_amendment(target, &payload).is_ok());
+        assert!(decode_challenge_response_amendment(unrelated, &payload).is_err());
     }
 
     #[test]
