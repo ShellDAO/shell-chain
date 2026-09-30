@@ -377,6 +377,18 @@ impl<S: KvStore + 'static> Node<S> {
                 );
                 continue;
             }
+            if let Err(e) = self.validate_registered_prover(
+                evm.state_db_mut().world_state_mut(),
+                &amendment,
+                next_number,
+            ) {
+                settled_stark_proofs.pop();
+                warn!(
+                    block = next_number,
+                    "skipping unregistered STARK prover: {e}"
+                );
+                continue;
+            }
             if let Err(e) = self.validate_stark_amendment_authentication(&amendment) {
                 settled_stark_proofs.pop();
                 warn!(
@@ -415,6 +427,11 @@ impl<S: KvStore + 'static> Node<S> {
                     continue;
                 }
             };
+            self.record_registered_prover_settlement(
+                evm.state_db_mut().world_state_mut(),
+                &amendment,
+                next_number,
+            )?;
             Self::apply_stark_mint(evm.state_db_mut().world_state_mut(), &reward_tx)?;
             receipts.push(TransactionReceipt {
                 tx_hash: reward_tx.hash(),

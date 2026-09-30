@@ -17,6 +17,17 @@ P2P gossip. Peers store the amendment so future block importers can skip per-sig
 
 ---
 
+## Registered prover activation
+
+The unreleased `prover_registry_height` schedule enables the canonical registry
+and registered-only proof admission and settlement. It is disabled by default;
+existing networks must schedule a future height consistently across peers. Both
+standalone provers and validator-provers need a separate registry entry after
+activation. See [ProverRegistry](PROVER_GUIDE.md#proverregistry) for the exact
+public-key governance request, quorum and finalized-state checks. A proof's
+counter increments only during successful settlement, using execution-local
+registry state on producers, importers and historical replay.
+
 ## Architecture
 
 ```

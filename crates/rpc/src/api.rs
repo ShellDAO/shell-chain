@@ -467,6 +467,22 @@ pub trait ShellApi {
         stake: String,
     ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Propose independent prover registration through a signed governance transaction.
+    /// Subject to the same signer and authenticated RPC policy as validator proposals.
+    #[method(name = "proposeRegisterProver")]
+    async fn propose_register_prover(
+        &self,
+        public_key: String,
+        algorithm: u8,
+    ) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Read the canonical governance registration; does not mutate authority or account keys.
+    #[method(name = "getRegisteredProver")]
+    async fn get_registered_prover(
+        &self,
+        address: Address,
+    ) -> Result<Option<serde_json::Value>, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Propose adding a validator via system contract transaction.
     /// Requires the node to be configured as a validator.
     /// Available remotely only when RPC API-key authentication is configured.

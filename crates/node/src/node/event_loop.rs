@@ -714,6 +714,10 @@ impl<S: KvStore + 'static> Node<S> {
                     } else {
                         self.metrics.stark_proofs_generated.inc();
                     }
+                    if let Err(e) = self.validate_prover_admission(&amendment) {
+                        warn!("local STARK proof is not eligible for submission: {e}");
+                        continue;
+                    }
                     if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
                         warn!(
                             block = amendment.block_number,
@@ -1624,7 +1628,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         );
                                         continue;
                                     }
-                                    if let Err(e) = self.validate_stark_amendment_authentication(&amendment) {
+                                    if let Err(e) = self.validate_prover_admission(&amendment) {
                                         warn!(
                                             block = block_number,
                                             layer = amendment.layer,
@@ -2714,7 +2718,7 @@ impl<S: KvStore + 'static> Node<S> {
                         Ok(amendment) => {
                             let covered_hashes = amendment.covered_hashes();
                             let recovered_is_valid = self
-                                .validate_stark_amendment_authentication(&amendment)
+                                .validate_prover_admission(&amendment)
                                 .and_then(|()| self.validate_stark_amendment_ordering(&amendment))
                                 .and_then(|()| {
                                     if amendment.has_valid_embedded_compression() {

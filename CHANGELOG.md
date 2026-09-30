@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add governance registration of independent prover identities through
+  `shell_proposeRegisterProver` and query them with `shell_getRegisteredProver`.
+  The optional, default-off `prover_registry_height` gates registration and
+  registered-only proof admission and settlement. Registration preserves validator
+  membership; proof counters update atomically in canonical execution state and
+  survive import, replay, snapshot recovery and restart. Existing schedules are
+  immutable and may only be introduced at a future height.
+
 ### Documentation
 
 - Replace nonexistent AccountManager encoding commands and unsigned RPC examples

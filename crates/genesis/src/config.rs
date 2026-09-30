@@ -204,6 +204,9 @@ pub struct GenesisConfig {
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
+    /// First block enabling independent prover governance registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prover_registry_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
