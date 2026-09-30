@@ -66,6 +66,7 @@ def until(fn, seconds=90):
             if v:
                 return v
         except OSError:
+            # The RPC socket may not be ready while the new node opens its database.
             pass
         time.sleep(0.1)
     raise TimeoutError('Acceptance predicate unmet')
