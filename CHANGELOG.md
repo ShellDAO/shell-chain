@@ -31,6 +31,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor `prover.proving_priority = "latest-first"` with a bounded contiguous
+  window and newer-first CPU work, including single-worker configurations.
+  Keep persistence and handoff in canonical order, bound active workers and
+  retained results, and drain reserved work on graceful shutdown.
+
 - Honor positive `prover.max_concurrent_proofs` from TOML and run bounded CPU
   proof jobs concurrently. Persist and hand off completed ranges in source order;
   graceful shutdown drains active proofs without waiting for event-loop capacity.

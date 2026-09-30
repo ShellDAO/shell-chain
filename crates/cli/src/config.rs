@@ -67,6 +67,7 @@ pub struct ConsensusSection {
 #[serde(default)]
 pub struct ProverSection {
     pub max_concurrent_proofs: Option<std::num::NonZeroUsize>,
+    pub proving_priority: Option<shell_node::ProvingPriority>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,6 +106,24 @@ pub fn load_config(path: &std::path::Path) -> Result<ShellConfig, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prover_priority_accepts_documented_values_and_rejects_typos() {
+        for (value, expected) in [
+            ("sequential", shell_node::ProvingPriority::Sequential),
+            ("latest-first", shell_node::ProvingPriority::LatestFirst),
+        ] {
+            let config: ShellConfig =
+                toml::from_str(&format!("[prover]\nproving_priority={value:?}")).unwrap();
+            assert_eq!(config.prover.proving_priority, Some(expected));
+        }
+        assert!(toml::from_str::<ShellConfig>("[prover]\nproving_priority='latest'").is_err());
+        assert!(toml::from_str::<ShellConfig>("")
+            .unwrap()
+            .prover
+            .proving_priority
+            .is_none());
+    }
 
     #[test]
     fn prover_concurrency_requires_a_positive_integer() {

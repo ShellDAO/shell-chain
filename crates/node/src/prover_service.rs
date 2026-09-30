@@ -26,7 +26,7 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use parking_lot::Mutex;
@@ -67,12 +67,13 @@ impl Default for ProverConfig {
 }
 
 /// Scheduling priority for the prover service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProvingPriority {
     /// Prove blocks strictly in block-number order. Safest for chain consistency.
     Sequential,
-    /// Prove the most recently arrived block first (LIFO). Lower latency for
-    /// the chain head, but older blocks take longer.
+    /// Prove newer eligible ranges first within a bounded contiguous window.
+    /// Persistence and handoff still follow canonical source order.
     LatestFirst,
 }
 
@@ -232,8 +233,8 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
 
     async fn run_loop(mut self, mut shutdown_rx: watch::Receiver<bool>) {
         info!(
-            "ProverService started (max_concurrent={})",
-            self.config.max_concurrent_proofs
+            "ProverService started (max_concurrent={}, priority={:?})",
+            self.config.max_concurrent_proofs, self.config.proving_priority
         );
         #[cfg(test)]
         if let Some(tx) = &self.test_event_tx {
@@ -245,7 +246,15 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             .unwrap_or_else(Instant::now);
         let mut jobs: VecDeque<(ProofTask, _)> = VecDeque::new();
         let limit = self.config.max_concurrent_proofs.max(1);
+        let mut latest_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
+            if jobs.is_empty() {
+                for worker in latest_workers.drain(..) {
+                    if let Err(error) = worker.await {
+                        error!(%error, "latest-first proof worker terminated");
+                    }
+                }
+            }
             // Stop admission on shutdown, but drain all reserved CPU jobs.
             // Persist and hand off results in canonical admission order.
             // Check shutdown signal.
@@ -279,13 +288,27 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             // Reserve contiguous source ranges before starting independent CPU work.
             // Results may finish in any order; only the front job can be persisted
             // and published, so later ranges never overtake their predecessor.
-            while jobs.len() < limit
+            // Latest-first reserves a finite window, then drains it before
+            // admitting more work. Continuous arrivals cannot starve its frontier.
+            let latest_first = self.config.proving_priority == ProvingPriority::LatestFirst;
+            let capacity = if latest_first {
+                limit.saturating_mul(2)
+            } else {
+                limit
+            };
+            let admit = !latest_first || jobs.is_empty();
+            let mut reserved: Vec<ProofTask> = Vec::new();
+            while admit
+                && jobs.len() + reserved.len() < capacity
                 && !*shutdown_rx.borrow()
                 && self.readiness_rx.as_ref().is_none_or(|rx| *rx.borrow())
             {
                 let task = {
                     let mut backlog = self.backlog.lock();
-                    if let (Some((previous, _)), Some(next)) = (jobs.back(), backlog.peek()) {
+                    let previous = reserved
+                        .last()
+                        .or_else(|| jobs.back().map(|(task, _)| task));
+                    if let (Some(previous), Some(next)) = (previous, backlog.peek()) {
                         let next_start = next.block_number.checked_add(1).and_then(|end| {
                             end.checked_sub(next.source_hashes.len().max(1) as u64)
                         });
@@ -302,25 +325,66 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 if let Some(tx) = &self.test_event_tx {
                     let _ = tx.send(ProverServiceTestEvent::BacklogPolled);
                 }
-                let Some(mut task) = task else { break };
-                let entries = std::mem::take(&mut task.entries);
-                #[cfg(test)]
-                let hook = self.test_proof_hook.clone();
-                #[cfg(test)]
-                let block_number = task.block_number;
-                let proof = tokio::task::spawn_blocking(move || {
+                let Some(task) = task else { break };
+                reserved.push(task);
+            }
+            if latest_first && !reserved.is_empty() {
+                let worker_count = limit.min(reserved.len());
+                let mut queue = Vec::with_capacity(reserved.len());
+                for mut task in reserved {
+                    let entries = std::mem::take(&mut task.entries);
+                    let (sender, receiver) = oneshot::channel();
+                    queue.push((entries, sender, task.block_number));
+                    let result = tokio::spawn(async move {
+                        receiver
+                            .await
+                            .unwrap_or_else(|_| Err("proof worker terminated".into()))
+                    });
+                    jobs.push_back((task, result));
+                }
+                let queue = Arc::new(Mutex::new(queue));
+                for _ in 0..worker_count {
+                    let queue = queue.clone();
                     #[cfg(test)]
-                    if let Some(hook) = &hook {
-                        hook(block_number, false);
-                    }
-                    let result = prove_sig_batch(&entries);
+                    let hook = self.test_proof_hook.clone();
+                    latest_workers.push(tokio::task::spawn_blocking(move || loop {
+                        let work = queue.lock().pop();
+                        let Some((entries, sender, _block_number)) = work else {
+                            break;
+                        };
+                        #[cfg(test)]
+                        if let Some(hook) = &hook {
+                            hook(_block_number, false);
+                        }
+                        let result = prove_sig_batch(&entries);
+                        #[cfg(test)]
+                        if let Some(hook) = &hook {
+                            hook(_block_number, true);
+                        }
+                        let _ = sender.send(result);
+                    }));
+                }
+            } else {
+                for mut task in reserved {
+                    let entries = std::mem::take(&mut task.entries);
                     #[cfg(test)]
-                    if let Some(hook) = hook {
-                        hook(block_number, true);
-                    }
-                    result
-                });
-                jobs.push_back((task, proof));
+                    let hook = self.test_proof_hook.clone();
+                    #[cfg(test)]
+                    let block_number = task.block_number;
+                    let proof = tokio::task::spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some(hook) = &hook {
+                            hook(block_number, false);
+                        }
+                        let result = prove_sig_batch(&entries);
+                        #[cfg(test)]
+                        if let Some(hook) = hook {
+                            hook(block_number, true);
+                        }
+                        result
+                    });
+                    jobs.push_back((task, proof));
+                }
             }
             let task = jobs.pop_front();
             match task {
@@ -755,8 +819,121 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_cpu_jobs_overlap_but_handoff_stays_in_source_order() {
+        for priority in [ProvingPriority::Sequential, ProvingPriority::LatestFirst] {
+            let (mut service, backlog) = make_service();
+            service.config.max_concurrent_proofs = 2;
+            service.config.proving_priority = priority;
+            for number in 1..=6u64 {
+                backlog.lock().push(ProofTask::with_sources(
+                    [number as u8; 32],
+                    number,
+                    vec![
+                        shell_stark_prover::SigBatchEntry {
+                            msg_hash: [number as u8; 32],
+                            pk_hash: [9; 32],
+                        };
+                        MIN_L1_STARK_TXS / 2
+                    ],
+                    1,
+                    vec![ShellHash::from([number as u8; 32])],
+                    Some(1_000_000),
+                ));
+            }
+            let gate = Arc::new((Mutex::new(0u64), parking_lot::Condvar::new()));
+            let (events, mut observed) = mpsc::unbounded_channel();
+            let worker_gate = gate.clone();
+            service.test_proof_hook = Some(Arc::new(move |number, completed| {
+                events.send((number, completed)).unwrap();
+                if !completed {
+                    let (mask, wake) = &*worker_gate;
+                    let mut mask = mask.lock();
+                    while *mask & (1 << number) == 0 {
+                        assert!(
+                            !wake
+                                .wait_for(&mut mask, Duration::from_secs(10))
+                                .timed_out(),
+                            "proof gate timed out"
+                        );
+                    }
+                }
+            }));
+            let (tx, mut rx) = mpsc::channel(1);
+            let store = service.amendment_store.clone();
+            let handle = service.with_amendment_sender(tx).start();
+            let mut starts = vec![];
+            for _ in 0..2 {
+                let (number, completed) =
+                    tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(!completed);
+                starts.push(number);
+            }
+            starts.sort();
+            assert_eq!(
+                starts,
+                if priority == ProvingPriority::Sequential {
+                    vec![2, 4]
+                } else {
+                    vec![4, 6]
+                }
+            );
+            assert_eq!(
+                backlog.lock().len(),
+                if priority == ProvingPriority::Sequential {
+                    2
+                } else {
+                    0
+                },
+                "reservation count follows the bounded scheduling window"
+            );
+            *gate.0.lock() |= 1 << 4;
+            gate.1.notify_all();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .unwrap(),
+                Some((4, true))
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "later proof must not overtake blocked predecessor"
+            );
+            assert!(store
+                .get_amendment(&ShellHash::from([4; 32]))
+                .unwrap()
+                .is_none());
+            *gate.0.lock() = u64::MAX;
+            gate.1.notify_all();
+            for end in [2u64, 4, 6] {
+                let amendment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(amendment.block_number, end);
+                shell_stark_prover::verify_sig_batch(&amendment.proof).unwrap();
+                amendment.verify_prover_authentication().unwrap();
+                assert!(store
+                    .get_amendment(&amendment.block_hash)
+                    .unwrap()
+                    .is_some());
+                let mut b = backlog.lock();
+                assert!(
+                    b.contains_source(1, &amendment.block_hash),
+                    "handoff retains reservation until consumer acknowledges"
+                );
+                b.complete_in_flight(1, end, &amendment.covered_hashes());
+            }
+            handle.shutdown().await;
+            assert!(backlog.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_first_computes_newer_range_before_frontier_but_publishes_in_order() {
         let (mut service, backlog) = make_service();
-        service.config.max_concurrent_proofs = 2;
+        service.config.proving_priority = ProvingPriority::LatestFirst;
         for number in 1..=6u64 {
             backlog.lock().push(ProofTask::with_sources(
                 [number as u8; 32],
@@ -773,61 +950,32 @@ mod tests {
                 Some(1_000_000),
             ));
         }
-        let gate = Arc::new((Mutex::new(0u64), parking_lot::Condvar::new()));
         let (events, mut observed) = mpsc::unbounded_channel();
-        let worker_gate = gate.clone();
         service.test_proof_hook = Some(Arc::new(move |number, completed| {
-            events.send((number, completed)).unwrap();
-            if !completed {
-                let (mask, wake) = &*worker_gate;
-                let mut mask = mask.lock();
-                while *mask & (1 << number) == 0 {
-                    assert!(
-                        !wake
-                            .wait_for(&mut mask, Duration::from_secs(10))
-                            .timed_out(),
-                        "proof gate timed out"
-                    );
-                }
-            }
+            let _ = events.send((number, completed));
         }));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(3);
         let store = service.amendment_store.clone();
         let handle = service.with_amendment_sender(tx).start();
-        let mut starts = vec![];
-        for _ in 0..2 {
-            let (number, completed) = tokio::time::timeout(Duration::from_secs(5), observed.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(!completed);
-            starts.push(number);
-        }
-        starts.sort();
-        assert_eq!(starts, vec![2, 4]);
-        assert_eq!(
-            backlog.lock().len(),
-            2,
-            "third job remains queued at capacity"
-        );
-        *gate.0.lock() |= 1 << 4;
-        gate.1.notify_all();
+        let first = tokio::time::timeout(Duration::from_secs(5), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, (4, false), "newest eligible range must start first");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), observed.recv())
                 .await
+                .unwrap()
                 .unwrap(),
-            Some((4, true))
+            (4, true)
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "later proof must not overtake blocked predecessor"
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            (2, false)
         );
-        assert!(store
-            .get_amendment(&ShellHash::from([4; 32]))
-            .unwrap()
-            .is_none());
-        *gate.0.lock() = u64::MAX;
-        gate.1.notify_all();
         for end in [2u64, 4, 6] {
             let amendment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
@@ -840,12 +988,9 @@ mod tests {
                 .get_amendment(&amendment.block_hash)
                 .unwrap()
                 .is_some());
-            let mut b = backlog.lock();
-            assert!(
-                b.contains_source(1, &amendment.block_hash),
-                "handoff retains reservation until consumer acknowledges"
-            );
-            b.complete_in_flight(1, end, &amendment.covered_hashes());
+            backlog
+                .lock()
+                .complete_in_flight(1, end, &amendment.covered_hashes());
         }
         handle.shutdown().await;
         assert!(backlog.lock().is_empty());
@@ -916,66 +1061,74 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drains_concurrent_proofs_without_waiting_for_handoff_capacity() {
-        let (mut service, backlog) = make_service();
-        service.config.max_concurrent_proofs = 2;
-        for number in 1..=4u64 {
-            backlog.lock().push(ProofTask::with_sources(
-                [number as u8; 32],
-                number,
-                vec![
-                    shell_stark_prover::SigBatchEntry {
-                        msg_hash: [1; 32],
-                        pk_hash: [2; 32]
-                    };
-                    MIN_L1_STARK_TXS / 2
-                ],
-                1,
-                vec![ShellHash::from([number as u8; 32])],
-                Some(1_000_000),
-            ));
-        }
-        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
-        let worker_gate = gate.clone();
-        let (events, mut observed) = mpsc::unbounded_channel();
-        service.test_proof_hook = Some(Arc::new(move |number, completed| {
-            if !completed {
-                events.send(number).unwrap();
-                let mut open = worker_gate.0.lock();
-                while !*open {
-                    assert!(!worker_gate
-                        .1
-                        .wait_for(&mut open, Duration::from_secs(10))
-                        .timed_out());
-                }
+        for priority in [ProvingPriority::Sequential, ProvingPriority::LatestFirst] {
+            let (mut service, backlog) = make_service();
+            service.config.max_concurrent_proofs = 2;
+            service.config.proving_priority = priority;
+            let last = if priority == ProvingPriority::LatestFirst {
+                6
+            } else {
+                4
+            };
+            for number in 1..=last {
+                backlog.lock().push(ProofTask::with_sources(
+                    [number as u8; 32],
+                    number,
+                    vec![
+                        shell_stark_prover::SigBatchEntry {
+                            msg_hash: [1; 32],
+                            pk_hash: [2; 32]
+                        };
+                        MIN_L1_STARK_TXS / 2
+                    ],
+                    1,
+                    vec![ShellHash::from([number as u8; 32])],
+                    Some(1_000_000),
+                ));
             }
-        }));
-        let (tx, _rx) = mpsc::channel(1);
-        let store = service.amendment_store.clone();
-        let handle = service.with_amendment_sender(tx).start();
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+            let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+            let worker_gate = gate.clone();
+            let (events, mut observed) = mpsc::unbounded_channel();
+            service.test_proof_hook = Some(Arc::new(move |number, completed| {
+                if !completed {
+                    events.send(number).unwrap();
+                    let mut open = worker_gate.0.lock();
+                    while !*open {
+                        assert!(!worker_gate
+                            .1
+                            .wait_for(&mut open, Duration::from_secs(10))
+                            .timed_out());
+                    }
+                }
+            }));
+            let (tx, _rx) = mpsc::channel(1);
+            let store = service.amendment_store.clone();
+            let handle = service.with_amendment_sender(tx).start();
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            // The receiver stays alive but never drains the bounded handoff channel.
+            let stopping = tokio::spawn(handle.shutdown());
+            tokio::task::yield_now().await;
+            *gate.0.lock() = true;
+            gate.1.notify_all();
+            tokio::time::timeout(Duration::from_secs(5), stopping)
                 .await
                 .unwrap()
                 .unwrap();
-        }
-        // The receiver stays alive but never drains the bounded handoff channel.
-        let stopping = tokio::spawn(handle.shutdown());
-        tokio::task::yield_now().await;
-        *gate.0.lock() = true;
-        gate.1.notify_all();
-        tokio::time::timeout(Duration::from_secs(5), stopping)
-            .await
-            .unwrap()
-            .unwrap();
-        for end in [2u8, 4] {
-            let hash = ShellHash::from([end; 32]);
-            let bytes = store.get_amendment(&hash).unwrap().unwrap();
-            let amendment = ProofAmendment::from_json(&bytes).unwrap();
-            shell_stark_prover::verify_sig_batch(&amendment.proof).unwrap();
-            assert!(
-                !backlog.lock().contains_source(1, &hash),
-                "unpublished job must release reservation"
-            );
+            for end in (2..=last as u8).step_by(2) {
+                let hash = ShellHash::from([end; 32]);
+                let bytes = store.get_amendment(&hash).unwrap().unwrap();
+                let amendment = ProofAmendment::from_json(&bytes).unwrap();
+                shell_stark_prover::verify_sig_batch(&amendment.proof).unwrap();
+                assert!(
+                    !backlog.lock().contains_source(1, &hash),
+                    "unpublished job must release reservation"
+                );
+            }
         }
     }
 

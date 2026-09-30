@@ -311,7 +311,18 @@ assuming that an older binary honors this setting.
 | Value | Behaviour |
 |-------|-----------|
 | `sequential` | Prove blocks in ascending order. Preferred for archival integrity. |
-| `latest-first` | Prove newest blocks first. Useful when the prover is catching up — recent blocks get proofs sooner. |
+| `latest-first` | Compute newer eligible ranges first within a bounded contiguous window. Results are persisted and submitted in source order. |
+
+The latest-first scheduler reserves up to twice `max_concurrent_proofs` eligible
+proof ranges from the canonical frontier. At most `max_concurrent_proofs` CPU
+workers take ranges from the newest end of that window. The entire window drains
+before more work is admitted, so new arrivals cannot indefinitely postpone older
+reserved ranges. Gaps and below-threshold ranges remain queued under the same
+strict settlement rules. Even with one worker, newer ranges in the window are
+computed first; proof publication still waits for their predecessors.
+
+Priority scheduling is an unreleased implementation change. Older binaries may
+parse the setting without changing the actual proving order.
 
 ---
 
