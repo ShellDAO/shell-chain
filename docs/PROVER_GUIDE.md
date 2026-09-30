@@ -454,6 +454,18 @@ Idle peer buckets expire after 600 seconds. These limits reset on process restar
 This receive-side enforcement is an unreleased implementation change; older
 binaries do not apply this challenge limit.
 
+Challenge responses carry a serialized `ProofAmendment`, including the full STARK
+proof and the prover's authenticated signature envelope. The receiver checks the
+signature and its binding to the prover address before validating the source range
+or writing proof artifacts. When `prover_registry_height` is active at the next
+block height, that prover must also be registered. A relay may forward another
+prover's signed amendment; the claimed `responder` address is not a substitute
+for proof authentication. Rejected responses leave the challenge open and do not
+write any proof-range artifacts. A valid response stores the proof and resolves
+the challenge; this alone does not settle a reward or increment registration counts.
+This response-admission correction is unreleased; verify the node build before
+relying on this behavior in an older binary.
+
 ## Local acceptance
 
 From a compatible source checkout, run:
@@ -474,8 +486,15 @@ For receive-side challenge admission, run:
 
 ```bash
 cargo test -p shell-node event_loop_limits_challenges_per_peer_before_tracking
+cargo test -p shell-node event_loop_authenticates_challenge_responses_before_storage
 ```
 
 This exercises the running node event loop through serialized in-process peer
 messages. It checks claimed-address rotation, rejected lifecycle entries and
 independent peer allowances; it does not simulate a 7,200-block challenge timeout.
+
+The response-admission regression uses fresh Dilithium identities, 512 signed
+transfers and a verified STARK proof through the serialized in-memory peer transport.
+It checks tampering, signer identity, relay forwarding, unchanged state on rejection,
+and disabled/before/at/after registration activation. It does not cover GossipSub
+transport, other signing algorithms, or challenge recovery after process restart.

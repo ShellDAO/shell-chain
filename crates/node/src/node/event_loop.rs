@@ -1858,6 +1858,10 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     };
+                                    if let Err(error) = self.validate_prover_admission(&amendment) {
+                                        warn!(%peer, %error, "I2: challenge response prover admission failed");
+                                        continue;
+                                    }
                                     if let Err(error) = self.validate_stark_amendment_ordering(&amendment) {
                                         warn!(%peer, %error, "I2: challenge response ordering validation failed");
                                         continue;

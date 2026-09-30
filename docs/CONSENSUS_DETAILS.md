@@ -547,6 +547,19 @@ When `enable_stark_aggregation = true`, received `ProofAmendment` messages are
 verified by all peers. If verification fails, the peer broadcasts a
 `ProofChallenge`:
 
+
+Challenge responses carry a serialized `ProofAmendment`, including the full STARK
+proof and the prover's authenticated signature envelope. The receiver checks the
+signature and its binding to the prover address before validating the source range
+or writing proof artifacts. When `prover_registry_height` is active at the next
+block height, that prover must also be registered. A relay may forward another
+prover's signed amendment; the claimed `responder` address is not a substitute
+for proof authentication. Rejected responses leave the challenge open and do not
+write any proof-range artifacts. A valid response stores the proof and resolves
+the challenge; this alone does not settle a reward or increment registration counts.
+This response-admission correction is unreleased; verify the node build before
+relying on this behavior in an older binary.
+
 ### ChallengeReason
 
 | Value | Description |
