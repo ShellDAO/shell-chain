@@ -152,7 +152,16 @@ try:
     fcfg = out / 'follower.toml'
     fcfg.write_text('[prover]\nproving_priority=' + json.dumps(options.proving_priority) + '\n')
     r['proving_priority'] = options.proving_priority
-    fcmd = [str(binary), '--password-file', str(pw), 'run', '--keystore', str(prover_key), '--config', str(fcfg), '--datadir', str(fdata), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{fport}', '--p2p', '--p2p-addr', f'127.0.0.1:{fp2p}', '--bootnode', bootnode, '--node-role', 'prover', '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--log-level', 'info', '--metrics-addr', '127.0.0.1:0']
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        metrics_port = sock.getsockname()[1]
+    def prover_metrics():
+        return urllib.request.urlopen(f'http://127.0.0.1:{metrics_port}/metrics', timeout=10).read().decode()
+    def metric_value(text, name):
+        match = re.search(r'^' + re.escape(name) + r' (\S+)$', text, re.M)
+        assert match, ('missing metric', name)
+        return float(match.group(1))
+    fcmd = [str(binary), '--password-file', str(pw), 'run', '--keystore', str(prover_key), '--config', str(fcfg), '--datadir', str(fdata), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{fport}', '--p2p', '--p2p-addr', f'127.0.0.1:{fp2p}', '--bootnode', bootnode, '--node-role', 'prover', '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--log-level', 'info', '--metrics-addr', f'127.0.0.1:{metrics_port}']
     flog = (audit / 'proof-peer-follower.log').open('w')
     follower = subprocess.Popen(fcmd, stdout=flog, stderr=subprocess.STDOUT, env={**os.environ, 'RUST_LOG': 'info'})
     flog.close()
@@ -161,6 +170,27 @@ try:
     until(lambda: int(rpc('net_peerCount'), 16) > 0 and int(rpc('net_peerCount', rpc_port=fport), 16) > 0)
     expected_priority = 'LatestFirst' if options.proving_priority == 'latest-first' else 'Sequential'
     assert f'priority={expected_priority}' in (audit / 'proof-peer-follower.log').read_text()
+    # Storage estimates initialize on the periodic peer/metrics tick.
+    before_metrics = until(lambda: text if 'shell_storage_cf_size_bytes{cf="proof"}' in (text := prover_metrics()) else None, 30)
+    (audit / 'metrics-before.txt').write_text(before_metrics)
+    documented_series = [
+        'shell_stark_proofs_generated_total',
+        'shell_stark_proof_duration_seconds_count',
+        'shell_stark_proof_duration_seconds_sum',
+        'shell_stark_proof_duration_seconds_bucket{le="1"}',
+        'shell_stark_proof_failures_total',
+        'shell_stark_backlog_depth',
+        'shell_stark_pending_settlements',
+        'shell_stark_amendments_rate_limited_total',
+        'shell_storage_cf_size_bytes{cf="witness"}',
+        'shell_storage_cf_size_bytes{cf="proof"}',
+        'shell_stark_settlements_accepted_total',
+        'shell_stark_settlements_rejected_total',
+        'shell_stark_frontier_lag',
+    ]
+    r['initial_metrics'] = {name: metric_value(before_metrics, name) for name in documented_series}
+    assert r['initial_metrics']['shell_stark_proof_duration_seconds_count'] == 0
+    r['backlog_samples'] = [metric_value(before_metrics, 'shell_stark_backlog_depth')]
     hashes = []
     for offset in range(0, 512, 16):
         batch = [rpc('eth_sendRawTransaction', [tx]) for tx in txs[offset:offset + 16]]
@@ -170,6 +200,7 @@ try:
             r['receipts'].append(receipt)
         hashes.extend(batch)
         r['accepted_count'] = len(hashes)
+        r['backlog_samples'].append(metric_value(prover_metrics(), 'shell_stark_backlog_depth'))
         save()
         print('accepted', len(hashes), flush=True)
     r['recipient_balance'] = rpc('eth_getBalance', ['0x' + 'ab' * 32, 'latest'])
@@ -213,6 +244,17 @@ try:
     common = rpc('eth_getBlockByHash', [a['block_hash'], False], rpc_port=fport)
     assert common and common['hash'] == a['block_hash']
     r['follower_same_source'] = True
+    after_metrics = prover_metrics()
+    (audit / 'metrics-after.txt').write_text(after_metrics)
+    r['metrics'] = {name: metric_value(after_metrics, name) for name in ['shell_stark_proofs_generated_total', 'shell_stark_proof_duration_seconds_count', 'shell_stark_proof_duration_seconds_sum', 'shell_stark_proof_failures_total', 'shell_stark_backlog_depth']}
+    save()
+    assert r['metrics']['shell_stark_proofs_generated_total'] == 1, r['metrics']
+    assert r['metrics']['shell_stark_proof_duration_seconds_count'] == 1, r['metrics']
+    assert r['metrics']['shell_stark_proof_duration_seconds_sum'] > 0, r['metrics']
+    assert r['metrics']['shell_stark_proof_failures_total'] == 0, r['metrics']
+    # Empty canonical blocks also remain queued below the proof threshold.
+    assert max(r['backlog_samples']) > r['backlog_samples'][0], r['backlog_samples']
+    assert r['metrics']['shell_stark_backlog_depth'] < max(r['backlog_samples']), r['metrics']
     stop_follower()
     flog = (audit / 'proof-peer-follower-restart.log').open('w')
     follower = subprocess.Popen(fcmd, stdout=flog, stderr=subprocess.STDOUT, env={**os.environ, 'RUST_LOG': 'info'})
@@ -220,6 +262,12 @@ try:
     fa2 = until(lambda: rpc('shell_getProofAmendment', [a['block_hash']], rpc_port=fport))
     r['follower_persisted'] = fa2 == fa
     assert r['follower_persisted']
+    restarted_metrics = until(lambda: text if 'shell_storage_cf_size_bytes{cf="proof"}' in (text := prover_metrics()) else None, 30)
+    (audit / 'metrics-restarted.txt').write_text(restarted_metrics)
+    assert metric_value(restarted_metrics, 'shell_stark_proofs_generated_total') == 0
+    assert metric_value(restarted_metrics, 'shell_stark_proof_duration_seconds_count') == 0
+    assert metric_value(restarted_metrics, 'shell_storage_cf_size_bytes{cf="proof"}') > 0
+    r['metrics_reset_with_durable_proof'] = True
     stop_follower()
     stop()
     start('-restart')

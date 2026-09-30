@@ -608,6 +608,7 @@ impl<S: KvStore + 'static> Node<S> {
                 prover_config,
                 prover_address,
             )
+            .with_metrics(Arc::clone(&self.metrics))
             .with_signer(Arc::clone(&signer))
             .with_amendment_sender(prover_amendment_tx)
             .with_readiness(prover_readiness_rx)

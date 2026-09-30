@@ -914,10 +914,12 @@ impl<S: KvStore + 'static> Node<S> {
             config.network.max_peers
         };
         let stark_aggregation = config.enable_stark_aggregation;
+        let proof_backlog = Arc::new(parking_lot::Mutex::new(ProofBacklog::new()));
         let metrics = Arc::new(
             Metrics::new()
                 .expect("failed to register Prometheus metrics")
-                .with_tx_pool(Arc::clone(&tx_pool)),
+                .with_tx_pool(Arc::clone(&tx_pool))
+                .with_proof_backlog(Arc::clone(&proof_backlog)),
         );
         let amendment_store = ProofAmendmentStore::new(store.clone());
         let settled_source_index = SettledSourceIndex::new(store.clone());
@@ -975,7 +977,7 @@ impl<S: KvStore + 'static> Node<S> {
             witness_pruner: RwLock::new(witness_pruner),
             body_pruner: RwLock::new(body_pruner),
             stark_aggregation,
-            proof_backlog: Arc::new(parking_lot::Mutex::new(ProofBacklog::new())),
+            proof_backlog,
             amendment_store,
             settled_source_index,
             l2_input_index,

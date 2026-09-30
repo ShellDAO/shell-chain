@@ -359,21 +359,58 @@ before the amendment lifecycle resolves to `RESOLVED` or `SLASHED`.
 
 ## Monitoring
 
-Key Prometheus metrics for prover operators:
+Scrape the configured metrics listener (port 9090 by default):
 
+```bash
+curl --fail --silent http://127.0.0.1:9090/metrics
 ```
-# Proof generation
-shell_stark_proofs_generated_total           - lifetime proofs generated
-shell_stark_proof_duration_seconds           - proof generation latency histogram
-shell_stark_backlog_depth                    - proof tasks waiting for a worker
-shell_stark_pending_settlements              - generated proofs awaiting canonical settlement
-shell_stark_amendments_rate_limited_total    - authenticated amendments rejected by admission limits
-shell_stark_frontier_lag                     - unsettled canonical L0 blocks
 
-# Storage
-shell_storage_cf_size_bytes{cf="witness"}    - should trend toward 0 when STARK is active
-shell_storage_cf_size_bytes{cf="proof"}      - grows with retained proofs
+Use these exact Prometheus series names:
+
+```text
+# Locally generated L1 proofs delivered to the node event loop (process lifetime)
+shell_stark_proofs_generated_total
+# CPU proof-attempt time, excluding queueing and ordered publication waits
+shell_stark_proof_duration_seconds_count
+shell_stark_proof_duration_seconds_sum
+shell_stark_proof_duration_seconds_bucket{le="1"}
+# Failed proof jobs; they do not increment the successful-proof counter
+shell_stark_proof_failures_total
+# Queued proof tasks, including below-threshold work; excludes reserved jobs
+shell_stark_backlog_depth
+# Generated proofs awaiting canonical settlement
+shell_stark_pending_settlements
+# Authenticated amendments rejected by admission limits
+shell_stark_amendments_rate_limited_total
+
+# Cached storage byte estimates, refreshed every 300 seconds
+shell_storage_cf_size_bytes{cf="witness"}
+shell_storage_cf_size_bytes{cf="proof"}
+
+# Local production accepts settlements; imported settlements do not increment this counter
+shell_stark_settlements_accepted_total
+# Amendments rejected during validation
+shell_stark_settlements_rejected_total
+# Canonical source blocks not yet settled at L1
+shell_stark_frontier_lag
 ```
+
+Counters and histogram samples reset when the process restarts; durable prover
+registration counts are queried separately with `shell_getRegisteredProver`.
+A generated proof is not necessarily accepted into the chain: check its settlement
+transaction receipt and the canonical prover record as well. The duration histogram
+records successful and failed CPU attempts. Waiting for enough entries or a missing
+source does not produce a duration sample or a proof failure.
+
+Storage estimates include keys and values under the witness and proof prefixes.
+Proof size varies with the source range and encoding; it is not a fixed number of
+bytes per block. Witness retention and the settled frontier govern pruning, so a
+nonzero witness estimate alone does not indicate a failure.
+
+The generation-duration, failure-count and live-backlog updates are an unreleased
+implementation change. Older binaries expose these series but may leave them at
+zero. Previous guide examples using `shell_prover_*` or unprefixed settlement
+names did not match the exported series.
 
 Proof generation remains paused while the node is synchronizing or otherwise
 fails its readiness gate. A prover keeps at most two generated amendments in
@@ -381,6 +418,7 @@ flight until canonical settlement releases capacity. Sustained growth in
 `shell_stark_amendments_rate_limited_total`, especially together with a stalled
 chain head, indicates peer pressure or a settlement-path failure and should be
 investigated before increasing any limits.
+
 
 ---
 
