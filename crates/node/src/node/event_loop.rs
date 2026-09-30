@@ -541,6 +541,7 @@ impl<S: KvStore + 'static> Node<S> {
         block_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut peer_count_timer = interval(Duration::from_secs(10));
         let mut storage_size_cache = crate::metrics::StorageSizeCache::default();
+        let mut challenge_rate_limiter = ProofRateLimiter::new(RateLimiterConfig::default());
         let mut sync_retry_timer = interval(Duration::from_secs(SYNC_RETRY_BASE_INTERVAL_SECS));
         let mut tx_rebroadcast_timer = interval(Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS));
         let mut sync_retry_attempts_without_progress = 0u32;
@@ -1817,6 +1818,14 @@ impl<S: KvStore + 'static> Node<S> {
                                 // I2: Received a proof challenge from a peer.
                                 // If we hold the proof, respond with raw bytes.
                                 NetworkMessage::ProofChallenge(challenge) => {
+                                    // Bind admission to the transport peer, not the freely chosen
+                                    // challenger address. This isolated bucket cannot consume proof
+                                    // settlement capacity or be bypassed by rotating addresses.
+                                    let peer_key = Address::from(*shell_primitives::blake3_hash(peer.0.as_bytes()).as_bytes());
+                                    if !challenge_rate_limiter.try_consume(&peer_key) {
+                                        debug!(%peer, "proof challenge rejected by per-peer rate limit");
+                                        continue;
+                                    }
                                     debug!(%peer, block = challenge.block_number, reason = %challenge.reason, "I2: received ProofChallenge");
                                     self.track_open_challenge(
                                         challenge.block_hash,
@@ -2262,6 +2271,7 @@ impl<S: KvStore + 'static> Node<S> {
                 // Periodically expire inactive proof limits and update peer metrics.
                 _ = peer_count_timer.tick() => {
                     self.proof_rate_limiter.lock().gc();
+                    challenge_rate_limiter.gc();
                     let peers = network.peer_count().await;
                     self.metrics.peer_count.set(peers as i64);
                     storage_size_cache.update(&self.chain_store, &self.metrics);

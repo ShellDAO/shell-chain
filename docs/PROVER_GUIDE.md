@@ -445,6 +445,15 @@ prover is slashed, depending on the verification outcome. Challenges are
 rate-limited per-peer to prevent DoS. A prover that accumulates failed
 challenges may be removed from `ProverRegistry`.
 
+Incoming challenges use a separate token bucket per network peer: ten initial
+requests, refilling five tokens every 60 seconds up to the initial capacity.
+Changing the claimed `challenger` address does not create another allowance.
+Excess requests are dropped before tracking the challenge or reading and sending
+proof data; they do not consume the prover's settlement-submission allowance.
+Idle peer buckets expire after 600 seconds. These limits reset on process restart.
+This receive-side enforcement is an unreleased implementation change; older
+binaries do not apply this challenge limit.
+
 ## Local acceptance
 
 From a compatible source checkout, run:
@@ -460,3 +469,13 @@ registers an independent prover, sends 512 signed transfers, verifies the actual
 STARK and tamper rejection, and checks replicated settlement counters and restart
 persistence. It stops its processes and keeps private temporary data and receipts
 for inspection. This local acceptance does not activate any public network.
+
+For receive-side challenge admission, run:
+
+```bash
+cargo test -p shell-node event_loop_limits_challenges_per_peer_before_tracking
+```
+
+This exercises the running node event loop through serialized in-process peer
+messages. It checks claimed-address rotation, rejected lifecycle entries and
+independent peer allowances; it does not simulate a 7,200-block challenge timeout.
