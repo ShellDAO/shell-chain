@@ -599,6 +599,7 @@ impl<S: KvStore + 'static> Node<S> {
             let prover_address = self.config.proposer_address.unwrap_or(local_signer_address);
             let prover_config = ProverConfig {
                 max_concurrent_proofs: self.config.prover_max_concurrent_proofs,
+                proving_priority: self.config.prover_priority,
                 ..ProverConfig::default()
             };
             let service = ProverService::new(

@@ -16,6 +16,7 @@ import argparse, datetime, json, os, re, secrets, socket, subprocess, tempfile, 
 repo = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--registration-only', action='store_true', help='verify governance, unchanged authority and restart without full proof generation')
+parser.add_argument('--proving-priority', choices=['sequential', 'latest-first'], default='sequential', help='exercise the documented TOML scheduling setting on the standalone prover')
 options = parser.parse_args()
 binary = Path(os.environ.get('SHELL_NODE_BIN', str(repo / 'target/debug/shell-node'))).resolve()
 helper = Path(os.environ.get('PROVER_ACCEPTANCE_BIN', str(repo / 'target/debug/examples/prover-acceptance'))).resolve()
@@ -148,13 +149,18 @@ try:
         raise SystemExit(0)
     logtext = (audit / 'proof-peer-node-registration-restart.log').read_text()
     bootnode = re.findall('/ip4/127\\.0\\.0\\.1/tcp/\\d+/p2p/[A-Za-z0-9]+', logtext)[-1]
-    fcmd = [str(binary), '--password-file', str(pw), 'run', '--keystore', str(prover_key), '--datadir', str(fdata), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{fport}', '--p2p', '--p2p-addr', f'127.0.0.1:{fp2p}', '--bootnode', bootnode, '--node-role', 'prover', '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--log-level', 'info', '--metrics-addr', '127.0.0.1:0']
+    fcfg = out / 'follower.toml'
+    fcfg.write_text('[prover]\nproving_priority=' + json.dumps(options.proving_priority) + '\n')
+    r['proving_priority'] = options.proving_priority
+    fcmd = [str(binary), '--password-file', str(pw), 'run', '--keystore', str(prover_key), '--config', str(fcfg), '--datadir', str(fdata), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{fport}', '--p2p', '--p2p-addr', f'127.0.0.1:{fp2p}', '--bootnode', bootnode, '--node-role', 'prover', '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--log-level', 'info', '--metrics-addr', '127.0.0.1:0']
     flog = (audit / 'proof-peer-follower.log').open('w')
     follower = subprocess.Popen(fcmd, stdout=flog, stderr=subprocess.STDOUT, env={**os.environ, 'RUST_LOG': 'info'})
     flog.close()
     r['commands'].append({'command': fcmd, 'pid': follower.pid})
     save()
     until(lambda: int(rpc('net_peerCount'), 16) > 0 and int(rpc('net_peerCount', rpc_port=fport), 16) > 0)
+    expected_priority = 'LatestFirst' if options.proving_priority == 'latest-first' else 'Sequential'
+    assert f'priority={expected_priority}' in (audit / 'proof-peer-follower.log').read_text()
     hashes = []
     for offset in range(0, 512, 16):
         batch = [rpc('eth_sendRawTransaction', [tx]) for tx in txs[offset:offset + 16]]

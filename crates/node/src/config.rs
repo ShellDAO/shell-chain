@@ -242,6 +242,8 @@ pub struct NodeConfig {
     pub enable_stark_aggregation: bool,
     /// Maximum concurrent CPU proof jobs; results are handed off in source order.
     pub prover_max_concurrent_proofs: usize,
+    /// Order of CPU proof computation; publication remains canonical.
+    pub prover_priority: crate::ProvingPriority,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -305,6 +307,7 @@ impl NodeConfig {
             parallel_pqvm: ParallelPqvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
             prover_max_concurrent_proofs: 1,
+            prover_priority: crate::ProvingPriority::Sequential,
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }

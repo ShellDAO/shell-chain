@@ -808,6 +808,10 @@ async fn main() {
                     .prover
                     .max_concurrent_proofs
                     .map_or(1, |n| n.get()),
+                prover_priority: file_config
+                    .prover
+                    .proving_priority
+                    .unwrap_or(shell_node::ProvingPriority::Sequential),
                 max_idle_interval,
                 mempool_max_size,
                 mempool_max_bytes,

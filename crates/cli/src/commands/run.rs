@@ -83,6 +83,7 @@ pub struct RunArgs {
     /// Enable STARK aggregate proof generation during block production (on by default).
     pub enable_stark_aggregation: bool,
     pub prover_max_concurrent_proofs: usize,
+    pub prover_priority: shell_node::ProvingPriority,
     /// L2 STARK aggregation mode: disabled, scaffold, or active.
     pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
@@ -949,6 +950,7 @@ async fn run_with_store<S: KvStore + 'static>(
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
+        prover_priority: args.prover_priority,
         l2_stark_mode: args
             .l2_stark_mode
             .parse::<L2StarkMode>()
@@ -1173,6 +1175,7 @@ mod tests {
             storage_profile: "full".into(),
             enable_stark_aggregation: false,
             prover_max_concurrent_proofs: 1,
+            prover_priority: shell_node::ProvingPriority::Sequential,
             l2_stark_mode: "disabled".into(),
             network: "dev".into(),
             consensus_engine: None,
