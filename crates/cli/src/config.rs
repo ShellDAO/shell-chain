@@ -26,6 +26,8 @@ pub struct NodeSection {
     pub chain_id: Option<u64>,
     /// Network profile: "dev", "testnet", or "mainnet".
     pub network: Option<String>,
+    /// Operational role: "validator", "validator-prover", or "prover".
+    pub node_role: Option<String>,
     pub block_time: Option<u64>,
     pub keystore: Option<String>,
     pub db: Option<String>,
@@ -102,6 +104,7 @@ mod tests {
 [node]
 datadir = "/var/shell"
 chain_id = 42
+node_role = "prover"
 block_time = 5000
 keystore = "keys/validator.json"
 db = "rocksdb"
@@ -137,6 +140,7 @@ format = "json"
 
         assert_eq!(config.node.datadir.as_deref(), Some("/var/shell"));
         assert_eq!(config.node.chain_id, Some(42));
+        assert_eq!(config.node.node_role.as_deref(), Some("prover"));
         assert_eq!(config.node.block_time, Some(5000));
         assert_eq!(config.node.keystore.as_deref(), Some("keys/validator.json"));
         assert_eq!(config.node.db.as_deref(), Some("rocksdb"));
@@ -179,6 +183,7 @@ format = "json"
 
         assert!(config.node.datadir.is_none());
         assert!(config.node.chain_id.is_none());
+        assert!(config.node.node_role.is_none());
         assert!(config.node.block_time.is_none());
         assert!(config.node.keystore.is_none());
         assert!(config.node.db.is_none());

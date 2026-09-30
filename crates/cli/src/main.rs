@@ -689,6 +689,13 @@ async fn main() {
             let effective_keystore =
                 keystore.or_else(|| file_config.node.keystore.map(PathBuf::from));
 
+            let effective_node_role = config_or_cli(
+                run_matches,
+                "node_role",
+                node_role,
+                file_config.node.node_role,
+            );
+
             let effective_chain_id =
                 config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
@@ -801,7 +808,7 @@ async fn main() {
                 enable_stark_aggregation,
                 l2_stark_mode,
                 consensus_engine,
-                node_role,
+                node_role: effective_node_role,
                 password_args: password_args.clone(),
             })
             .await
@@ -939,6 +946,12 @@ mod tests {
             "testnet".to_string(),
         );
         check_config_precedence("chain_id", "--chain-id", 1337u64, 42u64);
+        check_config_precedence(
+            "node_role",
+            "--node-role",
+            "validator".to_string(),
+            "prover".to_string(),
+        );
         check_config_precedence("ws_port", "--ws-port", 8546u16, 9546u16);
         check_config_precedence("pruning", "--pruning", 0u64, 128u64);
         check_config_precedence(

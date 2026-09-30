@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor `node.node_role` in TOML configuration instead of silently using the
+  default validator role. Explicit `--node-role` takes precedence, and invalid
+  configured roles fail validation instead of starting as validators.
+
 - Derive transaction admission and pending-pool metrics from the shared pool.
   RPC submissions now appear before block production, failed submissions do not
   increment the counter, and concurrent scrapes do not double-count admissions.
