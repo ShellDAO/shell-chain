@@ -59,6 +59,7 @@ pub struct P2pSection {
 #[serde(default)]
 pub struct ConsensusSection {
     pub engine: Option<String>,
+    pub enable_stark_aggregation: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -127,6 +128,7 @@ enable_mdns = false
 
 [consensus]
 engine = "poa"
+enable_stark_aggregation = true
 
 [metrics]
 enabled = true
@@ -166,6 +168,7 @@ format = "json"
         assert_eq!(config.p2p.bootnodes.as_ref().unwrap().len(), 1);
 
         assert_eq!(config.consensus.engine.as_deref(), Some("poa"));
+        assert_eq!(config.consensus.enable_stark_aggregation, Some(true));
 
         assert_eq!(config.metrics.enabled, Some(true));
         assert_eq!(

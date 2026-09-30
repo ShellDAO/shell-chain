@@ -240,7 +240,7 @@ enum Commands {
         /// Enable STARK aggregate proof generation during block production.
         /// WARNING: expensive. Keep disabled on ordinary validators; use a
         /// dedicated prover or validator-prover node when proof work is needed.
-        #[arg(long, default_value = "false")]
+        #[arg(long, default_value = "false", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
         enable_stark_aggregation: bool,
 
         /// L2 STARK aggregation mode: disabled, scaffold, or active.
@@ -698,6 +698,13 @@ async fn main() {
 
             let effective_consensus_engine = consensus_engine.or(file_config.consensus.engine);
 
+            let effective_stark_aggregation = config_or_cli(
+                run_matches,
+                "enable_stark_aggregation",
+                enable_stark_aggregation,
+                file_config.consensus.enable_stark_aggregation,
+            );
+
             let effective_chain_id =
                 config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
@@ -807,7 +814,7 @@ async fn main() {
                 storage_profile,
                 witness_retention,
                 body_retention,
-                enable_stark_aggregation,
+                enable_stark_aggregation: effective_stark_aggregation,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,
                 node_role: effective_node_role,
@@ -941,6 +948,12 @@ mod tests {
 
     #[test]
     fn explicit_run_defaults_override_file_config() {
+        check_config_precedence(
+            "enable_stark_aggregation",
+            "--enable-stark-aggregation",
+            false,
+            true,
+        );
         check_config_precedence(
             "network",
             "--network",

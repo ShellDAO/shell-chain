@@ -196,7 +196,7 @@ proving_priority = "sequential"
 node_role = "validator"       # "validator" | "validator-prover" | "prover"
 
 [consensus]
-enable_stark_aggregation = true   # defaults to true since v0.21.0; set false only to disable
+enable_stark_aggregation = false  # explicitly set true to prepare STARK proof inputs
 
 [prover]
 max_concurrent_proofs = 1         # parallel proof jobs
@@ -206,6 +206,27 @@ proving_priority = "sequential"   # "sequential" (oldest first) | "latest-first"
 proof_replacement_grace = 0       # blocks to keep WitnessBundle after proof arrival
                                   # 0 = delete immediately (default, recommended)
 ```
+
+### Checking aggregation configuration
+
+On source versions that support `consensus.enable_stark_aggregation` in TOML,
+the CLI takes precedence. A bare `--enable-stark-aggregation` enables input
+collection; `--enable-stark-aggregation=false` overrides a configured enablement.
+Omitting both keeps aggregation disabled.
+
+Run the configuration acceptance with Python 3 after building the node with
+RocksDB support (enabled by default):
+
+```bash
+cargo build -p shell-cli
+python3 tests/e2e/prover-config.py
+```
+
+It creates isolated development nodes and fresh keys, submits real transfers,
+checks block commitments for enabled/disabled and CLI override cases, and
+verifies the stored blocks after restarting RocksDB. A single transaction stays
+below the 512-entry L1 proof threshold: this checks input creation and persistence,
+not completed proof generation, concurrent proving, or public-network activation.
 
 ### proving_priority
 
