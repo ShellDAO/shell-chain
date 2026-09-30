@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor `consensus.enable_stark_aggregation` from TOML when preparing block
+  commitments and proof inputs. The bare CLI flag still enables aggregation;
+  `--enable-stark-aggregation=false` explicitly overrides a configured enablement.
+
 - Honor `consensus.engine` from the TOML configuration when starting a node.
   An explicit `--consensus-engine` still takes precedence; omitting both keeps
   the default WPoA engine.
