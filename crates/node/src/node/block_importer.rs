@@ -923,6 +923,11 @@ impl<S: KvStore + 'static> Node<S> {
             for amendment in &stark_settlements {
                 let tx_index = block.transactions.len().saturating_add(system_txs.len()) as u32;
                 let reward_tx = self.build_stark_reward_tx(block.number(), tx_index, amendment)?;
+                self.record_registered_prover_settlement(
+                    evm.state_db_mut().world_state_mut(),
+                    amendment,
+                    block.number(),
+                )?;
                 Self::apply_stark_mint(evm.state_db_mut().world_state_mut(), &reward_tx)?;
                 receipts.push(TransactionReceipt {
                     tx_hash: reward_tx.hash(),
@@ -1877,6 +1882,11 @@ impl<S: KvStore + 'static> Node<S> {
             for amendment in &stark_settlements {
                 let tx_index = block.transactions.len().saturating_add(system_txs.len()) as u32;
                 let reward_tx = self.build_stark_reward_tx(block.number(), tx_index, amendment)?;
+                self.record_registered_prover_settlement(
+                    evm.state_db_mut().world_state_mut(),
+                    amendment,
+                    block.number(),
+                )?;
                 Self::apply_stark_mint(evm.state_db_mut().world_state_mut(), &reward_tx)?;
                 receipts.push(TransactionReceipt {
                     tx_hash: reward_tx.hash(),

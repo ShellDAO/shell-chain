@@ -12,8 +12,9 @@ use crate::middleware::{ApiKeyLayer, RateLimitLayer, RpcRateLimitLayer};
 use crate::tls_proxy::{start_tls_proxy, TlsProxyHandle};
 
 const MAX_BATCH_REQUEST_LEN: u32 = 100;
-const GOVERNANCE_SIGNING_METHODS: [&str; 4] = [
+const GOVERNANCE_SIGNING_METHODS: [&str; 5] = [
     "shell_proposeAddValidator",
+    "shell_proposeRegisterProver",
     "shell_proposeRemoveValidator",
     "shell_proposeSetValidatorWeight",
     "shell_proposeSetValidatorStake",

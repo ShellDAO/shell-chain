@@ -144,6 +144,49 @@ impl<S: KvStore + 'static> Node<S> {
         ))
     }
 
+    /// Use the execution state's registry for imports and fork replay, never the live tip.
+    pub(crate) fn validate_registered_prover<T: KvStore + 'static>(
+        &self,
+        state: &WorldState<T>,
+        amendment: &ProofAmendment,
+        block_number: u64,
+    ) -> Result<bool, NodeError> {
+        let active = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|config| config.prover_registry_height)
+            .is_some_and(|height| block_number >= height);
+        if active && state.get_registered_prover(&amendment.prover)?.is_none() {
+            return Err(NodeError::Startup("STARK prover is not registered".into()));
+        }
+        Ok(active)
+    }
+
+    pub(crate) fn record_registered_prover_settlement<T: KvStore + 'static>(
+        &self,
+        state: &mut WorldState<T>,
+        amendment: &ProofAmendment,
+        block_number: u64,
+    ) -> Result<(), NodeError> {
+        if self.validate_registered_prover(state, amendment, block_number)? {
+            state.record_prover_settlement(&amendment.prover, amendment.block_number)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_prover_admission(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(), NodeError> {
+        self.validate_stark_amendment_authentication(amendment)?;
+        let height = self
+            .chain_store
+            .get_head_block()?
+            .map_or(0, |block| block.number().saturating_add(1));
+        self.validate_registered_prover(&*self.world_state.read(), amendment, height)?;
+        Ok(())
+    }
+
     pub(crate) fn apply_stark_mint<T: KvStore + 'static>(
         world_state: &mut WorldState<T>,
         reward_tx: &SystemTransaction,

@@ -201,6 +201,7 @@ async fn snapshot_export_import_roundtrip() {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

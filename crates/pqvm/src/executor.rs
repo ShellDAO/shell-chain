@@ -1587,6 +1587,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1809,6 +1810,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -1888,6 +1890,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
+                            prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -2456,6 +2459,7 @@ mod tests {
                     aa_validator_registry_height: None,
                     native_registry_view_height: None,
                     native_validator_events_height: None,
+                    prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -4732,6 +4736,91 @@ mod tests {
             value: U256::ZERO,
             data: shell_primitives::Bytes::from(data),
             gas_limit: 100_000,
+        }
+    }
+
+    #[test]
+    fn prover_registration_all_algorithms_and_aa_vote_rollback() {
+        use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer, SphincsSigner};
+        let signers: Vec<Box<dyn Signer>> = vec![
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+            Box::new(SphincsSigner::generate()),
+        ];
+        for (algorithm, signer) in signers.iter().enumerate() {
+            for quorum_size in [1, 2] {
+                let mut evm = setup_native_aa_evm();
+                let voters = [
+                    ShellAddress::from([0x51; 32]),
+                    ShellAddress::from([0x52; 32]),
+                ];
+                let validators = &voters[..quorum_size];
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(
+                        &serde_json::from_value(serde_json::json!({
+                            "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                            "aa_validator_registry_height":0, "prover_registry_height":0
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_validators(validators)
+                    .unwrap();
+                for voter in validators {
+                    fund_account(&mut evm, voter, U256::from(100_000_000));
+                }
+                let prover = ShellAddress::from_public_key(signer.public_key(), algorithm as u8);
+                let calldata = system_contracts::encode_register_prover_calldata(
+                    signer.public_key(),
+                    algorithm as u8,
+                );
+                // A later failing inner call must undo both approved records and pending votes.
+                let failed = make_aa_signed(
+                    voters[0],
+                    current_nonce(&mut evm, &voters[0]),
+                    500_000,
+                    1,
+                    vec![
+                        registry_inner(calldata.clone()),
+                        registry_inner(vec![0xff; 4]),
+                    ],
+                    None,
+                );
+                let result = evm
+                    .execute_aa_bundle(&failed, &sample_header(), 0, 0)
+                    .unwrap();
+                assert_eq!(result.receipt.status, 0);
+                assert!(evm
+                    .state_db()
+                    .world_state()
+                    .get_registered_prover(&prover)
+                    .unwrap()
+                    .is_none());
+                // Reverse the voters: the second voter alone cannot reuse the rolled-back first vote.
+                for (index, voter) in validators.iter().rev().enumerate() {
+                    let tx = make_system_tx(*voter, calldata.clone());
+                    let result = evm.execute_tx(&tx, &sample_header(), 0, 0).unwrap();
+                    assert_eq!(result.receipt.status, 1);
+                    let record = evm
+                        .state_db()
+                        .world_state()
+                        .get_registered_prover(&prover)
+                        .unwrap();
+                    assert_eq!(record.is_some(), index + 1 == quorum_size);
+                    if let Some(record) = record {
+                        assert_eq!(record.public_key, signer.public_key());
+                        assert_eq!(record.algorithm, algorithm as u8);
+                        assert_eq!(record.proofs_submitted, 0);
+                    }
+                }
+                assert_eq!(
+                    evm.state_db().world_state().get_validators().unwrap(),
+                    validators
+                );
+            }
         }
     }
 

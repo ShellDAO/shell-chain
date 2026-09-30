@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (44 methods)
+- **`shell_`** (46 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -522,6 +522,21 @@ encode_set_validator_stake(address: String, stake: String, ) → String
 ```
 
 Encode calldata for `setValidatorStake(address,uint256)` system contract call.
+
+### shell_proposeRegisterProver
+```
+propose_register_prover(public_key: String, algorithm: u8, ) → String
+```
+
+Propose independent prover registration through a signed governance transaction.
+Subject to the same signer and authenticated RPC policy as validator proposals.
+
+### shell_getRegisteredProver
+```
+get_registered_prover(address: Address, ) → Option<serde_json::Value>
+```
+
+Read the canonical governance registration; does not mutate authority or account keys.
 
 ### shell_proposeAddValidator
 ```

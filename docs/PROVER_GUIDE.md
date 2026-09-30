@@ -90,25 +90,78 @@ Broadcast to network (contains Dilithium3 sigs in WitnessBundle)
 
 ## ProverRegistry
 
-The `ProverRegistry` (in `shell-consensus`) maintains a list of registered
-provers. Only registered provers can submit `ProofAmendment` messages.
+The native ProverRegistry stores governance-approved proof signing identities in
+canonical chain state, separately from validator membership. Registration grants
+no block-production or consensus-voting rights.
+
+**Version and activation:** this interface is an unreleased source feature. It
+requires a node build containing `shell_proposeRegisterProver` and an explicitly
+configured `prover_registry_height`. The default is disabled. Existing databases
+accept only a future activation height, and a saved schedule cannot be changed.
+All peers must use the same schedule; snapshots must match trusted configuration.
+Do not set height zero on an existing network. Before activation, historical
+proof admission and settlement rules remain unchanged. At and after activation,
+proof admission and settlement require a registered prover, including proofs
+from `validator-prover` nodes.
 
 ### Registering a prover
 
-Provers register by submitting a governance transaction through
-`shell_proposeAddValidator` with the prover's address. The prover's address is
-derived from its PQ public key the same way as any account:
-`blake3(algo_id || pubkey)` rendered as `0x` + 64 lowercase hex characters.
+First generate the proof signing key as shown below. Submit only its public key
+and algorithm ID to a funded validator's authenticated governance RPC. Each
+validator votes through its own node; registration completes when votes represent
+strictly more than half of the current Registry weight. Repeating a vote does not
+add weight. No prior transaction from the prover account is required.
+
+For the Dilithium3 key generated in this guide (`algorithm = 0`), with `jq` and
+`curl` installed:
+
+```bash
+PROVER_PUBLIC_KEY=$(jq -r '.public_key' /data/prover-keystore.json)
+PROVER_ADDRESS=$(jq -r '.address' /data/prover-keystore.json)
+VALIDATOR_RPC=http://127.0.0.1:8545
+REQUEST=$(jq -nc --arg key "$PROVER_PUBLIC_KEY" \
+  '{jsonrpc:"2.0",id:1,method:"shell_proposeRegisterProver",params:[$key,0]}')
+curl -sS -H 'Content-Type: application/json' --data "$REQUEST" "$VALIDATOR_RPC"
+```
+
+The result is a transaction hash. Query `eth_getTransactionReceipt` with that
+hash and require `status: "0x1"`. A successful vote receipt alone does not prove
+quorum: query the record and wait for its `registered_at` block to be finalized
+(`eth_getBlockByNumber` with `["finalized", false]`) before starting the prover.
+
+```bash
+REQUEST=$(jq -nc --arg address "$PROVER_ADDRESS" \
+  '{jsonrpc:"2.0",id:2,method:"shell_getRegisteredProver",params:[$address]}')
+curl -sS -H 'Content-Type: application/json' --data "$REQUEST" "$VALIDATOR_RPC"
+```
+
+The query returns `null` until registration is committed. Match `pubkey` and
+`algorithm` to your key and check that `shell_getValidators` is unchanged.
+ML-DSA-65 uses algorithm ID `1`; SPHINCS+-SHA2-256f uses `2`. Addresses are derived
+as `blake3(algo_id || pubkey)`, rendered as `0x` plus 64 lowercase hex characters.
+Malformed keys, unsupported algorithms, non-validator callers, and duplicate
+registrations are rejected. `shell_proposeAddValidator` changes consensus
+membership and is not the prover-registration operation.
+
+When the validator RPC listener is non-loopback, the node must be configured
+with `--rpc-api-key`; add `Authorization: Bearer <key>` to the requests above.
+Keep the prover's encrypted key and password on the prover machine.
 
 ### ProverRecord fields
 
 | Field | Description |
 |-------|-------------|
-| `address` | Prover's address |
-| `pubkey` | Dilithium3 public key (for `ProofAmendment` signature verification) |
-| `registered_at` | Block height of registration |
-| `proofs_submitted` | Lifetime proof count |
-| `last_proof_block` | Most recently proved block number |
+| `address` | Prover's full 32-byte address |
+| `pubkey` | Public key bound to this proof signing identity |
+| `algorithm` | Signature algorithm ID: 0, 1, or 2 |
+| `registered_at` | Block height where governance reached quorum |
+| `proofs_submitted` | Successfully executed proof settlements since registration |
+| `last_proof_block` | Highest source block covered by those settlements |
+
+Receiving or storing a proof does not increment the count. Settlement updates
+share the block's state root, roll back with rejected blocks or failed execution,
+and persist through restart and snapshot recovery. Import and replay use the
+registry state of the block being executed.
 
 ---
 
@@ -283,7 +336,7 @@ prove_sig_batch()
 
 On receipt, the network:
 1. Checks `prover` is in `ProverRegistry`
-2. Verifies `prover_signature` with the registered Dilithium3 pubkey
+2. Verifies `prover_signature` with the PQ public key bound to the registered address
 3. Verifies the `SigBatchProof` (Winterfell STARK verification)
 4. Stores at `pa/<block_hash>`
 5. Deletes `w/<block_hash>` (after grace window)
@@ -342,3 +395,19 @@ close after `T_c = 7200` blocks; at that point the amendment is resolved or the
 prover is slashed, depending on the verification outcome. Challenges are
 rate-limited per-peer to prevent DoS. A prover that accumulates failed
 challenges may be removed from `ProverRegistry`.
+
+## Local acceptance
+
+From a compatible source checkout, run:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+cargo build -p shell-node --example prover-acceptance
+python3 tests/e2e/prover-registration.py
+```
+
+The script creates fresh keys and isolated Dev1337 nodes with explicit activation,
+registers an independent prover, sends 512 signed transfers, verifies the actual
+STARK and tamper rejection, and checks replicated settlement counters and restart
+persistence. It stops its processes and keeps private temporary data and receipts
+for inspection. This local acceptance does not activate any public network.

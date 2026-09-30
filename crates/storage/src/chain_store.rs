@@ -103,6 +103,9 @@ pub struct ChainConfig {
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
+    /// First block enabling independent prover governance registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prover_registry_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -1856,6 +1859,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.native_validator_events_height,
             ),
             (
+                "prover registry",
+                stored.prover_registry_height,
+                desired.prover_registry_height,
+            ),
+            (
                 "algorithm proposal staging",
                 stored.algorithm_proposal_staging_height,
                 desired.algorithm_proposal_staging_height,
@@ -2136,6 +2144,9 @@ impl<S: KvStore> ChainStore<S> {
             native_validator_events_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_validator_events_height),
+            prover_registry_height: self
+                .get_chain_config()?
+                .and_then(|config| config.prover_registry_height),
             algorithm_proposal_staging_height: self
                 .get_chain_config()?
                 .and_then(|config| config.algorithm_proposal_staging_height),
@@ -2199,6 +2210,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_aa_validator_registry = trusted.aa_validator_registry_height;
         let trusted_native_registry_view = trusted.native_registry_view_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
+        let trusted_prover_registry = trusted.prover_registry_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
         let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
         let trusted_algorithm_timelock_activation = trusted.algorithm_timelock_activation_height;
@@ -2343,6 +2355,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.aa_validator_registry_height != trusted_aa_validator_registry
                     || config.native_registry_view_height != trusted_native_registry_view
                     || config.native_validator_events_height != trusted_native_validator_events
+                    || config.prover_registry_height != trusted_prover_registry
                     || config.algorithm_proposal_staging_height
                         != trusted_algorithm_proposal_staging
                     || config.algorithm_quorum_activation_height
@@ -2536,6 +2549,15 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted native validator events activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.prover_registry_height)
+            != trusted_prover_registry
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted prover registry activation".into(),
             ));
         }
 
@@ -2757,6 +2779,7 @@ impl<S: KvStore> ChainStore<S> {
             aa_validator_registry_height: trusted_aa_validator_registry,
             native_registry_view_height: trusted_native_registry_view,
             native_validator_events_height: trusted_native_validator_events,
+            prover_registry_height: trusted_prover_registry,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
             algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
             algorithm_timelock_activation_height: trusted_algorithm_timelock_activation,
@@ -4330,6 +4353,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -4378,6 +4402,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -4412,6 +4437,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4436,6 +4462,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4492,6 +4519,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4516,6 +4544,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4572,6 +4601,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4596,6 +4626,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -4651,6 +4682,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: trusted_height,
@@ -4675,6 +4707,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: Some(6),
@@ -4775,6 +4808,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -4804,6 +4838,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -4865,6 +4900,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: trusted_height,
                 algorithm_timelock_activation_height: None,
             };
@@ -4889,6 +4925,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(6),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -4953,6 +4990,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -4980,6 +5018,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -5043,6 +5082,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -5070,6 +5110,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -5133,6 +5174,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5160,6 +5202,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5224,6 +5267,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5251,6 +5295,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5315,6 +5360,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5342,6 +5388,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5406,6 +5453,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5433,6 +5481,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5493,6 +5542,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
@@ -5520,6 +5570,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 validation_pqvm_height: None,
@@ -5583,6 +5634,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 session_registered_root_height: trusted_height,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -5610,6 +5662,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 session_registered_root_height: Some(6),
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -5831,6 +5884,51 @@ mod tests {
     }
 
     #[test]
+    fn prover_registry_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "prover_registry_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.prover_registry_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted prover registry activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn registered_key_algorithm_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -5851,6 +5949,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -5878,6 +5977,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -5946,6 +6046,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -5970,6 +6071,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -6303,6 +6405,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -6327,6 +6430,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -6393,6 +6497,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -6524,6 +6629,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -7458,6 +7564,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -8001,6 +8108,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
                 algorithm_quorum_activation_height: quorum_activation,
                 algorithm_timelock_activation_height: timelock_activation,
@@ -8095,6 +8203,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -8164,6 +8273,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -9288,6 +9398,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -9329,6 +9440,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

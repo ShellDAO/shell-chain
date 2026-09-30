@@ -772,6 +772,42 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         Ok(format!("0x{}", hex::encode(calldata)))
     }
 
+    async fn propose_register_prover(
+        &self,
+        public_key: String,
+        algorithm: u8,
+    ) -> Result<String, ErrorObjectOwned> {
+        if public_key.len() > 8194 {
+            return Err(invalid_params("prover public key exceeds maximum size"));
+        }
+        let public_key = hex::decode(public_key.strip_prefix("0x").unwrap_or(&public_key))
+            .map_err(|_| invalid_params("invalid prover public key hex"))?;
+        let calldata = shell_pqvm::encode_register_prover_calldata(&public_key, algorithm);
+        let hash = self.propose_validator_tx(calldata)?;
+        Ok(format!("0x{}", hex::encode(hash.0)))
+    }
+
+    async fn get_registered_prover(
+        &self,
+        address: Address,
+    ) -> Result<Option<serde_json::Value>, ErrorObjectOwned> {
+        let record = self
+            .world_state
+            .read()
+            .get_registered_prover(&address)
+            .map_err(internal_err)?;
+        Ok(record.map(|record| {
+            serde_json::json!({
+                "address": address,
+                "pubkey": format!("0x{}", hex::encode(record.public_key)),
+                "algorithm": record.algorithm,
+                "registered_at": record.registered_at,
+                "proofs_submitted": record.proofs_submitted,
+                "last_proof_block": record.last_proof_block,
+            })
+        }))
+    }
+
     async fn propose_add_validator(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
         let calldata = shell_pqvm::encode_add_validator_calldata(&addr);

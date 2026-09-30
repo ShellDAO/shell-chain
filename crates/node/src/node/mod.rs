@@ -3198,6 +3198,7 @@ mod tests {
                         aa_validator_registry_height: None,
                         native_registry_view_height: None,
                         native_validator_events_height: None,
+                        prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -3662,6 +3663,76 @@ mod tests {
             U256::from(50_000_000_000_000_000_000u128)
         );
         assert!(node.stark_reward_value(20_047, &invalid).is_err());
+    }
+
+    #[test]
+    fn prover_registration_admission_and_settlement_use_execution_state() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+            "chain_id": node.config.chain_id, "genesis_hash": ShellHash::ZERO,
+            "prover_registry_height": 1
+        }))
+        .unwrap();
+        node.chain_store.put_chain_config(&config).unwrap();
+        // This tests the registration/authentication boundary, not STARK validity.
+        let mut amendment = dummy_ordered_amendment(1, vec![ShellHash::ZERO], 0);
+        amendment.sign_prover_authentication(&signer).unwrap();
+        let before = node.world_state.write().state_root().unwrap();
+        assert!(node.validate_prover_admission(&amendment).is_err());
+        assert!(!node
+            .validate_registered_prover(&*node.world_state.read(), &amendment, 0)
+            .unwrap());
+        let record = shell_storage::RegisteredProver {
+            public_key: signer.public_key().to_vec(),
+            algorithm: signer.sig_type().as_u8(),
+            registered_at: 1,
+            proofs_submitted: 0,
+            last_proof_block: 0,
+        };
+        node.world_state
+            .write()
+            .set_registered_prover(&amendment.prover, &record)
+            .unwrap();
+        node.validate_prover_admission(&amendment).unwrap();
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_registered_prover(&amendment.prover)
+                .unwrap(),
+            Some(record)
+        );
+        let mut historical = WorldState::at_root(node.store.clone(), &before).unwrap();
+        assert!(node
+            .record_registered_prover_settlement(&mut historical, &amendment, 1)
+            .is_err());
+        assert_eq!(historical.state_root().unwrap(), before);
+        node.record_registered_prover_settlement(&mut historical, &amendment, 0)
+            .unwrap();
+        assert_eq!(historical.state_root().unwrap(), before);
+        node.record_registered_prover_settlement(&mut *node.world_state.write(), &amendment, 1)
+            .unwrap();
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_registered_prover(&amendment.prover)
+                .unwrap()
+                .unwrap()
+                .proofs_submitted,
+            1
+        );
+        let original = amendment.prover;
+        amendment.prover = Address::from([42; 32]);
+        assert!(node.validate_prover_admission(&amendment).is_err());
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_registered_prover(&original)
+                .unwrap()
+                .unwrap()
+                .proofs_submitted,
+            1
+        );
     }
 
     fn dummy_ordered_amendment(
@@ -4984,6 +5055,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
+                            prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5144,6 +5216,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
+                            prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5253,6 +5326,7 @@ mod tests {
                         aa_validator_registry_height: None,
                         native_registry_view_height: None,
                         native_validator_events_height: None,
+                        prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,

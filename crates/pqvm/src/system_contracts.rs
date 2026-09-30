@@ -74,6 +74,9 @@ pub fn is_system_contract(address: &Address) -> bool {
 
 // ── Function selectors (keccak256 of signature, first 4 bytes) ────
 
+/// keccak256("registerProver(bytes,uint8)")[..4]
+pub const REGISTER_PROVER_SELECTOR: [u8; 4] = compute_selector(b"registerProver(bytes,uint8)");
+
 /// keccak256("addValidator(address)")[..4]
 pub const ADD_VALIDATOR_SELECTOR: [u8; 4] = compute_selector(b"addValidator(address)");
 /// keccak256("removeValidator(address)")[..4]
@@ -287,6 +290,9 @@ pub fn execute_system_contract_call_at_block<S: KvStore + 'static>(
     block_number: u64,
 ) -> Result<SystemContractOutcome, SystemContractError> {
     if *target == registry_address() {
+        if decode_selector(input)? == REGISTER_PROVER_SELECTOR {
+            return register_prover(caller, &input[4..], world_state, chain_store, block_number);
+        }
         let (output, gas_used) = shell_crypto::with_algorithm_registry_mut(|registry| {
             execute_validator_registry_with_registry(
                 caller,
@@ -321,6 +327,84 @@ pub fn execute_system_contract_call_at_block<S: KvStore + 'static>(
     }
 
     Err(SystemContractError::UnknownSystemContract(*target))
+}
+
+fn register_prover<S: KvStore + 'static>(
+    caller: &Address,
+    params: &[u8],
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+) -> Result<SystemContractOutcome, SystemContractError> {
+    let enabled = chain_store
+        .get_chain_config()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .and_then(|config| config.prover_registry_height)
+        .is_some_and(|height| block_number >= height);
+    if !enabled {
+        return Err(SystemContractError::UnknownSelector(
+            REGISTER_PROVER_SELECTOR,
+        ));
+    }
+    let (public_key, algorithm) = decode_rotate_key_params(params)?;
+    let signature_type = SignatureType::from_u8(algorithm)
+        .ok_or(SystemContractError::InvalidAlgorithm(algorithm))?;
+    let expected_length = match signature_type {
+        SignatureType::Dilithium3 | SignatureType::MlDsa65 => 1952,
+        SignatureType::SphincsSha2256f => 64,
+    };
+    if public_key.len() != expected_length {
+        return Err(SystemContractError::AbiDecode(
+            "invalid prover public key length".into(),
+        ));
+    }
+    let address = Address::from_public_key(&public_key, algorithm);
+    let validators = world_state
+        .get_validators()
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    if !validators.contains(caller) {
+        return Err(SystemContractError::Unauthorized);
+    }
+    if world_state
+        .get_registered_prover(&address)
+        .map_err(|e| SystemContractError::Storage(e.to_string()))?
+        .is_some()
+    {
+        return Err(SystemContractError::AlreadyExists(address));
+    }
+    let applied = record_validator_vote(
+        world_state,
+        ValidatorRegistryOp::RegisterProver,
+        &address,
+        caller,
+        &validators,
+    )?;
+    if applied {
+        world_state
+            .set_registered_prover(
+                &address,
+                &shell_storage::RegisteredProver {
+                    public_key,
+                    algorithm,
+                    registered_at: block_number,
+                    proofs_submitted: 0,
+                    last_proof_block: 0,
+                },
+            )
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?;
+    }
+    Ok(SystemContractOutcome {
+        output: encode_bool(applied),
+        gas_used: SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
+        effects: SystemContractEffects::default(),
+    })
+}
+
+/// Calldata for governance registration of a standalone proof signing identity.
+pub fn encode_register_prover_calldata(pubkey: &[u8], algorithm: u8) -> Vec<u8> {
+    let mut data = encode_rotate_key_calldata(pubkey, algorithm);
+    data[..4].copy_from_slice(&REGISTER_PROVER_SELECTOR);
+    data
 }
 
 fn execute_validator_registry_with_registry<S: KvStore + 'static>(
@@ -1286,6 +1370,7 @@ fn deprecate_algorithm_op<S: KvStore + 'static>(
 
 #[derive(Debug, Clone, Copy)]
 enum ValidatorRegistryOp {
+    RegisterProver,
     Add,
     Remove,
     SetWeight(u64),
@@ -1295,6 +1380,7 @@ enum ValidatorRegistryOp {
 impl ValidatorRegistryOp {
     fn label(self) -> &'static [u8] {
         match self {
+            Self::RegisterProver => b"register_prover",
             Self::Add => b"add",
             Self::Remove => b"remove",
             Self::SetWeight(_) => b"set_weight",
@@ -1306,7 +1392,7 @@ impl ValidatorRegistryOp {
         match self {
             Self::SetWeight(weight) => bytes.extend_from_slice(&weight.to_be_bytes()),
             Self::SetStake(stake) => bytes.extend_from_slice(&stake.to_be_bytes::<32>()),
-            Self::Add | Self::Remove => {}
+            Self::Add | Self::Remove | Self::RegisterProver => {}
         }
     }
 }
@@ -1450,7 +1536,9 @@ fn record_validator_vote<S: KvStore + 'static>(
     }
 
     Ok(match op {
-        ValidatorRegistryOp::Add | ValidatorRegistryOp::Remove => voted_weight * 2 > total_weight,
+        ValidatorRegistryOp::Add
+        | ValidatorRegistryOp::Remove
+        | ValidatorRegistryOp::RegisterProver => voted_weight * 2 > total_weight,
         ValidatorRegistryOp::SetWeight(_) | ValidatorRegistryOp::SetStake(_) => {
             voted_weight * 3 > total_weight * 2
         }
@@ -2831,6 +2919,130 @@ mod tests {
     // ── Selector computation ───────────────────────────────────
 
     #[test]
+    fn prover_registration_requires_activation_quorum_and_preserves_authority() {
+        use shell_crypto::{MlDsaSigner, Signer};
+        let signer = MlDsaSigner::generate();
+        let prover = Address::from_public_key(signer.public_key(), 1);
+        let validators = [
+            Address::from([1; 32]),
+            Address::from([2; 32]),
+            Address::from([3; 32]),
+        ];
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(store.clone());
+        let mut state = WorldState::new(store.clone());
+        state.set_validators(&validators).unwrap();
+        let before = state.state_root().unwrap();
+        let data = encode_register_prover_calldata(signer.public_key(), 1);
+        let mut config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+            "chain_id": 1337, "genesis_hash": ShellHash::ZERO
+        }))
+        .unwrap();
+        chain.put_chain_config(&config).unwrap();
+        assert!(execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[0],
+            &data,
+            &mut state,
+            &chain,
+            10
+        )
+        .is_err());
+        config.prover_registry_height = Some(10);
+        let chain = ChainStore::new(Arc::new(MemoryDb::new()));
+        chain.put_chain_config(&config).unwrap();
+        assert!(execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[0],
+            &data,
+            &mut state,
+            &chain,
+            9
+        )
+        .is_err());
+        assert!(execute_system_contract_call_at_block(
+            &registry_address(),
+            &prover,
+            &data,
+            &mut state,
+            &chain,
+            10
+        )
+        .is_err());
+        assert_eq!(state.state_root().unwrap(), before);
+        let first = execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[0],
+            &data,
+            &mut state,
+            &chain,
+            10,
+        )
+        .unwrap();
+        assert_eq!(first.output, encode_bool(false));
+        assert!(state.get_registered_prover(&prover).unwrap().is_none());
+        // Repeating the same vote cannot manufacture quorum.
+        let repeated = execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[0],
+            &data,
+            &mut state,
+            &chain,
+            10,
+        )
+        .unwrap();
+        assert_eq!(repeated.output, encode_bool(false));
+        let second = execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[1],
+            &data,
+            &mut state,
+            &chain,
+            11,
+        )
+        .unwrap();
+        assert_eq!(second.output, encode_bool(true));
+        assert!(!second.effects.validator_set_changed);
+        assert_eq!(state.get_validators().unwrap(), validators);
+        let record = state.get_registered_prover(&prover).unwrap().unwrap();
+        assert_eq!(record.public_key, signer.public_key());
+        assert_eq!(record.algorithm, 1);
+        assert_eq!(record.registered_at, 11);
+        let root = state.state_root().unwrap();
+        let restored = WorldState::at_root(store.clone(), &root).unwrap();
+        assert_eq!(
+            restored.get_registered_prover(&prover).unwrap(),
+            Some(record)
+        );
+        assert!(WorldState::at_root(store, &before)
+            .unwrap()
+            .get_registered_prover(&prover)
+            .unwrap()
+            .is_none());
+        assert!(execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[2],
+            &data,
+            &mut state,
+            &chain,
+            12
+        )
+        .is_err());
+        assert_eq!(state.state_root().unwrap(), root);
+        let invalid = encode_register_prover_calldata(&[1, 2, 3], 1);
+        assert!(execute_system_contract_call_at_block(
+            &registry_address(),
+            &validators[0],
+            &invalid,
+            &mut state,
+            &chain,
+            12
+        )
+        .is_err());
+        assert_eq!(state.state_root().unwrap(), root);
+    }
+
+    #[test]
     fn selector_add_validator() {
         let hash = keccak256(b"addValidator(address)");
         let expected = &hash.as_bytes()[..4];
@@ -3276,6 +3488,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3361,6 +3574,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3465,6 +3679,7 @@ mod tests {
             aa_validator_registry_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
+            prover_registry_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3534,6 +3749,7 @@ mod tests {
                     aa_validator_registry_height: None,
                     native_registry_view_height: None,
                     native_validator_events_height: None,
+                    prover_registry_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -3684,6 +3900,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
+                prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,
