@@ -70,7 +70,7 @@ pub struct Metrics {
     pub block_production_ms: Histogram,
     /// Total number of blocks imported.
     pub blocks_imported: IntCounter,
-    /// Total number of transactions received.
+    /// Successful pool admissions in this process, including replacements/reinsertions.
     pub txs_received: IntCounter,
     /// Current epoch number (wPoA).
     pub epoch_number: IntGauge,
@@ -140,6 +140,8 @@ pub struct Metrics {
     /// Record via [`Metrics::record_rpc_call`].
     pub rpc_request_duration_seconds: HistogramVec,
     registry: Registry,
+    tx_pool: Option<Arc<shell_mempool::TxPool>>,
+    collection_lock: parking_lot::Mutex<()>,
 }
 
 impl Metrics {
@@ -187,7 +189,7 @@ impl Metrics {
         ))?;
         let txs_received = IntCounter::with_opts(Opts::new(
             "shell_txs_received_total",
-            "Total transactions received",
+            "Successful transaction pool admissions in this process",
         ))?;
         let epoch_number =
             IntGauge::with_opts(Opts::new("shell_epoch_number", "Current wPoA epoch"))?;
@@ -372,11 +374,28 @@ impl Metrics {
             storage_cf_size,
             rpc_request_duration_seconds,
             registry,
+            tx_pool: None,
+            collection_lock: parking_lot::Mutex::new(()),
         })
+    }
+
+    /// Bind the shared pool so every admission path is reflected at scrape time.
+    pub(crate) fn with_tx_pool(mut self, tx_pool: Arc<shell_mempool::TxPool>) -> Self {
+        self.tx_pool = Some(tx_pool);
+        self
     }
 
     /// Encode all collected metrics into Prometheus text exposition format.
     pub fn gather(&self) -> String {
+        // Serialize refresh and encoding so concurrent scrapes cannot double-count
+        // admissions or overwrite a newer pool snapshot with an older one.
+        let _collection = self.collection_lock.lock();
+        if let Some(pool) = &self.tx_pool {
+            let (pending, accepted) = pool.admission_stats();
+            self.tx_pool_size.set(pending as i64);
+            self.txs_received
+                .inc_by(accepted.saturating_sub(self.txs_received.get()));
+        }
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();

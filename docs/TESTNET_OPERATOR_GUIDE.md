@@ -739,10 +739,30 @@ The pre-built **Shell Chain Overview** dashboard (`monitoring/grafana/dashboards
 |-------|--------|-------------|
 | Block Height | `shell_block_height` | Current block number per node |
 | Blocks Imported | `rate(shell_blocks_imported_total[1m])` | Blocks/sec import rate |
-| Transactions Received | `rate(shell_txs_received_total[1m])` | Tx/sec receive rate |
+| Transactions Received | `rate(shell_txs_received_total[1m])` | Successful pool admissions/sec |
 | Peer Count | `shell_peer_count` | Connected peers per node |
 | Mempool Size | `shell_tx_pool_size` | Pending transactions |
 | Block Production Latency | `shell_block_production_duration_seconds` | Avg and p95 latency |
+
+`shell_txs_received_total` counts successful admissions to the shared transaction
+pool from RPC, P2P, or reinsertions after a reorganization. Replacements count as
+new admissions; duplicate and invalid submissions do not. It resets when the
+node process restarts. `shell_tx_pool_size` is sampled from the current pool on
+every scrape, including before the next block. These corrections are in the
+current source; older binaries may omit RPC admissions and retain a stale pool
+size until a block or P2P transaction arrives.
+
+To verify the metrics with a fresh isolated development node (Python 3 required):
+
+```bash
+cargo build -p shell-cli --features rocksdb
+python3 tests/e2e/operator-monitoring.py
+```
+
+The script creates a temporary validator, submits a signed transaction, compares
+pending metrics with the RPC pending block, checks inclusion and readiness, then
+restarts the persistent node and checks height and process-counter reset. It
+stops its node and prints the retained result directory on success or failure.
 
 ### Access
 

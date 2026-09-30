@@ -78,6 +78,8 @@ struct PoolInner {
     seq: u64,
     /// Aggregate serialized size of all retained transactions.
     total_bytes: usize,
+    /// Successful admissions over this pool instance, including replacements/reinsertions.
+    accepted_total: u64,
     /// Aggregate balance reserved by retained transactions for each sender or
     /// paymaster. This keeps admission checks independent of total pool size.
     reserved_by_account: HashMap<Address, ReservationTotal>,
@@ -152,6 +154,7 @@ impl TxPool {
                 by_priority: BTreeMap::new(),
                 seq: 0,
                 total_bytes: 0,
+                accepted_total: 0,
                 reserved_by_account: HashMap::new(),
             }),
         }
@@ -369,6 +372,7 @@ impl TxPool {
             },
         );
         inner.total_bytes = projected_bytes;
+        inner.accepted_total = inner.accepted_total.saturating_add(1);
 
         Ok(hash)
     }
@@ -537,6 +541,13 @@ impl TxPool {
     /// Number of transactions currently in the pool.
     pub fn len(&self) -> usize {
         self.inner.read().by_hash.len()
+    }
+
+    /// Consistent snapshot of pending count and lifetime successful admissions.
+    /// Rejected submissions do not count; removal and clearing do not reset admissions.
+    pub fn admission_stats(&self) -> (usize, u64) {
+        let inner = self.inner.read();
+        (inner.by_hash.len(), inner.accepted_total)
     }
 
     /// Aggregate serialized size of transactions currently retained by the pool.
@@ -1585,6 +1596,26 @@ mod tests {
         let second = pool.get_shared(&hash).expect("shared transaction");
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.hash(), hash);
+    }
+
+    #[test]
+    fn admission_stats_count_successes_without_resetting_on_removal() {
+        let pool = TxPool::new(make_config());
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let (tx, _) = make_signed_tx(0, 100);
+        assert_eq!(pool.admission_stats(), (0, 0));
+        let hash = insert_rich(&pool, tx.clone(), &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.admission_stats(), (1, 1));
+        assert!(insert_rich(&pool, tx.clone(), &verifier, &mut ws, &cs).is_err());
+        assert_eq!(pool.admission_stats(), (1, 1));
+        assert!(pool.remove(&hash));
+        assert_eq!(pool.admission_stats(), (0, 1));
+        insert_rich(&pool, tx.clone(), &verifier, &mut ws, &cs).unwrap();
+        pool.clear();
+        assert_eq!(pool.admission_stats(), (0, 2));
+        insert_rich(&pool, tx, &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.admission_stats(), (1, 3));
     }
 
     #[test]

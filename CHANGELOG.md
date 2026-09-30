@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Derive transaction admission and pending-pool metrics from the shared pool.
+  RPC submissions now appear before block production, failed submissions do not
+  increment the counter, and concurrent scrapes do not double-count admissions.
+
 - Restore active Registry authorities from the last epoch boundary when restarting
   mid-epoch, without activating pending membership or weight changes. Retain the
   finalized epoch state during rolling pruning and fail clearly if recovery data

@@ -914,7 +914,11 @@ impl<S: KvStore + 'static> Node<S> {
             config.network.max_peers
         };
         let stark_aggregation = config.enable_stark_aggregation;
-        let metrics = Arc::new(Metrics::new().expect("failed to register Prometheus metrics"));
+        let metrics = Arc::new(
+            Metrics::new()
+                .expect("failed to register Prometheus metrics")
+                .with_tx_pool(Arc::clone(&tx_pool)),
+        );
         let amendment_store = ProofAmendmentStore::new(store.clone());
         let settled_source_index = SettledSourceIndex::new(store.clone());
         let l2_input_index = L2InputIndex::new(store.clone());
@@ -10298,6 +10302,63 @@ mod tests {
             block.header.state_root, expected_root,
             "header state_root should be self-consistent"
         );
+    }
+
+    #[test]
+    fn shared_pool_metrics_count_admissions_once_across_scrapes() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+
+        let tx_signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let receiver = Address::from({
+            let mut a = [0u8; 32];
+            a[12..].fill(0xCC);
+            a
+        });
+
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(receiver),
+            value: U256::from(1_000),
+            data: shell_primitives::Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+
+        let tx_hash = tx.signing_hash(tx_signer.sig_type().as_u8());
+        let sig = tx_signer.sign(tx_hash.as_bytes()).expect("sign failed");
+        let signed =
+            SignedTransaction::with_pubkey(sender, tx, sig, tx_signer.public_key().to_vec());
+
+        node.handle_incoming_tx(signed.clone(), &MultiVerifier)
+            .unwrap();
+        assert!(node.handle_incoming_tx(signed, &MultiVerifier).is_err());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let metrics = &node.metrics;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        let text = metrics.gather();
+                        assert!(text.contains("shell_txs_received_total 1\n"));
+                        assert!(text.contains("shell_tx_pool_size 1\n"));
+                    }
+                });
+            }
+        });
+        let block = node.produce_block(&signer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        let text = node.metrics.gather();
+        assert!(text.contains("shell_txs_received_total 1\n"));
+        assert!(text.contains("shell_tx_pool_size 0\n"));
     }
 
     #[test]
