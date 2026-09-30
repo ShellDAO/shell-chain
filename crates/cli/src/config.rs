@@ -13,6 +13,7 @@ pub struct ShellConfig {
     pub rpc: RpcSection,
     pub p2p: P2pSection,
     pub consensus: ConsensusSection,
+    pub prover: ProverSection,
     pub metrics: MetricsSection,
     pub logging: LoggingSection,
     #[serde(alias = "parallel_evm")]
@@ -64,6 +65,12 @@ pub struct ConsensusSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct ProverSection {
+    pub max_concurrent_proofs: Option<std::num::NonZeroUsize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct MetricsSection {
     pub enabled: Option<bool>,
     pub listen_addr: Option<String>,
@@ -98,6 +105,18 @@ pub fn load_config(path: &std::path::Path) -> Result<ShellConfig, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prover_concurrency_requires_a_positive_integer() {
+        let config: ShellConfig = toml::from_str("[prover]\nmax_concurrent_proofs=2").unwrap();
+        assert_eq!(config.prover.max_concurrent_proofs.unwrap().get(), 2);
+        for value in ["0", "-1", "1.5", "\"two\""] {
+            assert!(toml::from_str::<ShellConfig>(&format!(
+                "[prover]\nmax_concurrent_proofs={value}"
+            ))
+            .is_err());
+        }
+    }
 
     #[test]
     fn parse_full_toml_config() {

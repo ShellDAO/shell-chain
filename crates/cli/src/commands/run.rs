@@ -82,6 +82,7 @@ pub struct RunArgs {
     pub storage_profile: String,
     /// Enable STARK aggregate proof generation during block production (on by default).
     pub enable_stark_aggregation: bool,
+    pub prover_max_concurrent_proofs: usize,
     /// L2 STARK aggregation mode: disabled, scaffold, or active.
     pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
@@ -940,6 +941,7 @@ async fn run_with_store<S: KvStore + 'static>(
             ..shell_node::config::ParallelPqvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
+        prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         l2_stark_mode: args
             .l2_stark_mode
             .parse::<L2StarkMode>()
@@ -1163,6 +1165,7 @@ mod tests {
             body_retention: Some(DEFAULT_BODY_RETENTION),
             storage_profile: "full".into(),
             enable_stark_aggregation: false,
+            prover_max_concurrent_proofs: 1,
             l2_stark_mode: "disabled".into(),
             network: "dev".into(),
             consensus_engine: None,

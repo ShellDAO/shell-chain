@@ -804,6 +804,10 @@ async fn main() {
                 unsafe_dev_exposed: effective_unsafe_dev_exposed,
                 metrics_addr: effective_metrics_addr,
                 metrics_enabled: file_config.metrics.enabled.unwrap_or(true),
+                prover_max_concurrent_proofs: file_config
+                    .prover
+                    .max_concurrent_proofs
+                    .map_or(1, |n| n.get()),
                 max_idle_interval,
                 mempool_max_size,
                 mempool_max_bytes,

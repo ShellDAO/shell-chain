@@ -240,6 +240,8 @@ pub struct NodeConfig {
     /// entries and stores the result in `BlockHeader::sig_aggregate_proof`.
     /// Off by default — generating a STARK proof per block is expensive (~150ms).
     pub enable_stark_aggregation: bool,
+    /// Maximum concurrent CPU proof jobs; results are handed off in source order.
+    pub prover_max_concurrent_proofs: usize,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -302,6 +304,7 @@ impl NodeConfig {
             state_cache_size_mb: 64,
             parallel_pqvm: ParallelPqvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
+            prover_max_concurrent_proofs: 1,
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }

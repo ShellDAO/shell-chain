@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor positive `prover.max_concurrent_proofs` from TOML and run bounded CPU
+  proof jobs concurrently. Persist and hand off completed ranges in source order;
+  graceful shutdown drains active proofs without waiting for event-loop capacity.
+
 - Honor `consensus.enable_stark_aggregation` from TOML when preparing block
   commitments and proof inputs. The bare CLI flag still enables aggregation;
   `--enable-stark-aggregation=false` explicitly overrides a configured enablement.
