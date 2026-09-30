@@ -228,6 +228,19 @@ verifies the stored blocks after restarting RocksDB. A single transaction stays
 below the 512-entry L1 proof threshold: this checks input creation and persistence,
 not completed proof generation, concurrent proving, or public-network activation.
 
+### max_concurrent_proofs
+
+Set a positive integer (default `1`). Zero, negative and non-integer values are
+rejected at configuration load. On builds containing the concurrent prover
+implementation, this bounds active CPU proof jobs and completed jobs awaiting
+ordered delivery. A later range may finish first, but persistence and event-loop
+handoff remain in canonical source order. Source reservations stay active until
+handoff is acknowledged. Graceful shutdown stops admission and drains active
+proofs to storage for recovery without waiting for a full handoff channel.
+
+This is an unreleased implementation change; verify the node build before
+assuming that an older binary honors this setting.
+
 ### proving_priority
 
 | Value | Behaviour |

@@ -597,7 +597,10 @@ impl<S: KvStore + 'static> Node<S> {
         // H3: Start background prover service if this node is configured to run proving.
         if self.config.node_role.runs_prover() {
             let prover_address = self.config.proposer_address.unwrap_or(local_signer_address);
-            let prover_config = ProverConfig::default();
+            let prover_config = ProverConfig {
+                max_concurrent_proofs: self.config.prover_max_concurrent_proofs,
+                ..ProverConfig::default()
+            };
             let service = ProverService::new(
                 Arc::clone(&self.proof_backlog),
                 self.amendment_store.clone(),
