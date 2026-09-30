@@ -9073,6 +9073,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_authenticates_challenge_responses_before_storage() {
+        use shell_consensus::{ChallengeReason, ChallengeResponse, ProofChallenge};
+        use shell_network::{
+            NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+        };
+        use std::time::Duration;
+
+        // The next admission height is 17: disabled, before, at, and after activation.
+        for activation in [None, Some(18u64), Some(17), Some(16)] {
+            let registry_active = activation.is_some_and(|height| height <= 17);
+            let (mut node, proposer) = setup_node();
+            node.config.rpc_enabled = false;
+            node.config.metrics.enabled = false;
+            let (sender, address, pubkey) = make_stark_account(&node);
+            fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+            let proof_signer = DilithiumSigner::generate();
+            let proof_address = Address::from_public_key(
+                proof_signer.public_key(),
+                proof_signer.sig_type().as_u8(),
+            );
+            if registry_active {
+                node.world_state
+                    .write()
+                    .set_registered_prover(
+                        &proof_address,
+                        &shell_storage::RegisteredProver {
+                            public_key: proof_signer.public_key().to_vec(),
+                            algorithm: proof_signer.sig_type().as_u8(),
+                            registered_at: 0,
+                            proofs_submitted: 0,
+                            last_proof_block: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+            store_consistent_genesis(&node);
+            let mut sources = vec![node
+                .chain_store
+                .get_block_hash_by_number(0)
+                .unwrap()
+                .unwrap()];
+            let mut entries = Vec::new();
+            let mut original_size = 0;
+            // Real signed transfers provide canonical witnesses for a full L1 batch.
+            for height in 1..=16u64 {
+                for offset in 0..32u64 {
+                    let tx = make_embedded_tx(
+                        &sender,
+                        address,
+                        pubkey.clone(),
+                        (height - 1) * 32 + offset,
+                        1,
+                    );
+                    node.tx_pool
+                        .insert(
+                            tx,
+                            &mut *node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                }
+                let block = node.produce_block(&proposer, 32).unwrap();
+                assert_eq!(block.transactions.len(), 32);
+                original_size += node
+                    .witness_store
+                    .bundle_size(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+                sources.push(block.hash());
+            }
+            assert_eq!(entries.len(), 512);
+            let proof = shell_stark_prover::prove_sig_batch(&entries).unwrap();
+            shell_stark_prover::verify_sig_batch(&proof).unwrap();
+            let mut valid = ProofAmendment {
+                version: shell_stark_prover::amendment::PROOF_AMENDMENT_VERSION,
+                block_hash: *sources.last().unwrap(),
+                block_number: 16,
+                start_block: Some(0),
+                proof,
+                prover: Address::ZERO,
+                prover_signature: Bytes::new(),
+                layer: 1,
+                source_hashes: sources,
+                original_size: Some(original_size),
+                compressed_size: None,
+                settlement_tx_hash: None,
+            };
+            valid.sign_prover_authentication(&proof_signer).unwrap();
+            node.validate_stark_amendment_ordering(&valid).unwrap();
+            node.validate_stark_proof_source_binding(&valid).unwrap();
+            let config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": node.config.chain_id, "genesis_hash": ShellHash::ZERO,
+                "prover_registry_height": activation
+            }))
+            .unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            let mut tampered = valid.clone();
+            let mut signature = tampered.prover_signature.as_ref().to_vec();
+            *signature.last_mut().unwrap() ^= 1;
+            tampered.prover_signature = Bytes::from(signature);
+            let mut wrong_identity = valid.clone();
+            wrong_identity.prover = Address::from([0xA5; 32]);
+            let mut unregistered = valid.clone();
+            unregistered
+                .sign_prover_authentication(&DilithiumSigner::generate())
+                .unwrap();
+            node.config.node_role = crate::NodeRole::Prover;
+            let node = Arc::new(node);
+            let bus = NetworkBus::new(32);
+            let mut network = bus.join(&NetworkConfig::default());
+            let mut relay = bus.join(&NetworkConfig::default());
+            let handle = tokio::spawn({
+                let node = Arc::clone(&node);
+                async move { node.run(Arc::new(proposer), &mut network).await }
+            });
+            relay
+                .broadcast(NetworkMessage::ProofChallenge(Box::new(
+                    ProofChallenge::new(
+                        valid.block_hash,
+                        16,
+                        ChallengeReason::VerificationFailed,
+                        Address::from([0xB6; 32]),
+                        1,
+                    ),
+                )))
+                .await
+                .unwrap();
+            let state_before = node.world_state.write().state_root().unwrap();
+            let mut outcomes = Vec::new();
+            let mut rejected = vec![
+                ("tampered signature", &tampered),
+                ("wrong identity", &wrong_identity),
+            ];
+            if registry_active {
+                rejected.push(("unregistered prover", &unregistered));
+            }
+            for amendment in rejected
+                .iter()
+                .map(|(_, amendment)| *amendment)
+                .chain(std::iter::once(&valid))
+            {
+                // A relay may carry another prover's authenticated amendment.
+                relay
+                    .broadcast(NetworkMessage::ProofChallengeResponse(Box::new(
+                        ChallengeResponse {
+                            block_hash: valid.block_hash,
+                            proof_bytes: amendment.to_json().unwrap(),
+                            responder: Address::from([0xC7; 32]),
+                        },
+                    )))
+                    .await
+                    .unwrap();
+                relay.broadcast(NetworkMessage::Ping).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(
+                            relay.next_event().await,
+                            Some(NetworkEvent::MessageReceived {
+                                message: NetworkMessage::Pong,
+                                ..
+                            })
+                        ) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                outcomes.push((
+                    node.amendment_store
+                        .get_amendment(&valid.block_hash)
+                        .unwrap(),
+                    node.challenge_lifecycle
+                        .lock()
+                        .get(&valid.block_hash)
+                        .unwrap()
+                        .status
+                        .clone(),
+                    valid
+                        .source_hashes
+                        .iter()
+                        .all(|hash| node.amendment_store.get_amendment(hash).unwrap().is_none()),
+                ));
+            }
+            node.shutdown();
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            for ((name, _), (stored, status, all_absent)) in rejected.iter().zip(&outcomes) {
+                assert!(*all_absent, "{name} response wrote a range artifact");
+                assert!(stored.is_none(), "{name} response wrote proof artifacts");
+                assert_eq!(
+                    *status,
+                    challenge_lifecycle::ChallengeStatus::Open,
+                    "{name} response resolved challenge"
+                );
+            }
+            assert_eq!(outcomes.last().unwrap().0, Some(valid.to_json().unwrap()));
+            assert_eq!(
+                outcomes.last().unwrap().1,
+                challenge_lifecycle::ChallengeStatus::Resolved
+            );
+            assert_eq!(node.world_state.write().state_root().unwrap(), state_before);
+            if registry_active {
+                assert_eq!(
+                    node.world_state
+                        .read()
+                        .get_registered_prover(&valid.prover)
+                        .unwrap()
+                        .unwrap()
+                        .proofs_submitted,
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn event_loop_limits_challenges_per_peer_before_tracking() {
         use shell_consensus::{ChallengeReason, ProofChallenge};
         use shell_network::{

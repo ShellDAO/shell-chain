@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Authenticate challenge-response proof amendments and enforce the activated prover registry before storage or challenge resolution.
+
 - Enforce proof-challenge admission per network peer before lifecycle tracking or
   proof responses, preventing claimed-address rotation from bypassing the request allowance.
 
