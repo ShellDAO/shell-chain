@@ -558,12 +558,17 @@ verified by all peers. If verification fails, the peer broadcasts a
 
 ### Rate limiting
 
-Challenges are rate-limited per-challenger via `ProofRateLimiter` to prevent
-DoS. `RateLimiterConfig` sets:
-- `max_challenges_per_window` — max challenges in any rolling window
-- `window_seconds` — rolling window duration
+Incoming challenges are rate-limited by the network peer using a separate
+`ProofRateLimiter` token bucket. The peer identity supplied by the transport,
+not the claimed `challenger` address, selects the bucket. Its `RateLimiterConfig`
+uses ten initial tokens, five tokens per 60-second refill (capped at ten), and
+600-second idle expiry. The existing periodic peer-metrics tick removes idle
+buckets. Limits reset on process restart.
 
-A challenger that exceeds the limit has its challenges silently dropped by peers.
+Excess challenges are dropped before lifecycle tracking, proof storage reads,
+or responses. Each peer has its own allowance, independent of authenticated
+proof-amendment submission limits. This receive-side enforcement is unreleased;
+older binaries do not apply this challenge limit.
 
 ### Challenge lifecycle
 

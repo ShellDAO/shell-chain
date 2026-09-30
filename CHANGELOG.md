@@ -31,6 +31,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Enforce proof-challenge admission per network peer before lifecycle tracking or
+  proof responses, preventing claimed-address rotation from bypassing the request allowance.
+
 - Connect prover CPU duration and failure observations to exported metrics,
   refresh pending proof backlog at scrape time, and correct prover monitoring queries.
 

@@ -9073,6 +9073,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_limits_challenges_per_peer_before_tracking() {
+        use shell_consensus::{ChallengeReason, ProofChallenge};
+        use shell_network::{
+            NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+        };
+        use std::time::Duration;
+
+        let (mut node, signer) = setup_node();
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+        node.config.node_role = crate::NodeRole::Prover;
+        let node = Arc::new(node);
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let mut first = bus.join(&NetworkConfig::default());
+        let mut second = bus.join(&NetworkConfig::default());
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(Arc::new(signer), &mut network).await }
+        });
+
+        async fn wait_for_pong(peer: &mut dyn NetworkService) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        peer.next_event().await,
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("node did not process the challenge burst");
+        }
+
+        // One transport peer cannot multiply its allowance by changing the
+        // unauthenticated challenger address. The documented burst is ten.
+        for value in 1u8..=11 {
+            first
+                .broadcast(NetworkMessage::ProofChallenge(Box::new(
+                    ProofChallenge::new(
+                        ShellHash::from([value; 32]),
+                        1,
+                        ChallengeReason::VerificationFailed,
+                        Address::from([value; 32]),
+                        u64::from(value),
+                    ),
+                )))
+                .await
+                .unwrap();
+        }
+        first.broadcast(NetworkMessage::Ping).await.unwrap();
+        wait_for_pong(&mut first).await;
+        // Pong is broadcast: drain the first barrier from the second peer
+        // before waiting for that peer's own request to be processed.
+        wait_for_pong(&mut second).await;
+        let first_count = node.challenge_lifecycle.lock().open_count();
+        let overflow_tracked = node
+            .challenge_lifecycle
+            .lock()
+            .get(&ShellHash::from([11; 32]))
+            .is_some();
+        second
+            .broadcast(NetworkMessage::ProofChallenge(Box::new(
+                ProofChallenge::new(
+                    ShellHash::from([12; 32]),
+                    1,
+                    ChallengeReason::VerificationFailed,
+                    Address::from([1; 32]),
+                    1,
+                ),
+            )))
+            .await
+            .unwrap();
+        second.broadcast(NetworkMessage::Ping).await.unwrap();
+        wait_for_pong(&mut second).await;
+        let second_tracked = node
+            .challenge_lifecycle
+            .lock()
+            .get(&ShellHash::from([12; 32]))
+            .is_some();
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_count, 10,
+            "one peer exceeded its challenge burst allowance"
+        );
+        assert!(!overflow_tracked, "rate-limited work mutated the lifecycle");
+        assert!(second_tracked, "one peer consumed another peer's allowance");
+    }
+
+    #[tokio::test]
     async fn event_loop_adopts_stateful_preferred_fork_before_resuming_production() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
