@@ -9080,6 +9080,45 @@ mod tests {
         };
         use std::time::Duration;
 
+        async fn request_proof(
+            relay: &mut dyn NetworkService,
+            hash: ShellHash,
+            sequence: u64,
+        ) -> Option<Box<ChallengeResponse>> {
+            relay
+                .broadcast(NetworkMessage::ProofChallenge(Box::new(
+                    ProofChallenge::new(
+                        hash,
+                        // A peer-supplied height must not replace the local header's height.
+                        999,
+                        ChallengeReason::VerificationFailed,
+                        Address::from([0xB6; 32]),
+                        sequence,
+                    ),
+                )))
+                .await
+                .unwrap();
+            relay.broadcast(NetworkMessage::Ping).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut response = None;
+                loop {
+                    match relay.next_event().await {
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::ProofChallengeResponse(received),
+                            ..
+                        }) => response = Some(received),
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        }) => return response,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+
         // The next admission height is 17: disabled, before, at, and after activation.
         for activation in [None, Some(18u64), Some(17), Some(16)] {
             let registry_active = activation.is_some_and(|height| height <= 17);
@@ -9259,12 +9298,99 @@ mod tests {
                         .all(|hash| node.amendment_store.get_amendment(hash).unwrap().is_none()),
                 ));
             }
+            // Earlier blocks store pointers; missing or inconsistent targets must not be sent.
+            let challenged_hash = valid.source_hashes[1];
+            let pointer_bytes = node
+                .amendment_store
+                .get_amendment(&challenged_hash)
+                .unwrap()
+                .unwrap();
+            node.amendment_store
+                .delete_amendment(&valid.block_hash)
+                .unwrap();
+            let missing_response = request_proof(&mut relay, challenged_hash, 2).await;
+            node.amendment_store
+                .put_amendment(&valid.block_hash, &valid.to_json().unwrap())
+                .unwrap();
+            let mut pointer: shell_stark_prover::amendment::ProofPointer =
+                serde_json::from_slice(&pointer_bytes).unwrap();
+            pointer.layer += 1;
+            node.amendment_store
+                .put_amendment(&challenged_hash, &pointer.to_json().unwrap())
+                .unwrap();
+            let inconsistent_response = request_proof(&mut relay, challenged_hash, 3).await;
+            let unresolved_status = node
+                .challenge_lifecycle
+                .lock()
+                .get(&challenged_hash)
+                .unwrap()
+                .status
+                .clone();
+            node.amendment_store
+                .put_amendment(&challenged_hash, &pointer_bytes)
+                .unwrap();
+            let range_response = request_proof(&mut relay, challenged_hash, 4).await;
+            if let Some(response) = &range_response {
+                relay
+                    .broadcast(NetworkMessage::ProofChallengeResponse(response.clone()))
+                    .await
+                    .unwrap();
+            }
+            relay.broadcast(NetworkMessage::Ping).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(
+                        relay.next_event().await,
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
             node.shutdown();
             tokio::time::timeout(Duration::from_secs(5), handle)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            assert!(
+                missing_response.is_none(),
+                "missing pointer target must not produce a response"
+            );
+            assert!(
+                inconsistent_response.is_none(),
+                "inconsistent pointer target must not produce a response"
+            );
+            assert_eq!(
+                unresolved_status,
+                challenge_lifecycle::ChallengeStatus::Open
+            );
+            let response =
+                range_response.expect("stored range proof must answer an earlier block challenge");
+            assert_eq!(response.block_hash, challenged_hash);
+            assert!(
+                response.proof_bytes == valid.to_json().unwrap(),
+                "challenge response must contain the full amendment, not a storage pointer"
+            );
+            assert_eq!(
+                node.challenge_lifecycle
+                    .lock()
+                    .get(&challenged_hash)
+                    .unwrap()
+                    .status,
+                challenge_lifecycle::ChallengeStatus::Resolved
+            );
+            for (hash, bytes) in valid.storage_artifacts_with_settlement(None).unwrap() {
+                assert_eq!(
+                    node.amendment_store.get_amendment(&hash).unwrap(),
+                    Some(bytes)
+                );
+            }
             for ((name, _), (stored, status, all_absent)) in rejected.iter().zip(&outcomes) {
                 assert!(*all_absent, "{name} response wrote a range artifact");
                 assert!(stored.is_none(), "{name} response wrote proof artifacts");

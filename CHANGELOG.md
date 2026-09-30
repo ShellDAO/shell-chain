@@ -31,6 +31,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Resolve stored proof pointers when answering challenges for earlier blocks in a
+  proof range, and bind responses to a covered source hash before verification.
+
 - Authenticate challenge-response proof amendments and enforce the activated prover registry before storage or challenge resolution.
 
 - Enforce proof-challenge admission per network peer before lifecycle tracking or
