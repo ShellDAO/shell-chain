@@ -764,6 +764,23 @@ pending metrics with the RPC pending block, checks inclusion and readiness, then
 restarts the persistent node and checks height and process-counter reset. It
 stops its node and prints the retained result directory on success or failure.
 
+To check connected peers, imported-block counters and readiness during actual
+catch-up, run the two-node acceptance with a libp2p-enabled binary:
+
+```bash
+cargo build -p shell-cli --features libp2p
+python3 tests/e2e/operator-p2p-monitoring.py
+```
+
+This starts an isolated validator and follower with fresh test keys, loopback
+ports and RocksDB directories. It checks matching block hashes, peer and import
+metrics, a 503 readiness response during synchronization, and readiness after
+catch-up. Allow about a minute after the build. Both nodes stop on exit; the
+printed temporary directory retains results and test data for inspection.
+An unobserved synchronization interval fails the check instead of counting as
+a pass. Set `SHELL_NODE_BIN` to use another compatible binary. This local
+acceptance does not establish public-network health or production capacity.
+
 ### Access
 
 - **Prometheus:** `http://localhost:9090`
