@@ -793,11 +793,22 @@ impl<S: KvStore + 'static> Node<S> {
             })
     }
 
-    fn validate_stark_amendment_ordering_with_overlay(
+    /// Historical responses may resolve challenges but must not re-enter settlement.
+    pub(crate) fn is_settled_stark_response(
         &self,
         amendment: &ProofAmendment,
-        overlay_layers: &HashMap<ShellHash, u32>,
-    ) -> Result<(), NodeError> {
+    ) -> Result<bool, NodeError> {
+        let (_, covered) = self.validate_stark_amendment_range(amendment)?;
+        let settled = self.settled_stark_sources.lock();
+        Ok(covered
+            .iter()
+            .all(|hash| settled.contains(&(amendment.layer, *hash))))
+    }
+
+    fn validate_stark_amendment_range(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(u64, Vec<ShellHash>), NodeError> {
         if amendment.layer == 0 {
             return Err(NodeError::Startup(
                 "STARK amendment layer must be at least 1".into(),
@@ -866,7 +877,18 @@ impl<S: KvStore + 'static> Node<S> {
                     "STARK amendment source #{number} is not canonical: expected {canonical_hash}, got {source_hash}"
                 )));
             }
+        }
+        Ok((start_block, covered))
+    }
 
+    fn validate_stark_amendment_ordering_with_overlay(
+        &self,
+        amendment: &ProofAmendment,
+        overlay_layers: &HashMap<ShellHash, u32>,
+    ) -> Result<(), NodeError> {
+        let (start_block, covered) = self.validate_stark_amendment_range(amendment)?;
+        for (offset, source_hash) in covered.iter().enumerate() {
+            let number = start_block.saturating_add(offset as u64);
             if !self.is_stark_compression_source(source_hash, overlay_layers)? {
                 return Err(NodeError::Startup(format!(
                     "STARK amendment source #{number} has no compressible witness/proof payload"
