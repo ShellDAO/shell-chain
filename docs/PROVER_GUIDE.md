@@ -114,7 +114,8 @@ derived from its PQ public key the same way as any account:
 
 ## Running a Prover Node
 
-A prover node does not need a validator keystore. It needs:
+A prover node does not need a validator identity. It uses a separate prover
+keystore to sign proof amendments and does not propose or vote on blocks. It needs:
 
 1. A PQ key for signing `ProofAmendment` messages
 2. Registration in `ProverRegistry`
@@ -135,7 +136,7 @@ shell-node key generate --algorithm dilithium3 --output /data/prover-keystore.js
 datadir = "/data/prover"
 chain_id = 31337
 node_role = "prover"
-# No keystore needed for block production
+keystore = "/data/prover-keystore.json"  # proof signing only; not a validator key
 
 [rpc]
 listen_addr = "127.0.0.1:8545"  # optional — prover nodes rarely need RPC
@@ -162,6 +163,17 @@ listen_addr = "0.0.0.0:9090"
 ```bash
 shell-node run --config prover.toml
 ```
+
+Enter the passphrase for the prover keystore generated in Step 1. The
+`[node].keystore` setting selects the proof-signing identity; generating a key
+alone does not configure it. If omitted, the node creates or loads its development
+identity instead, which has a different address from the generated prover key.
+Keep `node_role = "prover"` so loading the key does not enable block production.
+
+To check key selection and restart with fresh local accounts, build `shell-node`
+and run `python3 tests/e2e/prover-config.py --prover-key` from the node repository.
+This check compares the omitted-key baseline with the configured identity;
+registration and complete proof generation are separate acceptance steps.
 
 ---
 
