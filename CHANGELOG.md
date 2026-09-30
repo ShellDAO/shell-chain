@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor `consensus.engine` from the TOML configuration when starting a node.
+  An explicit `--consensus-engine` still takes precedence; omitting both keeps
+  the default WPoA engine.
+
 - Honor `node.node_role` in TOML configuration instead of silently using the
   default validator role. Explicit `--node-role` takes precedence, and invalid
   configured roles fail validation instead of starting as validators.
