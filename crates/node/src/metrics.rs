@@ -141,6 +141,7 @@ pub struct Metrics {
     pub rpc_request_duration_seconds: HistogramVec,
     registry: Registry,
     tx_pool: Option<Arc<shell_mempool::TxPool>>,
+    proof_backlog: Option<Arc<parking_lot::Mutex<shell_stark_prover::ProofBacklog>>>,
     collection_lock: parking_lot::Mutex<()>,
 }
 
@@ -375,6 +376,7 @@ impl Metrics {
             rpc_request_duration_seconds,
             registry,
             tx_pool: None,
+            proof_backlog: None,
             collection_lock: parking_lot::Mutex::new(()),
         })
     }
@@ -382,6 +384,15 @@ impl Metrics {
     /// Bind the shared pool so every admission path is reflected at scrape time.
     pub(crate) fn with_tx_pool(mut self, tx_pool: Arc<shell_mempool::TxPool>) -> Self {
         self.tx_pool = Some(tx_pool);
+        self
+    }
+
+    /// Bind pending proof work so scrapes include paused and below-threshold queues.
+    pub(crate) fn with_proof_backlog(
+        mut self,
+        backlog: Arc<parking_lot::Mutex<shell_stark_prover::ProofBacklog>>,
+    ) -> Self {
+        self.proof_backlog = Some(backlog);
         self
     }
 
@@ -395,6 +406,9 @@ impl Metrics {
             self.tx_pool_size.set(pending as i64);
             self.txs_received
                 .inc_by(accepted.saturating_sub(self.txs_received.get()));
+        }
+        if let Some(backlog) = &self.proof_backlog {
+            self.stark_backlog_depth.set(backlog.lock().len() as i64);
         }
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();

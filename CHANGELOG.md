@@ -31,6 +31,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Connect prover CPU duration and failure observations to exported metrics,
+  refresh pending proof backlog at scrape time, and correct prover monitoring queries.
+
 - Honor `prover.proving_priority = "latest-first"` with a bounded contiguous
   window and newer-first CPU work, including single-worker configurations.
   Keep persistence and handoff in canonical order, bound active workers and

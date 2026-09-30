@@ -38,7 +38,7 @@ use shell_stark_prover::{
 };
 use shell_storage::{KvStore, ProofAmendmentStore};
 
-use crate::config::L2StarkMode;
+use crate::{config::L2StarkMode, metrics::Metrics};
 
 // ── ProverConfig ──────────────────────────────────────────────────────────────
 
@@ -138,6 +138,7 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     amendment_store: ProofAmendmentStore<S>,
     amendment_tx: Option<mpsc::Sender<ProofAmendment>>,
     config: ProverConfig,
+    metrics: Option<Arc<Metrics>>,
     /// The node's own address, used as `prover` field in [`ProofAmendment`].
     prover_address: shell_primitives::Address,
     /// The node key that authenticates generated proof amendments.
@@ -173,6 +174,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             amendment_store,
             amendment_tx: None,
             config,
+            metrics: None,
             prover_address,
             prover_signer: None,
             readiness_rx: None,
@@ -182,6 +184,21 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             #[cfg(test)]
             test_proof_hook: None,
         }
+    }
+
+    /// Record actual CPU proof attempts in the node's metrics registry.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn prove_timed(
+        entries: &[shell_stark_prover::SigBatchEntry],
+        metrics: Option<&Metrics>,
+    ) -> Result<shell_stark_prover::SigBatchProof, String> {
+        // Start inside the worker: queueing and ordered handoff are not CPU proving time.
+        let _timer = metrics.map(|m| m.stark_proof_duration_seconds.start_timer());
+        prove_sig_batch(entries)
     }
 
     /// Set the signer used to authenticate locally generated amendments.
@@ -345,6 +362,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 let queue = Arc::new(Mutex::new(queue));
                 for _ in 0..worker_count {
                     let queue = queue.clone();
+                    let metrics = self.metrics.clone();
                     #[cfg(test)]
                     let hook = self.test_proof_hook.clone();
                     latest_workers.push(tokio::task::spawn_blocking(move || loop {
@@ -356,7 +374,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                         if let Some(hook) = &hook {
                             hook(_block_number, false);
                         }
-                        let result = prove_sig_batch(&entries);
+                        let result = Self::prove_timed(&entries, metrics.as_deref());
                         #[cfg(test)]
                         if let Some(hook) = &hook {
                             hook(_block_number, true);
@@ -371,12 +389,13 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     let hook = self.test_proof_hook.clone();
                     #[cfg(test)]
                     let block_number = task.block_number;
+                    let metrics = self.metrics.clone();
                     let proof = tokio::task::spawn_blocking(move || {
                         #[cfg(test)]
                         if let Some(hook) = &hook {
                             hook(block_number, false);
                         }
-                        let result = prove_sig_batch(&entries);
+                        let result = Self::prove_timed(&entries, metrics.as_deref());
                         #[cfg(test)]
                         if let Some(hook) = hook {
                             hook(block_number, true);
@@ -493,7 +512,10 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             return false;
         }
         let entries = std::mem::take(&mut task.entries);
-        let proof = tokio::task::spawn_blocking(move || prove_sig_batch(&entries)).await;
+        let metrics = self.metrics.clone();
+        let proof =
+            tokio::task::spawn_blocking(move || Self::prove_timed(&entries, metrics.as_deref()))
+                .await;
         self.process_proof(task, proof, shutdown_rx).await
     }
 
@@ -515,6 +537,11 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             ..
         } = task;
         let mut handed_off = false;
+        if !matches!(&proof_result, Ok(Ok(_))) {
+            if let Some(metrics) = &self.metrics {
+                metrics.stark_proof_failures.inc();
+            }
+        }
         match proof_result {
             Err(join_err) => {
                 error!("ProverService: proof task panicked for block #{block_number}: {join_err}");
@@ -823,6 +850,8 @@ mod tests {
             let (mut service, backlog) = make_service();
             service.config.max_concurrent_proofs = 2;
             service.config.proving_priority = priority;
+            let metrics = Arc::new(Metrics::new().unwrap().with_proof_backlog(backlog.clone()));
+            service = service.with_metrics(metrics.clone());
             for number in 1..=6u64 {
                 backlog.lock().push(ProofTask::with_sources(
                     [number as u8; 32],
@@ -839,6 +868,7 @@ mod tests {
                     Some(1_000_000),
                 ));
             }
+            assert!(metrics.gather().contains("shell_stark_backlog_depth 6\n"));
             let gate = Arc::new((Mutex::new(0u64), parking_lot::Condvar::new()));
             let (events, mut observed) = mpsc::unbounded_channel();
             let worker_gate = gate.clone();
@@ -888,6 +918,12 @@ mod tests {
                 },
                 "reservation count follows the bounded scheduling window"
             );
+            metrics.gather();
+            assert_eq!(
+                metrics.stark_backlog_depth.get(),
+                backlog.lock().len() as i64
+            );
+            assert_eq!(metrics.stark_proof_duration_seconds.get_sample_count(), 0);
             *gate.0.lock() |= 1 << 4;
             gate.1.notify_all();
             assert_eq!(
@@ -927,6 +963,10 @@ mod tests {
             }
             handle.shutdown().await;
             assert!(backlog.lock().is_empty());
+            assert!(metrics.gather().contains("shell_stark_backlog_depth 0\n"));
+            assert_eq!(metrics.stark_proof_duration_seconds.get_sample_count(), 3);
+            assert!(metrics.stark_proof_duration_seconds.get_sample_sum() > 0.0);
+            assert_eq!(metrics.stark_proof_failures.get(), 0);
         }
     }
 
@@ -1174,6 +1214,30 @@ mod tests {
         amendment
             .verify_prover_authentication()
             .expect("generated amendment is authenticated");
+    }
+
+    #[tokio::test]
+    async fn failed_proof_attempts_are_observed_without_success_or_persistence() {
+        let (service, _) = make_service();
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let service = service.with_metrics(metrics.clone());
+        let task = ProofTask::new([7; 32], 1, vec![]);
+        let result = ProverService::<MemoryDb>::prove_timed(&[], Some(&metrics));
+        assert!(result.is_err());
+        assert!(!service.process_proof(task.clone(), Ok(result), None).await);
+        assert_eq!(metrics.stark_proof_duration_seconds.get_sample_count(), 1);
+        assert!(metrics.stark_proof_duration_seconds.get_sample_sum() > 0.0);
+        assert_eq!(metrics.stark_proof_failures.get(), 1);
+
+        let panicked = tokio::task::spawn_blocking(|| panic!("worker failure")).await;
+        assert!(!service.process_proof(task, panicked, None).await);
+        assert_eq!(metrics.stark_proof_failures.get(), 2);
+        assert_eq!(metrics.stark_proofs_generated.get(), 0);
+        assert!(service
+            .amendment_store
+            .get_amendment(&ShellHash::from([7; 32]))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
