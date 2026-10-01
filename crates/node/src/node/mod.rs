@@ -663,6 +663,16 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
                 *frontier = frontier.saturating_add(1);
             }
         }
+        let l1_frontier = frontiers.get(&1).copied().unwrap_or(0) as i64;
+        drop(frontiers);
+        drop(settled);
+
+        if let Ok(Some(head)) = self.chain_store.get_head_block() {
+            let lag = (head.number() as i64 + 1)
+                .saturating_sub(l1_frontier)
+                .max(0);
+            self.metrics.stark_frontier_lag.set(lag);
+        }
     }
 
     fn remove_settled_pending(&self, amendments: &[ProofAmendment]) {
@@ -4229,6 +4239,20 @@ mod tests {
             }
             other => panic!("expected amendment, got {other:?}"),
         }
+
+        assert_eq!(
+            follower.metrics.stark_frontier_lag.get(),
+            1,
+            "a follower must refresh frontier lag after importing a settlement"
+        );
+
+        let successor = leader.produce_block(&signer, 100).unwrap();
+        follower.import_block(successor, &verifier).unwrap();
+        assert_eq!(
+            follower.metrics.stark_frontier_lag.get(),
+            2,
+            "frontier lag must grow when a later block has no L1 settlement"
+        );
     }
 
     #[test]

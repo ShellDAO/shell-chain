@@ -574,18 +574,6 @@ impl<S: KvStore + 'static> Node<S> {
         }
         prover.record_accepted_settlements(settled_stark_proofs.len());
         prover.record_settled_sources(&settled_stark_proofs);
-        if !settled_stark_proofs.is_empty() {
-            let l1_frontier = self
-                .settled_stark_frontiers
-                .lock()
-                .get(&1)
-                .copied()
-                .unwrap_or(0) as i64;
-            let lag = (block.number() as i64 + 1)
-                .saturating_sub(l1_frontier)
-                .max(0);
-            self.metrics.stark_frontier_lag.set(lag);
-        }
         self.feed_l2_scheduler_from_settlements(&settled_stark_proofs, block.number());
         block_store.schedule_settled_witness_deletes(
             &settled_stark_proofs,
