@@ -574,9 +574,15 @@ canonical range checks, and proof verification. When every covered source is
 already settled at that layer, a valid response resolves the challenge without
 rewriting proof artifacts, settlement links, or rewards. New or partially settled
 ranges retain the normal settlement-order checks. This historical-response
-correction is unreleased; the regression above also covers an unpruned L1 range
-with registry activation disabled. Pruned witnesses, L2 responses, and registry
-activation changes require separate verification.
+correction is unreleased. If L1 witnesses have been pruned, the response's
+settlement transaction link identifies the retained canonical `StarkReward`
+payload. The node checks the containing block is still canonical and matches
+the source range, original size, entry count, and batch root, then independently
+verifies the received proof. Missing or noncanonical settlement links cannot
+replace missing witnesses. This path does not rewrite settlement data or award
+another reward. The regression above covers unpruned and pruned L1 ranges with
+registry activation disabled; its shortened retention window is a test condition.
+L2 responses and registry activation changes require separate verification.
 
 ### ChallengeReason
 

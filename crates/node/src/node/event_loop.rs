@@ -1888,7 +1888,15 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     }
-                                    if let Err(error) = self.validate_stark_proof_source_binding(&amendment) {
+                                    let binding = self.validate_stark_proof_source_binding(&amendment)
+                                        .or_else(|error| {
+                                            if already_settled && amendment.layer == 1 {
+                                                self.validate_settled_l1_response(&amendment)
+                                            } else {
+                                                Err(error)
+                                            }
+                                        });
+                                    if let Err(error) = binding {
                                         warn!(%peer, %error, "I2: challenge response proof verification failed");
                                         continue;
                                     }

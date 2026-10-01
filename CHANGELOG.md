@@ -31,6 +31,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Verify historical L1 challenge responses after witness pruning against the
+  retained canonical settlement payload and independently verify the received
+  proof, without rewriting settlement artifacts or rewards.
+
 - Verify challenge responses for already settled proof ranges without applying
   fresh-settlement frontier rules or overwriting their settlement artifacts.
 
