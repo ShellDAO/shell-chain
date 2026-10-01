@@ -1,18 +1,29 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+use shell_storage::{KvStore, StorageError};
+
+const STORAGE_KEY: &[u8] = b"node/challenge-lifecycle/v1";
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    records: Vec<ChallengeRecord>,
+    penalties: Option<shell_consensus::PenaltyState>,
+}
+
 use shell_primitives::{Address, ShellHash};
 
 pub const CHALLENGE_TIMEOUT_BLOCKS: u64 = 7200;
 pub const MAX_TRACKED_CHALLENGES: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChallengeStatus {
     Open,
     Resolved,
     Slashed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeRecord {
     pub challenge_id: ShellHash,
     pub prover: Address,
@@ -21,15 +32,70 @@ pub struct ChallengeRecord {
     pub status: ChallengeStatus,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChallengeLifecycle {
     challenges: HashMap<ShellHash, ChallengeRecord>,
+    pub penalties: Option<shell_consensus::PenaltyState>,
 }
 
 impl ChallengeLifecycle {
+    pub fn load(store: &impl KvStore) -> Result<Self, StorageError> {
+        let Some(bytes) = store.get(STORAGE_KEY)? else {
+            return Ok(Self::new());
+        };
+        let snapshot: Snapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::Database(format!("invalid challenge snapshot: {e}")))?;
+        if let Some(penalties) = &snapshot.penalties {
+            let slashed: std::collections::HashSet<_> = penalties.slashed.iter().collect();
+            let reductions: std::collections::HashSet<_> = penalties
+                .reductions
+                .iter()
+                .map(|(address, _)| address)
+                .collect();
+            if slashed.len() != penalties.slashed.len()
+                || reductions.len() != penalties.reductions.len()
+                || penalties.reductions.iter().any(|(address, weight)| {
+                    !slashed.contains(address) || *weight > shell_primitives::MAX_VALIDATOR_WEIGHT
+                })
+            {
+                return Err(StorageError::Database("invalid penalty snapshot".into()));
+            }
+        }
+        let records = snapshot.records;
+        if records.len() > MAX_TRACKED_CHALLENGES {
+            return Err(StorageError::Database(
+                "challenge snapshot exceeds capacity".into(),
+            ));
+        }
+        let mut challenges = HashMap::with_capacity(records.len());
+        for record in records {
+            if challenges.insert(record.challenge_id, record).is_some() {
+                return Err(StorageError::Database(
+                    "duplicate challenge in snapshot".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            challenges,
+            penalties: snapshot.penalties,
+        })
+    }
+
+    pub fn persist(&self, store: &impl KvStore) -> Result<(), StorageError> {
+        let mut records: Vec<_> = self.challenges.values().cloned().collect();
+        records.sort_by(|a, b| a.challenge_id.as_bytes().cmp(b.challenge_id.as_bytes()));
+        let bytes = serde_json::to_vec(&Snapshot {
+            records,
+            penalties: self.penalties.clone(),
+        })
+        .map_err(|e| StorageError::Database(format!("encode challenge snapshot: {e}")))?;
+        store.put(STORAGE_KEY, &bytes)
+    }
+
     pub fn new() -> Self {
         Self {
             challenges: HashMap::new(),
+            penalties: None,
         }
     }
 
@@ -114,6 +180,76 @@ mod tests {
             challenger: addr(id.saturating_add(1)),
             opened_at_block,
             status: ChallengeStatus::Open,
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_terminal_states_and_rejects_corruption() {
+        let db = shell_storage::MemoryDb::new();
+        let mut state = ChallengeLifecycle::new();
+        state.open_challenge(open_record(1, 10));
+        state.open_challenge(open_record(2, 20));
+        state.resolve_challenge(&hash(1));
+        state.check_timeouts(20 + CHALLENGE_TIMEOUT_BLOCKS);
+        state.persist(&db).unwrap();
+        let mut recovered = ChallengeLifecycle::load(&db).unwrap();
+        assert_eq!(state, recovered);
+        assert!(recovered
+            .check_timeouts(21 + CHALLENGE_TIMEOUT_BLOCKS)
+            .is_empty());
+        assert_eq!(
+            recovered.get(&hash(1)).unwrap().status,
+            ChallengeStatus::Resolved
+        );
+        assert_eq!(
+            recovered.get(&hash(2)).unwrap().status,
+            ChallengeStatus::Slashed
+        );
+        db.put(STORAGE_KEY, b"invalid").unwrap();
+        assert!(ChallengeLifecycle::load(&db).is_err());
+        db.put(
+            STORAGE_KEY,
+            &serde_json::to_vec(&Snapshot {
+                records: vec![open_record(1, 10); 2],
+                penalties: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(ChallengeLifecycle::load(&db).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_ambiguous_penalty_state() {
+        let db = shell_storage::MemoryDb::new();
+        for penalties in [
+            shell_consensus::PenaltyState {
+                slashed: vec![addr(1); 2],
+                reductions: vec![],
+            },
+            shell_consensus::PenaltyState {
+                slashed: vec![addr(1)],
+                reductions: vec![(addr(1), 10); 2],
+            },
+            shell_consensus::PenaltyState {
+                slashed: vec![],
+                reductions: vec![(addr(1), 10)],
+            },
+            shell_consensus::PenaltyState {
+                slashed: vec![addr(1)],
+                reductions: vec![(addr(1), u64::MAX)],
+            },
+        ] {
+            db.put(
+                STORAGE_KEY,
+                &serde_json::to_vec(&Snapshot {
+                    records: vec![],
+                    penalties: Some(penalties),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(ChallengeLifecycle::load(&db).is_err());
         }
     }
 

@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve proof challenge deadlines and terminal states across database recovery.
+  Commit timeout penalties with their challenge state and restore absolute PoA/WPoA
+  reductions without applying them twice. Later equivocation penalties share the
+  durable snapshot; write failures restore the previous in-memory state.
+
 ### Added
 
 - Add governance registration of independent prover identities through

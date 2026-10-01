@@ -403,6 +403,22 @@ impl ConsensusEngine for WPoaEngine {
         self.apply_slash(offender);
     }
 
+    fn penalty_state(&self) -> crate::PenaltyState {
+        let mut slashed: Vec<_> = self.inner.config().slashed.iter().copied().collect();
+        slashed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut reductions: Vec<_> = self.slash_weights.iter().map(|(a, w)| (*a, *w)).collect();
+        reductions.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        crate::PenaltyState {
+            slashed,
+            reductions,
+        }
+    }
+
+    fn restore_penalty_state(&mut self, state: &crate::PenaltyState) {
+        self.inner.config_mut().slashed = state.slashed.iter().copied().collect();
+        self.slash_weights = state.reductions.iter().copied().collect();
+    }
+
     fn set_authorities(&mut self, authorities: Vec<Address>) {
         let current_weights = self.validator_weights();
         let weights: Vec<u64> = authorities
@@ -648,6 +664,26 @@ mod tests {
         assert_eq!(e.proposer_for_block(0), addr(1));
         assert_eq!(e.proposer_for_block(3), addr(1));
         assert_eq!(e.proposer_for_block(4), addr(3));
+    }
+
+    #[test]
+    fn penalty_recovery_is_idempotent_across_authority_reconfiguration() {
+        let mut original = engine_with_slash_bps(vec![addr(1), addr(2)], vec![100, 50], 1_000);
+        original.slash_authority(&addr(1));
+        original.slash_authority(&addr(1));
+        let snapshot = original.penalty_state();
+        let mut recovered = engine_with_slash_bps(vec![addr(1), addr(2)], vec![100, 50], 1_000);
+        for _ in 0..3 {
+            recovered.restore_penalty_state(&snapshot);
+            assert_eq!(recovered.validator_weights(), original.validator_weights());
+        }
+        original.set_authorities_with_weights(vec![addr(1), addr(3)], vec![200, 40]);
+        recovered.set_authorities_with_weights(vec![addr(1), addr(3)], vec![200, 40]);
+        assert_eq!(recovered.validator_weights(), original.validator_weights());
+        assert_eq!(recovered.validator_weights().get(&addr(1)), Some(&181));
+        assert_eq!(recovered.validator_weights().get(&addr(3)), Some(&40));
+        recovered.restore_penalty_state(&snapshot);
+        assert_eq!(recovered.validator_weights(), original.validator_weights());
     }
 
     #[test]
