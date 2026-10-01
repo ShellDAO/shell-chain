@@ -199,6 +199,29 @@ OPEN --(timeout at 7200 blocks)--> SLASHED
 
 Nodes create an `Open` record when they emit `ProofChallenge`, resolve it when proof bytes validate, and slash the responsible prover if the record is still open after the timeout.
 
+### Restart recovery (unreleased)
+
+The node stores challenge records, their original opening heights and terminal
+states in its database. Restarting with the same database preserves the original
+7200-block deadline. Timeout status and the resulting absolute consensus penalty
+are committed together; failed writes leave both in-memory states unchanged.
+Recovery restores the penalty instead of applying another percentage reduction.
+Later equivocation penalties update the same snapshot, so recovery cannot replace
+them with an older challenge penalty. Terminal-record garbage collection retains
+the penalty snapshot.
+
+These are local protocol observations, not canonical transaction state: a head
+rewind does not reopen a resolved challenge or reset its original deadline.
+A malformed persisted snapshot prevents network startup. This recovery support
+requires a build containing the change; it does not retrofit records lost by an
+older node before upgrading.
+
+Run the database process-recovery and failed-write regressions with:
+
+```bash
+cargo test -p shell-node --features rocksdb challenge -- --nocapture
+```
+
 ## Security Model
 
 1. **Prover registration** — Only nodes registered in the `ProverRegistry` system contract

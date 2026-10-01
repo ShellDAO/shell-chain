@@ -18,6 +18,13 @@ pub enum EngineType {
     BFT,
 }
 
+/// Absolute penalty state, restored without applying another percentage reduction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PenaltyState {
+    pub slashed: Vec<Address>,
+    pub reductions: Vec<(Address, u64)>,
+}
+
 /// Pluggable consensus engine interface.
 ///
 /// Implementations provide block validation, sealing, and proposer selection.
@@ -88,6 +95,10 @@ pub trait ConsensusEngine: Send + Sync {
 
     /// Slash a misbehaving authority, reducing its effective economic weight.
     fn slash_authority(&mut self, offender: &Address);
+
+    fn penalty_state(&self) -> PenaltyState;
+
+    fn restore_penalty_state(&mut self, state: &PenaltyState);
 
     /// Return the active validator set with per-validator weights.
     ///

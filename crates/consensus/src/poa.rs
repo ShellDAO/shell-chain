@@ -480,6 +480,22 @@ impl ConsensusEngine for PoaEngine {
         PoaEngine::slash_authority(self, offender);
     }
 
+    fn penalty_state(&self) -> crate::PenaltyState {
+        let mut slashed: Vec<_> = self.config.slashed.iter().copied().collect();
+        slashed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut reductions: Vec<_> = self.slash_weights.iter().map(|(a, w)| (*a, *w)).collect();
+        reductions.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        crate::PenaltyState {
+            slashed,
+            reductions,
+        }
+    }
+
+    fn restore_penalty_state(&mut self, state: &crate::PenaltyState) {
+        self.config.slashed = state.slashed.iter().copied().collect();
+        self.slash_weights = state.reductions.iter().copied().collect();
+    }
+
     fn validator_weights(&self) -> HashMap<Address, u64> {
         self.config
             .authorities

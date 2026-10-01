@@ -303,6 +303,35 @@ impl NodeTaskLifecycle {
 }
 
 impl<S: KvStore + 'static> Node<S> {
+    fn update_challenge_lifecycle<T>(
+        &self,
+        update: impl FnOnce(&mut ChallengeLifecycle) -> T,
+    ) -> Result<T, NodeError> {
+        let mut current = self.challenge_lifecycle.lock();
+        let mut next = current.clone();
+        let result = update(&mut next);
+        if next != *current {
+            next.persist(self.store.as_ref())?;
+            *current = next;
+        }
+        Ok(result)
+    }
+
+    fn persist_authority_slash(&self, offender: &Address) -> Result<(), NodeError> {
+        let mut current = self.challenge_lifecycle.lock();
+        let mut consensus = self.consensus.write();
+        let before = consensus.penalty_state();
+        consensus.slash_authority(offender);
+        let mut next = current.clone();
+        next.penalties = Some(consensus.penalty_state());
+        if let Err(error) = next.persist(self.store.as_ref()) {
+            consensus.restore_penalty_state(&before);
+            return Err(error.into());
+        }
+        *current = next;
+        Ok(())
+    }
+
     fn track_open_challenge(&self, challenge_id: ShellHash, challenger: Address) {
         // A peer-supplied height cannot identify the prover of a different hash.
         let prover = self
@@ -323,16 +352,22 @@ impl<S: KvStore + 'static> Node<S> {
                     .map(|block| block.header.proposer)
             })
             .unwrap_or(Address::ZERO);
-        let inserted = self
-            .challenge_lifecycle
-            .lock()
-            .open_challenge(ChallengeRecord {
+        let inserted = self.update_challenge_lifecycle(|lifecycle| {
+            lifecycle.open_challenge(ChallengeRecord {
                 challenge_id,
                 prover,
                 challenger,
                 opened_at_block: self.head_number(),
                 status: ChallengeStatus::Open,
-            });
+            })
+        });
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                warn!(%challenge_id, %error, "failed to persist open challenge");
+                return;
+            }
+        };
         if !inserted {
             debug!(
                 %challenge_id,
@@ -342,14 +377,37 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn resolve_open_challenge(&self, challenge_id: &ShellHash) {
-        let _ = self
-            .challenge_lifecycle
-            .lock()
-            .resolve_challenge(challenge_id);
+        if let Err(error) =
+            self.update_challenge_lifecycle(|lifecycle| lifecycle.resolve_challenge(challenge_id))
+        {
+            warn!(%challenge_id, %error, "failed to persist resolved challenge");
+        }
     }
 
     fn slash_timed_out_challenges(&self, block_number: u64) {
-        let slashed = self.challenge_lifecycle.lock().check_timeouts(block_number);
+        let mut current = self.challenge_lifecycle.lock();
+        let mut next = current.clone();
+        let slashed = next.check_timeouts(block_number);
+        let mut consensus = self.consensus.write();
+        let before = consensus.penalty_state();
+        for record in &slashed {
+            if record.prover != Address::ZERO {
+                consensus.slash_authority(&record.prover);
+            }
+        }
+        if !slashed.is_empty() {
+            next.penalties = Some(consensus.penalty_state());
+        }
+        if next != *current {
+            if let Err(error) = next.persist(self.store.as_ref()) {
+                consensus.restore_penalty_state(&before);
+                warn!(%error, "failed to persist challenge timeouts");
+                return;
+            }
+            *current = next;
+        }
+        drop(consensus);
+        drop(current);
         for record in slashed {
             if record.prover == Address::ZERO {
                 warn!(
@@ -371,7 +429,6 @@ impl<S: KvStore + 'static> Node<S> {
                 timeout_blocks = CHALLENGE_TIMEOUT_BLOCKS,
                 "challenge timed out; slashing prover"
             );
-            self.consensus.write().slash_authority(&record.prover);
         }
     }
 
@@ -403,6 +460,11 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
+        let recovered = ChallengeLifecycle::load(self.store.as_ref())?;
+        if let Some(penalties) = &recovered.penalties {
+            self.consensus.write().restore_penalty_state(penalties);
+        }
+        *self.challenge_lifecycle.lock() = recovered;
         self.recover_unfinalized_head()?;
         // Normal restarts may not rewind any blocks. Restore policy from the
         // recovered canonical state before exposing RPC or admitting transactions.
@@ -1813,7 +1875,9 @@ impl<S: KvStore + 'static> Node<S> {
                                         block_number = equivocation.header_a.number,
                                         "I1: signed equivocation evidence verified, applying slash"
                                     );
-                                    self.consensus.write().slash_authority(&equivocation.offender);
+                                    if let Err(error) = self.persist_authority_slash(&equivocation.offender) {
+                                        warn!(%error, "failed to persist equivocation penalty");
+                                    }
                                 }
                                 // I2: Received a proof challenge from a peer.
                                 // Resolve local storage pointers to a full amendment before responding.
@@ -3063,8 +3127,11 @@ mod challenge_tests {
     use shell_storage::MemoryDb;
 
     fn node_with_canonical_block() -> (Node<MemoryDb>, Block) {
+        node_with_store(Arc::new(MemoryDb::new()))
+    }
+
+    fn node_with_store<S: KvStore + 'static>(db: Arc<S>) -> (Node<S>, Block) {
         let proposer = Address::from([0x11; 32]);
-        let db = Arc::new(MemoryDb::new());
         let chain_store = Arc::new(ChainStore::new(db.clone()));
         let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
         let consensus = Arc::new(RwLock::new(PoaEngine::new(
@@ -3094,6 +3161,235 @@ mod challenge_tests {
             .set_canonical(block.number(), &block.hash())
             .unwrap();
         (node, block)
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn challenge_rocksdb_process_recovery() {
+        const DIRECTORY: &str = "SHELL_CHALLENGE_RECOVERY_DIRECTORY";
+        const PHASE: &str = "SHELL_CHALLENGE_RECOVERY_PHASE";
+        if let Ok(directory) = std::env::var(DIRECTORY) {
+            let stores = shell_storage::RocksDbStore::open_all(directory, None).unwrap();
+            let db = Arc::new(stores.chain);
+            let (node, block) = node_with_store(db.clone());
+            let resolved_id = ShellHash::from([0x44; 32]);
+            match std::env::var(PHASE).unwrap().as_str() {
+                "open" => {
+                    node.track_open_challenge(block.hash(), Address::from([0x33; 32]));
+                    node.track_open_challenge(resolved_id, Address::from([0x55; 32]));
+                    node.resolve_open_challenge(&resolved_id);
+                }
+                "timeout" => {
+                    let lifecycle = node.challenge_lifecycle.lock();
+                    let open = lifecycle.get(&block.hash()).unwrap();
+                    assert_eq!(open.status, ChallengeStatus::Open);
+                    assert_eq!(open.opened_at_block, 0);
+                    assert_eq!(
+                        lifecycle.get(&resolved_id).unwrap().status,
+                        ChallengeStatus::Resolved
+                    );
+                    drop(lifecycle);
+                    node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS - 1);
+                    assert_eq!(
+                        node.consensus.read().validator_weights()[&block.header.proposer],
+                        100
+                    );
+                    node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
+                    assert_eq!(
+                        node.consensus.read().validator_weights()[&block.header.proposer],
+                        90
+                    );
+                }
+                "recover" => {
+                    assert_eq!(
+                        node.consensus.read().validator_weights()[&block.header.proposer],
+                        90
+                    );
+                    assert_eq!(
+                        node.challenge_lifecycle
+                            .lock()
+                            .get(&block.hash())
+                            .unwrap()
+                            .status,
+                        ChallengeStatus::Slashed
+                    );
+                    node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS + 1);
+                    assert_eq!(
+                        node.consensus.read().validator_weights()[&block.header.proposer],
+                        90
+                    );
+                }
+                phase => panic!("unknown recovery phase: {phase}"),
+            }
+            // Exit without dropping the node or database: recovery must read the WAL,
+            // not depend on the graceful shutdown flush or RocksDB destructors.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-challenge-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for phase in ["open", "timeout", "recover", "recover"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "node::event_loop::challenge_tests::challenge_rocksdb_process_recovery",
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, &directory)
+                .env(PHASE, phase)
+                .status()
+                .unwrap();
+            assert!(status.success(), "challenge recovery phase failed: {phase}");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn challenge_storage_failure_preserves_memory_and_allows_retry() {
+        let db = Arc::new(crate::node::tests::FailingBatchDb::new());
+        let (node, block) = node_with_store(db.clone());
+        let challenger = Address::from([0x33; 32]);
+        db.fail_next_put();
+        node.track_open_challenge(block.hash(), challenger);
+        assert!(node.challenge_lifecycle.lock().get(&block.hash()).is_none());
+        assert!(ChallengeLifecycle::load(db.as_ref())
+            .unwrap()
+            .get(&block.hash())
+            .is_none());
+        node.track_open_challenge(block.hash(), challenger);
+        let open = node.challenge_lifecycle.lock().clone();
+        db.fail_next_put();
+        node.resolve_open_challenge(&block.hash());
+        assert_eq!(*node.challenge_lifecycle.lock(), open);
+        assert_eq!(ChallengeLifecycle::load(db.as_ref()).unwrap(), open);
+
+        let penalties = node.consensus.read().penalty_state();
+        db.fail_next_put();
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
+        assert_eq!(*node.challenge_lifecycle.lock(), open);
+        assert_eq!(ChallengeLifecycle::load(db.as_ref()).unwrap(), open);
+        assert_eq!(node.consensus.read().penalty_state(), penalties);
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            100
+        );
+
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            90
+        );
+        assert_eq!(
+            ChallengeLifecycle::load(db.as_ref()).unwrap(),
+            *node.challenge_lifecycle.lock()
+        );
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS + 1);
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            90
+        );
+    }
+
+    #[test]
+    fn later_authority_slash_does_not_restore_stale_challenge_penalties() {
+        let db = Arc::new(crate::node::tests::FailingBatchDb::new());
+        let (node, block) = node_with_store(db.clone());
+        node.track_open_challenge(block.hash(), Address::from([0x33; 32]));
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
+        db.fail_next_put();
+        assert!(node
+            .persist_authority_slash(&block.header.proposer)
+            .is_err());
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            90
+        );
+        node.persist_authority_slash(&block.header.proposer)
+            .unwrap();
+        assert_eq!(
+            node.consensus.read().validator_weights()[&block.header.proposer],
+            81
+        );
+        drop(node);
+        let (restarted, _) = node_with_store(db);
+        assert_eq!(
+            restarted.consensus.read().validator_weights()[&block.header.proposer],
+            81
+        );
+        restarted.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS + 1);
+        assert_eq!(
+            restarted.consensus.read().validator_weights()[&block.header.proposer],
+            81
+        );
+    }
+
+    #[test]
+    fn challenge_penalty_survives_repeated_recovery_and_record_gc() {
+        let (node, block) = node_with_canonical_block();
+        let initial = node.consensus.read().validator_weights();
+        node.track_open_challenge(block.hash(), Address::from([0x33; 32]));
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
+        let penalized = node.consensus.read().validator_weights();
+        assert_ne!(initial, penalized);
+        node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS * 2);
+        assert_eq!(node.challenge_lifecycle.lock().tracked_count(), 0);
+        let db = node.store.clone();
+        let config = node.config.clone();
+        drop(node);
+        for _ in 0..3 {
+            let restarted = Node::new(
+                config.clone(),
+                db.clone(),
+                Arc::new(ChainStore::new(db.clone())),
+                Arc::new(RwLock::new(WorldState::new(db.clone()))),
+                Arc::new(TxPool::new(MempoolConfig::default())),
+                Arc::new(RwLock::new(PoaEngine::new(
+                    PoaConfig::new(vec![block.header.proposer], 1).with_weights(vec![100]),
+                ))),
+            );
+            assert_eq!(restarted.consensus.read().validator_weights(), penalized);
+            restarted.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS * 3);
+            assert_eq!(restarted.consensus.read().validator_weights(), penalized);
+        }
+    }
+
+    #[test]
+    fn open_challenge_survives_node_reconstruction() {
+        let (node, block) = node_with_canonical_block();
+        let challenger = Address::from([0x33; 32]);
+        node.track_open_challenge(block.hash(), challenger);
+        let opened_at = node
+            .challenge_lifecycle
+            .lock()
+            .get(&block.hash())
+            .unwrap()
+            .opened_at_block;
+        let db = node.store.clone();
+        let config = node.config.clone();
+        drop(node);
+        let restarted = Node::new(
+            config,
+            db.clone(),
+            Arc::new(ChainStore::new(db.clone())),
+            Arc::new(RwLock::new(WorldState::new(db))),
+            Arc::new(TxPool::new(MempoolConfig::default())),
+            Arc::new(RwLock::new(PoaEngine::new(
+                PoaConfig::new(vec![block.header.proposer], 1).with_weights(vec![100]),
+            ))),
+        );
+        let lifecycle = restarted.challenge_lifecycle.lock();
+        let record = lifecycle
+            .get(&block.hash())
+            .expect("open challenge must survive restart");
+        assert_eq!(record.challenger, challenger);
+        assert_eq!(record.prover, block.header.proposer);
+        assert_eq!(record.opened_at_block, opened_at);
+        assert_eq!(record.status, ChallengeStatus::Open);
     }
 
     #[test]

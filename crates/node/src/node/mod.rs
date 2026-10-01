@@ -973,6 +973,17 @@ impl<S: KvStore + 'static> Node<S> {
         metrics.update_finality(current_head, finality_state.last_finalized_number());
         let fork_choice = restore_fork_choice(&chain_store, fin_number, fin_hash, current_head);
 
+        // Startup rechecks errors before serving network traffic.
+        let challenge_lifecycle =
+            ChallengeLifecycle::load(store.as_ref()).unwrap_or_else(|error| {
+                warn!(%error, "challenge snapshot unavailable; startup will reject recovery");
+                ChallengeLifecycle::new()
+            });
+
+        if let Some(penalties) = &challenge_lifecycle.penalties {
+            consensus.write().restore_penalty_state(penalties);
+        }
+
         let node = Self {
             config,
             store,
@@ -1014,7 +1025,7 @@ impl<S: KvStore + 'static> Node<S> {
             proof_window_manager: parking_lot::Mutex::new(ProofWindowManager::new(
                 WindowConfig::default(),
             )),
-            challenge_lifecycle: parking_lot::Mutex::new(ChallengeLifecycle::new()),
+            challenge_lifecycle: parking_lot::Mutex::new(challenge_lifecycle),
             wpoa_round: parking_lot::Mutex::new(None),
             peer_scorer: parking_lot::Mutex::new(PeerScorer::new(PeerScoringConfig::default())),
             peer_ban_list: parking_lot::Mutex::new(shell_network::PeerBanList::new(
@@ -1941,7 +1952,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct FailingBatchDb {
+    pub(super) struct FailingBatchDb {
         inner: MemoryDb,
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
@@ -1952,7 +1963,7 @@ mod tests {
     }
 
     impl FailingBatchDb {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 inner: MemoryDb::new(),
                 fail_next_get: AtomicBool::new(false),
@@ -1976,7 +1987,7 @@ mod tests {
             self.fail_next_get.store(true, Ordering::SeqCst);
         }
 
-        fn fail_next_put(&self) {
+        pub(super) fn fail_next_put(&self) {
             self.fail_next_put.store(true, Ordering::SeqCst);
         }
 

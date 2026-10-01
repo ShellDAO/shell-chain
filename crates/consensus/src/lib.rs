@@ -15,7 +15,7 @@ pub mod wpoa;
 pub mod wpoa_state;
 
 pub use challenge::{ChallengeReason, ChallengeResponse, ProofChallenge};
-pub use engine::{ConsensusEngine, EngineType};
+pub use engine::{ConsensusEngine, EngineType, PenaltyState};
 pub use error::ConsensusError;
 pub use finality::{Attestation, FinalityState};
 pub use fork_choice::{BlockScore, ForkChoice};
