@@ -1875,20 +1875,31 @@ impl<S: KvStore + 'static> Node<S> {
                                         warn!(%peer, %error, "I2: challenge response prover admission failed");
                                         continue;
                                     }
-                                    if let Err(error) = self.validate_stark_amendment_ordering(&amendment) {
-                                        warn!(%peer, %error, "I2: challenge response ordering validation failed");
-                                        continue;
+                                    let already_settled = match self.is_settled_stark_response(&amendment) {
+                                        Ok(settled) => settled,
+                                        Err(error) => {
+                                            warn!(%peer, %error, "I2: challenge response range validation failed");
+                                            continue;
+                                        }
+                                    };
+                                    if !already_settled {
+                                        if let Err(error) = self.validate_stark_amendment_ordering(&amendment) {
+                                            warn!(%peer, %error, "I2: challenge response ordering validation failed");
+                                            continue;
+                                        }
                                     }
                                     if let Err(error) = self.validate_stark_proof_source_binding(&amendment) {
                                         warn!(%peer, %error, "I2: challenge response proof verification failed");
                                         continue;
                                     }
-                                    if let Err(error) = self.store_stark_artifacts(&amendment, None) {
-                                        warn!(%peer, %error, "I2: failed to store verified challenge response");
-                                        continue;
+                                    if !already_settled {
+                                        if let Err(error) = self.store_stark_artifacts(&amendment, None) {
+                                            warn!(%peer, %error, "I2: failed to store verified challenge response");
+                                            continue;
+                                        }
                                     }
                                     self.resolve_open_challenge(&resp.block_hash);
-                                    info!(block = %resp.block_hash, "I2: challenge response verified and stored");
+                                    info!(block = %resp.block_hash, "I2: challenge response verified");
                                 }
                                 // L4: Peer announces its storage capability.
                                 NetworkMessage::StorageCapability { profile, oldest_body_block } => {

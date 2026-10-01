@@ -555,8 +555,9 @@ or writing proof artifacts. When `prover_registry_height` is active at the next
 block height, that prover must also be registered. A relay may forward another
 prover's signed amendment; the claimed `responder` address is not a substitute
 for proof authentication. Rejected responses leave the challenge open and do not
-write any proof-range artifacts. A valid response stores the proof and resolves
-the challenge; this alone does not settle a reward or increment registration counts.
+write any proof-range artifacts. A valid response for an unsettled range stores
+the proof and resolves the challenge; this alone does not settle a reward or
+increment registration counts.
 This response-admission correction is unreleased; verify the node build before
 relying on this behavior in an older binary.
 
@@ -567,6 +568,15 @@ amendment covers that hash before authentication and source verification. Missin
 or inconsistent pointer targets do not produce a response. This range-response
 correction is also unreleased; the stored, unsettled range flow is covered by
 `cargo test -p shell-node event_loop_authenticates_challenge_responses_before_storage`.
+
+For an already settled range, a response still requires prover admission,
+canonical range checks, and proof verification. When every covered source is
+already settled at that layer, a valid response resolves the challenge without
+rewriting proof artifacts, settlement links, or rewards. New or partially settled
+ranges retain the normal settlement-order checks. This historical-response
+correction is unreleased; the regression above also covers an unpruned L1 range
+with registry activation disabled. Pruned witnesses, L2 responses, and registry
+activation changes require separate verification.
 
 ### ChallengeReason
 

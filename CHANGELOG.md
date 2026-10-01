@@ -31,6 +31,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Verify challenge responses for already settled proof ranges without applying
+  fresh-settlement frontier rules or overwriting their settlement artifacts.
+
 - Resolve stored proof pointers when answering challenges for earlier blocks in a
   proof range, and bind responses to a covered source hash before verification.
 

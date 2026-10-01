@@ -9225,9 +9225,11 @@ mod tests {
             let bus = NetworkBus::new(32);
             let mut network = bus.join(&NetworkConfig::default());
             let mut relay = bus.join(&NetworkConfig::default());
+            let proposer = Arc::new(proposer);
             let handle = tokio::spawn({
                 let node = Arc::clone(&node);
-                async move { node.run(Arc::new(proposer), &mut network).await }
+                let proposer = Arc::clone(&proposer);
+                async move { node.run(proposer, &mut network).await }
             });
             relay
                 .broadcast(NetworkMessage::ProofChallenge(Box::new(
@@ -9352,6 +9354,109 @@ mod tests {
             })
             .await
             .unwrap();
+            let state_after_unsettled_response = node.world_state.write().state_root().unwrap();
+            let artifacts_after_unsettled_response: Vec<_> = valid
+                .source_hashes
+                .iter()
+                .map(|hash| {
+                    (
+                        *hash,
+                        node.amendment_store.get_amendment(hash).unwrap().unwrap(),
+                    )
+                })
+                .collect();
+            let historical_outcome = if activation.is_none() {
+                node.pending_stark_settlements.lock().push(valid.clone());
+                let block = node.produce_block(proposer.as_ref(), 0).unwrap();
+                let settlement = block
+                    .system_transactions
+                    .iter()
+                    .find(|tx| tx.kind == SystemTxKind::StarkReward)
+                    .expect("real proof settlement");
+                let settlement_hash = settlement.hash();
+                let before: Vec<_> = valid
+                    .source_hashes
+                    .iter()
+                    .map(|hash| {
+                        (
+                            *hash,
+                            node.amendment_store.get_amendment(hash).unwrap().unwrap(),
+                        )
+                    })
+                    .collect();
+                let root = node.world_state.write().state_root().unwrap();
+                let historical_hash = valid.source_hashes[2];
+                let response = request_proof(&mut relay, historical_hash, 5).await.unwrap();
+                let response_amendment = ProofAmendment::from_json(&response.proof_bytes).unwrap();
+                assert_eq!(response_amendment.settlement_tx_hash, Some(settlement_hash));
+                let mut bad_signature = response_amendment.clone();
+                let mut signature = bad_signature.prover_signature.as_ref().to_vec();
+                *signature.last_mut().unwrap() ^= 1;
+                bad_signature.prover_signature = Bytes::from(signature);
+                let mut bad_proof = response_amendment.clone();
+                *bad_proof.proof.proof_bytes.last_mut().unwrap() ^= 1;
+                bad_proof.sign_prover_authentication(&proof_signer).unwrap();
+                let mut noncanonical = response_amendment.clone();
+                noncanonical.source_hashes[0] = ShellHash::from([0xE1; 32]);
+                noncanonical
+                    .sign_prover_authentication(&proof_signer)
+                    .unwrap();
+                let mut statuses = Vec::new();
+                for candidate in [
+                    &bad_signature,
+                    &bad_proof,
+                    &noncanonical,
+                    &response_amendment,
+                ] {
+                    relay
+                        .broadcast(NetworkMessage::ProofChallengeResponse(Box::new(
+                            ChallengeResponse {
+                                block_hash: historical_hash,
+                                proof_bytes: candidate.to_json().unwrap(),
+                                responder: response.responder,
+                            },
+                        )))
+                        .await
+                        .unwrap();
+                    relay.broadcast(NetworkMessage::Ping).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if matches!(
+                                relay.next_event().await,
+                                Some(NetworkEvent::MessageReceived {
+                                    message: NetworkMessage::Pong,
+                                    ..
+                                })
+                            ) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    statuses.push(
+                        node.challenge_lifecycle
+                            .lock()
+                            .get(&historical_hash)
+                            .unwrap()
+                            .status
+                            .clone(),
+                    );
+                    assert!(
+                        before.iter().all(|(hash, bytes)| node
+                            .amendment_store
+                            .get_amendment(hash)
+                            .unwrap()
+                            .as_ref()
+                            == Some(bytes)),
+                        "historical response must not write settlement artifacts"
+                    );
+                    assert_eq!(node.world_state.write().state_root().unwrap(), root);
+                }
+                Some((historical_hash, before, root, statuses))
+            } else {
+                None
+            };
             node.shutdown();
             tokio::time::timeout(Duration::from_secs(5), handle)
                 .await
@@ -9385,10 +9490,40 @@ mod tests {
                     .status,
                 challenge_lifecycle::ChallengeStatus::Resolved
             );
-            for (hash, bytes) in valid.storage_artifacts_with_settlement(None).unwrap() {
+            assert_eq!(
+                artifacts_after_unsettled_response,
+                valid.storage_artifacts_with_settlement(None).unwrap()
+            );
+            if let Some((historical_hash, before, root, statuses)) = historical_outcome {
                 assert_eq!(
-                    node.amendment_store.get_amendment(&hash).unwrap(),
-                    Some(bytes)
+                    statuses,
+                    vec![
+                        challenge_lifecycle::ChallengeStatus::Open,
+                        challenge_lifecycle::ChallengeStatus::Open,
+                        challenge_lifecycle::ChallengeStatus::Open,
+                        challenge_lifecycle::ChallengeStatus::Resolved
+                    ]
+                );
+                assert_eq!(
+                    node.challenge_lifecycle
+                        .lock()
+                        .get(&historical_hash)
+                        .unwrap()
+                        .status,
+                    challenge_lifecycle::ChallengeStatus::Resolved,
+                    "a valid historical proof must resolve a challenge after settlement"
+                );
+                for (hash, bytes) in before {
+                    assert!(
+                        node.amendment_store.get_amendment(&hash).unwrap() == Some(bytes),
+                        "historical response must preserve settlement artifacts"
+                    );
+                    assert!(node.settled_source_index.has(1, &hash).unwrap());
+                }
+                assert_eq!(node.world_state.write().state_root().unwrap(), root);
+                assert!(
+                    node.validate_stark_amendment_ordering(&valid).is_err(),
+                    "historical response must not permit duplicate settlement"
                 );
             }
             for ((name, _), (stored, status, all_absent)) in rejected.iter().zip(&outcomes) {
@@ -9405,7 +9540,7 @@ mod tests {
                 outcomes.last().unwrap().1,
                 challenge_lifecycle::ChallengeStatus::Resolved
             );
-            assert_eq!(node.world_state.write().state_root().unwrap(), state_before);
+            assert_eq!(state_after_unsettled_response, state_before);
             if registry_active {
                 assert_eq!(
                     node.world_state
