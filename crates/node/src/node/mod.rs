@@ -9120,7 +9120,13 @@ mod tests {
         }
 
         // The next admission height is 17: disabled, before, at, and after activation.
-        for activation in [None, Some(18u64), Some(17), Some(16)] {
+        for (activation, prune) in [
+            (None, false),
+            (None, true),
+            (Some(18u64), false),
+            (Some(17), false),
+            (Some(16), false),
+        ] {
             let registry_active = activation.is_some_and(|height| height <= 17);
             let (mut node, proposer) = setup_node();
             node.config.rpc_enabled = false;
@@ -9374,6 +9380,20 @@ mod tests {
                     .find(|tx| tx.kind == SystemTxKind::StarkReward)
                     .expect("real proof settlement");
                 let settlement_hash = settlement.hash();
+                if prune {
+                    let result = shell_storage::WitnessPruner::new(1)
+                        .prune_before_settled(
+                            block.header.number,
+                            |hash| node.settled_source_index.has(1, hash).unwrap(),
+                            node.chain_store.as_ref(),
+                            node.witness_store.as_ref(),
+                        )
+                        .unwrap();
+                    assert!(result.pruned_count >= 16);
+                    for hash in &valid.source_hashes[1..] {
+                        assert!(!node.chain_store.has_witness_bundle(hash).unwrap());
+                    }
+                }
                 let before: Vec<_> = valid
                     .source_hashes
                     .iter()
@@ -9401,13 +9421,52 @@ mod tests {
                 noncanonical
                     .sign_prover_authentication(&proof_signer)
                     .unwrap();
+                let mut candidates = vec![bad_signature, bad_proof, noncanonical];
+                if prune {
+                    // A stale transaction index must not authenticate a settlement
+                    // whose containing block has left the canonical chain.
+                    node.chain_store
+                        .delete_canonical(block.header.number)
+                        .unwrap();
+                    assert!(node
+                        .validate_settled_l1_response(&response_amendment)
+                        .is_err());
+                    node.chain_store
+                        .set_canonical(block.header.number, &block.hash())
+                        .unwrap();
+                    let mut wrong_kind = response_amendment.clone();
+                    wrong_kind.settlement_tx_hash = Some(
+                        node.chain_store
+                            .get_system_transactions(&valid.source_hashes[1])
+                            .unwrap()
+                            .into_iter()
+                            .find(|tx| tx.kind == SystemTxKind::BlockGasReward)
+                            .expect("source block gas reward")
+                            .hash(),
+                    );
+                    candidates.push(wrong_kind);
+                    let mut missing_link = response_amendment.clone();
+                    missing_link.settlement_tx_hash = None;
+                    candidates.push(missing_link);
+                    let mut wrong_link = response_amendment.clone();
+                    wrong_link.settlement_tx_hash = Some(ShellHash::from([0xA7; 32]));
+                    candidates.push(wrong_link);
+                    let mut wrong_root = response_amendment.clone();
+                    wrong_root.proof.batch_root_bytes[0] ^= 1;
+                    wrong_root
+                        .sign_prover_authentication(&proof_signer)
+                        .unwrap();
+                    candidates.push(wrong_root);
+                    let mut wrong_size = response_amendment.clone();
+                    wrong_size.original_size = wrong_size.original_size.map(|size| size + 1);
+                    wrong_size
+                        .sign_prover_authentication(&proof_signer)
+                        .unwrap();
+                    candidates.push(wrong_size);
+                }
+                candidates.push(response_amendment.clone());
                 let mut statuses = Vec::new();
-                for candidate in [
-                    &bad_signature,
-                    &bad_proof,
-                    &noncanonical,
-                    &response_amendment,
-                ] {
+                for candidate in &candidates {
                     relay
                         .broadcast(NetworkMessage::ProofChallengeResponse(Box::new(
                             ChallengeResponse {
@@ -9495,15 +9554,12 @@ mod tests {
                 valid.storage_artifacts_with_settlement(None).unwrap()
             );
             if let Some((historical_hash, before, root, statuses)) = historical_outcome {
-                assert_eq!(
-                    statuses,
-                    vec![
-                        challenge_lifecycle::ChallengeStatus::Open,
-                        challenge_lifecycle::ChallengeStatus::Open,
-                        challenge_lifecycle::ChallengeStatus::Open,
-                        challenge_lifecycle::ChallengeStatus::Resolved
-                    ]
-                );
+                assert_eq!(statuses, {
+                    let mut expected =
+                        vec![challenge_lifecycle::ChallengeStatus::Open; if prune { 8 } else { 3 }];
+                    expected.push(challenge_lifecycle::ChallengeStatus::Resolved);
+                    expected
+                });
                 assert_eq!(
                     node.challenge_lifecycle
                         .lock()

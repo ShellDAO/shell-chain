@@ -320,6 +320,71 @@ impl<S: KvStore + 'static> Node<S> {
         )))
     }
 
+    /// Bind a historical L1 response to its canonical settlement when the
+    /// original witnesses are unavailable. The transaction index alone is not
+    /// sufficient: its containing block must still be canonical.
+    pub(crate) fn validate_settled_l1_response(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<(), NodeError> {
+        let invalid = || {
+            NodeError::Startup("historical L1 response does not match canonical settlement".into())
+        };
+        if amendment.layer != 1 || !self.is_settled_stark_response(amendment)? {
+            return Err(invalid());
+        }
+        let settlement_hash = amendment.settlement_tx_hash.ok_or_else(invalid)?;
+        let (block_hash, _) = self
+            .chain_store
+            .get_tx_location(&settlement_hash)?
+            .ok_or_else(invalid)?;
+        let header = self
+            .chain_store
+            .get_header_by_hash(&block_hash)?
+            .ok_or_else(invalid)?;
+        if self.chain_store.get_block_hash_by_number(header.number)? != Some(block_hash) {
+            return Err(invalid());
+        }
+        let tx = self
+            .chain_store
+            .get_system_transaction_by_hash(&settlement_hash)?
+            .ok_or_else(invalid)?;
+        if tx.kind != SystemTxKind::StarkReward
+            || tx.chain_id != self.config.chain_id
+            || tx.block_number != header.number
+            || tx.source_hash != amendment.block_hash
+            || tx.layer != Some(1)
+        {
+            return Err(invalid());
+        }
+        let payload = tx.proof_payload.as_ref().ok_or_else(invalid)?;
+        let settled = ProofAmendment::from_json(payload.as_ref()).map_err(|_| invalid())?;
+        if settled.layer != 1
+            || settled.block_hash != amendment.block_hash
+            || settled.block_number != amendment.block_number
+            || settled.range_start_block() != amendment.range_start_block()
+            || settled.covered_hashes() != amendment.covered_hashes()
+            || settled.original_size != amendment.original_size
+            || tx.original_size != amendment.original_size
+            || settled.proof.n_sigs != amendment.proof.n_sigs
+            || settled.proof.batch_root_bytes != amendment.proof.batch_root_bytes
+        {
+            return Err(invalid());
+        }
+        // Settlement certifies the source binding, not the incoming proof bytes.
+        // Verify those bytes independently even when the public inputs match.
+        if amendment.proof.n_sigs == 0 {
+            if !amendment.proof.proof_bytes.is_empty() {
+                return Err(invalid());
+            }
+        } else {
+            verify_sig_batch(&amendment.proof).map_err(|error| {
+                NodeError::Startup(format!("historical L1 proof verification failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
     fn validate_l1_proof_source_binding(
         &self,
         amendment: &ProofAmendment,
