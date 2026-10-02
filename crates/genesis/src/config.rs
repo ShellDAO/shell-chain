@@ -198,6 +198,9 @@ pub struct GenesisConfig {
     /// First block executing native ValidatorRegistry calls atomically inside AA bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_validator_registry_height: Option<u64>,
+    /// Activate separate primary and emergency registry governance quorums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency_governance_height: Option<u64>,
     /// First block enabling the non-overlapping native Registry view for contract calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_registry_view_height: Option<u64>,
@@ -235,6 +238,10 @@ pub struct GenesisConfig {
     pub extra_data: String,
     /// Consensus engine configuration.
     pub consensus: ConsensusConfig,
+    /// Optional SLH-DSA-SHA2-256f governance keys, keyed by validator identity.
+    /// These never replace primary account or consensus signing keys.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub governance_fallback_keys: HashMap<Address, String>,
     /// Optional economic parameters used to derive wPoA weights from locked
     /// validator stake at genesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +458,75 @@ pub struct AllocEntry {
 }
 
 impl GenesisConfig {
+    /// Commit optional fallback identities and their primary keys to genesis.
+    /// Legacy configurations produce no additional header bytes.
+    pub fn governance_fallback_commitment(&self) -> Result<Option<ShellHash>, GenesisError> {
+        if self.governance_fallback_keys.is_empty() {
+            if self.emergency_governance_height.is_some() {
+                return Err(GenesisError::Validation(
+                    "emergency governance activation requires genesis key bindings".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let height = self.emergency_governance_height.ok_or_else(|| {
+            GenesisError::Validation(
+                "genesis governance bindings require an explicit activation height".into(),
+            )
+        })?;
+        self.validate_consensus_authorities()?;
+        if self.governance_fallback_keys.len() != self.consensus.authorities().len() {
+            return Err(GenesisError::Validation(
+                "every genesis authority must register a governance fallback key".into(),
+            ));
+        }
+        let mut entries: Vec<_> = self.governance_fallback_keys.iter().collect();
+        entries.sort_by_key(|(address, _)| address.as_ref().to_vec());
+        let mut bytes = b"shell/genesis-governance-fallback/v1\0".to_vec();
+        bytes.extend_from_slice(&height.to_be_bytes());
+        let mut fallback_identities = std::collections::HashSet::new();
+        for (address, encoded) in entries {
+            let index = self
+                .consensus
+                .authorities()
+                .iter()
+                .position(|a| a == address)
+                .ok_or_else(|| {
+                    GenesisError::Validation("governance key is not a genesis authority".into())
+                })?;
+            let primary = self
+                .consensus
+                .authority_pubkeys()
+                .get(index)
+                .and_then(|key| hex::decode(key.trim_start_matches("0x")).ok())
+                .filter(|key| key.len() == 1952)
+                .ok_or_else(|| {
+                    GenesisError::Validation(
+                        "governance fallback requires an ML-DSA primary key".into(),
+                    )
+                })?;
+            if Address::from_public_key(&primary, shell_crypto::SignatureType::MlDsa65.as_u8())
+                != *address
+            {
+                return Err(GenesisError::Validation(
+                    "governance primary key does not derive its ML-DSA authority address".into(),
+                ));
+            }
+            let fallback = hex::decode(encoded.trim_start_matches("0x"))
+                .ok()
+                .filter(|key| key.len() == 64)
+                .ok_or_else(|| GenesisError::Validation("invalid SLH-DSA governance key".into()))?;
+            if !fallback_identities.insert(fallback.clone()) {
+                return Err(GenesisError::Validation(
+                    "governance fallback key is shared by multiple authorities".into(),
+                ));
+            }
+            bytes.extend_from_slice(address.as_ref());
+            bytes.extend_from_slice(&primary);
+            bytes.extend_from_slice(&fallback);
+        }
+        Ok(Some(shell_primitives::blake3_hash(&bytes)))
+    }
     /// Freeze the consensus interval with the optional voting-window schedule.
     pub fn algorithm_voting_window(
         &self,

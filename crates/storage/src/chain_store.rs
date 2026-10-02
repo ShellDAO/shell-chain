@@ -97,6 +97,9 @@ pub struct ChainConfig {
     /// First block executing native ValidatorRegistry calls atomically inside AA bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_validator_registry_height: Option<u64>,
+    /// Activate separate primary and emergency registry governance quorums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency_governance_height: Option<u64>,
     /// First block enabling the non-overlapping native Registry view for contract calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_registry_view_height: Option<u64>,
@@ -1849,6 +1852,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.aa_validator_registry_height,
             ),
             (
+                "emergency governance",
+                stored.emergency_governance_height,
+                desired.emergency_governance_height,
+            ),
+            (
                 "native Registry view",
                 stored.native_registry_view_height,
                 desired.native_registry_view_height,
@@ -1937,7 +1945,90 @@ impl<S: KvStore> ChainStore<S> {
         self.store.get(&Self::pubkey_key(address))
     }
 
-    // ── Guardian recovery storage ──────────────────────────────
+    /// Resolve the committed governance rules at the candidate block height.
+    pub fn emergency_governance_active(&self, block_number: u64) -> Result<bool, StorageError> {
+        Ok(self
+            .get_chain_config()?
+            .and_then(|config| config.emergency_governance_height)
+            .is_some_and(|height| block_number >= height)
+            && self.has_governance_fallback_bindings()?)
+    }
+
+    /// Whether this genesis opted into a nonempty governance key set.
+    pub fn has_governance_fallback_bindings(&self) -> Result<bool, StorageError> {
+        Ok(self
+            .store
+            .get(b"governance/genesis-bindings/v1")?
+            .is_some_and(|bytes| bytes != b"{}"))
+    }
+
+    /// Read the immutable genesis fallback key for registry governance only.
+    pub fn get_governance_fallback_key(
+        &self,
+        address: &Address,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(encoded) = self.store.get(b"governance/genesis-bindings/v1")? else {
+            return Ok(None);
+        };
+        let bindings: BTreeMap<String, (Vec<u8>, Vec<u8>)> = serde_json::from_slice(&encoded)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        Ok(bindings
+            .get(&hex::encode(address.as_ref()))
+            .map(|(_, fallback)| fallback.clone()))
+    }
+
+    /// Install immutable genesis key bindings atomically, preserving rotated roots.
+    pub fn initialize_genesis_authority_keys(
+        &self,
+        primary_keys: &[(Address, Vec<u8>)],
+        keys: &[(Address, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        let mut bindings = BTreeMap::new();
+        for (address, fallback) in keys {
+            let primary = primary_keys
+                .iter()
+                .find(|(a, _)| a == address)
+                .map(|(_, key)| key)
+                .filter(|key| key.len() == 1952)
+                .ok_or_else(|| {
+                    StorageError::State("governance primary key missing or invalid".into())
+                })?;
+            if fallback.len() != 64
+                || bindings
+                    .insert(
+                        hex::encode(address.as_ref()),
+                        (primary.clone(), fallback.clone()),
+                    )
+                    .is_some()
+            {
+                return Err(StorageError::State(
+                    "invalid or duplicate governance key".into(),
+                ));
+            }
+        }
+        let encoded = serde_json::to_vec(&bindings)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let binding_key = b"governance/genesis-bindings/v1";
+        if let Some(existing) = self.store.get(binding_key)? {
+            if existing != encoded {
+                return Err(StorageError::State(
+                    "genesis governance bindings changed".into(),
+                ));
+            }
+        }
+        let mut batch = WriteBatch::new();
+        for (address, key) in primary_keys {
+            if self.get_pubkey(address)?.is_none() {
+                batch.put(Self::pubkey_key(address), key.clone());
+            }
+        }
+        // Preserve legacy restart as a no-op when no bindings are configured.
+        // The genesis commitment rejects adding bindings to an existing chain.
+        if !keys.is_empty() {
+            batch.put(binding_key.to_vec(), encoded);
+        }
+        self.store.write_batch(batch)
+    }
 
     /// Persist the guardian configuration for an account.
     pub fn put_guardian_config(
@@ -2138,6 +2229,9 @@ impl<S: KvStore> ChainStore<S> {
             aa_validator_registry_height: self
                 .get_chain_config()?
                 .and_then(|config| config.aa_validator_registry_height),
+            emergency_governance_height: self
+                .get_chain_config()?
+                .and_then(|config| config.emergency_governance_height),
             native_registry_view_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_registry_view_height),
@@ -2208,6 +2302,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_registered_key_algorithm = trusted.registered_key_algorithm_height;
         let trusted_aa_account_manager = trusted.aa_account_manager_height;
         let trusted_aa_validator_registry = trusted.aa_validator_registry_height;
+        let trusted_emergency_governance = trusted.emergency_governance_height;
         let trusted_native_registry_view = trusted.native_registry_view_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
         let trusted_prover_registry = trusted.prover_registry_height;
@@ -2228,8 +2323,28 @@ impl<S: KvStore> ChainStore<S> {
         let mut snapshot_body_pruned_below = None;
         let mut snapshot_witness_pruned_below = None;
         let mut snapshot_state_trie_pruned_below = None;
+        let mut governance_bindings = None;
+        let mut governance_genesis = None;
         let mut progress_keys = std::collections::HashSet::new();
         while let Some(entry) = snap_reader.next_entry()? {
+            if entry.key == b"governance/genesis-bindings/v1"
+                && governance_bindings.replace(entry.value.clone()).is_some()
+            {
+                return Err(StorageError::State(
+                    "duplicate genesis governance bindings".into(),
+                ));
+            }
+            if entry.key == Self::header_key(expected_genesis_hash) {
+                let header: BlockHeader = decode_versioned(&entry.value)?;
+                if header.hash() != *expected_genesis_hash
+                    || header.number != 0
+                    || governance_genesis.replace(header).is_some()
+                {
+                    return Err(StorageError::State(
+                        "invalid or duplicate snapshot genesis header".into(),
+                    ));
+                }
+            }
             if entry.key == prefix::HEAD_BLOCK {
                 if entry.value.len() != 32 {
                     return Err(StorageError::State(
@@ -2353,6 +2468,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.registered_key_algorithm_height != trusted_registered_key_algorithm
                     || config.aa_account_manager_height != trusted_aa_account_manager
                     || config.aa_validator_registry_height != trusted_aa_validator_registry
+                    || config.emergency_governance_height != trusted_emergency_governance
                     || config.native_registry_view_height != trusted_native_registry_view
                     || config.native_validator_events_height != trusted_native_validator_events
                     || config.prover_registry_height != trusted_prover_registry
@@ -2379,6 +2495,56 @@ impl<S: KvStore> ChainStore<S> {
                     )));
                 }
             }
+        }
+
+        let bindings: BTreeMap<String, (Vec<u8>, Vec<u8>)> = match governance_bindings {
+            Some(ref bytes) => serde_json::from_slice(bytes)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            None => BTreeMap::new(),
+        };
+        let mut commitment_bytes = b"shell/genesis-governance-fallback/v1\0".to_vec();
+        if !bindings.is_empty() {
+            let height = snapshot_chain_config
+                .as_ref()
+                .and_then(|config| config.emergency_governance_height)
+                .ok_or_else(|| {
+                    StorageError::State("snapshot governance bindings lack activation".into())
+                })?;
+            commitment_bytes.extend_from_slice(&height.to_be_bytes());
+        }
+        for (address, (primary, fallback)) in &bindings {
+            let address_bytes =
+                hex::decode(address).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            if address_bytes.len() != 32
+                || hex::encode(&address_bytes) != *address
+                || primary.len() != 1952
+                || fallback.len() != 64
+            {
+                return Err(StorageError::State(
+                    "invalid snapshot governance key binding".into(),
+                ));
+            }
+            commitment_bytes.extend_from_slice(&address_bytes);
+            commitment_bytes.extend_from_slice(primary);
+            commitment_bytes.extend_from_slice(fallback);
+        }
+        // A snapshot may rely on already installed ancestor headers. Do not
+        // let omission of the genesis header erase a trusted binding set.
+        let governance_genesis =
+            governance_genesis.or(self.get_header_by_hash(expected_genesis_hash)?);
+        let declared = governance_genesis.as_ref().and_then(|header| {
+            let data = header.extra_data.as_ref();
+            data.len().checked_sub(44).and_then(|start| {
+                (&data[start..start + 12] == b"SHELL_GOV_V1")
+                    .then(|| ShellHash::from_slice(&data[start + 12..]))
+            })
+        });
+        let computed =
+            (!bindings.is_empty()).then(|| shell_primitives::blake3_hash(&commitment_bytes));
+        if declared != computed {
+            return Err(StorageError::State(
+                "snapshot governance bindings do not match trusted genesis".into(),
+            ));
         }
 
         if snapshot_chain_config
@@ -2531,6 +2697,15 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted AA ValidatorRegistry activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.emergency_governance_height)
+            != trusted_emergency_governance
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted emergency governance activation".into(),
             ));
         }
         if snapshot_chain_config
@@ -2777,6 +2952,7 @@ impl<S: KvStore> ChainStore<S> {
             registered_key_algorithm_height: trusted_registered_key_algorithm,
             aa_account_manager_height: trusted_aa_account_manager,
             aa_validator_registry_height: trusted_aa_validator_registry,
+            emergency_governance_height: trusted_emergency_governance,
             native_registry_view_height: trusted_native_registry_view,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
@@ -4351,6 +4527,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -4400,6 +4577,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -4435,6 +4613,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4460,6 +4639,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4517,6 +4697,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4542,6 +4723,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4599,6 +4781,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4624,6 +4807,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4680,6 +4864,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4705,6 +4890,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4806,6 +4992,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4836,6 +5023,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4898,6 +5086,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4923,6 +5112,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -4988,6 +5178,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5016,6 +5207,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5080,6 +5272,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5108,6 +5301,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5172,6 +5366,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5200,6 +5395,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5265,6 +5461,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5293,6 +5490,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5358,6 +5556,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5386,6 +5585,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5451,6 +5651,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5479,6 +5680,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5540,6 +5742,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5568,6 +5771,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5632,6 +5836,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5660,6 +5865,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5947,6 +6153,7 @@ mod tests {
                 registered_key_algorithm_height: trusted_height,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -5975,6 +6182,7 @@ mod tests {
                 registered_key_algorithm_height: Some(6),
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -6044,6 +6252,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -6069,6 +6278,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -6403,6 +6613,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -6428,6 +6639,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -6495,6 +6707,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -6627,6 +6840,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -7562,6 +7776,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -8106,6 +8321,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -8180,6 +8396,173 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn emergency_governance_binding_and_activation_survive_rocksdb_reopen() {
+        use shell_crypto::{MlDsaSigner, SignatureType, Signer, SphincsSigner};
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let rotated = MlDsaSigner::generate();
+        let address =
+            Address::from_public_key(primary.public_key(), SignatureType::MlDsa65.as_u8());
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let stores = crate::RocksDbStore::open_all(directory.path(), None).unwrap();
+            let cs = ChainStore::new(Arc::new(stores.chain));
+            cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"emergency_governance_height":5})).unwrap()).unwrap();
+            cs.initialize_genesis_authority_keys(
+                &[(address, primary.public_key().to_vec())],
+                &[(address, fallback.public_key().to_vec())],
+            )
+            .unwrap();
+            cs.put_pubkey(&address, rotated.public_key()).unwrap();
+        }
+        {
+            let stores = crate::RocksDbStore::open_all(directory.path(), None).unwrap();
+            let cs = ChainStore::new(Arc::new(stores.chain));
+            cs.initialize_genesis_authority_keys(
+                &[(address, primary.public_key().to_vec())],
+                &[(address, fallback.public_key().to_vec())],
+            )
+            .unwrap();
+            assert_eq!(
+                cs.get_pubkey(&address).unwrap().unwrap(),
+                rotated.public_key()
+            );
+            assert_eq!(
+                cs.get_governance_fallback_key(&address).unwrap().unwrap(),
+                fallback.public_key()
+            );
+            for height in [4, 5, 6] {
+                assert_eq!(cs.emergency_governance_active(height).unwrap(), height >= 5);
+            }
+            let mut changed = cs.get_chain_config().unwrap().unwrap();
+            changed.emergency_governance_height = Some(6);
+            assert!(cs.put_chain_config(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn governance_snapshot_authenticates_genesis_bindings_after_root_rotation() {
+        let address = Address::from([7; 32]);
+        let primary = vec![3; 1952];
+        let fallback = vec![4; 64];
+        let rotated = vec![5; 1952];
+        let mut preimage = b"shell/genesis-governance-fallback/v1\0".to_vec();
+        preimage.extend_from_slice(&0u64.to_be_bytes());
+        preimage.extend_from_slice(address.as_ref());
+        preimage.extend_from_slice(&primary);
+        preimage.extend_from_slice(&fallback);
+        let mut extra = b"SHELL_GOV_V1".to_vec();
+        extra.extend_from_slice(shell_primitives::blake3_hash(&preimage).as_bytes());
+        let mut genesis = empty_block(0);
+        genesis.header.extra_data = extra.into();
+        for corruption in 0..4 {
+            let source = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(source.clone());
+            put_canonical(&cs, &genesis);
+            cs.put_chain_config(
+                &serde_json::from_value(
+                    serde_json::json!({"chain_id":1337,"genesis_hash":genesis.hash(),"emergency_governance_height":0}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            cs.initialize_genesis_authority_keys(
+                &[(address, primary.clone())],
+                &[(address, fallback.clone())],
+            )
+            .unwrap();
+            cs.put_pubkey(&address, &rotated).unwrap();
+            cs.initialize_genesis_authority_keys(
+                &[(address, primary.clone())],
+                &[(address, fallback.clone())],
+            )
+            .unwrap();
+            assert_eq!(cs.get_pubkey(&address).unwrap().unwrap(), rotated);
+            let key = b"governance/genesis-bindings/v1";
+            if corruption == 1 {
+                source.delete(key).unwrap();
+            } else if corruption > 1 {
+                let mut bindings: BTreeMap<String, (Vec<u8>, Vec<u8>)> =
+                    serde_json::from_slice(&source.get(key).unwrap().unwrap()).unwrap();
+                let entry = bindings.get_mut(&hex::encode(address.as_ref())).unwrap();
+                if corruption == 2 {
+                    entry.0[0] ^= 1;
+                } else {
+                    entry.1[0] ^= 1;
+                }
+                source
+                    .put(key, &serde_json::to_vec(&bindings).unwrap())
+                    .unwrap();
+            }
+            let meta = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                genesis.hash(),
+                ShellHash::ZERO,
+                genesis.hash(),
+            );
+            let mut bytes = Vec::new();
+            cs.export_snapshot(meta, std::io::Cursor::new(&mut bytes))
+                .unwrap();
+            let destination = Arc::new(MemoryDb::new());
+            let restored = ChainStore::new(destination.clone());
+            restored.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":genesis.hash(),"emergency_governance_height":0})).unwrap()).unwrap();
+            let result =
+                restored.import_snapshot(std::io::Cursor::new(bytes), 1337, &genesis.hash());
+            if corruption == 0 {
+                result.unwrap();
+                assert_eq!(restored.get_pubkey(&address).unwrap().unwrap(), rotated);
+                assert_eq!(
+                    restored
+                        .get_governance_fallback_key(&address)
+                        .unwrap()
+                        .unwrap(),
+                    fallback
+                );
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("governance bindings"));
+                assert!(destination.get(key).unwrap().is_none());
+                assert!(restored.get_head_hash().unwrap().is_none());
+                assert!(restored.get_pubkey(&address).unwrap().is_none());
+            }
+        }
+        let destination = Arc::new(MemoryDb::new());
+        let restored = ChainStore::new(destination.clone());
+        restored.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":genesis.hash(),"emergency_governance_height":0})).unwrap()).unwrap();
+        put_canonical(&restored, &genesis);
+        restored
+            .initialize_genesis_authority_keys(
+                &[(address, primary)],
+                &[(address, fallback.clone())],
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        let meta =
+            crate::SnapshotMetadata::new(1337, 0, genesis.hash(), ShellHash::ZERO, genesis.hash());
+        let mut writer =
+            crate::SnapshotWriter::new(std::io::Cursor::new(&mut bytes), meta).unwrap();
+        writer
+            .write_entry(b"governance/genesis-bindings/v1", b"{}")
+            .unwrap();
+        writer.finalize().unwrap();
+        let error = restored
+            .import_snapshot(std::io::Cursor::new(bytes), 1337, &genesis.hash())
+            .unwrap_err();
+        assert!(error.to_string().contains("governance bindings"));
+        assert_eq!(
+            restored
+                .get_governance_fallback_key(&address)
+                .unwrap()
+                .unwrap(),
+            fallback
+        );
+    }
+
     #[test]
     fn test_export_snapshot_at_genesis_head() {
         let store = Arc::new(MemoryDb::new());
@@ -8201,6 +8584,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -8271,6 +8655,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -9396,6 +9781,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -9438,6 +9824,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,

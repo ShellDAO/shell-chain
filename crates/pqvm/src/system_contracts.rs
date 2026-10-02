@@ -329,6 +329,171 @@ pub fn execute_system_contract_call_at_block<S: KvStore + 'static>(
     Err(SystemContractError::UnknownSystemContract(*target))
 }
 
+/// Execute native calls with the outer transaction's authenticated identity.
+/// Custom account policies cannot substitute a governance quorum signature.
+pub(crate) fn execute_signed_system_contract_call<S: KvStore + 'static>(
+    target: &Address,
+    signed_tx: &shell_core::SignedTransaction,
+    input: &[u8],
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+) -> Result<SystemContractOutcome, SystemContractError> {
+    if *target == registry_address()
+        && chain_store
+            .emergency_governance_active(block_number)
+            .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    {
+        let selector = decode_selector(input)?;
+        let registry_mutation = matches!(
+            selector,
+            SUBMIT_ALGORITHM_PROPOSAL_SELECTOR
+                | VOTE_ALGORITHM_PROPOSAL_SELECTOR
+                | DEPRECATE_ALGORITHM_SELECTOR
+                | PROPOSE_ALGORITHM_ACTIVATION_SELECTOR
+        );
+        let governance_mutation = registry_mutation
+            || matches!(
+                selector,
+                ADD_VALIDATOR_SELECTOR
+                    | REMOVE_VALIDATOR_SELECTOR
+                    | SET_VALIDATOR_WEIGHT_SELECTOR
+                    | SET_VALIDATOR_STAKE_SELECTOR
+                    | REGISTER_PROVER_SELECTOR
+                    | PROPOSE_ALGORITHM_ACTIVATION_SELECTOR
+            );
+        if governance_mutation {
+            use shell_crypto::Verifier;
+            let algorithm = signed_tx.signature.sig_type;
+            let key = if algorithm == SignatureType::MlDsa65 {
+                chain_store
+                    .get_pubkey(&signed_tx.from)
+                    .map_err(|e| SystemContractError::Storage(e.to_string()))?
+            } else if registry_mutation {
+                crate::aa_validation::governance_fallback_pubkey(
+                    signed_tx,
+                    world_state,
+                    chain_store,
+                    block_number,
+                )
+                .map_err(|_| SystemContractError::Unauthorized)?
+            } else {
+                None
+            }
+            .ok_or(SystemContractError::Unauthorized)?;
+            if !shell_crypto::is_algorithm_allowed(algorithm)
+                || !shell_crypto::MultiVerifier
+                    .verify(
+                        &key,
+                        signed_tx.sender_signing_hash().as_bytes(),
+                        &signed_tx.signature,
+                    )
+                    .map_err(|_| SystemContractError::Unauthorized)?
+            {
+                return Err(SystemContractError::Unauthorized);
+            }
+            if registry_mutation {
+                return execute_authenticated_governance_call(
+                    &signed_tx.from,
+                    input,
+                    world_state,
+                    chain_store,
+                    block_number,
+                    algorithm,
+                );
+            }
+        }
+    }
+    execute_system_contract_call_at_block(
+        target,
+        &signed_tx.from,
+        input,
+        world_state,
+        chain_store,
+        block_number,
+    )
+}
+
+/// Direct transaction entry preserving its authenticated governance algorithm.
+pub(crate) fn execute_authenticated_governance_call<S: KvStore + 'static>(
+    caller: &Address,
+    input: &[u8],
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+    signing_algorithm: SignatureType,
+) -> Result<SystemContractOutcome, SystemContractError> {
+    if !matches!(
+        signing_algorithm,
+        SignatureType::MlDsa65 | SignatureType::SphincsSha2256f
+    ) {
+        return Err(SystemContractError::Unauthorized);
+    }
+    let (output, gas_used) = shell_crypto::with_algorithm_registry_mut(|registry| {
+        if decode_selector(input)? == PROPOSE_ALGORITHM_ACTIVATION_SELECTOR {
+            if input.len() != 100 {
+                return Err(SystemContractError::AbiDecode(
+                    "activation requires three words".into(),
+                ));
+            }
+            let (algo, height, verifier_hash) = decode_algo_activation_params(&input[4..])?;
+            let mut rules = algorithm_activation_rules(Some(chain_store), Some(block_number))?;
+            rules.require_quorum = true;
+            rules.stage_proposals = true;
+            rules.vote_op = if signing_algorithm == SignatureType::MlDsa65 {
+                AlgorithmGovernanceOp::ProposeActivationMlDsa
+            } else {
+                AlgorithmGovernanceOp::ProposeActivationSlh
+            };
+            let approved = propose_algorithm_activation_op(
+                caller,
+                algo,
+                height,
+                verifier_hash,
+                world_state,
+                registry,
+                rules,
+            )?;
+            return Ok((
+                encode_bool(approved),
+                SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS,
+            ));
+        }
+        if decode_selector(input)? == DEPRECATE_ALGORITHM_SELECTOR {
+            if input.len() != 36 {
+                return Err(SystemContractError::AbiDecode(
+                    "deprecation requires one algorithm word".into(),
+                ));
+            }
+            let algo = decode_signature_type(&input[4..])?;
+            let op = if signing_algorithm == SignatureType::MlDsa65 {
+                AlgorithmGovernanceOp::DeprecateMlDsa
+            } else {
+                AlgorithmGovernanceOp::DeprecateSlh
+            };
+            let approved = deprecate_algorithm_with_op(caller, algo, world_state, registry, op)?;
+            return Ok((
+                encode_bool(approved),
+                SYSTEM_CALL_BASE_GAS + SYSTEM_CALL_OP_GAS,
+            ));
+        }
+        algorithm_proposals::execute_authenticated(
+            caller,
+            input,
+            world_state,
+            Some(chain_store),
+            registry,
+            Some(block_number),
+            Some(signing_algorithm),
+        )
+    })?;
+    Ok(SystemContractOutcome {
+        output,
+        gas_used,
+        effects: SystemContractEffects::default(),
+    })
+}
+
 fn register_prover<S: KvStore + 'static>(
     caller: &Address,
     params: &[u8],
@@ -980,6 +1145,7 @@ struct AlgorithmActivationRules {
     stage_proposals: bool,
     voting_window: Option<(u64, u64)>,
     proposal_identity: bool,
+    vote_op: AlgorithmGovernanceOp,
 }
 
 fn algorithm_activation_rules<S: KvStore + 'static>(
@@ -1054,6 +1220,7 @@ fn algorithm_activation_rules<S: KvStore + 'static>(
         stage_proposals,
         voting_window,
         proposal_identity,
+        vote_op: AlgorithmGovernanceOp::ProposeActivation,
     })
 }
 
@@ -1090,12 +1257,7 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     // Per-voter deduplication: each validator may vote at most once per proposal.
     // The vote key is scoped to (op, algo, voter, current_validator_set) so a
     // validator-set change naturally resets outstanding votes.
-    let voter_key = algorithm_vote_key(
-        AlgorithmGovernanceOp::ProposeActivation,
-        algo,
-        caller,
-        &validators,
-    );
+    let voter_key = algorithm_vote_key(rules.vote_op, algo, caller, &validators);
     let already_voted = world_state
         .get_storage(&registry_address(), &voter_key)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -1189,13 +1351,7 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
                 )
                 .map_err(|e| SystemContractError::Storage(e.to_string()))?;
         }
-        if !record_algorithm_vote(
-            world_state,
-            AlgorithmGovernanceOp::ProposeActivation,
-            algo,
-            caller,
-            &validators,
-        )? {
+        if !record_algorithm_vote(world_state, rules.vote_op, algo, caller, &validators)? {
             return Ok(false);
         }
         publish_algorithm_proposal(
@@ -1277,13 +1433,7 @@ fn propose_algorithm_activation_op<S: KvStore + 'static>(
     }
 
     // Record this validator's vote; return early if quorum not yet reached.
-    if !record_algorithm_vote(
-        world_state,
-        AlgorithmGovernanceOp::ProposeActivation,
-        algo,
-        caller,
-        &validators,
-    )? {
+    if !record_algorithm_vote(world_state, rules.vote_op, algo, caller, &validators)? {
         return Ok(false);
     }
 
@@ -1345,6 +1495,22 @@ fn deprecate_algorithm_op<S: KvStore + 'static>(
     world_state: &mut WorldState<S>,
     registry: &mut AlgorithmRegistry,
 ) -> Result<bool, SystemContractError> {
+    deprecate_algorithm_with_op(
+        caller,
+        algo,
+        world_state,
+        registry,
+        AlgorithmGovernanceOp::Deprecate,
+    )
+}
+
+fn deprecate_algorithm_with_op<S: KvStore + 'static>(
+    caller: &Address,
+    algo: SignatureType,
+    world_state: &mut WorldState<S>,
+    registry: &mut AlgorithmRegistry,
+    op: AlgorithmGovernanceOp,
+) -> Result<bool, SystemContractError> {
     let validators = world_state
         .get_validators()
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
@@ -1353,13 +1519,7 @@ fn deprecate_algorithm_op<S: KvStore + 'static>(
         return Err(SystemContractError::Unauthorized);
     }
 
-    if !record_algorithm_vote(
-        world_state,
-        AlgorithmGovernanceOp::Deprecate,
-        algo,
-        caller,
-        &validators,
-    )? {
+    if !record_algorithm_vote(world_state, op, algo, caller, &validators)? {
         return Ok(false);
     }
 
@@ -1400,14 +1560,22 @@ impl ValidatorRegistryOp {
 #[derive(Debug, Clone, Copy)]
 enum AlgorithmGovernanceOp {
     ProposeActivation,
+    ProposeActivationMlDsa,
+    ProposeActivationSlh,
     Deprecate,
+    DeprecateMlDsa,
+    DeprecateSlh,
 }
 
 impl AlgorithmGovernanceOp {
     fn label(self) -> &'static [u8] {
         match self {
             Self::ProposeActivation => b"propose_activation",
+            Self::ProposeActivationMlDsa => b"propose_activation_mldsa_v1",
+            Self::ProposeActivationSlh => b"propose_activation_slh_v1",
             Self::Deprecate => b"deprecate",
+            Self::DeprecateMlDsa => b"deprecate_mldsa_v1",
+            Self::DeprecateSlh => b"deprecate_slh_v1",
         }
     }
 }
@@ -3486,6 +3654,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -3572,6 +3741,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -3677,6 +3847,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -3747,6 +3918,7 @@ mod tests {
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
+                    emergency_governance_height: None,
                     native_registry_view_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
@@ -3898,6 +4070,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,

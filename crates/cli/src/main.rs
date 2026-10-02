@@ -380,7 +380,7 @@ enum KeyCommands {
         #[arg(long, default_value = "keystore.json")]
         output: PathBuf,
 
-        /// PQ algorithm to use: `dilithium3` (default) or `mldsa65` (FIPS 204).
+        /// PQ algorithm: `dilithium3` (default), `mldsa65` (FIPS 204), or `slhdsa`.
         #[arg(long, default_value = "dilithium3")]
         algorithm: String,
     },

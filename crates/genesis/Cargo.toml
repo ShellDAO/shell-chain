@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 shell-primitives.workspace = true
 shell-core.workspace = true
+shell-crypto.workspace = true
 shell-consensus = { path = "../consensus" }
 shell-storage = { path = "../storage" }
 serde.workspace = true

@@ -40,6 +40,21 @@ fn vote_key(id: &ShellHash, voter: &Address) -> ShellHash {
     keccak256(&bytes)
 }
 
+fn authenticated_vote_key(
+    id: &ShellHash,
+    voter: &Address,
+    algorithm: Option<SignatureType>,
+) -> ShellHash {
+    let Some(algorithm) = algorithm else {
+        return vote_key(id, voter);
+    };
+    let mut bytes = b"algorithm_proposal_authenticated_vote/v1:".to_vec();
+    bytes.push(algorithm.as_u8());
+    bytes.extend_from_slice(id.as_bytes());
+    bytes.extend_from_slice(voter.as_bytes());
+    keccak256(&bytes)
+}
+
 fn read<S: KvStore + 'static>(
     ws: &WorldState<S>,
     key: &ShellHash,
@@ -66,6 +81,18 @@ pub(super) fn execute<S: KvStore + 'static>(
     registry: &mut AlgorithmRegistry,
     number: Option<u64>,
 ) -> Result<(Vec<u8>, u64), SystemContractError> {
+    execute_authenticated(caller, input, ws, cs, registry, number, None)
+}
+
+pub(super) fn execute_authenticated<S: KvStore + 'static>(
+    caller: &Address,
+    input: &[u8],
+    ws: &mut WorldState<S>,
+    cs: Option<&ChainStore<S>>,
+    registry: &mut AlgorithmRegistry,
+    number: Option<u64>,
+    signing_algorithm: Option<SignatureType>,
+) -> Result<(Vec<u8>, u64), SystemContractError> {
     let selector = decode_selector(input)?;
     let rules = algorithm_activation_rules(cs, number)?;
     if !rules.proposal_identity {
@@ -74,7 +101,7 @@ pub(super) fn execute<S: KvStore + 'static>(
     let params = &input[4..];
     match selector {
         SUBMIT_ALGORITHM_PROPOSAL_SELECTOR => {
-            let id = submit(caller, params, ws, cs, rules)?;
+            let id = submit(caller, params, ws, cs, rules, signing_algorithm)?;
             Ok((
                 id.as_bytes().to_vec(),
                 SYSTEM_CALL_BASE_GAS + 12 * SYSTEM_CALL_OP_GAS,
@@ -86,7 +113,7 @@ pub(super) fn execute<S: KvStore + 'static>(
             }
             let algo = decode_signature_type(&params[..32])?;
             let id = ShellHash::from_slice(&params[32..64]);
-            let approved = vote(caller, algo, id, ws, registry, rules)?;
+            let approved = vote(caller, algo, id, ws, registry, rules, signing_algorithm)?;
             Ok((
                 encode_bool(approved),
                 SYSTEM_CALL_BASE_GAS + 5 * SYSTEM_CALL_OP_GAS,
@@ -198,6 +225,7 @@ fn submit<S: KvStore + 'static>(
     ws: &mut WorldState<S>,
     cs: Option<&ChainStore<S>>,
     rules: AlgorithmActivationRules,
+    signing_algorithm: Option<SignatureType>,
 ) -> Result<ShellHash, SystemContractError> {
     let validators = ws
         .get_validators()
@@ -218,12 +246,14 @@ fn submit<S: KvStore + 'static>(
     let deadline = number
         .checked_add(duration)
         .ok_or_else(|| invalid("algorithm voting deadline exceeds block height range"))?;
-    let public_key = cs
-        .ok_or_else(|| invalid("proposal identity requires chain context"))?
-        .get_pubkey(caller)
-        .map_err(|e| SystemContractError::Storage(e.to_string()))?
-        .filter(|key| !key.is_empty() && key.len() <= MAX_ACCOUNT_PUBLIC_KEY_BYTES)
-        .ok_or(SystemContractError::ValidatorPubkeyMissing(*caller))?;
+    let store = cs.ok_or_else(|| invalid("proposal identity requires chain context"))?;
+    let public_key = match signing_algorithm {
+        Some(SignatureType::SphincsSha2256f) => store.get_governance_fallback_key(caller),
+        _ => store.get_pubkey(caller),
+    }
+    .map_err(|e| SystemContractError::Storage(e.to_string()))?
+    .filter(|key| !key.is_empty() && key.len() <= MAX_ACCOUNT_PUBLIC_KEY_BYTES)
+    .ok_or(SystemContractError::ValidatorPubkeyMissing(*caller))?;
     let id = proposal_id(params, &public_key);
     if id == ShellHash::ZERO || read(ws, &field_key(&id, DEADLINE))? != ShellHash::ZERO {
         return Err(invalid("duplicate algorithm proposal ID"));
@@ -281,6 +311,7 @@ fn vote<S: KvStore + 'static>(
     ws: &mut WorldState<S>,
     registry: &mut AlgorithmRegistry,
     rules: AlgorithmActivationRules,
+    signing_algorithm: Option<SignatureType>,
 ) -> Result<bool, SystemContractError> {
     let validators = ws
         .get_validators()
@@ -308,7 +339,7 @@ fn vote<S: KvStore + 'static>(
             rules.minimum_height,
         ));
     }
-    if read(ws, &vote_key(&id, caller))? != ShellHash::ZERO {
+    if read(ws, &authenticated_vote_key(&id, caller, signing_algorithm))? != ShellHash::ZERO {
         return Err(SystemContractError::DuplicateVote);
     }
     let mut total = 0u128;
@@ -319,12 +350,21 @@ fn vote<S: KvStore + 'static>(
                 .map_err(|e| SystemContractError::Storage(e.to_string()))?,
         );
         total += weight;
-        if validator == caller || read(ws, &vote_key(&id, validator))? != ShellHash::ZERO {
+        if validator == caller
+            || read(
+                ws,
+                &authenticated_vote_key(&id, validator, signing_algorithm),
+            )? != ShellHash::ZERO
+        {
             voted += weight;
         }
     }
     let verifier = read(ws, &field_key(&id, 6))?;
-    write(ws, &vote_key(&id, caller), &encode_u64_as_hash(1))?;
+    write(
+        ws,
+        &authenticated_vote_key(&id, caller, signing_algorithm),
+        &encode_u64_as_hash(1),
+    )?;
     if total == 0 || voted * 3 < total * 2 {
         return Ok(false);
     }
@@ -430,6 +470,39 @@ mod tests {
     }
     fn getter(id: &[u8]) -> Vec<u8> {
         [GET_ALGORITHM_PROPOSAL_SELECTOR.as_slice(), id].concat()
+    }
+
+    #[test]
+    fn authenticated_algorithm_quorums_do_not_mix() {
+        let mut f = Fixture::new(Some(0), 604_800);
+        let id = f.call(0, &submission(2_000_000), 1).unwrap();
+        let input = ballot(1, &id);
+        let original = f.registry.clone();
+        let call = |f: &mut Fixture, voter: usize, algorithm| {
+            execute_authenticated(
+                &f.voters[voter],
+                &input,
+                &mut f.ws,
+                Some(&f.cs),
+                &mut f.registry,
+                Some(1),
+                Some(algorithm),
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(f.call(0, &input, 1).unwrap(), encode_bool(false));
+        assert_eq!(call(&mut f, 0, SignatureType::MlDsa65), encode_bool(false));
+        assert_eq!(
+            call(&mut f, 1, SignatureType::SphincsSha2256f),
+            encode_bool(false)
+        );
+        assert_eq!(f.registry, original);
+        assert_eq!(
+            call(&mut f, 2, SignatureType::SphincsSha2256f),
+            encode_bool(true)
+        );
+        assert_ne!(f.registry, original);
     }
 
     #[test]

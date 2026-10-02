@@ -3219,6 +3219,7 @@ mod tests {
                         registered_key_algorithm_height: None,
                         aa_account_manager_height: None,
                         aa_validator_registry_height: None,
+                        emergency_governance_height: None,
                         native_registry_view_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
@@ -5090,6 +5091,7 @@ mod tests {
                             registered_key_algorithm_height: None,
                             aa_account_manager_height: None,
                             aa_validator_registry_height: None,
+                            emergency_governance_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
@@ -5251,6 +5253,7 @@ mod tests {
                             registered_key_algorithm_height: None,
                             aa_account_manager_height: None,
                             aa_validator_registry_height: None,
+                            emergency_governance_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
@@ -5361,6 +5364,7 @@ mod tests {
                         registered_key_algorithm_height: None,
                         aa_account_manager_height: None,
                         aa_validator_registry_height: None,
+                        emergency_governance_height: None,
                         native_registry_view_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
@@ -8348,6 +8352,170 @@ mod tests {
         assert!(
             AlgorithmRegistry::global().is_allowed(shell_crypto::SignatureType::SphincsSha2256f),
             "rejected imports must restore process-global algorithm status"
+        );
+    }
+
+    #[test]
+    fn emergency_governance_transaction_matches_production_and_import() {
+        const TEST_NAME: &str =
+            "node::tests::emergency_governance_transaction_matches_production_and_import";
+        if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_EMERGENCY_IMPORT") {
+            return;
+        }
+        use shell_crypto::{MlDsaSigner, SignatureType, SphincsSigner};
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let owner = Address::from_public_key(primary.public_key(), SignatureType::MlDsa65.as_u8());
+        // Keep the consensus signer independent of the algorithm being retired.
+        let leader = setup_node_with_authority(owner);
+        let proposer = owner;
+        let follower = setup_node_with_authority(proposer);
+        for node in [&leader, &follower] {
+            fund_account(node, &owner, U256::from(1_000_000_000_000_000_000u64));
+            node.world_state.write().set_validators(&[owner]).unwrap();
+            node.chain_store
+                .initialize_genesis_authority_keys(
+                    &[(owner, primary.public_key().to_vec())],
+                    &[(owner, fallback.public_key().to_vec())],
+                )
+                .unwrap();
+            node.chain_store
+                .put_chain_config(
+                    &serde_json::from_value(serde_json::json!({
+                        "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                        "emergency_governance_height": 1
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            store_consistent_genesis(node);
+        }
+        let hash = submit_signed_tx(
+            &leader,
+            &fallback,
+            owner,
+            Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(shell_pqvm::registry_address()),
+                value: U256::ZERO,
+                data: shell_pqvm::system_contracts::encode_deprecate_algorithm_calldata(
+                    SignatureType::Dilithium3,
+                )
+                .into(),
+                gas_limit: 500_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+        );
+        let before = AlgorithmRegistry::global().clone();
+        let block = leader.produce_block(&primary, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].hash(), hash);
+        assert!(!AlgorithmRegistry::global().is_allowed(SignatureType::Dilithium3));
+        let receipts = leader
+            .chain_store
+            .get_receipts(&block.hash())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipts[0].status, 1);
+        assert!(receipts[0].gas_used > 0);
+        let root = block.header.state_root;
+        *AlgorithmRegistry::global_mut() = before;
+        follower.register_authority_pubkey(proposer, primary.public_key().to_vec());
+        follower
+            .import_block(block.clone(), &MultiVerifier)
+            .unwrap();
+        assert!(!AlgorithmRegistry::global().is_allowed(SignatureType::Dilithium3));
+        assert_eq!(follower.world_state.write().state_root().unwrap(), root);
+        let imported = follower
+            .chain_store
+            .get_receipts(&block.hash())
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported[0].status, receipts[0].status);
+        assert_eq!(imported[0].gas_used, receipts[0].gas_used);
+        for node in [&leader, &follower] {
+            assert_eq!(
+                node.chain_store.get_pubkey(&owner).unwrap().unwrap(),
+                primary.public_key()
+            );
+            assert_eq!(
+                node.chain_store
+                    .get_governance_fallback_key(&owner)
+                    .unwrap()
+                    .unwrap(),
+                fallback.public_key()
+            );
+            assert_eq!(
+                node.world_state
+                    .read()
+                    .get_account(&owner)
+                    .unwrap()
+                    .unwrap()
+                    .nonce,
+                1
+            );
+        }
+        // Replay the same genuine vote from its pre-retirement parent while
+        // canonical state already contains the retired algorithm and nonce one.
+        let canonical_hash = block.hash();
+        let canonical_root = follower.world_state.write().state_root().unwrap();
+        let mut fork = block;
+        fork.header.witness_root = None;
+        // Equal-height forks with a larger hash lose the deterministic tie.
+        for salt in 0u64.. {
+            fork.header.extra_data = Bytes::from(salt.to_be_bytes().to_vec());
+            if fork.hash().as_bytes() > canonical_hash.as_bytes() {
+                break;
+            }
+        }
+        fork.proposer_seal = Some(primary.sign(fork.header.hash().as_bytes()).unwrap());
+        let fork_hash = fork.hash();
+        follower.import_block(fork.clone(), &MultiVerifier).unwrap();
+        assert!(follower
+            .chain_store
+            .get_block_by_hash(&fork_hash)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            follower
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .hash(),
+            canonical_hash
+        );
+        assert_eq!(
+            follower.world_state.write().state_root().unwrap(),
+            canonical_root
+        );
+        assert!(!AlgorithmRegistry::global().is_allowed(SignatureType::Dilithium3));
+        assert_eq!(follower.world_state.read().get_nonce(&owner).unwrap(), 1);
+        // The historical path must still verify the actual fallback signature.
+        fork.transactions[0].signature.data[0] ^= 1;
+        fork.header.extra_data = Bytes::from_static(b"invalid-emergency-governance-replay");
+        fork.proposer_seal = Some(primary.sign(fork.header.hash().as_bytes()).unwrap());
+        let error = follower.import_block(fork, &MultiVerifier).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("signature verification failed")
+                || message.contains("batch sig verification failed"),
+            "unexpected rejection: {message}"
+        );
+        assert_eq!(
+            follower.world_state.write().state_root().unwrap(),
+            canonical_root
+        );
+        assert_eq!(
+            follower.chain_store.get_pubkey(&owner).unwrap().unwrap(),
+            primary.public_key()
         );
     }
 

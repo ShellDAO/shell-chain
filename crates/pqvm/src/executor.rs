@@ -29,9 +29,7 @@ use std::sync::Arc;
 
 use crate::precompiles::ShellPrecompiles;
 use crate::state_db::{ShellStateDb, StateDbError};
-use crate::system_contracts::{
-    self, execute_system_contract_call_at_block, SystemContractEffects, SYSTEM_CALL_BASE_GAS,
-};
+use crate::system_contracts::{self, SystemContractEffects, SYSTEM_CALL_BASE_GAS};
 
 /// Errors returned during PQVM/revm execution.
 #[derive(Debug, thiserror::Error)]
@@ -833,9 +831,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         "native inner call out of gas".into(),
                     ))
                 } else {
-                    execute_system_contract_call_at_block(
+                    system_contracts::execute_signed_system_contract_call(
                         &target,
-                        &sender,
+                        signed_tx,
                         inner.data.as_ref(),
                         world,
                         chain,
@@ -1288,9 +1286,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 "system contracts do not accept value".into(),
             ))
         } else {
-            execute_system_contract_call_at_block(
+            system_contracts::execute_signed_system_contract_call(
                 &target,
-                caller,
+                signed_tx,
                 input,
                 ws,
                 chain_store,
@@ -1585,6 +1583,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -1808,6 +1807,7 @@ mod tests {
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
@@ -1888,6 +1888,7 @@ mod tests {
                             registered_key_algorithm_height: None,
                             aa_account_manager_height: None,
                             aa_validator_registry_height: None,
+                            emergency_governance_height: None,
                             native_registry_view_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
@@ -2457,6 +2458,7 @@ mod tests {
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
+                    emergency_governance_height: None,
                     native_registry_view_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
@@ -5258,6 +5260,162 @@ mod tests {
                     expected
                 );
             });
+        }
+    }
+
+    #[test]
+    fn emergency_governance_signed_execution_and_aa_rollback() {
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, MlDsaSigner, Signer, SphincsSigner,
+        };
+        for fallback in [false, true] {
+            for reject in [false, true] {
+                with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+                    let primary = MlDsaSigner::generate();
+                    let emergency = SphincsSigner::generate();
+                    let owner = ShellAddress::from_public_key(
+                        primary.public_key(),
+                        SignatureType::MlDsa65.as_u8(),
+                    );
+                    let mut evm = setup_native_aa_evm();
+                    let balance = U256::from(10_000_000);
+                    fund_account(&mut evm, &owner, balance);
+                    evm.state_db_mut()
+                        .world_state_mut()
+                        .set_validators(&[owner])
+                        .unwrap();
+                    evm.state_db()
+                        .chain_store()
+                        .initialize_genesis_authority_keys(
+                            &[(owner, primary.public_key().to_vec())],
+                            &[(owner, emergency.public_key().to_vec())],
+                        )
+                        .unwrap();
+                    evm.state_db().chain_store().put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"aa_validator_registry_height":0,"emergency_governance_height":0})).unwrap()).unwrap();
+                    let data = system_contracts::encode_deprecate_algorithm_calldata(
+                        SignatureType::MlDsa65,
+                    );
+                    let mut calls = vec![registry_inner(data.clone())];
+                    if reject && !fallback {
+                        calls.push(registry_inner(vec![0xff; 4]));
+                    }
+                    let mut signed = make_aa_signed(owner, 0, 500_000, 10, calls, None);
+                    let signer: &dyn Signer = if fallback { &emergency } else { &primary };
+                    if fallback {
+                        let mut tx = signed.tx.clone();
+                        tx.tx_type = 2;
+                        tx.to = Some(system_contracts::registry_address());
+                        tx.data = data.into();
+                        signed = SignedTransaction::with_pubkey(
+                            owner,
+                            tx,
+                            signer.sign(&[0]).unwrap(),
+                            signer.public_key().to_vec(),
+                        );
+                    } else {
+                        signed.signature = signer.sign(&[0]).unwrap();
+                    }
+                    signed.signature = signer
+                        .sign(signed.sender_signing_hash().as_bytes())
+                        .unwrap();
+                    if fallback && reject {
+                        signed.signature.data[0] ^= 1;
+                    }
+                    let result = if fallback {
+                        evm.execute_tx(&signed, &sample_header(), 0, 0)
+                    } else {
+                        evm.execute_aa_bundle(&signed, &sample_header(), 0, 0)
+                    }
+                    .unwrap();
+                    assert_eq!(result.receipt.status, u8::from(!reject));
+                    assert!(result.receipt.gas_used > 0);
+                    assert!(result.receipt.gas_used <= signed.tx.gas_limit);
+                    assert_eq!(get_nonce(&mut evm, &owner), 1);
+                    assert_eq!(
+                        get_balance(&mut evm, &owner),
+                        balance - U256::from(result.receipt.gas_used) * U256::from(10)
+                    );
+                    assert_eq!(
+                        shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65),
+                        reject
+                    );
+                    let persisted =
+                        system_contracts::load_algorithm_registry(evm.state_db().world_state())
+                            .unwrap();
+                    assert_eq!(persisted.is_allowed(SignatureType::MlDsa65), reject);
+                    assert_eq!(
+                        evm.state_db()
+                            .chain_store()
+                            .get_pubkey(&owner)
+                            .unwrap()
+                            .unwrap(),
+                        primary.public_key()
+                    );
+                    if reject && !fallback {
+                        // The failed batch must not retain its vote: the identical
+                        // proposal can be voted on again in a successful transaction.
+                        let mut retry = make_aa_signed(
+                            owner,
+                            1,
+                            500_000,
+                            10,
+                            vec![registry_inner(
+                                system_contracts::encode_deprecate_algorithm_calldata(
+                                    SignatureType::MlDsa65,
+                                ),
+                            )],
+                            None,
+                        );
+                        retry.signature = primary.sign(&[0]).unwrap();
+                        retry.signature = primary
+                            .sign(retry.sender_signing_hash().as_bytes())
+                            .unwrap();
+                        assert_eq!(
+                            evm.execute_aa_bundle(&retry, &sample_header(), 0, 0)
+                                .unwrap()
+                                .receipt
+                                .status,
+                            1
+                        );
+                        assert!(!shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65));
+                    }
+                    let mut emergency_batch = make_aa_signed(
+                        owner,
+                        get_nonce(&mut evm, &owner),
+                        500_000,
+                        10,
+                        vec![registry_inner(
+                            system_contracts::encode_deprecate_algorithm_calldata(
+                                SignatureType::Dilithium3,
+                            ),
+                        )],
+                        None,
+                    );
+                    emergency_batch.pubkey_mode =
+                        shell_core::PubkeyMode::Embedded(emergency.public_key().to_vec());
+                    emergency_batch.signature = emergency.sign(&[0]).unwrap();
+                    emergency_batch.signature = emergency
+                        .sign(emergency_batch.sender_signing_hash().as_bytes())
+                        .unwrap();
+                    crate::aa_validation::validate_aa_tx(
+                        &emergency_batch,
+                        evm.state_db().world_state(),
+                        evm.state_db().chain_store(),
+                        &shell_crypto::MultiVerifier,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        evm.execute_aa_bundle(&emergency_batch, &sample_header(), 0, 0)
+                            .unwrap()
+                            .receipt
+                            .status,
+                        1
+                    );
+                    assert!(!shell_crypto::is_algorithm_allowed(
+                        SignatureType::Dilithium3
+                    ));
+                });
+            }
         }
     }
 

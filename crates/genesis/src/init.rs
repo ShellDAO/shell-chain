@@ -21,6 +21,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
 ) -> Result<Block, GenesisError> {
     config.validate_economics()?;
     config.algorithm_voting_window()?;
+    let fallback_commitment = config.governance_fallback_commitment()?;
 
     let mut world_state = WorldState::new(std::sync::Arc::clone(&store));
 
@@ -95,6 +96,10 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         Vec::with_capacity(TRANSACTION_ID_GENESIS_DOMAIN.len() + config.extra_data.len());
     genesis_extra_data.extend_from_slice(TRANSACTION_ID_GENESIS_DOMAIN);
     genesis_extra_data.extend_from_slice(config.extra_data.as_bytes());
+    if let Some(commitment) = fallback_commitment {
+        genesis_extra_data.extend_from_slice(b"SHELL_GOV_V1");
+        genesis_extra_data.extend_from_slice(commitment.as_ref());
+    }
 
     let header = BlockHeader {
         parent_hash: ShellHash::ZERO,
@@ -146,6 +151,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
                 registered_key_algorithm_height: config.registered_key_algorithm_height,
                 aa_account_manager_height: config.aa_account_manager_height,
                 aa_validator_registry_height: config.aa_validator_registry_height,
+                emergency_governance_height: config.emergency_governance_height,
                 native_registry_view_height: config.native_registry_view_height,
                 native_validator_events_height: config.native_validator_events_height,
                 prover_registry_height: config.prover_registry_height,
@@ -175,8 +181,79 @@ pub fn initialize_authority_pubkeys<S: KvStore + 'static>(
         config.consensus.authority_pubkeys(),
     );
 
+    let commitment = config.governance_fallback_commitment()?;
+    if let Some(genesis) = chain_store
+        .get_block_by_number(0)
+        .map_err(|e| GenesisError::StateInit(e.to_string()))?
+    {
+        let extra = genesis.header.extra_data.as_ref();
+        if commitment.is_none()
+            && extra.len() >= 44
+            && &extra[extra.len() - 44..extra.len() - 32] == b"SHELL_GOV_V1"
+        {
+            return Err(GenesisError::Validation(
+                "genesis governance bindings omitted".into(),
+            ));
+        }
+        if let Some(hash) = commitment {
+            let mut suffix = b"SHELL_GOV_V1".to_vec();
+            suffix.extend_from_slice(hash.as_ref());
+            if !genesis.header.extra_data.as_ref().ends_with(&suffix) {
+                return Err(GenesisError::Validation(
+                    "governance keys do not match genesis commitment".into(),
+                ));
+            }
+        }
+    }
+
+    let mut fallback_keys = Vec::with_capacity(config.governance_fallback_keys.len());
+    for (address, encoded) in &config.governance_fallback_keys {
+        let Some(index) = authorities
+            .iter()
+            .position(|authority| authority == address)
+        else {
+            return Err(GenesisError::Validation(
+                "governance key is not a genesis authority".into(),
+            ));
+        };
+        let primary = authority_pubkeys
+            .get(index)
+            .and_then(|key| hex::decode(key.trim_start_matches("0x")).ok())
+            .ok_or_else(|| {
+                GenesisError::Validation("governance fallback requires a primary key".into())
+            })?;
+        if primary.len() != 1952 {
+            return Err(GenesisError::Validation(
+                "governance fallback requires an ML-DSA primary key".into(),
+            ));
+        }
+        let key = hex::decode(encoded.trim_start_matches("0x"))
+            .map_err(|e| GenesisError::Validation(format!("invalid governance key hex: {e}")))?;
+        if key.len() != 64 {
+            return Err(GenesisError::Validation(
+                "invalid SLH-DSA governance key length".into(),
+            ));
+        }
+        fallback_keys.push((*address, key));
+    }
+    // Validate every binding before any writes, including restart mismatches.
+    for (address, key) in &fallback_keys {
+        if let Some(existing) = chain_store
+            .get_governance_fallback_key(address)
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?
+        {
+            if existing != *key {
+                return Err(GenesisError::Validation(
+                    "genesis governance key changed".into(),
+                ));
+            }
+        }
+    }
+
     if authority_pubkeys.is_empty() {
-        return Ok(());
+        return chain_store
+            .initialize_genesis_authority_keys(&[], &[])
+            .map_err(|e| GenesisError::StateInit(e.to_string()));
     }
 
     if authority_pubkeys.len() != authorities.len() {
@@ -187,13 +264,15 @@ pub fn initialize_authority_pubkeys<S: KvStore + 'static>(
         )));
     }
 
+    let mut primary_keys = Vec::with_capacity(authority_pubkeys.len());
     for (address, pubkey_hex) in authorities.iter().zip(authority_pubkeys.iter()) {
         let pubkey = hex::decode(pubkey_hex.trim_start_matches("0x"))
             .map_err(|e| GenesisError::Validation(format!("invalid authority pubkey hex: {e}")))?;
-        chain_store
-            .put_pubkey(address, &pubkey)
-            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        primary_keys.push((*address, pubkey));
     }
+    chain_store
+        .initialize_genesis_authority_keys(&primary_keys, &fallback_keys)
+        .map_err(|e| GenesisError::StateInit(e.to_string()))?;
 
     Ok(())
 }
@@ -309,6 +388,7 @@ mod tests {
         );
 
         GenesisConfig {
+            governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
@@ -322,6 +402,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -394,6 +475,228 @@ mod tests {
 
         assert_eq!(block1.hash(), block2.hash());
         assert_eq!(block1.header.state_root, block2.header.state_root);
+    }
+
+    #[test]
+    fn governance_keys_change_genesis_and_cannot_be_added_to_legacy_chain() {
+        let mut config = test_genesis();
+        if let ConsensusConfig::PoA {
+            authorities,
+            authority_pubkeys,
+            ..
+        } = &mut config.consensus
+        {
+            authority_pubkeys[0] = hex::encode([1; 1952]);
+            authorities[0] =
+                Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8());
+        }
+        let legacy_db = Arc::new(MemoryDb::new());
+        let legacy = initialize_genesis(&config, Arc::clone(&legacy_db)).unwrap();
+        config.emergency_governance_height = Some(0);
+        config.governance_fallback_keys.insert(
+            Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8()),
+            hex::encode([2; 64]),
+        );
+        let cs = ChainStore::new(legacy_db);
+        assert!(initialize_authority_pubkeys(&config, &cs).is_err());
+        assert!(cs
+            .get_pubkey(&Address::from_public_key(
+                &[1; 1952],
+                shell_crypto::SignatureType::MlDsa65.as_u8()
+            ))
+            .unwrap()
+            .is_none());
+        let new_db = Arc::new(MemoryDb::new());
+        let upgraded = initialize_genesis(&config, Arc::clone(&new_db)).unwrap();
+        assert_ne!(legacy.hash(), upgraded.hash());
+        let new_cs = ChainStore::new(new_db);
+        initialize_authority_pubkeys(&config, &new_cs).unwrap();
+        config.governance_fallback_keys.clear();
+        config.emergency_governance_height = None;
+        assert!(initialize_authority_pubkeys(&config, &new_cs).is_err());
+        assert_eq!(
+            new_cs
+                .get_governance_fallback_key(&Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8()
+                ))
+                .unwrap(),
+            Some(vec![2; 64])
+        );
+    }
+
+    #[test]
+    fn governance_fallback_preserves_primary_and_rejects_replacement() {
+        let mut config = test_genesis();
+        if let ConsensusConfig::PoA {
+            authorities,
+            authority_pubkeys,
+            ..
+        } = &mut config.consensus
+        {
+            authority_pubkeys[0] = hex::encode([1; 1952]);
+            authorities[0] =
+                Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8());
+        }
+        config.emergency_governance_height = Some(0);
+        config.governance_fallback_keys.insert(
+            Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8()),
+            hex::encode([2; 64]),
+        );
+        let store = Arc::new(MemoryDb::new());
+        let chain_store = ChainStore::new(Arc::clone(&store));
+        initialize_authority_pubkeys(&config, &chain_store).unwrap();
+        let reopened = ChainStore::new(store);
+        assert_eq!(
+            reopened
+                .get_pubkey(&Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8()
+                ))
+                .unwrap(),
+            Some(vec![1; 1952])
+        );
+        assert_eq!(
+            reopened
+                .get_governance_fallback_key(&Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8()
+                ))
+                .unwrap(),
+            Some(vec![2; 64])
+        );
+        initialize_authority_pubkeys(&config, &reopened).unwrap();
+        config.emergency_governance_height = Some(0);
+        config.governance_fallback_keys.insert(
+            Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8()),
+            hex::encode([3; 64]),
+        );
+        assert!(initialize_authority_pubkeys(&config, &reopened).is_err());
+        assert_eq!(
+            reopened
+                .get_governance_fallback_key(&Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8()
+                ))
+                .unwrap(),
+            Some(vec![2; 64])
+        );
+    }
+
+    #[test]
+    fn invalid_governance_binding_writes_no_primary_keys() {
+        for (address, bytes) in [
+            (
+                Address::from_public_key(&[1; 1952], shell_crypto::SignatureType::MlDsa65.as_u8()),
+                vec![2; 63],
+            ),
+            (Address::from([3; 32]), vec![2; 64]),
+        ] {
+            let mut config = test_genesis();
+            if let ConsensusConfig::PoA {
+                authorities,
+                authority_pubkeys,
+                ..
+            } = &mut config.consensus
+            {
+                authority_pubkeys[0] = hex::encode([1; 1952]);
+                authorities[0] = Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8(),
+                );
+            }
+            config.emergency_governance_height = Some(0);
+            config
+                .governance_fallback_keys
+                .insert(address, hex::encode(bytes));
+            let chain_store = ChainStore::new(Arc::new(MemoryDb::new()));
+            assert!(initialize_authority_pubkeys(&config, &chain_store).is_err());
+            assert!(chain_store
+                .get_pubkey(&Address::from_public_key(
+                    &[1; 1952],
+                    shell_crypto::SignatureType::MlDsa65.as_u8()
+                ))
+                .unwrap()
+                .is_none());
+            assert!(chain_store
+                .get_governance_fallback_key(&address)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn governance_genesis_requires_complete_ml_identity_bindings() {
+        use shell_crypto::{MlDsaSigner, SignatureType, Signer, SphincsSigner};
+        let mut config = test_genesis();
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let owner = Address::from_public_key(primary.public_key(), SignatureType::MlDsa65.as_u8());
+        if let ConsensusConfig::PoA {
+            authorities,
+            authority_pubkeys,
+            ..
+        } = &mut config.consensus
+        {
+            *authorities = vec![owner];
+            *authority_pubkeys = vec![hex::encode(primary.public_key())];
+        }
+        config.emergency_governance_height = Some(5);
+        config
+            .governance_fallback_keys
+            .insert(owner, hex::encode(fallback.public_key()));
+        let db = Arc::new(MemoryDb::new());
+        let block = initialize_genesis(&config, db.clone()).unwrap();
+        let chain = ChainStore::new(db);
+        initialize_authority_pubkeys(&config, &chain).unwrap();
+        assert_eq!(
+            chain.get_pubkey(&owner).unwrap().unwrap(),
+            primary.public_key()
+        );
+        assert_eq!(
+            chain.get_governance_fallback_key(&owner).unwrap().unwrap(),
+            fallback.public_key()
+        );
+        assert!(block.header.extra_data.len() >= 44);
+        let mut wrong = config.clone();
+        if let ConsensusConfig::PoA { authorities, .. } = &mut wrong.consensus {
+            authorities[0] = Address::ZERO;
+        }
+        wrong.governance_fallback_keys =
+            [(Address::ZERO, hex::encode(fallback.public_key()))].into();
+        assert!(wrong
+            .governance_fallback_commitment()
+            .unwrap_err()
+            .to_string()
+            .contains("authority address"));
+        let second = MlDsaSigner::generate();
+        let second_address =
+            Address::from_public_key(second.public_key(), SignatureType::MlDsa65.as_u8());
+        if let ConsensusConfig::PoA {
+            authorities,
+            authority_pubkeys,
+            ..
+        } = &mut config.consensus
+        {
+            authorities.push(second_address);
+            authority_pubkeys.push(hex::encode(second.public_key()));
+        }
+        assert!(config
+            .governance_fallback_commitment()
+            .unwrap_err()
+            .to_string()
+            .contains("every genesis authority"));
+        let fresh = Arc::new(MemoryDb::new());
+        assert!(initialize_genesis(&config, fresh.clone()).is_err());
+        assert!(ChainStore::new(fresh).get_head_block().unwrap().is_none());
+        config
+            .governance_fallback_keys
+            .insert(second_address, hex::encode(fallback.public_key()));
+        assert!(config
+            .governance_fallback_commitment()
+            .unwrap_err()
+            .to_string()
+            .contains("shared by multiple"));
     }
 
     #[test]
@@ -575,6 +878,7 @@ mod tests {
         let v1 = Address::from([0x01; 32]);
         let v2 = Address::from([0x02; 32]);
         let config = GenesisConfig {
+            governance_fallback_keys: Default::default(),
             consensus: ConsensusConfig::WPoA {
                 authorities: vec![v1, v2],
                 authority_pubkeys: vec![],
@@ -611,6 +915,7 @@ mod tests {
             },
         );
         let config = GenesisConfig {
+            governance_fallback_keys: Default::default(),
             consensus: ConsensusConfig::WPoA {
                 authorities: vec![v1, v2],
                 authority_pubkeys: vec![],
@@ -647,6 +952,7 @@ mod tests {
     fn staking_genesis_rejects_supply_mismatch() {
         let v1 = Address::from([0x01; 32]);
         let config = GenesisConfig {
+            governance_fallback_keys: Default::default(),
             consensus: ConsensusConfig::WPoA {
                 authorities: vec![v1],
                 authority_pubkeys: vec![],

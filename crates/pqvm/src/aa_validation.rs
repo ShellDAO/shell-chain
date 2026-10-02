@@ -187,6 +187,56 @@ pub fn validate_aa_tx_at_block<S: KvStore + 'static, V: Verifier>(
     )
 }
 
+/// Resolve only a genesis-bound, embedded fallback key for registry mutations.
+/// Batches must contain only registry mutations and cannot delegate a session key. This performs scope and identity checks; callers still verify the
+/// transaction signature and nonce. Fallbacks never become account root keys.
+pub fn governance_fallback_pubkey<S: KvStore + 'static>(
+    tx: &SignedTransaction,
+    world_state: &WorldState<S>,
+    chain_store: &ChainStore<S>,
+    block_number: u64,
+) -> Result<Option<Vec<u8>>, AaValidationError> {
+    if !chain_store.emergency_governance_active(block_number)? {
+        return Ok(None);
+    }
+    use crate::system_contracts::{
+        DEPRECATE_ALGORITHM_SELECTOR, PROPOSE_ALGORITHM_ACTIVATION_SELECTOR,
+        SUBMIT_ALGORITHM_PROPOSAL_SELECTOR, VOTE_ALGORITHM_PROPOSAL_SELECTOR,
+    };
+    if tx.signature.sig_type != SignatureType::SphincsSha2256f || tx.tx.value != U256::ZERO {
+        return Ok(None);
+    }
+    let allowed_call = |to: Option<Address>, value: U256, data: &[u8]| {
+        to == Some(shell_storage::validator_registry_addr())
+            && value == U256::ZERO
+            && ((data.len() == 260 && data[..4] == SUBMIT_ALGORITHM_PROPOSAL_SELECTOR)
+                || (data.len() == 68 && data[..4] == VOTE_ALGORITHM_PROPOSAL_SELECTOR)
+                || (data.len() == 36 && data[..4] == DEPRECATE_ALGORITHM_SELECTOR)
+                || (data.len() == 100 && data[..4] == PROPOSE_ALGORITHM_ACTIVATION_SELECTOR))
+    };
+    let scoped = match tx.aa_bundle() {
+        Some(bundle) => {
+            bundle.session_auth.is_none()
+                && !bundle.inner_calls.is_empty()
+                && bundle
+                    .inner_calls
+                    .iter()
+                    .all(|call| allowed_call(call.to, call.value, call.data.as_ref()))
+        }
+        None => allowed_call(tx.tx.to, tx.tx.value, tx.tx.data.as_ref()),
+    };
+    if !scoped || !world_state.get_validators()?.contains(&tx.from) {
+        return Ok(None);
+    }
+    let Some(key) = chain_store.get_governance_fallback_key(&tx.from)? else {
+        return Ok(None);
+    };
+    if tx.pubkey_mode.pubkey_bytes() != Some(key.as_slice()) {
+        return Ok(None);
+    }
+    Ok(Some(key))
+}
+
 fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
     signed_tx: &SignedTransaction,
     world_state: &WorldState<S>,
@@ -232,6 +282,44 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
                 protocol_checks_nonce: true,
             });
         }
+    }
+
+    if let Some(fallback) = governance_fallback_pubkey(
+        signed_tx,
+        world_state,
+        chain_store,
+        match validation_header {
+            Some(header) => header.number,
+            None => {
+                validation_block_number(chain_store.get_head_block()?.map(|block| block.number()))
+            }
+        },
+    )? {
+        if !is_algorithm_allowed(signed_tx.signature.sig_type) {
+            return Err(AaValidationError::DisallowedAlgorithm(
+                signed_tx.signature.sig_type,
+            ));
+        }
+        if !verifier.verify(
+            &fallback,
+            signed_tx.sender_signing_hash().as_bytes(),
+            &signed_tx.signature,
+        )? {
+            return Err(AaValidationError::SignatureInvalid);
+        }
+        validate_paymaster_authorization(
+            signed_tx,
+            world_state,
+            chain_store,
+            verifier,
+            validation_header,
+        )?;
+        return Ok(AaValidationOutcome {
+            // Retain the primary root for pool invalidation and execution.
+            pubkey: registered_pubkey.ok_or(AaValidationError::PubkeyNotFound)?,
+            should_register_pubkey: false,
+            protocol_checks_nonce: true,
+        });
     }
 
     let candidate_height = match validation_header {
@@ -1333,6 +1421,383 @@ mod tests {
         Address::from_public_key(signer.public_key(), signer.sig_type().as_u8())
     }
 
+    #[test]
+    fn emergency_governance_activation_boundary() {
+        use shell_crypto::{MlDsaSigner, MultiVerifier, SphincsSigner};
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let from = Address::from_public_key(primary.public_key(), SignatureType::MlDsa65.as_u8());
+        for activation in [None, Some(5)] {
+            let (mut ws, cs) = setup_stores();
+            fund_account(&mut ws, &from);
+            ws.set_validators(&[from]).unwrap();
+            cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1,"genesis_hash":ShellHash::ZERO,"emergency_governance_height":activation})).unwrap()).unwrap();
+            cs.initialize_genesis_authority_keys(
+                &[(from, primary.public_key().to_vec())],
+                &[(from, fallback.public_key().to_vec())],
+            )
+            .unwrap();
+            let mut tx = base_tx(1, 0);
+            tx.to = Some(crate::system_contracts::registry_address());
+            tx.data = crate::system_contracts::encode_deprecate_algorithm_calldata(
+                SignatureType::Dilithium3,
+            )
+            .into();
+            let mut signed = SignedTransaction::with_pubkey(
+                from,
+                tx,
+                fallback.sign(&[0]).unwrap(),
+                fallback.public_key().to_vec(),
+            );
+            signed.signature = fallback
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            for number in [4, 5, 6] {
+                let header = BlockHeader {
+                    number,
+                    ..Default::default()
+                };
+                let enabled = activation.is_some_and(|height| number >= height);
+                assert_eq!(
+                    validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header).is_ok(),
+                    enabled
+                );
+                assert_eq!(
+                    governance_fallback_pubkey(&signed, &ws, &cs, number)
+                        .unwrap()
+                        .is_some(),
+                    enabled
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_governance_fallback_is_scoped_and_preserves_primary() {
+        use shell_crypto::{MlDsaSigner, MultiVerifier, SphincsSigner};
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let from = Address::from_public_key(primary.public_key(), SignatureType::MlDsa65.as_u8());
+        let (mut ws, cs) = setup_stores();
+        cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1,"genesis_hash":ShellHash::ZERO,"emergency_governance_height":0})).unwrap()).unwrap();
+        fund_account(&mut ws, &from);
+        ws.set_validators(&[from]).unwrap();
+        cs.initialize_genesis_authority_keys(
+            &[(from, primary.public_key().to_vec())],
+            &[(from, fallback.public_key().to_vec())],
+        )
+        .unwrap();
+        let mut tx = base_tx(1, 0);
+        tx.to = Some(shell_storage::validator_registry_addr());
+        let mut data = crate::system_contracts::VOTE_ALGORITHM_PROPOSAL_SELECTOR.to_vec();
+        data.extend_from_slice(&[0; 64]);
+        tx.data = Bytes::from(data);
+        let mut signed = SignedTransaction::with_pubkey(
+            from,
+            tx,
+            fallback.sign(&[0]).unwrap(),
+            fallback.public_key().to_vec(),
+        );
+        signed.signature = fallback
+            .sign(signed.sender_signing_hash().as_bytes())
+            .unwrap();
+        let result = validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).unwrap();
+        assert_eq!(result.pubkey, primary.public_key());
+        assert!(!result.should_register_pubkey);
+        assert_eq!(cs.get_pubkey(&from).unwrap().unwrap(), primary.public_key());
+        let mut tampered = signed.clone();
+        tampered.tx.nonce += 1;
+        assert!(validate_aa_tx(&tampered, &ws, &cs, &MultiVerifier).is_err());
+        let mut transfer = signed.clone();
+        transfer.tx.to = Some(Address::from([3; 32]));
+        transfer.signature = fallback
+            .sign(transfer.sender_signing_hash().as_bytes())
+            .unwrap();
+        assert!(validate_aa_tx(&transfer, &ws, &cs, &MultiVerifier).is_err());
+        let mut outer = signed.tx.clone();
+        outer.tx_type = shell_core::AA_BUNDLE_TX_TYPE;
+        outer.to = None;
+        outer.data = Bytes::new();
+        outer.gas_limit = 500_000;
+        let call = shell_core::InnerCall {
+            to: signed.tx.to,
+            value: U256::ZERO,
+            data: signed.tx.data.clone(),
+            gas_limit: 100_000,
+        };
+        let mut batch = SignedTransaction::with_aa_bundle(
+            from,
+            outer.clone(),
+            fallback.sign(&[0]).unwrap(),
+            signed.pubkey_mode.clone(),
+            shell_core::AaBundle {
+                inner_calls: vec![call.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        batch.signature = fallback
+            .sign(batch.sender_signing_hash().as_bytes())
+            .unwrap();
+        assert!(validate_aa_tx(&batch, &ws, &cs, &MultiVerifier).is_ok());
+        let mut unrelated = call.clone();
+        unrelated.to = Some(Address::from([3; 32]));
+        let mut mixed = SignedTransaction::with_aa_bundle(
+            from,
+            outer.clone(),
+            fallback.sign(&[0]).unwrap(),
+            signed.pubkey_mode.clone(),
+            shell_core::AaBundle {
+                inner_calls: vec![call.clone(), unrelated],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        mixed.signature = fallback
+            .sign(mixed.sender_signing_hash().as_bytes())
+            .unwrap();
+        assert!(validate_aa_tx(&mixed, &ws, &cs, &MultiVerifier).is_err());
+        // A valid emergency signature cannot authorize an unsigned sponsor.
+        let mut sponsored = SignedTransaction::with_aa_bundle(
+            from,
+            outer,
+            fallback.sign(&[0]).unwrap(),
+            signed.pubkey_mode.clone(),
+            shell_core::AaBundle {
+                inner_calls: vec![call],
+                paymaster: Some(Address::from([9; 32])),
+                paymaster_signature: Some(Bytes::from(vec![0; 1])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sponsored.signature = fallback
+            .sign(sponsored.sender_signing_hash().as_bytes())
+            .unwrap();
+        assert!(validate_aa_tx(&sponsored, &ws, &cs, &MultiVerifier).is_err());
+        ws.set_validators(&[]).unwrap();
+        assert!(validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_err());
+    }
+
+    #[test]
+    fn signed_legacy_activation_requires_one_algorithm_quorum() {
+        use crate::system_contracts::{
+            encode_propose_algorithm_activation_calldata, execute_signed_system_contract_call,
+            process_pending_activations, registry_address,
+        };
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, AlgorithmStatus, MlDsaSigner,
+            SphincsSigner,
+        };
+        let primary: Vec<_> = (0..3).map(|_| MlDsaSigner::generate()).collect();
+        let fallback: Vec<_> = (0..3).map(|_| SphincsSigner::generate()).collect();
+        let addresses: Vec<_> = primary
+            .iter()
+            .map(|key| Address::from_public_key(key.public_key(), SignatureType::MlDsa65.as_u8()))
+            .collect();
+        let (mut ws, cs) = setup_stores();
+        ws.set_validators(&addresses).unwrap();
+        cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1,"genesis_hash":ShellHash::ZERO,"emergency_governance_height":0})).unwrap()).unwrap();
+        cs.initialize_genesis_authority_keys(
+            &addresses
+                .iter()
+                .zip(&primary)
+                .map(|(a, k)| (*a, k.public_key().to_vec()))
+                .collect::<Vec<_>>(),
+            &addresses
+                .iter()
+                .zip(&fallback)
+                .map(|(a, k)| (*a, k.public_key().to_vec()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            for (index, emergency, approved) in
+                [(0, false, false), (1, true, false), (2, true, true)]
+            {
+                let signer: &dyn Signer = if emergency {
+                    &fallback[index]
+                } else {
+                    &primary[index]
+                };
+                let mut tx = base_tx(1, 0);
+                tx.to = Some(registry_address());
+                tx.data = encode_propose_algorithm_activation_calldata(
+                    SignatureType::Dilithium3,
+                    2_000_000,
+                    [0x44; 32],
+                )
+                .into();
+                let mut signed = SignedTransaction::with_pubkey(
+                    addresses[index],
+                    tx,
+                    signer.sign(&[0]).unwrap(),
+                    signer.public_key().to_vec(),
+                );
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                if emergency {
+                    assert!(governance_fallback_pubkey(&signed, &ws, &cs, 1)
+                        .unwrap()
+                        .is_some());
+                }
+                let result = execute_signed_system_contract_call(
+                    &registry_address(),
+                    &signed,
+                    signed.tx.data.as_ref(),
+                    &mut ws,
+                    &cs,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(result.output[31], u8::from(approved));
+                assert_eq!(
+                    shell_crypto::algorithm_status(SignatureType::Dilithium3),
+                    Some(if approved {
+                        AlgorithmStatus::PendingActivation
+                    } else {
+                        AlgorithmStatus::Active
+                    })
+                );
+                // A minority must not publish an activation that a later block
+                // can apply merely because its requested height has elapsed.
+                if !approved {
+                    assert!(shell_crypto::with_algorithm_registry_mut(|registry| {
+                        process_pending_activations(2_000_000, &mut ws, registry)
+                    })
+                    .unwrap()
+                    .is_empty());
+                }
+            }
+            let activated = shell_crypto::with_algorithm_registry_mut(|registry| {
+                process_pending_activations(2_000_000, &mut ws, registry)
+            })
+            .unwrap();
+            assert_eq!(activated, vec![SignatureType::Dilithium3]);
+        });
+    }
+
+    #[test]
+    fn signed_governance_execution_keeps_quorums_separate_after_ml_deprecation() {
+        use crate::system_contracts::{
+            encode_deprecate_algorithm_calldata, execute_signed_system_contract_call,
+            registry_address,
+        };
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, MlDsaSigner, SphincsSigner,
+        };
+        let primaries: Vec<_> = (0..3).map(|_| MlDsaSigner::generate()).collect();
+        let fallbacks: Vec<_> = (0..3).map(|_| SphincsSigner::generate()).collect();
+        let addresses: Vec<_> = primaries
+            .iter()
+            .map(|key| Address::from_public_key(key.public_key(), SignatureType::MlDsa65.as_u8()))
+            .collect();
+        let (mut ws, cs) = setup_stores();
+        cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1,"genesis_hash":ShellHash::ZERO,"emergency_governance_height":0})).unwrap()).unwrap();
+        ws.set_validators(&addresses).unwrap();
+        cs.initialize_genesis_authority_keys(
+            &addresses
+                .iter()
+                .zip(&primaries)
+                .map(|(a, k)| (*a, k.public_key().to_vec()))
+                .collect::<Vec<_>>(),
+            &addresses
+                .iter()
+                .zip(&fallbacks)
+                .map(|(a, k)| (*a, k.public_key().to_vec()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            // One vote from each algorithm must not form a two-thirds quorum.
+            for (index, fallback, expected) in
+                [(0, false, false), (1, true, false), (2, true, true)]
+            {
+                let mut tx = base_tx(1, 0);
+                tx.to = Some(registry_address());
+                tx.data = Bytes::from(encode_deprecate_algorithm_calldata(SignatureType::MlDsa65));
+                let signer: &dyn Signer = if fallback {
+                    &fallbacks[index]
+                } else {
+                    &primaries[index]
+                };
+                let mut signed = SignedTransaction::with_pubkey(
+                    addresses[index],
+                    tx,
+                    signer.sign(&[0]).unwrap(),
+                    signer.public_key().to_vec(),
+                );
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let mut tampered = signed.clone();
+                tampered.tx.nonce += 1;
+                assert!(execute_signed_system_contract_call(
+                    &registry_address(),
+                    &tampered,
+                    tampered.tx.data.as_ref(),
+                    &mut ws,
+                    &cs,
+                    1
+                )
+                .is_err());
+                let result = execute_signed_system_contract_call(
+                    &registry_address(),
+                    &signed,
+                    signed.tx.data.as_ref(),
+                    &mut ws,
+                    &cs,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(result.output[31], u8::from(expected));
+                assert_eq!(
+                    shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65),
+                    !expected
+                );
+            }
+            // The emergency quorum remains usable after retiring the primary algorithm.
+            for (index, expected) in [(0, false), (1, true)] {
+                let mut tx = base_tx(1, 1);
+                tx.to = Some(registry_address());
+                tx.data = Bytes::from(encode_deprecate_algorithm_calldata(
+                    SignatureType::Dilithium3,
+                ));
+                let signer = &fallbacks[index];
+                let mut signed = SignedTransaction::with_pubkey(
+                    addresses[index],
+                    tx,
+                    signer.sign(&[0]).unwrap(),
+                    signer.public_key().to_vec(),
+                );
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let result = execute_signed_system_contract_call(
+                    &registry_address(),
+                    &signed,
+                    signed.tx.data.as_ref(),
+                    &mut ws,
+                    &cs,
+                    2,
+                )
+                .unwrap();
+                assert_eq!(result.output[31], u8::from(expected));
+                assert_eq!(
+                    cs.get_pubkey(&addresses[index]).unwrap().unwrap(),
+                    primaries[index].public_key()
+                );
+            }
+            assert!(!shell_crypto::is_algorithm_allowed(
+                SignatureType::Dilithium3
+            ));
+            assert!(shell_crypto::is_algorithm_allowed(
+                SignatureType::SphincsSha2256f
+            ));
+        });
+    }
+
     fn base_tx(chain_id: u64, nonce: u64) -> Transaction {
         Transaction {
             chain_id,
@@ -1770,6 +2235,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,

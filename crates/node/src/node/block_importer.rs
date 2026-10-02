@@ -694,6 +694,18 @@ impl<S: KvStore + 'static> Node<S> {
                     continue;
                 }
 
+                if let Some(key) = shell_pqvm::governance_fallback_pubkey(
+                    tx,
+                    &signature_state,
+                    &replay_cs,
+                    block.number(),
+                )
+                .map_err(|e| NodeError::Startup(e.to_string()))?
+                {
+                    signing_pubkeys.push(Some(key));
+                    continue;
+                }
+
                 let root_pubkey = match &tx.pubkey_mode {
                     shell_core::PubkeyMode::Embedded(pubkey) => {
                         block_pubkeys
@@ -1634,6 +1646,18 @@ impl<S: KvStore + 'static> Node<S> {
                     .is_some();
                 if uses_custom_validator {
                     signing_pubkeys.push(None);
+                    continue;
+                }
+
+                if let Some(key) = shell_pqvm::governance_fallback_pubkey(
+                    tx,
+                    &signature_state,
+                    &import_cs,
+                    block.number(),
+                )
+                .map_err(|e| NodeError::Startup(e.to_string()))?
+                {
+                    signing_pubkeys.push(Some(key));
                     continue;
                 }
 

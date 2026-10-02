@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use shell_crypto::{DilithiumSigner, MlDsaSigner, SignatureType, Signer};
-use shell_keystore::{encrypt, encrypt_mldsa, migrate_keystore, EncryptedKey};
+use shell_crypto::{DilithiumSigner, MlDsaSigner, SignatureType, Signer, SphincsSigner};
+use shell_keystore::{encrypt, encrypt_mldsa, encrypt_sphincs, migrate_keystore, EncryptedKey};
 use shell_primitives::Address;
 
 use tracing::info;
@@ -13,7 +13,7 @@ use crate::secure_file::{read_sensitive_file, write_sensitive_file_new};
 
 /// Generate a new keypair and encrypt it to a keystore file.
 ///
-/// `algorithm` selects the PQ algorithm: `"dilithium3"` (default) or `"mldsa65"`.
+/// `algorithm` selects the PQ algorithm: `"dilithium3"` (default) `"mldsa65"`, or `"slhdsa"`.
 pub fn key_generate(
     output: PathBuf,
     password_args: PasswordArgs,
@@ -31,6 +31,12 @@ pub fn key_generate(
             let pubkey_hex = hex::encode(signer.public_key());
             (encrypted, pubkey_hex, address)
         }
+        "slhdsa" | "sphincs-sha2-256f" => {
+            let signer = SphincsSigner::generate();
+            let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let encrypted = encrypt_sphincs(&signer, password.as_bytes())?;
+            (encrypted, hex::encode(signer.public_key()), address)
+        }
         "dilithium3" | "" => {
             info!("Generating Dilithium3 keypair...");
             let signer = DilithiumSigner::generate();
@@ -41,9 +47,10 @@ pub fn key_generate(
             (encrypted, pubkey_hex, address)
         }
         other => {
-            return Err(
-                format!("unsupported algorithm: {other}; valid: dilithium3, mldsa65").into(),
-            );
+            return Err(format!(
+                "unsupported algorithm: {other}; valid: dilithium3, mldsa65, slhdsa"
+            )
+            .into());
         }
     };
 

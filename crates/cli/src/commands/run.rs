@@ -381,6 +381,7 @@ async fn initialize_chain<S: KvStore + 'static>(
                 registered_key_algorithm_height: genesis_config.registered_key_algorithm_height,
                 aa_account_manager_height: genesis_config.aa_account_manager_height,
                 aa_validator_registry_height: genesis_config.aa_validator_registry_height,
+                emergency_governance_height: genesis_config.emergency_governance_height,
                 native_registry_view_height: genesis_config.native_registry_view_height,
                 native_validator_events_height: genesis_config.native_validator_events_height,
                 prover_registry_height: genesis_config.prover_registry_height,
@@ -496,6 +497,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.aa_validator_registry_height
         || stored
             .as_ref()
+            .and_then(|config| config.emergency_governance_height)
+            != genesis_config.emergency_governance_height
+        || stored
+            .as_ref()
             .and_then(|config| config.native_registry_view_height)
             != genesis_config.native_registry_view_height
         || stored
@@ -537,6 +542,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             registered_key_algorithm_height: genesis_config.registered_key_algorithm_height,
             aa_account_manager_height: genesis_config.aa_account_manager_height,
             aa_validator_registry_height: genesis_config.aa_validator_registry_height,
+            emergency_governance_height: genesis_config.emergency_governance_height,
             native_registry_view_height: genesis_config.native_registry_view_height,
             native_validator_events_height: genesis_config.native_validator_events_height,
             prover_registry_height: genesis_config.prover_registry_height,
@@ -752,6 +758,7 @@ async fn run_with_store<S: KvStore + 'static>(
         );
 
         let config = GenesisConfig {
+            governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
@@ -765,6 +772,7 @@ async fn run_with_store<S: KvStore + 'static>(
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -1328,6 +1336,7 @@ mod tests {
 
     fn test_genesis(authority: Address) -> GenesisConfig {
         GenesisConfig {
+            governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
@@ -1341,6 +1350,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -1583,6 +1593,7 @@ mod tests {
             registered_key_algorithm_height: None,
             aa_account_manager_height: None,
             aa_validator_registry_height: None,
+            emergency_governance_height: None,
             native_registry_view_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
@@ -2736,6 +2747,7 @@ mod tests {
                     registered_key_algorithm_height: None,
                     aa_account_manager_height: None,
                     aa_validator_registry_height: None,
+                    emergency_governance_height: None,
                     native_registry_view_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,

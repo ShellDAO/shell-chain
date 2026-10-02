@@ -28,8 +28,17 @@ pub enum TxCommand {
         rpc_url: String,
     },
 
-    /// Send a value transfer transaction.
+    /// Send a transfer or contract transaction.
     Send {
+        /// Registered sender address (defaults to the signing key's address).
+        /// The node must authorize this key for the supplied account.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Contract calldata (hex, optionally prefixed with 0x).
+        #[arg(long)]
+        data: Option<String>,
+
         /// Recipient address (`0x` + 64 lowercase hex).
         #[arg(long)]
         to: String,
@@ -106,6 +115,8 @@ pub fn execute(
     match cmd {
         TxCommand::Receipt { hash, rpc_url } => cmd_receipt(hash, rpc_url),
         TxCommand::Send {
+            from,
+            data,
             to,
             value,
             keystore,
@@ -115,6 +126,8 @@ pub fn execute(
             gas_limit,
         } => cmd_send(
             SendArgs {
+                from,
+                data,
                 to,
                 value,
                 keystore,
@@ -174,6 +187,8 @@ fn cmd_receipt(hash: String, rpc_url: String) -> Result<(), Box<dyn std::error::
 // ---------------------------------------------------------------------------
 
 struct SendArgs {
+    from: Option<String>,
+    data: Option<String>,
     to: String,
     value: String,
     keystore: PathBuf,
@@ -188,6 +203,8 @@ fn cmd_send(
     password_args: &PasswordArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let SendArgs {
+        from,
+        data,
         to,
         value,
         keystore,
@@ -199,7 +216,15 @@ fn cmd_send(
 
     let value_u256 = parse_u256(&value)?;
     let signer = load_keystore(&keystore, password_args)?;
-    let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+    let from = match from {
+        Some(address) => parse_address(&address)?,
+        None => Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()),
+    };
+    let data = data
+        .as_deref()
+        .map(parse_hex_bytes)
+        .transpose()?
+        .unwrap_or_default();
     let to_addr = parse_address(&to)?;
 
     let chain_id = match chain_id {
@@ -217,7 +242,7 @@ fn cmd_send(
         nonce,
         to: Some(to_addr),
         value: value_u256,
-        data: Bytes::default(),
+        data: Bytes::copy_from_slice(&data),
         gas_limit: gas_limit.unwrap_or(21_000),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: 0,
@@ -229,7 +254,7 @@ fn cmd_send(
 
     let gas_limit_final = match gas_limit {
         Some(g) => g,
-        None => rpc_estimate_gas(&rpc_url, &from, Some(&to_addr), &value_u256, &[])?,
+        None => rpc_estimate_gas(&rpc_url, &from, Some(&to_addr), &value_u256, &data)?,
     };
 
     let tx = Transaction {
@@ -398,8 +423,8 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 /// Sign and build a [`SignedTransaction`].
 ///
-/// Checks the on-chain pubkey registry via `rpc_url`: if the sender's pubkey
-/// is already registered, uses [`shell_core::PubkeyMode::Reference`] (saves ~1,952 bytes).
+/// Checks the on-chain pubkey registry via `rpc_url`: if the signing pubkey
+/// matches the registered primary key, uses [`shell_core::PubkeyMode::Reference`] (saves ~1,952 bytes).
 /// On the first transaction from a new address, uses [`shell_core::PubkeyMode::Embedded`].
 fn sign_and_build(
     from: Address,
@@ -410,7 +435,8 @@ fn sign_and_build(
     let tx_hash = tx.signing_hash(signer.sig_type().as_u8());
     let sig = signer.sign(tx_hash.as_bytes())?;
 
-    let pubkey_registered = rpc_is_pubkey_registered(rpc_url, &from).unwrap_or(false);
+    let pubkey_registered =
+        rpc_is_pubkey_registered(rpc_url, &from, signer.public_key()).unwrap_or(false);
     let signed = if pubkey_registered {
         SignedTransaction::new(from, tx, sig)
     } else {
@@ -426,6 +452,7 @@ fn sign_and_build(
 fn rpc_is_pubkey_registered(
     rpc_url: &str,
     addr: &Address,
+    signing_key: &[u8],
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -434,8 +461,11 @@ fn rpc_is_pubkey_registered(
         "id": 1
     });
     let result = rpc_post(rpc_url, &body)?;
-    // result is Some(hex_pubkey_string) if registered, null if not
-    Ok(!result["result"].is_null())
+    // A governance fallback must remain embedded even when the primary exists.
+    Ok(result["result"]
+        .as_str()
+        .and_then(|key| parse_hex_bytes(key).ok())
+        .is_some_and(|key| key == signing_key))
 }
 
 /// RLP-encode and hex-encode a signed transaction, then submit via RPC.
@@ -566,6 +596,76 @@ fn parse_rpc_quantity(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_embeds_fallback_but_references_matching_primary() {
+        use shell_crypto::{MlDsaSigner, MultiVerifier, SphincsSigner, Verifier};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let primary = MlDsaSigner::generate();
+        let fallback = SphincsSigner::generate();
+        let from = Address::from_public_key(primary.public_key(), primary.sig_type().as_u8());
+        for signer in [&primary as &dyn Signer, &fallback as &dyn Signer] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let reply = serde_json::json!({"jsonrpc":"2.0","id":1,"result":format!("0x{}",hex::encode(primary.public_key()))}).to_string();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "shell_getPqPubkey");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+            });
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce: 7,
+                to: Some(Address::from([2; 32])),
+                value: U256::ZERO,
+                data: Bytes::from_static(b"registry-call"),
+                gas_limit: 500_000,
+                max_fee_per_gas: 10,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signed = sign_and_build(from, tx, signer, &url).unwrap();
+            server.join().unwrap();
+            assert_eq!(signed.from, from);
+            assert_eq!(signed.tx.nonce, 7);
+            assert_eq!(signed.tx.data.as_ref(), b"registry-call");
+            assert_eq!(
+                signed.pubkey_mode.pubkey_bytes().is_some(),
+                signer.sig_type() == fallback.sig_type()
+            );
+            assert!(MultiVerifier
+                .verify(
+                    signer.public_key(),
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                )
+                .unwrap());
+        }
+    }
 
     fn submit_with_reply(
         reply: impl FnOnce(&str) -> serde_json::Value,
