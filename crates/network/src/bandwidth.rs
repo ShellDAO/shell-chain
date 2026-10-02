@@ -118,6 +118,8 @@ impl BandwidthTracker {
     }
 
     fn saturating_add_counter(counter: &AtomicU64, bytes: u64) {
+        // Keep compatibility with Rust versions predating the try_update rename.
+        #[allow(deprecated)]
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_add(bytes))
         });

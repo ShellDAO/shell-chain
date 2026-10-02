@@ -55,6 +55,8 @@ pub trait ConsensusEngine: Send + Sync {
     ///
     /// The implementation should set `block.proposer_seal` with a valid
     /// PQ signature over the block header.
+    // async_trait adds #[must_use] to the boxed Future, which is already must-use.
+    #[allow(clippy::double_must_use)]
     async fn seal_block(&self, block: &mut Block) -> Result<(), ConsensusError>;
 
     /// Check whether the given address is the proposer for the given slot.

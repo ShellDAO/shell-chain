@@ -44,6 +44,8 @@ impl PeerCountState {
 
     fn unregister(&self) {
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        // Keep compatibility with Rust versions predating the try_update rename.
+        #[allow(deprecated)]
         let live_peers = self
             .live_peers
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

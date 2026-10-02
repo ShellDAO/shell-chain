@@ -148,6 +148,8 @@ impl SubscriptionTracker {
     /// Release a subscription slot (called when the forwarding task ends).
     /// Saturates at zero to prevent underflow from double-release bugs.
     pub fn release(&self) {
+        // Keep compatibility with Rust versions predating the try_update rename.
+        #[allow(deprecated)]
         let _ = self
             .active
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {

@@ -13,6 +13,8 @@ use std::sync::Arc;
 /// Implementations handle peer management, message serialization,
 /// and gossip protocol details. The node interacts with the network
 /// exclusively through this trait.
+// async_trait adds redundant must_use attributes to its boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NetworkService: Send + Sync {
     /// Broadcast a message to all connected peers.
