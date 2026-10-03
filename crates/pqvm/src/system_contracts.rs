@@ -1847,6 +1847,25 @@ pub fn load_algorithm_registry<S: KvStore + 'static>(
     Ok(registry)
 }
 
+/// Read approved maturity from the supplied parent state without activating it.
+/// Admission must not publish speculative registry changes before a block commits.
+pub(crate) fn approved_algorithm_matured<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+    algo: SignatureType,
+    height: u64,
+) -> Result<bool, shell_storage::StorageError> {
+    let read = |key| world_state.get_storage(&registry_address(), &key);
+    let pending = ShellHash::from(U256::from(3).to_be_bytes::<32>());
+    let approved = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+    if read(algorithm_status_key(algo))? != pending
+        || read(algorithm_quorum_approved_key(algo))? != approved
+    {
+        return Ok(false);
+    }
+    let maturity = U256::from_be_bytes(*read(algorithm_activation_height_key(algo))?.as_bytes());
+    Ok(maturity > U256::ZERO && maturity <= U256::from(height))
+}
+
 /// Process algorithm activations whose timelock has elapsed.
 ///
 /// Called once per block (in both block production and import) after the canonical
@@ -3647,6 +3666,7 @@ mod tests {
                 algorithm_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
+                algorithm_activation_admission_height: None,
                 validation_pqvm_height: None,
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
@@ -3734,6 +3754,7 @@ mod tests {
                 algorithm_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
+                algorithm_activation_admission_height: None,
                 validation_pqvm_height: None,
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
@@ -3840,6 +3861,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            algorithm_activation_admission_height: None,
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
@@ -3911,6 +3933,7 @@ mod tests {
                     algorithm_deprecation_height: None,
                     algorithm_session_deprecation_height: None,
                     algorithm_paymaster_deprecation_height: None,
+                    algorithm_activation_admission_height: None,
                     validation_pqvm_height: None,
                     validation_deprecation_height: None,
                     session_registered_root_height: None,
@@ -4063,6 +4086,7 @@ mod tests {
                 algorithm_deprecation_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
+                algorithm_activation_admission_height: None,
                 validation_pqvm_height: None,
                 validation_deprecation_height: None,
                 session_registered_root_height: None,
@@ -4384,6 +4408,41 @@ mod tests {
         let error = load_algorithm_registry(&ws).unwrap_err();
 
         assert!(matches!(error, SystemContractError::AbiDecode(_)));
+    }
+
+    #[test]
+    fn approved_maturity_requires_canonical_status_quorum_and_height() {
+        let algo = SignatureType::SphincsSha2256f;
+        for (status, approval, maturity, candidate, expected) in [
+            (3u64, 1u64, 5u64, 4u64, false),
+            (3, 1, 5, 5, true),
+            (3, 1, 5, 6, true),
+            (3, 0, 5, 5, false),
+            (3, 2, 5, 5, false),
+            (2, 1, 5, 5, false),
+            (0, 1, 5, 5, false),
+            (3, 1, 0, 5, false),
+        ] {
+            let mut ws = setup_with_validators(&[]);
+            for (key, value) in [
+                (algorithm_status_key(algo), status),
+                (algorithm_quorum_approved_key(algo), approval),
+                (algorithm_activation_height_key(algo), maturity),
+            ] {
+                ws.set_storage(
+                    &registry_address(),
+                    &key,
+                    &ShellHash::from(U256::from(value).to_be_bytes::<32>()),
+                )
+                .unwrap();
+            }
+            let root = ws.state_root().unwrap();
+            assert_eq!(
+                approved_algorithm_matured(&ws, algo, candidate).unwrap(),
+                expected
+            );
+            assert_eq!(ws.state_root().unwrap(), root);
+        }
     }
 
     #[test]

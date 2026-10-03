@@ -374,6 +374,8 @@ async fn initialize_chain<S: KvStore + 'static>(
                     .algorithm_session_deprecation_height,
                 algorithm_paymaster_deprecation_height: genesis_config
                     .algorithm_paymaster_deprecation_height,
+                algorithm_activation_admission_height: genesis_config
+                    .algorithm_activation_admission_height,
                 validation_pqvm_height: genesis_config.validation_pqvm_height,
                 validation_deprecation_height: genesis_config.validation_deprecation_height,
                 session_registered_root_height: genesis_config.session_registered_root_height,
@@ -469,6 +471,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.algorithm_paymaster_deprecation_height
         || stored
             .as_ref()
+            .and_then(|config| config.algorithm_activation_admission_height)
+            != genesis_config.algorithm_activation_admission_height
+        || stored
+            .as_ref()
             .and_then(|config| config.validation_pqvm_height)
             != genesis_config.validation_pqvm_height
         || stored
@@ -535,6 +541,8 @@ async fn initialize_chain<S: KvStore + 'static>(
                 .algorithm_session_deprecation_height,
             algorithm_paymaster_deprecation_height: genesis_config
                 .algorithm_paymaster_deprecation_height,
+            algorithm_activation_admission_height: genesis_config
+                .algorithm_activation_admission_height,
             validation_pqvm_height: genesis_config.validation_pqvm_height,
             validation_deprecation_height: genesis_config.validation_deprecation_height,
             session_registered_root_height: genesis_config.session_registered_root_height,
@@ -765,6 +773,7 @@ async fn run_with_store<S: KvStore + 'static>(
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            algorithm_activation_admission_height: None,
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
@@ -1343,6 +1352,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            algorithm_activation_admission_height: None,
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
@@ -1586,6 +1596,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            algorithm_activation_admission_height: None,
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,
@@ -2740,6 +2751,7 @@ mod tests {
                     algorithm_deprecation_height: None,
                     algorithm_session_deprecation_height: None,
                     algorithm_paymaster_deprecation_height: None,
+                    algorithm_activation_admission_height: None,
                     validation_pqvm_height: None,
                     validation_deprecation_height: None,
                     session_registered_root_height: None,

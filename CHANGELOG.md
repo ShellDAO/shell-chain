@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add default-off `algorithm_activation_admission_height` so direct account
+  signatures can enter and execute in an approved algorithm's activation block.
+  Eligibility reads the candidate height and persisted quorum without publishing
+  speculative process-wide activation. Omitted schedules retain legacy behavior.
+
 - Preserve proof challenge deadlines and terminal states across database recovery.
   Commit timeout penalties with their challenge state and restore absolute PoA/WPoA
   reductions without applying them twice. Later equivocation penalties share the

@@ -326,7 +326,19 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
         Some(header) => header.number,
         None => validation_block_number(chain_store.get_head_block()?.map(|block| block.number())),
     };
-    if !is_algorithm_allowed(signed_tx.signature.sig_type) {
+    let matured_direct_account = signed_tx
+        .aa_bundle()
+        .is_none_or(|bundle| bundle.session_auth.is_none())
+        && chain_store
+            .get_chain_config()?
+            .and_then(|config| config.algorithm_activation_admission_height)
+            .is_some_and(|height| candidate_height >= height)
+        && crate::system_contracts::approved_algorithm_matured(
+            world_state,
+            signed_tx.signature.sig_type,
+            candidate_height,
+        )?;
+    if !is_algorithm_allowed(signed_tx.signature.sig_type) && !matured_direct_account {
         // The exception is for an existing root-key account, never a new
         // address or a session key. Pending activation remains fail-closed.
         let registered_root = registered_pubkey.is_some()
@@ -2228,6 +2240,7 @@ mod tests {
             algorithm_deprecation_height: None,
             algorithm_session_deprecation_height: None,
             algorithm_paymaster_deprecation_height: None,
+            algorithm_activation_admission_height: None,
             validation_pqvm_height: None,
             validation_deprecation_height: None,
             session_registered_root_height: None,

@@ -74,6 +74,28 @@ For normal transaction blocks, the reward rules are:
 Reward records are first-class system transactions with deterministic hashes,
 receipts, block inclusion indexes, and address-history indexing.
 
+### Direct account admission at algorithm maturity
+
+The optional `algorithm_activation_admission_height` in `genesis.json` enables
+candidate-height eligibility for direct account signatures. This is an unreleased,
+default-off rule. An omitted or null value preserves the previous behavior: a
+pending algorithm becomes usable only after its activation block commits.
+
+After the configured upgrade height, direct account transactions may execute in
+the algorithm's recorded activation block if the parent state contains canonical
+PendingActivation status, a nonzero elapsed activation height, and quorum approval.
+Mempool validation uses the next block height; import validation uses the supplied
+block header. Signature verification, public-key binding, fees and nonce checks
+still apply. Admission only reads eligibility: the runtime registry and committed
+status change through the existing block activation processor.
+
+The schedule is persisted, immutable once installed, and checked against trusted
+snapshot configuration. Existing chains must select a future height consistently
+on all upgraded nodes. This rule covers direct root signatures; session, paymaster,
+custom-validation and consensus-signature eligibility retain their existing rules.
+Those paths require separate acceptance before claiming complete algorithm agility.
+No public network is activated by this source change.
+
 ### Algorithm governance timelock activation
 
 The optional `algorithm_timelock_activation_height` in `genesis.json` selects

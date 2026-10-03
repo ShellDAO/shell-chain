@@ -177,6 +177,9 @@ pub struct GenesisConfig {
     /// First block preserving registered original-root EOA paymaster authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_paymaster_deprecation_height: Option<u64>,
+    /// First block admitting direct account signatures at approved algorithm maturity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_activation_admission_height: Option<u64>,
     /// First block using the PQVM instruction set for account/paymaster validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_pqvm_height: Option<u64>,
