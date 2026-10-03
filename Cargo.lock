@@ -6135,6 +6135,7 @@ dependencies = [
  "serde_json",
  "shell-consensus",
  "shell-core",
+ "shell-crypto",
  "shell-primitives",
  "shell-storage",
  "tempfile",

@@ -92,6 +92,8 @@ pub fn execute(
             gas_limit,
         } => tx::execute(
             tx::TxCommand::Send {
+                from: None,
+                data: None,
                 to,
                 value,
                 keystore,

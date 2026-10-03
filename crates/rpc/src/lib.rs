@@ -3,7 +3,11 @@
 //! Provides Ethereum-compatible `eth_*` endpoints and shell-chain
 //! extension `shell_*` endpoints for post-quantum features.
 
+// jsonrpsee generates async_trait methods with redundant must_use on boxed futures.
+#[allow(clippy::double_must_use)]
 pub mod admin;
+// jsonrpsee generates async_trait methods with redundant must_use on boxed futures.
+#[allow(clippy::double_must_use)]
 pub mod api;
 pub mod auth;
 pub mod dev_control;
@@ -13,6 +17,8 @@ pub mod filter_registry;
 pub mod handler;
 pub mod middleware;
 pub mod server;
+// jsonrpsee generates async_trait methods with redundant must_use on boxed futures.
+#[allow(clippy::double_must_use)]
 pub mod subscriptions;
 pub mod tls;
 pub mod tls_proxy;

@@ -551,6 +551,8 @@ async fn main() -> AResult<()> {
 
             while test_start.elapsed() < deadline {
                 // Respect block budget: try to claim a slot
+                // Keep compatibility with Rust versions predating the try_update rename.
+                #[allow(deprecated)]
                 let slot = block_budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     if b > 0 {
                         Some(b - 1)

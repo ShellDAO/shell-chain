@@ -100,6 +100,7 @@ pub fn init(
             );
 
             GenesisConfig {
+                governance_fallback_keys: Default::default(),
                 log_address_activation_height: None,
                 algorithm_voting_window_activation_height: None,
                 algorithm_proposal_identity_height: None,
@@ -113,6 +114,7 @@ pub fn init(
                 registered_key_algorithm_height: None,
                 aa_account_manager_height: None,
                 aa_validator_registry_height: None,
+                emergency_governance_height: None,
                 native_registry_view_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,

@@ -5,6 +5,9 @@ and are executed as native Rust code — no Solidity bytecode, no compiler neede
 The PQVM/revm execution adapter intercepts calls to these addresses before
 running bytecode.
 
+For opt-in dual-key algorithm registry voting and local acceptance, see
+[Emergency algorithm governance](EMERGENCY_GOVERNANCE.md).
+
 ---
 
 ## Addresses
