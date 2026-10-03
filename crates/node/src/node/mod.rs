@@ -9490,6 +9490,15 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
+        assert_body_backfill(false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
+        assert_body_backfill(true).await;
+    }
+
+    async fn assert_body_backfill(late_peer: bool) {
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
         };
@@ -9499,8 +9508,9 @@ mod tests {
         let (mut node, signer) = setup_node();
         #[cfg(feature = "rocksdb")]
         let directory = std::env::temp_dir().join(format!(
-            "shell-body-gap-{}-{}",
+            "shell-body-gap-{}-{}-{}",
             std::process::id(),
+            late_peer,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -9531,12 +9541,22 @@ mod tests {
         let node = Arc::new(node);
         let bus = NetworkBus::new(64);
         let mut network = bus.join(&NetworkConfig::default());
-        let mut peer = bus.join(&NetworkConfig::default());
+        let mut peer = (!late_peer).then(|| bus.join(&NetworkConfig::default()));
         let handle = tokio::spawn({
             let node = Arc::clone(&node);
             async move { node.run(Arc::new(signer), &mut network).await }
         });
-        let requested = tokio::time::timeout(Duration::from_secs(3), async {
+        if late_peer {
+            // The startup scan runs after a 500 ms capability exchange window.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
+            peer = Some(bus.join(&NetworkConfig::default()));
+        }
+        let mut peer = peer.unwrap();
+        // ChannelNetwork updates peer counts without emitting PeerConnected;
+        // allow the real backfill retry timer to discover the late peer.
+        let wait = if late_peer { 90 } else { 3 };
+        let requested = tokio::time::timeout(Duration::from_secs(wait), async {
             loop {
                 if let Some(NetworkEvent::MessageReceived {
                     message:

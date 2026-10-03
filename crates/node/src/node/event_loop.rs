@@ -710,7 +710,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // A shutdown during startup must still reach the cleanup below.
             let shutdown_requested = *shutdown_rx.borrow();
-            if !shutdown_requested && network.peer_count().await > 0 {
+            if !shutdown_requested {
                 let head = self.head_number();
                 // Availability of genesis does not imply that an interrupted
                 // backfill restored every later canonical body.
@@ -723,21 +723,25 @@ impl<S: KvStore + 'static> Node<S> {
                 });
                 if let Some(start_number) = start {
                     let nonce = Self::wall_clock_millis();
-                    if network
-                        .broadcast(NetworkMessage::BodyRequest {
-                            start_number,
-                            count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
-                            nonce,
-                        })
-                        .await
-                        .is_ok()
+                    // Keep the gap pending even when startup has no peers or
+                    // the initial broadcast fails. PeerConnected and the retry
+                    // timer can then resume it without another node restart.
+                    body_request = Some(BodyRequestState {
+                        nonce,
+                        start_number,
+                        peer: None,
+                        requested_at: std::time::Instant::now(),
+                    });
+                    if network.peer_count().await > 0
+                        && network
+                            .broadcast(NetworkMessage::BodyRequest {
+                                start_number,
+                                count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                nonce,
+                            })
+                            .await
+                            .is_ok()
                     {
-                        body_request = Some(BodyRequestState {
-                            nonce,
-                            start_number,
-                            peer: None,
-                            requested_at: std::time::Instant::now(),
-                        });
                         info!(
                             start_number,
                             head, "L4: kicked historical body back-fill startup scan"
