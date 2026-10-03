@@ -8570,6 +8570,135 @@ mod tests {
     }
 
     #[test]
+    fn approved_activation_admits_new_account_after_maturity() {
+        const TEST_NAME: &str =
+            "node::tests::approved_activation_admits_new_account_after_maturity";
+        if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_NEW_ACCOUNT_ACTIVATION") {
+            return;
+        }
+        *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
+        let account_signer = shell_crypto::SphincsSigner::generate();
+        let algo = account_signer.sig_type();
+        let sender = Address::from_public_key(account_signer.public_key(), algo.as_u8());
+        let recipient = Address::from([0x42; 32]);
+        let (leader, signer) = setup_node();
+        let proposer = leader.config.proposer_address.unwrap();
+        let follower = setup_node_with_authority(proposer);
+        // Controlled maturity isolates admission from the proposal voting delay.
+        for node in [&leader, &follower] {
+            fund_account(node, &sender, U256::from(1_000_000_000_000_000_000u64));
+            configure_pending_activation(node, 2, algo);
+            for (prefix, value) in [
+                ("algorithm_status:", 3u64),
+                ("algorithm_quorum_required:", 1),
+                ("algorithm_quorum_approved:", 1),
+            ] {
+                let mut material = prefix.as_bytes().to_vec();
+                material.push(algo.as_u8());
+                let mut encoded = [0; 32];
+                encoded[24..].copy_from_slice(&value.to_be_bytes());
+                node.world_state
+                    .write()
+                    .set_storage(
+                        &shell_pqvm::registry_address(),
+                        &shell_primitives::keccak256(&material),
+                        &ShellHash::from(encoded),
+                    )
+                    .unwrap();
+            }
+            store_consistent_genesis(node);
+        }
+        follower.register_authority_pubkey(proposer, signer.public_key().to_vec());
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(recipient),
+            value: U256::from(7),
+            data: Bytes::new(),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signature = account_signer
+            .sign(tx.signing_hash(algo.as_u8()).as_bytes())
+            .unwrap();
+        let signed = SignedTransaction::with_pubkey(
+            sender,
+            tx,
+            signature,
+            account_signer.public_key().to_vec(),
+        );
+        for height in 1..=2 {
+            let root = leader.world_state.write().state_root().unwrap();
+            let rejected = leader.tx_pool.insert(
+                signed.clone(),
+                &mut leader.world_state.write(),
+                leader.chain_store.as_ref(),
+                &MultiVerifier,
+            );
+            let error = rejected.expect_err("pending account must be rejected");
+            assert!(
+                error.to_string().contains("disallowed signature algorithm"),
+                "unexpected rejection: {error}"
+            );
+            assert_eq!(leader.world_state.write().state_root().unwrap(), root);
+            assert!(leader.chain_store.get_pubkey(&sender).unwrap().is_none());
+            let before = AlgorithmRegistry::global().clone();
+            let block = leader.produce_block(&signer, 100).unwrap();
+            assert_eq!(block.header.number, height);
+            let root = block.header.state_root;
+            *AlgorithmRegistry::global_mut() = before;
+            follower.import_block(block, &MultiVerifier).unwrap();
+            assert_eq!(follower.world_state.write().state_root().unwrap(), root);
+            assert_eq!(AlgorithmRegistry::global().is_allowed(algo), height == 2);
+            let restored = load_algorithm_registry(&follower.world_state.read()).unwrap();
+            assert_eq!(restored.is_allowed(algo), height == 2);
+        }
+        leader
+            .tx_pool
+            .insert(
+                signed.clone(),
+                &mut leader.world_state.write(),
+                leader.chain_store.as_ref(),
+                &MultiVerifier,
+            )
+            .unwrap();
+        let block = leader.produce_block(&signer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].hash(), signed.hash());
+        follower
+            .import_block(block.clone(), &MultiVerifier)
+            .unwrap();
+        for node in [&leader, &follower] {
+            assert_eq!(
+                node.world_state.write().state_root().unwrap(),
+                block.header.state_root
+            );
+            assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 1);
+            assert_eq!(
+                node.world_state.read().get_balance(&recipient).unwrap(),
+                U256::from(7)
+            );
+            assert_eq!(
+                node.chain_store.get_pubkey(&sender).unwrap().unwrap(),
+                account_signer.public_key()
+            );
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .status,
+                1
+            );
+        }
+    }
+
+    #[test]
     fn activation_transition_propagates_persistence_failure() {
         const TEST_NAME: &str = "node::tests::activation_transition_propagates_persistence_failure";
         const ISOLATED_MARKER: &str = "SHELL_TEST_ISOLATED_ACTIVATION_PRODUCTION_FAILURE";
