@@ -53,7 +53,7 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config <PATH>` | — | TOML configuration file (overrides individual flags) |
+| `--config <PATH>` | — | TOML defaults (explicit CLI flags take precedence) |
 | `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC HTTP listen address |
 | `--network <PROFILE>` | `dev` | Network profile: `dev`, `testnet`, or `mainnet` |
 | `--block-time <MS>` | profile default | Block production interval in milliseconds (overrides profile) |
@@ -88,6 +88,19 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--body-retention <N>` | profile default | Override TX body retention (0 = keep forever) |
 | `--enable-stark-aggregation` | `false` | Enable local STARK aggregate proof generation. Expensive; use only on prover or validator-prover nodes. |
 | `--consensus-engine <ENGINE>` | `poa` | Consensus engine: `poa` or `wpoa` |
+
+In unreleased source builds, `[storage].profile` in a TOML file selects the
+same policy as `run --storage-profile`. For example:
+
+```toml
+[storage]
+profile = "archive"
+```
+
+Load it with `shell-node run --config node.toml`. An explicit
+`--storage-profile full` overrides the file; omission of both settings retains
+`full`. Invalid TOML profiles fail before opening the node database. This
+configuration support does not change the profiles' retention rules.
 
 For checkpoint sync, initialize the local configuration with the intended
 network's trusted genesis before the first run. The snapshot must match that

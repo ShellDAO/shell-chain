@@ -16,8 +16,15 @@ pub struct ShellConfig {
     pub prover: ProverSection,
     pub metrics: MetricsSection,
     pub logging: LoggingSection,
+    pub storage: StorageSection,
     #[serde(alias = "parallel_evm")]
     pub parallel_pqvm: ParallelPqvmSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StorageSection {
+    pub profile: Option<shell_node::pruning::StorageProfile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,6 +113,23 @@ pub fn load_config(path: &std::path::Path) -> Result<ShellConfig, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_profile_config_rejects_unknown_and_non_string_profiles() {
+        for value in ["archive", "full", "light"] {
+            let config: ShellConfig =
+                toml::from_str(&format!("[storage]\nprofile={value:?}")).unwrap();
+            assert_eq!(config.storage.profile.unwrap().as_str(), value);
+        }
+        for value in ["\"archvie\"", "1", "true"] {
+            assert!(toml::from_str::<ShellConfig>(&format!("[storage]\nprofile={value}")).is_err());
+        }
+        assert!(toml::from_str::<ShellConfig>("")
+            .unwrap()
+            .storage
+            .profile
+            .is_none());
+    }
 
     #[test]
     fn prover_priority_accepts_documented_values_and_rejects_typos() {
