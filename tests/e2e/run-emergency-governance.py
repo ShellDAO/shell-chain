@@ -2,8 +2,11 @@
 """Local opt-in governance acceptance. Requires a built shell-node and Python 3.
 
 Run: NODE_BIN=target/debug/shell-node python3 tests/e2e/run-emergency-governance.py
+Add --proposal-only for the signed activation vote and pending-state restart flow.
+That flow preserves the real timelock and does not wait for algorithm maturity.
 Creates temporary keys/data, uses loopback ports, and removes them on exit.
 """
+import argparse
 import json
 import os
 from pathlib import Path
@@ -12,6 +15,11 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--proposal-only", action="store_true",
+                    help="verify a signed activation vote and pending-state CLI restart; does not wait for maturity")
+args = parser.parse_args()
 
 BIN = str(Path(os.environ.get("NODE_BIN", "target/debug/shell-node")).resolve())
 REGISTRY = "0x" + "00" * 31 + "01"
@@ -40,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="shell-emergency-governance-") as direct
     owner = primary["address"]
     data = root / "data"
     data.mkdir()
-    (data / "genesis.json").write_text(json.dumps({
+    genesis = {
         "chain_id": 31337, "chain_name": "local-emergency-governance", "network_type": "Dev",
         "timestamp": int(time.time()) - 2, "gas_limit": 30000000, "extra_data": "local-governance",
         "consensus": {"engine": "poa", "authorities": [owner],
@@ -49,7 +57,14 @@ with tempfile.TemporaryDirectory(prefix="shell-emergency-governance-") as direct
         "alloc": {owner: {"balance": "0xd3c21bcecceda1000000", "nonce": 0}},
         "boot_nodes": [], "emergency_governance_height": 0,
         "governance_fallback_keys": {owner: fallback["public_key"]},
-    }))
+    }
+    if args.proposal_only:
+        genesis.update(algorithm_timelock_activation_height=0,
+                       algorithm_proposal_staging_height=0,
+                       algorithm_quorum_activation_height=0,
+                       algorithm_activation_admission_height=0)
+        genesis["alloc"][fallback["address"]] = {"balance": "0xd3c21bcecceda1000000", "nonce": 0}
+    (data / "genesis.json").write_text(json.dumps(genesis))
     rpc_port, metrics_port = port(), port()
     url = f"http://127.0.0.1:{rpc_port}"
     process = None
@@ -104,6 +119,47 @@ with tempfile.TemporaryDirectory(prefix="shell-emergency-governance-") as direct
 
     try:
         start()
+        if args.proposal_only:
+            # Preserve the real minimum delay; this acceptance stops before maturity.
+            activation = int(rpc("eth_blockNumber"), 16) + 1_296_100
+            calldata = "0x1b7520b8" + f"{2:064x}{activation:064x}" + "44" * 32
+            tx = cli("tx", "send", "--from", owner, "--to", REGISTRY, "--value", "0",
+                     "--data", calldata, "--gas-limit", "500000",
+                     "--keystore", root / "primary", "--rpc-url", url)
+            receipt = wait_for(lambda: rpc("eth_getTransactionReceipt", [tx]))
+            assert int(receipt["status"], 16) == 1, receipt
+            assert int(receipt["gasUsed"], 16) > 0
+            assert activation >= int(receipt["blockNumber"], 16) + 1_296_000
+
+            def pending():
+                return any(row["algo"] == "SphincsSha2256f" and row["status"] == "pending_activation"
+                           for row in rpc("shell_getAlgorithmRegistry"))
+
+            def rejects_pending_transfer():
+                try:
+                    cli("tx", "send", "--to", owner, "--value", "1", "--gas-limit", "100000",
+                        "--keystore", root / "fallback", "--rpc-url", url)
+                except subprocess.CalledProcessError as error:
+                    assert "disallowed" in error.stderr.lower(), error.stderr
+                else:
+                    raise AssertionError("pending algorithm admitted a transfer before maturity")
+                assert int(rpc("eth_getTransactionCount", [fallback["address"], "latest"]), 16) == 0
+
+            assert pending()
+            rejects_pending_transfer()
+            stop()
+            start()
+            assert pending()
+            assert rpc("eth_getTransactionReceipt", [tx])["blockHash"] == receipt["blockHash"]
+            assert int(rpc("eth_getTransactionCount", [owner, "latest"]), 16) == 1
+            assert rpc("shell_getPqPubkey", [owner]).removeprefix("0x") == primary["public_key"].removeprefix("0x")
+            rejects_pending_transfer()
+            print(json.dumps({"proposal_transaction": tx, "calldata": calldata,
+                              "activation_height": activation, "receipt": receipt,
+                              "head_after_restart": rpc("eth_blockNumber"),
+                              "registry_after_restart": rpc("shell_getAlgorithmRegistry")}))
+            print("PASS: signed quorum vote persists pending activation across CLI restart; pre-maturity transfer rejected")
+            raise SystemExit(0)
         # Retire a different algorithm so consensus continues under ML-DSA.
         tx = cli("tx", "send", "--from", owner, "--to", REGISTRY, "--value", "0",
                  "--data", "0xa4b88278" + "00" * 32, "--gas-limit", "500000",
