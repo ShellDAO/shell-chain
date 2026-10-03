@@ -74,6 +74,7 @@ with tempfile.TemporaryDirectory(prefix="shell-emergency-governance-") as direct
                 if result:
                     return result
             except (OSError, RuntimeError):
+                # Startup and receipt polling may fail transiently; retry until the deadline.
                 pass
             time.sleep(0.2)
         raise RuntimeError("acceptance timed out")
