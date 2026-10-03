@@ -1691,6 +1691,132 @@ mod tests {
     }
 
     #[test]
+    fn signed_proposal_admits_new_root_at_requested_maturity() {
+        use crate::system_contracts::{
+            encode_propose_algorithm_activation_calldata, execute_signed_system_contract_call,
+            load_algorithm_registry, process_pending_activations, registry_address,
+        };
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, MlDsaSigner, SphincsSigner,
+        };
+        // Advance only the validation header, never the requested governance delay
+        // or persisted approval. This does not model mining the intervening blocks.
+        const MATURITY: u64 = 2_000_000;
+        let voter = MlDsaSigner::generate();
+        let owner = Address::from_public_key(voter.public_key(), voter.sig_type().as_u8());
+        let account = SphincsSigner::generate();
+        let sender = Address::from_public_key(account.public_key(), account.sig_type().as_u8());
+        let (mut ws, cs) = setup_stores();
+        ws.set_validators(&[owner]).unwrap();
+        cs.put_pubkey(&owner, voter.public_key()).unwrap();
+        fund_account(&mut ws, &sender);
+        cs.put_chain_config(
+            &serde_json::from_value(serde_json::json!({
+                "chain_id":1, "genesis_hash":ShellHash::ZERO,
+                "emergency_governance_height":0,
+                "algorithm_timelock_activation_height":0,
+                "algorithm_proposal_staging_height":0,
+                "algorithm_quorum_activation_height":0,
+                "algorithm_activation_admission_height":0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            let mut vote = base_tx(1, 0);
+            vote.to = Some(registry_address());
+            vote.data = encode_propose_algorithm_activation_calldata(
+                account.sig_type(),
+                MATURITY,
+                [0x44; 32],
+            )
+            .into();
+            let signature = voter
+                .sign(vote.signing_hash(voter.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed_vote =
+                SignedTransaction::with_pubkey(owner, vote, signature, voter.public_key().to_vec());
+            let result = execute_signed_system_contract_call(
+                &registry_address(),
+                &signed_vote,
+                signed_vote.tx.data.as_ref(),
+                &mut ws,
+                &cs,
+                1,
+            )
+            .unwrap();
+            assert_eq!(result.output[31], 1);
+            let pending = load_algorithm_registry(&ws).unwrap();
+            assert!(!pending.is_allowed(account.sig_type()));
+            let tx = base_tx(1, 0);
+            let signature = account
+                .sign(tx.signing_hash(account.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed = SignedTransaction::with_pubkey(
+                sender,
+                tx,
+                signature,
+                account.public_key().to_vec(),
+            );
+            let root = ws.state_root().unwrap();
+            with_algorithm_registry_override(&pending, || {
+                for number in [MATURITY - 1, MATURITY, MATURITY + 1] {
+                    let header = BlockHeader {
+                        number,
+                        gas_limit: 30_000_000,
+                        ..BlockHeader::default()
+                    };
+                    let result = crate::tx_validation::validate_tx_for_import_at_block(
+                        &signed,
+                        &mut ws,
+                        &cs,
+                        &MultiVerifier,
+                        1,
+                        None,
+                        &header,
+                    );
+                    if number < MATURITY {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("disallowed signature algorithm"));
+                    } else {
+                        result.unwrap();
+                        let mut tampered = signed.clone();
+                        tampered.signature.data[0] ^= 1;
+                        assert!(crate::tx_validation::validate_tx_for_import_at_block(
+                            &tampered,
+                            &mut ws,
+                            &cs,
+                            &MultiVerifier,
+                            1,
+                            None,
+                            &header,
+                        )
+                        .is_err());
+                    }
+                    assert_eq!(ws.state_root().unwrap(), root);
+                    assert_eq!(ws.get_nonce(&sender).unwrap(), 0);
+                    assert!(cs.get_pubkey(&sender).unwrap().is_none());
+                }
+            });
+            let mut recovered = load_algorithm_registry(&ws).unwrap();
+            assert!(
+                process_pending_activations(MATURITY - 1, &mut ws, &mut recovered)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                process_pending_activations(MATURITY, &mut ws, &mut recovered).unwrap(),
+                vec![account.sig_type()]
+            );
+            assert!(load_algorithm_registry(&ws)
+                .unwrap()
+                .is_allowed(account.sig_type()));
+        });
+    }
+
+    #[test]
     fn signed_governance_execution_keeps_quorums_separate_after_ml_deprecation() {
         use crate::system_contracts::{
             encode_deprecate_algorithm_calldata, execute_signed_system_contract_call,
