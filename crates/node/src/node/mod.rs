@@ -9489,6 +9489,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
+        use shell_network::{
+            NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+        };
+        use std::time::Duration;
+
+        #[cfg(not(feature = "rocksdb"))]
+        let (mut node, signer) = setup_node();
+        #[cfg(feature = "rocksdb")]
+        let directory = std::env::temp_dir().join(format!(
+            "shell-body-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        #[cfg(feature = "rocksdb")]
+        let (mut node, signer) = {
+            let signer = DilithiumSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let stores = shell_storage::RocksDbStore::open_all(&directory, None).unwrap();
+            (
+                setup_node_with_store(authority, Arc::new(stores.chain)),
+                signer,
+            )
+        };
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+        let missing = node.produce_block(&signer, 100).unwrap();
+        let tip = node.produce_block(&signer, 100).unwrap();
+        // An interrupted migration can retain genesis and the tip while an
+        // interior canonical body is still absent.
+        node.chain_store.delete_body(&missing.hash()).unwrap();
+        assert_eq!(node.oldest_available_body_block(), 0);
+        assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
+        node.config.node_role = crate::NodeRole::Prover;
+        let node = Arc::new(node);
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let mut peer = bus.join(&NetworkConfig::default());
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(Arc::new(signer), &mut network).await }
+        });
+        let requested = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    message:
+                        NetworkMessage::BodyRequest {
+                            start_number,
+                            nonce,
+                            ..
+                        },
+                    peer: requester,
+                }) = peer.next_event().await
+                {
+                    peer.send_to_peer(
+                        &requester,
+                        NetworkMessage::BodyResponse {
+                            blocks: vec![missing.clone(), tip.clone()],
+                            nonce,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    while !node.chain_store.has_body(&missing.hash()).unwrap() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    break start_number;
+                }
+            }
+        })
+        .await;
+        node.shutdown();
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            requested.expect("interior missing body was never requested"),
+            1
+        );
+        let reopened = ChainStore::new(node.store.clone());
+        assert_eq!(
+            reopened
+                .get_block_by_hash(&missing.hash())
+                .unwrap()
+                .unwrap(),
+            missing
+        );
+        assert_eq!(reopened.get_head_hash().unwrap(), Some(tip.hash()));
+        #[cfg(feature = "rocksdb")]
+        {
+            drop(reopened);
+            drop(node);
+            let stores = shell_storage::RocksDbStore::open_all(&directory, None).unwrap();
+            let disk = ChainStore::new(Arc::new(stores.chain));
+            assert_eq!(
+                disk.get_block_by_hash(&missing.hash()).unwrap().unwrap(),
+                missing
+            );
+            assert_eq!(disk.get_head_hash().unwrap(), Some(tip.hash()));
+            drop(disk);
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn event_loop_shutdown_interrupts_startup_backfill_delay() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
