@@ -708,6 +708,16 @@ async fn main() {
             let effective_chain_id =
                 config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
+            let effective_storage_profile = config_or_cli(
+                run_matches,
+                "storage_profile",
+                storage_profile,
+                file_config
+                    .storage
+                    .profile
+                    .map(|profile| profile.as_str().to_owned()),
+            );
+
             // Storage backend: explicit CLI > config file > network-profile default.
             // dev → memory (ephemeral); testnet/mainnet → rocksdb (persistent).
             // If the binary was compiled without the rocksdb feature, fall back to
@@ -819,7 +829,7 @@ async fn main() {
                 state_cache_size_mb,
                 parallel_pqvm: effective_parallel_pqvm,
                 parallel_pqvm_workers: effective_parallel_pqvm_workers,
-                storage_profile,
+                storage_profile: effective_storage_profile,
                 witness_retention,
                 body_retention,
                 enable_stark_aggregation: effective_stark_aggregation,
@@ -956,6 +966,12 @@ mod tests {
 
     #[test]
     fn explicit_run_defaults_override_file_config() {
+        check_config_precedence(
+            "storage_profile",
+            "--storage-profile",
+            "full".to_string(),
+            "archive".to_string(),
+        );
         check_config_precedence(
             "enable_stark_aggregation",
             "--enable-stark-aggregation",

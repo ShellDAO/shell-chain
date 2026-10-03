@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Honor `[storage].profile` in node TOML configuration, with explicit
+  `run --storage-profile` flags taking precedence. Invalid TOML profiles fail
+  configuration parsing instead of silently starting with the full profile.
+
 - Add default-off `algorithm_activation_admission_height` so direct account
   signatures can enter and execute in an approved algorithm's activation block.
   Eligibility reads the candidate height and persisted quorum without publishing
