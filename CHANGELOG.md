@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Resume historical body backfill from the first missing canonical body even
+  when genesis and later bodies already exist after an interrupted migration.
+
 - Honor `[storage].profile` in node TOML configuration, with explicit
   `run --storage-profile` flags taking precedence. Invalid TOML profiles fail
   configuration parsing instead of silently starting with the full profile.

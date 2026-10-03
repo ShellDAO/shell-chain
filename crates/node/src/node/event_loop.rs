@@ -711,14 +711,21 @@ impl<S: KvStore + 'static> Node<S> {
             // A shutdown during startup must still reach the cleanup below.
             let shutdown_requested = *shutdown_rx.borrow();
             if !shutdown_requested && network.peer_count().await > 0 {
-                let oldest = self.oldest_available_body_block();
                 let head = self.head_number();
-                if oldest > 0 {
-                    // There are gaps — request bodies starting from the beginning.
+                // Availability of genesis does not imply that an interrupted
+                // backfill restored every later canonical body.
+                let start = (0..=head).find(|number| {
+                    self.chain_store
+                        .get_block_hash_by_number(*number)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|hash| matches!(self.chain_store.has_body(&hash), Ok(false)))
+                });
+                if let Some(start_number) = start {
                     let nonce = Self::wall_clock_millis();
                     if network
                         .broadcast(NetworkMessage::BodyRequest {
-                            start_number: 0,
+                            start_number,
                             count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                             nonce,
                         })
@@ -727,12 +734,12 @@ impl<S: KvStore + 'static> Node<S> {
                     {
                         body_request = Some(BodyRequestState {
                             nonce,
-                            start_number: 0,
+                            start_number,
                             peer: None,
                             requested_at: std::time::Instant::now(),
                         });
                         info!(
-                            oldest_available = oldest,
+                            start_number,
                             head, "L4: kicked historical body back-fill startup scan"
                         );
                     }
