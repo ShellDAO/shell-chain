@@ -2117,7 +2117,10 @@ mod tests {
     }
 
     fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
-        let db = Arc::new(MemoryDb::new());
+        setup_node_with_store(authority, Arc::new(MemoryDb::new()))
+    }
+
+    fn setup_node_with_store<S: KvStore + 'static>(authority: Address, db: Arc<S>) -> Node<S> {
         let chain_store = Arc::new(ChainStore::new(db.clone()));
         let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
         let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(
@@ -8580,15 +8583,22 @@ mod tests {
         if run_isolated(TEST_NAME, "SHELL_TEST_ISOLATED_NEW_ACCOUNT_ACTIVATION") {
             return;
         }
+        exercise_activation_admission(setup_node_with_authority);
+    }
+
+    fn exercise_activation_admission<S: KvStore + 'static>(
+        mut create: impl FnMut(Address) -> Node<S>,
+    ) {
         for upgrade in [None, Some(2), Some(3)] {
             *AlgorithmRegistry::global_mut() = AlgorithmRegistry::default();
             let account_signer = shell_crypto::SphincsSigner::generate();
             let algo = account_signer.sig_type();
             let sender = Address::from_public_key(account_signer.public_key(), algo.as_u8());
             let recipient = Address::from([0x42; 32]);
-            let (leader, signer) = setup_node();
-            let proposer = leader.config.proposer_address.unwrap();
-            let follower = setup_node_with_authority(proposer);
+            let signer = DilithiumSigner::generate();
+            let proposer = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let leader = create(proposer);
+            let follower = create(proposer);
             // Controlled maturity isolates admission from the proposal voting delay.
             for node in [&leader, &follower] {
                 fund_account(node, &sender, U256::from(1_000_000_000_000_000_000u64));
@@ -8739,6 +8749,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn activation_admission_rocksdb_process_recovery() {
+        const DIRECTORY: &str = "SHELL_ACTIVATION_RECOVERY_DIRECTORY";
+        const PHASE: &str = "SHELL_ACTIVATION_RECOVERY_PHASE";
+        const TEST: &str = "node::tests::activation_admission_rocksdb_process_recovery";
+        if let Ok(directory) = std::env::var(DIRECTORY) {
+            if std::env::var(PHASE).unwrap() == "produce" {
+                let mut index = 0;
+                exercise_activation_admission(|authority| {
+                    let path = std::path::Path::new(&directory).join(index.to_string());
+                    index += 1;
+                    let stores = shell_storage::RocksDbStore::open_all(path, None).unwrap();
+                    setup_node_with_store(authority, Arc::new(stores.chain))
+                });
+            } else {
+                // A fresh process opens only persisted state; no key files or seeded
+                // registry survive from the producer/importer acceptance process.
+                for index in 0..6 {
+                    let path = std::path::Path::new(&directory).join(index.to_string());
+                    let stores = shell_storage::RocksDbStore::open_all(path, None).unwrap();
+                    let db = Arc::new(stores.chain);
+                    let chain = ChainStore::new(db.clone());
+                    let head = chain.get_head_block().unwrap().unwrap();
+                    assert_eq!(head.number(), if index / 2 == 1 { 2 } else { 3 });
+                    assert_eq!(head.transactions.len(), 1);
+                    let signed = &head.transactions[0];
+                    let mut world =
+                        WorldState::at_root(db.clone(), &head.header.state_root).unwrap();
+                    world.validate().unwrap();
+                    let restored = load_algorithm_registry(&world).unwrap();
+                    let algo = shell_crypto::SignatureType::SphincsSha2256f;
+                    assert!(restored.is_allowed(algo));
+                    *AlgorithmRegistry::global_mut() = restored;
+                    assert_eq!(world.get_nonce(&signed.from).unwrap(), 1);
+                    assert_eq!(
+                        world.get_balance(&Address::from([0x42; 32])).unwrap(),
+                        U256::from(7)
+                    );
+                    assert_eq!(
+                        chain.get_pubkey(&signed.from).unwrap().unwrap(),
+                        signed.pubkey_mode.pubkey_bytes().unwrap()
+                    );
+                    assert_eq!(
+                        chain.get_receipts(&head.hash()).unwrap().unwrap()[0].status,
+                        1
+                    );
+                    assert_eq!(
+                        chain
+                            .get_chain_config()
+                            .unwrap()
+                            .unwrap()
+                            .algorithm_activation_admission_height,
+                        [None, Some(2), Some(3)][index / 2]
+                    );
+                    let pool = TxPool::new(MempoolConfig {
+                        chain_id: 1337,
+                        ..MempoolConfig::default()
+                    });
+                    assert!(matches!(
+                        pool.insert(signed.clone(), &mut world, &chain, &MultiVerifier),
+                        Err(shell_mempool::MempoolError::NonceTooLow { got: 0, pending: 1 })
+                    ));
+                    assert_eq!(world.state_root().unwrap(), head.header.state_root);
+                    let genesis = chain.get_block_by_number(0).unwrap().unwrap();
+                    let mut historical =
+                        WorldState::at_root(db, &genesis.header.state_root).unwrap();
+                    assert_eq!(historical.get_nonce(&signed.from).unwrap(), 0);
+                    assert_eq!(
+                        historical.get_balance(&Address::from([0x42; 32])).unwrap(),
+                        U256::ZERO
+                    );
+                    assert!(!load_algorithm_registry(&historical)
+                        .unwrap()
+                        .is_allowed(algo));
+                    assert_eq!(historical.state_root().unwrap(), genesis.header.state_root);
+                }
+            }
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-activation-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let result = ["produce", "recover", "recover"]
+            .into_iter()
+            .try_for_each(|phase| {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(DIRECTORY, &directory)
+                    .env(PHASE, phase)
+                    .status()
+                    .unwrap();
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(phase)
+                }
+            });
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            result.is_ok(),
+            "activation recovery phase failed: {result:?}"
+        );
     }
 
     #[test]
