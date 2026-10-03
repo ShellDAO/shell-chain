@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep historical body gaps pending when a node starts without peers, so a later
+  peer connection can resume backfill without restarting the node.
+
 - Resume historical body backfill from the first missing canonical body even
   when genesis and later bodies already exist after an interrupted migration.
 
