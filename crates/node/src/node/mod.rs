@@ -9515,6 +9515,15 @@ mod tests {
 
     #[test]
     fn legacy_reference_witness_restores_after_sender_nonce_advances() {
+        assert_legacy_reference_recovery(0);
+    }
+
+    #[test]
+    fn legacy_reference_witness_restores_with_older_retained_history() {
+        assert_legacy_reference_recovery(shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS);
+    }
+
+    fn assert_legacy_reference_recovery(extra_blocks: u64) {
         let (node, signer) = setup_node();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
@@ -9557,7 +9566,10 @@ mod tests {
         let mut third = transaction;
         third.nonce = 2;
         submit_signed_tx(&node, &signer, sender, third);
-        let tip = node.produce_block(&signer, 100).unwrap();
+        let mut tip = node.produce_block(&signer, 100).unwrap();
+        for _ in 0..extra_blocks {
+            tip = node.produce_block(&signer, 100).unwrap();
+        }
         assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
         node.store
             .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
@@ -9576,10 +9588,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             node.chain_store.get_block_by_hash(&missing.hash()).unwrap(),
-            Some(missing)
+            Some(missing.clone())
         );
         assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
         assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
+        node.chain_store
+            .prune_finalized_address_metadata_undo(tip.number())
+            .unwrap();
+        let without_history = node.store.scan_prefix(b"").unwrap();
+        assert!(node.validate_legacy_backfill_witness(&missing).is_err());
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), without_history);
     }
 
     #[tokio::test]
