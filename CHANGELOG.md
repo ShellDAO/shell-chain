@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Recover legacy witnesses after metadata undo pruning when a locally captured
+  genesis metadata checkpoint, genesis state, and earlier canonical bodies and
+  witnesses remain available. Keep replay private, resume it across backfill
+  retries, and discard progress when its canonical target or prefix changes.
+  This does not bootstrap checkpoints for existing databases that lack one.
+
 - Authenticate recent legacy witness backfill without a local commitment using
   isolated historical signature and execution replay. Preserve live state and
   atomic body/witness writes; defer unavailable gaps so later recovery proceeds.

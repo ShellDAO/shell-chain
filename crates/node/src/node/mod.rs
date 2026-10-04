@@ -228,6 +228,7 @@ pub struct Node<S: KvStore + 'static> {
     pub config: NodeConfig,
     pub store: Arc<S>,
     pub chain_store: Arc<ChainStore<S>>,
+    legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
     pub world_state: Arc<RwLock<WorldState<S>>>,
     pub tx_pool: Arc<TxPool>,
     pub consensus: Arc<RwLock<dyn ConsensusEngine>>,
@@ -988,6 +989,7 @@ impl<S: KvStore + 'static> Node<S> {
             config,
             store,
             chain_store,
+            legacy_replay: parking_lot::Mutex::new(None),
             world_state,
             tx_pool,
             consensus,
@@ -2415,6 +2417,29 @@ mod tests {
         ws.state_root().unwrap()
     }
 
+    fn assert_pruned_genesis_witness_recovery<S: KvStore + 'static>(node: &Node<S>, block: &Block) {
+        assert!(block.header.witness_root.is_none());
+        node.chain_store
+            .prune_finalized_address_metadata_undo(block.number())
+            .unwrap();
+        node.store
+            .delete(&[b"w/".as_ref(), block.hash().as_bytes()].concat())
+            .unwrap();
+        let before = node.store.scan_prefix(b"").unwrap();
+        node.validate_legacy_backfill_witness(block).unwrap();
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        node.chain_store
+            .put_backfill_block_with_validation(block, true, |candidate| {
+                node.validate_legacy_backfill_witness(candidate)
+                    .map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            node.chain_store.get_block_by_hash(&block.hash()).unwrap(),
+            Some(block.clone())
+        );
+    }
+
     #[test]
     fn import_block_accepts_custom_validator_owned_signature_policy() {
         let (leader, proposer_signer) = setup_node();
@@ -2468,6 +2493,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(follower.world_state.read().get_nonce(&sender).unwrap(), 1);
+
+        assert_pruned_genesis_witness_recovery(&follower, &block);
 
         let mut side_fork = block;
         side_fork.header.extra_data = Bytes::from_static(b"custom-validator-side-fork");
@@ -9490,27 +9517,27 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
-        assert_body_backfill(false, false, false, false, false, false).await;
+        assert_body_backfill(false, false, false, false, false, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
-        assert_body_backfill(true, false, false, false, false, false).await;
+        assert_body_backfill(true, false, false, false, false, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_body_over_libp2p_after_late_connection() {
-        assert_body_backfill(true, true, false, false, false, false).await;
+        assert_body_backfill(true, true, false, false, false, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_with_retained_body() {
-        assert_body_backfill(false, false, true, false, false, false).await;
+        assert_body_backfill(false, false, true, false, false, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_and_body_over_late_tcp_peer() {
-        assert_body_backfill(true, true, true, true, false, false).await;
+        assert_body_backfill(true, true, true, true, false, false, 0).await;
     }
 
     #[test]
@@ -9543,7 +9570,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
         submit_signed_tx(&node, &signer, sender, transaction.clone());
-        node.produce_block(&signer, 100).unwrap();
+        let first = node.produce_block(&signer, 100).unwrap();
         let mut second = transaction.clone();
         second.nonce = 1;
         let signature = signer
@@ -9595,6 +9622,75 @@ mod tests {
         node.chain_store
             .prune_finalized_address_metadata_undo(tip.number())
             .unwrap();
+        node.store
+            .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
+            .unwrap();
+        let before_reconstruction = node.store.scan_prefix(b"").unwrap();
+        assert!(node
+            .advance_legacy_backfill_from_genesis(&missing, 1)
+            .is_err());
+        assert!(node.legacy_replay.lock().is_some());
+        assert!(node
+            .advance_legacy_backfill_from_genesis(&first, 1)
+            .is_err());
+        assert_eq!(
+            node.legacy_replay.lock().as_ref().unwrap().target_hash(),
+            missing.hash()
+        );
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        node.advance_legacy_backfill_from_genesis(&missing, 1)
+            .unwrap();
+        assert!(node.legacy_replay.lock().is_none());
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        // A canonical change invalidates either the requested block or the
+        // replayed prefix. Neither case may restore a witness from a stale cursor.
+        for changed in [&missing, &first] {
+            assert!(node
+                .advance_legacy_backfill_from_genesis(&missing, 1)
+                .is_err());
+            assert!(node.legacy_replay.lock().is_some());
+            node.chain_store
+                .set_canonical(changed.number(), &ShellHash::ZERO)
+                .unwrap();
+            let changed_mapping = node.store.scan_prefix(b"").unwrap();
+            assert!(node
+                .advance_legacy_backfill_from_genesis(&missing, 1)
+                .is_err());
+            assert!(node.legacy_replay.lock().is_none());
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), changed_mapping);
+            node.chain_store
+                .set_canonical(changed.number(), &changed.hash())
+                .unwrap();
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        }
+        assert!(node.validate_legacy_backfill_witness(&bad).is_err());
+        node.validate_legacy_backfill_witness(&missing).unwrap();
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        node.chain_store
+            .put_backfill_block_with_validation(&missing, true, |candidate| {
+                node.validate_legacy_backfill_witness(candidate)
+                    .map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            node.chain_store.get_block_by_hash(&missing.hash()).unwrap(),
+            Some(missing.clone())
+        );
+        let first_witness_key = [b"w/".as_ref(), first.hash().as_bytes()].concat();
+        let first_witness = node.store.get(&first_witness_key).unwrap().unwrap();
+        node.store.delete(&first_witness_key).unwrap();
+        let without_ancestor = node.store.scan_prefix(b"").unwrap();
+        assert!(node.validate_legacy_backfill_witness(&missing).is_err());
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), without_ancestor);
+        node.store.put(&first_witness_key, &first_witness).unwrap();
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        node.store
+            .delete(&[b"amc/".as_ref(), genesis.as_bytes()].concat())
+            .unwrap();
         let without_history = node.store.scan_prefix(b"").unwrap();
         assert!(node.validate_legacy_backfill_witness(&missing).is_err());
         assert_eq!(node.store.scan_prefix(b"").unwrap(), without_history);
@@ -9602,17 +9698,22 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_restores_legacy_witness_with_historical_replay() {
-        assert_body_backfill(false, false, true, false, true, false).await;
+        assert_body_backfill(false, false, true, false, true, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_legacy_witness_and_body() {
-        assert_body_backfill(false, false, true, true, true, false).await;
+        assert_body_backfill(false, false, true, true, true, false, 0).await;
     }
 
     #[tokio::test]
     async fn event_loop_backfill_continues_after_unavailable_witness() {
-        assert_body_backfill(false, false, true, false, true, true).await;
+        assert_body_backfill(false, false, true, false, true, true, 0).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_backfill_resumes_pruned_genesis_replay() {
+        assert_body_backfill(false, false, true, false, true, false, 40).await;
     }
 
     async fn assert_body_backfill(
@@ -9622,6 +9723,7 @@ mod tests {
         remove_body: bool,
         legacy: bool,
         defer_first: bool,
+        replay_prefix: u64,
     ) {
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
@@ -9663,6 +9765,9 @@ mod tests {
             fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
         }
         store_consistent_genesis(&node);
+        for _ in 0..replay_prefix {
+            node.produce_block(&signer, 100).unwrap();
+        }
         if witness_only {
             let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
             submit_signed_tx(
@@ -9710,7 +9815,9 @@ mod tests {
                 let mut tampered = missing.clone();
                 tampered.transactions[0].signature.data[0] ^= 1;
                 assert!(node.validate_legacy_backfill_witness(&tampered).is_err());
-                node.validate_legacy_backfill_witness(&missing).unwrap();
+                if replay_prefix == 0 {
+                    node.validate_legacy_backfill_witness(&missing).unwrap();
+                }
                 assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
             } else {
                 node.chain_store
@@ -9724,6 +9831,12 @@ mod tests {
         } else {
             node.chain_store.delete_body(&missing.hash()).unwrap();
             assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
+        }
+        if replay_prefix > 0 {
+            *node.legacy_replay.lock() = None;
+            node.chain_store
+                .prune_finalized_address_metadata_undo(head.number())
+                .unwrap();
         }
         assert_eq!(node.oldest_available_body_block(), 0);
         if defer_first {
@@ -9793,7 +9906,12 @@ mod tests {
         let mut peer = peer.unwrap();
         // ChannelNetwork updates peer counts without emitting PeerConnected;
         // allow the real backfill retry timer to discover the late peer.
-        let wait = if late_peer { 90 } else { 3 };
+        let wait = if late_peer || replay_prefix > 0 {
+            90
+        } else {
+            3
+        };
+        let mut responses = 0;
         let requested = tokio::time::timeout(Duration::from_secs(wait), async {
             loop {
                 if let Some(NetworkEvent::MessageReceived {
@@ -9833,6 +9951,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                    responses += 1;
+                    if replay_prefix > 0 && responses == 1 {
+                        continue;
+                    }
                     if defer_first {
                         while !node.chain_store.has_body(&tip.hash()).unwrap() {
                             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -9857,7 +9979,11 @@ mod tests {
         handle.await.unwrap().unwrap();
         assert_eq!(
             requested.expect("interior missing body was never requested"),
-            if defer_first { tip.number() } else { 1 }
+            if defer_first {
+                tip.number()
+            } else {
+                missing.number()
+            }
         );
         let reopened = ChainStore::new(node.store.clone());
         if defer_first {
@@ -9876,6 +10002,14 @@ mod tests {
         if legacy {
             node.chain_store
                 .prune_finalized_address_metadata_undo(tip.number())
+                .unwrap();
+            let genesis = node
+                .chain_store
+                .get_block_hash_by_number(0)
+                .unwrap()
+                .unwrap();
+            node.store
+                .delete(&[b"amc/".as_ref(), genesis.as_bytes()].concat())
                 .unwrap();
             let before = node.store.scan_prefix(b"").unwrap();
             assert!(node.validate_legacy_backfill_witness(&missing).is_err());
@@ -12796,6 +12930,8 @@ mod tests {
         follower
             .import_block(canonical.clone(), &MultiVerifier)
             .unwrap();
+
+        assert_pruned_genesis_witness_recovery(&follower, &canonical);
 
         let mut side_fork = canonical.clone();
         side_fork.header.extra_data = Bytes::from_static(b"session-side-fork");

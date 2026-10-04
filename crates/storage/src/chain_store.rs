@@ -3601,12 +3601,111 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         Ok(())
     }
 
+    /// Preserve the locally accepted genesis metadata before its first transition.
+    /// This checkpoint is committed with block one and survives undo pruning.
+    fn stage_genesis_metadata_checkpoint(&self, block: &Block) -> Result<(), StorageError> {
+        if block.number() != 1
+            || self.get_block_hash_by_number(0)? != Some(block.header.parent_hash)
+            || self.get_head_hash()? != Some(block.header.parent_hash)
+        {
+            return Ok(());
+        }
+        let key = [b"amc/".as_ref(), block.header.parent_hash.as_bytes()].concat();
+        if self.store.get(&key)?.is_some() {
+            return Ok(());
+        }
+        let mut values = BTreeMap::new();
+        for prefix in Self::ADDRESS_METADATA_PREFIXES {
+            values.extend(self.store.scan_prefix(prefix)?);
+        }
+        // The overlay already contains block one's changes. Undo those changes
+        // in the checkpoint only, preserving the live transition in the overlay.
+        for (key, previous) in self
+            .store
+            .previous_values_since(&BTreeMap::new(), &Self::ADDRESS_METADATA_PREFIXES)?
+        {
+            match previous {
+                Some(value) => {
+                    values.insert(key, value);
+                }
+                None => {
+                    values.remove(&key);
+                }
+            }
+        }
+        let entries: Vec<_> = values
+            .into_iter()
+            .map(|(key, value)| AddressMetadataUndoEntry {
+                key,
+                previous_value: Some(value),
+            })
+            .collect();
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
+            return Err(StorageError::State(
+                "genesis metadata checkpoint exceeds size limit".into(),
+            ));
+        }
+        self.store.put(&key, &encoded)
+    }
+
+    /// Restore a locally recorded genesis checkpoint into this isolated overlay.
+    /// Absence is explicit: current metadata must never substitute for history.
+    pub fn restore_genesis_metadata_checkpoint(
+        &self,
+        genesis: &ShellHash,
+    ) -> Result<bool, StorageError> {
+        if self.get_block_hash_by_number(0)? != Some(*genesis) {
+            return Err(StorageError::State(
+                "metadata checkpoint genesis mismatch".into(),
+            ));
+        }
+        let key = [b"amc/".as_ref(), genesis.as_bytes()].concat();
+        let Some(encoded) = self.store.get(&key)? else {
+            return Ok(false);
+        };
+        if encoded.len() > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
+            return Err(StorageError::State(
+                "genesis metadata checkpoint exceeds size limit".into(),
+            ));
+        }
+        let entries: Vec<AddressMetadataUndoEntry> = serde_json::from_slice(&encoded)
+            .map_err(|error| StorageError::Codec(error.to_string()))?;
+        let mut values = BTreeMap::new();
+        for entry in entries {
+            if !Self::ADDRESS_METADATA_PREFIXES
+                .iter()
+                .any(|prefix| entry.key.starts_with(prefix) && entry.key.len() == prefix.len() + 32)
+                || entry.previous_value.is_none()
+                || values
+                    .insert(entry.key, entry.previous_value.unwrap_or_default())
+                    .is_some()
+            {
+                return Err(StorageError::Codec(
+                    "invalid genesis metadata checkpoint entry".into(),
+                ));
+            }
+        }
+        // Validate the entire checkpoint before changing even the overlay.
+        for prefix in Self::ADDRESS_METADATA_PREFIXES {
+            for (key, _) in self.store.scan_prefix(prefix)? {
+                self.store.delete(&key)?;
+            }
+        }
+        for (key, value) in values {
+            self.store.put(&key, &value)?;
+        }
+        Ok(true)
+    }
+
     /// Atomically commit overlay changes and canonical block artifacts to the base store.
     pub fn commit_canonical_overlay(
         &self,
         block: &Block,
         receipts: Option<&[TransactionReceipt]>,
     ) -> Result<(), StorageError> {
+        self.stage_genesis_metadata_checkpoint(block)?;
         self.stage_address_metadata_undo(&block.hash(), &BTreeMap::new())?;
         let batch = self.canonical_block_batch(block, receipts)?;
         self.store.commit_with_batch(batch)
@@ -9992,6 +10091,77 @@ mod tests {
         assert_eq!(rollback_cs.get_guardian_config(&account).unwrap(), None);
         assert_eq!(rollback_cs.get_recovery_proposal(&account).unwrap(), None);
         assert_eq!(base_cs.get_pubkey(&account).unwrap(), Some(new_pubkey));
+    }
+
+    #[test]
+    fn genesis_metadata_checkpoint_survives_pruning_and_isolates_restore() {
+        #[cfg(not(feature = "rocksdb"))]
+        let db = Arc::new(MemoryDb::new());
+        #[cfg(feature = "rocksdb")]
+        let directory = std::env::temp_dir().join(format!(
+            "shell-genesis-checkpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        #[cfg(feature = "rocksdb")]
+        let db = Arc::new(
+            crate::RocksDbStore::open_all(&directory, None)
+                .unwrap()
+                .chain,
+        );
+        let base = ChainStore::new(db.clone());
+        let genesis = empty_block(0);
+        base.commit_canonical_block(&genesis, None).unwrap();
+        let account = Address::from([0xA1; 32]);
+        base.put_pubkey(&account, &[0x11; 32]).unwrap();
+        let mut block = empty_block(1);
+        block.header.parent_hash = genesis.hash();
+        let overlay = Arc::new(OverlayStore::new(db.clone()));
+        let chain = ChainStore::new(overlay);
+        chain.put_pubkey(&account, &[0x22; 32]).unwrap();
+        chain.commit_canonical_overlay(&block, None).unwrap();
+        base.prune_finalized_address_metadata_undo(1).unwrap();
+        #[cfg(feature = "rocksdb")]
+        let (db, base) = {
+            drop(chain);
+            drop(base);
+            drop(db);
+            let db = Arc::new(
+                crate::RocksDbStore::open_all(&directory, None)
+                    .unwrap()
+                    .chain,
+            );
+            let base = ChainStore::new(db.clone());
+            (db, base)
+        };
+        let before = db.scan_prefix(b"").unwrap();
+        let restored = ChainStore::new(Arc::new(OverlayStore::new(db.clone())));
+        assert!(restored
+            .restore_genesis_metadata_checkpoint(&genesis.hash())
+            .unwrap());
+        assert_eq!(restored.get_pubkey(&account).unwrap(), Some(vec![0x11; 32]));
+        assert_eq!(base.get_pubkey(&account).unwrap(), Some(vec![0x22; 32]));
+        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        // Reject malformed checkpoints before mutating even the replay overlay.
+        let key = [b"amc/".as_ref(), genesis.hash().as_bytes()].concat();
+        db.put(&key, br#"[{"key":[1],"previous_value":[2]}]"#)
+            .unwrap();
+        let invalid = ChainStore::new(Arc::new(OverlayStore::new(db.clone())));
+        assert!(invalid
+            .restore_genesis_metadata_checkpoint(&genesis.hash())
+            .is_err());
+        assert_eq!(invalid.get_pubkey(&account).unwrap(), Some(vec![0x22; 32]));
+        #[cfg(feature = "rocksdb")]
+        {
+            drop(invalid);
+            drop(restored);
+            drop(base);
+            drop(db);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
