@@ -600,10 +600,11 @@ impl<S: KvStore + 'static> Node<S> {
         let mut cursor = chain.get_head_block()?.ok_or_else(|| {
             NodeError::Startup("legacy witness validation requires canonical head".into())
         })?;
-        if cursor.number() < block.number()
-            || cursor.number().saturating_sub(block.number())
-                >= shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS
-        {
+        // Retention is relative to finality, not the current head. Older
+        // journals can still be available on a chain with delayed finality.
+        // Require the actual canonical bodies and undo journals below instead
+        // of rejecting otherwise recoverable history by head distance.
+        if cursor.number() < block.number() {
             return Err(NodeError::Startup(
                 "legacy witness metadata history unavailable".into(),
             ));

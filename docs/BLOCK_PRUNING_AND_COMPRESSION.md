@@ -281,15 +281,17 @@ The unreleased node can request missing witnesses from peers during startup
 backfill, within the configured witness retention window (`0` means unlimited).
 A peer must still retain the original data. Restoration checks a locally retained pruning digest or a witness root in the
 canonical header. Without either commitment, the unreleased node can authenticate
-recent witnesses by replaying real signatures and execution against the canonical
+witnesses by replaying real signatures and execution against the canonical
 parent state in an isolated overlay. This fallback requires retained ancestor
-bodies, parent state and metadata undo journals within the last 128 blocks.
+bodies, parent state and metadata undo journals. Journal pruning retains 128
+blocks behind finality, so older witnesses can remain recoverable when finality
+lags the head.
 Body and witness writes commit together only after authentication succeeds; replay
 does not change live state. New pruning operations retain a digest atomically
 with deletion.
 
-Older gaps outside that replay window, or with missing historical state or
-journals, still require historical reconstruction support. Failed gaps remain
+Gaps with missing historical state or journals still require historical
+reconstruction support. Failed gaps remain
 pending for retry while later recoverable bodies and witnesses can proceed. This recovery
 path is not yet available in the published v0.27.3 binary. Keep witnesses locally
 when forensic retention must not depend on peer availability.
