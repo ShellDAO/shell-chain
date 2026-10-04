@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Upgrade libp2p to 0.57 and Hickory to 0.26.3 to remove vulnerable DNS
+  dependencies; retain late-peer body recovery coverage over real TCP.
+
 - Keep historical body gaps pending when a node starts without peers, so a later
   peer connection can resume backfill without restarting the node.
 

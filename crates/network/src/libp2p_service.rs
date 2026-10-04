@@ -96,7 +96,6 @@ struct DirectMessageCodec {
     max_message_size: usize,
 }
 
-#[async_trait]
 impl request_response::Codec for DirectMessageCodec {
     type Protocol = StreamProtocol;
     type Request = Arc<[u8]>;

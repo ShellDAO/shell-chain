@@ -83,7 +83,7 @@ http = "1"
 futures-util = "0.3"
 
 # --- network (libp2p) ---
-libp2p = { version = "0.56", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "mdns", "tokio", "identify", "kad", "macros", "relay", "dcutr", "autonat", "request-response"] }
+libp2p = { version = "0.57", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "mdns", "tokio", "identify", "kad", "macros", "relay", "dcutr", "autonat", "request-response"] }
 
 # --- storage (rocksdb) ---
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "zstd"] }
@@ -122,16 +122,6 @@ winterfell = "0.13"
 
 [patch.crates-io]
 ark-relations = { path = "deps/ark-relations" }
-libp2p-yamux = { path = "deps/libp2p-yamux" }
-
-[workspace.metadata.audit]
-ignore = [
-    # hickory-proto NSEC3 closest-encloser proof validation has no fixed release yet.
-    "RUSTSEC-2026-0118",
-    # hickory-proto CPU exhaustion remains transitive through libp2p 0.56 and
-    # there is no compatible crates.io upgrade path in this workspace yet.
-    "RUSTSEC-2026-0119",
-]
 
 [profile.dev]
 debug = 1
