@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Recover missing historical witnesses during profile backfill when a retained
+  pruning digest or canonical witness root authenticates them. Restore body and
+  witness together atomically; reject tampered peer responses.
+
 - Upgrade libp2p to 0.57 and Hickory to 0.26.3 to remove vulnerable DNS
   dependencies; retain late-peer body recovery coverage over real TCP.
 

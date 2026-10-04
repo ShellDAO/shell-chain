@@ -9490,20 +9490,35 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
-        assert_body_backfill(false, false).await;
+        assert_body_backfill(false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
-        assert_body_backfill(true, false).await;
+        assert_body_backfill(true, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_body_over_libp2p_after_late_connection() {
-        assert_body_backfill(true, true).await;
+        assert_body_backfill(true, true, false, false).await;
     }
 
-    async fn assert_body_backfill(late_peer: bool, tcp: bool) {
+    #[tokio::test]
+    async fn event_loop_restores_witness_with_retained_body() {
+        assert_body_backfill(false, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_restores_witness_and_body_over_late_tcp_peer() {
+        assert_body_backfill(true, true, true, true).await;
+    }
+
+    async fn assert_body_backfill(
+        late_peer: bool,
+        tcp: bool,
+        witness_only: bool,
+        remove_body: bool,
+    ) {
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
         };
@@ -9536,13 +9551,51 @@ mod tests {
         node.config.rpc_enabled = false;
         node.config.metrics.enabled = false;
         store_consistent_genesis(&node);
+        if witness_only {
+            let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+            submit_signed_tx(
+                &node,
+                &signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce: 0,
+                    to: Some(Address::from([0xcc; 32])),
+                    value: U256::from(1_000),
+                    data: shell_primitives::Bytes::new(),
+                    gas_limit: 21_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+        }
         let missing = node.produce_block(&signer, 100).unwrap();
         let tip = node.produce_block(&signer, 100).unwrap();
         // An interrupted migration can retain genesis and the tip while an
         // interior canonical body is still absent.
-        node.chain_store.delete_body(&missing.hash()).unwrap();
+        if witness_only {
+            assert!(!missing.transactions.is_empty());
+            assert!(node
+                .chain_store
+                .has_witness_bundle(&missing.hash())
+                .unwrap());
+            node.chain_store
+                .delete_witness_bundle(&missing.hash())
+                .unwrap();
+            assert!(node.chain_store.has_body(&missing.hash()).unwrap());
+            if remove_body {
+                node.chain_store.delete_body(&missing.hash()).unwrap();
+            }
+        } else {
+            node.chain_store.delete_body(&missing.hash()).unwrap();
+            assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
+        }
         assert_eq!(node.oldest_available_body_block(), 0);
-        assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
         node.config.node_role = crate::NodeRole::Prover;
         let node = Arc::new(node);
         let bus = NetworkBus::new(64);
@@ -9629,7 +9682,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    while !node.chain_store.has_body(&missing.hash()).unwrap() {
+                    while !(node.chain_store.has_body(&missing.hash()).unwrap()
+                        && (!witness_only
+                            || node
+                                .chain_store
+                                .has_witness_bundle(&missing.hash())
+                                .unwrap()))
+                    {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     break start_number;

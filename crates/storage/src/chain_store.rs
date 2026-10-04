@@ -426,6 +426,10 @@ impl<S: KvStore> ChainStore<S> {
         [prefix::BODY_DIGEST_BY_HASH, hash.as_bytes()].concat()
     }
 
+    fn witness_digest_key(hash: &ShellHash) -> Vec<u8> {
+        [b"wd/".as_ref(), hash.as_bytes()].concat()
+    }
+
     fn witness_key(hash: &ShellHash) -> Vec<u8> {
         [prefix::WITNESS_BY_HASH, hash.as_bytes()].concat()
     }
@@ -999,7 +1003,100 @@ impl<S: KvStore> ChainStore<S> {
     /// The stripped body at `b/<hash>` is preserved so transaction payloads
     /// remain readable.
     pub fn delete_witness_bundle(&self, hash: &ShellHash) -> Result<(), StorageError> {
-        self.store.delete(&Self::witness_key(hash))
+        self.delete_witness_bundles(&[*hash])
+    }
+
+    fn stage_witness_deletions(
+        &self,
+        batch: &mut WriteBatch,
+        hashes: &[ShellHash],
+    ) -> Result<(), StorageError> {
+        for hash in hashes {
+            if let Some(bytes) = self.store.get(&Self::witness_key(hash))? {
+                let bundle = decode_witness_bundle(&bytes)?;
+                let mut canonical = Vec::new();
+                bundle.encode(&mut canonical);
+                batch.put(
+                    Self::witness_digest_key(hash),
+                    shell_primitives::blake3_hash(&canonical)
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+            batch.delete(Self::witness_key(hash));
+        }
+        Ok(())
+    }
+
+    /// Whether locally authenticated pruned witness material can be recovered.
+    pub fn has_recoverable_witness_gap(&self, hash: &ShellHash) -> Result<bool, StorageError> {
+        if self.has_witness_bundle(hash)? {
+            return Ok(false);
+        }
+        if self.store.get(&Self::witness_digest_key(hash))?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get_header_by_hash(hash)?.is_some_and(|header| {
+            header
+                .witness_root
+                .is_some_and(|root| root != ShellHash::ZERO)
+        }))
+    }
+
+    /// Import a historical body and optional authenticated witness atomically.
+    /// A rejected witness must not leave a partially restored body behind.
+    pub fn put_backfill_block(
+        &self,
+        block: &Block,
+        restore_witness: bool,
+    ) -> Result<(), StorageError> {
+        let overlay = Arc::new(crate::OverlayStore::new(self.store.clone()));
+        let staged = ChainStore::new(overlay.clone());
+        if !staged.has_body(&block.hash())? {
+            staged.put_body_only(block)?;
+        }
+        if restore_witness {
+            staged.restore_pruned_witness(block)?;
+        }
+        overlay.commit()
+    }
+
+    /// Restore a previously pruned witness only if it matches the locally
+    /// authenticated material and the retained transaction body exactly.
+    /// Legacy deletions can use a witness root from the locally accepted header.
+    pub fn restore_pruned_witness(&self, block: &Block) -> Result<(), StorageError> {
+        let hash = block.hash();
+        let (body, bundle) = StrippedBlock::split(block);
+        let retained = self.store.get(&Self::body_key(&hash))?.ok_or_else(|| {
+            StorageError::InvalidInput("witness restoration requires retained body".into())
+        })?;
+        let retained: StrippedBlock = decode_versioned(&retained)?;
+        if encode_rlp(&retained) != encode_rlp(&body) {
+            return Err(StorageError::InvalidInput(
+                "witness response changed retained body".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        bundle.encode(&mut bytes);
+        if let Some(expected) = self.store.get(&Self::witness_digest_key(&hash))? {
+            if expected.as_slice() != shell_primitives::blake3_hash(&bytes).as_bytes() {
+                return Err(StorageError::InvalidInput(
+                    "restored witness differs from pruned witness".into(),
+                ));
+            }
+        } else {
+            // Older databases did not retain a pruning digest. A root in the
+            // locally accepted canonical header still authenticates the bundle.
+            let header = self
+                .get_header_by_hash(&hash)?
+                .ok_or_else(|| StorageError::InvalidInput("missing local witness header".into()))?;
+            if header.witness_root != Some(bundle.compute_root()) {
+                return Err(StorageError::InvalidInput(
+                    "no matching local witness commitment for restoration".into(),
+                ));
+            }
+        }
+        self.store.put(&Self::witness_key(&hash), &bytes)
     }
 
     /// Delete multiple witness bundles in one atomic storage batch.
@@ -1009,9 +1106,7 @@ impl<S: KvStore> ChainStore<S> {
         }
 
         let mut batch = WriteBatch::new();
-        for hash in hashes {
-            batch.delete(Self::witness_key(hash));
-        }
+        self.stage_witness_deletions(&mut batch, hashes)?;
         self.store.write_batch(batch)
     }
 
@@ -1023,9 +1118,7 @@ impl<S: KvStore> ChainStore<S> {
         pruned_below: u64,
     ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
-        for hash in hashes {
-            batch.delete(Self::witness_key(hash));
-        }
+        self.stage_witness_deletions(&mut batch, hashes)?;
         batch.put(
             prefix::WITNESS_PRUNED_BELOW.to_vec(),
             pruned_below.to_be_bytes().to_vec(),
@@ -9326,6 +9419,52 @@ mod tests {
     }
 
     #[test]
+    fn backfill_body_and_witness_rejection_is_atomic() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(db.clone());
+        let block = make_block_with_txs(2);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        cs.delete_body(&hash).unwrap();
+        cs.delete_witness_bundle(&hash).unwrap();
+        let mut bad = block.clone();
+        bad.transactions[0].signature.data[0] ^= 1;
+        assert!(cs.put_backfill_block(&bad, true).is_err());
+        assert!(!cs.has_body(&hash).unwrap());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        db.fail_next_batch();
+        assert!(cs.put_backfill_block(&block, true).is_err());
+        assert!(!cs.has_body(&hash).unwrap());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        cs.put_backfill_block(&block, true).unwrap();
+        assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
+    fn witness_pruning_digest_and_cursor_are_atomic() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let block = make_block_with_txs(1);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        db.fail_next_batch();
+        assert!(cs.prune_witness_bundles_below(&[hash], 2).is_err());
+        assert!(cs.has_witness_bundle(&hash).unwrap());
+        assert_eq!(cs.witness_pruned_below().unwrap(), 0);
+        assert!(db
+            .get(&ChainStore::<FailingBatchStore>::witness_digest_key(&hash))
+            .unwrap()
+            .is_none());
+        cs.prune_witness_bundles_below(&[hash], 2).unwrap();
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        assert_eq!(cs.witness_pruned_below().unwrap(), 2);
+        assert!(db
+            .get(&ChainStore::<FailingBatchStore>::witness_digest_key(&hash))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn backfill_without_legacy_digest_remains_compatible() {
         let db = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(Arc::clone(&db));
@@ -9390,6 +9529,72 @@ mod tests {
         assert_eq!(loaded.transactions.len(), 1);
         assert_eq!(loaded.transactions[0].from, original_from);
         assert_eq!(loaded.transactions[0].tx.value, original_value);
+    }
+
+    #[test]
+    fn legacy_witness_without_commitment_cannot_trust_peer_header() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db.clone());
+        let block = make_block_with_txs(2);
+        assert!(block.header.witness_root.is_none());
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        db.delete(&ChainStore::<MemoryDb>::witness_key(&hash))
+            .unwrap();
+        assert!(!cs.has_recoverable_witness_gap(&hash).unwrap());
+        assert!(cs.restore_pruned_witness(&block).is_err());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        let mut forged = block.clone();
+        forged.header.witness_root = Some(
+            shell_core::WitnessBundle::compute_root_from_transactions(&forged.transactions),
+        );
+        assert!(cs.restore_pruned_witness(&forged).is_err());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        assert!(!cs.has_witness_bundle(&forged.hash()).unwrap());
+    }
+
+    #[test]
+    fn legacy_pruned_witness_uses_local_header_commitment() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db.clone());
+        let mut block = make_block_with_txs(2);
+        block.header.witness_root = Some(
+            shell_core::WitnessBundle::compute_root_from_transactions(&block.transactions),
+        );
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        // Simulate a database pruned before pruning digests were introduced.
+        db.delete(&ChainStore::<MemoryDb>::witness_key(&hash))
+            .unwrap();
+        assert!(cs.has_recoverable_witness_gap(&hash).unwrap());
+        let mut bad = block.clone();
+        bad.transactions[0].signature.data[0] ^= 1;
+        assert!(cs.restore_pruned_witness(&bad).is_err());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        cs.restore_pruned_witness(&block).unwrap();
+        assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
+    fn pruned_witness_restoration_rejects_tampering() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db.clone());
+        let block = make_block_with_txs(2);
+        let hash = block.hash();
+        cs.put_block(&block).unwrap();
+        cs.prune_witness_bundles_below(&[hash], 3).unwrap();
+        cs.delete_witness_bundle(&hash).unwrap(); // Preserve digest on repeated pruning.
+        let mut bad = block.clone();
+        bad.transactions[0].signature.data[0] ^= 1;
+        assert!(cs.restore_pruned_witness(&bad).is_err());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        let mut bad = block.clone();
+        bad.transactions[0].tx.value = U256::from(999);
+        assert!(cs.restore_pruned_witness(&bad).is_err());
+        assert!(!cs.has_witness_bundle(&hash).unwrap());
+        cs.restore_pruned_witness(&block).unwrap();
+        let reopened = ChainStore::new(db);
+        assert_eq!(reopened.get_block_by_hash(&hash).unwrap(), Some(block));
     }
 
     #[test]

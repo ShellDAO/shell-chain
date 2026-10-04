@@ -277,9 +277,17 @@ witness bundle still exists.
 
 **Q: Can I recover a deleted witness bundle?**
 
-No. Deletion is irreversible. If forensic retention is needed, set
-`proof_replacement_grace` to the desired block count (e.g., `604800` ≈ 7 days
-at 1 block/s).
+The unreleased node can request missing witnesses from peers during startup
+backfill, within the configured witness retention window (`0` means unlimited).
+A peer must still retain the original data. Restoration requires either a
+locally retained pruning digest or a witness root in the canonical header; body
+and witness writes commit together only after these checks pass. New pruning
+operations retain a digest atomically with deletion.
+
+Older databases pruned without either commitment still require historical
+authentication support before their witnesses can be restored. This recovery
+path is not yet available in the published v0.27.3 binary. Keep witnesses locally
+when forensic retention must not depend on peer availability.
 
 **Q: Does the compression ratio hold for empty blocks?**
 
