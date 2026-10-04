@@ -1043,6 +1043,20 @@ impl<S: KvStore> ChainStore<S> {
         }))
     }
 
+    /// Whether a nonempty canonical body is missing its witness, including
+    /// legacy data that needs historical signature validation.
+    pub fn has_witness_gap(&self, hash: &ShellHash) -> Result<bool, StorageError> {
+        if self.has_recoverable_witness_gap(hash)? {
+            return Ok(true);
+        }
+        if self.has_witness_bundle(hash)? {
+            return Ok(false);
+        }
+        Ok(self
+            .get_block_by_hash(hash)?
+            .is_some_and(|block| !block.transactions.is_empty()))
+    }
+
     /// Import a historical body and optional authenticated witness atomically.
     /// A rejected witness must not leave a partially restored body behind.
     pub fn put_backfill_block(
@@ -1050,13 +1064,29 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         restore_witness: bool,
     ) -> Result<(), StorageError> {
+        self.put_backfill_block_with_validation(block, restore_witness, |_| {
+            Err(StorageError::InvalidInput(
+                "historical witness validation required".into(),
+            ))
+        })
+    }
+
+    /// The validator must authenticate legacy signatures against canonical
+    /// historical state without writing to the underlying store. It is invoked
+    /// only when neither a pruning digest nor a header commitment is available.
+    pub fn put_backfill_block_with_validation(
+        &self,
+        block: &Block,
+        restore_witness: bool,
+        validate_legacy: impl FnOnce(&Block) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         let overlay = Arc::new(crate::OverlayStore::new(self.store.clone()));
         let staged = ChainStore::new(overlay.clone());
         if !staged.has_body(&block.hash())? {
             staged.put_body_only(block)?;
         }
         if restore_witness {
-            staged.restore_pruned_witness(block)?;
+            staged.restore_pruned_witness_with_validation(block, validate_legacy)?;
         }
         overlay.commit()
     }
@@ -1065,6 +1095,18 @@ impl<S: KvStore> ChainStore<S> {
     /// authenticated material and the retained transaction body exactly.
     /// Legacy deletions can use a witness root from the locally accepted header.
     pub fn restore_pruned_witness(&self, block: &Block) -> Result<(), StorageError> {
+        self.restore_pruned_witness_with_validation(block, |_| {
+            Err(StorageError::InvalidInput(
+                "historical witness validation required".into(),
+            ))
+        })
+    }
+
+    fn restore_pruned_witness_with_validation(
+        &self,
+        block: &Block,
+        validate_legacy: impl FnOnce(&Block) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         let hash = block.hash();
         let (body, bundle) = StrippedBlock::split(block);
         let retained = self.store.get(&Self::body_key(&hash))?.ok_or_else(|| {
@@ -1090,7 +1132,12 @@ impl<S: KvStore> ChainStore<S> {
             let header = self
                 .get_header_by_hash(&hash)?
                 .ok_or_else(|| StorageError::InvalidInput("missing local witness header".into()))?;
-            if header.witness_root != Some(bundle.compute_root()) {
+            if header
+                .witness_root
+                .is_none_or(|root| root == ShellHash::ZERO)
+            {
+                validate_legacy(block)?;
+            } else if header.witness_root != Some(bundle.compute_root()) {
                 return Err(StorageError::InvalidInput(
                     "no matching local witness commitment for restoration".into(),
                 ));
