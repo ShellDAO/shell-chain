@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Authenticate recent legacy witness backfill without a local commitment using
+  isolated historical signature and execution replay. Preserve live state and
+  atomic body/witness writes; defer unavailable gaps so later recovery proceeds.
+  This fallback requires retained history within 128 blocks of the head.
+
 - Recover missing historical witnesses during profile backfill when a retained
   pruning digest or canonical witness root authenticates them. Restore body and
   witness together atomically; reject tampered peer responses.

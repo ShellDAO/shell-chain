@@ -9490,27 +9490,111 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
-        assert_body_backfill(false, false, false, false).await;
+        assert_body_backfill(false, false, false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
-        assert_body_backfill(true, false, false, false).await;
+        assert_body_backfill(true, false, false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_body_over_libp2p_after_late_connection() {
-        assert_body_backfill(true, true, false, false).await;
+        assert_body_backfill(true, true, false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_with_retained_body() {
-        assert_body_backfill(false, false, true, false).await;
+        assert_body_backfill(false, false, true, false, false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_and_body_over_late_tcp_peer() {
-        assert_body_backfill(true, true, true, true).await;
+        assert_body_backfill(true, true, true, true, false, false).await;
+    }
+
+    #[test]
+    fn legacy_reference_witness_restores_after_sender_nonce_advances() {
+        let (node, signer) = setup_node();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let transaction = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(Address::from([0xcc; 32])),
+            value: U256::from(1_000),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        submit_signed_tx(&node, &signer, sender, transaction.clone());
+        node.produce_block(&signer, 100).unwrap();
+        let mut second = transaction.clone();
+        second.nonce = 1;
+        let signature = signer
+            .sign(second.signing_hash(signer.sig_type().as_u8()).as_bytes())
+            .unwrap();
+        let signed = SignedTransaction::new(sender, second, signature);
+        assert!(matches!(
+            signed.pubkey_mode,
+            shell_core::PubkeyMode::Reference
+        ));
+        node.tx_pool
+            .insert(
+                signed,
+                &mut node.world_state.write(),
+                node.chain_store.as_ref(),
+                &MultiVerifier,
+            )
+            .unwrap();
+        let missing = node.produce_block(&signer, 100).unwrap();
+        let mut third = transaction;
+        third.nonce = 2;
+        submit_signed_tx(&node, &signer, sender, third);
+        let tip = node.produce_block(&signer, 100).unwrap();
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
+        node.store
+            .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
+            .unwrap();
+        let before = node.store.scan_prefix(b"").unwrap();
+        let mut bad = missing.clone();
+        bad.transactions[0].signature.data[0] ^= 1;
+        assert!(node.validate_legacy_backfill_witness(&bad).is_err());
+        node.validate_legacy_backfill_witness(&missing).unwrap();
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        node.chain_store
+            .put_backfill_block_with_validation(&missing, true, |candidate| {
+                node.validate_legacy_backfill_witness(candidate)
+                    .map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            node.chain_store.get_block_by_hash(&missing.hash()).unwrap(),
+            Some(missing)
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn event_loop_restores_legacy_witness_with_historical_replay() {
+        assert_body_backfill(false, false, true, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_restores_legacy_witness_and_body() {
+        assert_body_backfill(false, false, true, true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_backfill_continues_after_unavailable_witness() {
+        assert_body_backfill(false, false, true, false, true, true).await;
     }
 
     async fn assert_body_backfill(
@@ -9518,6 +9602,8 @@ mod tests {
         tcp: bool,
         witness_only: bool,
         remove_body: bool,
+        legacy: bool,
+        defer_first: bool,
     ) {
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
@@ -9527,11 +9613,15 @@ mod tests {
         #[cfg(not(feature = "rocksdb"))]
         let (mut node, signer) = setup_node();
         #[cfg(feature = "rocksdb")]
+        static NEXT_BACKFILL_DB: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "rocksdb")]
         let directory = std::env::temp_dir().join(format!(
-            "shell-body-gap-{}-{}-{}-{}",
+            "shell-body-gap-{}-{}-{}-{}-{}",
             std::process::id(),
             late_peer,
             tcp,
+            NEXT_BACKFILL_DB.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -9550,10 +9640,13 @@ mod tests {
         };
         node.config.rpc_enabled = false;
         node.config.metrics.enabled = false;
-        store_consistent_genesis(&node);
         if witness_only {
             let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
             fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        }
+        store_consistent_genesis(&node);
+        if witness_only {
+            let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
             submit_signed_tx(
                 &node,
                 &signer,
@@ -9576,6 +9669,11 @@ mod tests {
         }
         let missing = node.produce_block(&signer, 100).unwrap();
         let tip = node.produce_block(&signer, 100).unwrap();
+        let head = if defer_first {
+            node.produce_block(&signer, 100).unwrap()
+        } else {
+            tip.clone()
+        };
         // An interrupted migration can retain genesis and the tip while an
         // interior canonical body is still absent.
         if witness_only {
@@ -9584,9 +9682,23 @@ mod tests {
                 .chain_store
                 .has_witness_bundle(&missing.hash())
                 .unwrap());
-            node.chain_store
-                .delete_witness_bundle(&missing.hash())
-                .unwrap();
+            if legacy {
+                assert!(missing.header.witness_root.is_none());
+                // Model pruning by an older node, without retaining a digest.
+                node.store
+                    .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
+                    .unwrap();
+                let before = node.store.scan_prefix(b"").unwrap();
+                let mut tampered = missing.clone();
+                tampered.transactions[0].signature.data[0] ^= 1;
+                assert!(node.validate_legacy_backfill_witness(&tampered).is_err());
+                node.validate_legacy_backfill_witness(&missing).unwrap();
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            } else {
+                node.chain_store
+                    .delete_witness_bundle(&missing.hash())
+                    .unwrap();
+            }
             assert!(node.chain_store.has_body(&missing.hash()).unwrap());
             if remove_body {
                 node.chain_store.delete_body(&missing.hash()).unwrap();
@@ -9596,6 +9708,9 @@ mod tests {
             assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
         }
         assert_eq!(node.oldest_available_body_block(), 0);
+        if defer_first {
+            node.chain_store.delete_body(&tip.hash()).unwrap();
+        }
         node.config.node_role = crate::NodeRole::Prover;
         let node = Arc::new(node);
         let bus = NetworkBus::new(64);
@@ -9673,15 +9788,39 @@ mod tests {
                     peer: requester,
                 }) = peer.next_event().await
                 {
+                    if defer_first && start_number == missing.number() {
+                        let mut bad = missing.clone();
+                        bad.transactions[0].signature.data[0] ^= 1;
+                        peer.send_to_peer(
+                            &requester,
+                            NetworkMessage::BodyResponse {
+                                blocks: vec![bad],
+                                nonce,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        continue;
+                    }
                     peer.send_to_peer(
                         &requester,
                         NetworkMessage::BodyResponse {
-                            blocks: vec![missing.clone(), tip.clone()],
+                            blocks: if defer_first {
+                                vec![tip.clone()]
+                            } else {
+                                vec![missing.clone(), tip.clone()]
+                            },
                             nonce,
                         },
                     )
                     .await
                     .unwrap();
+                    if defer_first {
+                        while !node.chain_store.has_body(&tip.hash()).unwrap() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        break start_number;
+                    }
                     while !(node.chain_store.has_body(&missing.hash()).unwrap()
                         && (!witness_only
                             || node
@@ -9700,28 +9839,46 @@ mod tests {
         handle.await.unwrap().unwrap();
         assert_eq!(
             requested.expect("interior missing body was never requested"),
-            1
+            if defer_first { tip.number() } else { 1 }
         );
         let reopened = ChainStore::new(node.store.clone());
-        assert_eq!(
-            reopened
-                .get_block_by_hash(&missing.hash())
-                .unwrap()
-                .unwrap(),
-            missing
-        );
-        assert_eq!(reopened.get_head_hash().unwrap(), Some(tip.hash()));
+        if defer_first {
+            assert!(!reopened.has_witness_bundle(&missing.hash()).unwrap());
+            assert!(reopened.has_body(&tip.hash()).unwrap());
+        } else {
+            assert_eq!(
+                reopened
+                    .get_block_by_hash(&missing.hash())
+                    .unwrap()
+                    .unwrap(),
+                missing
+            );
+        }
+        assert_eq!(reopened.get_head_hash().unwrap(), Some(head.hash()));
+        if legacy {
+            node.chain_store
+                .prune_finalized_address_metadata_undo(tip.number())
+                .unwrap();
+            let before = node.store.scan_prefix(b"").unwrap();
+            assert!(node.validate_legacy_backfill_witness(&missing).is_err());
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        }
         #[cfg(feature = "rocksdb")]
         {
             drop(reopened);
             drop(node);
             let stores = shell_storage::RocksDbStore::open_all(&directory, None).unwrap();
             let disk = ChainStore::new(Arc::new(stores.chain));
-            assert_eq!(
-                disk.get_block_by_hash(&missing.hash()).unwrap().unwrap(),
-                missing
-            );
-            assert_eq!(disk.get_head_hash().unwrap(), Some(tip.hash()));
+            if !defer_first {
+                assert_eq!(
+                    disk.get_block_by_hash(&missing.hash()).unwrap().unwrap(),
+                    missing
+                );
+            } else {
+                assert!(!disk.has_witness_bundle(&missing.hash()).unwrap());
+                assert!(disk.has_body(&tip.hash()).unwrap());
+            }
+            assert_eq!(disk.get_head_hash().unwrap(), Some(head.hash()));
             drop(disk);
             std::fs::remove_dir_all(&directory).unwrap();
         }

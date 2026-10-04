@@ -640,6 +640,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut sync_request: Option<BlockRequestState> = None;
         let mut early_commit_certificate = EarlyCommitCertificate::default();
         let mut body_request: Option<BodyRequestState> = None;
+        let mut deferred_body_gap: Option<u64> = None;
         let startup_peers = network.peer_count().await;
         let allow_isolated_production = self.config.network_type == shell_genesis::NetworkType::Dev
             || self.consensus.read().poa_config().authorities.len() == 1;
@@ -743,7 +744,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     head,
                                     self.config.pruning.witness_retention,
                                 ) && matches!(
-                                    self.chain_store.has_recoverable_witness_gap(&hash),
+                                    self.chain_store.has_witness_gap(&hash),
                                     Ok(true)
                                 ))
                         })
@@ -2085,7 +2086,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     // Track the first block in this response so we can
                                     // advance past a bad batch even if no block is stored.
                                     let batch_start = blocks.first().map(|b| b.header.number);
-                                    let mut last_stored: Option<u64> = None;
+                                    let mut last_processed: Option<u64> = None;
                                     // Track first gap (mismatch or storage failure) so we
                                     // re-request from that point and don't silently skip blocks.
                                     let mut first_gap: Option<u64> = None;
@@ -2112,21 +2113,25 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                         let needs_witness = witness_in_retention_window(n, head_number, self.config.pruning.witness_retention)
-                                            && self.chain_store.has_recoverable_witness_gap(&actual_hash).unwrap_or(false);
-                                        if let Err(error) = self.chain_store.put_backfill_block(block, needs_witness) {
+                                            && !block.transactions.is_empty() && !self.chain_store.has_witness_bundle(&actual_hash).unwrap_or(true);
+                                        if let Err(error) = self.chain_store.put_backfill_block_with_validation(block, needs_witness, |candidate| {
+                                            self.validate_legacy_backfill_witness(candidate).map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
+                                        }) {
                                             warn!(block = n, %error, "failed to restore historical block data");
-                                            first_gap.get_or_insert(n);
+                                            deferred_body_gap = Some(deferred_body_gap.map_or(n, |gap| gap.min(n)));
+                                            // Continue the sweep so unavailable old witnesses do
+                                            // not starve later recoverable bodies and witnesses.
+                                            last_processed = Some(n);
                                             continue;
                                         }
-                                        last_stored = Some(n);
+                                        last_processed = Some(n);
                                     }
-                                    // If any block failed (mismatch or store error), re-request from
-                                    // the first gap so missing blocks are never permanently skipped.
-                                    // If all succeeded, continue from last_stored + 1.
-                                    // If the entire batch was bad, skip it when there is room.
+                                    // Retry sequence/hash mismatches immediately. Persistence or
+                                    // witness-validation failures remain deferred until this sweep
+                                    // reaches the head, so later independent gaps can progress.
                                     let next_start = body_backfill_next_start(
                                         first_gap,
-                                        last_stored,
+                                        last_processed,
                                         batch_start,
                                     );
                                     if let Some(next) = next_start {
@@ -2153,6 +2158,15 @@ impl<S: KvStore + 'static> Node<S> {
                                                     requested_at: std::time::Instant::now(),
                                                 });
                                             }
+                                        } else if let Some(gap) = deferred_body_gap.take() {
+                                            // Retain failed work and use the existing retry delay;
+                                            // never report a partial sweep as complete.
+                                            body_request = Some(BodyRequestState {
+                                                nonce: Self::wall_clock_millis().max(nonce.saturating_add(1)),
+                                                start_number: gap,
+                                                peer: None,
+                                                requested_at: std::time::Instant::now(),
+                                            });
                                         } else {
                                             info!("L4: historical body back-fill complete");
                                         }

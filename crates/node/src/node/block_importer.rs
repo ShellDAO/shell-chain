@@ -592,6 +592,58 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(result)
     }
 
+    /// Authenticate legacy backfill in a historical overlay. Never commit replay
+    /// writes: only the separately checked body and witness may be restored.
+    pub(super) fn validate_legacy_backfill_witness(&self, block: &Block) -> Result<(), NodeError> {
+        let overlay = Arc::new(self.chain_store.native_replay_overlay()?);
+        let chain = ChainStore::new(overlay.clone());
+        let mut cursor = chain.get_head_block()?.ok_or_else(|| {
+            NodeError::Startup("legacy witness validation requires canonical head".into())
+        })?;
+        if cursor.number() < block.number()
+            || cursor.number().saturating_sub(block.number())
+                >= shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS
+        {
+            return Err(NodeError::Startup(
+                "legacy witness metadata history unavailable".into(),
+            ));
+        }
+        loop {
+            if cursor.number() == block.number() && cursor.hash() != block.hash() {
+                return Err(NodeError::Startup(
+                    "legacy witness block is not canonical".into(),
+                ));
+            }
+            chain.restore_address_metadata(std::slice::from_ref(&cursor))?;
+            if cursor.hash() == block.hash() {
+                break;
+            }
+            let parent_hash = cursor.header.parent_hash;
+            let parent = if parent_hash == block.hash() {
+                block.clone()
+            } else {
+                chain.get_block_by_hash(&parent_hash)?.ok_or_else(|| {
+                    NodeError::Startup("legacy witness ancestor body unavailable".into())
+                })?
+            };
+            if parent.number().checked_add(1) != Some(cursor.number()) {
+                return Err(NodeError::Startup(
+                    "legacy witness ancestry is inconsistent".into(),
+                ));
+            }
+            cursor = parent;
+        }
+        let parent = chain
+            .get_header_by_hash(&block.header.parent_hash)?
+            .ok_or_else(|| NodeError::Startup("legacy witness parent header unavailable".into()))?;
+        chain.set_head(&block.header.parent_hash)?;
+        let state = WorldState::at_root(overlay.clone(), &parent.state_root)?;
+        let mut registry = load_algorithm_registry(&state)
+            .map_err(|error| NodeError::Startup(format!("legacy witness registry: {error}")))?;
+        self.replay_fork_block_with_registry(block, parent.state_root, overlay, &mut registry)?;
+        Ok(())
+    }
+
     fn replay_fork_block_with_registry(
         &self,
         block: &Block,
