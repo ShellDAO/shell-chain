@@ -32,6 +32,8 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+libp2p.workspace = true
+shell-network = { path = "../network", features = ["libp2p"] }
 
 [features]
 # Enables persistent-storage recovery acceptance tests.

@@ -6242,6 +6242,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libp2p",
  "parking_lot",
  "prometheus",
  "serde",
