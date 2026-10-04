@@ -9490,15 +9490,20 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
-        assert_body_backfill(false).await;
+        assert_body_backfill(false, false).await;
     }
 
     #[tokio::test]
     async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
-        assert_body_backfill(true).await;
+        assert_body_backfill(true, false).await;
     }
 
-    async fn assert_body_backfill(late_peer: bool) {
+    #[tokio::test]
+    async fn event_loop_restores_body_over_libp2p_after_late_connection() {
+        assert_body_backfill(true, true).await;
+    }
+
+    async fn assert_body_backfill(late_peer: bool, tcp: bool) {
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
         };
@@ -9508,9 +9513,10 @@ mod tests {
         let (mut node, signer) = setup_node();
         #[cfg(feature = "rocksdb")]
         let directory = std::env::temp_dir().join(format!(
-            "shell-body-gap-{}-{}-{}",
+            "shell-body-gap-{}-{}-{}-{}",
             std::process::id(),
             late_peer,
+            tcp,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -9540,17 +9546,63 @@ mod tests {
         node.config.node_role = crate::NodeRole::Prover;
         let node = Arc::new(node);
         let bus = NetworkBus::new(64);
-        let mut network = bus.join(&NetworkConfig::default());
-        let mut peer = (!late_peer).then(|| bus.join(&NetworkConfig::default()));
+        // Reserve an ephemeral loopback port; discovery is disabled so this
+        // acceptance test cannot contact an external network.
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let mut config = NetworkConfig {
+            listen_addr: address,
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_relay: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let identity = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = identity.public().to_peer_id();
+        let identity_path = std::env::temp_dir().join(format!(
+            "shell-backfill-identity-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
+        if tcp {
+            std::fs::write(&identity_path, identity.to_protobuf_encoding().unwrap()).unwrap();
+            config.identity_key_path = Some(identity_path.clone());
+        }
+        drop(reservation);
+        let mut network: Box<dyn NetworkService> = if tcp {
+            Box::new(shell_network::Libp2pNetwork::new(&config).await.unwrap())
+        } else {
+            Box::new(bus.join(&config))
+        };
+        if tcp {
+            std::fs::remove_file(&identity_path).unwrap();
+            config.identity_key_path = None;
+        }
+        let mut peer: Option<Box<dyn NetworkService>> = if late_peer {
+            None
+        } else {
+            Some(Box::new(bus.join(&config)))
+        };
         let handle = tokio::spawn({
             let node = Arc::clone(&node);
-            async move { node.run(Arc::new(signer), &mut network).await }
+            async move { node.run(Arc::new(signer), network.as_mut()).await }
         });
         if late_peer {
             // The startup scan runs after a 500 ms capability exchange window.
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
-            peer = Some(bus.join(&NetworkConfig::default()));
+            peer = Some(if tcp {
+                config.listen_addr = "127.0.0.1:0".parse().unwrap();
+                config.boot_nodes = vec![format!(
+                    "/ip4/127.0.0.1/tcp/{}/p2p/{peer_id}",
+                    address.port()
+                )];
+                Box::new(shell_network::Libp2pNetwork::new(&config).await.unwrap())
+            } else {
+                Box::new(bus.join(&config))
+            });
         }
         let mut peer = peer.unwrap();
         // ChannelNetwork updates peer counts without emitting PeerConnected;
