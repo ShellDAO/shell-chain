@@ -1,6 +1,21 @@
 use super::*;
 use std::borrow::Cow;
 
+pub(super) struct LegacyReplay<S: KvStore> {
+    target: ShellHash,
+    target_number: u64,
+    overlay: Arc<shell_storage::OverlayStore<S>>,
+    parent: BlockHeader,
+    registry: AlgorithmRegistry,
+}
+
+#[cfg(test)]
+impl<S: KvStore> LegacyReplay<S> {
+    pub(super) fn target_hash(&self) -> ShellHash {
+        self.target
+    }
+}
+
 fn tx_for_import_validation<'a, S: KvStore>(
     tx: &'a SignedTransaction,
     validation_pubkeys: &HashMap<Address, Vec<u8>>,
@@ -595,6 +610,143 @@ impl<S: KvStore + 'static> Node<S> {
     /// Authenticate legacy backfill in a historical overlay. Never commit replay
     /// writes: only the separately checked body and witness may be restored.
     pub(super) fn validate_legacy_backfill_witness(&self, block: &Block) -> Result<(), NodeError> {
+        self.validate_legacy_backfill_from_undo(block)
+            .or_else(|_| self.validate_legacy_backfill_from_genesis(block))
+    }
+
+    fn validate_legacy_backfill_from_genesis(&self, block: &Block) -> Result<(), NodeError> {
+        self.advance_legacy_backfill_from_genesis(block, 32)
+    }
+
+    pub(super) fn advance_legacy_backfill_from_genesis(
+        &self,
+        block: &Block,
+        max_blocks: u64,
+    ) -> Result<(), NodeError> {
+        let mut pending = self.legacy_replay.lock();
+        if self.chain_store.get_block_hash_by_number(block.number())? != Some(block.hash()) {
+            *pending = None;
+            return Err(NodeError::Startup(
+                "legacy witness block is not canonical".into(),
+            ));
+        }
+        // Keep the current gap's progress while the same sweep visits other
+        // gaps. Otherwise each later response would restart the oldest replay.
+        if let Some(cursor) = pending.as_ref() {
+            if cursor.target != block.hash()
+                && self
+                    .chain_store
+                    .get_block_hash_by_number(cursor.target_number)?
+                    == Some(cursor.target)
+                && self
+                    .chain_store
+                    .get_block_hash_by_number(cursor.parent.number)?
+                    == Some(cursor.parent.hash())
+            {
+                return Err(NodeError::Startup(
+                    "another legacy witness replay is pending".into(),
+                ));
+            }
+        }
+        let retained = pending.take().filter(|cursor| {
+            cursor.target == block.hash()
+                && self
+                    .chain_store
+                    .get_block_hash_by_number(cursor.parent.number)
+                    .ok()
+                    .flatten()
+                    == Some(cursor.parent.hash())
+        });
+        let mut cursor = match retained {
+            Some(cursor) => cursor,
+            None => {
+                let overlay = Arc::new(
+                    self.chain_store
+                        .native_replay_overlay()?
+                        .with_write_limit(64 * 1024 * 1024)?,
+                );
+                let chain = ChainStore::new(overlay.clone());
+                if block.number() == 0
+                    || chain
+                        .get_head_block()?
+                        .is_none_or(|head| head.number() < block.number())
+                    || chain.get_block_hash_by_number(block.number())? != Some(block.hash())
+                {
+                    return Err(NodeError::Startup(
+                        "legacy witness block is not canonical".into(),
+                    ));
+                }
+                let genesis = chain.get_block_hash_by_number(0)?.ok_or_else(|| {
+                    NodeError::Startup("legacy witness genesis unavailable".into())
+                })?;
+                if !chain.restore_genesis_metadata_checkpoint(&genesis)? {
+                    return Err(NodeError::Startup(
+                        "legacy witness metadata checkpoint unavailable".into(),
+                    ));
+                }
+                let parent = chain.get_header_by_hash(&genesis)?.ok_or_else(|| {
+                    NodeError::Startup("legacy witness genesis header unavailable".into())
+                })?;
+                let state = WorldState::at_root(overlay.clone(), &parent.state_root)?;
+                let registry = load_algorithm_registry(&state).map_err(|error| {
+                    NodeError::Startup(format!("legacy witness registry: {error}"))
+                })?;
+                chain.set_head(&genesis)?;
+                LegacyReplay {
+                    target: block.hash(),
+                    target_number: block.number(),
+                    overlay,
+                    parent,
+                    registry,
+                }
+            }
+        };
+        let chain = ChainStore::new(cursor.overlay.clone());
+        let end = block
+            .number()
+            .min(cursor.parent.number.saturating_add(max_blocks));
+        for number in cursor.parent.number.saturating_add(1)..=end {
+            let hash = chain.get_block_hash_by_number(number)?.ok_or_else(|| {
+                NodeError::Startup("legacy witness canonical ancestor unavailable".into())
+            })?;
+            let candidate = if number == block.number() {
+                block.clone()
+            } else {
+                let ancestor = chain.get_block_by_hash(&hash)?.ok_or_else(|| {
+                    NodeError::Startup("legacy witness ancestor body unavailable".into())
+                })?;
+                if !ancestor.transactions.is_empty() && !chain.has_witness_bundle(&hash)? {
+                    return Err(NodeError::Startup(
+                        "legacy witness ancestor witness unavailable".into(),
+                    ));
+                }
+                ancestor
+            };
+            if candidate.hash() != hash
+                || candidate.header.parent_hash != cursor.parent.hash()
+                || candidate.number() != number
+            {
+                return Err(NodeError::Startup(
+                    "legacy witness ancestry is inconsistent".into(),
+                ));
+            }
+            self.replay_fork_block_with_registry(
+                &candidate,
+                cursor.parent.state_root,
+                cursor.overlay.clone(),
+                &mut cursor.registry,
+            )?;
+            chain.set_head(&hash)?;
+            cursor.parent = candidate.header;
+        }
+        if cursor.parent.number < block.number() {
+            *pending = Some(cursor);
+            return Err(NodeError::Startup("legacy witness replay pending".into()));
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_backfill_from_undo(&self, block: &Block) -> Result<(), NodeError> {
         let overlay = Arc::new(self.chain_store.native_replay_overlay()?);
         let chain = ChainStore::new(overlay.clone());
         let mut cursor = chain.get_head_block()?.ok_or_else(|| {

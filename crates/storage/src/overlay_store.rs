@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
@@ -9,6 +10,8 @@ use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 /// [`commit`](Self::commit) is called.
 pub struct OverlayStore<S: KvStore> {
     base: Arc<S>,
+    write_limit: Option<usize>,
+    staged_bytes: AtomicUsize,
     frozen_prefixes: Vec<Vec<u8>>,
     changes: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
 }
@@ -17,6 +20,8 @@ impl<S: KvStore> OverlayStore<S> {
     pub fn new(base: Arc<S>) -> Self {
         Self {
             base,
+            write_limit: None,
+            staged_bytes: AtomicUsize::new(0),
             frozen_prefixes: Vec::new(),
             changes: RwLock::new(BTreeMap::new()),
         }
@@ -31,8 +36,14 @@ impl<S: KvStore> OverlayStore<S> {
         max_bytes: usize,
     ) -> Result<Self, StorageError> {
         let entries = base.snapshot_prefixes(prefixes, max_bytes)?;
+        let staged_bytes = entries
+            .iter()
+            .map(|(key, value)| key.len() + value.len() + 64)
+            .sum();
         Ok(Self {
             base,
+            write_limit: None,
+            staged_bytes: AtomicUsize::new(staged_bytes),
             frozen_prefixes: prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
             changes: RwLock::new(
                 entries
@@ -41,6 +52,18 @@ impl<S: KvStore> OverlayStore<S> {
                     .collect(),
             ),
         })
+    }
+
+    /// Limit private staged data, including an allowance for each map entry.
+    /// A rejected write or batch leaves the overlay unchanged.
+    pub fn with_write_limit(mut self, max_bytes: usize) -> Result<Self, StorageError> {
+        if self.staged_bytes.load(Ordering::Relaxed) > max_bytes {
+            return Err(StorageError::Database(
+                "replay overlay write limit exceeded".into(),
+            ));
+        }
+        self.write_limit = Some(max_bytes);
+        Ok(self)
     }
 
     /// Atomically apply all pending changes to the base store.
@@ -143,6 +166,7 @@ impl<S: KvStore> OverlayStore<S> {
         }
         self.base.write_batch(batch)?;
         changes.clear();
+        self.staged_bytes.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -204,19 +228,15 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-        self.changes
-            .write()
-            .map_err(|e| StorageError::Database(e.to_string()))?
-            .insert(key.to_vec(), Some(value.to_vec()));
-        Ok(())
+        let mut batch = WriteBatch::new();
+        batch.put(key.to_vec(), value.to_vec());
+        self.write_batch(batch)
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
-        self.changes
-            .write()
-            .map_err(|e| StorageError::Database(e.to_string()))?
-            .insert(key.to_vec(), None);
-        Ok(())
+        let mut batch = WriteBatch::new();
+        batch.delete(key.to_vec());
+        self.write_batch(batch)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -228,16 +248,35 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
             .changes
             .write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
+        // Collapse duplicate keys before checking the final batch size. Borrow
+        // values until the whole batch is accepted so rejection is atomic.
+        let mut updates = BTreeMap::new();
         for op in batch.ops() {
             match op {
                 WriteBatchOp::Put { key, value } => {
-                    changes.insert(key.clone(), Some(value.clone()));
+                    updates.insert(key, Some(value));
                 }
                 WriteBatchOp::Delete { key } => {
-                    changes.insert(key.clone(), None);
+                    updates.insert(key, None);
                 }
             }
         }
+        let mut bytes = self.staged_bytes.load(Ordering::Relaxed);
+        for (key, value) in &updates {
+            if let Some(old) = changes.get(*key) {
+                bytes -= key.len() + old.as_ref().map_or(0, Vec::len) + 64;
+            }
+            bytes = bytes.saturating_add(key.len() + value.map_or(0, Vec::len) + 64);
+        }
+        if self.write_limit.is_some_and(|limit| bytes > limit) {
+            return Err(StorageError::Database(
+                "replay overlay write limit exceeded".into(),
+            ));
+        }
+        for (key, value) in updates {
+            changes.insert(key.clone(), value.cloned());
+        }
+        self.staged_bytes.store(bytes, Ordering::Relaxed);
         Ok(())
     }
 
@@ -250,6 +289,33 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
 mod tests {
     use super::*;
     use crate::MemoryDb;
+
+    #[test]
+    fn write_limit_rejects_whole_batch_and_reclaims_replaced_values() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"a", b"base").unwrap();
+        let overlay = OverlayStore::new(base.clone())
+            .with_write_limit(140)
+            .unwrap();
+        overlay.put(b"a", b"1234567890").unwrap();
+        let before = overlay.checkpoint().unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"a".to_vec(), b"changed".to_vec());
+        batch.put(b"b".to_vec(), b"oversized".to_vec());
+        assert!(overlay.write_batch(batch).is_err());
+        assert_eq!(overlay.checkpoint().unwrap(), before);
+        assert!(overlay.put(b"huge", &[0; 200]).is_err());
+        overlay.delete(b"a").unwrap();
+        overlay.put(b"b", b"1234567890").unwrap();
+        assert_eq!(overlay.get(b"a").unwrap(), None);
+        let mut batch = WriteBatch::new();
+        batch.put(b"b".to_vec(), vec![0; 200]);
+        batch.put(b"b".to_vec(), b"short".to_vec());
+        overlay.write_batch(batch).unwrap();
+        assert_eq!(overlay.get(b"b").unwrap(), Some(b"short".to_vec()));
+        assert_eq!(base.get(b"a").unwrap(), Some(b"base".to_vec()));
+        assert_eq!(base.get(b"b").unwrap(), None);
+    }
 
     #[test]
     fn address_history_range_scan_contract() {

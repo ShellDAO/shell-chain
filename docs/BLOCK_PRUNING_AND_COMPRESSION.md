@@ -290,8 +290,19 @@ Body and witness writes commit together only after authentication succeeds; repl
 does not change live state. New pruning operations retain a digest atomically
 with deletion.
 
-Gaps with missing historical state or journals still require historical
-reconstruction support. Failed gaps remain
+If undo journals are unavailable, the unreleased node can reconstruct metadata
+from a local genesis checkpoint captured atomically with the first canonical
+block. This requires retained genesis state and every earlier canonical body
+and nonempty witness bundle. Reconstruction advances up to 32 blocks per retry
+and retains one private replay cursor with a 64 MiB staged-data allowance.
+Canonical target and prefix changes invalidate the cursor. The cursor is held
+in memory, so a restart starts reconstruction again; the checkpoint itself is
+persisted. The allowance bounds staged data, not total process memory or the
+execution time of one block.
+
+Existing databases without this checkpoint, missing historical state or
+ancestor witnesses, and reconstructions exceeding the allowance still require
+additional reconstruction support. Failed gaps remain
 pending for retry while later recoverable bodies and witnesses can proceed. This recovery
 path is not yet available in the published v0.27.3 binary. Keep witnesses locally
 when forensic retention must not depend on peer availability.
