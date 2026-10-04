@@ -8,6 +8,23 @@ const FORK_ADOPTION_RETRY_BASE_SECS: u64 = 5;
 const FORK_ADOPTION_RETRY_MAX_SECS: u64 = 30;
 const BODY_BACKFILL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn witness_in_retention_window(number: u64, head: u64, retention: u64) -> bool {
+    number <= head
+        && (retention == 0 || number >= crate::pruning::retention_cutoff(head, retention))
+}
+
+#[cfg(test)]
+#[test]
+fn witness_backfill_retention_boundaries() {
+    assert!(witness_in_retention_window(0, 100, 0));
+    assert!(!witness_in_retention_window(101, 100, 0));
+    assert!(witness_in_retention_window(37, 100, 64));
+    assert!(!witness_in_retention_window(36, 100, 64));
+    assert!(witness_in_retention_window(0, 2, 64));
+    assert!(witness_in_retention_window(100, 100, 1));
+    assert!(!witness_in_retention_window(99, 100, 1));
+}
+
 /// A quorum certificate may arrive before its block on a different gossip topic.
 /// Keep only the next height, so unimported network data cannot grow a backlog.
 #[derive(Default)]
@@ -719,7 +736,17 @@ impl<S: KvStore + 'static> Node<S> {
                         .get_block_hash_by_number(*number)
                         .ok()
                         .flatten()
-                        .is_some_and(|hash| matches!(self.chain_store.has_body(&hash), Ok(false)))
+                        .is_some_and(|hash| {
+                            matches!(self.chain_store.has_body(&hash), Ok(false))
+                                || (witness_in_retention_window(
+                                    *number,
+                                    head,
+                                    self.config.pruning.witness_retention,
+                                ) && matches!(
+                                    self.chain_store.has_recoverable_witness_gap(&hash),
+                                    Ok(true)
+                                ))
+                        })
                 });
                 if let Some(start_number) = start {
                     let nonce = Self::wall_clock_millis();
@@ -2084,16 +2111,14 @@ impl<S: KvStore + 'static> Node<S> {
                                             first_gap.get_or_insert(n);
                                             continue;
                                         }
-                                        if self.chain_store.has_body(&actual_hash).unwrap_or(false) {
-                                            last_stored = Some(n);
+                                        let needs_witness = witness_in_retention_window(n, head_number, self.config.pruning.witness_retention)
+                                            && self.chain_store.has_recoverable_witness_gap(&actual_hash).unwrap_or(false);
+                                        if let Err(error) = self.chain_store.put_backfill_block(block, needs_witness) {
+                                            warn!(block = n, %error, "failed to restore historical block data");
+                                            first_gap.get_or_insert(n);
                                             continue;
                                         }
-                                        if let Err(e) = self.chain_store.put_body_only(block) {
-                                            warn!(block = n, error = %e, "L4: failed to store backfill body");
-                                            first_gap.get_or_insert(n);
-                                        } else {
-                                            last_stored = Some(n);
-                                        }
+                                        last_stored = Some(n);
                                     }
                                     // If any block failed (mismatch or store error), re-request from
                                     // the first gap so missing blocks are never permanently skipped.
