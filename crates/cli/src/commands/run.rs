@@ -1452,6 +1452,7 @@ mod tests {
             chain.commit_canonical_block(&later, None).unwrap();
             let checkpoint = [b"amc/".as_ref(), genesis_hash.as_bytes()].concat();
             store.delete(&checkpoint).unwrap();
+            store.delete(genesis.header.state_root.as_bytes()).unwrap();
             initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
                 .await
                 .unwrap();
@@ -1468,6 +1469,16 @@ mod tests {
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
             let chain = ChainStore::new(store.clone());
             assert_eq!(chain.get_head_hash().unwrap(), Some(head_hash));
+            let root = chain
+                .get_header_by_hash(&genesis_hash)
+                .unwrap()
+                .unwrap()
+                .state_root;
+            let historical = shell_storage::WorldState::at_root(store.clone(), &root).unwrap();
+            assert_eq!(
+                historical.get_balance(&authority).unwrap(),
+                config.alloc[&authority].balance
+            );
             let overlay = ChainStore::new(Arc::new(shell_storage::OverlayStore::new(store)));
             assert!(overlay
                 .restore_genesis_metadata_checkpoint(&genesis_hash)

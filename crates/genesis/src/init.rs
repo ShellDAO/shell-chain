@@ -170,7 +170,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     Ok(block)
 }
 
-/// Seed missing historical metadata from a locally configured, hash-matched genesis.
+/// Restore missing genesis trie nodes and historical metadata from a hash-matched configuration.
 /// Live account metadata and the canonical head are never used as genesis values.
 pub fn bootstrap_genesis_metadata<S: KvStore + 'static>(
     config: &GenesisConfig,
@@ -471,6 +471,38 @@ mod tests {
             alloc,
             boot_nodes: vec![],
         }
+    }
+
+    #[test]
+    fn bootstrap_restores_missing_trie_and_rejects_conflicting_nodes_atomically() {
+        let mut config = test_genesis();
+        if let crate::ConsensusConfig::PoA {
+            authority_pubkeys, ..
+        } = &mut config.consensus
+        {
+            authority_pubkeys.clear();
+        }
+        let store = Arc::new(MemoryDb::new());
+        let genesis = initialize_genesis(&config, store.clone()).unwrap();
+        let chain = ChainStore::new(store.clone());
+        store
+            .put(genesis.header.state_root.as_bytes(), b"corrupt")
+            .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(bootstrap_genesis_metadata(&config, &chain).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        for (key, _) in before {
+            if key.len() == 32 {
+                store.delete(&key).unwrap();
+            }
+        }
+        assert!(bootstrap_genesis_metadata(&config, &chain).unwrap());
+        assert!(!bootstrap_genesis_metadata(&config, &chain).unwrap());
+        let state = WorldState::at_root(store, &genesis.header.state_root).unwrap();
+        for (address, entry) in &config.alloc {
+            assert_eq!(state.get_balance(address).unwrap(), entry.balance);
+        }
+        assert_eq!(chain.get_head_hash().unwrap(), Some(genesis.hash()));
     }
 
     #[test]
