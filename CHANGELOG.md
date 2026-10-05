@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Fetch missing ancestor witnesses needed for legacy historical validation, even
+  outside the configured witness retention window. Authenticate them before
+  resuming the dependent backfill without changing live state or the chain head.
+
 - Restore missing content-addressed genesis trie nodes from a matching genesis
   configuration during startup, including when the metadata checkpoint already
   exists. Reject conflicting stored nodes and commit restoration atomically.

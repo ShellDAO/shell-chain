@@ -2112,17 +2112,22 @@ impl<S: KvStore + 'static> Node<S> {
                                             first_gap.get_or_insert(n);
                                             continue;
                                         }
-                                        let needs_witness = witness_in_retention_window(n, head_number, self.config.pruning.witness_retention)
+                                        let is_replay_dependency = *self.legacy_backfill_dependency.lock() == Some(n);
+                                        let needs_witness = (is_replay_dependency || witness_in_retention_window(n, head_number, self.config.pruning.witness_retention))
                                             && !block.transactions.is_empty() && !self.chain_store.has_witness_bundle(&actual_hash).unwrap_or(true);
                                         if let Err(error) = self.chain_store.put_backfill_block_with_validation(block, needs_witness, |candidate| {
                                             self.validate_legacy_backfill_witness(candidate).map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
                                         }) {
                                             warn!(block = n, %error, "failed to restore historical block data");
-                                            deferred_body_gap = Some(deferred_body_gap.map_or(n, |gap| gap.min(n)));
+                                            let retry = self.legacy_backfill_dependency.lock().map_or(n, |dependency| dependency.min(n));
+                                            deferred_body_gap = Some(deferred_body_gap.map_or(retry, |gap| gap.min(retry)));
                                             // Continue the sweep so unavailable old witnesses do
                                             // not starve later recoverable bodies and witnesses.
                                             last_processed = Some(n);
                                             continue;
+                                        }
+                                        if is_replay_dependency {
+                                            *self.legacy_backfill_dependency.lock() = None;
                                         }
                                         last_processed = Some(n);
                                     }

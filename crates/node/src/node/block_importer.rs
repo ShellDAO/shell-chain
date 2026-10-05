@@ -713,9 +713,13 @@ impl<S: KvStore + 'static> Node<S> {
                 block.clone()
             } else {
                 let ancestor = chain.get_block_by_hash(&hash)?.ok_or_else(|| {
+                    let mut dependency = self.legacy_backfill_dependency.lock();
+                    *dependency = Some(dependency.map_or(number, |pending| pending.min(number)));
                     NodeError::Startup("legacy witness ancestor body unavailable".into())
                 })?;
                 if !ancestor.transactions.is_empty() && !chain.has_witness_bundle(&hash)? {
+                    let mut dependency = self.legacy_backfill_dependency.lock();
+                    *dependency = Some(dependency.map_or(number, |pending| pending.min(number)));
                     return Err(NodeError::Startup(
                         "legacy witness ancestor witness unavailable".into(),
                     ));

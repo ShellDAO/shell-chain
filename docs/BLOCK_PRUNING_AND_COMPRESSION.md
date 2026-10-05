@@ -308,7 +308,13 @@ with a combined 64 MiB allowance. Stores without a chain
 identity or canonical genesis remain pending. The allowance bounds staged data, not total process memory or the
 execution time of one block.
 
-Missing later historical state or ancestor witnesses, unauthenticated genesis
+Missing ancestor bodies or witnesses discovered during reconstruction are
+requested on the next backfill sweep. An ancestor witness is authenticated even
+when it falls outside the configured retention window, because it is needed to
+validate the retained target. A restart rediscovers these dependencies from the
+still-missing target. Peers must retain the required data.
+
+Missing later historical state, unauthenticated genesis
 configuration, and reconstructions exceeding the allowance still require
 additional reconstruction support. Failed gaps remain
 pending for retry while later recoverable bodies and witnesses can proceed. This recovery

@@ -229,6 +229,7 @@ pub struct Node<S: KvStore + 'static> {
     pub store: Arc<S>,
     pub chain_store: Arc<ChainStore<S>>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
+    legacy_backfill_dependency: parking_lot::Mutex<Option<u64>>,
     pub world_state: Arc<RwLock<WorldState<S>>>,
     pub tx_pool: Arc<TxPool>,
     pub consensus: Arc<RwLock<dyn ConsensusEngine>>,
@@ -990,6 +991,7 @@ impl<S: KvStore + 'static> Node<S> {
             store,
             chain_store,
             legacy_replay: parking_lot::Mutex::new(None),
+            legacy_backfill_dependency: parking_lot::Mutex::new(None),
             world_state,
             tx_pool,
             consensus,
@@ -9517,27 +9519,72 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_resumes_body_backfill_with_genesis_already_present() {
-        assert_body_backfill(false, false, false, false, false, false, 0).await;
+        assert_body_backfill(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_starts_body_backfill_when_peer_arrives_late() {
-        assert_body_backfill(true, false, false, false, false, false, 0).await;
+        assert_body_backfill(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_body_over_libp2p_after_late_connection() {
-        assert_body_backfill(true, true, false, false, false, false, 0).await;
+        assert_body_backfill(
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_with_retained_body() {
-        assert_body_backfill(false, false, true, false, false, false, 0).await;
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_witness_and_body_over_late_tcp_peer() {
-        assert_body_backfill(true, true, true, true, false, false, 0).await;
+        assert_body_backfill(
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[test]
@@ -9693,12 +9740,24 @@ mod tests {
             Some(missing.clone())
         );
         let first_witness_key = [b"w/".as_ref(), first.hash().as_bytes()].concat();
-        let first_witness = node.store.get(&first_witness_key).unwrap().unwrap();
         node.store.delete(&first_witness_key).unwrap();
         let without_ancestor = node.store.scan_prefix(b"").unwrap();
         assert!(node.validate_legacy_backfill_witness(&missing).is_err());
         assert_eq!(node.store.scan_prefix(b"").unwrap(), without_ancestor);
-        node.store.put(&first_witness_key, &first_witness).unwrap();
+        assert_eq!(
+            *node.legacy_backfill_dependency.lock(),
+            Some(first.number())
+        );
+        node.chain_store
+            .put_backfill_block_with_validation(&first, true, |candidate| {
+                node.validate_legacy_backfill_witness(candidate)
+                    .map_err(|error| shell_storage::StorageError::InvalidInput(error.to_string()))
+            })
+            .unwrap();
+        assert!(node.chain_store.has_witness_bundle(&first.hash()).unwrap());
+        node.validate_legacy_backfill_witness(&missing).unwrap();
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
         let genesis = node
             .chain_store
             .get_block_hash_by_number(0)
@@ -9741,22 +9800,84 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_restores_legacy_witness_with_historical_replay() {
-        assert_body_backfill(false, false, true, false, true, false, 0).await;
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_restores_legacy_witness_and_body() {
-        assert_body_backfill(false, false, true, true, true, false, 0).await;
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            true,
+            true,
+            false,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_backfill_continues_after_unavailable_witness() {
-        assert_body_backfill(false, false, true, false, true, true, 0).await;
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            false,
+            true,
+            true,
+            BackfillReplay::default(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn event_loop_backfill_resumes_pruned_genesis_replay() {
-        assert_body_backfill(false, false, true, false, true, false, 40).await;
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            BackfillReplay {
+                prefix: 40,
+                missing_ancestor: false,
+            },
+        )
+        .await;
+    }
+
+    #[derive(Default)]
+    struct BackfillReplay {
+        prefix: u64,
+        missing_ancestor: bool,
+    }
+
+    #[tokio::test]
+    async fn event_loop_recovers_ancestor_witness_outside_retention() {
+        assert_body_backfill(
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            BackfillReplay {
+                prefix: 1,
+                missing_ancestor: true,
+            },
+        )
+        .await;
     }
 
     async fn assert_body_backfill(
@@ -9766,8 +9887,9 @@ mod tests {
         remove_body: bool,
         legacy: bool,
         defer_first: bool,
-        replay_prefix: u64,
+        replay: BackfillReplay,
     ) {
+        let replay_prefix = replay.prefix;
         use shell_network::{
             NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
         };
@@ -9801,6 +9923,8 @@ mod tests {
                 signer,
             )
         };
+        let expected_sender =
+            Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         node.config.rpc_enabled = false;
         node.config.metrics.enabled = false;
         if witness_only {
@@ -9808,8 +9932,32 @@ mod tests {
             fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
         }
         store_consistent_genesis(&node);
+        let mut ancestors = Vec::new();
         for _ in 0..replay_prefix {
-            node.produce_block(&signer, 100).unwrap();
+            if replay.missing_ancestor {
+                let sender =
+                    Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+                submit_signed_tx(
+                    &node,
+                    &signer,
+                    sender,
+                    Transaction {
+                        chain_id: 1337,
+                        nonce: 0,
+                        to: Some(Address::from([0xcc; 32])),
+                        value: U256::from(1_000),
+                        data: Bytes::new(),
+                        gas_limit: 21_000,
+                        max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 0,
+                        access_list: None,
+                        tx_type: 2,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    },
+                );
+            }
+            ancestors.push(node.produce_block(&signer, 100).unwrap());
         }
         if witness_only {
             let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -9819,7 +9967,7 @@ mod tests {
                 sender,
                 Transaction {
                     chain_id: 1337,
-                    nonce: 0,
+                    nonce: u64::from(replay.missing_ancestor),
                     to: Some(Address::from([0xcc; 32])),
                     value: U256::from(1_000),
                     data: shell_primitives::Bytes::new(),
@@ -9880,6 +10028,13 @@ mod tests {
             node.chain_store
                 .prune_finalized_address_metadata_undo(head.number())
                 .unwrap();
+        }
+        if replay.missing_ancestor {
+            node.config.pruning.witness_retention = 2;
+            node.store
+                .delete(&[b"w/".as_ref(), ancestors[0].hash().as_bytes()].concat())
+                .unwrap();
+            assert!(ancestors[0].number() < head.number() - 1);
         }
         assert_eq!(node.oldest_available_body_block(), 0);
         if defer_first {
@@ -9984,7 +10139,14 @@ mod tests {
                     peer.send_to_peer(
                         &requester,
                         NetworkMessage::BodyResponse {
-                            blocks: if defer_first {
+                            blocks: if replay.missing_ancestor {
+                                ancestors
+                                    .iter()
+                                    .chain([&missing, &tip])
+                                    .filter(|b| b.number() >= start_number)
+                                    .cloned()
+                                    .collect()
+                            } else if defer_first {
                                 vec![tip.clone()]
                             } else {
                                 vec![missing.clone(), tip.clone()]
@@ -10024,10 +10186,22 @@ mod tests {
             requested.expect("interior missing body was never requested"),
             if defer_first {
                 tip.number()
+            } else if replay.missing_ancestor {
+                ancestors[0].number()
             } else {
                 missing.number()
             }
         );
+        if replay.missing_ancestor {
+            assert!(node
+                .chain_store
+                .has_witness_bundle(&ancestors[0].hash())
+                .unwrap());
+            assert_eq!(
+                node.world_state.read().get_nonce(&expected_sender).unwrap(),
+                2
+            );
+        }
         let reopened = ChainStore::new(node.store.clone());
         if defer_first {
             assert!(!reopened.has_witness_bundle(&missing.hash()).unwrap());
