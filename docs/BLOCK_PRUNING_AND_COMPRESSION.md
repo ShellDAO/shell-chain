@@ -295,9 +295,13 @@ from a local genesis checkpoint captured atomically with the first canonical
 block. This requires available genesis state and every earlier canonical body
 and nonempty witness bundle. Reconstruction advances up to 32 blocks per retry
 and retains one private replay cursor with a 64 MiB staged-data allowance.
-Canonical target and prefix changes invalidate the cursor. The cursor is held
-in memory, so a restart starts reconstruction again; the checkpoint itself is
-persisted. On startup, the unreleased CLI also seeds a missing checkpoint from
+Each completed ancestor and its cursor commit atomically in a private database
+namespace, releasing staged data before the next block. Reconstruction resumes
+after restart without changing live account metadata or the canonical head.
+Canonical target and prefix changes invalidate the cursor; the supplied target
+witness is always authenticated again. Completion removes the private replay
+data. The allowance applies to each staged block and the initial metadata
+snapshot, rather than cumulative history. On startup, the unreleased CLI also seeds a missing checkpoint from
 the configured genesis in an isolated store after verifying its chain ID and
 genesis hash against the stored identity and canonical block zero. It never
 copies current account metadata into this checkpoint. Missing genesis trie nodes

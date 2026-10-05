@@ -626,9 +626,42 @@ impl<S: KvStore + 'static> Node<S> {
         let mut pending = self.legacy_replay.lock();
         if self.chain_store.get_block_hash_by_number(block.number())? != Some(block.hash()) {
             *pending = None;
+            self.chain_store.reopen_native_replay()?.clear_replay()?;
             return Err(NodeError::Startup(
                 "legacy witness block is not canonical".into(),
             ));
+        }
+        if pending.is_none() {
+            let overlay = Arc::new(
+                self.chain_store
+                    .reopen_native_replay()?
+                    .with_write_limit(64 * 1024 * 1024)?,
+            );
+            if let Some(bytes) = overlay.replay_checkpoint()? {
+                let saved = serde_json::from_slice::<(ShellHash, u64, BlockHeader)>(&bytes);
+                if let Ok((target, target_number, parent)) = saved {
+                    if parent.number < target_number
+                        && self.chain_store.get_block_hash_by_number(target_number)? == Some(target)
+                        && self.chain_store.get_block_hash_by_number(parent.number)?
+                            == Some(parent.hash())
+                    {
+                        let state = WorldState::at_root(overlay.clone(), &parent.state_root)?;
+                        let registry = load_algorithm_registry(&state).map_err(|error| {
+                            NodeError::Startup(format!("legacy witness registry: {error}"))
+                        })?;
+                        *pending = Some(LegacyReplay {
+                            target,
+                            target_number,
+                            overlay: overlay.clone(),
+                            parent,
+                            registry,
+                        });
+                    }
+                }
+                if pending.is_none() {
+                    overlay.clear_replay()?;
+                }
+            }
         }
         // Keep the current gap's progress while the same sweep visits other
         // gaps. Otherwise each later response would restart the oldest replay.
@@ -660,9 +693,10 @@ impl<S: KvStore + 'static> Node<S> {
         let mut cursor = match retained {
             Some(cursor) => cursor,
             None => {
+                self.chain_store.reopen_native_replay()?.clear_replay()?;
                 let overlay = Arc::new(
                     self.chain_store
-                        .native_replay_overlay()?
+                        .durable_native_replay_overlay()?
                         .with_write_limit(64 * 1024 * 1024)?,
                 );
                 let chain = ChainStore::new(overlay.clone());
@@ -742,11 +776,22 @@ impl<S: KvStore + 'static> Node<S> {
             )?;
             chain.set_head(&hash)?;
             cursor.parent = candidate.header;
+            let checkpoint =
+                serde_json::to_vec(&(cursor.target, cursor.target_number, &cursor.parent))
+                    .map_err(|error| {
+                        NodeError::Startup(format!("legacy witness cursor: {error}"))
+                    })?;
+            // The supplied target witness must be validated on every call,
+            // including after a crash immediately before cleanup.
+            if cursor.parent.number < cursor.target_number {
+                cursor.overlay.persist_replay_checkpoint(&checkpoint)?;
+            }
         }
         if cursor.parent.number < block.number() {
             *pending = Some(cursor);
             return Err(NodeError::Startup("legacy witness replay pending".into()));
         }
+        cursor.overlay.clear_replay()?;
         Ok(())
     }
 
