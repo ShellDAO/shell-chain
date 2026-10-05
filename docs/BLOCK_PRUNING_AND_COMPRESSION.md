@@ -292,7 +292,7 @@ with deletion.
 
 If undo journals are unavailable, the unreleased node can reconstruct metadata
 from a local genesis checkpoint captured atomically with the first canonical
-block. This requires retained genesis state and every earlier canonical body
+block. This requires available genesis state and every earlier canonical body
 and nonempty witness bundle. Reconstruction advances up to 32 blocks per retry
 and retains one private replay cursor with a 64 MiB staged-data allowance.
 Canonical target and prefix changes invalidate the cursor. The cursor is held
@@ -300,11 +300,15 @@ in memory, so a restart starts reconstruction again; the checkpoint itself is
 persisted. On startup, the unreleased CLI also seeds a missing checkpoint from
 the configured genesis in an isolated store after verifying its chain ID and
 genesis hash against the stored identity and canonical block zero. It never
-copies current account metadata into this checkpoint. Stores without a chain
+copies current account metadata into this checkpoint. Missing genesis trie nodes
+are also restored from the same reconstruction, even if the checkpoint already
+exists. Content hashes are verified and conflicting stored nodes are rejected
+before any writes; missing nodes and a missing checkpoint commit in one batch
+with a combined 64 MiB allowance. Stores without a chain
 identity or canonical genesis remain pending. The allowance bounds staged data, not total process memory or the
 execution time of one block.
 
-Missing historical state or ancestor witnesses, unauthenticated genesis
+Missing later historical state or ancestor witnesses, unauthenticated genesis
 configuration, and reconstructions exceeding the allowance still require
 additional reconstruction support. Failed gaps remain
 pending for retry while later recoverable bodies and witnesses can proceed. This recovery

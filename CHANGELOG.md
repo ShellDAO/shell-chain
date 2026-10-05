@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Restore missing content-addressed genesis trie nodes from a matching genesis
+  configuration during startup, including when the metadata checkpoint already
+  exists. Reject conflicting stored nodes and commit restoration atomically.
+
 - Recover legacy witnesses after metadata undo pruning when a locally captured
   genesis metadata checkpoint, genesis state, and earlier canonical bodies and
   witnesses remain available. Keep replay private, resume it across backfill

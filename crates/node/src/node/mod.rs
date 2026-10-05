@@ -9717,6 +9717,24 @@ mod tests {
         assert!(node.validate_legacy_backfill_witness(&bad).is_err());
         node.validate_legacy_backfill_witness(&missing).unwrap();
         assert_eq!(node.store.scan_prefix(b"").unwrap(), restored);
+        let genesis_root = node
+            .chain_store
+            .get_header_by_hash(&genesis)
+            .unwrap()
+            .unwrap()
+            .state_root;
+        assert_ne!(genesis_root, tip.header.state_root);
+        node.store.delete(genesis_root.as_bytes()).unwrap();
+        assert!(node.validate_legacy_backfill_witness(&missing).is_err());
+        assert_eq!(
+            WorldState::at_root(node.store.clone(), &tip.header.state_root)
+                .unwrap()
+                .get_nonce(&sender)
+                .unwrap(),
+            3
+        );
+        shell_genesis::bootstrap_genesis_metadata(&genesis_config, &node.chain_store).unwrap();
+        node.validate_legacy_backfill_witness(&missing).unwrap();
         assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
         assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
     }

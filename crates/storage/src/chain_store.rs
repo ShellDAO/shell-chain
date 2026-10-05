@@ -1491,7 +1491,7 @@ impl<S: KvStore> ChainStore<S> {
         self.store.write_batch(batch)
     }
 
-    /// Copy metadata only from a trusted genesis-only store with matching identity.
+    /// Restore missing trie nodes and metadata from a trusted, identity-matched genesis.
     pub fn seed_genesis_metadata_checkpoint<T: KvStore>(
         &self,
         trusted: &ChainStore<T>,
@@ -1504,27 +1504,56 @@ impl<S: KvStore> ChainStore<S> {
                 "metadata bootstrap genesis mismatch".into(),
             ));
         }
+        let mut batch = WriteBatch::new();
+        let mut bytes = 0usize;
+        // Trie nodes are immutable and addressed by the hash of their encoding.
+        // Copy only authenticated missing nodes; never overwrite live data.
+        for (key, value) in trusted.store.scan_prefix(b"")? {
+            if key.len() != 32 {
+                continue;
+            }
+            if shell_primitives::keccak256(&value).as_bytes() != key.as_slice() {
+                return Err(StorageError::State("invalid genesis trie node".into()));
+            }
+            match self.store.get(&key)? {
+                Some(existing) if existing != value => {
+                    return Err(StorageError::State("conflicting genesis trie node".into()));
+                }
+                Some(_) => continue,
+                None => {}
+            }
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            if bytes > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
+                return Err(StorageError::State(
+                    "genesis restoration exceeds size limit".into(),
+                ));
+            }
+            batch.put(key, value);
+        }
         let key = [b"amc/".as_ref(), genesis.hash().as_bytes()].concat();
-        if self.store.get(&key)?.is_some() {
+        if self.store.get(&key)?.is_none() {
+            let mut entries = Vec::new();
+            for prefix in ChainStore::<OverlayStore<S>>::ADDRESS_METADATA_PREFIXES {
+                for (key, value) in trusted.store.scan_prefix(prefix)? {
+                    entries.push(AddressMetadataUndoEntry {
+                        key,
+                        previous_value: Some(value),
+                    });
+                }
+            }
+            let encoded = serde_json::to_vec(&entries)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            if bytes.saturating_add(encoded.len()) > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
+                return Err(StorageError::State(
+                    "genesis restoration exceeds size limit".into(),
+                ));
+            }
+            batch.put(key, encoded);
+        }
+        if batch.is_empty() {
             return Ok(false);
         }
-        let mut entries = Vec::new();
-        for prefix in ChainStore::<OverlayStore<S>>::ADDRESS_METADATA_PREFIXES {
-            for (key, value) in trusted.store.scan_prefix(prefix)? {
-                entries.push(AddressMetadataUndoEntry {
-                    key,
-                    previous_value: Some(value),
-                });
-            }
-        }
-        let encoded =
-            serde_json::to_vec(&entries).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        if encoded.len() > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
-            return Err(StorageError::State(
-                "genesis metadata checkpoint exceeds size limit".into(),
-            ));
-        }
-        self.store.put(&key, &encoded)?;
+        self.store.write_batch(batch)?;
         Ok(true)
     }
 
