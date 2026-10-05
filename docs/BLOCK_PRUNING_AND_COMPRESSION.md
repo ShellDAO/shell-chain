@@ -415,6 +415,24 @@ retries on each new peer connection.
 > **Note**: if *all* nodes in a network ran `light` profile and data has been
 > pruned, that history is permanently lost and cannot be recovered.
 
+### Retention boundary regression
+
+Run the production-node storage and back-fill regression with:
+
+```bash
+cargo test -p shell-node --features rocksdb event_loop_backfills_after_default_light_retention_boundary
+```
+
+The test creates an isolated database and signing key, produces 4,097 blocks,
+checks the default Light body window at finalized heights 4,095–4,097, and
+switches to Full. An in-process peer returns the expired genesis and signed
+transaction block. The test checks restored bodies and unchanged account state
+and head, then reopens RocksDB to check persistence.
+
+Finalized cursors are supplied explicitly and block production is accelerated.
+This regression does not validate wall-clock consensus finalization, external
+peer discovery, or a released binary. No retention override is used.
+
 ### Docker Compose defaults
 
 The bundled `docker-compose.yml` assigns:
