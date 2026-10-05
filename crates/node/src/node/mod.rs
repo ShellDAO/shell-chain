@@ -9553,8 +9553,24 @@ mod tests {
     fn assert_legacy_reference_recovery(extra_blocks: u64) {
         let (node, signer) = setup_node();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
-        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
-        store_consistent_genesis(&node);
+        let genesis_config: shell_genesis::GenesisConfig =
+            serde_json::from_value(serde_json::json!({
+                "chain_id": 1337,
+                "timestamp": 1_700_000_000,
+                "consensus": {
+                    "engine": "poa",
+                    "authorities": [sender],
+                    "authority_pubkeys": [format!("0x{}", hex::encode(signer.public_key()))],
+                    "block_time_secs": 1
+                },
+                "alloc": {sender.to_string(): {"balance": "100000000000000"}}
+            }))
+            .unwrap();
+        let genesis =
+            shell_genesis::initialize_genesis(&genesis_config, node.store.clone()).unwrap();
+        *node.world_state.write() =
+            WorldState::at_root(node.store.clone(), &genesis.header.state_root).unwrap();
+        shell_genesis::initialize_authority_pubkeys(&genesis_config, &node.chain_store).unwrap();
         let transaction = Transaction {
             chain_id: 1337,
             nonce: 0,
@@ -9694,6 +9710,15 @@ mod tests {
         let without_history = node.store.scan_prefix(b"").unwrap();
         assert!(node.validate_legacy_backfill_witness(&missing).is_err());
         assert_eq!(node.store.scan_prefix(b"").unwrap(), without_history);
+        assert!(
+            shell_genesis::bootstrap_genesis_metadata(&genesis_config, &node.chain_store).unwrap()
+        );
+        let restored = node.store.scan_prefix(b"").unwrap();
+        assert!(node.validate_legacy_backfill_witness(&bad).is_err());
+        node.validate_legacy_backfill_witness(&missing).unwrap();
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), restored);
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), 3);
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
     }
 
     #[tokio::test]

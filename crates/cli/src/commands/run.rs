@@ -563,6 +563,7 @@ async fn initialize_chain<S: KvStore + 'static>(
         };
         chain_store.schedule_protocol_activations(&desired)?;
     }
+    shell_genesis::bootstrap_genesis_metadata(genesis_config, &chain_store)?;
     initialize_authority_pubkeys(genesis_config, &chain_store)?;
     Ok(())
 }
@@ -1424,6 +1425,60 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rocksdb")]
+    #[tokio::test]
+    async fn legacy_genesis_metadata_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = DilithiumSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let mut config = test_genesis(authority);
+        if let ConsensusConfig::PoA {
+            authority_pubkeys, ..
+        } = &mut config.consensus
+        {
+            *authority_pubkeys = vec![format!("0x{}", hex::encode(signer.public_key()))];
+        }
+        let db_path = dir.path().join("db");
+        let genesis_hash;
+        let head_hash;
+        {
+            let stores = shell_storage::RocksDbStore::open_all(&db_path, None).unwrap();
+            let store = Arc::new(stores.state);
+            let genesis = initialize_genesis(&config, store.clone()).unwrap();
+            genesis_hash = genesis.hash();
+            let chain = ChainStore::new(store.clone());
+            let later = test_block(1, genesis_hash, genesis.header.state_root);
+            head_hash = later.hash();
+            chain.commit_canonical_block(&later, None).unwrap();
+            let checkpoint = [b"amc/".as_ref(), genesis_hash.as_bytes()].concat();
+            store.delete(&checkpoint).unwrap();
+            initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+                .await
+                .unwrap();
+            assert!(store.get(&checkpoint).unwrap().is_some());
+            store.flush().unwrap();
+        }
+        {
+            let stores = shell_storage::RocksDbStore::open_all(&db_path, None).unwrap();
+            let store = Arc::new(stores.state);
+            let before = store.scan_prefix(b"").unwrap();
+            initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+                .await
+                .unwrap();
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+            let chain = ChainStore::new(store.clone());
+            assert_eq!(chain.get_head_hash().unwrap(), Some(head_hash));
+            let overlay = ChainStore::new(Arc::new(shell_storage::OverlayStore::new(store)));
+            assert!(overlay
+                .restore_genesis_metadata_checkpoint(&genesis_hash)
+                .unwrap());
+            assert_eq!(
+                overlay.get_pubkey(&authority).unwrap(),
+                Some(signer.public_key().to_vec())
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn checkpoint_fixture(dir: &Path, config: &GenesisConfig) -> (String, ShellHash) {
         let source = Arc::new(MemoryDb::new());
@@ -1550,7 +1605,16 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+            let after = store.scan_prefix(b"").unwrap();
+            let checkpoint_key = [b"amc/".as_ref(), genesis.hash().as_bytes()].concat();
+            assert_eq!(store.get(&checkpoint_key).unwrap().is_some(), has_config);
+            assert_eq!(
+                after
+                    .into_iter()
+                    .filter(|(key, _)| key != &checkpoint_key)
+                    .collect::<Vec<_>>(),
+                before
+            );
         }
     }
 
@@ -1693,6 +1757,8 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let mut config = test_genesis(Address::from([7u8; 20]));
         initialize_genesis(&config, Arc::clone(&store)).unwrap();
+        shell_genesis::bootstrap_genesis_metadata(&config, &ChainStore::new(store.clone()))
+            .unwrap();
         let before = store.scan_prefix(b"").unwrap();
         config.boot_nodes.push("/ip4/127.0.0.1/tcp/30333".into());
         initialize_chain(

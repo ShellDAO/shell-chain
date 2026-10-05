@@ -1491,6 +1491,43 @@ impl<S: KvStore> ChainStore<S> {
         self.store.write_batch(batch)
     }
 
+    /// Copy metadata only from a trusted genesis-only store with matching identity.
+    pub fn seed_genesis_metadata_checkpoint<T: KvStore>(
+        &self,
+        trusted: &ChainStore<T>,
+    ) -> Result<bool, StorageError> {
+        let genesis = trusted
+            .get_head_block()?
+            .ok_or_else(|| StorageError::State("trusted genesis unavailable".into()))?;
+        if genesis.number() != 0 || self.get_block_hash_by_number(0)? != Some(genesis.hash()) {
+            return Err(StorageError::State(
+                "metadata bootstrap genesis mismatch".into(),
+            ));
+        }
+        let key = [b"amc/".as_ref(), genesis.hash().as_bytes()].concat();
+        if self.store.get(&key)?.is_some() {
+            return Ok(false);
+        }
+        let mut entries = Vec::new();
+        for prefix in ChainStore::<OverlayStore<S>>::ADDRESS_METADATA_PREFIXES {
+            for (key, value) in trusted.store.scan_prefix(prefix)? {
+                entries.push(AddressMetadataUndoEntry {
+                    key,
+                    previous_value: Some(value),
+                });
+            }
+        }
+        let encoded =
+            serde_json::to_vec(&entries).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        if encoded.len() > MAX_NATIVE_REPLAY_SNAPSHOT_BYTES {
+            return Err(StorageError::State(
+                "genesis metadata checkpoint exceeds size limit".into(),
+            ));
+        }
+        self.store.put(&key, &encoded)?;
+        Ok(true)
+    }
+
     /// Atomically commit the genesis block, canonical/head pointers, and chain config.
     ///
     /// This keeps bootstrap metadata aligned with the genesis state root so

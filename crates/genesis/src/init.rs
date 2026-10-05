@@ -170,6 +170,47 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     Ok(block)
 }
 
+/// Seed missing historical metadata from a locally configured, hash-matched genesis.
+/// Live account metadata and the canonical head are never used as genesis values.
+pub fn bootstrap_genesis_metadata<S: KvStore + 'static>(
+    config: &GenesisConfig,
+    chain_store: &ChainStore<S>,
+) -> Result<bool, GenesisError> {
+    let Some(stored) = chain_store
+        .get_chain_config()
+        .map_err(|e| GenesisError::StateInit(e.to_string()))?
+    else {
+        // Legacy stores without a chain identity remain usable, but cannot
+        // authenticate this historical metadata checkpoint.
+        return Ok(false);
+    };
+    if stored.chain_id != config.chain_id {
+        return Err(GenesisError::Validation(
+            "metadata bootstrap chain ID mismatch".into(),
+        ));
+    }
+    let isolated = std::sync::Arc::new(shell_storage::MemoryDb::new());
+    let genesis = initialize_genesis(config, isolated.clone())?;
+    if stored.genesis_hash != genesis.hash() {
+        return Err(GenesisError::Validation(
+            "metadata bootstrap genesis identity mismatch".into(),
+        ));
+    }
+    // Checkpoint-only stores may not contain genesis history yet.
+    if chain_store
+        .get_block_hash_by_number(0)
+        .map_err(|e| GenesisError::StateInit(e.to_string()))?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let trusted = ChainStore::new(isolated);
+    initialize_authority_pubkeys(config, &trusted)?;
+    chain_store
+        .seed_genesis_metadata_checkpoint(&trusted)
+        .map_err(|e| GenesisError::StateInit(e.to_string()))
+}
+
 /// Persist authority PQ public keys from genesis into the shared pubkey registry.
 pub fn initialize_authority_pubkeys<S: KvStore + 'static>(
     config: &GenesisConfig,
@@ -430,6 +471,77 @@ mod tests {
             alloc,
             boot_nodes: vec![],
         }
+    }
+
+    #[test]
+    fn metadata_bootstrap_defers_checkpoint_only_history() {
+        let config = test_genesis();
+        let source = Arc::new(MemoryDb::new());
+        initialize_genesis(&config, source.clone()).unwrap();
+        let source = ChainStore::new(source);
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(store.clone());
+        let mut identity = source.get_chain_config().unwrap().unwrap();
+        chain.put_chain_config(&identity).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(!bootstrap_genesis_metadata(&config, &chain).unwrap());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        identity.genesis_hash = ShellHash::ZERO;
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(store.clone());
+        chain.put_chain_config(&identity).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(bootstrap_genesis_metadata(&config, &chain).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_bootstrap_uses_genesis_not_live_keys() {
+        use shell_crypto::{MlDsaSigner, Signer};
+        let signer = MlDsaSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let mut config = test_genesis();
+        if let ConsensusConfig::PoA {
+            authorities,
+            authority_pubkeys,
+            ..
+        } = &mut config.consensus
+        {
+            *authorities = vec![authority];
+            *authority_pubkeys = vec![format!("0x{}", hex::encode(signer.public_key()))];
+        }
+        let store = Arc::new(MemoryDb::new());
+        let genesis = initialize_genesis(&config, store.clone()).unwrap();
+        let chain = ChainStore::new(store.clone());
+        let mut later = genesis.clone();
+        later.header.number = 1;
+        later.header.parent_hash = genesis.hash();
+        chain.commit_canonical_block(&later, None).unwrap();
+        chain.put_pubkey(&authority, b"later-key").unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let mut wrong = config.clone();
+        wrong.chain_id += 1;
+        assert!(bootstrap_genesis_metadata(&wrong, &chain).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        let mut wrong = config.clone();
+        wrong.timestamp += 1;
+        assert!(bootstrap_genesis_metadata(&wrong, &chain).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        assert!(bootstrap_genesis_metadata(&config, &chain).unwrap());
+        assert!(!bootstrap_genesis_metadata(&config, &chain).unwrap());
+        assert_eq!(chain.get_head_hash().unwrap(), Some(later.hash()));
+        assert_eq!(
+            chain.get_pubkey(&authority).unwrap(),
+            Some(b"later-key".to_vec())
+        );
+        let isolated = ChainStore::new(Arc::new(shell_storage::OverlayStore::new(store)));
+        assert!(isolated
+            .restore_genesis_metadata_checkpoint(&genesis.hash())
+            .unwrap());
+        assert_eq!(
+            isolated.get_pubkey(&authority).unwrap(),
+            Some(signer.public_key().to_vec())
+        );
     }
 
     #[test]
