@@ -10465,6 +10465,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_backfills_after_default_light_retention_boundary() {
+        use shell_network::{
+            NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+        };
+        use std::time::Duration;
+
+        #[cfg(not(feature = "rocksdb"))]
+        let (mut node, signer) = setup_node();
+        #[cfg(feature = "rocksdb")]
+        let directory = std::env::temp_dir().join(format!(
+            "shell-retention-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        #[cfg(feature = "rocksdb")]
+        let (mut node, signer) = {
+            let signer = DilithiumSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let stores = shell_storage::RocksDbStore::open_all(&directory, None).unwrap();
+            (
+                setup_node_with_store(authority, Arc::new(stores.chain)),
+                signer,
+            )
+        };
+        node.config.pruning = StorageProfile::Light.to_pruning_config(None, None, None);
+        // Reconstruct the node so its pruners use the actual profile defaults.
+        node = Node::new(
+            node.config.clone(),
+            Arc::clone(&node.store),
+            Arc::clone(&node.chain_store),
+            Arc::clone(&node.world_state),
+            Arc::clone(&node.tx_pool),
+            Arc::clone(&node.consensus),
+        );
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        fund_account(&node, &sender, U256::from(100_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let genesis = node.chain_store.get_block_by_number(0).unwrap().unwrap();
+        submit_signed_tx(
+            &node,
+            &signer,
+            sender,
+            Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(Address::from([0xcc; 32])),
+                value: U256::from(1_000),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+        );
+        let first = node.produce_block(&signer, 100).unwrap();
+        let mut tip = first.clone();
+        for _ in 1..4097 {
+            tip = node.produce_block(&signer, 100).unwrap();
+        }
+        assert_eq!(tip.number(), 4097);
+        assert!(node.chain_store.has_body(&genesis.hash()).unwrap());
+        assert!(node.chain_store.has_body(&first.hash()).unwrap());
+
+        // This test supplies finalized cursors explicitly: it covers the real
+        // 4096-block storage boundary, not wall-clock consensus finalization.
+        for (finalized, expected_cursor) in [(4095, 0), (4096, 1), (4097, 2)] {
+            let hash = node
+                .chain_store
+                .get_block_hash_by_number(finalized)
+                .unwrap()
+                .unwrap();
+            node.chain_store.set_finalized_number(finalized).unwrap();
+            node.finality.write().set_finalized_direct(finalized, hash);
+            node.record_canonical_state_root(tip.number(), tip.header.state_root);
+            assert_eq!(
+                node.chain_store.body_pruned_below().unwrap(),
+                expected_cursor
+            );
+            assert_eq!(
+                node.chain_store.has_body(&genesis.hash()).unwrap(),
+                finalized < 4096
+            );
+            assert_eq!(
+                node.chain_store.has_body(&first.hash()).unwrap(),
+                finalized < 4097
+            );
+            assert!(node.chain_store.get_block_by_number(2).unwrap().is_some());
+        }
+        let nonce = node.world_state.read().get_nonce(&sender).unwrap();
+        let balance = node.world_state.read().get_balance(&sender).unwrap();
+        node.config.pruning = StorageProfile::Full.to_pruning_config(None, None, None);
+        node.config.node_role = crate::NodeRole::Prover;
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        let restarted = Node::new(
+            node.config.clone(),
+            Arc::clone(&node.store),
+            Arc::clone(&node.chain_store),
+            Arc::clone(&node.world_state),
+            Arc::clone(&node.tx_pool),
+            Arc::clone(&node.consensus),
+        );
+        drop(node);
+        let node = Arc::new(restarted);
+        let bus = NetworkBus::new(64);
+        let config = NetworkConfig::default();
+        let mut network = bus.join(&config);
+        let mut peer = bus.join(&config);
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(Arc::new(signer), &mut network).await }
+        });
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    peer: requester,
+                    message:
+                        NetworkMessage::BodyRequest {
+                            start_number,
+                            nonce,
+                            ..
+                        },
+                }) = peer.next_event().await
+                {
+                    assert_eq!(start_number, 0);
+                    peer.send_to_peer(
+                        &requester,
+                        NetworkMessage::BodyResponse {
+                            blocks: vec![genesis.clone(), first.clone()],
+                            nonce,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    while !node.chain_store.has_body(&first.hash()).unwrap() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    break;
+                }
+            }
+        })
+        .await;
+        node.shutdown();
+        handle.await.unwrap().unwrap();
+        recovered.expect("expired bodies were not recovered after switching to Full");
+        assert_eq!(
+            node.chain_store.get_block_by_number(0).unwrap().unwrap(),
+            genesis
+        );
+        assert_eq!(
+            node.chain_store.get_block_by_number(1).unwrap().unwrap(),
+            first
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        assert_eq!(node.world_state.read().get_nonce(&sender).unwrap(), nonce);
+        assert_eq!(
+            node.world_state.read().get_balance(&sender).unwrap(),
+            balance
+        );
+        #[cfg(feature = "rocksdb")]
+        {
+            drop(node);
+            let stores = shell_storage::RocksDbStore::open_all(&directory, None).unwrap();
+            let store = Arc::new(stores.chain);
+            let chain = ChainStore::new(Arc::clone(&store));
+            let state = WorldState::at_root(store, &tip.header.state_root).unwrap();
+            assert_eq!(chain.get_block_by_number(0).unwrap().unwrap(), genesis);
+            assert_eq!(chain.get_block_by_number(1).unwrap().unwrap(), first);
+            assert_eq!(chain.get_head_hash().unwrap(), Some(tip.hash()));
+            assert_eq!(state.get_nonce(&sender).unwrap(), nonce);
+            assert_eq!(state.get_balance(&sender).unwrap(), balance);
+            drop(state);
+            drop(chain);
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn event_loop_shutdown_interrupts_startup_backfill_delay() {
         use shell_network::{NetworkBus, NetworkConfig};
         use std::time::Duration;
