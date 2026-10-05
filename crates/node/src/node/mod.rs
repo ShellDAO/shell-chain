@@ -2058,6 +2058,38 @@ mod tests {
     }
 
     #[test]
+    fn durable_replay_failed_batch_preserves_last_checkpoint() {
+        let base = Arc::new(FailingBatchDb::new());
+        base.put(b"meta/key", b"live").unwrap();
+        let overlay =
+            shell_storage::OverlayStore::reopen_replay(base.clone(), b"private-test/", &[b"meta/"])
+                .unwrap();
+        overlay.put(b"meta/key", b"first").unwrap();
+        overlay.persist_replay_checkpoint(b"one").unwrap();
+        overlay.put(b"meta/key", b"second").unwrap();
+        overlay.put(b"new-key", b"private").unwrap();
+        base.fail_next_batch();
+        assert!(overlay.persist_replay_checkpoint(b"two").is_err());
+        assert_eq!(overlay.get(b"meta/key").unwrap(), Some(b"second".to_vec()));
+        let reopened =
+            shell_storage::OverlayStore::reopen_replay(base.clone(), b"private-test/", &[b"meta/"])
+                .unwrap();
+        assert_eq!(reopened.replay_checkpoint().unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(b"meta/key").unwrap(), Some(b"first".to_vec()));
+        assert_eq!(reopened.get(b"new-key").unwrap(), None);
+        overlay.persist_replay_checkpoint(b"two").unwrap();
+        assert_eq!(reopened.replay_checkpoint().unwrap(), Some(b"two".to_vec()));
+        assert_eq!(base.get(b"meta/key").unwrap(), Some(b"live".to_vec()));
+        // Cleanup failure removes the cursor first, so a partial namespace
+        // cannot be mistaken for a valid restart checkpoint.
+        base.fail_next_batch();
+        assert!(overlay.clear_replay().is_err());
+        assert_eq!(reopened.replay_checkpoint().unwrap(), None);
+        overlay.clear_replay().unwrap();
+        assert!(base.scan_prefix(b"private-test/").unwrap().is_empty());
+    }
+
+    #[test]
     fn next_block_request_start_stops_at_terminal_height() {
         assert_eq!(next_block_request_start(0), Some(1));
         assert_eq!(next_block_request_start(u64::MAX - 1), Some(u64::MAX));
@@ -9589,17 +9621,111 @@ mod tests {
 
     #[test]
     fn legacy_reference_witness_restores_after_sender_nonce_advances() {
-        assert_legacy_reference_recovery(0);
+        assert_legacy_reference_recovery(0, false);
     }
 
     #[test]
     fn legacy_reference_witness_restores_with_older_retained_history() {
-        assert_legacy_reference_recovery(shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS);
+        assert_legacy_reference_recovery(shell_storage::ADDRESS_METADATA_HISTORY_BLOCKS, false);
     }
 
-    fn assert_legacy_reference_recovery(extra_blocks: u64) {
-        let (node, signer) = setup_node();
+    #[test]
+    fn legacy_reference_replay_resumes_in_new_node() {
+        assert_legacy_reference_recovery(0, true);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn legacy_reference_replay_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_LEGACY_REPLAY_TEST_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            legacy_reference_recovery_with_store(
+                0,
+                true,
+                Arc::new(stores.state),
+                Some(&directory.join("fixture.json")),
+            );
+            unreachable!();
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-legacy-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::legacy_reference_replay_survives_process_exit",
+            ])
+            .env(DIRECTORY, directory.as_path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, missing, bad, tip): (Address, Block, Block, Block) = serde_json::from_slice(
+            &std::fs::read(directory.as_path().join("fixture.json")).unwrap(),
+        )
+        .unwrap();
+        let stores =
+            shell_storage::RocksDbStore::open_all(directory.as_path().join("db"), None).unwrap();
+        let store = Arc::new(stores.state);
+        let node = setup_node_with_store(sender, store.clone());
+        assert!(node.advance_legacy_backfill_from_genesis(&bad, 1).is_err());
+        node.advance_legacy_backfill_from_genesis(&missing, 1)
+            .unwrap();
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        assert_eq!(
+            WorldState::at_root(store.clone(), &tip.header.state_root)
+                .unwrap()
+                .get_nonce(&sender)
+                .unwrap(),
+            3
+        );
+        assert!(store
+            .scan_prefix(b"private/legacy-witness-replay/v1/")
+            .unwrap()
+            .is_empty());
+        drop(node);
+        drop(store);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn canonical_entries(store: &impl KvStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        store
+            .scan_prefix(b"")
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(b"private/legacy-witness-replay/v1/"))
+            .collect()
+    }
+
+    fn assert_legacy_reference_recovery(extra_blocks: u64, resume_in_new_node: bool) {
+        legacy_reference_recovery_with_store(
+            extra_blocks,
+            resume_in_new_node,
+            Arc::new(MemoryDb::new()),
+            None,
+        );
+    }
+
+    fn legacy_reference_recovery_with_store<S: KvStore + 'static>(
+        extra_blocks: u64,
+        resume_in_new_node: bool,
+        store: Arc<S>,
+        exit_fixture: Option<&std::path::Path>,
+    ) {
+        let (_, signer) = setup_node();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let node = setup_node_with_store(sender, store);
         let genesis_config: shell_genesis::GenesisConfig =
             serde_json::from_value(serde_json::json!({
                 "chain_id": 1337,
@@ -9664,12 +9790,12 @@ mod tests {
         node.store
             .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
             .unwrap();
-        let before = node.store.scan_prefix(b"").unwrap();
+        let before = canonical_entries(node.store.as_ref());
         let mut bad = missing.clone();
         bad.transactions[0].signature.data[0] ^= 1;
         assert!(node.validate_legacy_backfill_witness(&bad).is_err());
         node.validate_legacy_backfill_witness(&missing).unwrap();
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        assert_eq!(canonical_entries(node.store.as_ref()), before);
         node.chain_store
             .put_backfill_block_with_validation(&missing, true, |candidate| {
                 node.validate_legacy_backfill_witness(candidate)
@@ -9688,11 +9814,68 @@ mod tests {
         node.store
             .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
             .unwrap();
-        let before_reconstruction = node.store.scan_prefix(b"").unwrap();
+        // Earlier rejected witnesses may have checkpointed valid ancestors.
+        // Start this restart-budget assertion from a fresh private replay.
+        node.chain_store
+            .reopen_native_replay()
+            .unwrap()
+            .clear_replay()
+            .unwrap();
+        *node.legacy_replay.lock() = None;
+        let before_reconstruction = canonical_entries(node.store.as_ref());
         assert!(node
             .advance_legacy_backfill_from_genesis(&missing, 1)
             .is_err());
         assert!(node.legacy_replay.lock().is_some());
+        assert!(node
+            .chain_store
+            .reopen_native_replay()
+            .unwrap()
+            .replay_checkpoint()
+            .unwrap()
+            .is_some());
+        if let Some(path) = exit_fixture {
+            std::fs::write(
+                path,
+                serde_json::to_vec(&(sender, &missing, &bad, &tip)).unwrap(),
+            )
+            .unwrap();
+            std::process::exit(0);
+        }
+        if resume_in_new_node {
+            // Discard all in-memory replay progress, retaining only the store.
+            // A fresh node must spend its next block budget on the target,
+            // rather than repeating the already validated ancestor.
+            let store = node.store.clone();
+            let tip_root = tip.header.state_root;
+            drop(node);
+            let restarted = setup_node_with_store(sender, store.clone());
+            assert!(restarted
+                .advance_legacy_backfill_from_genesis(&bad, 1)
+                .is_err());
+            restarted
+                .advance_legacy_backfill_from_genesis(&missing, 1)
+                .expect("persisted replay did not resume after reconstructing the node");
+            assert_eq!(
+                restarted.chain_store.get_head_hash().unwrap(),
+                Some(tip.hash())
+            );
+            assert_eq!(
+                WorldState::at_root(store, &tip_root)
+                    .unwrap()
+                    .get_nonce(&sender)
+                    .unwrap(),
+                3
+            );
+            assert!(restarted
+                .chain_store
+                .reopen_native_replay()
+                .unwrap()
+                .replay_checkpoint()
+                .unwrap()
+                .is_none());
+            return;
+        }
         assert!(node
             .advance_legacy_backfill_from_genesis(&first, 1)
             .is_err());
@@ -9700,11 +9883,17 @@ mod tests {
             node.legacy_replay.lock().as_ref().unwrap().target_hash(),
             missing.hash()
         );
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        assert_eq!(
+            canonical_entries(node.store.as_ref()),
+            before_reconstruction
+        );
         node.advance_legacy_backfill_from_genesis(&missing, 1)
             .unwrap();
         assert!(node.legacy_replay.lock().is_none());
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        assert_eq!(
+            canonical_entries(node.store.as_ref()),
+            before_reconstruction
+        );
         // A canonical change invalidates either the requested block or the
         // replayed prefix. Neither case may restore a witness from a stale cursor.
         for changed in [&missing, &first] {
@@ -9715,20 +9904,26 @@ mod tests {
             node.chain_store
                 .set_canonical(changed.number(), &ShellHash::ZERO)
                 .unwrap();
-            let changed_mapping = node.store.scan_prefix(b"").unwrap();
+            let changed_mapping = canonical_entries(node.store.as_ref());
             assert!(node
                 .advance_legacy_backfill_from_genesis(&missing, 1)
                 .is_err());
             assert!(node.legacy_replay.lock().is_none());
-            assert_eq!(node.store.scan_prefix(b"").unwrap(), changed_mapping);
+            assert_eq!(canonical_entries(node.store.as_ref()), changed_mapping);
             node.chain_store
                 .set_canonical(changed.number(), &changed.hash())
                 .unwrap();
-            assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+            assert_eq!(
+                canonical_entries(node.store.as_ref()),
+                before_reconstruction
+            );
         }
         assert!(node.validate_legacy_backfill_witness(&bad).is_err());
         node.validate_legacy_backfill_witness(&missing).unwrap();
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_reconstruction);
+        assert_eq!(
+            canonical_entries(node.store.as_ref()),
+            before_reconstruction
+        );
         node.chain_store
             .put_backfill_block_with_validation(&missing, true, |candidate| {
                 node.validate_legacy_backfill_witness(candidate)
@@ -9741,9 +9936,9 @@ mod tests {
         );
         let first_witness_key = [b"w/".as_ref(), first.hash().as_bytes()].concat();
         node.store.delete(&first_witness_key).unwrap();
-        let without_ancestor = node.store.scan_prefix(b"").unwrap();
+        let without_ancestor = canonical_entries(node.store.as_ref());
         assert!(node.validate_legacy_backfill_witness(&missing).is_err());
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), without_ancestor);
+        assert_eq!(canonical_entries(node.store.as_ref()), without_ancestor);
         assert_eq!(
             *node.legacy_backfill_dependency.lock(),
             Some(first.number())
@@ -9766,16 +9961,16 @@ mod tests {
         node.store
             .delete(&[b"amc/".as_ref(), genesis.as_bytes()].concat())
             .unwrap();
-        let without_history = node.store.scan_prefix(b"").unwrap();
+        let without_history = canonical_entries(node.store.as_ref());
         assert!(node.validate_legacy_backfill_witness(&missing).is_err());
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), without_history);
+        assert_eq!(canonical_entries(node.store.as_ref()), without_history);
         assert!(
             shell_genesis::bootstrap_genesis_metadata(&genesis_config, &node.chain_store).unwrap()
         );
-        let restored = node.store.scan_prefix(b"").unwrap();
+        let restored = canonical_entries(node.store.as_ref());
         assert!(node.validate_legacy_backfill_witness(&bad).is_err());
         node.validate_legacy_backfill_witness(&missing).unwrap();
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), restored);
+        assert_eq!(canonical_entries(node.store.as_ref()), restored);
         let genesis_root = node
             .chain_store
             .get_header_by_hash(&genesis)
@@ -10002,14 +10197,23 @@ mod tests {
                 node.store
                     .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
                     .unwrap();
-                let before = node.store.scan_prefix(b"").unwrap();
+                let before = canonical_entries(node.store.as_ref());
                 let mut tampered = missing.clone();
                 tampered.transactions[0].signature.data[0] ^= 1;
                 assert!(node.validate_legacy_backfill_witness(&tampered).is_err());
                 if replay_prefix == 0 {
                     node.validate_legacy_backfill_witness(&missing).unwrap();
                 }
-                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(canonical_entries(node.store.as_ref()), before);
+                if replay_prefix != 0 {
+                    assert!(node
+                        .chain_store
+                        .reopen_native_replay()
+                        .unwrap()
+                        .replay_checkpoint()
+                        .unwrap()
+                        .is_some());
+                }
             } else {
                 node.chain_store
                     .delete_witness_bundle(&missing.hash())
@@ -10024,6 +10228,13 @@ mod tests {
             assert!(!node.chain_store.has_body(&missing.hash()).unwrap());
         }
         if replay_prefix > 0 {
+            // This scenario starts cold so the peer must supply every missing
+            // dependency; discard progress from the earlier rejection probe.
+            node.chain_store
+                .reopen_native_replay()
+                .unwrap()
+                .clear_replay()
+                .unwrap();
             *node.legacy_replay.lock() = None;
             node.chain_store
                 .prune_finalized_address_metadata_undo(head.number())

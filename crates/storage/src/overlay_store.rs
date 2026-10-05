@@ -11,6 +11,7 @@ use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 pub struct OverlayStore<S: KvStore> {
     base: Arc<S>,
     write_limit: Option<usize>,
+    replay_namespace: Option<Vec<u8>>,
     staged_bytes: AtomicUsize,
     frozen_prefixes: Vec<Vec<u8>>,
     changes: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
@@ -21,6 +22,7 @@ impl<S: KvStore> OverlayStore<S> {
         Self {
             base,
             write_limit: None,
+            replay_namespace: None,
             staged_bytes: AtomicUsize::new(0),
             frozen_prefixes: Vec::new(),
             changes: RwLock::new(BTreeMap::new()),
@@ -43,6 +45,7 @@ impl<S: KvStore> OverlayStore<S> {
         Ok(Self {
             base,
             write_limit: None,
+            replay_namespace: None,
             staged_bytes: AtomicUsize::new(staged_bytes),
             frozen_prefixes: prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
             changes: RwLock::new(
@@ -64,6 +67,115 @@ impl<S: KvStore> OverlayStore<S> {
         }
         self.write_limit = Some(max_bytes);
         Ok(self)
+    }
+
+    /// Use a caller-owned private namespace for durable replay checkpoints.
+    /// Existing entries are visible beneath staged writes. The caller must use
+    /// a fresh or authenticated namespace, separate from canonical store keys.
+    pub fn with_replay_namespace(mut self, namespace: &[u8]) -> Result<Self, StorageError> {
+        if namespace.is_empty() || self.frozen_prefixes.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "durable replay requires a private namespace and frozen prefixes".into(),
+            ));
+        }
+        self.replay_namespace = Some(namespace.to_vec());
+        Ok(self)
+    }
+
+    /// Reopen an existing private replay without copying current live metadata.
+    pub fn reopen_replay(
+        base: Arc<S>,
+        namespace: &[u8],
+        prefixes: &[&[u8]],
+    ) -> Result<Self, StorageError> {
+        let mut overlay = Self::new(base);
+        overlay.frozen_prefixes = prefixes.iter().map(|p| p.to_vec()).collect();
+        overlay.with_replay_namespace(namespace)
+    }
+
+    fn replay_key(&self, suffix: &[u8]) -> Result<Vec<u8>, StorageError> {
+        let namespace = self
+            .replay_namespace
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidInput("replay namespace unavailable".into()))?;
+        Ok([namespace.as_slice(), suffix].concat())
+    }
+
+    pub fn replay_checkpoint(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        self.base.get(&self.replay_key(b"cursor")?)
+    }
+
+    /// Persist a completed replay chunk and its cursor atomically. Only the
+    /// private namespace is written; successful persistence releases staged RAM.
+    pub fn persist_replay_checkpoint(&self, cursor: &[u8]) -> Result<(), StorageError> {
+        let prefix = self.replay_key(b"data/")?;
+        let mut changes = self
+            .changes
+            .write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut batch = WriteBatch::new();
+        for (key, value) in changes.iter() {
+            let encoded = match value {
+                Some(value) => [b"\x01".as_ref(), value.as_slice()].concat(),
+                None => vec![0],
+            };
+            batch.put([prefix.as_slice(), key.as_slice()].concat(), encoded);
+        }
+        batch.put(self.replay_key(b"cursor")?, cursor.to_vec());
+        self.base.write_batch(batch)?;
+        changes.clear();
+        self.staged_bytes.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Invalidate the cursor before reclaiming private replay data. Interrupted
+    /// cleanup cannot leave a resumable cursor pointing at incomplete state.
+    pub fn clear_replay(&self) -> Result<(), StorageError> {
+        self.base.delete(&self.replay_key(b"cursor")?)?;
+        let prefix = self.replay_key(b"data/")?;
+        loop {
+            let mut batch = WriteBatch::new();
+            let mut after = None;
+            for _ in 0..128 {
+                // Do not retain a whole batch of potentially large values just
+                // to remove their keys. Peak scan memory is one stored entry.
+                let mut entries = self.base.scan_prefix_after(&prefix, after.as_deref(), 1)?;
+                let Some((key, _)) = entries.pop() else { break };
+                after = Some(key.clone());
+                batch.delete(key);
+            }
+            if batch.is_empty() {
+                return Ok(());
+            }
+            self.base.write_batch(batch)?;
+        }
+    }
+
+    fn decode_replay_value(value: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        match value {
+            [0] => Ok(None),
+            [1, rest @ ..] => Ok(Some(rest.to_vec())),
+            _ => Err(StorageError::Database(
+                "invalid persisted replay value".into(),
+            )),
+        }
+    }
+
+    fn unstaged_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        if self.replay_namespace.is_some() {
+            let prefix = self.replay_key(b"data/")?;
+            if let Some(value) = self.base.get(&[prefix.as_slice(), key].concat())? {
+                return Self::decode_replay_value(&value);
+            }
+        }
+        if self
+            .frozen_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Ok(None);
+        }
+        self.base.get(key)
     }
 
     /// Atomically apply all pending changes to the base store.
@@ -129,7 +241,7 @@ impl<S: KvStore> OverlayStore<S> {
                 }
                 let old_value = match checkpoint.get(key) {
                     Some(value) => value.clone(),
-                    None => self.base.get(key)?,
+                    None => self.unstaged_value(key)?,
                 };
                 previous.insert(key.clone(), old_value);
             }
@@ -189,6 +301,22 @@ impl<S: KvStore> OverlayStore<S> {
                 .any(|frozen| key.starts_with(frozen))
         })
         .collect();
+        if let Some(namespace) = &self.replay_namespace {
+            entries.retain(|key, _| !key.starts_with(namespace));
+            let data_prefix = self.replay_key(b"data/")?;
+            let scan_prefix = [data_prefix.as_slice(), prefix].concat();
+            for (key, value) in self.base.scan_prefix(&scan_prefix)? {
+                let logical_key = key[data_prefix.len()..].to_vec();
+                match Self::decode_replay_value(&value)? {
+                    Some(value) => {
+                        entries.insert(logical_key, value);
+                    }
+                    None => {
+                        entries.remove(&logical_key);
+                    }
+                }
+            }
+        }
         let changes = self
             .changes
             .read()
@@ -217,14 +345,7 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
         {
             return Ok(value.clone());
         }
-        if self
-            .frozen_prefixes
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
-        {
-            return Ok(None);
-        }
-        self.base.get(key)
+        self.unstaged_value(key)
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
@@ -289,6 +410,145 @@ impl<S: KvStore> KvStore for OverlayStore<S> {
 mod tests {
     use super::*;
     use crate::MemoryDb;
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn durable_replay_survives_process_exit() {
+        const ENV: &str = "SHELL_REPLAY_TEST_DB";
+        if let Some(path) = std::env::var_os(ENV) {
+            let stores = crate::RocksDbStore::open_all(path, None).unwrap();
+            let base = Arc::new(stores.chain);
+            base.put(b"meta/key", b"live").unwrap();
+            let overlay = OverlayStore::with_snapshot_prefixes(base, &[b"meta/"], 1024)
+                .unwrap()
+                .with_replay_namespace(b"private-test/")
+                .unwrap()
+                .with_write_limit(5 * 1024 * 1024)
+                .unwrap();
+            for index in 0..17u8 {
+                overlay
+                    .put(&[b's', index], &vec![index; 4 * 1024 * 1024])
+                    .unwrap();
+                overlay.put(b"meta/key", &[index]).unwrap();
+                overlay.persist_replay_checkpoint(&[index]).unwrap();
+            }
+            // Exit without running RocksDB or overlay destructors. The next
+            // process must recover the WAL, including the last cursor batch.
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_store::tests::durable_replay_survives_process_exit",
+            ])
+            .env(ENV, dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let stores = crate::RocksDbStore::open_all(dir.path(), None).unwrap();
+        let base = Arc::new(stores.chain);
+        let overlay =
+            OverlayStore::reopen_replay(base.clone(), b"private-test/", &[b"meta/"]).unwrap();
+        assert_eq!(overlay.replay_checkpoint().unwrap(), Some(vec![16]));
+        assert_eq!(overlay.get(b"meta/key").unwrap(), Some(vec![16]));
+        assert_eq!(base.get(b"meta/key").unwrap(), Some(b"live".to_vec()));
+        for index in 0..17u8 {
+            assert_eq!(
+                overlay.get(&[b's', index]).unwrap(),
+                Some(vec![index; 4 * 1024 * 1024])
+            );
+            assert_eq!(base.get(&[b's', index]).unwrap(), None);
+        }
+        overlay.clear_replay().unwrap();
+        assert!(base.scan_prefix(b"private-test/").unwrap().is_empty());
+        assert_eq!(base.get(b"meta/key").unwrap(), Some(b"live".to_vec()));
+    }
+
+    #[test]
+    fn durable_replay_preserves_frozen_values_tombstones_and_rollback_reads() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"meta/key", b"original").unwrap();
+        base.put(b"state/deleted", b"live").unwrap();
+        let overlay = OverlayStore::with_snapshot_prefixes(base.clone(), &[b"meta/"], 1024)
+            .unwrap()
+            .with_replay_namespace(b"private-replay/")
+            .unwrap();
+        overlay.put(b"meta/key", b"historical").unwrap();
+        overlay.delete(b"state/deleted").unwrap();
+        overlay.persist_replay_checkpoint(b"height-one").unwrap();
+        drop(overlay);
+        base.put(b"meta/new", b"later").unwrap();
+        let reopened =
+            OverlayStore::reopen_replay(base.clone(), b"private-replay/", &[b"meta/"]).unwrap();
+        assert_eq!(
+            reopened.replay_checkpoint().unwrap(),
+            Some(b"height-one".to_vec())
+        );
+        assert_eq!(
+            reopened.get(b"meta/key").unwrap(),
+            Some(b"historical".to_vec())
+        );
+        assert_eq!(reopened.get(b"meta/new").unwrap(), None);
+        assert_eq!(reopened.get(b"state/deleted").unwrap(), None);
+        let before = reopened.checkpoint().unwrap();
+        reopened.put(b"meta/key", b"next").unwrap();
+        assert_eq!(
+            reopened
+                .previous_values_since(&before, &[b"meta/"])
+                .unwrap(),
+            vec![(b"meta/key".to_vec(), Some(b"historical".to_vec()))]
+        );
+        assert_eq!(
+            reopened.scan_prefix(b"meta/").unwrap(),
+            vec![(b"meta/key".to_vec(), b"next".to_vec())]
+        );
+        assert!(reopened
+            .scan_prefix(b"")
+            .unwrap()
+            .iter()
+            .all(|(key, _)| !key.starts_with(b"private-replay/")));
+        assert_eq!(base.get(b"meta/key").unwrap(), Some(b"original".to_vec()));
+        assert_eq!(base.get(b"state/deleted").unwrap(), Some(b"live".to_vec()));
+        assert!(reopened.commit().is_err());
+        reopened.clear_replay().unwrap();
+        assert!(base.scan_prefix(b"private-replay/").unwrap().is_empty());
+        assert_eq!(base.get(b"meta/key").unwrap(), Some(b"original".to_vec()));
+        assert_eq!(base.get(b"state/deleted").unwrap(), Some(b"live".to_vec()));
+    }
+
+    #[test]
+    fn durable_replay_spills_more_than_64_mib_in_bounded_chunks() {
+        let base = Arc::new(MemoryDb::new());
+        let chunk_size = 4 * 1024 * 1024;
+        let overlay = OverlayStore::with_snapshot_prefixes(base.clone(), &[b"meta/"], 1024)
+            .unwrap()
+            .with_replay_namespace(b"private-replay/")
+            .unwrap()
+            .with_write_limit(chunk_size + 128)
+            .unwrap();
+        for index in 0u8..17 {
+            let key = [b"state/".as_slice(), &[index]].concat();
+            overlay.put(&key, &vec![index; chunk_size]).unwrap();
+            overlay.persist_replay_checkpoint(&[index]).unwrap();
+            assert_eq!(overlay.staged_bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(base.get(&key).unwrap(), None);
+        }
+        drop(overlay);
+        let reopened = OverlayStore::reopen_replay(base, b"private-replay/", &[b"meta/"])
+            .unwrap()
+            .with_write_limit(chunk_size + 128)
+            .unwrap();
+        assert_eq!(reopened.replay_checkpoint().unwrap(), Some(vec![16]));
+        for index in 0u8..17 {
+            assert_eq!(
+                reopened
+                    .get(&[b"state/".as_slice(), &[index]].concat())
+                    .unwrap(),
+                Some(vec![index; chunk_size])
+            );
+        }
+    }
 
     #[test]
     fn write_limit_rejects_whole_batch_and_reclaims_replaced_values() {

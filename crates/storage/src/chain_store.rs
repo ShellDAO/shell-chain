@@ -3289,6 +3289,27 @@ impl<S: KvStore> ChainStore<S> {
         )
     }
 
+    /// Reopen the isolated legacy witness replay state without sampling live
+    /// mutable metadata again.
+    pub fn reopen_native_replay(&self) -> Result<OverlayStore<S>, StorageError> {
+        OverlayStore::reopen_replay(
+            Arc::clone(&self.store),
+            b"private/legacy-witness-replay/v1/",
+            &[
+                prefix::PUBKEY_BY_ADDR,
+                prefix::GUARDIAN_CONFIG,
+                prefix::RECOVERY_PROPOSAL,
+                prefix::HEAD_BLOCK,
+                prefix::ADDRESS_METADATA_UNDO,
+            ],
+        )
+    }
+
+    pub fn durable_native_replay_overlay(&self) -> Result<OverlayStore<S>, StorageError> {
+        self.native_replay_overlay()?
+            .with_replay_namespace(b"private/legacy-witness-replay/v1/")
+    }
+
     /// Prune all journals through finality without retaining replay history.
     pub fn prune_finalized_address_metadata_undo(
         &self,
