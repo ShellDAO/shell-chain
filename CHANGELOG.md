@@ -10,7 +10,9 @@ All notable changes to this project will be documented in this file.
   genesis metadata checkpoint, genesis state, and earlier canonical bodies and
   witnesses remain available. Keep replay private, resume it across backfill
   retries, and discard progress when its canonical target or prefix changes.
-  This does not bootstrap checkpoints for existing databases that lack one.
+  Bootstrap missing checkpoints on CLI startup from configured genesis after
+  verifying the stored chain identity and canonical genesis hash, without
+  changing current account metadata or the chain head.
 
 - Authenticate recent legacy witness backfill without a local commitment using
   isolated historical signature and execution replay. Preserve live state and
