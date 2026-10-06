@@ -433,6 +433,23 @@ Finalized cursors are supplied explicitly and block production is accelerated.
 This regression does not validate wall-clock consensus finalization, external
 peer discovery, or a released binary. No retention override is used.
 
+### Large historical replay regression
+
+The explicit, slower process-restart check is:
+
+```bash
+cargo test -p shell-node --features rocksdb legacy_large_replay_survives_process_exit -- --ignored --nocapture
+```
+
+It executes 2,800 signed deployments with distinct 24 KiB runtime code, then
+replays the history in batches of at most 32 blocks. The check requires more
+than 64 MiB of persisted private replay data before abruptly exiting the child
+process. A fresh process rejects a tampered target witness, validates the
+original target within one block of replay work, preserves the canonical head
+and account nonce, and removes private replay data. The existing short restart
+check remains enabled by default. These are isolated source-level checks, not
+claims about a released binary or production-scale throughput.
+
 ### Docker Compose defaults
 
 The bundled `docker-compose.yml` assigns:

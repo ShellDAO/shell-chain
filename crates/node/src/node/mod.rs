@@ -9637,10 +9637,29 @@ mod tests {
     #[cfg(feature = "rocksdb")]
     #[test]
     fn legacy_reference_replay_survives_process_exit() {
+        assert_legacy_replay_process_exit(false);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    #[ignore = "large signed history; run explicitly with --ignored"]
+    fn legacy_large_replay_survives_process_exit() {
+        assert_legacy_replay_process_exit(true);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn assert_legacy_replay_process_exit(large: bool) {
         const DIRECTORY: &str = "SHELL_LEGACY_REPLAY_TEST_DIRECTORY";
         if let Some(directory) = std::env::var_os(DIRECTORY) {
             let directory = std::path::PathBuf::from(directory);
             let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            if large {
+                legacy_large_replay_fixture(
+                    Arc::new(stores.state),
+                    &directory.join("fixture.json"),
+                );
+                unreachable!();
+            }
             legacy_reference_recovery_with_store(
                 0,
                 true,
@@ -9661,16 +9680,22 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "node::tests::legacy_reference_replay_survives_process_exit",
+                if large {
+                    "node::tests::legacy_large_replay_survives_process_exit"
+                } else {
+                    "node::tests::legacy_reference_replay_survives_process_exit"
+                },
             ])
+            .args(if large { vec!["--ignored"] } else { vec![] })
             .env(DIRECTORY, directory.as_path())
             .status()
             .unwrap();
         assert!(status.success());
-        let (sender, missing, bad, tip): (Address, Block, Block, Block) = serde_json::from_slice(
-            &std::fs::read(directory.as_path().join("fixture.json")).unwrap(),
-        )
-        .unwrap();
+        let (sender, missing, bad, tip, expected_nonce): (Address, Block, Block, Block, u64) =
+            serde_json::from_slice(
+                &std::fs::read(directory.as_path().join("fixture.json")).unwrap(),
+            )
+            .unwrap();
         let stores =
             shell_storage::RocksDbStore::open_all(directory.as_path().join("db"), None).unwrap();
         let store = Arc::new(stores.state);
@@ -9684,7 +9709,7 @@ mod tests {
                 .unwrap()
                 .get_nonce(&sender)
                 .unwrap(),
-            3
+            expected_nonce
         );
         assert!(store
             .scan_prefix(b"private/legacy-witness-replay/v1/")
@@ -9697,6 +9722,126 @@ mod tests {
         drop(stores.index);
         drop(stores.witness);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn legacy_large_replay_fixture<S: KvStore + 'static>(store: Arc<S>, fixture: &std::path::Path) {
+        const DEPLOYMENTS: u64 = 2_800;
+        const CODE_SIZE: usize = 24_576;
+        let signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let node = setup_node_with_store(sender, store);
+        let config: shell_genesis::GenesisConfig = serde_json::from_value(serde_json::json!({
+            "chain_id":1337,"timestamp":1_700_000_000,
+            "consensus":{"engine":"poa","authorities":[sender],
+                "authority_pubkeys":[format!("0x{}",hex::encode(signer.public_key()))],"block_time_secs":1},
+            "alloc":{sender.to_string():{"balance":"1000000000000000000000000"}}
+        })).unwrap();
+        let genesis = shell_genesis::initialize_genesis(&config, node.store.clone()).unwrap();
+        *node.world_state.write() =
+            WorldState::at_root(node.store.clone(), &genesis.header.state_root).unwrap();
+        shell_genesis::initialize_authority_pubkeys(&config, &node.chain_store).unwrap();
+        let mut tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 6_000_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        for nonce in 0..DEPLOYMENTS {
+            // Return a legal-size runtime with a unique unreachable suffix,
+            // preventing code-hash deduplication from shrinking the replay.
+            let mut runtime = vec![0; CODE_SIZE];
+            runtime[CODE_SIZE - 8..].copy_from_slice(&nonce.to_be_bytes());
+            let mut init = vec![
+                0x61, 0x60, 0x00, 0x61, 0x00, 0x0f, 0x60, 0x00, 0x39, 0x61, 0x60, 0x00, 0x60, 0x00,
+                0xf3,
+            ];
+            init.extend_from_slice(&runtime);
+            tx.nonce = nonce;
+            tx.data = Bytes::from(init);
+            submit_signed_tx(&node, &signer, sender, tx.clone());
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert!(node
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap()
+                .iter()
+                .all(|r| r.status == 1));
+            assert_eq!(
+                node.chain_store
+                    .get_code(&shell_primitives::keccak256(&runtime))
+                    .unwrap()
+                    .unwrap(),
+                runtime
+            );
+        }
+        tx.nonce = DEPLOYMENTS;
+        tx.to = Some(Address::from([0xcc; 32]));
+        tx.value = U256::from(1_000);
+        tx.data = Bytes::new();
+        tx.gas_limit = 21_000;
+        submit_signed_tx(&node, &signer, sender, tx);
+        let missing = node.produce_block(&signer, 100).unwrap();
+        let tip = node.produce_block(&signer, 100).unwrap();
+        node.store
+            .delete(&[b"w/".as_ref(), missing.hash().as_bytes()].concat())
+            .unwrap();
+        node.chain_store
+            .prune_finalized_address_metadata_undo(tip.number())
+            .unwrap();
+        let mut parent = 0;
+        while parent < DEPLOYMENTS {
+            let budget = (DEPLOYMENTS - parent).min(32);
+            let error = node
+                .advance_legacy_backfill_from_genesis(&missing, budget)
+                .unwrap_err();
+            assert!(error.to_string().contains("replay pending"), "{error}");
+            let checkpoint = node
+                .chain_store
+                .reopen_native_replay()
+                .unwrap()
+                .replay_checkpoint()
+                .unwrap()
+                .unwrap();
+            let (_, _, header): (ShellHash, u64, BlockHeader) =
+                serde_json::from_slice(&checkpoint).unwrap();
+            assert_eq!(header.number, parent + budget);
+            parent = header.number;
+        }
+        let bytes: usize = node
+            .store
+            .scan_prefix(b"private/legacy-witness-replay/v1/")
+            .unwrap()
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        assert!(
+            bytes > 64 * 1024 * 1024,
+            "only {bytes} persisted replay bytes"
+        );
+        assert_eq!(
+            node.world_state.read().get_nonce(&sender).unwrap(),
+            DEPLOYMENTS + 1
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        let mut bad = missing.clone();
+        bad.transactions[0].signature.data[0] ^= 1;
+        std::fs::write(
+            fixture,
+            serde_json::to_vec(&(sender, missing, bad, tip, DEPLOYMENTS + 1)).unwrap(),
+        )
+        .unwrap();
+        println!("persisted replay bytes: {bytes}; signed deployments: {DEPLOYMENTS}");
+        std::process::exit(0);
     }
 
     fn canonical_entries(store: &impl KvStore) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -9837,7 +9982,7 @@ mod tests {
         if let Some(path) = exit_fixture {
             std::fs::write(
                 path,
-                serde_json::to_vec(&(sender, &missing, &bad, &tip)).unwrap(),
+                serde_json::to_vec(&(sender, &missing, &bad, &tip, 3u64)).unwrap(),
             )
             .unwrap();
             std::process::exit(0);
