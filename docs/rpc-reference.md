@@ -764,35 +764,26 @@ Does NOT require signatures; is a pure estimator. Errors
 estimate_paymaster_gas(req: crate::types::PaymasterGasEstimateRequest, ) → serde_json::Value
 ```
 
-Reports paymaster validation gas capability for contract paymasters.
+Estimate contract-paymaster validation using the admission STATICCALL.
 
-Current node builds return a versioned cap-only response for the
-protocol `validatePaymasterOp` gas limit. They do not perform a full EVM
-staticcall dry-run from this RPC path yet. Clients must inspect
-`simulation_status` and only enable contract-paymaster UX when it is
-upgraded from `"cap_only"`.
+With `gas_limit` (outer bundle gas limit, hex), simulate at the next
+candidate height using the current state and admission block context.
+`max_fee_per_gas` defaults to 1 gwei; the product is passed as
+`maxGasCost`. Raw `inner_calls_data` must be the canonical RLP inner-call
+list; `paymaster_context` is forwarded unchanged (empty if omitted).
+This checks contract acceptance, not bundle validity, balance or signatures.
+No state changes are committed. Later inclusion may produce a different result.
 
-**Input** (`paymaster_context` is the opaque bytes forwarded to the contract):
-```json
-{
-  "paymaster": "0x…",
-  "sender": "0x…",
-  "inner_calls_data": "0x…",
-  "max_fee_per_gas": "0x…",
-  "paymaster_context": "0x…"
-}
-```
+Success reports `simulation_status: "simulated"`, `simulation_version: 2`,
+`capability: "paymaster_staticcall"`, measured `validation_gas` (including
+intrinsic and wrapper gas), `paymaster_gas_cap: "0xc350"`, `within_cap: true`,
+`max_gas_cost`, `paymaster` and `sender`. Gas is a hex quantity.
+Rejection, revert, static-state-write or budget exhaustion returns -32000.
+Invalid request encoding or zero `gas_limit` returns -32602.
 
-**Response**:
-- `validation_gas` — `null` while `simulation_status` is `"cap_only"`
-- `paymaster_gas_cap` — hard cap enforced by the node (50 000)
-- `within_cap` — `null` while no staticcall simulation has run
-- `paymaster` — the paymaster address queried
-- `simulation_status` — currently `"cap_only"`
-- `simulation_version` — response contract version
-- `capability` — current node capability string
-
-**Future error** (`-32000`): EVM simulation failed or paymaster contract reverted.
+Without `gas_limit`, retain version 1 `cap_only`: null `validation_gas`
+and `within_cap`, and `capability: "paymaster_cap_only"`. Clients must
+inspect status before using the estimate; old servers also return cap-only.
 
 ### shell_getPaymasterPolicy
 ```
