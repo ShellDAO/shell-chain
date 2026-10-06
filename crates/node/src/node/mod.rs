@@ -10220,6 +10220,202 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn event_loop_prefers_archive_for_historical_body_request() {
+        assert_archive_body_preference(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_prefers_late_advertised_archive() {
+        assert_archive_body_preference(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn event_loop_prefers_archive_then_recovers_after_disconnect() {
+        assert_archive_body_preference(false, true).await;
+    }
+
+    async fn assert_archive_body_preference(late_advertisement: bool, disconnect: bool) {
+        use shell_network::{
+            Libp2pNetwork, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+        };
+        use std::time::Duration;
+        let (mut node, signer) = setup_node();
+        node.config.rpc_enabled = false;
+        node.config.metrics.enabled = false;
+        store_consistent_genesis(&node);
+        let missing = node.produce_block(&signer, 100).unwrap();
+        node.produce_block(&signer, 100).unwrap();
+        node.chain_store.delete_body(&missing.hash()).unwrap();
+        node.config.node_role = crate::NodeRole::Prover;
+        async fn peer(boot_nodes: Vec<String>) -> (Libp2pNetwork, shell_network::PeerId, String) {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            let identity = libp2p::identity::Keypair::generate_ed25519();
+            let id = identity.public().to_peer_id();
+            let path = std::env::temp_dir().join(format!(
+                "shell-preference-{}-{}",
+                std::process::id(),
+                address.port()
+            ));
+            std::fs::write(&path, identity.to_protobuf_encoding().unwrap()).unwrap();
+            let config = NetworkConfig {
+                listen_addr: address,
+                boot_nodes,
+                identity_key_path: Some(path.clone()),
+                enable_mdns: false,
+                enable_kademlia: false,
+                enable_relay: false,
+                enable_dcutr: false,
+                enable_autonat: false,
+                ..Default::default()
+            };
+            drop(socket);
+            let network = Libp2pNetwork::new(&config).await.unwrap();
+            std::fs::remove_file(path).unwrap();
+            (
+                network,
+                id.to_string().into(),
+                format!("/ip4/127.0.0.1/tcp/{}/p2p/{id}", address.port()),
+            )
+        }
+        let (mut network, _, address) = peer(vec![]).await;
+        let (mut archive, archive_id, _) = peer(vec![address.clone()]).await;
+        let (mut light, light_id, _) = peer(vec![address]).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while network.peer_count().await != 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if !late_advertisement {
+            node.peer_caps.record(archive_id, "archive".into(), 0);
+        }
+        node.peer_caps
+            .record(light_id, "pruned".into(), missing.number());
+        let node = Arc::new(node);
+        let handle = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.run(Arc::new(signer), &mut network).await }
+        });
+        if late_advertisement {
+            // Drain unknown-capability requests before advertising the archive.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut requester = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(100), light.next_event()).await
+            {
+                if let NetworkEvent::MessageReceived {
+                    message: NetworkMessage::BodyRequest { .. },
+                    peer,
+                } = event
+                {
+                    requester = Some(peer);
+                }
+            }
+            while tokio::time::timeout(Duration::from_millis(100), archive.next_event())
+                .await
+                .is_ok()
+            {}
+            archive
+                .send_to_peer(
+                    &requester.expect("initial unknown-peer request"),
+                    NetworkMessage::StorageCapability {
+                        profile: "archive".into(),
+                        oldest_body_block: 0,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut observed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    message:
+                        NetworkMessage::BodyRequest {
+                            start_number,
+                            nonce,
+                            ..
+                        },
+                    peer: requester,
+                }) = archive.next_event().await
+                {
+                    break (start_number, nonce, requester);
+                }
+            }
+        })
+        .await;
+        let light_requested = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    message: NetworkMessage::BodyRequest { .. },
+                    ..
+                }) = light.next_event().await
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if disconnect {
+            archive.shutdown().await.unwrap();
+            observed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(NetworkEvent::MessageReceived {
+                        message:
+                            NetworkMessage::BodyRequest {
+                                start_number,
+                                nonce,
+                                ..
+                            },
+                        peer,
+                    }) = light.next_event().await
+                    {
+                        break (start_number, nonce, peer);
+                    }
+                }
+            })
+            .await;
+        }
+        let responder = if disconnect { &light } else { &archive };
+        let restored = if let Ok((_, nonce, requester)) = observed.as_ref() {
+            responder
+                .send_to_peer(
+                    requester,
+                    NetworkMessage::BodyResponse {
+                        blocks: vec![missing.clone()],
+                        nonce: *nonce,
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !node.chain_store.has_body(&missing.hash()).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        node.shutdown();
+        handle.await.unwrap().unwrap();
+        assert_eq!(observed.unwrap().0, missing.number());
+        assert!(restored, "peer response did not restore canonical body");
+        assert_eq!(
+            node.head_number(),
+            2,
+            "body recovery changed canonical head"
+        );
+        assert!(
+            !light_requested,
+            "historical body request also sent to light peer despite known archive peer"
+        );
+    }
+
     async fn assert_body_backfill(
         late_peer: bool,
         tcp: bool,

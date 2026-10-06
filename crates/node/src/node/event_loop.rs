@@ -760,16 +760,23 @@ impl<S: KvStore + 'static> Node<S> {
                         peer: None,
                         requested_at: std::time::Instant::now(),
                     });
-                    if network.peer_count().await > 0
-                        && network
-                            .broadcast(NetworkMessage::BodyRequest {
-                                start_number,
-                                count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
-                                nonce,
-                            })
-                            .await
-                            .is_ok()
-                    {
+                    let preferred = self.peer_caps.best_peer_for_block(start_number);
+                    let message = NetworkMessage::BodyRequest {
+                        start_number,
+                        count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                        nonce,
+                    };
+                    let sent = if let Some(peer) = preferred.as_ref() {
+                        network.send_to_peer(peer, message).await.is_ok()
+                    } else if network.peer_count().await > 0 {
+                        network.broadcast(message).await.is_ok()
+                    } else {
+                        false
+                    };
+                    if sent {
+                        if let Some(request) = body_request.as_mut() {
+                            request.peer = preferred;
+                        }
                         info!(
                             start_number,
                             head, "L4: kicked historical body back-fill startup scan"
@@ -2016,6 +2023,23 @@ impl<S: KvStore + 'static> Node<S> {
                                 NetworkMessage::StorageCapability { profile, oldest_body_block } => {
                                     debug!(%peer, profile, oldest_body_block, "L4: received StorageCapability");
                                     self.peer_caps.record(peer.clone(), profile, oldest_body_block);
+                                    if let Some(request) = body_request.as_ref().cloned() {
+                                        if let Some(preferred) = self.peer_caps.best_peer_for_block(request.start_number) {
+                                            if request.peer.as_ref() != Some(&preferred) {
+                                                let nonce = Self::wall_clock_millis().max(request.nonce.saturating_add(1));
+                                                if network.send_to_peer(&preferred, NetworkMessage::BodyRequest {
+                                                    start_number: request.start_number,
+                                                    count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
+                                                    nonce,
+                                                }).await.is_ok() {
+                                                    body_request = Some(BodyRequestState {
+                                                        nonce, peer: Some(preferred),
+                                                        requested_at: std::time::Instant::now(), ..request
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 // L4: Peer requests block bodies for historical back-fill.
                                 NetworkMessage::BodyRequest { start_number, count, nonce } => {
