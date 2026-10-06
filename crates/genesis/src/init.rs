@@ -332,7 +332,9 @@ fn apply_alloc<S: KvStore + 'static>(
     if let Some(ref code_hex) = entry.code {
         let code = hex::decode(code_hex.trim_start_matches("0x"))
             .map_err(|e| StorageError::Codec(e.to_string()))?;
-        account.code_hash = Some(keccak256(&code));
+        let code_hash = keccak256(&code);
+        ChainStore::new(std::sync::Arc::clone(world_state.store())).put_code(&code_hash, &code)?;
+        account.code_hash = Some(code_hash);
     }
 
     world_state.set_account(address, &account)?;
@@ -916,10 +918,13 @@ mod tests {
         let store = Arc::new(MemoryDb::new());
         let block = initialize_genesis(&config, Arc::clone(&store)).unwrap();
 
+        let chain_store = ChainStore::new(Arc::clone(&store));
         let ws = WorldState::at_root(store, &block.header.state_root).unwrap();
         let acct = ws.get_account(&contract_addr).unwrap().unwrap();
         assert!(acct.is_contract());
         assert_eq!(acct.nonce, 1);
+        let code = hex::decode("6080604052").unwrap();
+        assert_eq!(chain_store.get_code(&keccak256(&code)).unwrap(), Some(code));
     }
 
     #[test]

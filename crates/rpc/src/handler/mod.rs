@@ -9331,6 +9331,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn estimate_paymaster_gas_executes_contract_with_complete_cost() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 32]);
+        let sender = Address::from([0xBB; 32]);
+        // ABI true; the VM must execute this code, not return a protocol cap.
+        let code = hex::decode("600160005260206000f3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&paymaster, hash)
+            .unwrap();
+        let req = serde_json::from_value(serde_json::json!({
+            "paymaster":paymaster, "sender":sender, "inner_calls_data":"0xc0",
+            "gas_limit":"0x493e0", "max_fee_per_gas":"0x7", "paymaster_context":"0x"
+        }))
+        .unwrap();
+        let result = ShellApiServer::estimate_paymaster_gas(&handler, req)
+            .await
+            .unwrap();
+        assert_eq!(result["simulation_status"], "simulated");
+        let gas = u64::from_str_radix(
+            result["validation_gas"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        assert!(gas > 0 && gas <= shell_pqvm::PAYMASTER_VALIDATE_GAS_CAP);
+        assert_eq!(result["within_cap"], true);
+    }
+
+    #[tokio::test]
+    async fn estimate_paymaster_gas_rejects_failure_and_preserves_state() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 32]);
+        let sender = Address::from([0xBB; 32]);
+        handler
+            .world_state
+            .write()
+            .set_balance(&sender, U256::from(1234))
+            .unwrap();
+        for code in [
+            "600060005260206000f3",           // false
+            "60006000fd",                     // revert
+            "6001600055600160005260206000f3", // SSTORE in static context
+            "5b600056",                       // exhaust validation budget
+            "00",                             // missing ABI bool
+        ] {
+            let code = hex::decode(code).unwrap();
+            let hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&hash, &code).unwrap();
+            handler
+                .world_state
+                .write()
+                .set_code_hash(&paymaster, hash)
+                .unwrap();
+            let root = handler.world_state.write().state_root().unwrap();
+            let req = serde_json::from_value(serde_json::json!({
+                "paymaster":paymaster, "sender":sender, "inner_calls_data":"0xc0",
+                "gas_limit":"0x493e0", "max_fee_per_gas":"0x7", "paymaster_context":"0x"
+            }))
+            .unwrap();
+            let err = ShellApiServer::estimate_paymaster_gas(&handler, req)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), -32000);
+            assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+            assert_eq!(
+                handler.world_state.read().get_balance(&sender).unwrap(),
+                U256::from(1234)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_paymaster_gas_forwards_cost_and_context() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 32]);
+        let mut sender_bytes = [0; 32];
+        sender_bytes[31] = 0xbb;
+        let sender = Address::from(sender_bytes);
+        // Independently check ABI maxGasCost word at byte 68: 300000 * 7.
+        // Then check dynamic context payload (one byte) at byte 228.
+        let code = hex::decode("60443562200b201460e43560f81c60ab141660a43560f81c60c0141660043560bb141660005260206000f3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&paymaster, hash)
+            .unwrap();
+        let root = handler.world_state.write().state_root().unwrap();
+        for (fee, context, calls, accepted) in [
+            ("0x7", "0xab", "0xc0", true),
+            ("0x8", "0xab", "0xc0", false),
+            ("0x7", "0xac", "0xc0", false),
+            ("0x7", "0xab", "0xc1", false),
+        ] {
+            let req = serde_json::from_value(serde_json::json!({
+                "paymaster":paymaster,"sender":sender,"inner_calls_data":calls,
+                "gas_limit":"0x493e0","max_fee_per_gas":fee,"paymaster_context":context
+            }))
+            .unwrap();
+            let result = ShellApiServer::estimate_paymaster_gas(&handler, req).await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "fee={fee} context={context}: {result:?}"
+            );
+            assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_paymaster_gas_outer_limit_boundaries() {
+        let handler = setup();
+        let paymaster = Address::from([0xAA; 32]);
+        let code = hex::decode("600160005260206000f3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&paymaster, hash)
+            .unwrap();
+        for gas in ["0x0", "not-hex", "0x10000000000000000"] {
+            let req = serde_json::from_value(serde_json::json!({
+                "paymaster":paymaster,"sender":Address::ZERO,"gas_limit":gas
+            }))
+            .unwrap();
+            assert_eq!(
+                ShellApiServer::estimate_paymaster_gas(&handler, req)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                -32602
+            );
+        }
+        let req = serde_json::from_value(serde_json::json!({
+            "paymaster":paymaster,"sender":Address::ZERO,
+            "gas_limit":"0xffffffffffffffff","max_fee_per_gas":"0xffffffffffffffff"
+        }))
+        .unwrap();
+        let result = ShellApiServer::estimate_paymaster_gas(&handler, req)
+            .await
+            .unwrap();
+        assert_eq!(result["max_gas_cost"], "0xfffffffffffffffe0000000000000001");
+    }
+
+    #[tokio::test]
     async fn estimate_paymaster_gas_reports_versioned_cap_only_status() {
         let handler = setup();
         let paymaster = Address::from([0xAA; 20]);
@@ -9339,6 +9492,7 @@ mod tests {
         let res = ShellApiServer::estimate_paymaster_gas(
             &handler,
             PaymasterGasEstimateRequest {
+                gas_limit: None,
                 paymaster,
                 sender,
                 inner_calls_data: Some("0x".into()),
@@ -9390,6 +9544,7 @@ mod tests {
             let err = ShellApiServer::estimate_paymaster_gas(
                 &handler,
                 PaymasterGasEstimateRequest {
+                    gas_limit: None,
                     paymaster,
                     sender,
                     inner_calls_data,
@@ -9418,6 +9573,7 @@ mod tests {
             let err = ShellApiServer::estimate_paymaster_gas(
                 &handler,
                 PaymasterGasEstimateRequest {
+                    gas_limit: None,
                     paymaster,
                     sender,
                     inner_calls_data,
@@ -9455,6 +9611,7 @@ mod tests {
             let err = ShellApiServer::estimate_paymaster_gas(
                 &handler,
                 PaymasterGasEstimateRequest {
+                    gas_limit: None,
                     paymaster,
                     sender,
                     inner_calls_data,
@@ -9484,6 +9641,7 @@ mod tests {
         let err = ShellApiServer::estimate_paymaster_gas(
             &handler,
             PaymasterGasEstimateRequest {
+                gas_limit: None,
                 paymaster,
                 sender,
                 inner_calls_data: None,

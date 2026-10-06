@@ -1074,8 +1074,48 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         .unwrap_or(U256::MAX);
 
     let call_data = bundle.encode_inner_calls();
-    let calldata =
-        encode_validate_paymaster_op_calldata(&signed_tx.from, &call_data, max_gas_cost, context);
+    simulate_paymaster_validation(
+        world_state,
+        chain_store,
+        &PaymasterValidationInput {
+            chain_id: signed_tx.tx.chain_id,
+            sender: &signed_tx.from,
+            paymaster,
+            call_data: &call_data,
+            max_gas_cost,
+            context,
+        },
+        validation_header,
+    )
+    .map(|_| ())
+}
+
+/// Inputs shared by admission and read-only contract-paymaster estimation.
+pub struct PaymasterValidationInput<'a> {
+    pub chain_id: u64,
+    pub sender: &'a Address,
+    pub paymaster: &'a Address,
+    pub call_data: &'a [u8],
+    pub max_gas_cost: U256,
+    pub context: &'a [u8],
+}
+
+/// Execute the same bounded STATICCALL as admission without committing state.
+/// Returns total spent gas, including the validation wrapper and intrinsic gas.
+/// Success only establishes acceptance of these inputs at this state/context.
+pub fn simulate_paymaster_validation<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+    chain_store: &ChainStore<S>,
+    input: &PaymasterValidationInput<'_>,
+    validation_header: Option<&BlockHeader>,
+) -> Result<u64, AaValidationError> {
+    let paymaster = input.paymaster;
+    let calldata = encode_validate_paymaster_op_calldata(
+        input.sender,
+        input.call_data,
+        input.max_gas_cost,
+        input.context,
+    );
 
     let wrapper_address = paymaster_validation_wrapper_address(paymaster);
     let state_db = ValidationStateDb::with_inline_code(
@@ -1098,7 +1138,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         .value(alloy_primitives::U256::ZERO)
         .data(AlBytes::from(calldata))
         .nonce(0)
-        .chain_id(Some(signed_tx.tx.chain_id))
+        .chain_id(Some(input.chain_id))
         .build_fill();
 
     let mut block_env = BlockEnv {
@@ -1118,7 +1158,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
     let ctx: MainnetContext<&mut ValidationStateDb<'_, S>> = Context::new(&mut db, SpecId::CANCUN)
         .modify_block_chained(|b| *b = block_env)
         .modify_cfg_chained(|cfg: &mut CfgEnv| {
-            cfg.chain_id = signed_tx.tx.chain_id;
+            cfg.chain_id = input.chain_id;
             cfg.disable_nonce_check = true;
             cfg.disable_base_fee = true;
         });
@@ -1159,6 +1199,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
         .map_err(|e| AaValidationError::PaymasterValidationFailed(format!("{e:?}")))?
         .result;
 
+    let gas_spent = exec_result.gas().spent();
     match exec_result {
         ExecutionResult::Success { output, .. } => {
             let bytes = match output {
@@ -1169,7 +1210,7 @@ fn call_paymaster_validate<S: KvStore + 'static>(
             // The boolean true is represented as ...0001 (low byte = 1).
             let accepted = decode_abi_bool(&bytes) == Some(true);
             if accepted {
-                Ok(())
+                Ok(gas_spent)
             } else {
                 Err(AaValidationError::PaymasterRejected)
             }

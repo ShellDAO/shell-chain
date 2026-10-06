@@ -550,3 +550,30 @@ It stops its child processes and prints the report path; node data and encrypted
 keys remain in its private temporary directory. It does not test multiple-authority
 quorum or prove public package availability. See the
 [execution decision](adr/aa-validator-registry.md) for the atomicity boundary.
+
+## Contract-paymaster gas simulation (unreleased)
+
+`shell_estimatePaymasterGas` can execute the same bounded STATICCALL used by
+admission when `gas_limit` is supplied. This is available in updated source
+builds, not the currently published v0.27.4 binary. Existing requests without
+`gas_limit` and older servers return `simulation_status: "cap_only"` with null
+`validation_gas` and `within_cap`.
+
+Supply the actual outer bundle `gas_limit`, `max_fee_per_gas`, `sender`,
+`paymaster`, canonical RLP `inner_calls_data`, and `paymaster_context`. Hex byte
+strings require `0x`; gas quantities are hex strings. The maximum sponsorship
+cost is `gas_limit * max_fee_per_gas` (fee defaults to 1 gwei). Raw inner-call
+bytes are passed to the policy; this method does not check bundle structure.
+
+On acceptance, version 2 reports `simulation_status: "simulated"`, capability
+`paymaster_staticcall`, measured `validation_gas`, `max_gas_cost`, the 50,000
+`paymaster_gas_cap` and `within_cap: true`. Measured gas includes intrinsic and
+wrapper execution cost, matching the admission budget. This is not a fee receipt.
+A rejecting/reverting policy, static-state write or exhausted budget returns
+`-32000`; malformed inputs or zero outer gas limit return `-32602`.
+
+Execution uses the current state and admission's next-candidate block context.
+The existing paymaster ABI and activation policies are unchanged, including its
+retained `address` argument mapping. No simulation writes are committed.
+Acceptance does not verify signatures, sender nonce, funding or full bundle
+validity, and cannot guarantee sponsorship at a later inclusion state or height.

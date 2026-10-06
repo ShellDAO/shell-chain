@@ -25,9 +25,10 @@ pub mod tracer;
 mod tx_validation;
 
 pub use aa_validation::{
-    governance_fallback_pubkey, registered_session_root_deprecation_enabled, validate_aa_tx,
-    validate_aa_tx_at_block, verify_session_root_authorization, AaValidationError,
-    AaValidationOutcome, PAYMASTER_VALIDATE_GAS_CAP, VALIDATION_GAS_CAP,
+    governance_fallback_pubkey, registered_session_root_deprecation_enabled,
+    simulate_paymaster_validation, validate_aa_tx, validate_aa_tx_at_block,
+    verify_session_root_authorization, AaValidationError, AaValidationOutcome,
+    PaymasterValidationInput, PAYMASTER_VALIDATE_GAS_CAP, VALIDATION_GAS_CAP,
 };
 pub use executor::{
     commit_pqvm_state, commit_pqvm_state_raw, ExecutorError, ShellPqvm, TxExecutionResult,

@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Persist genesis allocation bytecode alongside its account code hash so
+  predeployed contracts can execute and remain executable after restart.
+
+- Execute contract-paymaster gas estimation through the same isolated STATICCALL
+  as admission when the RPC request includes the outer `gas_limit`. Report actual
+  validation gas and reject failing policies without changing state. Requests
+  without that input retain the versioned cap-only response.
+
 - Fetch missing ancestor witnesses needed for legacy historical validation, even
   outside the configured witness retention window. Authenticate them before
   resuming the dependent backfill without changing live state or the chain head.
