@@ -450,6 +450,34 @@ and account nonce, and removes private replay data. The existing short restart
 check remains enabled by default. These are isolated source-level checks, not
 claims about a released binary or production-scale throughput.
 
+### CLI retention and peer recovery regression
+
+For current source builds with RocksDB and libp2p, run this manual check with
+Python 3.9 or newer. Allow about 70 minutes for actual one-second blocks and
+up to 90 minutes for the finality wait. Use a new output directory:
+
+```bash
+cargo build -p shell-cli --features libp2p --bin shell-node
+python3 scripts/test-cli-storage-retention.py \
+  --binary target/debug/shell-node \
+  --output-dir retention-results
+```
+
+The check creates temporary keys and databases, starts a light validator and
+an independent archive observer over loopback libp2p, and sends a signed
+transfer. It waits for weighted finality past the default 4,096-block body
+retention window, checks that the light node has removed the old body while
+the archive node retains it, then restarts the light node as full. The original
+body must be recovered from the peer and survive another restart, with exact
+sender balance, nonce, and recipient balance preserved. Finality is obtained
+through consensus; no finalized-height injection or retention override is used.
+
+Run Python without optimization so assertions remain enabled. A failure exits
+nonzero; JSON results and node logs remain in the output directory. Temporary
+node data and test keys are removed when the check exits. This covers a local
+single-validator network using legacy default fee accounting. It does not
+establish multi-validator fault tolerance or availability in a published binary.
+
 ### Docker Compose defaults
 
 The bundled `docker-compose.yml` assigns:
