@@ -1504,11 +1504,38 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             shell_core::MAX_PAYMASTER_CONTEXT,
         )?;
 
-        // Current RPC handlers do not yet expose the full EVM staticcall
-        // executor needed to run validatePaymasterOp from this read-only path.
-        // Return an explicit cap-only response so clients can gate sponsored
-        // flows without mistaking this for a successful contract simulation.
-        let _ = (inner_calls_data, max_fee_per_gas, paymaster_context); // used in full impl
+        if let Some(gas_limit) = req.gas_limit.as_deref() {
+            let gas_limit = parse_hex_u64(gas_limit)?;
+            if gas_limit == 0 {
+                return Err(invalid_params("gas_limit must be nonzero"));
+            }
+            let max_gas_cost = U256::from(gas_limit) * U256::from(max_fee_per_gas);
+            let validation_gas = shell_pqvm::simulate_paymaster_validation(
+                &self.world_state.read(),
+                &self.chain_store,
+                &shell_pqvm::PaymasterValidationInput {
+                    chain_id: self.chain_id,
+                    sender: &req.sender,
+                    paymaster: &req.paymaster,
+                    call_data: &inner_calls_data,
+                    max_gas_cost,
+                    context: &paymaster_context,
+                },
+                None,
+            )
+            .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+            return Ok(serde_json::json!({
+                "paymaster": req.paymaster,
+                "sender": req.sender,
+                "validation_gas": hex_u64(validation_gas),
+                "paymaster_gas_cap": hex_u64(PAYMASTER_VALIDATE_GAS_CAP),
+                "within_cap": true,
+                "simulation_status": "simulated",
+                "simulation_version": 2u64,
+                "capability": "paymaster_staticcall",
+                "max_gas_cost": hex_u256(max_gas_cost),
+            }));
+        }
 
         Ok(serde_json::json!({
             "paymaster": req.paymaster,
@@ -1519,7 +1546,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "simulation_status": "cap_only",
             "simulation_version": 1u64,
             "capability": "paymaster_cap_only",
-            "reason": "validatePaymasterOp staticcall simulation is not exposed by this RPC handler yet",
+            "reason": "gas_limit is required to simulate the exact maximum sponsorship cost",
             "note": "Current response reports the protocol gas cap only. Use shell_estimateBatch for bundle gas estimation and gate contract-paymaster UX on simulation_status.",
         }))
     }

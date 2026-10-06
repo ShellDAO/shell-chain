@@ -416,11 +416,10 @@ pub struct BatchInnerCallRequest {
 
 /// Request body for `shell_estimatePaymasterGas` (AA Phase 2).
 ///
-/// Reports the protocol gas cap for contract-paymaster validation.
-///
-/// Current node builds return a versioned `cap_only` response instead of a
-/// real `validatePaymasterOp` staticcall simulation. Clients must inspect the
-/// response `simulation_status` before enabling contract-paymaster UX.
+/// With `gas_limit`, executes the admission STATICCALL using the supplied
+/// sponsorship inputs. Omission preserves the legacy `cap_only` response.
+/// Clients must inspect `simulation_status`; simulation does not validate the
+/// whole bundle or guarantee sponsorship in a later block.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaymasterGasEstimateRequest {
     /// Paymaster contract address to query.
@@ -429,6 +428,9 @@ pub struct PaymasterGasEstimateRequest {
     pub sender: Address,
     /// Inner calls as raw hex bytes (forwarded to `validatePaymasterOp`).
     pub inner_calls_data: Option<String>,
+    /// Outer bundle gas limit (hex). Required for actual validation simulation.
+    /// Omission preserves the legacy cap-only response.
+    pub gas_limit: Option<String>,
     /// Max fee per gas (hex wei). Used to compute `max_gas_cost`.
     pub max_fee_per_gas: Option<String>,
     /// Opaque context bytes forwarded to `validatePaymasterOp`.
