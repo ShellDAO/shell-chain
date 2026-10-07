@@ -12,6 +12,7 @@
 //! `ecrecover`, BN256, and BLAKE2f.
 
 use alloy_primitives::{address, Address, Bytes};
+use rayon::prelude::*;
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::ContextTr;
 use revm::handler::PrecompileProvider;
@@ -456,6 +457,16 @@ fn verify_slhdsa_sha2_256f<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> bool {
 }
 
 fn verify_mldsa65_batch<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> (usize, bool) {
+    // Carry the caller's historical/provisional policy into each worker.
+    let registry = shell_crypto::with_algorithm_registry_mut(|current| current.clone());
+    verify_mldsa65_batch_with(input, |item| {
+        shell_crypto::with_algorithm_registry_override(&registry, || {
+            verify_mldsa65::<ALLOW_DEPRECATED>(item)
+        })
+    })
+}
+
+fn verify_mldsa65_batch_with(input: &[u8], verify: impl Fn(&[u8]) -> bool + Sync) -> (usize, bool) {
     // Batch wire format:
     // [4-byte count][item_0][item_1]...
     // Each item: [4-byte pubkey_len][pubkey][4-byte msg_len][msg][sig]
@@ -464,7 +475,10 @@ fn verify_mldsa65_batch<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> (usize, b
     };
     let count = u32::from_be_bytes(count_bytes.try_into().expect("slice length checked")) as usize;
     let mut cursor = 4usize;
-    let mut valid = true;
+    if count == 0 || count > MAX_BATCH_SIGNATURES as usize {
+        return (count, false);
+    }
+    let mut items = Vec::with_capacity(count);
 
     for _ in 0..count {
         // Read pubkey_len
@@ -496,11 +510,18 @@ fn verify_mldsa65_batch<const ALLOW_DEPRECATED: bool>(input: &[u8]) -> (usize, b
         // H-3: ML-DSA-65-first dispatch (ML-DSA-65 primary + Dilithium3 fallback)
         // matches the single-verify path so batch and single verification are consistent.
         let item = &input[item_start..item_end];
-        valid &= verify_mldsa65::<ALLOW_DEPRECATED>(item);
+        items.push(item);
         cursor = item_end;
     }
 
-    (count, valid && cursor == input.len())
+    if cursor != input.len() {
+        return (count, false);
+    }
+    let valid = items
+        .par_iter()
+        .map(|item| verify(item))
+        .reduce(|| true, |a, b| a & b);
+    (count, valid)
 }
 
 fn bool_output(valid: bool) -> Bytes {
@@ -689,9 +710,11 @@ mod tests {
                         &signature.data
                     ));
                     if !slh {
-                        let mut batch = 1u32.to_be_bytes().to_vec();
-                        batch.extend_from_slice(&input);
-                        assert_eq!(verify_mldsa65_batch::<true>(&batch), (1, stage != 2));
+                        let mut batch = 16u32.to_be_bytes().to_vec();
+                        for _ in 0..16 {
+                            batch.extend_from_slice(&input);
+                        }
+                        assert_eq!(verify_mldsa65_batch::<true>(&batch), (16, stage != 2));
                         let result = run_mldsa65_batch_verify::<true>(
                             PQ_MLDSA65_BATCH_VERIFY_GAS_PER_SIG - 1,
                             &batch,
@@ -919,6 +942,60 @@ mod tests {
             &expected,
             "count=2 batch should verify successfully"
         );
+    }
+
+    #[test]
+    fn batch_verify_rejects_bad_framing_before_crypto_work() {
+        let signer = DilithiumSigner::generate();
+        let message = b"batch framing";
+        let signature = signer.sign(message).unwrap();
+        let mut valid = 1u32.to_be_bytes().to_vec();
+        valid.extend(encode_batch_item(
+            signer.public_key(),
+            message,
+            &signature.data,
+        ));
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let truncated = &valid[..valid.len() - 1];
+        for input in [
+            &trailing[..],
+            truncated,
+            &0u32.to_be_bytes(),
+            &257u32.to_be_bytes(),
+        ] {
+            let (_, accepted) = verify_mldsa65_batch_with(input, |_| {
+                panic!("malformed batch must not start signature verification")
+            });
+            assert!(!accepted);
+        }
+    }
+
+    #[test]
+    fn batch_verify_uses_multiple_workers_with_real_signatures() {
+        let signer = DilithiumSigner::generate();
+        let message = b"parallel precompile acceptance";
+        let signature = signer.sign(message).unwrap();
+        let item = encode_batch_item(signer.public_key(), message, &signature.data);
+        let mut input = 16u32.to_be_bytes().to_vec();
+        for _ in 0..16 {
+            input.extend_from_slice(&item);
+        }
+        let workers = std::sync::Mutex::new(std::collections::HashSet::new());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let result = pool.install(|| {
+            verify_mldsa65_batch_with(&input, |item| {
+                workers.lock().unwrap().insert(std::thread::current().id());
+                // Give both workers an observable independent verification window.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                verify_mldsa65::<false>(item)
+            })
+        });
+        assert_eq!(result, (16, true));
+        assert_eq!(workers.lock().unwrap().len(), 2);
     }
 
     /// Regression test: count=2 with one tampered signature must return false.

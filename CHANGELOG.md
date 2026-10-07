@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Execute bounded PQ batch-precompile verification across Rayon workers,
+  retaining the caller's algorithm policy snapshot and existing gas/ABI rules.
+  Reject malformed batch framing before starting signature verification.
+
 - Persist genesis allocation bytecode alongside its account code hash so
   predeployed contracts can execute and remain executable after restart.
 
