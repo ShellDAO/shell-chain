@@ -60,6 +60,7 @@ pub const PQ_ADDRESS_DERIVE_BASE_GAS: u64 = 200;
 /// Legacy name for the PQ address derivation base gas.
 pub const PQ_ADDRESS_DERIVE_GAS: u64 = PQ_ADDRESS_DERIVE_BASE_GAS;
 
+const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 const SPHINCS_PUBLIC_KEY_BYTES: usize = 64;
 const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
@@ -68,6 +69,7 @@ const SPHINCS_SIGNATURE_BYTES: usize = 49_856;
 pub struct ShellPrecompiles {
     spec: SpecId,
     allow_deprecated: bool,
+    enforce_address_bounds: bool,
     native_validators: Option<Vec<ShellAddress>>,
 }
 
@@ -76,6 +78,7 @@ impl ShellPrecompiles {
         Self {
             spec,
             allow_deprecated: false,
+            enforce_address_bounds: false,
             native_validators: None,
         }
     }
@@ -85,14 +88,18 @@ impl ShellPrecompiles {
         self
     }
 
-    pub(crate) fn with_native_registry_view<S: KvStore>(
+    pub(crate) fn with_chain_config<S: KvStore>(
         mut self,
         world: &WorldState<S>,
         chain: &ChainStore<S>,
         height: u64,
     ) -> Result<Self, StorageError> {
-        if chain
-            .get_chain_config()?
+        let config = chain.get_chain_config()?;
+        self.enforce_address_bounds = config
+            .as_ref()
+            .and_then(|config| config.pq_address_bounds_height)
+            .is_some_and(|activation| height >= activation);
+        if config
             .and_then(|config| config.native_registry_view_height)
             .is_some_and(|activation| height >= activation)
         {
@@ -135,6 +142,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
                     inputs,
                     context,
                     self.native_validators.as_deref(),
+                    self.enforce_address_bounds,
                 )
             } else {
                 run_pq_precompile::<_, false>(
@@ -142,6 +150,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for ShellPrecompiles {
                     inputs,
                     context,
                     self.native_validators.as_deref(),
+                    self.enforce_address_bounds,
                 )
             }));
         }
@@ -173,6 +182,7 @@ fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
     inputs: &CallInputs,
     context: &mut CTX,
     native_validators: Option<&[ShellAddress]>,
+    enforce_address_bounds: bool,
 ) -> InterpreterResult {
     // Hold the shared-memory guard through execution so precompiles can read
     // calldata in place instead of cloning it into a temporary buffer.
@@ -204,7 +214,9 @@ fn run_pq_precompile<CTX: ContextTr, const ALLOW_DEPRECATED: bool>(
         }
         PQ_BLAKE3_256_ADDR => run_blake3_256(inputs.gas_limit, input),
         PQ_BLAKE3_512_ADDR => run_blake3_512(inputs.gas_limit, input),
-        PQ_ADDRESS_DERIVE_ADDR => run_pq_address_derive(inputs.gas_limit, input),
+        PQ_ADDRESS_DERIVE_ADDR => {
+            run_pq_address_derive_with_bounds(inputs.gas_limit, input, enforce_address_bounds)
+        }
         _ => InterpreterResult {
             result: InstructionResult::PrecompileError,
             gas: Gas::new(inputs.gas_limit),
@@ -349,7 +361,16 @@ fn run_blake3_512(gas_limit: u64, input: &[u8]) -> InterpreterResult {
     result
 }
 
+#[cfg(test)]
 fn run_pq_address_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
+    run_pq_address_derive_with_bounds(gas_limit, input, false)
+}
+
+fn run_pq_address_derive_with_bounds(
+    gas_limit: u64,
+    input: &[u8],
+    enforce_bounds: bool,
+) -> InterpreterResult {
     let mut result = base_result(gas_limit);
     let pubkey_len = input.len().saturating_sub(1);
     if !charge_gas(&mut result, pq_address_derive_gas(pubkey_len)) {
@@ -360,6 +381,17 @@ fn run_pq_address_derive(gas_limit: u64, input: &[u8]) -> InterpreterResult {
         result.result = InstructionResult::PrecompileError;
         return result;
     };
+    if enforce_bounds {
+        let max_key_bytes = match SignatureType::from_u8(algo_id) {
+            Some(SignatureType::Dilithium3 | SignatureType::MlDsa65) => DILITHIUM3_PUBLIC_KEY_BYTES,
+            Some(SignatureType::SphincsSha2256f) => SPHINCS_PUBLIC_KEY_BYTES,
+            None => usize::MAX,
+        };
+        if pubkey.len() > max_key_bytes {
+            result.output = Bytes::from(vec![0; 32]);
+            return result;
+        }
+    }
     let Some(address) = derive_pq_address(algo_id, pubkey) else {
         result.result = InstructionResult::PrecompileError;
         return result;
@@ -627,7 +659,7 @@ mod tests {
                 .unwrap();
             for height in [9, 10, 11] {
                 let provider = ShellPrecompiles::new(SpecId::CANCUN)
-                    .with_native_registry_view(&world, &chain, height)
+                    .with_chain_config(&world, &chain, height)
                     .unwrap();
                 assert_eq!(
                     provider.is_precompile(&NATIVE_REGISTRY_VIEW_ADDR),
@@ -770,6 +802,33 @@ mod tests {
         let expected = ShellAddress::from_public_key(&pubkey, SignatureType::MlDsa65.as_u8());
         assert_eq!(output.result, InstructionResult::Return);
         assert_eq!(output.output.as_ref(), expected.as_bytes());
+    }
+
+    #[test]
+    fn pq_address_derive_algorithm_bounds_preserve_legacy_and_charge_gas() {
+        for (algorithm, maximum) in [
+            (SignatureType::Dilithium3, 1952),
+            (SignatureType::MlDsa65, 1952),
+            (SignatureType::SphincsSha2256f, 64),
+        ] {
+            let mut input = vec![algorithm.as_u8()];
+            input.extend(vec![0x11; maximum]);
+            let boundary = run_pq_address_derive_with_bounds(100_000, &input, true);
+            assert_eq!(boundary.result, InstructionResult::Return);
+            assert_eq!(boundary.output.len(), 32);
+            assert_ne!(boundary.output.as_ref(), &[0; 32]);
+            input.push(0x11);
+            let legacy = run_pq_address_derive(100_000, &input);
+            assert_eq!(legacy.result, InstructionResult::Return);
+            assert_ne!(legacy.output.as_ref(), &[0; 32]);
+            let bounded = run_pq_address_derive_with_bounds(100_000, &input, true);
+            assert_eq!(bounded.result, InstructionResult::Return);
+            assert_eq!(bounded.output.as_ref(), &[0; 32]);
+            let expected_gas = 200 + 6 * ((maximum as u64 + 1).div_ceil(32));
+            assert_eq!(bounded.gas.spent(), expected_gas);
+            let insufficient = run_pq_address_derive_with_bounds(expected_gas - 1, &input, true);
+            assert_eq!(insufficient.result, InstructionResult::PrecompileOOG);
+        }
     }
 
     #[test]

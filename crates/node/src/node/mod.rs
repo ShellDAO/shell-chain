@@ -3286,6 +3286,7 @@ mod tests {
                         aa_validator_registry_height: None,
                         emergency_governance_height: None,
                         native_registry_view_height: None,
+                        pq_address_bounds_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -5159,6 +5160,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             emergency_governance_height: None,
                             native_registry_view_height: None,
+                            pq_address_bounds_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5322,6 +5324,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             emergency_governance_height: None,
                             native_registry_view_height: None,
+                            pq_address_bounds_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5434,6 +5437,7 @@ mod tests {
                         aa_validator_registry_height: None,
                         emergency_governance_height: None,
                         native_registry_view_height: None,
+                        pq_address_bounds_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -6350,6 +6354,242 @@ mod tests {
         assert_eq!(receipts[0].tx_index, 0);
         assert_eq!(receipts[1].tx_index, 1);
         assert_eq!(receipts[2].tx_index, 2);
+    }
+
+    #[test]
+    fn pq_address_bounds_signed_blocks_import_and_historical_replay() {
+        for activation in [None, Some(3)] {
+            let (leader, proposer_signer) = setup_node();
+            let proposer = leader.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(proposer);
+            let tx_signer = DilithiumSigner::generate();
+            let sender =
+                Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+            for node in [&leader, &follower] {
+                node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                let config = serde_json::from_value(serde_json::json!({
+                    "chain_id": 1337,
+                    "genesis_hash": ShellHash::ZERO,
+                    "pq_address_bounds_height": activation,
+                }))
+                .unwrap();
+                node.chain_store.put_chain_config(&config).unwrap();
+                fund_account(node, &sender, U256::from(10_000_000_000_000_000_000u64));
+                store_consistent_genesis(node);
+            }
+            // Forward calldata to precompile 0x06 and persist its returned word in slot zero.
+            let runtime =
+                hex::decode("3660006000376000600036600060065afa503d600060003e6000516000553d6000f3")
+                    .unwrap();
+            let transaction = |nonce, to, data| Transaction {
+                chain_id: 1337,
+                nonce,
+                to,
+                value: U256::ZERO,
+                data: Bytes::from(data),
+                gas_limit: 5_000_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            submit_signed_tx(
+                &leader,
+                &tx_signer,
+                sender,
+                transaction(0, None, make_init_code(&runtime)),
+            );
+            let deployment = leader.produce_block(&proposer_signer, 100).unwrap();
+            follower
+                .import_block(deployment.clone(), &MultiVerifier)
+                .unwrap();
+            let receipts = leader
+                .chain_store
+                .get_receipts(&deployment.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipts[0].status, 1);
+            let contract = receipts[0].contract_address.unwrap();
+            let mut input = vec![1];
+            input.extend(vec![0x11; 1953]);
+            // Independently recorded from the legacy public RPC before this change.
+            let legacy = ShellHash::from_slice(
+                &hex::decode("e1a150c1c8065b24480c1a562f8339d7617051a86b1d3963e1050f231d7ec071")
+                    .unwrap(),
+            );
+            let mut calls = Vec::new();
+            for nonce in 1..=3 {
+                submit_signed_tx(
+                    &leader,
+                    &tx_signer,
+                    sender,
+                    transaction(nonce, Some(contract), input.clone()),
+                );
+                let block = leader.produce_block(&proposer_signer, 100).unwrap();
+                follower
+                    .import_block(block.clone(), &MultiVerifier)
+                    .unwrap();
+                let expected = if activation.is_some_and(|height| block.number() >= height) {
+                    ShellHash::ZERO
+                } else {
+                    legacy
+                };
+                for node in [&leader, &follower] {
+                    let receipts = node
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(receipts[0].status, 1);
+                    assert_eq!(
+                        node.world_state
+                            .read()
+                            .get_storage(&contract, &ShellHash::ZERO)
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        node.world_state.read().get_nonce(&sender).unwrap(),
+                        nonce + 1
+                    );
+                    assert_eq!(current_state_root(node), block.header.state_root);
+                }
+                calls.push(block);
+            }
+            // Reconstruct historical execution after the tip crossed the activation boundary.
+            for block in calls {
+                assert_pruned_genesis_witness_recovery(&follower, &block);
+            }
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn pq_address_bounds_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_PQ_ADDRESS_BOUNDS_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let signer = DilithiumSigner::generate();
+            let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let node = setup_node_with_store(sender, Arc::new(stores.state));
+            node.register_authority_pubkey(sender, signer.public_key().to_vec());
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "pq_address_bounds_height": 2,
+            }))
+            .unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            fund_account(&node, &sender, U256::from(10_000_000_000_000_000_000u64));
+            store_consistent_genesis(&node);
+            let transaction = |nonce, to, data| Transaction {
+                chain_id: 1337,
+                nonce,
+                to,
+                value: U256::ZERO,
+                data: Bytes::from(data),
+                gas_limit: 5_000_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let runtime =
+                hex::decode("3660006000376000600036600060065afa503d600060003e6000516000553d6000f3")
+                    .unwrap();
+            submit_signed_tx(
+                &node,
+                &signer,
+                sender,
+                transaction(0, None, make_init_code(&runtime)),
+            );
+            let deployment = node.produce_block(&signer, 100).unwrap();
+            let receipts = node
+                .chain_store
+                .get_receipts(&deployment.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipts[0].status, 1);
+            let contract = receipts[0].contract_address.unwrap();
+            let mut input = vec![1];
+            input.extend(vec![0x11; 1953]);
+            submit_signed_tx(
+                &node,
+                &signer,
+                sender,
+                transaction(1, Some(contract), input),
+            );
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .status,
+                1
+            );
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&(sender, contract, block)).unwrap(),
+            )
+            .unwrap();
+            // Terminate the writer process so the reader cannot reuse its in-memory state.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-pq-address-bounds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::pq_address_bounds_survives_process_exit",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, contract, tip): (Address, Address, Block) =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let node = setup_node_with_store(sender, Arc::new(stores.state));
+        assert_eq!(
+            node.chain_store
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .pq_address_bounds_height,
+            Some(2)
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        let state = WorldState::at_root(node.store.clone(), &tip.header.state_root).unwrap();
+        assert_eq!(state.get_nonce(&sender).unwrap(), 2);
+        assert_eq!(
+            state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+            ShellHash::ZERO
+        );
+        assert_eq!(
+            node.chain_store.get_receipts(&tip.hash()).unwrap().unwrap()[0].status,
+            1
+        );
+        assert_pruned_genesis_witness_recovery(&node, &tip);
+        drop(state);
+        drop(node);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

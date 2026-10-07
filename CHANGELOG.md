@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add default-off `pq_address_bounds_height` for address derivation at precompile
+  `0x06`. At the configured block, inputs above the selected algorithm's public-key
+  bound return a 32-byte zero value after normal gas charging. Preserve historical
+  outputs before activation, immutable future schedules and trusted snapshot checks.
+
 - Execute bounded PQ batch-precompile verification across Rayon workers,
   retaining the caller's algorithm policy snapshot and existing gas/ABI rules.
   Reject malformed batch framing before starting signature verification.

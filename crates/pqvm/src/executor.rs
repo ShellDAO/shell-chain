@@ -369,7 +369,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
         // Build revm context + EVM.
         // Use CANCUN spec for transient storage (EIP-1153) and MCOPY (EIP-5656).
-        let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_native_registry_view(
+        let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_chain_config(
             self.state_db.world_state(),
             self.state_db.chain_store(),
             header.number,
@@ -916,7 +916,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 .chain_id(Some(self.chain_id))
                 .build_fill();
 
-            let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_native_registry_view(
+            let precompiles = ShellPrecompiles::new(SpecId::CANCUN).with_chain_config(
                 self.state_db.world_state(),
                 self.state_db.chain_store(),
                 header.number,
@@ -1586,6 +1586,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 emergency_governance_height: None,
                 native_registry_view_height: None,
+                pq_address_bounds_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -1811,6 +1812,7 @@ mod tests {
                 aa_validator_registry_height: None,
                 emergency_governance_height: None,
                 native_registry_view_height: None,
+                pq_address_bounds_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -1893,6 +1895,7 @@ mod tests {
                             aa_validator_registry_height: None,
                             emergency_governance_height: None,
                             native_registry_view_height: None,
+                            pq_address_bounds_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -2464,6 +2467,7 @@ mod tests {
                     aa_validator_registry_height: None,
                     emergency_governance_height: None,
                     native_registry_view_height: None,
+                    pq_address_bounds_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
@@ -5003,6 +5007,85 @@ mod tests {
                         result.receipt.logs[0].topics[1],
                         ShellHash::from([0x53; 32])
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pq_address_bounds_contract_execution_and_aa_activation_boundary() {
+        let owner = ShellAddress::from([0xa8; 32]);
+        let contract = ShellAddress::from([0x91; 32]);
+        // Forward calldata through STATICCALL to the address-derivation precompile.
+        let runtime =
+            hex::decode("3660006000376000600036600060065afa503d600060003e3d6000f3").unwrap();
+        for activation in [None, Some(10)] {
+            for height in [9, 10, 11] {
+                for (algorithm, length, oversized) in [
+                    (1, 1952, false),
+                    (1, 1953, true),
+                    (2, 64, false),
+                    (2, 65, true),
+                ] {
+                    let mut evm = setup_native_aa_evm();
+                    fund_account(&mut evm, &owner, U256::from(100_000_000));
+                    evm.state_db()
+                        .chain_store()
+                        .put_chain_config(
+                            &serde_json::from_value(serde_json::json!({
+                                "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                                "pq_address_bounds_height":activation
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    let hash = shell_primitives::keccak256(&runtime);
+                    evm.state_db()
+                        .chain_store()
+                        .put_code(&hash, &runtime)
+                        .unwrap();
+                    evm.state_db_mut()
+                        .world_state_mut()
+                        .set_account(
+                            &contract,
+                            &Account {
+                                code_hash: Some(hash),
+                                ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                            },
+                        )
+                        .unwrap();
+                    let mut data = vec![algorithm];
+                    data.extend(vec![0x11; length]);
+                    let header = BlockHeader {
+                        number: height,
+                        ..sample_header()
+                    };
+                    let bounded = oversized && activation.is_some_and(|at| height >= at);
+                    let ordinary = make_system_tx_to(owner, contract, data.clone());
+                    let result = evm.execute_tx(&ordinary, &header, 0, 0).unwrap();
+                    assert!(result.receipt.succeeded());
+                    assert_eq!(result.output.len(), 32);
+                    assert_eq!(result.output == vec![0; 32], bounded);
+                    let aa = make_aa_signed(
+                        owner,
+                        current_nonce(&mut evm, &owner),
+                        500_000,
+                        10,
+                        vec![shell_core::InnerCall {
+                            to: Some(contract),
+                            value: U256::ZERO,
+                            data: data.into(),
+                            gas_limit: 100_000,
+                        }],
+                        None,
+                    );
+                    let (result, trace) = evm
+                        .trace_transaction(&aa, &header, 0, 0, TraceConfig::default())
+                        .unwrap();
+                    assert!(result.receipt.succeeded());
+                    let output = trace.result.frame.calls[0].output.as_ref().unwrap();
+                    assert_eq!(output.len(), 32);
+                    assert_eq!(output.as_ref() == [0; 32], bounded);
                 }
             }
         }

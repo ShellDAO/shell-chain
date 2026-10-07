@@ -207,6 +207,9 @@ pub struct GenesisConfig {
     /// First block enabling the non-overlapping native Registry view for contract calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_registry_view_height: Option<u64>,
+    /// First block rejecting oversized PQ address-derivation precompile inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_address_bounds_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,

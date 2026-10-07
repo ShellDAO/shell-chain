@@ -681,7 +681,7 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
         instructions,
         ShellPrecompiles::new(spec)
             .with_deprecated_verification(allow_deprecated)
-            .with_native_registry_view(world_state, chain_store, number)?,
+            .with_chain_config(world_state, chain_store, number)?,
     );
 
     let exec_result = evm
@@ -1191,7 +1191,7 @@ pub fn simulate_paymaster_validation<S: KvStore + 'static>(
         instructions,
         ShellPrecompiles::new(spec)
             .with_deprecated_verification(allow_deprecated)
-            .with_native_registry_view(world_state, chain_store, number)?,
+            .with_chain_config(world_state, chain_store, number)?,
     );
 
     let exec_result = evm
@@ -2417,6 +2417,7 @@ mod tests {
             aa_validator_registry_height: None,
             emergency_governance_height: None,
             native_registry_view_height: None,
+            pq_address_bounds_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
