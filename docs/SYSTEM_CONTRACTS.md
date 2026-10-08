@@ -90,6 +90,30 @@ height. The separate [voting window](CONSENSUS_DETAILS.md#algorithm-voting-windo
 can reject expired votes. These optional upgrades and their legacy behavior are
 specified in the linked activation rules.
 
+### PQ address derivation input bounds
+
+The PQ address-derivation precompile occupies the full 32-byte address
+`0x0000000000000000000000000000000000000000000000000000000000000006`.
+Its input is `u8 algo_id || public_key`; successful derivation returns
+`BLAKE3(algo_id || public_key)` as 32 bytes. Its gas cost is
+`200 + 6 * ceil(public_key_bytes / 32)`, excluding the caller's other gas costs.
+
+For node versions containing the input-bounds upgrade, the optional genesis
+field `pq_address_bounds_height` activates oversized-input rejection at the
+configured block height. It defaults to absent. Dilithium3 and ML-DSA-65 have
+an upper bound of 1952 public-key bytes; SLH-DSA-SHA2-256f has an upper bound
+of 64 bytes. A larger key input returns 32 zero bytes after charging the same
+length-based gas. Insufficient gas still fails with out-of-gas. This is a length
+bound, not cryptographic public-key validation.
+
+Before activation, address derivation retains its historical output for oversized
+inputs. Existing databases accept only a new future activation; saved schedules
+cannot be removed or changed, and imported snapshots must match the locally
+trusted schedule. Contract execution and account/paymaster validation use the
+candidate block height, including during import and historical replay. The
+schedule applies to precompile `0x06`; it does not redefine the `PQADDR` opcode.
+Source support does not imply a published binary or activation on any network.
+
 ### Calling from Solidity
 
 Use the independently activated **NativeRegistryView** at full address

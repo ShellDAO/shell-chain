@@ -117,6 +117,7 @@ pub fn init(
                 aa_validator_registry_height: None,
                 emergency_governance_height: None,
                 native_registry_view_height: None,
+                pq_address_bounds_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
