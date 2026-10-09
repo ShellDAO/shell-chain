@@ -1,0 +1,74 @@
+{
+  "source": "pragma solidity ^0.8.20; contract NativeModes { function invokeStatic(address target, bytes memory data) external view returns(bool,bytes memory) {return target.staticcall(data);} function invokeDelegate(address target, bytes memory data) external payable returns(bool,bytes memory) {return target.delegatecall(data);} }",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "staticSelector": "0x828562b2",
+  "delegateSelector": "0x5b262f2d",
+  "artifact": {
+    "contractName": "NativeModes",
+    "sourcePath": "NativeModes.sol",
+    "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+    "abi": [
+      {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invokeDelegate",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "payable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invokeStatic",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      }
+    ],
+    "bytecode": "0x60808060405234601557610216908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80635b262f2d1461007c5763828562b21461002f575f80fd5b346100785761003d36610101565b9060024310610078575f828192602082519201905afa3d9061005e826101b8565b915f602084013e61007460405192839283610169565b0390f35b5f80fd5b61008536610101565b9060024310610078575f828192602082519201905af43d9061005e826101b8565b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100e057604052565b6100a6565b67ffffffffffffffff81116100e057601f01601f191660200190565b906040600319830112610078576004359160243567ffffffffffffffff8111610078578160238201121561007857806004013590610146610141836100e5565b6100ba565b928284526024838301011161007857815f92602460209301838601378301015290565b90929192151581526040602082015282518060408301525f5b8181106101a2575060609293505f838284010152601f8019910116010190565b8060208092870101516060828601015201610182565b906101c5610141836100e5565b82815280926101d6601f19916100e5565b019060203691013756fea2646970667358221220fbd453b410e59a669c8709b8a85b54e199c4e96bdaf139bf88eb67961e514e4e64736f6c63430008230033",
+    "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80635b262f2d1461007c5763828562b21461002f575f80fd5b346100785761003d36610101565b9060024310610078575f828192602082519201905afa3d9061005e826101b8565b915f602084013e61007460405192839283610169565b0390f35b5f80fd5b61008536610101565b9060024310610078575f828192602082519201905af43d9061005e826101b8565b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100e057604052565b6100a6565b67ffffffffffffffff81116100e057601f01601f191660200190565b906040600319830112610078576004359160243567ffffffffffffffff8111610078578160238201121561007857806004013590610146610141836100e5565b6100ba565b928284526024838301011161007857815f92602460209301838601378301015290565b90929192151581526040602082015282518060408301525f5b8181106101a2575060609293505f838284010152601f8019910116010190565b8060208092870101516060828601015201610182565b906101c5610141836100e5565b82815280926101d6601f19916100e5565b019060203691013756fea2646970667358221220fbd453b410e59a669c8709b8a85b54e199c4e96bdaf139bf88eb67961e514e4e64736f6c63430008230033"
+  }
+}

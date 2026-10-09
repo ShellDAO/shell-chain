@@ -1,0 +1,79 @@
+{
+  "source": "pragma solidity ^0.8.20; contract NativeCall { function invoke(address target, bytes memory data, uint256 value) external payable returns(bool,bytes memory) {return target.call{value:value}(data);} function invokeNoValue(address target, bytes memory data) external returns(bool,bytes memory) {return target.call(data);} }",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "selector": "0x9e976db1",
+  "noValueSelector": "0x09f31afc",
+  "artifact": {
+    "contractName": "NativeCall",
+    "sourcePath": "NativeCall.sol",
+    "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+    "abi": [
+      {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          },
+          {
+            "internalType": "uint256",
+            "name": "value",
+            "type": "uint256"
+          }
+        ],
+        "name": "invoke",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "payable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invokeNoValue",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      }
+    ],
+    "bytecode": "0x60808060405234601557610240908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c806309f31afc1461003457639e976db11461002f575f80fd5b610193565b346100a45760403660031901126100a45760043560243567ffffffffffffffff81116100a457610068903690600401610103565b90600243106100a4575f82819282602083519301915af13d9061008a826101e2565b915f602084013e6100a060405192839283610144565b0390f35b5f80fd5b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100e257604052565b6100a8565b67ffffffffffffffff81116100e257601f01601f191660200190565b81601f820112156100a45780359061012261011d836100e7565b6100bc565b92828452602083830101116100a457815f926020809301838601378301015290565b90929192151581526040602082015282518060408301525f5b81811061017d575060609293505f838284010152601f8019910116010190565b806020809287010151606082860101520161015d565b60603660031901126100a45760043560243567ffffffffffffffff81116100a4576101c2903690600401610103565b60443590600243106100a4575f928392602083519301915af13d9061008a825b906101ef61011d836100e7565b8281528092610200601f19916100e7565b019060203691013756fea264697066735822122012114a46b3956558aef66e0b9a3b2b6263b7abee4522d692996458ce02c134ce64736f6c63430008230033",
+    "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c806309f31afc1461003457639e976db11461002f575f80fd5b610193565b346100a45760403660031901126100a45760043560243567ffffffffffffffff81116100a457610068903690600401610103565b90600243106100a4575f82819282602083519301915af13d9061008a826101e2565b915f602084013e6100a060405192839283610144565b0390f35b5f80fd5b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100e257604052565b6100a8565b67ffffffffffffffff81116100e257601f01601f191660200190565b81601f820112156100a45780359061012261011d836100e7565b6100bc565b92828452602083830101116100a457815f926020809301838601378301015290565b90929192151581526040602082015282518060408301525f5b81811061017d575060609293505f838284010152601f8019910116010190565b806020809287010151606082860101520161015d565b60603660031901126100a45760043560243567ffffffffffffffff81116100a4576101c2903690600401610103565b60443590600243106100a4575f928392602083519301915af13d9061008a825b906101ef61011d836100e7565b8281528092610200601f19916100e7565b019060203691013756fea264697066735822122012114a46b3956558aef66e0b9a3b2b6263b7abee4522d692996458ce02c134ce64736f6c63430008230033"
+  }
+}

@@ -386,6 +386,7 @@ async fn initialize_chain<S: KvStore + 'static>(
                 emergency_governance_height: genesis_config.emergency_governance_height,
                 native_registry_view_height: genesis_config.native_registry_view_height,
                 pq_address_bounds_height: genesis_config.pq_address_bounds_height,
+                native_address_context_height: genesis_config.native_address_context_height,
                 native_validator_events_height: genesis_config.native_validator_events_height,
                 prover_registry_height: genesis_config.prover_registry_height,
                 algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
@@ -516,6 +517,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             != genesis_config.pq_address_bounds_height
         || stored
             .as_ref()
+            .and_then(|config| config.native_address_context_height)
+            != genesis_config.native_address_context_height
+        || stored
+            .as_ref()
             .and_then(|config| config.native_validator_events_height)
             != genesis_config.native_validator_events_height
         || stored
@@ -558,6 +563,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             emergency_governance_height: genesis_config.emergency_governance_height,
             native_registry_view_height: genesis_config.native_registry_view_height,
             pq_address_bounds_height: genesis_config.pq_address_bounds_height,
+            native_address_context_height: genesis_config.native_address_context_height,
             native_validator_events_height: genesis_config.native_validator_events_height,
             prover_registry_height: genesis_config.prover_registry_height,
             algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
@@ -791,6 +797,7 @@ async fn run_with_store<S: KvStore + 'static>(
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1371,6 +1378,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1690,6 +1698,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1852,6 +1861,69 @@ mod tests {
         let before = store.scan_prefix(b"").unwrap();
         for conflict in [None, Some(10)] {
             config.pq_address_bounds_height = conflict;
+            assert!(initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_address_context_schedule_persists_and_rejects_conflicts_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let mut config = test_genesis(Address::from([7u8; 20]));
+        initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        config.native_address_context_height = Some(0);
+        assert!(initialize_chain(
+            Arc::clone(&store),
+            &config,
+            dir.path(),
+            config.chain_id,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        config.native_address_context_height = Some(9);
+        for _ in 0..2 {
+            initialize_chain(
+                Arc::clone(&store),
+                &config,
+                dir.path(),
+                config.chain_id,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let chain = ChainStore::new(Arc::clone(&store));
+        assert_eq!(
+            chain
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .native_address_context_height,
+            Some(9)
+        );
+        let before = store.scan_prefix(b"").unwrap();
+        for conflict in [None, Some(10)] {
+            config.native_address_context_height = conflict;
             assert!(initialize_chain(
                 Arc::clone(&store),
                 &config,
@@ -2911,6 +2983,7 @@ mod tests {
                     emergency_governance_height: None,
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
+                    native_address_context_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
