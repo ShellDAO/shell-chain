@@ -6711,11 +6711,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_compiler_receiver_signed_blocks_import_and_replay() {
-        let (leader, proposer_signer) = setup_node();
+    fn native_compiler_receiver_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+    ) -> (Address, Address, Address, Vec<Block>) {
         let proposer = leader.config.proposer_address.unwrap();
-        let follower = setup_node_with_authority(proposer);
         let signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         let contract = Address::from([0x98; 32]);
@@ -6738,7 +6739,7 @@ mod tests {
         // Emit and store CALLER, return it for empty input, and revert with it otherwise.
         let callee = hex::decode("335f55335f5260205fa0361560135760205ffd5b60205ff3").unwrap();
         let alias_code = hex::decode("60ff5f5560ff5f5260205ff3").unwrap();
-        for node in [&leader, &follower] {
+        macro_rules! initialize { ($node:expr) => {{ let node = $node;
             node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
             let config = serde_json::from_value(serde_json::json!({
                 "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
@@ -6767,7 +6768,9 @@ mod tests {
                 )
                 .unwrap();
             store_consistent_genesis(node);
-        }
+        }}; }
+        initialize!(leader);
+        initialize!(follower);
         let counter_slot = ShellHash::from(U256::from(1).to_be_bytes::<32>());
         let mut blocks = Vec::new();
         for nonce in 0..4 {
@@ -6786,7 +6789,7 @@ mod tests {
                 data.extend_from_slice(&[0; 31]);
             }
             submit_signed_tx(
-                &leader,
+                leader,
                 &signer,
                 sender,
                 Transaction {
@@ -6804,49 +6807,54 @@ mod tests {
                     blob_versioned_hashes: None,
                 },
             );
-            let block = leader.produce_block(&proposer_signer, 100).unwrap();
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
             assert_eq!(block.number(), nonce + 1);
             assert_eq!(block.transactions.len(), 1);
             follower
                 .import_block(block.clone(), &MultiVerifier)
                 .unwrap();
-            for node in [&leader, &follower] {
-                let receipts = node
-                    .chain_store
-                    .get_receipts(&block.hash())
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(receipts[0].status, u8::from(nonce > 0));
-                assert_eq!(receipts[0].logs.len(), usize::from(nonce > 0 && !reverts));
-                if nonce > 0 && !reverts {
-                    assert_eq!(receipts[0].logs[0].address, target);
-                    assert_eq!(receipts[0].logs[0].data.as_ref(), contract.as_bytes());
-                }
-                let root = current_state_root(node);
-                assert_eq!(root, block.header.state_root);
-                let state = WorldState::at_root(node.store.clone(), &root).unwrap();
-                assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
-                assert_eq!(
-                    state.get_storage(&contract, &counter_slot).unwrap(),
-                    ShellHash::from(U256::from(nonce).to_be_bytes::<32>())
-                );
-                assert_eq!(
-                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
-                    ShellHash::from(*target.as_bytes())
-                );
-                assert_eq!(
-                    state.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                    if nonce == 0 {
-                        ShellHash::ZERO
-                    } else {
-                        ShellHash::from(*contract.as_bytes())
+            macro_rules! assert_committed {
+                ($node:expr) => {{
+                    let node = $node;
+                    let receipts = node
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(receipts[0].status, u8::from(nonce > 0));
+                    assert_eq!(receipts[0].logs.len(), usize::from(nonce > 0 && !reverts));
+                    if nonce > 0 && !reverts {
+                        assert_eq!(receipts[0].logs[0].address, target);
+                        assert_eq!(receipts[0].logs[0].data.as_ref(), contract.as_bytes());
                     }
-                );
-                assert_eq!(
-                    state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
-                    ShellHash::ZERO
-                );
+                    let root = current_state_root(node);
+                    assert_eq!(root, block.header.state_root);
+                    let state = WorldState::at_root(node.store.clone(), &root).unwrap();
+                    assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
+                    assert_eq!(
+                        state.get_storage(&contract, &counter_slot).unwrap(),
+                        ShellHash::from(U256::from(nonce).to_be_bytes::<32>())
+                    );
+                    assert_eq!(
+                        state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(*target.as_bytes())
+                    );
+                    assert_eq!(
+                        state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        if nonce == 0 {
+                            ShellHash::ZERO
+                        } else {
+                            ShellHash::from(*contract.as_bytes())
+                        }
+                    );
+                    assert_eq!(
+                        state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                }};
             }
+            assert_committed!(leader);
+            assert_committed!(follower);
             assert_eq!(
                 leader.chain_store.get_receipts(&block.hash()).unwrap(),
                 follower.chain_store.get_receipts(&block.hash()).unwrap()
@@ -6859,7 +6867,7 @@ mod tests {
         }
         // Pruning advances monotonically; replay itself may descend across activation.
         for block in &blocks {
-            assert_pruned_genesis_witness_recovery(&follower, block);
+            assert_pruned_genesis_witness_recovery(follower, block);
         }
         for block in blocks.iter().rev() {
             let before = follower.store.scan_prefix(b"").unwrap();
@@ -6880,6 +6888,126 @@ mod tests {
                 .unwrap(),
             ShellHash::from(U256::from(3).to_be_bytes::<32>())
         );
+        (sender, contract, target, blocks)
+    }
+
+    #[test]
+    fn native_compiler_receiver_signed_blocks_import_and_replay() {
+        let (leader, signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        native_compiler_receiver_signed_import(&leader, &follower, &signer);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_compiler_receiver_import_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_NATIVE_RECEIVER_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let fixture = native_compiler_receiver_signed_import(&leader, &follower, &signer);
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            // Recover committed WAL data after exiting without dropping the database.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-native-receiver-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::native_compiler_receiver_import_survives_process_exit",
+                "--nocapture",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "native receiver writer failed; retained {}",
+            directory.display()
+        );
+        let (sender, contract, target, blocks): (Address, Address, Address, Vec<Block>) =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        let tip = blocks.last().unwrap();
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let node = setup_node_with_store(tip.header.proposer, Arc::new(stores.state));
+        assert_eq!(
+            node.chain_store
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .native_address_context_height,
+            Some(2)
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        let mut bytes = *target.as_bytes();
+        bytes[..12].fill(0x56);
+        let alias = Address::from(bytes);
+        let counter_slot = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+        for block in blocks.iter().rev() {
+            let state = WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+            assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+            assert_eq!(
+                state.get_storage(&contract, &counter_slot).unwrap(),
+                ShellHash::from(U256::from(block.number() - 1).to_be_bytes::<32>())
+            );
+            assert_eq!(
+                state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                ShellHash::from(*target.as_bytes())
+            );
+            assert_eq!(
+                state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                ShellHash::ZERO
+            );
+            assert_eq!(
+                state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                if block.number() == 1 {
+                    ShellHash::ZERO
+                } else {
+                    ShellHash::from(*contract.as_bytes())
+                }
+            );
+            let receipt = node
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt[0].status, u8::from(block.number() > 1));
+            assert_eq!(
+                receipt[0].logs.len(),
+                usize::from(block.number() == 2 || block.number() == 4)
+            );
+            for log in &receipt[0].logs {
+                assert_eq!(log.address, target);
+                assert_eq!(log.data.as_ref(), contract.as_bytes());
+            }
+            let before = node.store.scan_prefix(b"").unwrap();
+            node.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        }
+        drop(node);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
