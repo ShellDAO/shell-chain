@@ -6711,6 +6711,256 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_typed_interface_real_aa_admission_import_and_rollback() {
+        for activation in [None, Some(2)] {
+            for signer in [
+                Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+                Box::new(MlDsaSigner::generate()),
+            ] {
+                let (leader, proposer_signer) = setup_node();
+                let proposer = leader.config.proposer_address.unwrap();
+                let follower = setup_node_with_authority(proposer);
+                let sender =
+                    Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+                let contract = Address::from([0x98; 20]);
+                let mut first = [0x12; 32];
+                first[..12].fill(0x34);
+                let mut second = first;
+                second[..12].fill(0x56);
+                let mut alias = first;
+                alias[..12].fill(0);
+                let first = Address::from(first);
+                let second = Address::from(second);
+                let alias = Address::from(alias);
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../pqvm/tests/fixtures/native-typed-call.json"
+                ))
+                .unwrap();
+                let runtime = |name: &str| {
+                    hex::decode(
+                        fixture["artifacts"][name]["deployedBytecode"]
+                            .as_str()
+                            .unwrap()
+                            .trim_start_matches("0x"),
+                    )
+                    .unwrap()
+                };
+                let input = |target: Address, value: Address| {
+                    let mut data = hex::decode(
+                        fixture["selectors"]["invoke(address,address)"]
+                            .as_str()
+                            .unwrap()
+                            .trim_start_matches("0x"),
+                    )
+                    .unwrap();
+                    data.extend_from_slice(target.as_bytes());
+                    data.extend_from_slice(value.as_bytes());
+                    Bytes::from(data)
+                };
+                let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+                for node in [&leader, &follower] {
+                    node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                    let config = serde_json::from_value(serde_json::json!({
+                        "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0
+                    })).unwrap();
+                    node.chain_store.put_chain_config(&config).unwrap();
+                    fund_account(node, &sender, initial_balance);
+                    for (address, code) in [
+                        (contract, runtime("Typed")),
+                        (first, runtime("Echo")),
+                        (second, runtime("Echo")),
+                        (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+                    ] {
+                        let hash = shell_primitives::keccak256(&code);
+                        node.chain_store.put_code(&hash, &code).unwrap();
+                        node.world_state
+                            .write()
+                            .set_code_hash(&address, hash)
+                            .unwrap();
+                    }
+                    store_consistent_genesis(node);
+                }
+                let mut fees = U256::ZERO;
+                let mut blocks = Vec::new();
+                // The height-2 compiled fixture requires the matching node profile after height 1.
+                for nonce in 0..if activation.is_some() { 4 } else { 1 } {
+                    let revert = nonce == 3;
+                    let success = activation.is_some_and(|height| nonce + 1 >= height) && !revert;
+                    let tx = Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: None,
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 800_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 1,
+                        access_list: None,
+                        tx_type: AA_BUNDLE_TX_TYPE,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    };
+                    let mut signed = SignedTransaction::with_aa_bundle(
+                        sender,
+                        tx,
+                        PQSignature::new(signer.sig_type(), vec![]),
+                        PubkeyMode::Embedded(signer.public_key().to_vec()),
+                        AaBundle {
+                            inner_calls: vec![
+                                InnerCall {
+                                    to: Some(contract),
+                                    value: U256::ZERO,
+                                    data: input(first, if nonce == 3 { second } else { first }),
+                                    gas_limit: 300_000,
+                                },
+                                InnerCall {
+                                    to: Some(contract),
+                                    value: U256::ZERO,
+                                    data: input(
+                                        second,
+                                        if revert { Address::ZERO } else { second },
+                                    ),
+                                    gas_limit: 300_000,
+                                },
+                            ],
+                            ..AaBundle::default()
+                        },
+                    )
+                    .unwrap();
+                    signed.signature = signer
+                        .sign(signed.sender_signing_hash().as_bytes())
+                        .unwrap();
+                    let before_root = current_state_root(&leader);
+                    let before_store = leader.store.scan_prefix(b"").unwrap();
+                    let mut tampered = signed.clone();
+                    tampered.signature.data[0] ^= 1;
+                    let mut changed_bundle = signed.clone();
+                    changed_bundle.aa_bundle.as_mut().unwrap().inner_calls[0].value = U256::from(6);
+                    for bad in [tampered, changed_bundle] {
+                        assert!(leader
+                            .tx_pool
+                            .insert(
+                                bad,
+                                &mut leader.world_state.write(),
+                                leader.chain_store.as_ref(),
+                                &MultiVerifier
+                            )
+                            .is_err());
+                        assert_eq!(current_state_root(&leader), before_root);
+                        assert_eq!(leader.store.scan_prefix(b"").unwrap(), before_store);
+                    }
+                    leader
+                        .tx_pool
+                        .insert(
+                            signed,
+                            &mut leader.world_state.write(),
+                            leader.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                    let block = leader.produce_block(&proposer_signer, 100).unwrap();
+                    assert_eq!(block.transactions.len(), 1);
+                    follower
+                        .import_block(block.clone(), &MultiVerifier)
+                        .unwrap();
+                    let receipts = leader
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        receipts[0].status,
+                        u8::from(success),
+                        "activation={activation:?} nonce={nonce}"
+                    );
+                    assert_eq!(
+                        follower
+                            .chain_store
+                            .get_receipts(&block.hash())
+                            .unwrap()
+                            .unwrap(),
+                        receipts
+                    );
+                    fees += U256::from(receipts[0].gas_used)
+                        * U256::from(shell_core::effective_gas_price(
+                            2 * shell_core::INITIAL_BASE_FEE,
+                            1,
+                            block.header.base_fee_per_gas,
+                        ));
+                    let completed = if activation.is_some() {
+                        nonce.min(2)
+                    } else {
+                        0
+                    };
+                    for node in [&leader, &follower] {
+                        let world = node.world_state.read();
+                        assert_eq!(world.get_nonce(&sender).unwrap(), nonce + 1);
+                        assert_eq!(world.get_balance(&sender).unwrap(), initial_balance - fees);
+                        assert_eq!(
+                            world.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                            ShellHash::from(U256::from(2 * completed).to_be_bytes::<32>())
+                        );
+                        for target in [first, second] {
+                            assert_eq!(world.get_balance(&target).unwrap(), U256::ZERO);
+                            assert_eq!(
+                                world.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                                if completed > 0 {
+                                    ShellHash::from(*target.as_bytes())
+                                } else {
+                                    ShellHash::ZERO
+                                }
+                            );
+                        }
+                        assert_eq!(
+                            world.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                            ShellHash::ZERO
+                        );
+                        drop(world);
+                        assert_eq!(current_state_root(node), block.header.state_root);
+                        assert!(receipts[0].logs.is_empty());
+                    }
+                    blocks.push(block);
+                }
+                for block in &blocks {
+                    assert_pruned_genesis_witness_recovery(&follower, block);
+                }
+                for block in blocks.iter().rev() {
+                    let before = follower.store.scan_prefix(b"").unwrap();
+                    follower.validate_legacy_backfill_witness(block).unwrap();
+                    assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+                    assert_eq!(
+                        current_state_root(&follower),
+                        blocks.last().unwrap().header.state_root
+                    );
+                    let history =
+                        WorldState::at_root(follower.store.clone(), &block.header.state_root)
+                            .unwrap();
+                    let completed = if activation.is_some() {
+                        (block.number() - 1).min(2)
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        history.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(U256::from(2 * completed).to_be_bytes::<32>())
+                    );
+                    assert_eq!(history.get_nonce(&sender).unwrap(), block.number());
+                    for target in [first, second] {
+                        assert_eq!(
+                            history.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                            if completed > 0 {
+                                ShellHash::from(*target.as_bytes())
+                            } else {
+                                ShellHash::ZERO
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn native_typed_interface_signed_import<S: KvStore + 'static>(
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
