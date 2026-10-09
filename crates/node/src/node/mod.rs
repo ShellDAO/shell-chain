@@ -6715,6 +6715,7 @@ mod tests {
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
         proposer_signer: &DilithiumSigner,
+        observe: impl Fn(&Node<S>, &Block),
     ) -> (Address, Address, Address, Vec<Block>) {
         let proposer = leader.config.proposer_address.unwrap();
         let signer = DilithiumSigner::generate();
@@ -6863,6 +6864,7 @@ mod tests {
                 leader.world_state.read().get_balance(&sender).unwrap(),
                 follower.world_state.read().get_balance(&sender).unwrap()
             );
+            observe(follower, &block);
             blocks.push(block);
         }
         // Pruning advances monotonically; replay itself may descend across activation.
@@ -6895,7 +6897,88 @@ mod tests {
     fn native_compiler_receiver_signed_blocks_import_and_replay() {
         let (leader, signer) = setup_node();
         let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
-        native_compiler_receiver_signed_import(&leader, &follower, &signer);
+        native_compiler_receiver_signed_import(&leader, &follower, &signer, |_, _| {});
+    }
+
+    #[test]
+    fn native_compiler_receiver_rpc_output_and_historical_replay() {
+        use shell_rpc::api::{DebugApiServer, EthApiServer};
+        use shell_rpc::types::CallRequest;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime_guard = runtime.enter();
+        let (leader, signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&follower.chain_store),
+            Arc::clone(&follower.world_state),
+            Arc::clone(&follower.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let expected_output = |block: &Block| {
+            if block.number() == 1 {
+                return "0x".to_string();
+            }
+            let mut bytes = vec![0; 128];
+            bytes[..32]
+                .copy_from_slice(&U256::from(u8::from(block.number() != 3)).to_be_bytes::<32>());
+            bytes[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+            bytes[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+            bytes[96..].copy_from_slice(block.transactions[0].tx.to.unwrap().as_bytes());
+            format!("0x{}", hex::encode(bytes))
+        };
+        let (_, contract, target, blocks) =
+            native_compiler_receiver_signed_import(&leader, &follower, &signer, |node, block| {
+                let signed = &block.transactions[0];
+                let before = node.store.scan_prefix(b"").unwrap();
+                let root = current_state_root(node);
+                let output = runtime.block_on(EthApiServer::call(
+                    &handler,
+                    CallRequest {
+                        from: Some(signed.sender()),
+                        to: signed.tx.to,
+                        data: Some(format!("0x{}", hex::encode(&signed.tx.data))),
+                        value: None,
+                        gas: Some("0x7a120".into()),
+                        access_list: None,
+                    },
+                    Some("latest".into()),
+                ));
+                if block.number() == 1 {
+                    assert!(output.is_err());
+                } else {
+                    assert_eq!(output.unwrap(), expected_output(block));
+                }
+                assert_eq!(current_state_root(node), root);
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            });
+        // Historical trace output must follow the original block after the live counter advances.
+        let before = follower.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(&follower);
+        for block in blocks.iter().rev() {
+            let trace = runtime
+                .block_on(DebugApiServer::trace_transaction(
+                    &handler,
+                    block.transactions[0].hash().to_string(),
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(trace["output"], expected_output(block));
+            if block.number() > 1 {
+                assert_eq!(trace["calls"][0]["from"], contract.to_string());
+                assert_eq!(trace["calls"][0]["to"], target.to_string());
+                assert_eq!(
+                    trace["calls"][0]["output"],
+                    format!("0x{}", hex::encode(contract.as_bytes()))
+                );
+            }
+            assert_eq!(current_state_root(&follower), root);
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        }
     }
 
     #[cfg(feature = "rocksdb")]
@@ -6910,7 +6993,8 @@ mod tests {
                 leader.config.proposer_address.unwrap(),
                 Arc::new(stores.state),
             );
-            let fixture = native_compiler_receiver_signed_import(&leader, &follower, &signer);
+            let fixture =
+                native_compiler_receiver_signed_import(&leader, &follower, &signer, |_, _| {});
             std::fs::write(
                 directory.join("fixture.json"),
                 serde_json::to_vec(&fixture).unwrap(),
