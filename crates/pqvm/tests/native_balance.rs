@@ -49,6 +49,12 @@ fn make_system_tx_to(from: ShellAddress, to: ShellAddress, calldata: Vec<u8>) ->
 // Regenerate with shell-sdk's compile-native-balance-fixture.mjs after npm run build.
 #[test]
 fn native_balance_calls_preserve_numeric_results_full_identities_and_rollback() {
+    for reader_contract in ["Reader", "PureReader"] {
+        check_native_balance_reader(reader_contract);
+    }
+}
+
+fn check_native_balance_reader(reader_contract: &str) {
     for activation in [None, Some(2u64)] {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/native-balance.json")).unwrap();
@@ -93,7 +99,7 @@ fn native_balance_calls_preserve_numeric_results_full_identities_and_rollback() 
             (
                 reader,
                 hex::decode(
-                    fixture["artifacts"]["Reader"]["deployedBytecode"]
+                    fixture["artifacts"][reader_contract]["deployedBytecode"]
                         .as_str()
                         .unwrap()
                         .trim_start_matches("0x"),
