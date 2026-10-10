@@ -49,8 +49,16 @@ fn make_system_tx_to(from: ShellAddress, to: ShellAddress, calldata: Vec<u8>) ->
 // Regenerate with shell-sdk's compile-native-owner-fixture.mjs.
 #[test]
 fn native_uint256_interface_calls_preserve_selector_full_owner_and_static_mode() {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/native-owner.json")).unwrap();
+    check_owner_fixture(include_str!("fixtures/native-owner.json"));
+}
+
+#[test]
+fn native_uint256_interface_calls_preserve_bytes32_owner_and_static_mode() {
+    check_owner_fixture(include_str!("fixtures/native-owner-bytes32.json"));
+}
+
+fn check_owner_fixture(source: &str) {
+    let fixture: serde_json::Value = serde_json::from_str(source).unwrap();
     let store = Arc::new(MemoryDb::new());
     let mut evm = ShellPqvm::new(
         ShellStateDb::new(
