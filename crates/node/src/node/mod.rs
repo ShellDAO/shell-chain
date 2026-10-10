@@ -6718,6 +6718,7 @@ mod tests {
         signer: &dyn Signer,
         activation: Option<u64>,
         owner_query: bool,
+        genesis_directory: Option<&std::path::Path>,
     ) -> (Address, Address, Address, Address, Vec<Block>) {
         let proposer = leader.config.proposer_address.unwrap();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -6774,8 +6775,41 @@ mod tests {
             Bytes::from(data)
         };
         let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        // CLI recovery must use a real, reproducible genesis commitment.
+        let cli_genesis = genesis_directory.map(|directory| {
+            let mut alloc = serde_json::Map::new();
+            alloc.insert(sender.to_string(), serde_json::json!({"balance":initial_balance}));
+            for (address, code) in [
+                (contract, runtime(if owner_query { "Reader" } else { "Typed" })),
+                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+            ] {
+                let storage = if owner_query && [first, second].contains(&address) {
+                    serde_json::json!({ShellHash::ZERO.to_string():ShellHash::from(*address.as_bytes())})
+                } else {
+                    serde_json::json!({})
+                };
+                alloc.insert(address.to_string(), serde_json::json!({
+                    "balance":U256::ZERO,"code":hex::encode(code),"storage":storage
+                }));
+            }
+            let config: shell_genesis::GenesisConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"timestamp":0,"network_type":"Dev",
+                "native_address_context_height":activation,"fee_accounting_activation_height":0,
+                "consensus":{"engine":"poa","authorities":[proposer],
+                    "authority_pubkeys":[hex::encode(proposer_signer.public_key())],"block_time_secs":1},
+                "alloc":alloc
+            })).unwrap();
+            std::fs::write(directory.join("genesis.json"),serde_json::to_vec(&config).unwrap()).unwrap();
+            config
+        });
         macro_rules! initialize { ($node:expr) => {{ let node = $node;
             node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+            if let Some(config) = &cli_genesis {
+                let genesis = shell_genesis::initialize_genesis(config, node.store.clone()).unwrap();
+                *node.world_state.write() = WorldState::at_root(node.store.clone(), &genesis.header.state_root).unwrap();
+            } else {
             let config = serde_json::from_value(serde_json::json!({
                 "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0
             })).unwrap();
@@ -6810,6 +6844,7 @@ mod tests {
                 }
             }
             store_consistent_genesis(node);
+            }
         }}; }
         initialize!(leader);
         initialize!(follower);
@@ -7006,6 +7041,7 @@ mod tests {
                     signer.as_ref(),
                     activation,
                     owner_query,
+                    None,
                 );
             }
         }
@@ -7578,6 +7614,109 @@ mod tests {
             .expect("isolated owner RPC request timed out")
         }
 
+        #[allow(clippy::too_many_arguments)]
+        async fn verify_http(
+            address: std::net::SocketAddr,
+            sender: Address,
+            contract: Address,
+            first: Address,
+            second: Address,
+            expected_balance: U256,
+            continued_blocks: &[(Block, Vec<shell_core::TransactionReceipt>, U256)],
+            check_reads: impl Fn(),
+        ) {
+            for (target, token) in [
+                (first, U256::MAX),
+                (second, U256::MAX),
+                (second, U256::ZERO),
+            ] {
+                let mut data = shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()
+                    [..4]
+                    .to_vec();
+                data.extend_from_slice(target.as_bytes());
+                data.extend_from_slice(&token.to_be_bytes::<32>());
+                let response = http_request(
+                    address,
+                    "eth_call",
+                    serde_json::json!([
+                        {"from":sender.to_string(),"to":contract.to_string(),
+                         "data":format!("0x{}",hex::encode(data)),"gas":"0x7a120"},"latest"
+                    ]),
+                )
+                .await;
+                if token == U256::MAX {
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(
+                        response["result"],
+                        format!("0x{}", hex::encode(target.as_bytes()))
+                    );
+                } else {
+                    assert!(response.get("result").is_none(), "{response}");
+                    assert_eq!(response["error"]["code"], -32000);
+                    let mut revert =
+                        shell_primitives::keccak256(b"Missing(uint256)").as_bytes()[..4].to_vec();
+                    revert.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                    assert_eq!(
+                        response["error"]["data"],
+                        format!("0x{}", hex::encode(revert))
+                    );
+                }
+                check_reads();
+            }
+            for (method, params, expected) in [
+                ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
+                ("eth_blockNumber", serde_json::json!([]), "0x6".to_owned()),
+                (
+                    "eth_getTransactionCount",
+                    serde_json::json!([sender.to_string(), "latest"]),
+                    "0x6".to_owned(),
+                ),
+                (
+                    "eth_getBalance",
+                    serde_json::json!([sender.to_string(), "latest"]),
+                    format!("0x{expected_balance:x}"),
+                ),
+                (
+                    "eth_getStorageAt",
+                    serde_json::json!([contract.to_string(), "0x0", "latest"]),
+                    format!("0x{}", hex::encode(U256::from(6).to_be_bytes::<32>())),
+                ),
+            ] {
+                let response = http_request(address, method, params).await;
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(response["result"], expected);
+            }
+            for (block, receipts, _) in continued_blocks {
+                let receipt = &receipts[0];
+                let response = http_request(
+                    address,
+                    "eth_getTransactionReceipt",
+                    serde_json::json!([receipt.tx_hash.to_string()]),
+                )
+                .await;
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(
+                    response["result"]["transactionHash"],
+                    receipt.tx_hash.to_string()
+                );
+                assert_eq!(response["result"]["blockHash"], block.hash().to_string());
+                assert_eq!(
+                    response["result"]["blockNumber"],
+                    format!("0x{:x}", block.number())
+                );
+                assert_eq!(
+                    response["result"]["status"],
+                    format!("0x{:x}", u8::from(block.number() == 5))
+                );
+                assert_eq!(
+                    response["result"]["gasUsed"],
+                    format!("0x{:x}", receipt.gas_used)
+                );
+                assert_eq!(response["result"]["from"], sender.to_string());
+                assert!(response["result"]["to"].is_null());
+            }
+            check_reads();
+        }
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_TYPED_AA_DIRECTORY";
         const ALGORITHM: &str = "SHELL_TEST_NATIVE_TYPED_AA_ALGORITHM";
         if let Some(directory) = std::env::var_os(DIRECTORY) {
@@ -7631,6 +7770,7 @@ mod tests {
                 signer.as_ref(),
                 Some(2),
                 true,
+                std::env::var_os("SHELL_TEST_NATIVE_AA_CLI").map(|_| directory.as_path()),
             );
             std::fs::write(
                 directory.join("fixture.json"),
@@ -8056,100 +8196,20 @@ mod tests {
                 .await
                 .unwrap();
                 let before = node.store.scan_prefix(b"").unwrap();
-                for (target, token) in [
-                    (first, U256::MAX),
-                    (second, U256::MAX),
-                    (second, U256::ZERO),
-                ] {
-                    let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
-                        .as_bytes()[..4]
-                        .to_vec();
-                    data.extend_from_slice(target.as_bytes());
-                    data.extend_from_slice(&token.to_be_bytes::<32>());
-                    let response = http_request(
-                        server.http_addr,
-                        "eth_call",
-                        serde_json::json!([
-                            {"from":sender.to_string(),"to":contract.to_string(),
-                             "data":format!("0x{}",hex::encode(data)),"gas":"0x7a120"},"latest"
-                        ]),
-                    )
-                    .await;
-                    if token == U256::MAX {
-                        assert!(response.get("error").is_none(), "{response}");
-                        assert_eq!(
-                            response["result"],
-                            format!("0x{}", hex::encode(target.as_bytes()))
-                        );
-                    } else {
-                        assert!(response.get("result").is_none(), "{response}");
-                        assert_eq!(response["error"]["code"], -32000);
-                        let mut revert = shell_primitives::keccak256(b"Missing(uint256)")
-                            .as_bytes()[..4]
-                            .to_vec();
-                        revert.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
-                        assert_eq!(
-                            response["error"]["data"],
-                            format!("0x{}", hex::encode(revert))
-                        );
-                    }
-                    assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
-                    assert_eq!(current_state_root(&node), continued_tip.header.state_root);
-                }
-                for (method, params, expected) in [
-                    ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
-                    ("eth_blockNumber", serde_json::json!([]), "0x6".to_owned()),
-                    (
-                        "eth_getTransactionCount",
-                        serde_json::json!([sender.to_string(), "latest"]),
-                        "0x6".to_owned(),
-                    ),
-                    (
-                        "eth_getBalance",
-                        serde_json::json!([sender.to_string(), "latest"]),
-                        format!("0x{expected_balance:x}"),
-                    ),
-                    (
-                        "eth_getStorageAt",
-                        serde_json::json!([contract.to_string(), "0x0", "latest"]),
-                        format!("0x{}", hex::encode(U256::from(6).to_be_bytes::<32>())),
-                    ),
-                ] {
-                    let response = http_request(server.http_addr, method, params).await;
-                    assert!(response.get("error").is_none(), "{response}");
-                    assert_eq!(response["result"], expected);
-                }
-                for (block, receipts, _) in &continued_blocks {
-                    let receipt = &receipts[0];
-                    let response = http_request(
-                        server.http_addr,
-                        "eth_getTransactionReceipt",
-                        serde_json::json!([receipt.tx_hash.to_string()]),
-                    )
-                    .await;
-                    assert!(response.get("error").is_none(), "{response}");
-                    assert_eq!(
-                        response["result"]["transactionHash"],
-                        receipt.tx_hash.to_string()
-                    );
-                    assert_eq!(response["result"]["blockHash"], block.hash().to_string());
-                    assert_eq!(
-                        response["result"]["blockNumber"],
-                        format!("0x{:x}", block.number())
-                    );
-                    assert_eq!(
-                        response["result"]["status"],
-                        format!("0x{:x}", u8::from(block.number() == 5))
-                    );
-                    assert_eq!(
-                        response["result"]["gasUsed"],
-                        format!("0x{:x}", receipt.gas_used)
-                    );
-                    assert_eq!(response["result"]["from"], sender.to_string());
-                    assert!(response["result"]["to"].is_null());
-                }
-                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
-                assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                verify_http(
+                    server.http_addr,
+                    sender,
+                    contract,
+                    first,
+                    second,
+                    expected_balance,
+                    &continued_blocks,
+                    || {
+                        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                        assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                    },
+                )
+                .await;
                 server.http_handle.stop().unwrap();
                 server.http_handle.stopped().await;
             });
@@ -8160,6 +8220,102 @@ mod tests {
             drop(stores.receipts);
             drop(stores.index);
             drop(stores.witness);
+            if let Some(binary) = std::env::var_os("SHELL_TEST_NATIVE_AA_CLI") {
+                // A fresh non-authority dev key makes this isolated CLI an observer.
+                // P2P is disabled by default; metrics are explicitly disabled.
+                std::fs::write(
+                    directory.join("observer.toml"),
+                    "[metrics]\nenabled = false\n",
+                )
+                .unwrap();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(listener);
+                let log = std::fs::File::create(directory.join("cli.log")).unwrap();
+                let child = Command::new(binary)
+                    .arg("--datadir")
+                    .arg(&directory)
+                    .args([
+                        "run",
+                        "--network",
+                        "dev",
+                        "--chain-id",
+                        "1337",
+                        "--db",
+                        "rocksdb",
+                        "--consensus-engine",
+                        "poa",
+                        "--storage-profile",
+                        "archive",
+                        "--rpc-addr",
+                    ])
+                    .arg(address.to_string())
+                    .arg("--config")
+                    .arg(directory.join("observer.toml"))
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap();
+                // Always reap the owned process, including on a failed assertion.
+                struct Process(std::process::Child);
+                impl Drop for Process {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut child = Process(child);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    if std::net::TcpStream::connect(address).is_ok() {
+                        break;
+                    }
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "CLI startup failed; retained {}",
+                        directory.display()
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "CLI RPC timeout; retained {}",
+                        directory.display()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(verify_http(
+                    address,
+                    sender,
+                    contract,
+                    first,
+                    second,
+                    expected_balance,
+                    &continued_blocks,
+                    || {},
+                ));
+                drop(runtime);
+                drop(child);
+                // Abruptly terminating a read-only CLI must preserve the committed state.
+                let stores =
+                    shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+                let chain = ChainStore::new(Arc::new(stores.state));
+                assert_eq!(chain.get_head_hash().unwrap(), Some(continued_tip.hash()));
+                let root = chain.get_head_block().unwrap().unwrap().header.state_root;
+                assert_eq!(root, continued_tip.header.state_root);
+                let state = WorldState::at_root(chain.store().clone(), &root).unwrap();
+                assert_eq!(state.get_nonce(&sender).unwrap(), 6);
+                assert_eq!(state.get_balance(&sender).unwrap(), expected_balance);
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                );
+                drop(state);
+                drop(chain);
+                drop(stores.chain);
+                drop(stores.receipts);
+                drop(stores.index);
+                drop(stores.witness);
+            }
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
