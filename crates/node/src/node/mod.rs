@@ -7311,6 +7311,7 @@ mod tests {
     fn native_typed_interface_import_survives_process_exit() {
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_TYPED_DIRECTORY";
         const ALGORITHM: &str = "SHELL_TEST_NATIVE_TYPED_ALGORITHM";
+        const PROFILE: &str = "SHELL_TEST_NATIVE_TYPED_PROFILE";
         if let Some(directory) = std::env::var_os(DIRECTORY) {
             let directory = std::path::PathBuf::from(directory);
             let (leader, proposer_signer) = setup_node();
@@ -7319,13 +7320,20 @@ mod tests {
                 leader.config.proposer_address.unwrap(),
                 Arc::new(stores.state),
             );
+            let owner_fixture = match std::env::var(PROFILE).unwrap().as_str() {
+                "echo" => None,
+                "bytes32" => Some(include_str!(
+                    "../../../pqvm/tests/fixtures/native-owner-bytes32.json"
+                )),
+                _ => panic!("unsupported typed fixture profile"),
+            };
             let fixture = if std::env::var(ALGORITHM).unwrap() == "mldsa" {
                 native_typed_interface_signed_import(
                     &leader,
                     &follower,
                     &proposer_signer,
                     &MlDsaSigner::generate(),
-                    None,
+                    owner_fixture,
                 )
             } else {
                 native_typed_interface_signed_import(
@@ -7333,7 +7341,7 @@ mod tests {
                     &follower,
                     &proposer_signer,
                     &DilithiumSigner::generate(),
-                    None,
+                    owner_fixture,
                 )
             };
             std::fs::write(
@@ -7344,9 +7352,14 @@ mod tests {
             // Leave committed WAL data without dropping the database handles.
             std::process::exit(0);
         }
-        for algorithm in ["dilithium", "mldsa"] {
+        for (profile, algorithm) in [
+            ("echo", "dilithium"),
+            ("echo", "mldsa"),
+            ("bytes32", "dilithium"),
+            ("bytes32", "mldsa"),
+        ] {
             let directory = std::env::temp_dir().join(format!(
-                "shell-native-typed-{algorithm}-{}-{}",
+                "shell-native-typed-{profile}-{algorithm}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -7362,6 +7375,7 @@ mod tests {
                 ])
                 .env(DIRECTORY, &directory)
                 .env(ALGORITHM, algorithm)
+                .env(PROFILE, profile)
                 .status()
                 .unwrap();
             assert!(
@@ -7413,7 +7427,7 @@ mod tests {
                 );
                 assert_eq!(
                     state.get_storage(&first, &ShellHash::ZERO).unwrap(),
-                    if block.number() >= 2 {
+                    if profile == "bytes32" || block.number() >= 2 {
                         ShellHash::from(*first.as_bytes())
                     } else {
                         ShellHash::ZERO
@@ -7421,7 +7435,7 @@ mod tests {
                 );
                 assert_eq!(
                     state.get_storage(&second, &ShellHash::ZERO).unwrap(),
-                    if block.number() >= 4 {
+                    if profile == "bytes32" || block.number() >= 4 {
                         ShellHash::from(*second.as_bytes())
                     } else {
                         ShellHash::ZERO
@@ -7435,6 +7449,12 @@ mod tests {
                     .get_account(&Address::from([0x68; 32]))
                     .unwrap()
                     .is_none());
+                assert_eq!(
+                    state
+                        .get_storage(&Address::from([0x69; 32]), &ShellHash::ZERO)
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
                 let receipt = node
                     .chain_store
                     .get_receipts(&block.hash())
