@@ -7675,6 +7675,51 @@ mod tests {
                 assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
             }
             assert_eq!(current_state_root(&node), tip.header.state_root);
+            // Execute the original ABI through the recovered RPC state, rather than
+            // inferring runtime readiness from the restored trie alone.
+            use shell_rpc::api::EthApiServer;
+            use shell_rpc::types::CallRequest;
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let guard = runtime.enter();
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let handler = shell_rpc::RpcHandler::new(
+                Arc::clone(&node.chain_store),
+                Arc::clone(&node.world_state),
+                Arc::clone(&node.tx_pool),
+                1337,
+                None,
+                events,
+                Arc::new(RwLock::new(0)),
+                Arc::new(RwLock::new(FinalityState::new())),
+            );
+            let before = node.store.scan_prefix(b"").unwrap();
+            for target in [first, second] {
+                let mut data = shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()
+                    [..4]
+                    .to_vec();
+                data.extend_from_slice(target.as_bytes());
+                data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+                let output = runtime
+                    .block_on(EthApiServer::call(
+                        &handler,
+                        CallRequest {
+                            from: Some(sender),
+                            to: Some(contract),
+                            data: Some(format!("0x{}", hex::encode(data))),
+                            value: None,
+                            gas: Some("0x7a120".into()),
+                            access_list: None,
+                        },
+                        Some("latest".into()),
+                    ))
+                    .unwrap();
+                assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
+                assert_eq!(current_state_root(&node), tip.header.state_root);
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            }
+            drop(handler);
+            drop(guard);
+            drop(runtime);
             drop(node);
             drop(recovered_store);
             drop(stores.chain);
