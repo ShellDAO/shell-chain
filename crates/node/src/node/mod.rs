@@ -6717,9 +6717,10 @@ mod tests {
         proposer_signer: &DilithiumSigner,
         signer: &dyn Signer,
         activation: Option<u64>,
-        owner_query: bool,
+        owner_fixture: Option<&str>,
         genesis_directory: Option<&std::path::Path>,
     ) -> (Address, Address, Address, Address, Vec<Block>) {
+        let owner_query = owner_fixture.is_some();
         let proposer = leader.config.proposer_address.unwrap();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         let contract = Address::from([0x98; 20]);
@@ -6732,11 +6733,9 @@ mod tests {
         let first = Address::from(first);
         let second = Address::from(second);
         let alias = Address::from(alias);
-        let fixture: serde_json::Value = serde_json::from_str(if owner_query {
-            include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json")
-        } else {
-            include_str!("../../../pqvm/tests/fixtures/native-typed-call.json")
-        })
+        let fixture: serde_json::Value = serde_json::from_str(owner_fixture.unwrap_or(
+            include_str!("../../../pqvm/tests/fixtures/native-typed-call.json"),
+        ))
         .unwrap();
         let runtime = |name: &str| {
             hex::decode(
@@ -7026,7 +7025,7 @@ mod tests {
         (sender, contract, first, second, blocks)
     }
 
-    fn check_native_typed_aa(owner_query: bool) {
+    fn check_native_typed_aa(owner_fixture: Option<&str>) {
         for activation in [None, Some(2)] {
             for signer in [
                 Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
@@ -7040,7 +7039,7 @@ mod tests {
                     &proposer_signer,
                     signer.as_ref(),
                     activation,
-                    owner_query,
+                    owner_fixture,
                     None,
                 );
             }
@@ -7049,12 +7048,21 @@ mod tests {
 
     #[test]
     fn native_typed_interface_real_aa_admission_import_and_rollback() {
-        check_native_typed_aa(false);
+        check_native_typed_aa(None);
     }
 
     #[test]
     fn native_typed_interface_bytes32_real_aa_admission_import_and_rollback() {
-        check_native_typed_aa(true);
+        check_native_typed_aa(Some(include_str!(
+            "../../../pqvm/tests/fixtures/native-owner-bytes32.json"
+        )));
+    }
+
+    #[test]
+    fn native_typed_interface_address_owner_real_aa_admission_import_and_rollback() {
+        check_native_typed_aa(Some(include_str!(
+            "../../../pqvm/tests/fixtures/native-owner.json"
+        )));
     }
 
     fn native_typed_interface_signed_import<S: KvStore + 'static>(
@@ -7576,6 +7584,35 @@ mod tests {
     #[cfg(feature = "rocksdb")]
     #[test]
     fn native_typed_interface_bytes32_aa_survives_process_exit() {
+        check_native_typed_owner_aa_recovery(
+            include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json"),
+            "node::tests::native_typed_interface_bytes32_aa_survives_process_exit",
+            "bytes32",
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_typed_interface_address_owner_aa_survives_process_exit() {
+        check_native_typed_owner_aa_recovery(
+            include_str!("../../../pqvm/tests/fixtures/native-owner.json"),
+            "node::tests::native_typed_interface_address_owner_aa_survives_process_exit",
+            "address",
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn check_native_typed_owner_aa_recovery(
+        owner_fixture: &str,
+        test_name: &str,
+        result_type: &str,
+    ) {
+        let fixture: serde_json::Value = serde_json::from_str(owner_fixture).unwrap();
+        for (contract, function) in [("Reader", "lookup"), ("Owner", "ownerOf")] {
+            let abi = fixture["artifacts"][contract]["abi"].as_array().unwrap();
+            let entry = abi.iter().find(|entry| entry["name"] == function).unwrap();
+            assert_eq!(entry["outputs"][0]["type"], result_type);
+        }
         async fn http_request(
             address: std::net::SocketAddr,
             method: &str,
@@ -7769,7 +7806,7 @@ mod tests {
                 &proposer_signer,
                 signer.as_ref(),
                 Some(2),
-                true,
+                Some(owner_fixture),
                 std::env::var_os("SHELL_TEST_NATIVE_AA_CLI").map(|_| directory.as_path()),
             );
             std::fs::write(
@@ -7782,7 +7819,7 @@ mod tests {
         }
         for algorithm in ["dilithium", "mldsa"] {
             let directory = std::env::temp_dir().join(format!(
-                "shell-native-typed-aa-bytes32-{algorithm}-{}-{}",
+                "shell-native-typed-aa-{result_type}-{algorithm}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -7791,11 +7828,7 @@ mod tests {
             ));
             std::fs::create_dir(&directory).unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "node::tests::native_typed_interface_bytes32_aa_survives_process_exit",
-                    "--nocapture",
-                ])
+                .args(["--exact", test_name, "--nocapture"])
                 .env(DIRECTORY, &directory)
                 .env(ALGORITHM, algorithm)
                 .status()
