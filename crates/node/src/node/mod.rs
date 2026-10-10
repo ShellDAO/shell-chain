@@ -7540,6 +7540,44 @@ mod tests {
     #[cfg(feature = "rocksdb")]
     #[test]
     fn native_typed_interface_bytes32_aa_survives_process_exit() {
+        async fn http_request(
+            address: std::net::SocketAddr,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            use http_body_util::BodyExt;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                let (mut client, connection) =
+                    hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let connection = tokio::spawn(connection);
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                }))
+                .unwrap();
+                let request = hyper::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{address}/"))
+                    .header("Host", address.to_string())
+                    .header("Content-Type", "application/json")
+                    .body(http_body_util::Full::new(hyper::body::Bytes::from(payload)))
+                    .unwrap();
+                let response = client.send_request(request).await.unwrap();
+                assert_eq!(response.status(), hyper::StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                drop(client);
+                connection.await.unwrap().unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(response["jsonrpc"], "2.0");
+                assert_eq!(response["id"], 1);
+                response
+            })
+            .await
+            .expect("isolated owner RPC request timed out")
+        }
+
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_TYPED_AA_DIRECTORY";
         const ALGORITHM: &str = "SHELL_TEST_NATIVE_TYPED_AA_ALGORITHM";
         if let Some(directory) = std::env::var_os(DIRECTORY) {
@@ -7986,6 +8024,136 @@ mod tests {
                     ShellHash::from(U256::from(6).to_be_bytes::<32>())
                 );
             }
+            // Exercise the registered HTTP JSON-RPC entry against the twice-recovered
+            // state, including serialization, persisted receipts and failed simulation.
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let server = shell_rpc::start_rpc_server(
+                    shell_rpc::RpcConfig {
+                        listen_addr: "127.0.0.1:0".parse().unwrap(),
+                        ws_addr: None,
+                        ..shell_rpc::RpcConfig::default()
+                    },
+                    Arc::clone(&node.chain_store),
+                    Arc::clone(&node.world_state),
+                    Arc::clone(&node.tx_pool),
+                    1337,
+                    None,
+                    events,
+                    None,
+                    None,
+                    Arc::new(RwLock::new(0)),
+                    Arc::new(RwLock::new(FinalityState::new())),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    None,
+                    None,
+                    Some(Arc::clone(&node.witness_store)),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let before = node.store.scan_prefix(b"").unwrap();
+                for (target, token) in [
+                    (first, U256::MAX),
+                    (second, U256::MAX),
+                    (second, U256::ZERO),
+                ] {
+                    let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                        .as_bytes()[..4]
+                        .to_vec();
+                    data.extend_from_slice(target.as_bytes());
+                    data.extend_from_slice(&token.to_be_bytes::<32>());
+                    let response = http_request(
+                        server.http_addr,
+                        "eth_call",
+                        serde_json::json!([
+                            {"from":sender.to_string(),"to":contract.to_string(),
+                             "data":format!("0x{}",hex::encode(data)),"gas":"0x7a120"},"latest"
+                        ]),
+                    )
+                    .await;
+                    if token == U256::MAX {
+                        assert!(response.get("error").is_none(), "{response}");
+                        assert_eq!(
+                            response["result"],
+                            format!("0x{}", hex::encode(target.as_bytes()))
+                        );
+                    } else {
+                        assert!(response.get("result").is_none(), "{response}");
+                        assert_eq!(response["error"]["code"], -32000);
+                        let mut revert = shell_primitives::keccak256(b"Missing(uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        revert.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                        assert_eq!(
+                            response["error"]["data"],
+                            format!("0x{}", hex::encode(revert))
+                        );
+                    }
+                    assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                    assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                }
+                for (method, params, expected) in [
+                    ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
+                    ("eth_blockNumber", serde_json::json!([]), "0x6".to_owned()),
+                    (
+                        "eth_getTransactionCount",
+                        serde_json::json!([sender.to_string(), "latest"]),
+                        "0x6".to_owned(),
+                    ),
+                    (
+                        "eth_getBalance",
+                        serde_json::json!([sender.to_string(), "latest"]),
+                        format!("0x{expected_balance:x}"),
+                    ),
+                    (
+                        "eth_getStorageAt",
+                        serde_json::json!([contract.to_string(), "0x0", "latest"]),
+                        format!("0x{}", hex::encode(U256::from(6).to_be_bytes::<32>())),
+                    ),
+                ] {
+                    let response = http_request(server.http_addr, method, params).await;
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(response["result"], expected);
+                }
+                for (block, receipts, _) in &continued_blocks {
+                    let receipt = &receipts[0];
+                    let response = http_request(
+                        server.http_addr,
+                        "eth_getTransactionReceipt",
+                        serde_json::json!([receipt.tx_hash.to_string()]),
+                    )
+                    .await;
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(
+                        response["result"]["transactionHash"],
+                        receipt.tx_hash.to_string()
+                    );
+                    assert_eq!(response["result"]["blockHash"], block.hash().to_string());
+                    assert_eq!(
+                        response["result"]["blockNumber"],
+                        format!("0x{:x}", block.number())
+                    );
+                    assert_eq!(
+                        response["result"]["status"],
+                        format!("0x{:x}", u8::from(block.number() == 5))
+                    );
+                    assert_eq!(
+                        response["result"]["gasUsed"],
+                        format!("0x{:x}", receipt.gas_used)
+                    );
+                    assert_eq!(response["result"]["from"], sender.to_string());
+                    assert!(response["result"]["to"].is_null());
+                }
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                server.http_handle.stop().unwrap();
+                server.http_handle.stopped().await;
+            });
+            drop(runtime);
             drop(node);
             drop(recovered_store);
             drop(stores.chain);
