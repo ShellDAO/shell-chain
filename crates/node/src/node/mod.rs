@@ -6711,8 +6711,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_typed_interface_real_aa_admission_import_and_rollback() {
+    fn check_native_typed_aa(owner_query: bool) {
         for activation in [None, Some(2)] {
             for signer in [
                 Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
@@ -6733,9 +6732,11 @@ mod tests {
                 let first = Address::from(first);
                 let second = Address::from(second);
                 let alias = Address::from(alias);
-                let fixture: serde_json::Value = serde_json::from_str(include_str!(
-                    "../../../pqvm/tests/fixtures/native-typed-call.json"
-                ))
+                let fixture: serde_json::Value = serde_json::from_str(if owner_query {
+                    include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json")
+                } else {
+                    include_str!("../../../pqvm/tests/fixtures/native-typed-call.json")
+                })
                 .unwrap();
                 let runtime = |name: &str| {
                     hex::decode(
@@ -6748,14 +6749,29 @@ mod tests {
                 };
                 let input = |target: Address, value: Address| {
                     let mut data = hex::decode(
-                        fixture["selectors"]["invoke(address,address)"]
-                            .as_str()
-                            .unwrap()
-                            .trim_start_matches("0x"),
+                        fixture["selectors"][if owner_query {
+                            "lookup(address,uint256)"
+                        } else {
+                            "invoke(address,address)"
+                        }]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
                     )
                     .unwrap();
                     data.extend_from_slice(target.as_bytes());
-                    data.extend_from_slice(value.as_bytes());
+                    if owner_query {
+                        data.extend_from_slice(
+                            &if value == Address::ZERO {
+                                U256::ZERO
+                            } else {
+                                U256::MAX
+                            }
+                            .to_be_bytes::<32>(),
+                        );
+                    } else {
+                        data.extend_from_slice(value.as_bytes());
+                    }
                     Bytes::from(data)
                 };
                 let initial_balance = U256::from(10_000_000_000_000_000_000u64);
@@ -6767,9 +6783,12 @@ mod tests {
                     node.chain_store.put_chain_config(&config).unwrap();
                     fund_account(node, &sender, initial_balance);
                     for (address, code) in [
-                        (contract, runtime("Typed")),
-                        (first, runtime("Echo")),
-                        (second, runtime("Echo")),
+                        (
+                            contract,
+                            runtime(if owner_query { "Reader" } else { "Typed" }),
+                        ),
+                        (first, runtime(if owner_query { "Owner" } else { "Echo" })),
+                        (second, runtime(if owner_query { "Owner" } else { "Echo" })),
                         (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
                     ] {
                         let hash = shell_primitives::keccak256(&code);
@@ -6778,6 +6797,18 @@ mod tests {
                             .write()
                             .set_code_hash(&address, hash)
                             .unwrap();
+                    }
+                    if owner_query {
+                        for target in [first, second] {
+                            node.world_state
+                                .write()
+                                .set_storage(
+                                    &target,
+                                    &ShellHash::ZERO,
+                                    &ShellHash::from(*target.as_bytes()),
+                                )
+                                .unwrap();
+                        }
                     }
                     store_consistent_genesis(node);
                 }
@@ -6883,11 +6914,10 @@ mod tests {
                         receipts
                     );
                     fees += U256::from(receipts[0].gas_used)
-                        * U256::from(shell_core::effective_gas_price(
-                            2 * shell_core::INITIAL_BASE_FEE,
-                            1,
-                            block.header.base_fee_per_gas,
-                        ));
+                        * U256::from(
+                            (2 * shell_core::INITIAL_BASE_FEE)
+                                .min(block.header.base_fee_per_gas + 1),
+                        );
                     let completed = if activation.is_some() {
                         nonce.min(2)
                     } else {
@@ -6905,7 +6935,7 @@ mod tests {
                             assert_eq!(world.get_balance(&target).unwrap(), U256::ZERO);
                             assert_eq!(
                                 world.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                                if completed > 0 {
+                                if owner_query || completed > 0 {
                                     ShellHash::from(*target.as_bytes())
                                 } else {
                                     ShellHash::ZERO
@@ -6949,7 +6979,7 @@ mod tests {
                     for target in [first, second] {
                         assert_eq!(
                             history.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                            if completed > 0 {
+                            if owner_query || completed > 0 {
                                 ShellHash::from(*target.as_bytes())
                             } else {
                                 ShellHash::ZERO
@@ -6959,6 +6989,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_typed_interface_real_aa_admission_import_and_rollback() {
+        check_native_typed_aa(false);
+    }
+
+    #[test]
+    fn native_typed_interface_bytes32_real_aa_admission_import_and_rollback() {
+        check_native_typed_aa(true);
     }
 
     fn native_typed_interface_signed_import<S: KvStore + 'static>(
