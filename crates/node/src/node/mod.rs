@@ -7714,47 +7714,51 @@ mod tests {
             // inferring runtime readiness from the restored trie alone.
             use shell_rpc::api::EthApiServer;
             use shell_rpc::types::CallRequest;
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let guard = runtime.enter();
-            let (events, _) = tokio::sync::broadcast::channel(16);
-            let handler = shell_rpc::RpcHandler::new(
-                Arc::clone(&node.chain_store),
-                Arc::clone(&node.world_state),
-                Arc::clone(&node.tx_pool),
-                1337,
-                None,
-                events,
-                Arc::new(RwLock::new(0)),
-                Arc::new(RwLock::new(FinalityState::new())),
-            );
-            let before = node.store.scan_prefix(b"").unwrap();
-            for target in [first, second] {
-                let mut data = shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()
-                    [..4]
-                    .to_vec();
-                data.extend_from_slice(target.as_bytes());
-                data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
-                let output = runtime
-                    .block_on(EthApiServer::call(
-                        &handler,
-                        CallRequest {
-                            from: Some(sender),
-                            to: Some(contract),
-                            data: Some(format!("0x{}", hex::encode(data))),
-                            value: None,
-                            gas: Some("0x7a120".into()),
-                            access_list: None,
-                        },
-                        Some("latest".into()),
-                    ))
-                    .unwrap();
-                assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
-                assert_eq!(current_state_root(&node), tip.header.state_root);
-                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
-            }
-            drop(handler);
-            drop(guard);
-            drop(runtime);
+            let assert_readonly_rpc =
+                |node: &Node<shell_storage::RocksDbStore>, expected_root: ShellHash| {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    let guard = runtime.enter();
+                    let (events, _) = tokio::sync::broadcast::channel(16);
+                    let handler = shell_rpc::RpcHandler::new(
+                        Arc::clone(&node.chain_store),
+                        Arc::clone(&node.world_state),
+                        Arc::clone(&node.tx_pool),
+                        1337,
+                        None,
+                        events,
+                        Arc::new(RwLock::new(0)),
+                        Arc::new(RwLock::new(FinalityState::new())),
+                    );
+                    let before = node.store.scan_prefix(b"").unwrap();
+                    for target in [first, second] {
+                        let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        data.extend_from_slice(target.as_bytes());
+                        data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+                        let output = runtime
+                            .block_on(EthApiServer::call(
+                                &handler,
+                                CallRequest {
+                                    from: Some(sender),
+                                    to: Some(contract),
+                                    data: Some(format!("0x{}", hex::encode(data))),
+                                    value: None,
+                                    gas: Some("0x7a120".into()),
+                                    access_list: None,
+                                },
+                                Some("latest".into()),
+                            ))
+                            .unwrap();
+                        assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
+                        assert_eq!(current_state_root(node), expected_root);
+                        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                    }
+                    drop(handler);
+                    drop(guard);
+                    drop(runtime);
+                };
+            assert_readonly_rpc(&node, tip.header.state_root);
             let (proposer_public, proposer_secret, sender_public, sender_secret): (
                 Vec<u8>,
                 Vec<u8>,
@@ -7780,12 +7784,26 @@ mod tests {
             for (key, value) in node.store.scan_prefix(b"").unwrap() {
                 replica_store.put(&key, &value).unwrap();
             }
-            let (replica, _) = crate::builder::NodeBuilder::new(recovered_config, replica_store)
-                .build()
-                .unwrap();
+            let (replica, _) =
+                crate::builder::NodeBuilder::new(recovered_config.clone(), replica_store)
+                    .build()
+                    .unwrap();
             // Restore the operator's public authority credential for seal verification.
             node.register_authority_pubkey(tip.header.proposer, proposer_public.clone());
             replica.register_authority_pubkey(tip.header.proposer, proposer_public);
+            let mut expected_balance = U256::from(10_000_000_000_000_000_000u64);
+            for block in &blocks {
+                let receipts = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                expected_balance -= U256::from(receipts[0].gas_used)
+                    * U256::from(
+                        (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                    );
+            }
+            let mut continued_blocks = Vec::new();
             for nonce in [4, 5] {
                 let inner_calls = [first, second]
                     .into_iter()
@@ -7839,7 +7857,6 @@ mod tests {
                     .sign(signed.sender_signing_hash().as_bytes())
                     .unwrap();
                 let transaction_hash = signed.hash();
-                let balance = node.world_state.read().get_balance(&sender).unwrap();
                 node.tx_pool
                     .insert(
                         signed,
@@ -7876,11 +7893,12 @@ mod tests {
                     * U256::from(
                         (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
                     );
+                expected_balance -= fee;
                 macro_rules! assert_resumed {
                     ($node:expr) => {{
                         let state = $node.world_state.read();
                         assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
-                        assert_eq!(state.get_balance(&sender).unwrap(), balance - fee);
+                        assert_eq!(state.get_balance(&sender).unwrap(), expected_balance);
                         assert_eq!(
                             state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
                             ShellHash::from(U256::from(6).to_be_bytes::<32>())
@@ -7897,8 +7915,77 @@ mod tests {
                 assert_resumed!(replica);
                 assert_eq!(current_state_root(&node), block.header.state_root);
                 assert_eq!(current_state_root(&replica), block.header.state_root);
+                continued_blocks.push((block, receipts, expected_balance));
             }
             drop(replica);
+            drop(node);
+            drop(recovered_store);
+            drop(stores.chain);
+            drop(stores.receipts);
+            drop(stores.index);
+            drop(stores.witness);
+            // Close every database handle, then validate the state committed by the
+            // resumed successful and reverted bundles through another fresh startup.
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let (node, recovered_store) =
+                crate::builder::NodeBuilder::new(recovered_config, Arc::new(stores.state))
+                    .build()
+                    .unwrap();
+            let continued_tip = &continued_blocks.last().unwrap().0;
+            assert_eq!(
+                node.chain_store.get_head_hash().unwrap(),
+                Some(continued_tip.hash())
+            );
+            assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+            assert_eq!(
+                node.chain_store
+                    .get_chain_config()
+                    .unwrap()
+                    .unwrap()
+                    .native_address_context_height,
+                Some(2)
+            );
+            let before = node.store.scan_prefix(b"").unwrap();
+            for (block, receipts, balance) in continued_blocks.iter().rev() {
+                let state =
+                    WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+                assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+                assert_eq!(state.get_balance(&sender).unwrap(), *balance);
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                );
+                for target in [first, second] {
+                    assert_eq!(
+                        state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(*target.as_bytes())
+                    );
+                }
+                assert_eq!(
+                    state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(
+                    node.chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap(),
+                    *receipts
+                );
+                node.validate_legacy_backfill_witness(block).unwrap();
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+            }
+            assert_readonly_rpc(&node, continued_tip.header.state_root);
+            {
+                let state = node.world_state.read();
+                assert_eq!(state.get_nonce(&sender).unwrap(), 6);
+                assert_eq!(state.get_balance(&sender).unwrap(), expected_balance);
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                );
+            }
             drop(node);
             drop(recovered_store);
             drop(stores.chain);
