@@ -6966,6 +6966,7 @@ mod tests {
         follower: &Node<S>,
         proposer_signer: &DilithiumSigner,
         tx_signer: &impl Signer,
+        owner_query: bool,
     ) -> (Address, Address, Address, Address, Vec<Block>) {
         let proposer = leader.config.proposer_address.unwrap();
         let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
@@ -6981,10 +6982,13 @@ mod tests {
         let alias = Address::from(alias);
         let short = Address::from([0x67; 32]);
         let missing = Address::from([0x68; 32]);
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../pqvm/tests/fixtures/native-typed-call.json"
-        ))
+        let fixture: serde_json::Value = serde_json::from_str(if owner_query {
+            include_str!("../../../pqvm/tests/fixtures/native-owner.json")
+        } else {
+            include_str!("../../../pqvm/tests/fixtures/native-typed-call.json")
+        })
         .unwrap();
+        let writer = Address::from([0x69; 32]);
         let runtime = |name: &str| {
             hex::decode(
                 fixture["artifacts"][name]["deployedBytecode"]
@@ -7000,9 +7004,9 @@ mod tests {
             node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2,"fee_accounting_activation_height":0})).unwrap()).unwrap();
             fund_account(node, &sender, initial_balance);
             for (address, code) in [
-                (contract, runtime("Typed")),
-                (first, runtime("Echo")),
-                (second, runtime("Echo")),
+                (contract, runtime(if owner_query { "Reader" } else { "Typed" })),
+                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
                 (short, hex::decode("60015ff3").unwrap()),
                 (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
             ] {
@@ -7013,6 +7017,15 @@ mod tests {
                     .set_code_hash(&address, hash)
                     .unwrap();
             }
+            if owner_query {
+                let code = runtime("Writer");
+                let hash = shell_primitives::keccak256(&code);
+                node.chain_store.put_code(&hash, &code).unwrap();
+                node.world_state.write().set_code_hash(&writer, hash).unwrap();
+                for target in [first, second] {
+                    node.world_state.write().set_storage(&target, &ShellHash::ZERO, &ShellHash::from(*target.as_bytes())).unwrap();
+                }
+            }
             node.world_state.write().set_validators(&[proposer]).unwrap();
             node.world_state.write().set_validator_weights(&[proposer], &[1]).unwrap();
             store_consistent_genesis(node);
@@ -7021,18 +7034,29 @@ mod tests {
         initialize!(follower);
         let mut blocks = Vec::new();
         let mut fees = U256::ZERO;
-        for (nonce, (method, target, value, success, counter)) in [
-            ("invoke(address,address)", first, first, false, 0u64),
-            ("invoke(address,address)", first, first, true, 1),
-            ("invoke(address,address)", second, Address::ZERO, false, 1),
-            ("invoke(address,address)", second, second, true, 2),
-            ("inspect(address,address)", first, second, false, 2),
-            ("invoke(address,address)", short, first, false, 2),
-            ("invoke(address,address)", missing, first, false, 2),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        let cases = if owner_query {
+            let maximum = Address::from([0xff; 32]);
+            [
+                ("lookup(address,uint256)", first, maximum, false, 0u64),
+                ("lookup(address,uint256)", first, maximum, true, 1),
+                ("lookup(address,uint256)", second, Address::ZERO, false, 1),
+                ("lookup(address,uint256)", second, maximum, true, 2),
+                ("lookup(address,uint256)", writer, maximum, false, 2),
+                ("lookup(address,uint256)", short, maximum, false, 2),
+                ("lookup(address,uint256)", missing, maximum, false, 2),
+            ]
+        } else {
+            [
+                ("invoke(address,address)", first, first, false, 0u64),
+                ("invoke(address,address)", first, first, true, 1),
+                ("invoke(address,address)", second, Address::ZERO, false, 1),
+                ("invoke(address,address)", second, second, true, 2),
+                ("inspect(address,address)", first, second, false, 2),
+                ("invoke(address,address)", short, first, false, 2),
+                ("invoke(address,address)", missing, first, false, 2),
+            ]
+        };
+        for (nonce, (method, target, value, success, counter)) in cases.into_iter().enumerate() {
             let nonce = nonce as u64;
             let mut data = hex::decode(
                 fixture["selectors"][method]
@@ -7106,7 +7130,7 @@ mod tests {
                     );
                     assert_eq!(
                         recovered.get_storage(&first, &ShellHash::ZERO).unwrap(),
-                        if nonce >= 1 {
+                        if owner_query || nonce >= 1 {
                             ShellHash::from(*first.as_bytes())
                         } else {
                             ShellHash::ZERO
@@ -7114,7 +7138,7 @@ mod tests {
                     );
                     assert_eq!(
                         recovered.get_storage(&second, &ShellHash::ZERO).unwrap(),
-                        if nonce >= 3 {
+                        if owner_query || nonce >= 3 {
                             ShellHash::from(*second.as_bytes())
                         } else {
                             ShellHash::ZERO
@@ -7125,6 +7149,12 @@ mod tests {
                         ShellHash::ZERO
                     );
                     assert!(recovered.get_account(&missing).unwrap().is_none());
+                    if owner_query {
+                        assert_eq!(
+                            recovered.get_storage(&writer, &ShellHash::ZERO).unwrap(),
+                            ShellHash::ZERO
+                        );
+                    }
                 }};
             }
             assert_committed!(leader);
@@ -7166,7 +7196,105 @@ mod tests {
         fn run(tx_signer: &impl Signer) {
             let (leader, proposer_signer) = setup_node();
             let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
-            native_typed_interface_signed_import(&leader, &follower, &proposer_signer, tx_signer);
+            native_typed_interface_signed_import(
+                &leader,
+                &follower,
+                &proposer_signer,
+                tx_signer,
+                false,
+            );
+        }
+        run(&DilithiumSigner::generate());
+        run(&MlDsaSigner::generate());
+    }
+
+    #[test]
+    fn native_typed_interface_uint256_signed_import_rpc_and_history() {
+        use shell_rpc::api::{DebugApiServer, EthApiServer};
+        use shell_rpc::types::CallRequest;
+        fn run(tx_signer: &impl Signer) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+            let (leader, proposer_signer) = setup_node();
+            let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+            let (sender, contract, first, second, blocks) = native_typed_interface_signed_import(
+                &leader,
+                &follower,
+                &proposer_signer,
+                tx_signer,
+                true,
+            );
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let handler = shell_rpc::RpcHandler::new(
+                Arc::clone(&follower.chain_store),
+                Arc::clone(&follower.world_state),
+                Arc::clone(&follower.tx_pool),
+                1337,
+                None,
+                events,
+                Arc::new(RwLock::new(0)),
+                Arc::new(RwLock::new(FinalityState::new())),
+            );
+            let before = follower.store.scan_prefix(b"").unwrap();
+            let root = current_state_root(&follower);
+            // The imported tip's original lookup selector returns each complete owner
+            // from committed storage; simulation must not persist the reader counter.
+            for target in [first, second] {
+                let mut data = shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()
+                    [..4]
+                    .to_vec();
+                data.extend_from_slice(target.as_bytes());
+                data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+                let output = runtime
+                    .block_on(EthApiServer::call(
+                        &handler,
+                        CallRequest {
+                            from: Some(sender),
+                            to: Some(contract),
+                            data: Some(format!("0x{}", hex::encode(data))),
+                            value: None,
+                            gas: Some("0x7a120".into()),
+                            access_list: None,
+                        },
+                        Some("latest".into()),
+                    ))
+                    .unwrap();
+                assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
+                assert_eq!(current_state_root(&follower), root);
+                assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+            }
+            // Replay at descending historical heights after the live counter advanced.
+            for block in blocks.iter().rev() {
+                let trace = runtime
+                    .block_on(DebugApiServer::trace_transaction(
+                        &handler,
+                        block.transactions[0].hash().to_string(),
+                        None,
+                    ))
+                    .unwrap();
+                let output = match block.number() {
+                    2 => format!("0x{}", hex::encode(first.as_bytes())),
+                    4 => format!("0x{}", hex::encode(second.as_bytes())),
+                    3 => {
+                        let mut bytes = shell_primitives::keccak256(b"Missing(uint256)").as_bytes()
+                            [..4]
+                            .to_vec();
+                        bytes.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                        format!("0x{}", hex::encode(bytes))
+                    }
+                    _ => "0x".into(),
+                };
+                assert_eq!(trace["output"], output);
+                if [2, 3, 4].contains(&block.number()) {
+                    assert_eq!(trace["calls"][0]["from"], contract.to_string());
+                    assert_eq!(
+                        trace["calls"][0]["to"],
+                        if block.number() == 2 { first } else { second }.to_string()
+                    );
+                }
+                assert_eq!(current_state_root(&follower), root);
+                assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+            }
         }
         run(&DilithiumSigner::generate());
         run(&MlDsaSigner::generate());
@@ -7191,6 +7319,7 @@ mod tests {
                     &follower,
                     &proposer_signer,
                     &MlDsaSigner::generate(),
+                    false,
                 )
             } else {
                 native_typed_interface_signed_import(
@@ -7198,6 +7327,7 @@ mod tests {
                     &follower,
                     &proposer_signer,
                     &DilithiumSigner::generate(),
+                    false,
                 )
             };
             std::fs::write(
