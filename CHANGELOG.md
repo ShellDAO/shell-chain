@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add an unreleased, default-off native address-context profile for full 32-byte
+  contract calls, identity words, state keys and ordinary/AA log emitters.
+  Preserve earlier execution before its immutable configured height. Native
+  creation semantics and public release acceptance remain pending; deployed
+  networks must not enable this development profile.
+
 - Add default-off `pq_address_bounds_height` for address derivation at precompile
   `0x06`. At the configured block, inputs above the selected algorithm's public-key
   bound return a 32-byte zero value after normal gas charging. Preserve historical

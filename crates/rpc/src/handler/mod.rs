@@ -3775,6 +3775,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_address_context_rpc_call_selects_head_height_without_state_writes() {
+        for activation in [None, Some(2)] {
+            let handler = setup();
+            let caller = Address::from([0x42; 32]);
+            let address = Address::from([0x98; 32]);
+            let code = hex::decode("335f52335f553060205260406000f3").unwrap();
+            let code_hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&code_hash, &code).unwrap();
+            handler
+                .world_state
+                .write()
+                .set_code_hash(&address, code_hash)
+                .unwrap();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":42,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation
+            })).unwrap();
+            handler.chain_store.put_chain_config(&config).unwrap();
+            let root = handler.world_state.write().state_root().unwrap();
+            let request = crate::types::CallRequest {
+                from: Some(caller),
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: None,
+                access_list: None,
+            };
+            for number in [1, 2, 3, 1] {
+                let mut block = make_genesis_block();
+                block.header.number = number;
+                block.header.state_root = root;
+                handler.chain_store.put_block(&block).unwrap();
+                handler.chain_store.set_head(&block.hash()).unwrap();
+                let checkpoint = handler.chain_store.store().scan_prefix(b"").unwrap();
+                let output = EthApiServer::call(&handler, request.clone(), Some("latest".into()))
+                    .await
+                    .unwrap();
+                let full = activation.is_some_and(|height| number >= height);
+                let expected_caller = if full {
+                    caller
+                } else {
+                    Address::from(caller.to_alloy())
+                };
+                let expected_self = if full {
+                    address
+                } else {
+                    Address::from(address.to_alloy())
+                };
+                assert_eq!(
+                    output,
+                    format!(
+                        "0x{}{}",
+                        hex::encode(expected_caller.as_bytes()),
+                        hex::encode(expected_self.as_bytes())
+                    )
+                );
+                assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+                assert_eq!(
+                    handler.chain_store.store().scan_prefix(b"").unwrap(),
+                    checkpoint
+                );
+                assert!(
+                    EthApiServer::call(&handler, request.clone(), Some("0x1".into()))
+                        .await
+                        .is_err()
+                );
+            }
+            // Simulated SSTORE never appears in the live contract state.
+            assert_eq!(
+                handler
+                    .world_state
+                    .read()
+                    .get_storage(&address, &ShellHash::ZERO)
+                    .unwrap(),
+                ShellHash::ZERO
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_address_context_rpc_historical_signed_replay_uses_block_height() {
+        let handler = setup();
+        let signer = DilithiumSigner::generate();
+        let caller = signer_address(&signer);
+        let address = Address::from([0x98; 32]);
+        let config = serde_json::from_value(serde_json::json!({
+            "chain_id":42,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+        }))
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        let code = hex::decode("335f52335f553060205260406000f3").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        let store = Arc::clone(handler.chain_store.store());
+        let mut state = WorldState::new(Arc::clone(&store));
+        state
+            .set_account(
+                &caller,
+                &shell_core::Account::new_user_account(ShellHash::ZERO, U256::from(1_000_000)),
+            )
+            .unwrap();
+        state.set_code_hash(&address, code_hash).unwrap();
+        let mut parent = make_genesis_block();
+        parent.header.state_root = state.state_root().unwrap();
+        handler.chain_store.put_block(&parent).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &parent.hash())
+            .unwrap();
+        handler.chain_store.set_head(&parent.hash()).unwrap();
+        let mut executor = ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(store)), 42);
+        let mut blocks = Vec::new();
+        for number in 1..=3 {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce: number - 1,
+                to: Some(address),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 100_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signature = signer
+                .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed =
+                SignedTransaction::with_pubkey(caller, tx, signature, signer.public_key().to_vec());
+            let world = executor.state_db_mut().world_state_mut();
+            shell_pqvm::validate_tx(
+                &signed,
+                world,
+                &handler.chain_store,
+                &shell_crypto::MultiVerifier,
+                42,
+            )
+            .unwrap();
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number,
+                    ..parent.header.clone()
+                },
+                transactions: vec![signed],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let result = executor
+                .execute_tx(&block.transactions[0], &block.header, 0, 0)
+                .unwrap();
+            assert_eq!(result.receipt.status, 1);
+            shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
+            block.header.state_root = executor
+                .state_db_mut()
+                .world_state_mut()
+                .state_root()
+                .unwrap();
+            block.header.gas_used = result.gas_used;
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .put_receipts(&block.hash(), &[result.receipt])
+                .unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+            parent = block.clone();
+            blocks.push(block);
+        }
+        // Change live state after the historical blocks, including code and storage.
+        {
+            let mut live = handler.world_state.write();
+            live.rollback_to_root(&parent.header.state_root).unwrap();
+            live.set_code_hash(&address, ShellHash::ZERO).unwrap();
+            live.set_storage(&address, &ShellHash::ZERO, &ShellHash::from([0xff; 32]))
+                .unwrap();
+            live.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let root = handler.world_state.write().state_root().unwrap();
+        for block in blocks.iter().rev() {
+            let trace = DebugApiServer::trace_transaction(
+                &handler,
+                format!("{}", block.transactions[0].hash()),
+                None,
+            )
+            .await
+            .unwrap();
+            let full = block.header.number >= 2;
+            let expected_caller = if full {
+                caller
+            } else {
+                Address::from(caller.to_alloy())
+            };
+            let expected_self = if full {
+                address
+            } else {
+                Address::from(address.to_alloy())
+            };
+            assert_eq!(
+                trace["output"],
+                format!(
+                    "0x{}{}",
+                    hex::encode(expected_caller.as_bytes()),
+                    hex::encode(expected_self.as_bytes())
+                )
+            );
+            assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn fee_activation_eth_call_preserves_legacy_base_fee_and_does_not_charge() {
         let handler = setup();
         let address = test_address(b"base-fee-contract");
@@ -3808,6 +4029,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3878,6 +4100,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7692,6 +7915,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,

@@ -3287,6 +3287,7 @@ mod tests {
                         emergency_governance_height: None,
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
+                        native_address_context_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -5161,6 +5162,7 @@ mod tests {
                             emergency_governance_height: None,
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
+                            native_address_context_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5325,6 +5327,7 @@ mod tests {
                             emergency_governance_height: None,
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
+                            native_address_context_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5438,6 +5441,7 @@ mod tests {
                         emergency_governance_height: None,
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
+                        native_address_context_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -6354,6 +6358,2306 @@ mod tests {
         assert_eq!(receipts[0].tx_index, 0);
         assert_eq!(receipts[1].tx_index, 1);
         assert_eq!(receipts[2].tx_index, 2);
+    }
+
+    fn native_address_context_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        activation: Option<u64>,
+    ) -> (Address, Address, Vec<Block>) {
+        let proposer = leader.config.proposer_address.unwrap();
+        let signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let contract = Address::from([0x98; 32]);
+        // Predeployed code keeps this acceptance independent of unresolved CREATE semantics.
+        // Read a fresh canonical missing account at each height, then perform
+        // the existing caller/self writes. Only legacy heights materialize it.
+        let runtime = hex::decode("4362010000013150335f5530600155335f5260205ff3").unwrap();
+        let code_hash = shell_primitives::keccak256(&runtime);
+        let initialize = |chain: &ChainStore<_>, world: &mut WorldState<_>| {
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation
+            })).unwrap();
+            chain.put_chain_config(&config).unwrap();
+            chain.put_code(&code_hash, &runtime).unwrap();
+            world
+                .set_account(
+                    &sender,
+                    &shell_core::Account::new_user_account(
+                        ShellHash::ZERO,
+                        U256::from(10_000_000_000_000_000_000u64),
+                    ),
+                )
+                .unwrap();
+            world.set_code_hash(&contract, code_hash).unwrap();
+        };
+        leader.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        follower.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        initialize(&leader.chain_store, &mut leader.world_state.write());
+        // The follower may use a different storage backend.
+        let config = leader.chain_store.get_chain_config().unwrap().unwrap();
+        follower.chain_store.put_chain_config(&config).unwrap();
+        follower.chain_store.put_code(&code_hash, &runtime).unwrap();
+        fund_account(follower, &sender, U256::from(10_000_000_000_000_000_000u64));
+        follower
+            .world_state
+            .write()
+            .set_code_hash(&contract, code_hash)
+            .unwrap();
+        store_consistent_genesis(leader);
+        store_consistent_genesis(follower);
+        let mut blocks = Vec::new();
+        for nonce in 0..3 {
+            submit_signed_tx(
+                leader,
+                &signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(contract),
+                    value: U256::from(7),
+                    data: Bytes::new(),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
+            assert_eq!(block.transactions.len(), 1);
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let full = activation.is_some_and(|height| block.number() >= height);
+            let missing = Address::from(U256::from(0x10000 + block.number()).to_be_bytes::<32>());
+            assert_eq!(
+                leader
+                    .world_state
+                    .read()
+                    .get_account(&missing)
+                    .unwrap()
+                    .is_none(),
+                full
+            );
+            assert_eq!(
+                follower
+                    .world_state
+                    .read()
+                    .get_account(&missing)
+                    .unwrap()
+                    .is_none(),
+                full
+            );
+            let expected_caller = if full {
+                sender
+            } else {
+                Address::from(sender.to_alloy())
+            };
+            let expected_self = if full {
+                contract
+            } else {
+                Address::from(contract.to_alloy())
+            };
+            {
+                let (chain, world) = (&*leader.chain_store, &*leader.world_state.read());
+                assert_eq!(
+                    chain.get_receipts(&block.hash()).unwrap().unwrap()[0].status,
+                    1
+                );
+                assert_eq!(
+                    world.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(*expected_caller.as_bytes())
+                );
+                assert_eq!(
+                    world
+                        .get_storage(
+                            &contract,
+                            &ShellHash::from(U256::from(1).to_be_bytes::<32>())
+                        )
+                        .unwrap(),
+                    ShellHash::from(*expected_self.as_bytes())
+                );
+            }
+            let world = follower.world_state.read();
+            assert_eq!(
+                world.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                ShellHash::from(*expected_caller.as_bytes())
+            );
+            assert_eq!(
+                world
+                    .get_storage(
+                        &contract,
+                        &ShellHash::from(U256::from(1).to_be_bytes::<32>())
+                    )
+                    .unwrap(),
+                ShellHash::from(*expected_self.as_bytes())
+            );
+            assert_eq!(world.get_nonce(&sender).unwrap(), nonce + 1);
+            assert_eq!(
+                world.get_balance(&contract).unwrap(),
+                U256::from(7 * (nonce + 1))
+            );
+            assert_eq!(
+                world.get_balance(&sender).unwrap(),
+                leader.world_state.read().get_balance(&sender).unwrap()
+            );
+            drop(world);
+            assert_eq!(current_state_root(leader), block.header.state_root);
+            assert_eq!(current_state_root(follower), block.header.state_root);
+            assert_eq!(
+                follower.chain_store.get_receipts(&block.hash()).unwrap(),
+                leader.chain_store.get_receipts(&block.hash()).unwrap()
+            );
+            blocks.push(block);
+        }
+        for block in &blocks {
+            assert_pruned_genesis_witness_recovery(follower, block);
+        }
+        (sender, contract, blocks)
+    }
+
+    #[test]
+    fn native_address_context_real_aa_admission_import_and_rollback() {
+        for activation in [None, Some(2)] {
+            for signer in [
+                Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+                Box::new(MlDsaSigner::generate()),
+            ] {
+                let (leader, proposer_signer) = setup_node();
+                let proposer = leader.config.proposer_address.unwrap();
+                let follower = setup_node_with_authority(proposer);
+                let sender =
+                    Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+                let first = Address::from([0x98; 32]);
+                let second = Address::from([0x56; 32]);
+                let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+                for node in [&leader, &follower] {
+                    node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                    let config = serde_json::from_value(serde_json::json!({
+                        "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0
+                    })).unwrap();
+                    node.chain_store.put_chain_config(&config).unwrap();
+                    fund_account(node, &sender, initial_balance);
+                    // First records caller and increments a counter; second reverts on nonempty input.
+                    for (address, code) in [
+                        (
+                            first,
+                            hex::decode("335f556001546001016001555f5ff3").unwrap(),
+                        ),
+                        (second, hex::decode("335f5536600857005b5f5ffd").unwrap()),
+                    ] {
+                        let hash = shell_primitives::keccak256(&code);
+                        node.chain_store.put_code(&hash, &code).unwrap();
+                        node.world_state
+                            .write()
+                            .set_code_hash(&address, hash)
+                            .unwrap();
+                    }
+                    store_consistent_genesis(node);
+                }
+                let mut fees = U256::ZERO;
+                let mut blocks = Vec::new();
+                for nonce in 0..4 {
+                    let revert = nonce == 3;
+                    let tx = Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: None,
+                        value: U256::from(16),
+                        data: Bytes::new(),
+                        gas_limit: 300_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 1,
+                        access_list: None,
+                        tx_type: AA_BUNDLE_TX_TYPE,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    };
+                    let mut signed = SignedTransaction::with_aa_bundle(
+                        sender,
+                        tx,
+                        PQSignature::new(signer.sig_type(), vec![]),
+                        PubkeyMode::Embedded(signer.public_key().to_vec()),
+                        AaBundle {
+                            inner_calls: vec![
+                                InnerCall {
+                                    to: Some(first),
+                                    value: U256::from(7),
+                                    data: Bytes::new(),
+                                    gas_limit: 100_000,
+                                },
+                                InnerCall {
+                                    to: Some(second),
+                                    value: U256::from(9),
+                                    data: if revert {
+                                        Bytes::from(vec![1])
+                                    } else {
+                                        Bytes::new()
+                                    },
+                                    gas_limit: 100_000,
+                                },
+                            ],
+                            ..AaBundle::default()
+                        },
+                    )
+                    .unwrap();
+                    signed.signature = signer
+                        .sign(signed.sender_signing_hash().as_bytes())
+                        .unwrap();
+                    let before_root = current_state_root(&leader);
+                    let before_store = leader.store.scan_prefix(b"").unwrap();
+                    let mut tampered = signed.clone();
+                    tampered.signature.data[0] ^= 1;
+                    let mut changed_bundle = signed.clone();
+                    changed_bundle.aa_bundle.as_mut().unwrap().inner_calls[0].value = U256::from(6);
+                    for bad in [tampered, changed_bundle] {
+                        assert!(leader
+                            .tx_pool
+                            .insert(
+                                bad,
+                                &mut leader.world_state.write(),
+                                leader.chain_store.as_ref(),
+                                &MultiVerifier
+                            )
+                            .is_err());
+                        assert_eq!(current_state_root(&leader), before_root);
+                        assert_eq!(leader.store.scan_prefix(b"").unwrap(), before_store);
+                    }
+                    leader
+                        .tx_pool
+                        .insert(
+                            signed,
+                            &mut leader.world_state.write(),
+                            leader.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                    let block = leader.produce_block(&proposer_signer, 100).unwrap();
+                    assert_eq!(block.transactions.len(), 1);
+                    follower
+                        .import_block(block.clone(), &MultiVerifier)
+                        .unwrap();
+                    let receipts = leader
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(receipts[0].status, u8::from(!revert));
+                    assert_eq!(
+                        follower
+                            .chain_store
+                            .get_receipts(&block.hash())
+                            .unwrap()
+                            .unwrap(),
+                        receipts
+                    );
+                    fees += U256::from(receipts[0].gas_used)
+                        * U256::from(shell_core::effective_gas_price(
+                            2 * shell_core::INITIAL_BASE_FEE,
+                            1,
+                            block.header.base_fee_per_gas,
+                        ));
+                    let completed = (nonce + 1).min(3);
+                    let native = activation.is_some_and(|height| block.number() >= height);
+                    let expected_caller = if native {
+                        sender
+                    } else {
+                        Address::from(sender.to_alloy())
+                    };
+                    for node in [&leader, &follower] {
+                        let world = node.world_state.read();
+                        assert_eq!(world.get_nonce(&sender).unwrap(), nonce + 1);
+                        assert_eq!(
+                            world.get_balance(&first).unwrap(),
+                            U256::from(7 * completed)
+                        );
+                        assert_eq!(
+                            world.get_balance(&second).unwrap(),
+                            U256::from(9 * completed)
+                        );
+                        assert_eq!(
+                            world.get_balance(&sender).unwrap(),
+                            initial_balance - fees - U256::from(16 * completed)
+                        );
+                        assert_eq!(
+                            world
+                                .get_storage(
+                                    &first,
+                                    &ShellHash::from(U256::from(1).to_be_bytes::<32>())
+                                )
+                                .unwrap(),
+                            ShellHash::from(U256::from(completed).to_be_bytes::<32>())
+                        );
+                        for target in [first, second] {
+                            assert_eq!(
+                                world.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                                ShellHash::from(*expected_caller.as_bytes())
+                            );
+                        }
+                        drop(world);
+                        assert_eq!(current_state_root(node), block.header.state_root);
+                    }
+                    blocks.push(block);
+                }
+                for block in &blocks {
+                    assert_pruned_genesis_witness_recovery(&follower, block);
+                }
+            }
+        }
+    }
+
+    fn native_typed_aa_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        signer: &dyn Signer,
+        activation: Option<u64>,
+        owner_query: bool,
+    ) -> (Address, Address, Address, Address, Vec<Block>) {
+        let proposer = leader.config.proposer_address.unwrap();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let contract = Address::from([0x98; 20]);
+        let mut first = [0x12; 32];
+        first[..12].fill(0x34);
+        let mut second = first;
+        second[..12].fill(0x56);
+        let mut alias = first;
+        alias[..12].fill(0);
+        let first = Address::from(first);
+        let second = Address::from(second);
+        let alias = Address::from(alias);
+        let fixture: serde_json::Value = serde_json::from_str(if owner_query {
+            include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json")
+        } else {
+            include_str!("../../../pqvm/tests/fixtures/native-typed-call.json")
+        })
+        .unwrap();
+        let runtime = |name: &str| {
+            hex::decode(
+                fixture["artifacts"][name]["deployedBytecode"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap()
+        };
+        let input = |target: Address, value: Address| {
+            let mut data = hex::decode(
+                fixture["selectors"][if owner_query {
+                    "lookup(address,uint256)"
+                } else {
+                    "invoke(address,address)"
+                }]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            )
+            .unwrap();
+            data.extend_from_slice(target.as_bytes());
+            if owner_query {
+                data.extend_from_slice(
+                    &if value == Address::ZERO {
+                        U256::ZERO
+                    } else {
+                        U256::MAX
+                    }
+                    .to_be_bytes::<32>(),
+                );
+            } else {
+                data.extend_from_slice(value.as_bytes());
+            }
+            Bytes::from(data)
+        };
+        let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        macro_rules! initialize { ($node:expr) => {{ let node = $node;
+            node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0
+            })).unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            fund_account(node, &sender, initial_balance);
+            for (address, code) in [
+                (
+                    contract,
+                    runtime(if owner_query { "Reader" } else { "Typed" }),
+                ),
+                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+            ] {
+                let hash = shell_primitives::keccak256(&code);
+                node.chain_store.put_code(&hash, &code).unwrap();
+                node.world_state
+                    .write()
+                    .set_code_hash(&address, hash)
+                    .unwrap();
+            }
+            if owner_query {
+                for target in [first, second] {
+                    node.world_state
+                        .write()
+                        .set_storage(
+                            &target,
+                            &ShellHash::ZERO,
+                            &ShellHash::from(*target.as_bytes()),
+                        )
+                        .unwrap();
+                }
+            }
+            store_consistent_genesis(node);
+        }}; }
+        initialize!(leader);
+        initialize!(follower);
+        let mut fees = U256::ZERO;
+        let mut blocks = Vec::new();
+        // The height-2 compiled fixture requires the matching node profile after height 1.
+        for nonce in 0..if activation.is_some() { 4 } else { 1 } {
+            let revert = nonce == 3;
+            let success = activation.is_some_and(|height| nonce + 1 >= height) && !revert;
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce,
+                to: None,
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 800_000,
+                max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: AA_BUNDLE_TX_TYPE,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let mut signed = SignedTransaction::with_aa_bundle(
+                sender,
+                tx,
+                PQSignature::new(signer.sig_type(), vec![]),
+                PubkeyMode::Embedded(signer.public_key().to_vec()),
+                AaBundle {
+                    inner_calls: vec![
+                        InnerCall {
+                            to: Some(contract),
+                            value: U256::ZERO,
+                            data: input(first, if nonce == 3 { second } else { first }),
+                            gas_limit: 300_000,
+                        },
+                        InnerCall {
+                            to: Some(contract),
+                            value: U256::ZERO,
+                            data: input(second, if revert { Address::ZERO } else { second }),
+                            gas_limit: 300_000,
+                        },
+                    ],
+                    ..AaBundle::default()
+                },
+            )
+            .unwrap();
+            signed.signature = signer
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            let before_root = current_state_root(leader);
+            let before_store = leader.store.scan_prefix(b"").unwrap();
+            let mut tampered = signed.clone();
+            tampered.signature.data[0] ^= 1;
+            let mut changed_bundle = signed.clone();
+            changed_bundle.aa_bundle.as_mut().unwrap().inner_calls[0].value = U256::from(6);
+            for bad in [tampered, changed_bundle] {
+                assert!(leader
+                    .tx_pool
+                    .insert(
+                        bad,
+                        &mut leader.world_state.write(),
+                        leader.chain_store.as_ref(),
+                        &MultiVerifier
+                    )
+                    .is_err());
+                assert_eq!(current_state_root(leader), before_root);
+                assert_eq!(leader.store.scan_prefix(b"").unwrap(), before_store);
+            }
+            leader
+                .tx_pool
+                .insert(
+                    signed,
+                    &mut leader.world_state.write(),
+                    leader.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
+            assert_eq!(block.transactions.len(), 1);
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let receipts = leader
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipts[0].status,
+                u8::from(success),
+                "activation={activation:?} nonce={nonce}"
+            );
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap(),
+                receipts
+            );
+            fees += U256::from(receipts[0].gas_used)
+                * U256::from(
+                    (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                );
+            let completed = if activation.is_some() {
+                nonce.min(2)
+            } else {
+                0
+            };
+            macro_rules! assert_state {
+                ($node:expr) => {{
+                    let node = $node;
+                    let world = node.world_state.read();
+                    assert_eq!(world.get_nonce(&sender).unwrap(), nonce + 1);
+                    assert_eq!(world.get_balance(&sender).unwrap(), initial_balance - fees);
+                    assert_eq!(
+                        world.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(U256::from(2 * completed).to_be_bytes::<32>())
+                    );
+                    for target in [first, second] {
+                        assert_eq!(world.get_balance(&target).unwrap(), U256::ZERO);
+                        assert_eq!(
+                            world.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                            if owner_query || completed > 0 {
+                                ShellHash::from(*target.as_bytes())
+                            } else {
+                                ShellHash::ZERO
+                            }
+                        );
+                    }
+                    assert_eq!(
+                        world.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                    drop(world);
+                    assert_eq!(current_state_root(node), block.header.state_root);
+                    assert!(receipts[0].logs.is_empty());
+                }};
+            }
+            assert_state!(leader);
+            assert_state!(follower);
+            blocks.push(block);
+        }
+        for block in &blocks {
+            assert_pruned_genesis_witness_recovery(follower, block);
+        }
+        for block in blocks.iter().rev() {
+            let before = follower.store.scan_prefix(b"").unwrap();
+            follower.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+            assert_eq!(
+                current_state_root(follower),
+                blocks.last().unwrap().header.state_root
+            );
+            let history =
+                WorldState::at_root(follower.store.clone(), &block.header.state_root).unwrap();
+            let completed = if activation.is_some() {
+                (block.number() - 1).min(2)
+            } else {
+                0
+            };
+            assert_eq!(
+                history.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                ShellHash::from(U256::from(2 * completed).to_be_bytes::<32>())
+            );
+            assert_eq!(history.get_nonce(&sender).unwrap(), block.number());
+            for target in [first, second] {
+                assert_eq!(
+                    history.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                    if owner_query || completed > 0 {
+                        ShellHash::from(*target.as_bytes())
+                    } else {
+                        ShellHash::ZERO
+                    }
+                );
+            }
+        }
+        (sender, contract, first, second, blocks)
+    }
+
+    fn check_native_typed_aa(owner_query: bool) {
+        for activation in [None, Some(2)] {
+            for signer in [
+                Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+                Box::new(MlDsaSigner::generate()),
+            ] {
+                let (leader, proposer_signer) = setup_node();
+                let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+                native_typed_aa_import(
+                    &leader,
+                    &follower,
+                    &proposer_signer,
+                    signer.as_ref(),
+                    activation,
+                    owner_query,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_typed_interface_real_aa_admission_import_and_rollback() {
+        check_native_typed_aa(false);
+    }
+
+    #[test]
+    fn native_typed_interface_bytes32_real_aa_admission_import_and_rollback() {
+        check_native_typed_aa(true);
+    }
+
+    fn native_typed_interface_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        tx_signer: &impl Signer,
+        owner_fixture: Option<&str>,
+    ) -> (Address, Address, Address, Address, Vec<Block>) {
+        let owner_query = owner_fixture.is_some();
+        let proposer = leader.config.proposer_address.unwrap();
+        let sender = Address::from_public_key(tx_signer.public_key(), tx_signer.sig_type().as_u8());
+        let contract = Address::from([0x98; 32]);
+        let mut first = [0x12; 32];
+        first[..12].fill(0x34);
+        let mut second = first;
+        second[..12].fill(0x56);
+        let mut alias = first;
+        alias[..12].fill(0);
+        let first = Address::from(first);
+        let second = Address::from(second);
+        let alias = Address::from(alias);
+        let short = Address::from([0x67; 32]);
+        let missing = Address::from([0x68; 32]);
+        let fixture: serde_json::Value = serde_json::from_str(owner_fixture.unwrap_or(
+            include_str!("../../../pqvm/tests/fixtures/native-typed-call.json"),
+        ))
+        .unwrap();
+        let writer = Address::from([0x69; 32]);
+        let runtime = |name: &str| {
+            hex::decode(
+                fixture["artifacts"][name]["deployedBytecode"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap()
+        };
+        let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        macro_rules! initialize { ($node:expr) => {{ let node = $node;
+            node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+            node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2,"fee_accounting_activation_height":0})).unwrap()).unwrap();
+            fund_account(node, &sender, initial_balance);
+            for (address, code) in [
+                (contract, runtime(if owner_query { "Reader" } else { "Typed" })),
+                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (short, hex::decode("60015ff3").unwrap()),
+                (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+            ] {
+                let hash = shell_primitives::keccak256(&code);
+                node.chain_store.put_code(&hash, &code).unwrap();
+                node.world_state
+                    .write()
+                    .set_code_hash(&address, hash)
+                    .unwrap();
+            }
+            if owner_query {
+                let code = runtime("Writer");
+                let hash = shell_primitives::keccak256(&code);
+                node.chain_store.put_code(&hash, &code).unwrap();
+                node.world_state.write().set_code_hash(&writer, hash).unwrap();
+                for target in [first, second] {
+                    node.world_state.write().set_storage(&target, &ShellHash::ZERO, &ShellHash::from(*target.as_bytes())).unwrap();
+                }
+            }
+            node.world_state.write().set_validators(&[proposer]).unwrap();
+            node.world_state.write().set_validator_weights(&[proposer], &[1]).unwrap();
+            store_consistent_genesis(node);
+        }}; }
+        initialize!(leader);
+        initialize!(follower);
+        let mut blocks = Vec::new();
+        let mut fees = U256::ZERO;
+        let cases = if owner_query {
+            let maximum = Address::from([0xff; 32]);
+            [
+                ("lookup(address,uint256)", first, maximum, false, 0u64),
+                ("lookup(address,uint256)", first, maximum, true, 1),
+                ("lookup(address,uint256)", second, Address::ZERO, false, 1),
+                ("lookup(address,uint256)", second, maximum, true, 2),
+                ("lookup(address,uint256)", writer, maximum, false, 2),
+                ("lookup(address,uint256)", short, maximum, false, 2),
+                ("lookup(address,uint256)", missing, maximum, false, 2),
+            ]
+        } else {
+            [
+                ("invoke(address,address)", first, first, false, 0u64),
+                ("invoke(address,address)", first, first, true, 1),
+                ("invoke(address,address)", second, Address::ZERO, false, 1),
+                ("invoke(address,address)", second, second, true, 2),
+                ("inspect(address,address)", first, second, false, 2),
+                ("invoke(address,address)", short, first, false, 2),
+                ("invoke(address,address)", missing, first, false, 2),
+            ]
+        };
+        for (nonce, (method, target, value, success, counter)) in cases.into_iter().enumerate() {
+            let nonce = nonce as u64;
+            let mut data = hex::decode(
+                fixture["selectors"][method]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            data.extend_from_slice(target.as_bytes());
+            data.extend_from_slice(value.as_bytes());
+            let hash = submit_signed_tx(
+                leader,
+                tx_signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(contract),
+                    value: U256::ZERO,
+                    data: Bytes::from(data),
+                    gas_limit: 500_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
+            assert_eq!(block.number(), nonce + 1);
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(block.transactions[0].hash(), hash);
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let receipts = leader
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipts[0].status, u8::from(success));
+            assert!(receipts[0].logs.is_empty());
+            fees += U256::from(receipts[0].gas_used)
+                * U256::from(shell_core::effective_gas_price(
+                    shell_core::INITIAL_BASE_FEE,
+                    0,
+                    block.header.base_fee_per_gas,
+                ));
+            macro_rules! assert_committed {
+                ($node:expr) => {{
+                    let node = $node;
+                    assert_eq!(
+                        node.chain_store
+                            .get_receipts(&block.hash())
+                            .unwrap()
+                            .unwrap(),
+                        receipts
+                    );
+                    assert_eq!(current_state_root(node), block.header.state_root);
+                    let recovered =
+                        WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+                    assert_eq!(recovered.get_nonce(&sender).unwrap(), nonce + 1);
+                    assert_eq!(
+                        recovered.get_balance(&sender).unwrap(),
+                        initial_balance - fees
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(U256::from(counter).to_be_bytes::<32>())
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&first, &ShellHash::ZERO).unwrap(),
+                        if owner_query || nonce >= 1 {
+                            ShellHash::from(*first.as_bytes())
+                        } else {
+                            ShellHash::ZERO
+                        }
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&second, &ShellHash::ZERO).unwrap(),
+                        if owner_query || nonce >= 3 {
+                            ShellHash::from(*second.as_bytes())
+                        } else {
+                            ShellHash::ZERO
+                        }
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert!(recovered.get_account(&missing).unwrap().is_none());
+                    if owner_query {
+                        assert_eq!(
+                            recovered.get_storage(&writer, &ShellHash::ZERO).unwrap(),
+                            ShellHash::ZERO
+                        );
+                    }
+                }};
+            }
+            assert_committed!(leader);
+            assert_committed!(follower);
+            blocks.push(block);
+        }
+        for block in &blocks {
+            assert_pruned_genesis_witness_recovery(follower, block);
+        }
+        for block in blocks.iter().rev() {
+            let before = follower.store.scan_prefix(b"").unwrap();
+            follower.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+            let history =
+                WorldState::at_root(follower.store.clone(), &block.header.state_root).unwrap();
+            let count = match block.number() {
+                1 => 0u64,
+                2 | 3 => 1,
+                _ => 2,
+            };
+            assert_eq!(
+                history.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                ShellHash::from(U256::from(count).to_be_bytes::<32>())
+            );
+        }
+        assert_eq!(
+            follower
+                .world_state
+                .read()
+                .get_storage(&contract, &ShellHash::ZERO)
+                .unwrap(),
+            ShellHash::from(U256::from(2).to_be_bytes::<32>())
+        );
+        (sender, contract, first, second, blocks)
+    }
+
+    #[test]
+    fn native_typed_interface_signed_admission_import_and_replay() {
+        fn run(tx_signer: &impl Signer) {
+            let (leader, proposer_signer) = setup_node();
+            let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+            native_typed_interface_signed_import(
+                &leader,
+                &follower,
+                &proposer_signer,
+                tx_signer,
+                None,
+            );
+        }
+        run(&DilithiumSigner::generate());
+        run(&MlDsaSigner::generate());
+    }
+
+    fn native_owner_signed_rpc_and_history(tx_signer: &impl Signer, owner_fixture: &str) {
+        use shell_rpc::api::{DebugApiServer, EthApiServer};
+        use shell_rpc::types::CallRequest;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (leader, proposer_signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        let (sender, contract, first, second, blocks) = native_typed_interface_signed_import(
+            &leader,
+            &follower,
+            &proposer_signer,
+            tx_signer,
+            Some(owner_fixture),
+        );
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&follower.chain_store),
+            Arc::clone(&follower.world_state),
+            Arc::clone(&follower.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let before = follower.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(&follower);
+        // The imported tip's original lookup selector returns each complete owner
+        // from committed storage; simulation must not persist the reader counter.
+        for target in [first, second] {
+            let mut data =
+                shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()[..4].to_vec();
+            data.extend_from_slice(target.as_bytes());
+            data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+            let output = runtime
+                .block_on(EthApiServer::call(
+                    &handler,
+                    CallRequest {
+                        from: Some(sender),
+                        to: Some(contract),
+                        data: Some(format!("0x{}", hex::encode(data))),
+                        value: None,
+                        gas: Some("0x7a120".into()),
+                        access_list: None,
+                    },
+                    Some("latest".into()),
+                ))
+                .unwrap();
+            assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
+            assert_eq!(current_state_root(&follower), root);
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        }
+        // Replay at descending historical heights after the live counter advanced.
+        for block in blocks.iter().rev() {
+            let trace = runtime
+                .block_on(DebugApiServer::trace_transaction(
+                    &handler,
+                    block.transactions[0].hash().to_string(),
+                    None,
+                ))
+                .unwrap();
+            let output = match block.number() {
+                2 => format!("0x{}", hex::encode(first.as_bytes())),
+                4 => format!("0x{}", hex::encode(second.as_bytes())),
+                3 => {
+                    let mut bytes =
+                        shell_primitives::keccak256(b"Missing(uint256)").as_bytes()[..4].to_vec();
+                    bytes.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                    format!("0x{}", hex::encode(bytes))
+                }
+                _ => "0x".into(),
+            };
+            assert_eq!(trace["output"], output);
+            if [2, 3, 4].contains(&block.number()) {
+                assert_eq!(trace["calls"][0]["from"], contract.to_string());
+                assert_eq!(
+                    trace["calls"][0]["to"],
+                    if block.number() == 2 { first } else { second }.to_string()
+                );
+            }
+            assert_eq!(current_state_root(&follower), root);
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_typed_interface_uint256_signed_import_rpc_and_history() {
+        let fixture = include_str!("../../../pqvm/tests/fixtures/native-owner.json");
+        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture);
+        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture);
+    }
+
+    #[test]
+    fn native_typed_interface_bytes32_signed_import_rpc_and_history() {
+        let fixture = include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json");
+        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture);
+        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_typed_interface_import_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_NATIVE_TYPED_DIRECTORY";
+        const ALGORITHM: &str = "SHELL_TEST_NATIVE_TYPED_ALGORITHM";
+        const PROFILE: &str = "SHELL_TEST_NATIVE_TYPED_PROFILE";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, proposer_signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let owner_fixture = match std::env::var(PROFILE).unwrap().as_str() {
+                "echo" => None,
+                "bytes32" => Some(include_str!(
+                    "../../../pqvm/tests/fixtures/native-owner-bytes32.json"
+                )),
+                _ => panic!("unsupported typed fixture profile"),
+            };
+            let fixture = if std::env::var(ALGORITHM).unwrap() == "mldsa" {
+                native_typed_interface_signed_import(
+                    &leader,
+                    &follower,
+                    &proposer_signer,
+                    &MlDsaSigner::generate(),
+                    owner_fixture,
+                )
+            } else {
+                native_typed_interface_signed_import(
+                    &leader,
+                    &follower,
+                    &proposer_signer,
+                    &DilithiumSigner::generate(),
+                    owner_fixture,
+                )
+            };
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            // Leave committed WAL data without dropping the database handles.
+            std::process::exit(0);
+        }
+        for (profile, algorithm) in [
+            ("echo", "dilithium"),
+            ("echo", "mldsa"),
+            ("bytes32", "dilithium"),
+            ("bytes32", "mldsa"),
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "shell-native-typed-{profile}-{algorithm}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "node::tests::native_typed_interface_import_survives_process_exit",
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, &directory)
+                .env(ALGORITHM, algorithm)
+                .env(PROFILE, profile)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "typed call writer failed; retained {}",
+                directory.display()
+            );
+            let (sender, contract, first, second, blocks): (
+                Address,
+                Address,
+                Address,
+                Address,
+                Vec<Block>,
+            ) = serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+            let tip = blocks.last().unwrap();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let (node, recovered_store) = crate::builder::NodeBuilder::new(
+                NodeConfig::dev(tip.header.proposer),
+                Arc::new(stores.state),
+            )
+            .build()
+            .unwrap();
+            assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+            assert_eq!(
+                node.chain_store
+                    .get_chain_config()
+                    .unwrap()
+                    .unwrap()
+                    .native_address_context_height,
+                Some(2)
+            );
+            let mut alias = *first.as_bytes();
+            alias[..12].fill(0);
+            let alias = Address::from(alias);
+            assert_eq!(current_state_root(&node), tip.header.state_root);
+            for block in blocks.iter().rev() {
+                let state =
+                    WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+                let count = match block.number() {
+                    1 => 0u64,
+                    2 | 3 => 1,
+                    _ => 2,
+                };
+                assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(count).to_be_bytes::<32>())
+                );
+                assert_eq!(
+                    state.get_storage(&first, &ShellHash::ZERO).unwrap(),
+                    if profile == "bytes32" || block.number() >= 2 {
+                        ShellHash::from(*first.as_bytes())
+                    } else {
+                        ShellHash::ZERO
+                    }
+                );
+                assert_eq!(
+                    state.get_storage(&second, &ShellHash::ZERO).unwrap(),
+                    if profile == "bytes32" || block.number() >= 4 {
+                        ShellHash::from(*second.as_bytes())
+                    } else {
+                        ShellHash::ZERO
+                    }
+                );
+                assert_eq!(
+                    state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+                assert!(state
+                    .get_account(&Address::from([0x68; 32]))
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    state
+                        .get_storage(&Address::from([0x69; 32]), &ShellHash::ZERO)
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                let receipt = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(receipt[0].status, u8::from(matches!(block.number(), 2 | 4)));
+                assert!(receipt[0].logs.is_empty());
+                let before = node.store.scan_prefix(b"").unwrap();
+                node.validate_legacy_backfill_witness(block).unwrap();
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            }
+            assert_eq!(current_state_root(&node), tip.header.state_root);
+            drop(node);
+            drop(recovered_store);
+            drop(stores.chain);
+            drop(stores.receipts);
+            drop(stores.index);
+            drop(stores.witness);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_typed_interface_bytes32_aa_survives_process_exit() {
+        async fn http_request(
+            address: std::net::SocketAddr,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            use http_body_util::BodyExt;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                let (mut client, connection) =
+                    hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let connection = tokio::spawn(connection);
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                }))
+                .unwrap();
+                let request = hyper::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{address}/"))
+                    .header("Host", address.to_string())
+                    .header("Content-Type", "application/json")
+                    .body(http_body_util::Full::new(hyper::body::Bytes::from(payload)))
+                    .unwrap();
+                let response = client.send_request(request).await.unwrap();
+                assert_eq!(response.status(), hyper::StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                drop(client);
+                connection.await.unwrap().unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(response["jsonrpc"], "2.0");
+                assert_eq!(response["id"], 1);
+                response
+            })
+            .await
+            .expect("isolated owner RPC request timed out")
+        }
+
+        const DIRECTORY: &str = "SHELL_TEST_NATIVE_TYPED_AA_DIRECTORY";
+        const ALGORITHM: &str = "SHELL_TEST_NATIVE_TYPED_AA_ALGORITHM";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, proposer_signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let (signer, signing_key): (Box<dyn Signer>, Vec<u8>) =
+                match std::env::var(ALGORITHM).unwrap().as_str() {
+                    "mldsa" => {
+                        let signer = MlDsaSigner::generate();
+                        let key = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), key)
+                    }
+                    "dilithium" => {
+                        let signer = DilithiumSigner::generate();
+                        let key = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), key)
+                    }
+                    _ => panic!("unsupported AA signer"),
+                };
+            // Only freshly generated test keys live in this isolated temporary directory.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            options
+                .open(directory.join("test-signers.json"))
+                .unwrap()
+                .write_all(
+                    &serde_json::to_vec(&(
+                        proposer_signer.public_key(),
+                        proposer_signer.secret_key_bytes().as_slice(),
+                        signer.public_key(),
+                        signing_key,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            let fixture = native_typed_aa_import(
+                &leader,
+                &follower,
+                &proposer_signer,
+                signer.as_ref(),
+                Some(2),
+                true,
+            );
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            // Leave committed WAL data without dropping the database handles.
+            std::process::exit(0);
+        }
+        for algorithm in ["dilithium", "mldsa"] {
+            let directory = std::env::temp_dir().join(format!(
+                "shell-native-typed-aa-bytes32-{algorithm}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "node::tests::native_typed_interface_bytes32_aa_survives_process_exit",
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, &directory)
+                .env(ALGORITHM, algorithm)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "typed call writer failed; retained {}",
+                directory.display()
+            );
+            let (sender, contract, first, second, blocks): (
+                Address,
+                Address,
+                Address,
+                Address,
+                Vec<Block>,
+            ) = serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+            let tip = blocks.last().unwrap();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            // Match the writer's one-second PoA test network on both recovered nodes.
+            let mut recovered_config = NodeConfig::dev(tip.header.proposer);
+            recovered_config.consensus = crate::config::ConsensusEngineConfig::Poa(PoaConfig::new(
+                vec![tip.header.proposer],
+                1,
+            ));
+            let (node, recovered_store) =
+                crate::builder::NodeBuilder::new(recovered_config.clone(), Arc::new(stores.state))
+                    .build()
+                    .unwrap();
+            assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+            assert_eq!(
+                node.chain_store
+                    .get_chain_config()
+                    .unwrap()
+                    .unwrap()
+                    .native_address_context_height,
+                Some(2)
+            );
+            let mut alias = *first.as_bytes();
+            alias[..12].fill(0);
+            let alias = Address::from(alias);
+            assert_eq!(current_state_root(&node), tip.header.state_root);
+            for block in blocks.iter().rev() {
+                let state =
+                    WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+                let count = 2 * (block.number() - 1).min(2);
+                assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(count).to_be_bytes::<32>())
+                );
+                assert_eq!(
+                    state.get_storage(&first, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(*first.as_bytes())
+                );
+                assert_eq!(
+                    state.get_storage(&second, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(*second.as_bytes())
+                );
+                assert_eq!(
+                    state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+                let receipt = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(receipt[0].status, u8::from(matches!(block.number(), 2 | 3)));
+                assert!(receipt[0].logs.is_empty());
+                let mut fees = U256::ZERO;
+                for earlier in blocks.iter().take(block.number() as usize) {
+                    let receipts = node
+                        .chain_store
+                        .get_receipts(&earlier.hash())
+                        .unwrap()
+                        .unwrap();
+                    fees += U256::from(receipts[0].gas_used)
+                        * U256::from(
+                            (2 * shell_core::INITIAL_BASE_FEE)
+                                .min(earlier.header.base_fee_per_gas + 1),
+                        );
+                }
+                assert_eq!(
+                    state.get_balance(&sender).unwrap(),
+                    U256::from(10_000_000_000_000_000_000u64) - fees
+                );
+                let before = node.store.scan_prefix(b"").unwrap();
+                node.validate_legacy_backfill_witness(block).unwrap();
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            }
+            assert_eq!(current_state_root(&node), tip.header.state_root);
+            // Execute the original ABI through the recovered RPC state, rather than
+            // inferring runtime readiness from the restored trie alone.
+            use shell_rpc::api::EthApiServer;
+            use shell_rpc::types::CallRequest;
+            let assert_readonly_rpc =
+                |node: &Node<shell_storage::RocksDbStore>, expected_root: ShellHash| {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    let guard = runtime.enter();
+                    let (events, _) = tokio::sync::broadcast::channel(16);
+                    let handler = shell_rpc::RpcHandler::new(
+                        Arc::clone(&node.chain_store),
+                        Arc::clone(&node.world_state),
+                        Arc::clone(&node.tx_pool),
+                        1337,
+                        None,
+                        events,
+                        Arc::new(RwLock::new(0)),
+                        Arc::new(RwLock::new(FinalityState::new())),
+                    );
+                    let before = node.store.scan_prefix(b"").unwrap();
+                    for target in [first, second] {
+                        let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        data.extend_from_slice(target.as_bytes());
+                        data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+                        let output = runtime
+                            .block_on(EthApiServer::call(
+                                &handler,
+                                CallRequest {
+                                    from: Some(sender),
+                                    to: Some(contract),
+                                    data: Some(format!("0x{}", hex::encode(data))),
+                                    value: None,
+                                    gas: Some("0x7a120".into()),
+                                    access_list: None,
+                                },
+                                Some("latest".into()),
+                            ))
+                            .unwrap();
+                        assert_eq!(output, format!("0x{}", hex::encode(target.as_bytes())));
+                        assert_eq!(current_state_root(node), expected_root);
+                        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                    }
+                    drop(handler);
+                    drop(guard);
+                    drop(runtime);
+                };
+            assert_readonly_rpc(&node, tip.header.state_root);
+            let (proposer_public, proposer_secret, sender_public, sender_secret): (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+            ) = serde_json::from_slice(
+                &std::fs::read(directory.join("test-signers.json")).unwrap(),
+            )
+            .unwrap();
+            let proposer_signer =
+                DilithiumSigner::from_bytes(&proposer_public, &proposer_secret).unwrap();
+            let signer: Box<dyn Signer> = if algorithm == "mldsa" {
+                Box::new(MlDsaSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+            } else {
+                Box::new(DilithiumSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+            };
+            assert_eq!(
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()),
+                sender
+            );
+            // A separate recovered state validates imports independently of production.
+            let replica_store = Arc::new(MemoryDb::new());
+            for (key, value) in node.store.scan_prefix(b"").unwrap() {
+                replica_store.put(&key, &value).unwrap();
+            }
+            let (replica, _) =
+                crate::builder::NodeBuilder::new(recovered_config.clone(), replica_store)
+                    .build()
+                    .unwrap();
+            // Restore the operator's public authority credential for seal verification.
+            node.register_authority_pubkey(tip.header.proposer, proposer_public.clone());
+            replica.register_authority_pubkey(tip.header.proposer, proposer_public);
+            let mut expected_balance = U256::from(10_000_000_000_000_000_000u64);
+            for block in &blocks {
+                let receipts = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                expected_balance -= U256::from(receipts[0].gas_used)
+                    * U256::from(
+                        (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                    );
+            }
+            let mut continued_blocks = Vec::new();
+            for nonce in [4, 5] {
+                let inner_calls = [first, second]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        data.extend_from_slice(target.as_bytes());
+                        data.extend_from_slice(
+                            &if nonce == 5 && index == 1 {
+                                U256::ZERO
+                            } else {
+                                U256::MAX
+                            }
+                            .to_be_bytes::<32>(),
+                        );
+                        InnerCall {
+                            to: Some(contract),
+                            value: U256::ZERO,
+                            data: Bytes::from(data),
+                            gas_limit: 300_000,
+                        }
+                    })
+                    .collect();
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    sender,
+                    Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: None,
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 800_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 1,
+                        access_list: None,
+                        tx_type: AA_BUNDLE_TX_TYPE,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    },
+                    PQSignature::new(signer.sig_type(), vec![]),
+                    PubkeyMode::Embedded(signer.public_key().to_vec()),
+                    AaBundle {
+                        inner_calls,
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let transaction_hash = signed.hash();
+                node.tx_pool
+                    .insert(
+                        signed,
+                        &mut node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+                let block = node.produce_block(&proposer_signer, 100).unwrap();
+                replica.import_block(block.clone(), &MultiVerifier).unwrap();
+                let receipts = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                let transaction_index = block
+                    .transactions
+                    .iter()
+                    .position(|transaction| transaction.hash() == transaction_hash)
+                    .unwrap();
+                // NodeBuilder enables protocol reward receipts in addition to user transactions.
+                let user_receipt = &receipts[transaction_index];
+                assert_eq!(user_receipt.tx_hash, transaction_hash);
+                assert_eq!(user_receipt.status, u8::from(nonce == 4));
+                assert_eq!(
+                    replica
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap(),
+                    receipts
+                );
+                let fee = U256::from(user_receipt.gas_used)
+                    * U256::from(
+                        (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                    );
+                expected_balance -= fee;
+                macro_rules! assert_resumed {
+                    ($node:expr) => {{
+                        let state = $node.world_state.read();
+                        assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
+                        assert_eq!(state.get_balance(&sender).unwrap(), expected_balance);
+                        assert_eq!(
+                            state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                            ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                        );
+                        for target in [first, second] {
+                            assert_eq!(
+                                state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                                ShellHash::from(*target.as_bytes())
+                            );
+                        }
+                    }};
+                }
+                assert_resumed!(node);
+                assert_resumed!(replica);
+                assert_eq!(current_state_root(&node), block.header.state_root);
+                assert_eq!(current_state_root(&replica), block.header.state_root);
+                continued_blocks.push((block, receipts, expected_balance));
+            }
+            drop(replica);
+            drop(node);
+            drop(recovered_store);
+            drop(stores.chain);
+            drop(stores.receipts);
+            drop(stores.index);
+            drop(stores.witness);
+            // Close every database handle, then validate the state committed by the
+            // resumed successful and reverted bundles through another fresh startup.
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let (node, recovered_store) =
+                crate::builder::NodeBuilder::new(recovered_config, Arc::new(stores.state))
+                    .build()
+                    .unwrap();
+            let continued_tip = &continued_blocks.last().unwrap().0;
+            assert_eq!(
+                node.chain_store.get_head_hash().unwrap(),
+                Some(continued_tip.hash())
+            );
+            assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+            assert_eq!(
+                node.chain_store
+                    .get_chain_config()
+                    .unwrap()
+                    .unwrap()
+                    .native_address_context_height,
+                Some(2)
+            );
+            let before = node.store.scan_prefix(b"").unwrap();
+            for (block, receipts, balance) in continued_blocks.iter().rev() {
+                let state =
+                    WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+                assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+                assert_eq!(state.get_balance(&sender).unwrap(), *balance);
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                );
+                for target in [first, second] {
+                    assert_eq!(
+                        state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(*target.as_bytes())
+                    );
+                }
+                assert_eq!(
+                    state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(
+                    node.chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap(),
+                    *receipts
+                );
+                node.validate_legacy_backfill_witness(block).unwrap();
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+            }
+            assert_readonly_rpc(&node, continued_tip.header.state_root);
+            {
+                let state = node.world_state.read();
+                assert_eq!(state.get_nonce(&sender).unwrap(), 6);
+                assert_eq!(state.get_balance(&sender).unwrap(), expected_balance);
+                assert_eq!(
+                    state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                );
+            }
+            // Exercise the registered HTTP JSON-RPC entry against the twice-recovered
+            // state, including serialization, persisted receipts and failed simulation.
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let server = shell_rpc::start_rpc_server(
+                    shell_rpc::RpcConfig {
+                        listen_addr: "127.0.0.1:0".parse().unwrap(),
+                        ws_addr: None,
+                        ..shell_rpc::RpcConfig::default()
+                    },
+                    Arc::clone(&node.chain_store),
+                    Arc::clone(&node.world_state),
+                    Arc::clone(&node.tx_pool),
+                    1337,
+                    None,
+                    events,
+                    None,
+                    None,
+                    Arc::new(RwLock::new(0)),
+                    Arc::new(RwLock::new(FinalityState::new())),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    None,
+                    None,
+                    Some(Arc::clone(&node.witness_store)),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let before = node.store.scan_prefix(b"").unwrap();
+                for (target, token) in [
+                    (first, U256::MAX),
+                    (second, U256::MAX),
+                    (second, U256::ZERO),
+                ] {
+                    let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                        .as_bytes()[..4]
+                        .to_vec();
+                    data.extend_from_slice(target.as_bytes());
+                    data.extend_from_slice(&token.to_be_bytes::<32>());
+                    let response = http_request(
+                        server.http_addr,
+                        "eth_call",
+                        serde_json::json!([
+                            {"from":sender.to_string(),"to":contract.to_string(),
+                             "data":format!("0x{}",hex::encode(data)),"gas":"0x7a120"},"latest"
+                        ]),
+                    )
+                    .await;
+                    if token == U256::MAX {
+                        assert!(response.get("error").is_none(), "{response}");
+                        assert_eq!(
+                            response["result"],
+                            format!("0x{}", hex::encode(target.as_bytes()))
+                        );
+                    } else {
+                        assert!(response.get("result").is_none(), "{response}");
+                        assert_eq!(response["error"]["code"], -32000);
+                        let mut revert = shell_primitives::keccak256(b"Missing(uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        revert.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                        assert_eq!(
+                            response["error"]["data"],
+                            format!("0x{}", hex::encode(revert))
+                        );
+                    }
+                    assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                    assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                }
+                for (method, params, expected) in [
+                    ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
+                    ("eth_blockNumber", serde_json::json!([]), "0x6".to_owned()),
+                    (
+                        "eth_getTransactionCount",
+                        serde_json::json!([sender.to_string(), "latest"]),
+                        "0x6".to_owned(),
+                    ),
+                    (
+                        "eth_getBalance",
+                        serde_json::json!([sender.to_string(), "latest"]),
+                        format!("0x{expected_balance:x}"),
+                    ),
+                    (
+                        "eth_getStorageAt",
+                        serde_json::json!([contract.to_string(), "0x0", "latest"]),
+                        format!("0x{}", hex::encode(U256::from(6).to_be_bytes::<32>())),
+                    ),
+                ] {
+                    let response = http_request(server.http_addr, method, params).await;
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(response["result"], expected);
+                }
+                for (block, receipts, _) in &continued_blocks {
+                    let receipt = &receipts[0];
+                    let response = http_request(
+                        server.http_addr,
+                        "eth_getTransactionReceipt",
+                        serde_json::json!([receipt.tx_hash.to_string()]),
+                    )
+                    .await;
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(
+                        response["result"]["transactionHash"],
+                        receipt.tx_hash.to_string()
+                    );
+                    assert_eq!(response["result"]["blockHash"], block.hash().to_string());
+                    assert_eq!(
+                        response["result"]["blockNumber"],
+                        format!("0x{:x}", block.number())
+                    );
+                    assert_eq!(
+                        response["result"]["status"],
+                        format!("0x{:x}", u8::from(block.number() == 5))
+                    );
+                    assert_eq!(
+                        response["result"]["gasUsed"],
+                        format!("0x{:x}", receipt.gas_used)
+                    );
+                    assert_eq!(response["result"]["from"], sender.to_string());
+                    assert!(response["result"]["to"].is_null());
+                }
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(&node), continued_tip.header.state_root);
+                server.http_handle.stop().unwrap();
+                server.http_handle.stopped().await;
+            });
+            drop(runtime);
+            drop(node);
+            drop(recovered_store);
+            drop(stores.chain);
+            drop(stores.receipts);
+            drop(stores.index);
+            drop(stores.witness);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    fn native_compiler_receiver_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        observe: impl Fn(&Node<S>, &Block),
+    ) -> (Address, Address, Address, Vec<Block>) {
+        let proposer = leader.config.proposer_address.unwrap();
+        let signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let contract = Address::from([0x98; 32]);
+        let mut target_bytes = [0x12; 32];
+        target_bytes[..12].fill(0x34);
+        let target = Address::from(target_bytes);
+        target_bytes[..12].fill(0x56);
+        let alias = Address::from(target_bytes);
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../pqvm/tests/fixtures/native-function-receiver.json"
+        ))
+        .unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        // Emit and store CALLER, return it for empty input, and revert with it otherwise.
+        let callee = hex::decode("335f55335f5260205fa0361560135760205ffd5b60205ff3").unwrap();
+        let alias_code = hex::decode("60ff5f5560ff5f5260205ff3").unwrap();
+        macro_rules! initialize { ($node:expr) => {{ let node = $node;
+            node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+            }))
+            .unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            fund_account(node, &sender, U256::from(10_000_000_000_000_000_000u64));
+            for (address, code) in [
+                (contract, runtime.as_slice()),
+                (target, callee.as_slice()),
+                (alias, alias_code.as_slice()),
+            ] {
+                let hash = shell_primitives::keccak256(code);
+                node.chain_store.put_code(&hash, code).unwrap();
+                node.world_state
+                    .write()
+                    .set_code_hash(&address, hash)
+                    .unwrap();
+            }
+            node.world_state
+                .write()
+                .set_storage(
+                    &contract,
+                    &ShellHash::ZERO,
+                    &ShellHash::from(*target.as_bytes()),
+                )
+                .unwrap();
+            store_consistent_genesis(node);
+        }}; }
+        initialize!(leader);
+        initialize!(follower);
+        let counter_slot = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+        let mut blocks = Vec::new();
+        for nonce in 0..4 {
+            let reverts = nonce == 2;
+            let mut data = hex::decode(
+                fixture["selector"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(u8::from(reverts)).to_be_bytes::<32>());
+            if reverts {
+                data.extend_from_slice(&[1]);
+                data.extend_from_slice(&[0; 31]);
+            }
+            submit_signed_tx(
+                leader,
+                &signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(contract),
+                    value: U256::ZERO,
+                    data: Bytes::from(data),
+                    gas_limit: 500_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
+            assert_eq!(block.number(), nonce + 1);
+            assert_eq!(block.transactions.len(), 1);
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            macro_rules! assert_committed {
+                ($node:expr) => {{
+                    let node = $node;
+                    let receipts = node
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(receipts[0].status, u8::from(nonce > 0));
+                    assert_eq!(receipts[0].logs.len(), usize::from(nonce > 0 && !reverts));
+                    if nonce > 0 && !reverts {
+                        assert_eq!(receipts[0].logs[0].address, target);
+                        assert_eq!(receipts[0].logs[0].data.as_ref(), contract.as_bytes());
+                    }
+                    let root = current_state_root(node);
+                    assert_eq!(root, block.header.state_root);
+                    let state = WorldState::at_root(node.store.clone(), &root).unwrap();
+                    assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
+                    assert_eq!(
+                        state.get_storage(&contract, &counter_slot).unwrap(),
+                        ShellHash::from(U256::from(nonce).to_be_bytes::<32>())
+                    );
+                    assert_eq!(
+                        state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                        ShellHash::from(*target.as_bytes())
+                    );
+                    assert_eq!(
+                        state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        if nonce == 0 {
+                            ShellHash::ZERO
+                        } else {
+                            ShellHash::from(*contract.as_bytes())
+                        }
+                    );
+                    assert_eq!(
+                        state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                }};
+            }
+            assert_committed!(leader);
+            assert_committed!(follower);
+            assert_eq!(
+                leader.chain_store.get_receipts(&block.hash()).unwrap(),
+                follower.chain_store.get_receipts(&block.hash()).unwrap()
+            );
+            assert_eq!(
+                leader.world_state.read().get_balance(&sender).unwrap(),
+                follower.world_state.read().get_balance(&sender).unwrap()
+            );
+            observe(follower, &block);
+            blocks.push(block);
+        }
+        // Pruning advances monotonically; replay itself may descend across activation.
+        for block in &blocks {
+            assert_pruned_genesis_witness_recovery(follower, block);
+        }
+        for block in blocks.iter().rev() {
+            let before = follower.store.scan_prefix(b"").unwrap();
+            follower.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+            let historical =
+                WorldState::at_root(follower.store.clone(), &block.header.state_root).unwrap();
+            assert_eq!(
+                historical.get_storage(&contract, &counter_slot).unwrap(),
+                ShellHash::from(U256::from(block.number() - 1).to_be_bytes::<32>())
+            );
+        }
+        assert_eq!(
+            follower
+                .world_state
+                .read()
+                .get_storage(&contract, &counter_slot)
+                .unwrap(),
+            ShellHash::from(U256::from(3).to_be_bytes::<32>())
+        );
+        (sender, contract, target, blocks)
+    }
+
+    #[test]
+    fn native_compiler_receiver_signed_blocks_import_and_replay() {
+        let (leader, signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        native_compiler_receiver_signed_import(&leader, &follower, &signer, |_, _| {});
+    }
+
+    #[test]
+    fn native_compiler_receiver_rpc_output_and_historical_replay() {
+        use shell_rpc::api::{DebugApiServer, EthApiServer};
+        use shell_rpc::types::CallRequest;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime_guard = runtime.enter();
+        let (leader, signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&follower.chain_store),
+            Arc::clone(&follower.world_state),
+            Arc::clone(&follower.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let expected_output = |block: &Block| {
+            if block.number() == 1 {
+                return "0x".to_string();
+            }
+            let mut bytes = vec![0; 128];
+            bytes[..32]
+                .copy_from_slice(&U256::from(u8::from(block.number() != 3)).to_be_bytes::<32>());
+            bytes[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+            bytes[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+            bytes[96..].copy_from_slice(block.transactions[0].tx.to.unwrap().as_bytes());
+            format!("0x{}", hex::encode(bytes))
+        };
+        let (_, contract, target, blocks) =
+            native_compiler_receiver_signed_import(&leader, &follower, &signer, |node, block| {
+                let signed = &block.transactions[0];
+                let before = node.store.scan_prefix(b"").unwrap();
+                let root = current_state_root(node);
+                let output = runtime.block_on(EthApiServer::call(
+                    &handler,
+                    CallRequest {
+                        from: Some(signed.sender()),
+                        to: signed.tx.to,
+                        data: Some(format!("0x{}", hex::encode(&signed.tx.data))),
+                        value: None,
+                        gas: Some("0x7a120".into()),
+                        access_list: None,
+                    },
+                    Some("latest".into()),
+                ));
+                if block.number() == 1 {
+                    assert!(output.is_err());
+                } else {
+                    assert_eq!(output.unwrap(), expected_output(block));
+                }
+                assert_eq!(current_state_root(node), root);
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            });
+        // Historical trace output must follow the original block after the live counter advances.
+        let before = follower.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(&follower);
+        for block in blocks.iter().rev() {
+            let trace = runtime
+                .block_on(DebugApiServer::trace_transaction(
+                    &handler,
+                    block.transactions[0].hash().to_string(),
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(trace["output"], expected_output(block));
+            if block.number() > 1 {
+                assert_eq!(trace["calls"][0]["from"], contract.to_string());
+                assert_eq!(trace["calls"][0]["to"], target.to_string());
+                assert_eq!(
+                    trace["calls"][0]["output"],
+                    format!("0x{}", hex::encode(contract.as_bytes()))
+                );
+            }
+            assert_eq!(current_state_root(&follower), root);
+            assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_compiler_receiver_import_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_NATIVE_RECEIVER_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let fixture =
+                native_compiler_receiver_signed_import(&leader, &follower, &signer, |_, _| {});
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            // Recover committed WAL data after exiting without dropping the database.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-native-receiver-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::native_compiler_receiver_import_survives_process_exit",
+                "--nocapture",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "native receiver writer failed; retained {}",
+            directory.display()
+        );
+        let (sender, contract, target, blocks): (Address, Address, Address, Vec<Block>) =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        let tip = blocks.last().unwrap();
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let node = setup_node_with_store(tip.header.proposer, Arc::new(stores.state));
+        assert_eq!(
+            node.chain_store
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .native_address_context_height,
+            Some(2)
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        let mut bytes = *target.as_bytes();
+        bytes[..12].fill(0x56);
+        let alias = Address::from(bytes);
+        let counter_slot = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+        for block in blocks.iter().rev() {
+            let state = WorldState::at_root(node.store.clone(), &block.header.state_root).unwrap();
+            assert_eq!(state.get_nonce(&sender).unwrap(), block.number());
+            assert_eq!(
+                state.get_storage(&contract, &counter_slot).unwrap(),
+                ShellHash::from(U256::from(block.number() - 1).to_be_bytes::<32>())
+            );
+            assert_eq!(
+                state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                ShellHash::from(*target.as_bytes())
+            );
+            assert_eq!(
+                state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                ShellHash::ZERO
+            );
+            assert_eq!(
+                state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                if block.number() == 1 {
+                    ShellHash::ZERO
+                } else {
+                    ShellHash::from(*contract.as_bytes())
+                }
+            );
+            let receipt = node
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt[0].status, u8::from(block.number() > 1));
+            assert_eq!(
+                receipt[0].logs.len(),
+                usize::from(block.number() == 2 || block.number() == 4)
+            );
+            for log in &receipt[0].logs {
+                assert_eq!(log.address, target);
+                assert_eq!(log.data.as_ref(), contract.as_bytes());
+            }
+            let before = node.store.scan_prefix(b"").unwrap();
+            node.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        }
+        drop(node);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_address_context_signed_blocks_import_and_historical_replay() {
+        for activation in [None, Some(2)] {
+            let (leader, signer) = setup_node();
+            let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+            native_address_context_signed_import(&leader, &follower, &signer, activation);
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_address_context_import_survives_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_NATIVE_CONTEXT_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let fixture =
+                native_address_context_signed_import(&leader, &follower, &signer, Some(2));
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            // Exit without dropping RocksDB: reader must recover committed WAL data.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-native-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::native_address_context_import_survives_process_exit",
+                "--nocapture",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "native context writer failed; retained {}",
+            directory.display()
+        );
+        let (sender, contract, blocks): (Address, Address, Vec<Block>) =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        let tip = blocks.last().unwrap();
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let node = setup_node_with_store(tip.header.proposer, Arc::new(stores.state));
+        assert_eq!(
+            node.chain_store
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .native_address_context_height,
+            Some(2)
+        );
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
+        let state = WorldState::at_root(node.store.clone(), &tip.header.state_root).unwrap();
+        assert_eq!(state.get_nonce(&sender).unwrap(), 3);
+        assert_eq!(state.get_balance(&contract).unwrap(), U256::from(21));
+        assert_eq!(
+            state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+            ShellHash::from(*sender.as_bytes())
+        );
+        assert_eq!(
+            state
+                .get_storage(
+                    &contract,
+                    &ShellHash::from(U256::from(1).to_be_bytes::<32>())
+                )
+                .unwrap(),
+            ShellHash::from(*contract.as_bytes())
+        );
+        for block in &blocks {
+            let missing = Address::from(U256::from(0x10000 + block.number()).to_be_bytes::<32>());
+            assert_eq!(
+                state.get_account(&missing).unwrap().is_none(),
+                block.number() >= 2
+            );
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .status,
+                1
+            );
+            // Writer already pruned through the tip; recovery must not rewind its cursor.
+            let before = node.store.scan_prefix(b"").unwrap();
+            node.validate_legacy_backfill_witness(block).unwrap();
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        }
+        drop(state);
+        drop(node);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

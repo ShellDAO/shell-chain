@@ -1,0 +1,130 @@
+{
+  "source": "pragma solidity ^0.8.20; contract NativeContextCall { address public last; function invoke(bytes memory data) external returns(bool,bytes memory) {return address(this).call(data);} function poke() external returns(address) {last=msg.sender; return msg.sender;} function invokeDelegate(bytes memory data) external returns(bool,bytes memory) {return address(this).delegatecall(data);} function invokeStatic(bytes memory data) external view returns(bool,bytes memory) {return address(this).staticcall(data);} function read() external view returns(address) {return msg.sender;} }",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "selector": "0xa6514259",
+  "pokeSelector": "0x18178358",
+  "staticSelector": "0x4e941b01",
+  "delegateSelector": "0xb40262a5",
+  "readSelector": "0x57de26a4",
+  "artifact": {
+    "contractName": "NativeContextCall",
+    "sourcePath": "NativeContextCall.sol",
+    "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+    "abi": [
+      {
+        "inputs": [
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invoke",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invokeDelegate",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "invokeStatic",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          },
+          {
+            "internalType": "bytes",
+            "name": "",
+            "type": "bytes"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "last",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "poke",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "read",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      }
+    ],
+    "bytecode": "0x60808060405234601557610321908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c8063181783581461007457806347799da81461006f5780634e941b011461006a57806357de26a414610065578063a6514259146100605763b40262a51461005b575f80fd5b610275565b61023e565b61021c565b6101cc565b6100a3565b3461009f575f36600319011261009f5761008c6102ab565b5f556100966102ab565b60805260206080f35b5f80fd5b3461009f575f36600319011261009f5760205f54604051908152f35b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100f957604052565b6100bf565b67ffffffffffffffff81116100f957601f01601f191660200190565b602060031982011261009f5760043567ffffffffffffffff811161009f578160238201121561009f5780600401359061015a610155836100fe565b6100d3565b928284526024838301011161009f57815f92602460209301838601378301015290565b90929192151581526040602082015282518060408301525f5b8181106101b6575060609293505f838284010152601f8019910116010190565b8060208092870101516060828601015201610196565b3461009f576101da3661011a565b6101e26102b7565b6002431061009f575f828192602082519201905afa3d90610202826102c3565b915f602084013e6102186040519283928361017d565b0390f35b3461009f575f36600319011261009f5760206102366102ab565b604051908152f35b3461009f5761024c3661011a565b6102546102b7565b6002431061009f575f82819282602083519301915af13d90610202826102c3565b3461009f576102833661011a565b61028b6102b7565b6002431061009f575f828192602082519201905af43d90610202826102c3565b6002431061009f573390565b6002431061009f573090565b906102d0610155836100fe565b82815280926102e1601f19916100fe565b019060203691013756fea2646970667358221220f098cdac058830687ec4a0444469a5b51b582030a866563b620b6a92ef68029964736f6c63430008230033",
+    "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c8063181783581461007457806347799da81461006f5780634e941b011461006a57806357de26a414610065578063a6514259146100605763b40262a51461005b575f80fd5b610275565b61023e565b61021c565b6101cc565b6100a3565b3461009f575f36600319011261009f5761008c6102ab565b5f556100966102ab565b60805260206080f35b5f80fd5b3461009f575f36600319011261009f5760205f54604051908152f35b634e487b7160e01b5f52604160045260245ffd5b6040519190601f01601f1916820167ffffffffffffffff8111838210176100f957604052565b6100bf565b67ffffffffffffffff81116100f957601f01601f191660200190565b602060031982011261009f5760043567ffffffffffffffff811161009f578160238201121561009f5780600401359061015a610155836100fe565b6100d3565b928284526024838301011161009f57815f92602460209301838601378301015290565b90929192151581526040602082015282518060408301525f5b8181106101b6575060609293505f838284010152601f8019910116010190565b8060208092870101516060828601015201610196565b3461009f576101da3661011a565b6101e26102b7565b6002431061009f575f828192602082519201905afa3d90610202826102c3565b915f602084013e6102186040519283928361017d565b0390f35b3461009f575f36600319011261009f5760206102366102ab565b604051908152f35b3461009f5761024c3661011a565b6102546102b7565b6002431061009f575f82819282602083519301915af13d90610202826102c3565b3461009f576102833661011a565b61028b6102b7565b6002431061009f575f828192602082519201905af43d90610202826102c3565b6002431061009f573390565b6002431061009f573090565b906102d0610155836100fe565b82815280926102e1601f19916100fe565b019060203691013756fea2646970667358221220f098cdac058830687ec4a0444469a5b51b582030a866563b620b6a92ef68029964736f6c63430008230033"
+  }
+}

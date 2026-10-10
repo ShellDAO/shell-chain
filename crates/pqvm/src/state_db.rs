@@ -13,8 +13,9 @@
 //! For EVM-compatible accounts (upper 12 bytes are all zero), the 20-byte
 //! form is losslessly recovered by zero-padding. For PQ-derived accounts
 //! (upper 12 bytes non-zero, produced by `PQADDR`), the 20-byte form is a
-//! lossy truncation; full 32-byte-native execution requires a future revm
-//! fork that passes `ShellAddress` through the EVM call stack.
+//! lossy truncation in the legacy execution profile. The native context uses
+//! transaction-local handles to retain full identity through account lookup
+//! and retained instructions; creation and activation integration are pending.
 
 use alloy_primitives::{Address as EvmAddress, B256, U256};
 use revm::database_interface::{DBErrorMarker, Database};
@@ -52,8 +53,8 @@ impl DBErrorMarker for StateDbError {}
 /// `address_registry` provides the full 32-byte address so that lookups
 /// succeed when revm queries by the 20-byte truncated form.
 ///
-/// Full 32-byte-native execution throughout the EVM call stack requires a
-/// future revm fork; this registry is the compatibility shim until then.
+/// The legacy registry is a compatibility shim. The native context resolves
+/// transaction-local revm handles independently, without aliasing full keys.
 pub struct ShellStateDb<S: KvStore + 'static> {
     world_state: WorldState<S>,
     chain_store: ChainStore<S>,
@@ -61,6 +62,7 @@ pub struct ShellStateDb<S: KvStore + 'static> {
     /// accounts (upper 12 bytes non-zero). Populated by the executor before
     /// each tx; cleared after commit.
     pub(crate) address_registry: HashMap<EvmAddress, ShellAddress>,
+    native_context: Option<crate::native_context::NativeAddressContext>,
 }
 
 /// Read-only bridge used by simulation and validation paths.
@@ -71,6 +73,7 @@ pub struct ShellStateDb<S: KvStore + 'static> {
 pub(crate) struct ShellStateRefDb<'a, S: KvStore + 'static> {
     world_state: &'a WorldState<S>,
     chain_store: &'a ChainStore<S>,
+    native_context: Option<crate::native_context::NativeAddressContext>,
 }
 
 impl<'a, S: KvStore + 'static> ShellStateRefDb<'a, S> {
@@ -78,7 +81,26 @@ impl<'a, S: KvStore + 'static> ShellStateRefDb<'a, S> {
         Self {
             world_state,
             chain_store,
+            native_context: None,
         }
+    }
+
+    pub(crate) fn set_native_context(
+        &mut self,
+        context: crate::native_context::NativeAddressContext,
+    ) {
+        self.native_context = Some(context);
+    }
+
+    pub(crate) fn native_context_enabled(&self) -> bool {
+        self.native_context.is_some()
+    }
+
+    pub(crate) fn resolve_address(&self, address: EvmAddress) -> ShellAddress {
+        self.native_context.as_ref().map_or_else(
+            || ShellAddress::from(address),
+            |context| context.resolve(address),
+        )
     }
 
     pub(crate) fn world_state(&self) -> &WorldState<S> {
@@ -96,7 +118,19 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
             world_state,
             chain_store,
             address_registry: HashMap::new(),
+            native_context: None,
         }
+    }
+
+    pub(crate) fn set_native_context(
+        &mut self,
+        context: crate::native_context::NativeAddressContext,
+    ) {
+        self.native_context = Some(context);
+    }
+
+    pub(crate) fn clear_native_context(&mut self) {
+        self.native_context = None;
     }
 
     /// Register the full 32-byte Shell address for a PQ-derived account so
@@ -114,6 +148,7 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
     /// Clear the address registry after a transaction has been committed.
     pub fn clear_address_registry(&mut self) {
         self.address_registry.clear();
+        self.native_context = None;
     }
 
     /// Return a snapshot of the address registry (cloned).
@@ -124,13 +159,19 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
     pub fn address_registry_snapshot(
         &self,
     ) -> std::collections::HashMap<alloy_primitives::Address, ShellAddress> {
-        self.address_registry.clone()
+        self.native_context
+            .as_ref()
+            .map(|context| context.snapshot())
+            .unwrap_or_else(|| self.address_registry.clone())
     }
 
     /// Resolve a 20-byte EVM address to a full 32-byte Shell address.
     /// Checks the registry first; falls back to zero-padding.
     #[inline]
     pub(crate) fn resolve_address(&self, addr: &EvmAddress) -> ShellAddress {
+        if let Some(context) = &self.native_context {
+            return context.resolve(*addr);
+        }
         self.address_registry
             .get(addr)
             .copied()
@@ -165,6 +206,9 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
         &ChainStore<S>,
         &HashMap<EvmAddress, ShellAddress>,
     ) {
+        if let Some(context) = &self.native_context {
+            self.address_registry = context.snapshot();
+        }
         (
             &mut self.world_state,
             &self.chain_store,
@@ -240,7 +284,7 @@ impl<S: KvStore + 'static> Database for ShellStateRefDb<'_, S> {
     type Error = StateDbError;
 
     fn basic(&mut self, address: EvmAddress) -> Result<Option<AccountInfo>, Self::Error> {
-        let shell_addr = ShellAddress::from(address);
+        let shell_addr = self.resolve_address(address);
         Ok(self
             .world_state
             .get_account(&shell_addr)?
@@ -258,7 +302,7 @@ impl<S: KvStore + 'static> Database for ShellStateRefDb<'_, S> {
     }
 
     fn storage(&mut self, address: EvmAddress, index: U256) -> Result<U256, Self::Error> {
-        let shell_addr = ShellAddress::from(address);
+        let shell_addr = self.resolve_address(address);
         let key = ShellHash::from(B256::from(index));
         let value_hash = self.world_state.get_storage(&shell_addr, &key)?;
         Ok(U256::from_be_bytes(*value_hash.as_bytes()))

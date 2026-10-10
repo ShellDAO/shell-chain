@@ -210,6 +210,9 @@ pub struct GenesisConfig {
     /// First block rejecting oversized PQ address-derivation precompile inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_address_bounds_height: Option<u64>,
+    /// First block using full native address identities in contract execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_address_context_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,

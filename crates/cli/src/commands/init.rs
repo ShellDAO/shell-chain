@@ -118,6 +118,7 @@ pub fn init(
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,

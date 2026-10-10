@@ -1,8 +1,8 @@
 //! Bounded execution observations for read-only RPC replay.
 
 use revm::bytecode::opcode::{SLOAD, SSTORE};
+use revm::context::{BlockEnv, CfgEnv, Context, Journal, TxEnv};
 use revm::context_interface::ContextTr;
-use revm::handler::MainnetContext;
 use revm::inspector::Inspector;
 use revm::interpreter::interpreter_types::{Jumps, LoopControl};
 use revm::interpreter::{
@@ -126,10 +126,13 @@ impl ExecutionTracer {
     }
 }
 
-impl<S: KvStore + 'static> Inspector<MainnetContext<&mut ShellStateDb<S>>> for ExecutionTracer {
+type ExecutionContext<'a, S, C> =
+    Context<BlockEnv, TxEnv, CfgEnv, &'a mut ShellStateDb<S>, Journal<&'a mut ShellStateDb<S>>, C>;
+
+impl<S: KvStore + 'static, C> Inspector<ExecutionContext<'_, S, C>> for ExecutionTracer {
     fn call(
         &mut self,
-        ctx: &mut MainnetContext<&mut ShellStateDb<S>>,
+        ctx: &mut ExecutionContext<'_, S, C>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         if !self.reserve(TRACE_RECORD_OVERHEAD + inputs.input.len().saturating_mul(2)) {
@@ -154,7 +157,7 @@ impl<S: KvStore + 'static> Inspector<MainnetContext<&mut ShellStateDb<S>>> for E
 
     fn call_end(
         &mut self,
-        _ctx: &mut MainnetContext<&mut ShellStateDb<S>>,
+        _ctx: &mut ExecutionContext<'_, S, C>,
         _inputs: &CallInputs,
         outcome: &mut CallOutcome,
     ) {
@@ -163,7 +166,7 @@ impl<S: KvStore + 'static> Inspector<MainnetContext<&mut ShellStateDb<S>>> for E
 
     fn create(
         &mut self,
-        ctx: &mut MainnetContext<&mut ShellStateDb<S>>,
+        ctx: &mut ExecutionContext<'_, S, C>,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
         if !self.reserve(TRACE_RECORD_OVERHEAD + inputs.init_code().len().saturating_mul(2)) {
@@ -188,14 +191,14 @@ impl<S: KvStore + 'static> Inspector<MainnetContext<&mut ShellStateDb<S>>> for E
 
     fn create_end(
         &mut self,
-        _ctx: &mut MainnetContext<&mut ShellStateDb<S>>,
+        _ctx: &mut ExecutionContext<'_, S, C>,
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
         self.end(&outcome.result, outcome.address.map(Address::from));
     }
 
-    fn step(&mut self, interp: &mut Interpreter, _ctx: &mut MainnetContext<&mut ShellStateDb<S>>) {
+    fn step(&mut self, interp: &mut Interpreter, _ctx: &mut ExecutionContext<'_, S, C>) {
         self.current_step = None;
         let stack_bytes = if self.config.disable_stack {
             0
@@ -250,11 +253,7 @@ impl<S: KvStore + 'static> Inspector<MainnetContext<&mut ShellStateDb<S>>> for E
         });
     }
 
-    fn step_end(
-        &mut self,
-        interp: &mut Interpreter,
-        _ctx: &mut MainnetContext<&mut ShellStateDb<S>>,
-    ) {
+    fn step_end(&mut self, interp: &mut Interpreter, _ctx: &mut ExecutionContext<'_, S, C>) {
         let Some((index, op, key)) = self.current_step.take() else {
             return;
         };
