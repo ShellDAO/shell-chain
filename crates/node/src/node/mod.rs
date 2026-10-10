@@ -7550,11 +7550,42 @@ mod tests {
                 leader.config.proposer_address.unwrap(),
                 Arc::new(stores.state),
             );
-            let signer: Box<dyn Signer> = match std::env::var(ALGORITHM).unwrap().as_str() {
-                "mldsa" => Box::new(MlDsaSigner::generate()),
-                "dilithium" => Box::new(DilithiumSigner::generate()),
-                _ => panic!("unsupported AA signer"),
-            };
+            let (signer, signing_key): (Box<dyn Signer>, Vec<u8>) =
+                match std::env::var(ALGORITHM).unwrap().as_str() {
+                    "mldsa" => {
+                        let signer = MlDsaSigner::generate();
+                        let key = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), key)
+                    }
+                    "dilithium" => {
+                        let signer = DilithiumSigner::generate();
+                        let key = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), key)
+                    }
+                    _ => panic!("unsupported AA signer"),
+                };
+            // Only freshly generated test keys live in this isolated temporary directory.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            options
+                .open(directory.join("test-signers.json"))
+                .unwrap()
+                .write_all(
+                    &serde_json::to_vec(&(
+                        proposer_signer.public_key(),
+                        proposer_signer.secret_key_bytes().as_slice(),
+                        signer.public_key(),
+                        signing_key,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
             let fixture = native_typed_aa_import(
                 &leader,
                 &follower,
@@ -7606,12 +7637,16 @@ mod tests {
                 .unwrap();
             let tip = blocks.last().unwrap();
             let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
-            let (node, recovered_store) = crate::builder::NodeBuilder::new(
-                NodeConfig::dev(tip.header.proposer),
-                Arc::new(stores.state),
-            )
-            .build()
-            .unwrap();
+            // Match the writer's one-second PoA test network on both recovered nodes.
+            let mut recovered_config = NodeConfig::dev(tip.header.proposer);
+            recovered_config.consensus = crate::config::ConsensusEngineConfig::Poa(PoaConfig::new(
+                vec![tip.header.proposer],
+                1,
+            ));
+            let (node, recovered_store) =
+                crate::builder::NodeBuilder::new(recovered_config.clone(), Arc::new(stores.state))
+                    .build()
+                    .unwrap();
             assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
             assert_eq!(
                 node.chain_store
@@ -7720,6 +7755,150 @@ mod tests {
             drop(handler);
             drop(guard);
             drop(runtime);
+            let (proposer_public, proposer_secret, sender_public, sender_secret): (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+            ) = serde_json::from_slice(
+                &std::fs::read(directory.join("test-signers.json")).unwrap(),
+            )
+            .unwrap();
+            let proposer_signer =
+                DilithiumSigner::from_bytes(&proposer_public, &proposer_secret).unwrap();
+            let signer: Box<dyn Signer> = if algorithm == "mldsa" {
+                Box::new(MlDsaSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+            } else {
+                Box::new(DilithiumSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+            };
+            assert_eq!(
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()),
+                sender
+            );
+            // A separate recovered state validates imports independently of production.
+            let replica_store = Arc::new(MemoryDb::new());
+            for (key, value) in node.store.scan_prefix(b"").unwrap() {
+                replica_store.put(&key, &value).unwrap();
+            }
+            let (replica, _) = crate::builder::NodeBuilder::new(recovered_config, replica_store)
+                .build()
+                .unwrap();
+            // Restore the operator's public authority credential for seal verification.
+            node.register_authority_pubkey(tip.header.proposer, proposer_public.clone());
+            replica.register_authority_pubkey(tip.header.proposer, proposer_public);
+            for nonce in [4, 5] {
+                let inner_calls = [first, second]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
+                            .as_bytes()[..4]
+                            .to_vec();
+                        data.extend_from_slice(target.as_bytes());
+                        data.extend_from_slice(
+                            &if nonce == 5 && index == 1 {
+                                U256::ZERO
+                            } else {
+                                U256::MAX
+                            }
+                            .to_be_bytes::<32>(),
+                        );
+                        InnerCall {
+                            to: Some(contract),
+                            value: U256::ZERO,
+                            data: Bytes::from(data),
+                            gas_limit: 300_000,
+                        }
+                    })
+                    .collect();
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    sender,
+                    Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: None,
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 800_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 1,
+                        access_list: None,
+                        tx_type: AA_BUNDLE_TX_TYPE,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    },
+                    PQSignature::new(signer.sig_type(), vec![]),
+                    PubkeyMode::Embedded(signer.public_key().to_vec()),
+                    AaBundle {
+                        inner_calls,
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                let transaction_hash = signed.hash();
+                let balance = node.world_state.read().get_balance(&sender).unwrap();
+                node.tx_pool
+                    .insert(
+                        signed,
+                        &mut node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+                let block = node.produce_block(&proposer_signer, 100).unwrap();
+                replica.import_block(block.clone(), &MultiVerifier).unwrap();
+                let receipts = node
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                let transaction_index = block
+                    .transactions
+                    .iter()
+                    .position(|transaction| transaction.hash() == transaction_hash)
+                    .unwrap();
+                // NodeBuilder enables protocol reward receipts in addition to user transactions.
+                let user_receipt = &receipts[transaction_index];
+                assert_eq!(user_receipt.tx_hash, transaction_hash);
+                assert_eq!(user_receipt.status, u8::from(nonce == 4));
+                assert_eq!(
+                    replica
+                        .chain_store
+                        .get_receipts(&block.hash())
+                        .unwrap()
+                        .unwrap(),
+                    receipts
+                );
+                let fee = U256::from(user_receipt.gas_used)
+                    * U256::from(
+                        (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                    );
+                macro_rules! assert_resumed {
+                    ($node:expr) => {{
+                        let state = $node.world_state.read();
+                        assert_eq!(state.get_nonce(&sender).unwrap(), nonce + 1);
+                        assert_eq!(state.get_balance(&sender).unwrap(), balance - fee);
+                        assert_eq!(
+                            state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
+                            ShellHash::from(U256::from(6).to_be_bytes::<32>())
+                        );
+                        for target in [first, second] {
+                            assert_eq!(
+                                state.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                                ShellHash::from(*target.as_bytes())
+                            );
+                        }
+                    }};
+                }
+                assert_resumed!(node);
+                assert_resumed!(replica);
+                assert_eq!(current_state_root(&node), block.header.state_root);
+                assert_eq!(current_state_root(&replica), block.header.state_root);
+            }
+            drop(replica);
             drop(node);
             drop(recovered_store);
             drop(stores.chain);
