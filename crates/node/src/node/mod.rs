@@ -8085,8 +8085,7 @@ mod tests {
                 .unwrap();
             assert!(
                 receipts[0].status == u8::from(success),
-                "{reader} {activation:?} receipt status mismatch at block{}",
-                block.number()
+                "{reader} {activation:?} receipt status mismatch for input case {nonce}"
             );
             assert!(receipts[0].logs.is_empty());
             assert_eq!(
@@ -8401,8 +8400,7 @@ mod tests {
                 .unwrap();
             assert!(
                 receipts[0].status == u8::from(success),
-                "{reader} {activation:?} AA receipt status mismatch at block{}",
-                block.number()
+                "{reader} {activation:?} AA receipt status mismatch for input case {nonce}"
             );
             assert_eq!(receipts[0].tx_hash, hash);
             assert!(receipts[0].logs.is_empty());
