@@ -6746,8 +6746,8 @@ mod tests {
         serde_json::to_string(&fixture).unwrap()
     }
 
-    fn native_balance_latest_rpc(
-        node: &Node<MemoryDb>,
+    fn native_balance_latest_rpc<S: KvStore + 'static>(
+        node: &Node<S>,
         sender: Address,
         contract: Address,
         first: Address,
@@ -6770,26 +6770,38 @@ mod tests {
         );
         let before = node.store.scan_prefix(b"").unwrap();
         let root = current_state_root(node);
+        let active = node
+            .chain_store
+            .get_chain_config()
+            .unwrap()
+            .unwrap()
+            .native_address_context_height
+            .is_some();
         for (target, owner, word) in native_balance_words(first, second) {
             let mut data =
                 shell_primitives::keccak256(b"lookup(address,address)").as_bytes()[..4].to_vec();
             data.extend_from_slice(target.as_bytes());
             data.extend_from_slice(owner.as_bytes());
-            let output = runtime
-                .block_on(EthApiServer::call(
-                    &handler,
-                    CallRequest {
-                        from: Some(sender),
-                        to: Some(contract),
-                        data: Some(format!("0x{}", hex::encode(data))),
-                        value: None,
-                        gas: Some("0x7a120".into()),
-                        access_list: None,
-                    },
-                    Some("latest".into()),
-                ))
-                .unwrap();
-            assert_eq!(output, format!("0x{}", hex::encode(word.as_bytes())));
+            let output = runtime.block_on(EthApiServer::call(
+                &handler,
+                CallRequest {
+                    from: Some(sender),
+                    to: Some(contract),
+                    data: Some(format!("0x{}", hex::encode(data))),
+                    value: None,
+                    gas: Some("0x7a120".into()),
+                    access_list: None,
+                },
+                Some("latest".into()),
+            ));
+            if active {
+                assert_eq!(
+                    output.unwrap(),
+                    format!("0x{}", hex::encode(word.as_bytes()))
+                );
+            } else {
+                assert!(output.is_err(), "default-off native calldata must reject");
+            }
             assert_eq!(current_state_root(node), root);
             assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
         }
@@ -7224,6 +7236,7 @@ mod tests {
         proposer_signer: &DilithiumSigner,
         tx_signer: &impl Signer,
         owner_fixture: Option<&str>,
+        activation: Option<u64>,
     ) -> (Address, Address, Address, Address, Vec<Block>) {
         let owner_query = owner_fixture.is_some();
         let proposer = leader.config.proposer_address.unwrap();
@@ -7259,7 +7272,7 @@ mod tests {
         let initial_balance = U256::from(10_000_000_000_000_000_000u64);
         macro_rules! initialize { ($node:expr) => {{ let node = $node;
             node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
-            node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2,"fee_accounting_activation_height":0})).unwrap()).unwrap();
+            node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0})).unwrap()).unwrap();
             fund_account(node, &sender, initial_balance);
             for (address, code) in [
                 (contract, runtime(if owner_query || balance_query { "Reader" } else { "Typed" })),
@@ -7333,6 +7346,9 @@ mod tests {
         };
         for (nonce, (method, target, value, success, counter)) in cases.into_iter().enumerate() {
             let nonce = nonce as u64;
+            let active = activation.is_some_and(|height| nonce + 1 >= height);
+            let success = success && active;
+            let counter = if active { counter } else { 0 };
             let mut data = hex::decode(
                 fixture["selectors"][method]
                     .as_str()
@@ -7459,10 +7475,14 @@ mod tests {
             assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
             let history =
                 WorldState::at_root(follower.store.clone(), &block.header.state_root).unwrap();
-            let count = match block.number() {
-                1 => 0u64,
-                2 | 3 => 1,
-                _ => 2,
+            let count = if activation.is_none() {
+                0
+            } else {
+                match block.number() {
+                    1 => 0u64,
+                    2 | 3 => 1,
+                    _ => 2,
+                }
             };
             assert_eq!(
                 history.get_storage(&contract, &ShellHash::ZERO).unwrap(),
@@ -7485,7 +7505,9 @@ mod tests {
                 .read()
                 .get_storage(&contract, &ShellHash::ZERO)
                 .unwrap(),
-            ShellHash::from(U256::from(2).to_be_bytes::<32>())
+            ShellHash::from(
+                U256::from(if activation.is_some() { 2 } else { 0 }).to_be_bytes::<32>()
+            )
         );
         (sender, contract, first, second, blocks)
     }
@@ -7501,13 +7523,18 @@ mod tests {
                 &proposer_signer,
                 tx_signer,
                 None,
+                Some(2),
             );
         }
         run(&DilithiumSigner::generate());
         run(&MlDsaSigner::generate());
     }
 
-    fn native_owner_signed_rpc_and_history(tx_signer: &impl Signer, owner_fixture: &str) {
+    fn native_owner_signed_rpc_and_history(
+        tx_signer: &impl Signer,
+        owner_fixture: &str,
+        activation: Option<u64>,
+    ) {
         use shell_rpc::api::{DebugApiServer, EthApiServer};
         use shell_rpc::types::CallRequest;
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -7520,6 +7547,7 @@ mod tests {
             &proposer_signer,
             tx_signer,
             Some(owner_fixture),
+            activation,
         );
         let (events, _) = tokio::sync::broadcast::channel(16);
         let handler = shell_rpc::RpcHandler::new(
@@ -7578,27 +7606,31 @@ mod tests {
                     None,
                 ))
                 .unwrap();
-            let output = match block.number() {
-                2 => format!("0x{}", hex::encode(first.as_bytes())),
-                4 => format!(
-                    "0x{}",
-                    hex::encode(if balance_query { first } else { second }.as_bytes())
-                ),
-                3 => {
-                    let mut bytes = shell_primitives::keccak256(if balance_query {
-                        b"Missing(address)".as_slice()
-                    } else {
-                        b"Missing(uint256)".as_slice()
-                    })
-                    .as_bytes()[..4]
-                        .to_vec();
-                    bytes.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
-                    format!("0x{}", hex::encode(bytes))
+            let output = if activation.is_none() {
+                "0x".into()
+            } else {
+                match block.number() {
+                    2 => format!("0x{}", hex::encode(first.as_bytes())),
+                    4 => format!(
+                        "0x{}",
+                        hex::encode(if balance_query { first } else { second }.as_bytes())
+                    ),
+                    3 => {
+                        let mut bytes = shell_primitives::keccak256(if balance_query {
+                            b"Missing(address)".as_slice()
+                        } else {
+                            b"Missing(uint256)".as_slice()
+                        })
+                        .as_bytes()[..4]
+                            .to_vec();
+                        bytes.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                        format!("0x{}", hex::encode(bytes))
+                    }
+                    _ => "0x".into(),
                 }
-                _ => "0x".into(),
             };
             assert_eq!(trace["output"], output);
-            if [2, 3, 4].contains(&block.number()) {
+            if activation.is_some() && [2, 3, 4].contains(&block.number()) {
                 assert_eq!(trace["calls"][0]["from"], contract.to_string());
                 assert_eq!(
                     trace["calls"][0]["to"],
@@ -7617,23 +7649,35 @@ mod tests {
             ("PureBytesReader", "bytes32"),
         ] {
             let fixture = native_pure_balance_fixture(reader, result_type);
-            native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), &fixture);
-            native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), &fixture);
+            native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), &fixture, Some(2));
+            native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), &fixture, Some(2));
+        }
+    }
+
+    #[test]
+    fn native_pure_balance_signed_default_off_import_rpc_and_history() {
+        for (reader, result_type) in [
+            ("PureAddressReader", "address"),
+            ("PureBytesReader", "bytes32"),
+        ] {
+            let fixture = native_pure_balance_fixture(reader, result_type);
+            native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), &fixture, None);
+            native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), &fixture, None);
         }
     }
 
     #[test]
     fn native_typed_interface_uint256_signed_import_rpc_and_history() {
         let fixture = include_str!("../../../pqvm/tests/fixtures/native-owner.json");
-        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture);
-        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture);
+        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture, Some(2));
+        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture, Some(2));
     }
 
     #[test]
     fn native_typed_interface_bytes32_signed_import_rpc_and_history() {
         let fixture = include_str!("../../../pqvm/tests/fixtures/native-owner-bytes32.json");
-        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture);
-        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture);
+        native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), fixture, Some(2));
+        native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), fixture, Some(2));
     }
 
     #[cfg(feature = "rocksdb")]
@@ -7664,6 +7708,7 @@ mod tests {
                     &proposer_signer,
                     &MlDsaSigner::generate(),
                     owner_fixture,
+                    Some(2),
                 )
             } else {
                 native_typed_interface_signed_import(
@@ -7672,6 +7717,7 @@ mod tests {
                     &proposer_signer,
                     &DilithiumSigner::generate(),
                     owner_fixture,
+                    Some(2),
                 )
             };
             std::fs::write(
@@ -7828,13 +7874,41 @@ mod tests {
     }
 
     #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_pure_balance_address_aa_survives_process_exit() {
+        let fixture = native_pure_balance_fixture("PureAddressReader", "address");
+        check_native_typed_owner_aa_recovery(
+            &fixture,
+            "node::tests::native_pure_balance_address_aa_survives_process_exit",
+            "address",
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_pure_balance_bytes32_aa_survives_process_exit() {
+        let fixture = native_pure_balance_fixture("PureBytesReader", "bytes32");
+        check_native_typed_owner_aa_recovery(
+            &fixture,
+            "node::tests::native_pure_balance_bytes32_aa_survives_process_exit",
+            "bytes32",
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
     fn check_native_typed_owner_aa_recovery(
         owner_fixture: &str,
         test_name: &str,
         result_type: &str,
     ) {
         let fixture: serde_json::Value = serde_json::from_str(owner_fixture).unwrap();
-        for (contract, function) in [("Reader", "lookup"), ("Owner", "ownerOf")] {
+        let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let entries = if balance_query {
+            vec![("Reader", "lookup")]
+        } else {
+            vec![("Reader", "lookup"), ("Owner", "ownerOf")]
+        };
+        for (contract, function) in entries {
             let abi = fixture["artifacts"][contract]["abi"].as_array().unwrap();
             let entry = abi.iter().find(|entry| entry["name"] == function).unwrap();
             assert_eq!(entry["outputs"][0]["type"], result_type);
@@ -7886,18 +7960,31 @@ mod tests {
             second: Address,
             expected_balance: U256,
             continued_blocks: &[(Block, Vec<shell_core::TransactionReceipt>, U256)],
+            balance_query: bool,
             check_reads: impl Fn(),
         ) {
-            for (target, token) in [
-                (first, U256::MAX),
-                (second, U256::MAX),
-                (second, U256::ZERO),
-            ] {
-                let mut data = shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()
-                    [..4]
+            let mut cases = if balance_query {
+                native_balance_words(first, second)
+                    .into_iter()
+                    .map(|(target, owner, word)| (target, owner, Some(word)))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![
+                    (first, Address::from([0xff; 32]), Some(first)),
+                    (second, Address::from([0xff; 32]), Some(second)),
+                ]
+            };
+            cases.push((second, Address::ZERO, None));
+            for (target, owner, expected) in cases {
+                let mut data = shell_primitives::keccak256(if balance_query {
+                    b"lookup(address,address)".as_slice()
+                } else {
+                    b"lookup(address,uint256)".as_slice()
+                })
+                .as_bytes()[..4]
                     .to_vec();
                 data.extend_from_slice(target.as_bytes());
-                data.extend_from_slice(&token.to_be_bytes::<32>());
+                data.extend_from_slice(owner.as_bytes());
                 let response = http_request(
                     address,
                     "eth_call",
@@ -7907,18 +7994,23 @@ mod tests {
                     ]),
                 )
                 .await;
-                if token == U256::MAX {
+                if let Some(word) = expected {
                     assert!(response.get("error").is_none(), "{response}");
                     assert_eq!(
                         response["result"],
-                        format!("0x{}", hex::encode(target.as_bytes()))
+                        format!("0x{}", hex::encode(word.as_bytes()))
                     );
                 } else {
                     assert!(response.get("result").is_none(), "{response}");
                     assert_eq!(response["error"]["code"], -32000);
-                    let mut revert =
-                        shell_primitives::keccak256(b"Missing(uint256)").as_bytes()[..4].to_vec();
-                    revert.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                    let mut revert = shell_primitives::keccak256(if balance_query {
+                        b"Missing(address)".as_slice()
+                    } else {
+                        b"Missing(uint256)".as_slice()
+                    })
+                    .as_bytes()[..4]
+                        .to_vec();
+                    revert.extend_from_slice(Address::ZERO.as_bytes());
                     assert_eq!(
                         response["error"]["data"],
                         format!("0x{}", hex::encode(revert))
@@ -8108,12 +8200,30 @@ mod tests {
                 );
                 assert_eq!(
                     state.get_storage(&first, &ShellHash::ZERO).unwrap(),
-                    ShellHash::from(*first.as_bytes())
+                    if balance_query {
+                        ShellHash::ZERO
+                    } else {
+                        ShellHash::from(*first.as_bytes())
+                    }
                 );
                 assert_eq!(
                     state.get_storage(&second, &ShellHash::ZERO).unwrap(),
-                    ShellHash::from(*second.as_bytes())
+                    if balance_query {
+                        ShellHash::ZERO
+                    } else {
+                        ShellHash::from(*second.as_bytes())
+                    }
                 );
+                if balance_query {
+                    for (target, owner, word) in native_balance_words(first, second) {
+                        assert_eq!(
+                            state
+                                .get_storage(&target, &native_balance_slot(owner))
+                                .unwrap(),
+                            ShellHash::from(*word.as_bytes())
+                        );
+                    }
+                }
                 assert_eq!(
                     state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
                     ShellHash::ZERO
@@ -8153,6 +8263,11 @@ mod tests {
             use shell_rpc::types::CallRequest;
             let assert_readonly_rpc =
                 |node: &Node<shell_storage::RocksDbStore>, expected_root: ShellHash| {
+                    if balance_query {
+                        native_balance_latest_rpc(node, sender, contract, first, second);
+                        assert_eq!(current_state_root(node), expected_root);
+                        return;
+                    }
                     let runtime = tokio::runtime::Runtime::new().unwrap();
                     let guard = runtime.enter();
                     let (events, _) = tokio::sync::broadcast::channel(16);
@@ -8246,12 +8361,22 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(index, target)| {
-                        let mut data = shell_primitives::keccak256(b"lookup(address,uint256)")
-                            .as_bytes()[..4]
+                        let mut data = shell_primitives::keccak256(if balance_query {
+                            b"record(address,address)".as_slice()
+                        } else {
+                            b"lookup(address,uint256)".as_slice()
+                        })
+                        .as_bytes()[..4]
                             .to_vec();
                         data.extend_from_slice(target.as_bytes());
                         data.extend_from_slice(
-                            &if nonce == 5 && index == 1 {
+                            &if balance_query {
+                                if nonce == 5 && index == 1 {
+                                    U256::ZERO
+                                } else {
+                                    U256::from_be_bytes(*target.as_bytes())
+                                }
+                            } else if nonce == 5 && index == 1 {
                                 U256::ZERO
                             } else {
                                 U256::MAX
@@ -8343,8 +8468,22 @@ mod tests {
                         for target in [first, second] {
                             assert_eq!(
                                 state.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                                ShellHash::from(*target.as_bytes())
+                                if balance_query {
+                                    ShellHash::ZERO
+                                } else {
+                                    ShellHash::from(*target.as_bytes())
+                                }
                             );
+                        }
+                        if balance_query {
+                            for (target, owner, word) in native_balance_words(first, second) {
+                                assert_eq!(
+                                    state
+                                        .get_storage(&target, &native_balance_slot(owner))
+                                        .unwrap(),
+                                    ShellHash::from(*word.as_bytes())
+                                );
+                            }
                         }
                     }};
                 }
@@ -8395,8 +8534,22 @@ mod tests {
                 for target in [first, second] {
                     assert_eq!(
                         state.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                        ShellHash::from(*target.as_bytes())
+                        if balance_query {
+                            ShellHash::ZERO
+                        } else {
+                            ShellHash::from(*target.as_bytes())
+                        }
                     );
+                }
+                if balance_query {
+                    for (target, owner, word) in native_balance_words(first, second) {
+                        assert_eq!(
+                            state
+                                .get_storage(&target, &native_balance_slot(owner))
+                                .unwrap(),
+                            ShellHash::from(*word.as_bytes())
+                        );
+                    }
                 }
                 assert_eq!(
                     state.get_storage(&alias, &ShellHash::ZERO).unwrap(),
@@ -8463,6 +8616,7 @@ mod tests {
                     second,
                     expected_balance,
                     &continued_blocks,
+                    balance_query,
                     || {
                         assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
                         assert_eq!(current_state_root(&node), continued_tip.header.state_root);
@@ -8550,6 +8704,7 @@ mod tests {
                     second,
                     expected_balance,
                     &continued_blocks,
+                    balance_query,
                     || {},
                 ));
                 drop(runtime);
@@ -8568,6 +8723,18 @@ mod tests {
                     state.get_storage(&contract, &ShellHash::ZERO).unwrap(),
                     ShellHash::from(U256::from(6).to_be_bytes::<32>())
                 );
+                if balance_query {
+                    for (target, owner, word) in native_balance_words(first, second) {
+                        assert_eq!(
+                            state
+                                .get_storage(&target, &native_balance_slot(owner))
+                                .unwrap(),
+                            ShellHash::from(*word.as_bytes())
+                        );
+                    }
+                    let alias = state.get_storage(&alias, &ShellHash::ZERO).unwrap();
+                    assert_eq!(alias, ShellHash::ZERO);
+                }
                 drop(state);
                 drop(chain);
                 drop(stores.chain);

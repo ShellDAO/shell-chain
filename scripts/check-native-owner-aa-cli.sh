@@ -5,8 +5,11 @@ set -euo pipefail
 case "${1:-all}" in
   address) test_name=native_typed_interface_address_owner_aa_survives_process_exit ;;
   bytes32) test_name=native_typed_interface_bytes32_aa_survives_process_exit ;;
+  pure-address) test_name=native_pure_balance_address_aa_survives_process_exit ;;
+  pure-bytes32) test_name=native_pure_balance_bytes32_aa_survives_process_exit ;;
+  pure) test_name=native_pure_balance_ ;;
   all) test_name=aa_survives_process_exit ;;
-  *) echo "usage: $0 [address|bytes32|all]" >&2; exit 2 ;;
+  *) echo "usage: $0 [address|bytes32|pure-address|pure-bytes32|pure|all]" >&2; exit 2 ;;
 esac
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
