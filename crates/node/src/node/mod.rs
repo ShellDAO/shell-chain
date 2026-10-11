@@ -7628,7 +7628,10 @@ mod tests {
             assert_eq!(receipts[0].status, u8::from(step.success));
             let state =
                 WorldState::at_root(node.store.clone(), &step.block.header.state_root).unwrap();
-            assert_eq!(state.get_nonce(&sender).unwrap(), step.block.number());
+            assert_eq!(
+                state.get_nonce(&sender).unwrap(),
+                step.block.transactions[0].tx.nonce + 1
+            );
             assert_eq!(state.get_balance(&sender).unwrap(), step.sender_balance);
             assert_eq!(
                 state
@@ -7750,7 +7753,15 @@ mod tests {
         } else {
             assert!(output.is_err());
         }
-        assert_eq!(root, tip.block.header.state_root);
+        assert_eq!(
+            root,
+            node.chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .header
+                .state_root
+        );
         assert_eq!(current_state_root(node), root);
         assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
     }
@@ -8939,6 +8950,7 @@ mod tests {
         directory: &std::path::Path,
         p2p: bool,
         bootnode: Option<&str>,
+        wpoa: bool,
     ) -> (NativeStructCli, std::net::SocketAddr, Option<String>) {
         std::fs::write(
             directory.join("observer.toml"),
@@ -8958,10 +8970,12 @@ mod tests {
                 "dev",
                 "--chain-id",
                 "1337",
+                "--block-time",
+                "5000",
                 "--db",
                 "rocksdb",
                 "--consensus-engine",
-                "poa",
+                if wpoa { "wpoa" } else { "poa" },
                 "--storage-profile",
                 "archive",
                 "--rpc-addr",
@@ -8973,7 +8987,15 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let socket = listener.local_addr().unwrap();
             // Fresh transport identity, independent of the consensus and transaction keys.
-            let identity = libp2p::identity::Keypair::generate_ed25519();
+            let key_path = directory.join("libp2p.key");
+            let identity = if key_path.exists() {
+                libp2p::identity::Keypair::from_protobuf_encoding(
+                    &std::fs::read(&key_path).unwrap(),
+                )
+                .unwrap()
+            } else {
+                libp2p::identity::Keypair::generate_ed25519()
+            };
             let mut options = std::fs::OpenOptions::new();
             options.create_new(true).write(true);
             #[cfg(unix)]
@@ -8982,11 +9004,13 @@ mod tests {
                 options.mode(0o600);
             }
             use std::io::Write;
-            options
-                .open(directory.join("libp2p.key"))
-                .unwrap()
-                .write_all(&identity.to_protobuf_encoding().unwrap())
-                .unwrap();
+            if !key_path.exists() {
+                options
+                    .open(&key_path)
+                    .unwrap()
+                    .write_all(&identity.to_protobuf_encoding().unwrap())
+                    .unwrap();
+            }
             command
                 .args(["--p2p", "--p2p-addr"])
                 .arg(socket.to_string());
@@ -9028,6 +9052,491 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         (child, address, peer_address)
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn native_struct_argument_live_cli(
+        binary: &std::ffi::OsStr,
+        directory: &std::path::Path,
+        reader: &str,
+        algorithm: &str,
+        activation: Option<u64>,
+        config: &NodeConfig,
+        steps: &mut Vec<NativeStructStep>,
+    ) {
+        let (proposer_public, proposer_secret, sender_public, sender_secret): (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        ) = serde_json::from_slice(&std::fs::read(directory.join("test-signers.json")).unwrap())
+            .unwrap();
+        let signer: Box<dyn Signer> = if algorithm == "mldsa" {
+            Box::new(MlDsaSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+        } else {
+            Box::new(DilithiumSigner::from_bytes(&sender_public, &sender_secret).unwrap())
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).truncate(true);
+        // This file belongs to the fresh isolated test observer, never an existing user key.
+        use std::io::Write;
+        options
+            .open(directory.join("dev-authority.json"))
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&serde_json::json!({
+                    "public_key":format!("0x{}",hex::encode(proposer_public)),
+                    "secret_key":format!("0x{}",hex::encode(proposer_secret)),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let (validator, validator_address, bootnode) =
+            native_struct_start_cli(binary, directory, true, None, true);
+        let follower_directory = directory.join("peer");
+        let (follower, follower_address, _) =
+            native_struct_start_cli(binary, &follower_directory, true, bootnode.as_deref(), true);
+        let mut live_config = config.clone();
+        let crate::config::ConsensusEngineConfig::Poa(poa) = &config.consensus else {
+            panic!("original fixture must use PoA");
+        };
+        live_config.consensus =
+            crate::config::ConsensusEngineConfig::WPoa(WPoaConfig::from_poa(poa.clone()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let sender = steps[0].block.transactions[0].from;
+        let ledger = Address::from([0x98; 32]);
+        let first = native_struct_word(0x34, 0x12);
+        let second = native_struct_word(0x56, 0x12);
+        let beneficiary = native_struct_word(0x78, 0x23);
+        let other = native_struct_word(0x9a, 0x23);
+        let mut lookup = shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
+        lookup.extend_from_slice(&[0; 32]);
+        let set = |token: Address, owner: Address| {
+            let mut data = shell_primitives::keccak256(b"set(uint256,address,address)").as_bytes()
+                [..4]
+                .to_vec();
+            data.extend_from_slice(&[0; 32]);
+            data.extend_from_slice(token.as_bytes());
+            data.extend_from_slice(owner.as_bytes());
+            data
+        };
+        let mut live = Vec::new();
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let peers =
+                    native_http_request(follower_address, "net_peerCount", serde_json::json!([]))
+                        .await;
+                if peers["result"] == "0x1" {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "live peer timeout: {peers}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let mut nonce = steps.last().unwrap().block.transactions[0].tx.nonce + 1;
+            let mut balance = steps.last().unwrap().sender_balance;
+            let mut token = steps.last().unwrap().token;
+            let mut owner = steps.last().unwrap().beneficiary;
+            let mut selections = steps.last().unwrap().selections;
+            for (target, beneficiary, word, valid) in [
+                (first, beneficiary, U256::MAX, true),
+                (
+                    first,
+                    other,
+                    (U256::from(1) << 200usize) + U256::from(73),
+                    true,
+                ),
+                (second, beneficiary, U256::from(19), true),
+                (second, other, U256::ZERO, true),
+                (first, beneficiary, U256::MAX, false),
+            ] {
+                let mut calls = vec![
+                    (set(target, beneficiary), vec![]),
+                    (lookup.clone(), word.to_be_bytes::<32>().to_vec()),
+                ];
+                if !valid {
+                    calls.push((set(Address::from([0x67; 32]), beneficiary), vec![]));
+                    calls.push((lookup.clone(), vec![]));
+                }
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    sender,
+                    Transaction {
+                        chain_id: 1337,
+                        nonce,
+                        to: None,
+                        value: U256::ZERO,
+                        data: Bytes::new(),
+                        gas_limit: 1_500_000,
+                        max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                        max_priority_fee_per_gas: 1,
+                        access_list: None,
+                        tx_type: AA_BUNDLE_TX_TYPE,
+                        max_fee_per_blob_gas: None,
+                        blob_versioned_hashes: None,
+                    },
+                    PQSignature::new(signer.sig_type(), vec![]),
+                    PubkeyMode::Embedded(signer.public_key().to_vec()),
+                    AaBundle {
+                        inner_calls: calls
+                            .iter()
+                            .map(|(data, _)| InnerCall {
+                                to: Some(ledger),
+                                value: U256::ZERO,
+                                data: Bytes::from(data.clone()),
+                                gas_limit: 300_000,
+                            })
+                            .collect(),
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                if live.is_empty() {
+                    let controls = [
+                        (
+                            "eth_getTransactionCount",
+                            serde_json::json!([sender.to_string(), "latest"]),
+                        ),
+                        (
+                            "eth_getBalance",
+                            serde_json::json!([sender.to_string(), "latest"]),
+                        ),
+                        (
+                            "eth_getTransactionCount",
+                            serde_json::json!([beneficiary.to_string(), "latest"]),
+                        ),
+                        (
+                            "eth_getBalance",
+                            serde_json::json!([beneficiary.to_string(), "latest"]),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([
+                                ledger.to_string(),
+                                native_struct_record_slot(0).to_string(),
+                                "latest"
+                            ]),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([
+                                ledger.to_string(),
+                                native_struct_record_slot(1).to_string(),
+                                "latest"
+                            ]),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([ledger.to_string(), "0x1", "latest"]),
+                        ),
+                    ];
+                    let mut before = Vec::new();
+                    for (method, params) in &controls {
+                        let result =
+                            native_http_request(follower_address, method, params.clone()).await;
+                        assert!(result.get("error").is_none(), "{result}");
+                        before.push(result["result"].clone());
+                    }
+                    let mut tampered = signed.clone();
+                    tampered.signature.data[0] ^= 1;
+                    let mut changed = signed.clone();
+                    changed.aa_bundle.as_mut().unwrap().inner_calls[0].value = U256::from(1);
+                    let mut wrong_sender = signed.clone();
+                    wrong_sender.from = beneficiary;
+                    for (index,bad) in [tampered, changed, wrong_sender].into_iter().enumerate() {
+                        let params=serde_json::json!([bad]);
+                        let result = native_http_request(
+                            follower_address,
+                            "shell_sendTransaction",
+                            params.clone(),
+                        ).await;
+                        std::fs::write(directory.join(format!("live-rejected-{index}.json")),
+                            serde_json::to_vec(&serde_json::json!({"method":"shell_sendTransaction","params":params,"response":result})).unwrap()).unwrap();
+                        assert!(
+                            result.get("result").is_none() && result.get("error").is_some(),
+                            "{result}"
+                        );
+                    }
+                    for ((method, params), expected) in controls.iter().zip(before) {
+                        let result =
+                            native_http_request(follower_address, method, params.clone()).await;
+                        assert_eq!(
+                            result["result"], expected,
+                            "rejected input changed {method}: {result}"
+                        );
+                    }
+                    let unchanged = native_http_request(
+                        follower_address,
+                        "eth_getTransactionCount",
+                        serde_json::json!([sender.to_string(), "latest"]),
+                    )
+                    .await;
+                    assert_eq!(unchanged["result"], format!("0x{nonce:x}"));
+                }
+                let hash = signed.hash();
+                let params=serde_json::json!([signed]);
+                let response = native_http_request(
+                    follower_address,
+                    "shell_sendTransaction",
+                    params.clone(),
+                ).await;
+                // Public signed envelopes and receipts preserve precise failing inputs;
+                // private signing credentials stay outside these diagnostic artifacts.
+                std::fs::write(directory.join(format!("live-{nonce}-request.json")),
+                    serde_json::to_vec(&serde_json::json!({"method":"shell_sendTransaction","params":params,"response":response})).unwrap()).unwrap();
+                assert_eq!(response["result"], hash.to_string(), "{response}");
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+                let receipt = loop {
+                    let receipt = native_http_request(
+                        follower_address,
+                        "eth_getTransactionReceipt",
+                        serde_json::json!([hash.to_string()]),
+                    )
+                    .await;
+                    if receipt["result"].is_object() {
+                        break receipt["result"].clone();
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "live inclusion timeout: {receipt}; retained {}",
+                        directory.display()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                };
+                std::fs::write(directory.join(format!("live-{nonce}-receipt.json")),serde_json::to_vec(&receipt).unwrap()).unwrap();
+                let success = activation.is_some() && valid;
+                assert_eq!(receipt["transactionHash"], hash.to_string());
+                assert_eq!(receipt["status"], format!("0x{:x}", u8::from(success)));
+                let number = u64::from_str_radix(
+                    receipt["blockNumber"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                let gas = u64::from_str_radix(
+                    receipt["gasUsed"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                assert!(gas > 0);
+                let block = native_http_request(
+                    follower_address,
+                    "eth_getBlockByNumber",
+                    serde_json::json!([format!("0x{number:x}"), false]),
+                )
+                .await;
+                assert_eq!(block["result"]["hash"], receipt["blockHash"]);
+                let base = u64::from_str_radix(
+                    block["result"]["baseFeePerGas"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                balance -=
+                    U256::from(gas) * U256::from((2 * shell_core::INITIAL_BASE_FEE).min(base + 1));
+                nonce += 1;
+                if success {
+                    token = target;
+                    owner = beneficiary;
+                    selections += u64::from(reader == "SelectingLedger");
+                }
+                for endpoint in [validator_address, follower_address] {
+                    for (method, params, expected) in [
+                        (
+                            "eth_getTransactionCount",
+                            serde_json::json!([sender.to_string(), "latest"]),
+                            format!("0x{nonce:x}"),
+                        ),
+                        (
+                            "eth_getBalance",
+                            serde_json::json!([sender.to_string(), "latest"]),
+                            format!("0x{balance:x}"),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([
+                                ledger.to_string(),
+                                native_struct_record_slot(0).to_string(),
+                                "latest"
+                            ]),
+                            token.to_string(),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([
+                                ledger.to_string(),
+                                native_struct_record_slot(1).to_string(),
+                                "latest"
+                            ]),
+                            owner.to_string(),
+                        ),
+                        (
+                            "eth_getStorageAt",
+                            serde_json::json!([ledger.to_string(), "0x1", "latest"]),
+                            ShellHash::from(U256::from(selections).to_be_bytes::<32>()).to_string(),
+                        ),
+                    ] {
+                        let result = native_http_request(endpoint, method, params).await;
+                        assert_eq!(result["result"], expected, "{method}: {result}");
+                    }
+                    let copy = native_http_request(
+                        endpoint,
+                        "eth_getTransactionReceipt",
+                        serde_json::json!([hash.to_string()]),
+                    )
+                    .await;
+                    assert_eq!(copy["result"], receipt);
+                }
+                live.push((
+                    number,
+                    hash,
+                    token,
+                    owner,
+                    selections,
+                    balance,
+                    success,
+                    if activation.is_some() {
+                        calls.into_iter().map(|(_, output)| output).collect()
+                    } else {
+                        vec![vec![], vec![]]
+                    },
+                ));
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let finalized = native_http_request(
+                    follower_address,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["finalized", false]),
+                )
+                .await;
+                let number = finalized["result"]["number"]
+                    .as_str()
+                    .and_then(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+                if number >= live.last().unwrap().0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "live wPoA finality timeout: {finalized}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        drop(validator);
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let (source, recovered) =
+            crate::builder::NodeBuilder::new(live_config.clone(), Arc::new(stores.state))
+                .build()
+                .unwrap();
+        let head = source.chain_store.get_head_block().unwrap().unwrap();
+        let finalized = source.chain_store.get_finalized_number().unwrap().unwrap();
+        assert!(finalized >= live.last().unwrap().0);
+        let finalized_hash = source
+            .chain_store
+            .get_block_hash_by_number(finalized)
+            .unwrap()
+            .unwrap();
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let tip = native_http_request(
+                    follower_address,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["latest", false]),
+                )
+                .await;
+                let finality = native_http_request(
+                    follower_address,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["finalized", false]),
+                )
+                .await;
+                if tip["result"]["hash"] == head.hash().to_string()
+                    && finality["result"]["hash"] == finalized_hash.to_string()
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "live finality timeout: {tip} {finality}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        for (
+            number,
+            hash,
+            token,
+            beneficiary,
+            selections,
+            sender_balance,
+            success,
+            inner_outputs,
+        ) in live
+        {
+            let block = source
+                .chain_store
+                .get_block_by_number(number)
+                .unwrap()
+                .unwrap();
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(block.transactions[0].hash(), hash);
+            steps.push(NativeStructStep {
+                block,
+                token,
+                beneficiary,
+                selections,
+                sender_balance,
+                success,
+                output: vec![],
+                inner_outputs: Some(inner_outputs),
+            });
+        }
+        native_struct_argument_history(&source, steps, activation);
+        drop(follower);
+        let follower_stores =
+            shell_storage::RocksDbStore::open_all(follower_directory.join("db"), None).unwrap();
+        let (replica, replica_store) =
+            crate::builder::NodeBuilder::new(live_config, Arc::new(follower_stores.state))
+                .build()
+                .unwrap();
+        assert_eq!(
+            replica.chain_store.get_head_hash().unwrap(),
+            Some(head.hash())
+        );
+        assert_eq!(current_state_root(&replica), head.header.state_root);
+        assert_eq!(
+            replica.chain_store.get_finalized_number().unwrap(),
+            Some(finalized)
+        );
+        native_struct_argument_history(&replica, steps, activation);
+        assert_eq!(current_state_root(&source), current_state_root(&replica));
+        drop(replica);
+        drop(replica_store);
+        drop(follower_stores.chain);
+        drop(follower_stores.receipts);
+        drop(follower_stores.index);
+        drop(follower_stores.witness);
+        drop(source);
+        drop(recovered);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
     }
 
     #[cfg(feature = "rocksdb")]
@@ -9294,7 +9803,7 @@ mod tests {
                             let p2p = std::env::var("SHELL_TEST_NATIVE_STRUCT_P2P").as_deref()
                                 == Ok("yes");
                             let (child, address, bootnode) =
-                                native_struct_start_cli(&binary, &directory, p2p, None);
+                                native_struct_start_cli(&binary, &directory, p2p, None, false);
                             let runtime = tokio::runtime::Runtime::new().unwrap();
                             runtime.block_on(native_struct_argument_http_verify(
                                 address,
@@ -9319,6 +9828,7 @@ mod tests {
                                         &follower_directory,
                                         true,
                                         Some(&bootnode),
+                                        false,
                                     );
                                 assert_ne!(
                                     follower_peer.as_ref().unwrap().rsplit('/').next(),
@@ -9428,10 +9938,12 @@ mod tests {
                             let stores =
                                 shell_storage::RocksDbStore::open_all(directory.join("db"), None)
                                     .unwrap();
-                            let (node, recovered_store) =
-                                crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
-                                    .build()
-                                    .unwrap();
+                            let (node, recovered_store) = crate::builder::NodeBuilder::new(
+                                config.clone(),
+                                Arc::new(stores.state),
+                            )
+                            .build()
+                            .unwrap();
                             assert_eq!(
                                 node.chain_store.get_head_hash().unwrap(),
                                 Some(steps.last().unwrap().block.hash())
@@ -9447,6 +9959,16 @@ mod tests {
                             drop(stores.receipts);
                             drop(stores.index);
                             drop(stores.witness);
+                            if std::env::var("SHELL_TEST_NATIVE_STRUCT_LIVE").as_deref()
+                                == Ok("yes")
+                            {
+                                // All offline writers and observers are stopped before this sole
+                                // temporary authority starts signing in the actual CLI event loop.
+                                native_struct_argument_live_cli(
+                                    &binary, &directory, reader, algorithm, activation, &config,
+                                    &mut steps,
+                                );
+                            }
                         }
                     }
                     std::fs::remove_dir_all(directory).unwrap();
