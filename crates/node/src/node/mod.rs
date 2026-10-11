@@ -8095,7 +8095,7 @@ mod tests {
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
         proposer_signer: &DilithiumSigner,
-        signer: &impl Signer,
+        signer: &(impl Signer + ?Sized),
         reader: &str,
         activation: Option<u64>,
     ) -> Vec<NativeStructStep> {
@@ -8463,6 +8463,368 @@ mod tests {
     }
 
     #[cfg(feature = "rocksdb")]
+    async fn native_http_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        use http_body_util::BodyExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (mut client, connection) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let connection = tokio::spawn(connection);
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            }))
+            .unwrap();
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri(format!("http://{address}/"))
+                .header("Host", address.to_string())
+                .header("Content-Type", "application/json")
+                .body(http_body_util::Full::new(hyper::body::Bytes::from(payload)))
+                .unwrap();
+            let response = client.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            drop(client);
+            connection.await.unwrap().unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], 1);
+            response
+        })
+        .await
+        .expect("isolated native RPC request timed out")
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn native_struct_argument_resume<S: KvStore + 'static, T: KvStore + 'static>(
+        node: &Node<S>,
+        replica: &Node<T>,
+        proposer: &DilithiumSigner,
+        signer: &dyn Signer,
+        reader: &str,
+        activation: Option<u64>,
+        steps: &mut Vec<NativeStructStep>,
+    ) {
+        let sender = steps[0].block.transactions[0].from;
+        let ledger = Address::from([0x98; 32]);
+        let first = native_struct_word(0x34, 0x12);
+        let second = native_struct_word(0x56, 0x12);
+        let beneficiary = native_struct_word(0x78, 0x23);
+        let mut lookup = shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
+        lookup.extend_from_slice(&[0; 32]);
+        let set = |target: Address| {
+            let mut data = shell_primitives::keccak256(b"set(uint256,address,address)").as_bytes()
+                [..4]
+                .to_vec();
+            data.extend_from_slice(&[0; 32]);
+            data.extend_from_slice(target.as_bytes());
+            data.extend_from_slice(beneficiary.as_bytes());
+            data
+        };
+        // The first resumed batch changes the original record. The second reads MAX,
+        // then fails, so its earlier record and selecting-index changes must roll back.
+        for (calls, valid) in [
+            (
+                vec![
+                    (set(second), vec![]),
+                    (lookup.clone(), U256::from(19).to_be_bytes::<32>().to_vec()),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    (set(first), vec![]),
+                    (lookup.clone(), U256::MAX.to_be_bytes::<32>().to_vec()),
+                    (set(Address::from([0x67; 32])), vec![]),
+                    (lookup, vec![]),
+                ],
+                false,
+            ),
+        ] {
+            let previous = steps.last().unwrap();
+            let nonce = previous.block.number();
+            let mut signed = SignedTransaction::with_aa_bundle(
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: None,
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 1_500_000,
+                    max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 1,
+                    access_list: None,
+                    tx_type: AA_BUNDLE_TX_TYPE,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+                PQSignature::new(signer.sig_type(), vec![]),
+                PubkeyMode::Embedded(signer.public_key().to_vec()),
+                AaBundle {
+                    inner_calls: calls
+                        .iter()
+                        .map(|(data, _)| InnerCall {
+                            to: Some(ledger),
+                            value: U256::ZERO,
+                            data: Bytes::from(data.clone()),
+                            gas_limit: 300_000,
+                        })
+                        .collect(),
+                    ..AaBundle::default()
+                },
+            )
+            .unwrap();
+            signed.signature = signer
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            let hash = signed.hash();
+            node.tx_pool
+                .insert(
+                    signed,
+                    &mut node.world_state.write(),
+                    node.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            let block = node.produce_block(proposer, 100).unwrap();
+            assert_eq!(block.number(), nonce + 1);
+            assert_eq!(block.transactions[0].hash(), hash);
+            replica.import_block(block.clone(), &MultiVerifier).unwrap();
+            let receipts = node
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            let active = activation.is_some_and(|height| block.number() >= height);
+            let success = active && valid;
+            assert_eq!(receipts[0].tx_hash, hash);
+            assert_eq!(receipts[0].status, u8::from(success));
+            assert!(receipts[0].gas_used > 0);
+            assert_eq!(
+                replica
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap(),
+                receipts
+            );
+            let balance = previous.sender_balance
+                - U256::from(receipts[0].gas_used)
+                    * U256::from(
+                        (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                    );
+            let selections =
+                previous.selections + u64::from(success && reader == "SelectingLedger");
+            assert_eq!(
+                node.world_state.read().get_nonce(&sender).unwrap(),
+                nonce + 1
+            );
+            assert_eq!(
+                node.world_state.read().get_balance(&sender).unwrap(),
+                balance
+            );
+            assert_eq!(
+                replica.world_state.read().get_nonce(&sender).unwrap(),
+                nonce + 1
+            );
+            assert_eq!(
+                replica.world_state.read().get_balance(&sender).unwrap(),
+                balance
+            );
+            assert_eq!(current_state_root(node), block.header.state_root);
+            assert_eq!(current_state_root(replica), block.header.state_root);
+            steps.push(NativeStructStep {
+                token: if success { second } else { previous.token },
+                beneficiary: if success {
+                    beneficiary
+                } else {
+                    previous.beneficiary
+                },
+                selections,
+                sender_balance: balance,
+                success,
+                output: vec![],
+                inner_outputs: Some(if active {
+                    calls.into_iter().map(|(_, output)| output).collect()
+                } else {
+                    vec![vec![], vec![]]
+                }),
+                block,
+            });
+        }
+        native_struct_argument_history(node, steps, activation);
+        native_struct_argument_history(replica, steps, activation);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    async fn native_struct_argument_http<S: KvStore + 'static>(
+        node: &Node<S>,
+        steps: &[NativeStructStep],
+        activation: Option<u64>,
+    ) {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let server = shell_rpc::start_rpc_server(
+            shell_rpc::RpcConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                ws_addr: None,
+                ..shell_rpc::RpcConfig::default()
+            },
+            Arc::clone(&node.chain_store),
+            Arc::clone(&node.world_state),
+            Arc::clone(&node.tx_pool),
+            1337,
+            None,
+            events,
+            None,
+            None,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            None,
+            Some(Arc::clone(&node.witness_store)),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sender = steps[0].block.transactions[0].from;
+        let ledger = Address::from([0x98; 32]);
+        let tip = steps.last().unwrap();
+        let before = node.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(node);
+        let mut lookup = shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
+        lookup.extend_from_slice(&[0; 32]);
+        let balances = [
+            (
+                native_struct_word(0x34, 0x12),
+                native_struct_word(0x78, 0x23),
+                U256::MAX,
+            ),
+            (
+                native_struct_word(0x34, 0x12),
+                native_struct_word(0x9a, 0x23),
+                (U256::from(1) << 200usize) + U256::from(73),
+            ),
+            (
+                native_struct_word(0x56, 0x12),
+                native_struct_word(0x78, 0x23),
+                U256::from(19),
+            ),
+            (
+                native_struct_word(0x56, 0x12),
+                native_struct_word(0x9a, 0x23),
+                U256::ZERO,
+            ),
+        ];
+        for (tag, step) in steps
+            .iter()
+            .rev()
+            .map(|s| (format!("0x{:x}", s.block.number()), s))
+            .chain([("latest".into(), tip), ("pending".into(), tip)])
+        {
+            let response = native_http_request(server.http_addr, "eth_call", serde_json::json!([
+                {"from":sender.to_string(),"to":ledger.to_string(),"data":format!("0x{}",hex::encode(&lookup)),"gas":"0x7a120"},tag
+            ])).await;
+            if activation.is_some_and(|height| step.block.number() >= height) {
+                let word = balances
+                    .iter()
+                    .find(|(token, owner, _)| *token == step.token && *owner == step.beneficiary)
+                    .unwrap()
+                    .2;
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(
+                    response["result"],
+                    format!("0x{}", hex::encode(word.to_be_bytes::<32>()))
+                );
+            } else {
+                assert!(response.get("result").is_none(), "{response}");
+                assert_eq!(response["error"]["code"], -32000);
+            }
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            assert_eq!(current_state_root(node), root);
+        }
+        for (method, params, expected) in [
+            ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
+            (
+                "eth_blockNumber",
+                serde_json::json!([]),
+                format!("0x{:x}", tip.block.number()),
+            ),
+            (
+                "eth_getTransactionCount",
+                serde_json::json!([sender.to_string(), "latest"]),
+                format!("0x{:x}", tip.block.number()),
+            ),
+            (
+                "eth_getBalance",
+                serde_json::json!([sender.to_string(), "latest"]),
+                format!("0x{:x}", tip.sender_balance),
+            ),
+            (
+                "eth_getStorageAt",
+                serde_json::json!([
+                    ledger.to_string(),
+                    native_struct_record_slot(0).to_string(),
+                    "latest"
+                ]),
+                tip.token.to_string(),
+            ),
+            (
+                "eth_getStorageAt",
+                serde_json::json!([
+                    ledger.to_string(),
+                    native_struct_record_slot(1).to_string(),
+                    "latest"
+                ]),
+                tip.beneficiary.to_string(),
+            ),
+        ] {
+            let response = native_http_request(server.http_addr, method, params).await;
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response["result"], expected);
+        }
+        for step in &steps[steps.len() - 2..] {
+            let hash = step.block.transactions[0].hash();
+            let receipts = node
+                .chain_store
+                .get_receipts(&step.block.hash())
+                .unwrap()
+                .unwrap();
+            let response = native_http_request(
+                server.http_addr,
+                "eth_getTransactionReceipt",
+                serde_json::json!([hash.to_string()]),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{response}");
+            for (name, value) in [
+                ("transactionHash", hash.to_string()),
+                ("blockHash", step.block.hash().to_string()),
+                ("blockNumber", format!("0x{:x}", step.block.number())),
+                ("from", sender.to_string()),
+                ("status", format!("0x{:x}", u8::from(step.success))),
+                ("gasUsed", format!("0x{:x}", receipts[0].gas_used)),
+            ] {
+                assert_eq!(response["result"][name], value);
+            }
+            assert!(response["result"]["to"].is_null());
+        }
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        assert_eq!(current_state_root(node), root);
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+    }
+
+    #[cfg(feature = "rocksdb")]
     fn native_struct_argument_process_exit(aa: bool) {
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_STRUCT_DIRECTORY";
         const READER: &str = "SHELL_TEST_NATIVE_STRUCT_READER";
@@ -8480,25 +8842,46 @@ mod tests {
             let reader = std::env::var(READER).unwrap();
             assert!(["Ledger", "SelectingLedger"].contains(&reader.as_str()));
             let steps = if aa {
-                if std::env::var(ALGORITHM).unwrap() == "mldsa" {
-                    native_struct_argument_aa_import(
-                        &leader,
-                        &follower,
-                        &proposer_signer,
-                        &MlDsaSigner::generate(),
-                        &reader,
-                        activation,
-                    )
-                } else {
-                    native_struct_argument_aa_import(
-                        &leader,
-                        &follower,
-                        &proposer_signer,
-                        &DilithiumSigner::generate(),
-                        &reader,
-                        activation,
-                    )
+                let (signer, secret): (Box<dyn Signer>, Vec<u8>) =
+                    if std::env::var(ALGORITHM).unwrap() == "mldsa" {
+                        let signer = MlDsaSigner::generate();
+                        let secret = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), secret)
+                    } else {
+                        let signer = DilithiumSigner::generate();
+                        let secret = signer.secret_key_bytes().to_vec();
+                        (Box::new(signer), secret)
+                    };
+                // Persist only fresh test credentials, with owner-only file permissions.
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
                 }
+                use std::io::Write;
+                options
+                    .open(directory.join("test-signers.json"))
+                    .unwrap()
+                    .write_all(
+                        &serde_json::to_vec(&(
+                            proposer_signer.public_key(),
+                            proposer_signer.secret_key_bytes().as_slice(),
+                            signer.public_key(),
+                            secret,
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                native_struct_argument_aa_import(
+                    &leader,
+                    &follower,
+                    &proposer_signer,
+                    signer.as_ref(),
+                    &reader,
+                    activation,
+                )
             } else if std::env::var(ALGORITHM).unwrap() == "mldsa" {
                 native_struct_argument_signed_import(
                     &leader,
@@ -8560,19 +8943,22 @@ mod tests {
                         "struct writer failed; retained {}",
                         directory.display()
                     );
-                    let steps: Vec<NativeStructStep> = serde_json::from_slice(
+                    let mut steps: Vec<NativeStructStep> = serde_json::from_slice(
                         &std::fs::read(directory.join("steps.json")).unwrap(),
                     )
                     .unwrap();
                     let tip = &steps.last().unwrap().block;
                     let stores =
                         shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
-                    let (node, recovered_store) = crate::builder::NodeBuilder::new(
-                        NodeConfig::dev(tip.header.proposer),
-                        Arc::new(stores.state),
-                    )
-                    .build()
-                    .unwrap();
+                    let mut config = NodeConfig::dev(tip.header.proposer);
+                    config.consensus = crate::config::ConsensusEngineConfig::Poa(PoaConfig::new(
+                        vec![tip.header.proposer],
+                        1,
+                    ));
+                    let (node, recovered_store) =
+                        crate::builder::NodeBuilder::new(config.clone(), Arc::new(stores.state))
+                            .build()
+                            .unwrap();
                     assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(tip.hash()));
                     assert_eq!(
                         node.chain_store
@@ -8583,8 +8969,90 @@ mod tests {
                         activation
                     );
                     native_struct_argument_history(&node, &steps, activation);
+                    if aa {
+                        let (proposer_public, proposer_secret, sender_public, sender_secret): (
+                            Vec<u8>,
+                            Vec<u8>,
+                            Vec<u8>,
+                            Vec<u8>,
+                        ) = serde_json::from_slice(
+                            &std::fs::read(directory.join("test-signers.json")).unwrap(),
+                        )
+                        .unwrap();
+                        let proposer =
+                            DilithiumSigner::from_bytes(&proposer_public, &proposer_secret)
+                                .unwrap();
+                        let signer: Box<dyn Signer> = if algorithm == "mldsa" {
+                            Box::new(
+                                MlDsaSigner::from_bytes(&sender_public, &sender_secret).unwrap(),
+                            )
+                        } else {
+                            Box::new(
+                                DilithiumSigner::from_bytes(&sender_public, &sender_secret)
+                                    .unwrap(),
+                            )
+                        };
+                        assert_eq!(
+                            Address::from_public_key(
+                                signer.public_key(),
+                                signer.sig_type().as_u8()
+                            ),
+                            steps[0].block.transactions[0].from
+                        );
+                        // Restore a separate node from the committed database, then verify imports.
+                        let replica_store = Arc::new(MemoryDb::new());
+                        for (key, value) in node.store.scan_prefix(b"").unwrap() {
+                            replica_store.put(&key, &value).unwrap();
+                        }
+                        let (replica, _) =
+                            crate::builder::NodeBuilder::new(config.clone(), replica_store)
+                                .build()
+                                .unwrap();
+                        node.register_authority_pubkey(
+                            tip.header.proposer,
+                            proposer_public.clone(),
+                        );
+                        replica.register_authority_pubkey(tip.header.proposer, proposer_public);
+                        native_struct_argument_resume(
+                            &node,
+                            &replica,
+                            &proposer,
+                            signer.as_ref(),
+                            reader,
+                            activation,
+                            &mut steps,
+                        );
+                        drop(replica);
+                    }
                     drop(node);
                     drop(recovered_store);
+                    drop(stores.chain);
+                    drop(stores.receipts);
+                    drop(stores.index);
+                    drop(stores.witness);
+                    if aa {
+                        let stores =
+                            shell_storage::RocksDbStore::open_all(directory.join("db"), None)
+                                .unwrap();
+                        let (node, recovered_store) =
+                            crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
+                                .build()
+                                .unwrap();
+                        assert_eq!(
+                            node.chain_store.get_head_hash().unwrap(),
+                            Some(steps.last().unwrap().block.hash())
+                        );
+                        native_struct_argument_history(&node, &steps, activation);
+                        let runtime = tokio::runtime::Runtime::new().unwrap();
+                        runtime.block_on(native_struct_argument_http(&node, &steps, activation));
+                        drop(runtime);
+                        drop(node);
+                        drop(recovered_store);
+                        drop(stores.chain);
+                        drop(stores.receipts);
+                        drop(stores.index);
+                        drop(stores.witness);
+                    }
                     std::fs::remove_dir_all(directory).unwrap();
                 }
             }
@@ -9059,44 +9527,6 @@ mod tests {
             let entry = abi.iter().find(|entry| entry["name"] == function).unwrap();
             assert_eq!(entry["outputs"][0]["type"], result_type);
         }
-        async fn http_request(
-            address: std::net::SocketAddr,
-            method: &str,
-            params: serde_json::Value,
-        ) -> serde_json::Value {
-            use http_body_util::BodyExt;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-                let (mut client, connection) =
-                    hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                        .await
-                        .unwrap();
-                let connection = tokio::spawn(connection);
-                let payload = serde_json::to_vec(&serde_json::json!({
-                    "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-                }))
-                .unwrap();
-                let request = hyper::Request::builder()
-                    .method("POST")
-                    .uri(format!("http://{address}/"))
-                    .header("Host", address.to_string())
-                    .header("Content-Type", "application/json")
-                    .body(http_body_util::Full::new(hyper::body::Bytes::from(payload)))
-                    .unwrap();
-                let response = client.send_request(request).await.unwrap();
-                assert_eq!(response.status(), hyper::StatusCode::OK);
-                let body = response.into_body().collect().await.unwrap().to_bytes();
-                drop(client);
-                connection.await.unwrap().unwrap();
-                let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(response["jsonrpc"], "2.0");
-                assert_eq!(response["id"], 1);
-                response
-            })
-            .await
-            .expect("isolated owner RPC request timed out")
-        }
-
         #[allow(clippy::too_many_arguments)]
         async fn verify_http(
             address: std::net::SocketAddr,
@@ -9132,7 +9562,7 @@ mod tests {
                     .to_vec();
                 data.extend_from_slice(target.as_bytes());
                 data.extend_from_slice(owner.as_bytes());
-                let response = http_request(
+                let response = native_http_request(
                     address,
                     "eth_call",
                     serde_json::json!([
@@ -9184,13 +9614,13 @@ mod tests {
                     format!("0x{}", hex::encode(U256::from(6).to_be_bytes::<32>())),
                 ),
             ] {
-                let response = http_request(address, method, params).await;
+                let response = native_http_request(address, method, params).await;
                 assert!(response.get("error").is_none(), "{response}");
                 assert_eq!(response["result"], expected);
             }
             for (block, receipts, _) in continued_blocks {
                 let receipt = &receipts[0];
-                let response = http_request(
+                let response = native_http_request(
                     address,
                     "eth_getTransactionReceipt",
                     serde_json::json!([receipt.tx_hash.to_string()]),
