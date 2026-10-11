@@ -6717,13 +6717,39 @@ mod tests {
         shell_primitives::keccak256(&input)
     }
 
-    fn native_balance_words(first: Address, second: Address) -> [(Address, Address, Address); 4] {
+    fn native_balance_is_numeric(fixture: &serde_json::Value) -> bool {
+        fixture["artifacts"]["Reader"]["abi"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["name"] == "lookup" && entry["outputs"][0]["type"] == "uint256"
+                })
+            })
+    }
+
+    fn native_balance_words(
+        first: Address,
+        second: Address,
+        numeric_result: bool,
+    ) -> [(Address, Address, Address); 4] {
+        // Raw ABI words: numeric edge values are independent of both addresses.
+        let words = if numeric_result {
+            [
+                U256::MAX,
+                (U256::from(1) << 200) + U256::from(73),
+                U256::from(19),
+                U256::ZERO,
+            ]
+            .map(|value| Address::from(value.to_be_bytes::<32>()))
+        } else {
+            [first, second, second, first]
+        };
         // Targets and owners both collide in low20; each changes the expected word.
         [
-            (first, first, first),
-            (first, second, second),
-            (second, first, second),
-            (second, second, first),
+            (first, first, words[0]),
+            (first, second, words[1]),
+            (second, first, words[2]),
+            (second, second, words[3]),
         ]
     }
 
@@ -6752,6 +6778,7 @@ mod tests {
         contract: Address,
         first: Address,
         second: Address,
+        numeric_result: bool,
     ) {
         use shell_rpc::api::EthApiServer;
         use shell_rpc::types::CallRequest;
@@ -6777,7 +6804,7 @@ mod tests {
             .unwrap()
             .native_address_context_height
             .is_some();
-        for (target, owner, word) in native_balance_words(first, second) {
+        for (target, owner, word) in native_balance_words(first, second, numeric_result) {
             let mut data =
                 shell_primitives::keccak256(b"lookup(address,address)").as_bytes()[..4].to_vec();
             data.extend_from_slice(target.as_bytes());
@@ -6832,7 +6859,9 @@ mod tests {
                         None,
                     );
                     if activation.is_some() {
-                        native_balance_latest_rpc(&follower, sender, contract, first, second);
+                        native_balance_latest_rpc(
+                            &follower, sender, contract, first, second, false,
+                        );
                     }
                 }
             }
@@ -6866,6 +6895,7 @@ mod tests {
         ))
         .unwrap();
         let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let numeric_result = balance_query && native_balance_is_numeric(&fixture);
         let owner_query = owner_query && !balance_query;
         let runtime = |name: &str| {
             hex::decode(
@@ -6917,7 +6947,7 @@ mod tests {
                 (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
             ] {
                 let storage = if balance_query && [first, second].contains(&address) {
-                    native_balance_words(first, second).into_iter().filter(|(target, _, _)| *target == address)
+                    native_balance_words(first, second, numeric_result).into_iter().filter(|(target, _, _)| *target == address)
                         .map(|(_, owner, word)| (native_balance_slot(owner).to_string(), serde_json::json!(ShellHash::from(*word.as_bytes()))))
                         .collect::<serde_json::Map<String, serde_json::Value>>().into()
                 } else if owner_query && [first, second].contains(&address) {
@@ -6967,7 +6997,7 @@ mod tests {
                     .unwrap();
             }
             if balance_query {
-                for (target, owner, word) in native_balance_words(first, second) {
+                for (target, owner, word) in native_balance_words(first, second, numeric_result) {
                     node.world_state.write().set_storage(&target, &native_balance_slot(owner), &ShellHash::from(*word.as_bytes())).unwrap();
                 }
             }
@@ -7123,7 +7153,9 @@ mod tests {
                         ShellHash::ZERO
                     );
                     if balance_query {
-                        for (target, owner, word) in native_balance_words(first, second) {
+                        for (target, owner, word) in
+                            native_balance_words(first, second, numeric_result)
+                        {
                             assert_eq!(
                                 world
                                     .get_storage(&target, &native_balance_slot(owner))
@@ -7177,7 +7209,7 @@ mod tests {
                 );
             }
             if balance_query {
-                for (target, owner, word) in native_balance_words(first, second) {
+                for (target, owner, word) in native_balance_words(first, second, numeric_result) {
                     assert_eq!(
                         history
                             .get_storage(&target, &native_balance_slot(owner))
@@ -7258,6 +7290,7 @@ mod tests {
         ))
         .unwrap();
         let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let numeric_result = balance_query && native_balance_is_numeric(&fixture);
         let owner_query = owner_query && !balance_query;
         let writer = Address::from([0x69; 32]);
         let runtime = |name: &str| {
@@ -7289,7 +7322,7 @@ mod tests {
                     .unwrap();
             }
             if balance_query {
-                for (target, owner, word) in native_balance_words(first, second) {
+                for (target, owner, word) in native_balance_words(first, second, numeric_result) {
                     node.world_state.write().set_storage(&target, &native_balance_slot(owner), &ShellHash::from(*word.as_bytes())).unwrap();
                 }
             }
@@ -7445,7 +7478,9 @@ mod tests {
                     );
                     assert!(recovered.get_account(&missing).unwrap().is_none());
                     if balance_query {
-                        for (target, owner, word) in native_balance_words(first, second) {
+                        for (target, owner, word) in
+                            native_balance_words(first, second, numeric_result)
+                        {
                             assert_eq!(
                                 recovered
                                     .get_storage(&target, &native_balance_slot(owner))
@@ -7489,7 +7524,7 @@ mod tests {
                 ShellHash::from(U256::from(count).to_be_bytes::<32>())
             );
             if balance_query {
-                for (target, owner, word) in native_balance_words(first, second) {
+                for (target, owner, word) in native_balance_words(first, second, numeric_result) {
                     assert_eq!(
                         history
                             .get_storage(&target, &native_balance_slot(owner))
@@ -7560,11 +7595,11 @@ mod tests {
             Arc::new(RwLock::new(0)),
             Arc::new(RwLock::new(FinalityState::new())),
         );
-        let balance_query = serde_json::from_str::<serde_json::Value>(owner_fixture).unwrap()
-            ["selectors"]["balanceOf(address)"]
-            .is_string();
+        let fixture: serde_json::Value = serde_json::from_str(owner_fixture).unwrap();
+        let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let numeric_result = balance_query && native_balance_is_numeric(&fixture);
         if balance_query {
-            native_balance_latest_rpc(&follower, sender, contract, first, second);
+            native_balance_latest_rpc(&follower, sender, contract, first, second, numeric_result);
         }
         let before = follower.store.scan_prefix(b"").unwrap();
         let root = current_state_root(&follower);
@@ -7610,10 +7645,27 @@ mod tests {
                 "0x".into()
             } else {
                 match block.number() {
-                    2 => format!("0x{}", hex::encode(first.as_bytes())),
+                    2 => format!(
+                        "0x{}",
+                        hex::encode(
+                            if balance_query {
+                                native_balance_words(first, second, numeric_result)[0].2
+                            } else {
+                                first
+                            }
+                            .as_bytes()
+                        )
+                    ),
                     4 => format!(
                         "0x{}",
-                        hex::encode(if balance_query { first } else { second }.as_bytes())
+                        hex::encode(
+                            if balance_query {
+                                native_balance_words(first, second, numeric_result)[3].2
+                            } else {
+                                second
+                            }
+                            .as_bytes()
+                        )
                     ),
                     3 => {
                         let mut bytes = shell_primitives::keccak256(if balance_query {
@@ -7652,6 +7704,32 @@ mod tests {
             native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), &fixture, Some(2));
             native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), &fixture, Some(2));
         }
+    }
+
+    #[test]
+    fn native_pure_balance_uint256_signed_and_aa_runtime() {
+        let fixture = native_pure_balance_fixture("PureReader", "uint256");
+        fn run(signer: &impl Signer, fixture: &str) {
+            for activation in [None, Some(2)] {
+                native_owner_signed_rpc_and_history(signer, fixture, activation);
+                let (leader, proposer_signer) = setup_node();
+                let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+                let (sender, contract, first, second, _) = native_typed_aa_import(
+                    &leader,
+                    &follower,
+                    &proposer_signer,
+                    signer,
+                    activation,
+                    Some(fixture),
+                    None,
+                );
+                // Independent mapping words exceed 2^160; numeric returns must retain
+                // every bit while target and owner addresses collide in their low20.
+                native_balance_latest_rpc(&follower, sender, contract, first, second, true);
+            }
+        }
+        run(&DilithiumSigner::generate(), &fixture);
+        run(&MlDsaSigner::generate(), &fixture);
     }
 
     #[test]
@@ -7896,6 +7974,17 @@ mod tests {
     }
 
     #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_pure_balance_uint256_aa_survives_process_exit() {
+        let fixture = native_pure_balance_fixture("PureReader", "uint256");
+        check_native_typed_owner_aa_recovery(
+            &fixture,
+            "node::tests::native_pure_balance_uint256_aa_survives_process_exit",
+            "uint256",
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
     fn check_native_typed_owner_aa_recovery(
         owner_fixture: &str,
         test_name: &str,
@@ -7903,6 +7992,7 @@ mod tests {
     ) {
         let fixture: serde_json::Value = serde_json::from_str(owner_fixture).unwrap();
         let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let numeric_result = balance_query && native_balance_is_numeric(&fixture);
         let entries = if balance_query {
             vec![("Reader", "lookup")]
         } else {
@@ -7961,10 +8051,11 @@ mod tests {
             expected_balance: U256,
             continued_blocks: &[(Block, Vec<shell_core::TransactionReceipt>, U256)],
             balance_query: bool,
+            numeric_result: bool,
             check_reads: impl Fn(),
         ) {
             let mut cases = if balance_query {
-                native_balance_words(first, second)
+                native_balance_words(first, second, numeric_result)
                     .into_iter()
                     .map(|(target, owner, word)| (target, owner, Some(word)))
                     .collect::<Vec<_>>()
@@ -8215,7 +8306,8 @@ mod tests {
                     }
                 );
                 if balance_query {
-                    for (target, owner, word) in native_balance_words(first, second) {
+                    for (target, owner, word) in native_balance_words(first, second, numeric_result)
+                    {
                         assert_eq!(
                             state
                                 .get_storage(&target, &native_balance_slot(owner))
@@ -8264,7 +8356,14 @@ mod tests {
             let assert_readonly_rpc =
                 |node: &Node<shell_storage::RocksDbStore>, expected_root: ShellHash| {
                     if balance_query {
-                        native_balance_latest_rpc(node, sender, contract, first, second);
+                        native_balance_latest_rpc(
+                            node,
+                            sender,
+                            contract,
+                            first,
+                            second,
+                            numeric_result,
+                        );
                         assert_eq!(current_state_root(node), expected_root);
                         return;
                     }
@@ -8476,7 +8575,9 @@ mod tests {
                             );
                         }
                         if balance_query {
-                            for (target, owner, word) in native_balance_words(first, second) {
+                            for (target, owner, word) in
+                                native_balance_words(first, second, numeric_result)
+                            {
                                 assert_eq!(
                                     state
                                         .get_storage(&target, &native_balance_slot(owner))
@@ -8542,7 +8643,8 @@ mod tests {
                     );
                 }
                 if balance_query {
-                    for (target, owner, word) in native_balance_words(first, second) {
+                    for (target, owner, word) in native_balance_words(first, second, numeric_result)
+                    {
                         assert_eq!(
                             state
                                 .get_storage(&target, &native_balance_slot(owner))
@@ -8617,6 +8719,7 @@ mod tests {
                     expected_balance,
                     &continued_blocks,
                     balance_query,
+                    numeric_result,
                     || {
                         assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
                         assert_eq!(current_state_root(&node), continued_tip.header.state_root);
@@ -8705,6 +8808,7 @@ mod tests {
                     expected_balance,
                     &continued_blocks,
                     balance_query,
+                    numeric_result,
                     || {},
                 ));
                 drop(runtime);
@@ -8724,7 +8828,8 @@ mod tests {
                     ShellHash::from(U256::from(6).to_be_bytes::<32>())
                 );
                 if balance_query {
-                    for (target, owner, word) in native_balance_words(first, second) {
+                    for (target, owner, word) in native_balance_words(first, second, numeric_result)
+                    {
                         assert_eq!(
                             state
                                 .get_storage(&target, &native_balance_slot(owner))
