@@ -308,3 +308,210 @@ fn check_native_balance_reader(reader_contract: &str) {
         }
     }
 }
+
+// Regenerate with shell-sdk's compile-native-struct-fixture.mjs after npm run build.
+#[test]
+fn native_struct_members_preserve_full_words_and_committed_history() {
+    use shell_storage::KvStore;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/native-struct.json")).unwrap();
+    for artifact in ["original", "nested"] {
+        for activation in [None, Some(2u64)] {
+            let store = Arc::new(MemoryDb::new());
+            let mut vm = ShellPqvm::new(
+                ShellStateDb::new(
+                    WorldState::new(store.clone()),
+                    ChainStore::new(store.clone()),
+                ),
+                1337,
+            );
+            let sender = ShellAddress::from([0x42; 32]);
+            let ledger = ShellAddress::from([0x43; 32]);
+            let mut first = [0x12; 32];
+            first[..12].fill(0x34);
+            let mut second = first;
+            second[..12].fill(0x56);
+            let first = U256::from_be_bytes(first);
+            let second = U256::from_be_bytes(second);
+            let nested = artifact == "nested";
+            let max = if nested {
+                (U256::from(1) << 96usize) - U256::from(1)
+            } else {
+                U256::MAX
+            };
+            let code = hex::decode(
+                fixture["artifacts"][artifact]["deployedBytecode"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            vm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &ledger,
+                    &Account {
+                        code_hash: Some(shell_primitives::keccak256(&code)),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+            vm.state_db()
+                .chain_store()
+                .put_code(&shell_primitives::keccak256(&code), &code)
+                .unwrap();
+            vm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &sender,
+                    &Account::new_user_account(ShellHash::ZERO, U256::from(10_000_000u64)),
+                )
+                .unwrap();
+            vm.state_db().chain_store().put_chain_config(&serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation
+            })).unwrap()).unwrap();
+            let set = if nested {
+                "set(uint256,address,uint96,address)"
+            } else {
+                "set(uint256,address,uint256)"
+            };
+            let words = |id, owner, amount, backup| {
+                let mut values = vec![id, owner, amount];
+                if nested {
+                    values.push(backup);
+                }
+                values
+            };
+            let mut operations = vec![
+                (set, words(U256::ZERO, first, max, second), false, true),
+                (
+                    set,
+                    words(U256::from(1), second, U256::from(19), first),
+                    false,
+                    true,
+                ),
+                ("get(uint256)", vec![U256::ZERO], false, true),
+                (
+                    if nested {
+                        "update(uint256,address,uint96)"
+                    } else {
+                        set
+                    },
+                    vec![U256::ZERO, second, U256::ZERO],
+                    false,
+                    true,
+                ),
+                ("get(uint256)", vec![U256::from(1)], false, true),
+                (set, words(U256::ZERO, first, max, first), true, false),
+            ];
+            if nested {
+                operations.push((
+                    set,
+                    words(U256::ZERO, first, U256::from(1) << 96usize, first),
+                    false,
+                    false,
+                ));
+            }
+            operations.extend([
+                ("get(uint256)", vec![U256::ZERO], false, true),
+                ("get(uint256)", vec![U256::MAX], false, true),
+            ]);
+            let zero = [U256::ZERO; 3];
+            let mut expected_zero = zero;
+            let mut expected_one = zero;
+            let mut history = Vec::new();
+            let slot = |id: U256, offset: usize| {
+                let mut key = id.to_be_bytes::<32>().to_vec();
+                key.extend_from_slice(&[0u8; 32]);
+                let base = U256::from_be_bytes(*shell_primitives::keccak256(&key).as_bytes());
+                ShellHash::from((base + U256::from(offset)).to_be_bytes::<32>())
+            };
+            for (nonce, (signature, values, short, success)) in operations.into_iter().enumerate() {
+                let mut input = hex::decode(
+                    fixture["selectors"][signature]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                )
+                .unwrap();
+                for word in &values {
+                    input.extend_from_slice(&word.to_be_bytes::<32>());
+                }
+                if short {
+                    input.pop();
+                }
+                let mut tx = make_system_tx_to(sender, ledger, input);
+                tx.tx.nonce = nonce as u64;
+                tx.tx.gas_limit = 500_000;
+                let mut header = sample_header();
+                header.number = nonce as u64 + 1;
+                let before = vm.state_db_mut().world_state_mut().state_root().unwrap();
+                let result = vm.execute_tx(&tx, &header, 0, 0).unwrap();
+                assert_eq!(
+                    vm.state_db_mut().world_state_mut().state_root().unwrap(),
+                    before
+                );
+                assert_eq!(
+                    result.receipt.status,
+                    u8::from(success),
+                    "{artifact} nonce{nonce} activation{activation:?}"
+                );
+                if nonce == 0 {
+                    expected_zero = [first, max, if nested { second } else { U256::ZERO }];
+                }
+                if nonce == 1 {
+                    expected_one = [
+                        second,
+                        U256::from(19),
+                        if nested { first } else { U256::ZERO },
+                    ];
+                }
+                if nonce == 3 {
+                    expected_zero = [second, U256::ZERO, if nested { second } else { U256::ZERO }];
+                }
+                if signature == "get(uint256)" {
+                    let expected = if values[0] == U256::ZERO {
+                        expected_zero
+                    } else if values[0] == U256::from(1) {
+                        expected_one
+                    } else {
+                        zero
+                    };
+                    let output = expected[..if nested { 3 } else { 2 }]
+                        .iter()
+                        .flat_map(|value| value.to_be_bytes::<32>())
+                        .collect::<Vec<_>>();
+                    assert_eq!(result.output, output);
+                }
+                commit_pqvm_state(&result, vm.state_db_mut()).unwrap();
+                let root = vm.state_db_mut().world_state_mut().state_root().unwrap();
+                let recovered = WorldState::at_root(store.clone(), &root).unwrap();
+                assert_eq!(recovered.get_nonce(&sender).unwrap(), nonce as u64 + 1);
+                for (id, expected) in [(U256::ZERO, expected_zero), (U256::from(1), expected_one)] {
+                    for (offset, value) in expected[..if nested { 3 } else { 2 }].iter().enumerate()
+                    {
+                        assert_eq!(
+                            recovered.get_storage(&ledger, &slot(id, offset)).unwrap(),
+                            ShellHash::from(value.to_be_bytes::<32>())
+                        );
+                    }
+                }
+                history.push((root, expected_zero, expected_one));
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            for (root, expected_zero, expected_one) in history.into_iter().rev() {
+                let historical = WorldState::at_root(store.clone(), &root).unwrap();
+                for (id, expected) in [(U256::ZERO, expected_zero), (U256::from(1), expected_one)] {
+                    for (offset, value) in expected[..if nested { 3 } else { 2 }].iter().enumerate()
+                    {
+                        assert_eq!(
+                            historical.get_storage(&ledger, &slot(id, offset)).unwrap(),
+                            ShellHash::from(value.to_be_bytes::<32>())
+                        );
+                    }
+                }
+            }
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+}
