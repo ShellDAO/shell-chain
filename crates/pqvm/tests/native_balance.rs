@@ -48,8 +48,13 @@ fn make_system_tx_to(from: ShellAddress, to: ShellAddress, calldata: Vec<u8>) ->
 
 // Regenerate with shell-sdk's compile-native-balance-fixture.mjs after npm run build.
 #[test]
-fn native_balance_calls_preserve_numeric_results_full_identities_and_rollback() {
-    for reader_contract in ["Reader", "PureReader"] {
+fn native_typed_calls_preserve_full_word_results_identities_and_rollback() {
+    for reader_contract in [
+        "Reader",
+        "PureReader",
+        "PureAddressReader",
+        "PureBytesReader",
+    ] {
         check_native_balance_reader(reader_contract);
     }
 }
@@ -87,9 +92,21 @@ fn check_native_balance_reader(reader_contract: &str) {
             bytes.extend_from_slice(&[0u8; 32]);
             shell_primitives::keccak256(&bytes)
         };
-        let large = U256::from(1u64) << 200usize | U256::from(73u64);
+        // Address/bytes32 results deliberately collide in their low 20 bytes.
+        // Expected words come from independently initialized storage.
+        let word_result = matches!(reader_contract, "PureAddressReader" | "PureBytesReader");
+        let first_balance = if word_result {
+            U256::from_be_bytes(*first.as_bytes())
+        } else {
+            U256::MAX
+        };
+        let large = if word_result {
+            U256::from_be_bytes(*second.as_bytes())
+        } else {
+            U256::from(1u64) << 200usize | U256::from(73u64)
+        };
         let balances = [
-            (first, owner, U256::MAX),
+            (first, owner, first_balance),
             (first, other_owner, large),
             (second, owner, U256::from(19u64)),
             (second, other_owner, U256::ZERO),
@@ -176,11 +193,11 @@ fn check_native_balance_reader(reader_contract: &str) {
             .unwrap();
         let cases = [
             (1, first, owner, false, false, U256::ZERO, 0u64),
-            (2, first, owner, false, true, U256::MAX, 0),
+            (2, first, owner, false, true, first_balance, 0),
             (3, first, other_owner, false, true, large, 0),
             (4, second, owner, false, true, U256::from(19u64), 0),
             (5, second, other_owner, false, true, U256::ZERO, 0),
-            (6, first, owner, true, true, U256::MAX, 1),
+            (6, first, owner, true, true, first_balance, 1),
             (7, first, ShellAddress::ZERO, true, false, U256::ZERO, 1),
             (8, writer, owner_alias, true, false, U256::ZERO, 1),
             (9, short, owner, true, false, U256::ZERO, 1),
@@ -249,7 +266,7 @@ fn check_native_balance_reader(reader_contract: &str) {
                 assert_eq!(
                     result.output,
                     balance.to_be_bytes::<32>(),
-                    "numeric result height{height}"
+                    "full-word result {reader_contract} height{height}"
                 );
             } else if enabled && height == 7 {
                 let mut denied = hex::decode(
