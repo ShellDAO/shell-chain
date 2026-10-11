@@ -6711,6 +6711,122 @@ mod tests {
         }
     }
 
+    fn native_balance_slot(owner: Address) -> ShellHash {
+        let mut input = owner.as_bytes().to_vec();
+        input.extend_from_slice(&[0u8; 32]);
+        shell_primitives::keccak256(&input)
+    }
+
+    fn native_balance_words(first: Address, second: Address) -> [(Address, Address, Address); 4] {
+        // Targets and owners both collide in low20; each changes the expected word.
+        [
+            (first, first, first),
+            (first, second, second),
+            (second, first, second),
+            (second, second, first),
+        ]
+    }
+
+    fn native_pure_balance_fixture(reader: &str, result_type: &str) -> String {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../pqvm/tests/fixtures/native-balance.json"
+        ))
+        .unwrap();
+        let original = fixture["artifacts"][reader].clone();
+        let lookup = original["abi"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "lookup")
+            .unwrap();
+        assert_eq!(lookup["stateMutability"], "pure");
+        assert_eq!(lookup["outputs"][0]["type"], result_type);
+        // Only select the original compiled artifact for the shared test harness.
+        fixture["artifacts"]["Reader"] = original;
+        serde_json::to_string(&fixture).unwrap()
+    }
+
+    fn native_balance_latest_rpc(
+        node: &Node<MemoryDb>,
+        sender: Address,
+        contract: Address,
+        first: Address,
+        second: Address,
+    ) {
+        use shell_rpc::api::EthApiServer;
+        use shell_rpc::types::CallRequest;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&node.chain_store),
+            Arc::clone(&node.world_state),
+            Arc::clone(&node.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let before = node.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(node);
+        for (target, owner, word) in native_balance_words(first, second) {
+            let mut data =
+                shell_primitives::keccak256(b"lookup(address,address)").as_bytes()[..4].to_vec();
+            data.extend_from_slice(target.as_bytes());
+            data.extend_from_slice(owner.as_bytes());
+            let output = runtime
+                .block_on(EthApiServer::call(
+                    &handler,
+                    CallRequest {
+                        from: Some(sender),
+                        to: Some(contract),
+                        data: Some(format!("0x{}", hex::encode(data))),
+                        value: None,
+                        gas: Some("0x7a120".into()),
+                        access_list: None,
+                    },
+                    Some("latest".into()),
+                ))
+                .unwrap();
+            assert_eq!(output, format!("0x{}", hex::encode(word.as_bytes())));
+            assert_eq!(current_state_root(node), root);
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_pure_balance_real_aa_admission_import_and_rollback() {
+        for (reader, result_type) in [
+            ("PureAddressReader", "address"),
+            ("PureBytesReader", "bytes32"),
+        ] {
+            let fixture = native_pure_balance_fixture(reader, result_type);
+            for activation in [None, Some(2)] {
+                for signer in [
+                    Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+                    Box::new(MlDsaSigner::generate()),
+                ] {
+                    let (leader, proposer_signer) = setup_node();
+                    let follower =
+                        setup_node_with_authority(leader.config.proposer_address.unwrap());
+                    let (sender, contract, first, second, _) = native_typed_aa_import(
+                        &leader,
+                        &follower,
+                        &proposer_signer,
+                        signer.as_ref(),
+                        activation,
+                        Some(&fixture),
+                        None,
+                    );
+                    if activation.is_some() {
+                        native_balance_latest_rpc(&follower, sender, contract, first, second);
+                    }
+                }
+            }
+        }
+    }
+
     fn native_typed_aa_import<S: KvStore + 'static>(
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
@@ -6737,6 +6853,8 @@ mod tests {
             include_str!("../../../pqvm/tests/fixtures/native-typed-call.json"),
         ))
         .unwrap();
+        let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let owner_query = owner_query && !balance_query;
         let runtime = |name: &str| {
             hex::decode(
                 fixture["artifacts"][name]["deployedBytecode"]
@@ -6748,7 +6866,9 @@ mod tests {
         };
         let input = |target: Address, value: Address| {
             let mut data = hex::decode(
-                fixture["selectors"][if owner_query {
+                fixture["selectors"][if balance_query {
+                    "record(address,address)"
+                } else if owner_query {
                     "lookup(address,uint256)"
                 } else {
                     "invoke(address,address)"
@@ -6779,12 +6899,16 @@ mod tests {
             let mut alloc = serde_json::Map::new();
             alloc.insert(sender.to_string(), serde_json::json!({"balance":initial_balance}));
             for (address, code) in [
-                (contract, runtime(if owner_query { "Reader" } else { "Typed" })),
-                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
-                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (contract, runtime(if owner_query || balance_query { "Reader" } else { "Typed" })),
+                (first, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
                 (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
             ] {
-                let storage = if owner_query && [first, second].contains(&address) {
+                let storage = if balance_query && [first, second].contains(&address) {
+                    native_balance_words(first, second).into_iter().filter(|(target, _, _)| *target == address)
+                        .map(|(_, owner, word)| (native_balance_slot(owner).to_string(), serde_json::json!(ShellHash::from(*word.as_bytes()))))
+                        .collect::<serde_json::Map<String, serde_json::Value>>().into()
+                } else if owner_query && [first, second].contains(&address) {
                     serde_json::json!({ShellHash::ZERO.to_string():ShellHash::from(*address.as_bytes())})
                 } else {
                     serde_json::json!({})
@@ -6817,10 +6941,10 @@ mod tests {
             for (address, code) in [
                 (
                     contract,
-                    runtime(if owner_query { "Reader" } else { "Typed" }),
+                    runtime(if owner_query || balance_query { "Reader" } else { "Typed" }),
                 ),
-                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
-                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (first, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
                 (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
             ] {
                 let hash = shell_primitives::keccak256(&code);
@@ -6829,6 +6953,11 @@ mod tests {
                     .write()
                     .set_code_hash(&address, hash)
                     .unwrap();
+            }
+            if balance_query {
+                for (target, owner, word) in native_balance_words(first, second) {
+                    node.world_state.write().set_storage(&target, &native_balance_slot(owner), &ShellHash::from(*word.as_bytes())).unwrap();
+                }
             }
             if owner_query {
                 for target in [first, second] {
@@ -6968,7 +7097,9 @@ mod tests {
                         assert_eq!(world.get_balance(&target).unwrap(), U256::ZERO);
                         assert_eq!(
                             world.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                            if owner_query || completed > 0 {
+                            if balance_query {
+                                ShellHash::ZERO
+                            } else if owner_query || completed > 0 {
                                 ShellHash::from(*target.as_bytes())
                             } else {
                                 ShellHash::ZERO
@@ -6979,6 +7110,16 @@ mod tests {
                         world.get_storage(&alias, &ShellHash::ZERO).unwrap(),
                         ShellHash::ZERO
                     );
+                    if balance_query {
+                        for (target, owner, word) in native_balance_words(first, second) {
+                            assert_eq!(
+                                world
+                                    .get_storage(&target, &native_balance_slot(owner))
+                                    .unwrap(),
+                                ShellHash::from(*word.as_bytes())
+                            );
+                        }
+                    }
                     drop(world);
                     assert_eq!(current_state_root(node), block.header.state_root);
                     assert!(receipts[0].logs.is_empty());
@@ -7014,12 +7155,24 @@ mod tests {
             for target in [first, second] {
                 assert_eq!(
                     history.get_storage(&target, &ShellHash::ZERO).unwrap(),
-                    if owner_query || completed > 0 {
+                    if balance_query {
+                        ShellHash::ZERO
+                    } else if owner_query || completed > 0 {
                         ShellHash::from(*target.as_bytes())
                     } else {
                         ShellHash::ZERO
                     }
                 );
+            }
+            if balance_query {
+                for (target, owner, word) in native_balance_words(first, second) {
+                    assert_eq!(
+                        history
+                            .get_storage(&target, &native_balance_slot(owner))
+                            .unwrap(),
+                        ShellHash::from(*word.as_bytes())
+                    );
+                }
             }
         }
         (sender, contract, first, second, blocks)
@@ -7091,6 +7244,8 @@ mod tests {
             include_str!("../../../pqvm/tests/fixtures/native-typed-call.json"),
         ))
         .unwrap();
+        let balance_query = fixture["selectors"]["balanceOf(address)"].is_string();
+        let owner_query = owner_query && !balance_query;
         let writer = Address::from([0x69; 32]);
         let runtime = |name: &str| {
             hex::decode(
@@ -7107,9 +7262,9 @@ mod tests {
             node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2,"fee_accounting_activation_height":0})).unwrap()).unwrap();
             fund_account(node, &sender, initial_balance);
             for (address, code) in [
-                (contract, runtime(if owner_query { "Reader" } else { "Typed" })),
-                (first, runtime(if owner_query { "Owner" } else { "Echo" })),
-                (second, runtime(if owner_query { "Owner" } else { "Echo" })),
+                (contract, runtime(if owner_query || balance_query { "Reader" } else { "Typed" })),
+                (first, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
+                (second, runtime(if balance_query { "Token" } else if owner_query { "Owner" } else { "Echo" })),
                 (short, hex::decode("60015ff3").unwrap()),
                 (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
             ] {
@@ -7120,13 +7275,20 @@ mod tests {
                     .set_code_hash(&address, hash)
                     .unwrap();
             }
-            if owner_query {
+            if balance_query {
+                for (target, owner, word) in native_balance_words(first, second) {
+                    node.world_state.write().set_storage(&target, &native_balance_slot(owner), &ShellHash::from(*word.as_bytes())).unwrap();
+                }
+            }
+            if owner_query || balance_query {
                 let code = runtime("Writer");
                 let hash = shell_primitives::keccak256(&code);
                 node.chain_store.put_code(&hash, &code).unwrap();
                 node.world_state.write().set_code_hash(&writer, hash).unwrap();
-                for target in [first, second] {
-                    node.world_state.write().set_storage(&target, &ShellHash::ZERO, &ShellHash::from(*target.as_bytes())).unwrap();
+                if owner_query {
+                    for target in [first, second] {
+                        node.world_state.write().set_storage(&target, &ShellHash::ZERO, &ShellHash::from(*target.as_bytes())).unwrap();
+                    }
                 }
             }
             node.world_state.write().set_validators(&[proposer]).unwrap();
@@ -7137,7 +7299,17 @@ mod tests {
         initialize!(follower);
         let mut blocks = Vec::new();
         let mut fees = U256::ZERO;
-        let cases = if owner_query {
+        let cases = if balance_query {
+            [
+                ("record(address,address)", first, first, false, 0u64),
+                ("record(address,address)", first, first, true, 1),
+                ("record(address,address)", second, Address::ZERO, false, 1),
+                ("record(address,address)", second, second, true, 2),
+                ("record(address,address)", writer, alias, false, 2),
+                ("record(address,address)", short, first, false, 2),
+                ("record(address,address)", missing, first, false, 2),
+            ]
+        } else if owner_query {
             let maximum = Address::from([0xff; 32]);
             [
                 ("lookup(address,uint256)", first, maximum, false, 0u64),
@@ -7233,7 +7405,9 @@ mod tests {
                     );
                     assert_eq!(
                         recovered.get_storage(&first, &ShellHash::ZERO).unwrap(),
-                        if owner_query || nonce >= 1 {
+                        if balance_query {
+                            ShellHash::ZERO
+                        } else if owner_query || nonce >= 1 {
                             ShellHash::from(*first.as_bytes())
                         } else {
                             ShellHash::ZERO
@@ -7241,7 +7415,9 @@ mod tests {
                     );
                     assert_eq!(
                         recovered.get_storage(&second, &ShellHash::ZERO).unwrap(),
-                        if owner_query || nonce >= 3 {
+                        if balance_query {
+                            ShellHash::ZERO
+                        } else if owner_query || nonce >= 3 {
                             ShellHash::from(*second.as_bytes())
                         } else {
                             ShellHash::ZERO
@@ -7252,7 +7428,17 @@ mod tests {
                         ShellHash::ZERO
                     );
                     assert!(recovered.get_account(&missing).unwrap().is_none());
-                    if owner_query {
+                    if balance_query {
+                        for (target, owner, word) in native_balance_words(first, second) {
+                            assert_eq!(
+                                recovered
+                                    .get_storage(&target, &native_balance_slot(owner))
+                                    .unwrap(),
+                                ShellHash::from(*word.as_bytes())
+                            );
+                        }
+                    }
+                    if owner_query || balance_query {
                         assert_eq!(
                             recovered.get_storage(&writer, &ShellHash::ZERO).unwrap(),
                             ShellHash::ZERO
@@ -7282,6 +7468,16 @@ mod tests {
                 history.get_storage(&contract, &ShellHash::ZERO).unwrap(),
                 ShellHash::from(U256::from(count).to_be_bytes::<32>())
             );
+            if balance_query {
+                for (target, owner, word) in native_balance_words(first, second) {
+                    assert_eq!(
+                        history
+                            .get_storage(&target, &native_balance_slot(owner))
+                            .unwrap(),
+                        ShellHash::from(*word.as_bytes())
+                    );
+                }
+            }
         }
         assert_eq!(
             follower
@@ -7336,11 +7532,21 @@ mod tests {
             Arc::new(RwLock::new(0)),
             Arc::new(RwLock::new(FinalityState::new())),
         );
+        let balance_query = serde_json::from_str::<serde_json::Value>(owner_fixture).unwrap()
+            ["selectors"]["balanceOf(address)"]
+            .is_string();
+        if balance_query {
+            native_balance_latest_rpc(&follower, sender, contract, first, second);
+        }
         let before = follower.store.scan_prefix(b"").unwrap();
         let root = current_state_root(&follower);
         // The imported tip's original lookup selector returns each complete owner
         // from committed storage; simulation must not persist the reader counter.
-        for target in [first, second] {
+        for target in if balance_query {
+            Vec::new()
+        } else {
+            vec![first, second]
+        } {
             let mut data =
                 shell_primitives::keccak256(b"lookup(address,uint256)").as_bytes()[..4].to_vec();
             data.extend_from_slice(target.as_bytes());
@@ -7374,10 +7580,18 @@ mod tests {
                 .unwrap();
             let output = match block.number() {
                 2 => format!("0x{}", hex::encode(first.as_bytes())),
-                4 => format!("0x{}", hex::encode(second.as_bytes())),
+                4 => format!(
+                    "0x{}",
+                    hex::encode(if balance_query { first } else { second }.as_bytes())
+                ),
                 3 => {
-                    let mut bytes =
-                        shell_primitives::keccak256(b"Missing(uint256)").as_bytes()[..4].to_vec();
+                    let mut bytes = shell_primitives::keccak256(if balance_query {
+                        b"Missing(address)".as_slice()
+                    } else {
+                        b"Missing(uint256)".as_slice()
+                    })
+                    .as_bytes()[..4]
+                        .to_vec();
                     bytes.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
                     format!("0x{}", hex::encode(bytes))
                 }
@@ -7393,6 +7607,18 @@ mod tests {
             }
             assert_eq!(current_state_root(&follower), root);
             assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_pure_balance_signed_import_rpc_and_history() {
+        for (reader, result_type) in [
+            ("PureAddressReader", "address"),
+            ("PureBytesReader", "bytes32"),
+        ] {
+            let fixture = native_pure_balance_fixture(reader, result_type);
+            native_owner_signed_rpc_and_history(&DilithiumSigner::generate(), &fixture);
+            native_owner_signed_rpc_and_history(&MlDsaSigner::generate(), &fixture);
         }
     }
 
