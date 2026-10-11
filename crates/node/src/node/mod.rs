@@ -8083,10 +8083,9 @@ mod tests {
                 .get_receipts(&block.hash())
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                receipts[0].status,
-                u8::from(success),
-                "{reader} {activation:?} block{}",
+            assert!(
+                receipts[0].status == u8::from(success),
+                "{reader} {activation:?} receipt status mismatch at block{}",
                 block.number()
             );
             assert!(receipts[0].logs.is_empty());
@@ -8400,10 +8399,9 @@ mod tests {
                 .get_receipts(&block.hash())
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                receipts[0].status,
-                u8::from(success),
-                "{reader} {activation:?} AA block{}",
+            assert!(
+                receipts[0].status == u8::from(success),
+                "{reader} {activation:?} AA receipt status mismatch at block{}",
                 block.number()
             );
             assert_eq!(receipts[0].tx_hash, hash);
