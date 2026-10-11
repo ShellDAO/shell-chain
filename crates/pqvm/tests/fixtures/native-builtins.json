@@ -1,0 +1,56 @@
+{
+  "source": "pragma solidity ^0.8.20; contract NativeContext { address public stored; function read() external returns(address,address,address,address) { stored = msg.sender; return(msg.sender,tx.origin,block.coinbase,address(this)); } }",
+  "activationHeight": 2,
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "selector": "0x57de26a4",
+  "artifact": {
+    "contractName": "NativeContext",
+    "sourcePath": "NativeContext.sol",
+    "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+    "abi": [
+      {
+        "inputs": [],
+        "name": "read",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "stored",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      }
+    ],
+    "bytecode": "0x6080806040523460135760c6908160188239f35b5f80fdfe608060405260043610156010575f80fd5b5f3560e01c806357de26a41460305763e582dd3114602c575f80fd5b606b565b346067575f36600319011260675760446085565b5f55604c6085565b600243106067576080523260a0524160c0523060e052608080f35b5f80fd5b346067575f36600319011260675760205f54604051908152f35b60024310606757339056fea26469706673582212200b55c8ad34c97b1c2175d6aa304c795e2ae86a2c38a260a83181aa6f5bd0264764736f6c63430008230033",
+    "deployedBytecode": "0x608060405260043610156010575f80fd5b5f3560e01c806357de26a41460305763e582dd3114602c575f80fd5b606b565b346067575f36600319011260675760446085565b5f55604c6085565b600243106067576080523260a0524160c0523060e052608080f35b5f80fd5b346067575f36600319011260675760205f54604051908152f35b60024310606757339056fea26469706673582212200b55c8ad34c97b1c2175d6aa304c795e2ae86a2c38a260a83181aa6f5bd0264764736f6c63430008230033"
+  }
+}

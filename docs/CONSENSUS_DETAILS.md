@@ -678,3 +678,23 @@ algorithms, and leaves custom account validators and session policy unchanged.
 The schedule is immutable once configured; adding it to an existing chain
 requires a future height. Snapshot imports require the same trusted schedule.
 See [scope and compatibility](adr/algorithm-deprecation-migration.md).
+
+
+### Unreleased native address context: journal commits
+
+The development `native_address_context_height` schedule remains absent by
+default. At and after its configured height, ordinary PQVM transactions and
+native AA inner calls persist only touched journal accounts. Reading the
+balance, code hash or code of a nonexistent account must not create an account
+or change its persisted metadata. Successful writes and transfers still commit;
+reverted AA batches retain their existing atomic rollback and fee rules.
+Before this activation, journal commit behavior is preserved for historical
+state-root compatibility. This profile remains incomplete and unreleased;
+it must not be enabled on a deployed network until its remaining native
+creation behavior and release checks are complete.
+
+At native address-context activation, ordinary and AA receipt log emitters
+resolve through the transaction-local full-address registry, even if the older
+log-address schedule is absent. Internal execution handles never appear as
+public log addresses. Receipt bloom hashing still follows its own activation
+schedule. Before native activation, existing log-address rules remain intact.

@@ -609,7 +609,29 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
     calldata: Vec<u8>,
     validation_header: Option<&BlockHeader>,
 ) -> Result<Vec<u8>, AaValidationError> {
-    let state_db = ValidationStateDb::new(
+    let (number, ..) = validation_block_env(chain_store, validation_header, VALIDATION_GAS_CAP)?;
+    let context = crate::native_context::NativeAddressContext::at_height(chain_store, number)?;
+    call_custom_validation_with_address_context(
+        signed_tx,
+        world_state,
+        chain_store,
+        validation_code_hash,
+        calldata,
+        validation_header,
+        context,
+    )
+}
+
+fn call_custom_validation_with_address_context<S: KvStore + 'static>(
+    signed_tx: &SignedTransaction,
+    world_state: &WorldState<S>,
+    chain_store: &ChainStore<S>,
+    validation_code_hash: ShellHash,
+    calldata: Vec<u8>,
+    validation_header: Option<&BlockHeader>,
+    native_context: Option<crate::native_context::NativeAddressContext>,
+) -> Result<Vec<u8>, AaValidationError> {
+    let mut state_db = ValidationStateDb::new(
         world_state,
         chain_store,
         signed_tx.from,
@@ -619,12 +641,20 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
     let (number, timestamp, gas_limit, excess_blob_gas, base_fee) =
         validation_block_env(chain_store, validation_header, VALIDATION_GAS_CAP)?;
 
+    let target = if let Some(context) = &native_context {
+        state_db.inner.set_native_context(context.clone());
+        context
+            .register(signed_tx.from)
+            .map_err(|error| AaValidationError::ValidationContractRejected(error.into()))?
+    } else {
+        signed_tx.from.into()
+    };
     let tx_env = TxEnv::builder()
         .caller(Address::ZERO.into())
         .gas_limit(VALIDATION_GAS_CAP)
         .max_fee_per_gas(0)
         .gas_priority_fee(Some(0))
-        .kind(TxKind::Call(signed_tx.from.into()))
+        .kind(TxKind::Call(target))
         .value(alloy_primitives::U256::ZERO)
         .data(AlBytes::from(calldata))
         .nonce(0)
@@ -653,6 +683,7 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
             cfg.disable_base_fee = true;
         });
 
+    let ctx = ctx.with_chain(native_context.clone().unwrap_or_default());
     let spec = SpecId::CANCUN;
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
     let config = chain_store.get_chain_config()?;
@@ -675,6 +706,10 @@ fn call_custom_validation_contract<S: KvStore + 'static>(
                 0,
             ),
         );
+    }
+    if native_context.is_some() {
+        crate::executor::install_pqvm_instructions(&mut instructions);
+        crate::native_context::install(&mut instructions);
     }
     let mut evm = Evm::new(
         ctx,
@@ -1109,6 +1144,25 @@ pub fn simulate_paymaster_validation<S: KvStore + 'static>(
     input: &PaymasterValidationInput<'_>,
     validation_header: Option<&BlockHeader>,
 ) -> Result<u64, AaValidationError> {
+    let (number, ..) =
+        validation_block_env(chain_store, validation_header, PAYMASTER_VALIDATE_GAS_CAP)?;
+    let context = crate::native_context::NativeAddressContext::at_height(chain_store, number)?;
+    simulate_paymaster_with_address_context(
+        world_state,
+        chain_store,
+        input,
+        validation_header,
+        context,
+    )
+}
+
+fn simulate_paymaster_with_address_context<S: KvStore + 'static>(
+    world_state: &WorldState<S>,
+    chain_store: &ChainStore<S>,
+    input: &PaymasterValidationInput<'_>,
+    validation_header: Option<&BlockHeader>,
+    native_context: Option<crate::native_context::NativeAddressContext>,
+) -> Result<u64, AaValidationError> {
     let paymaster = input.paymaster;
     let calldata = encode_validate_paymaster_op_calldata(
         input.sender,
@@ -1118,23 +1172,35 @@ pub fn simulate_paymaster_validation<S: KvStore + 'static>(
     );
 
     let wrapper_address = paymaster_validation_wrapper_address(paymaster);
-    let state_db = ValidationStateDb::with_inline_code(
+    let mut state_db = ValidationStateDb::with_inline_code(
         world_state,
         chain_store,
         wrapper_address,
         *paymaster,
-        paymaster_validation_wrapper_code(paymaster),
+        if native_context.is_some() {
+            paymaster_validation_wrapper_code_for_profile(paymaster, true)
+        } else {
+            paymaster_validation_wrapper_code(paymaster)
+        },
     );
 
     let (number, timestamp, gas_limit, excess_blob_gas, base_fee) =
         validation_block_env(chain_store, validation_header, PAYMASTER_VALIDATE_GAS_CAP)?;
 
+    let target = if let Some(context) = &native_context {
+        state_db.inner.set_native_context(context.clone());
+        context
+            .register(wrapper_address)
+            .map_err(|error| AaValidationError::ValidationContractRejected(error.into()))?
+    } else {
+        wrapper_address.into()
+    };
     let tx_env = TxEnv::builder()
         .caller(Address::ZERO.into())
         .gas_limit(PAYMASTER_VALIDATE_GAS_CAP)
         .max_fee_per_gas(0)
         .gas_priority_fee(Some(0))
-        .kind(TxKind::Call(wrapper_address.into()))
+        .kind(TxKind::Call(target))
         .value(alloy_primitives::U256::ZERO)
         .data(AlBytes::from(calldata))
         .nonce(0)
@@ -1163,6 +1229,7 @@ pub fn simulate_paymaster_validation<S: KvStore + 'static>(
             cfg.disable_base_fee = true;
         });
 
+    let ctx = ctx.with_chain(native_context.clone().unwrap_or_default());
     let spec = SpecId::CANCUN;
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
     let config = chain_store.get_chain_config()?;
@@ -1185,6 +1252,10 @@ pub fn simulate_paymaster_validation<S: KvStore + 'static>(
                 0,
             ),
         );
+    }
+    if native_context.is_some() {
+        crate::executor::install_pqvm_instructions(&mut instructions);
+        crate::native_context::install(&mut instructions);
     }
     let mut evm = Evm::new(
         ctx,
@@ -1244,17 +1315,37 @@ fn paymaster_validation_wrapper_address(paymaster: &Address) -> Address {
 /// Build a transient wrapper that forwards calldata with `STATICCALL` and
 /// propagates the target's return or revert data.
 fn paymaster_validation_wrapper_code(paymaster: &Address) -> Vec<u8> {
+    paymaster_validation_wrapper_code_for_profile(paymaster, false)
+}
+
+fn paymaster_validation_wrapper_code_for_profile(paymaster: &Address, native: bool) -> Vec<u8> {
     let mut code = vec![
         0x36, 0x5F, 0x5F, 0x37, // calldatacopy(0, 0, calldatasize())
         0x5F, 0x5F, 0x36, 0x5F, 0x73, // staticcall output/input arguments + PUSH20
     ];
-    code.extend_from_slice(paymaster.to_alloy().as_slice());
+    if native {
+        *code.last_mut().unwrap() = 0x7f; // PUSH32
+        code.extend_from_slice(paymaster.as_bytes());
+    } else {
+        code.extend_from_slice(paymaster.to_alloy().as_slice());
+    }
     code.extend_from_slice(&[
-        0x5A, 0xFA, // gas(), staticcall(...)
-        0x3D, 0x5F, 0x5F, 0x3E, // returndatacopy(0, 0, returndatasize())
-        0x60, 0x29, 0x57, // jump to success when STATICCALL returned true
-        0x3D, 0x5F, 0xFD, // revert(0, returndatasize())
-        0x5B, 0x3D, 0x5F, 0xF3, // success: return(0, returndatasize())
+        0x5A,
+        0xFA, // gas(), staticcall(...)
+        0x3D,
+        0x5F,
+        0x5F,
+        0x3E, // returndatacopy(0, 0, returndatasize())
+        0x60,
+        if native { 0x35 } else { 0x29 },
+        0x57, // success label after address operand
+        0x3D,
+        0x5F,
+        0xFD, // revert(0, returndatasize())
+        0x5B,
+        0x3D,
+        0x5F,
+        0xF3, // success: return(0, returndatasize())
     ]);
     code
 }
@@ -1344,6 +1435,14 @@ struct ValidationStateDb<'a, S: KvStore + 'static> {
 }
 
 impl<'a, S: KvStore + 'static> ValidationStateDb<'a, S> {
+    fn matches_address(&self, key: alloy_primitives::Address, address: Address) -> bool {
+        if self.inner.native_context_enabled() {
+            self.inner.resolve_address(key) == address
+        } else {
+            key == address.to_alloy()
+        }
+    }
+
     fn new(
         world_state: &'a WorldState<S>,
         chain_store: &'a ChainStore<S>,
@@ -1387,14 +1486,14 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
         &mut self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
-        let is_validation_target = address == self.validation_target.to_alloy();
+        let is_validation_target = self.matches_address(address, self.validation_target);
         let mut info = if is_validation_target {
             self.inner
                 .world_state()
                 .get_account(&self.validation_target)
                 .map_err(StateDbError::Storage)?
                 .map(|account| ShellStateDb::<S>::to_account_info(&account))
-        } else if address == self.state_target.to_alloy() {
+        } else if self.matches_address(address, self.state_target) {
             self.inner
                 .world_state()
                 .get_account(&self.state_target)
@@ -1432,7 +1531,7 @@ impl<S: KvStore + 'static> Database for ValidationStateDb<'_, S> {
         address: alloy_primitives::Address,
         index: alloy_primitives::U256,
     ) -> Result<alloy_primitives::U256, Self::Error> {
-        if address == self.state_target.to_alloy() {
+        if self.matches_address(address, self.state_target) {
             let key = ShellHash::from(alloy_primitives::B256::from(index));
             let value = self
                 .inner
@@ -1463,6 +1562,157 @@ mod tests {
     use shell_primitives::{Bytes, U256};
     use shell_storage::MemoryDb;
     use std::sync::Arc;
+
+    #[test]
+    fn native_context_validation_reads_distinct_full_accounts_without_committing() {
+        let (mut ws, cs) = setup_stores();
+        let target = Address::from([0x12; 32]);
+        let mut other_bytes = *target.as_bytes();
+        other_bytes[..12].fill(0x34);
+        let other = Address::from(other_bytes);
+        ws.set_account(
+            &target,
+            &Account::new_user_account(ShellHash::ZERO, U256::from(7)),
+        )
+        .unwrap();
+        ws.set_account(
+            &other,
+            &Account::new_user_account(ShellHash::ZERO, U256::from(9)),
+        )
+        .unwrap();
+        ws.set_storage(
+            &target,
+            &ShellHash::ZERO,
+            &ShellHash::from(U256::from(1).to_be_bytes::<32>()),
+        )
+        .unwrap();
+        let signed = SignedTransaction::new(
+            target,
+            base_tx(1337, 0),
+            PQSignature::new(SignatureType::MlDsa65, vec![0]),
+        );
+        // Simulated SSTORE is journal-local; then read native context and a
+        // distinct account that shares the same low 160 bits.
+        let mut code = vec![0x60, 0x02, 0x5f, 0x55, 0x30, 0x5f, 0x52, 0x7f];
+        code.extend_from_slice(other.as_bytes());
+        code.extend_from_slice(&[
+            0x31, 0x60, 0x20, 0x52, 0x5f, 0x54, 0x60, 0x40, 0x52, 0x60, 0x60, 0x5f, 0xf3,
+        ]);
+        let hash = keccak256(&code);
+        cs.put_code(&hash, &code).unwrap();
+        let before = ws.state_root().unwrap();
+        let output = call_custom_validation_with_address_context(
+            &signed,
+            &ws,
+            &cs,
+            hash,
+            vec![],
+            None,
+            Some(crate::native_context::NativeAddressContext::default()),
+        )
+        .unwrap();
+        assert_eq!(&output[..32], target.as_bytes());
+        assert_eq!(&output[32..64], &U256::from(9).to_be_bytes::<32>());
+        assert_eq!(&output[64..], &U256::from(2).to_be_bytes::<32>());
+        assert_eq!(ws.state_root().unwrap(), before);
+        assert_eq!(ws.get_nonce(&target).unwrap(), 0);
+        assert_eq!(
+            ws.get_storage(&target, &ShellHash::ZERO).unwrap(),
+            ShellHash::from(U256::from(1).to_be_bytes::<32>())
+        );
+    }
+
+    #[test]
+    fn native_context_paymaster_static_wrapper_preserves_identity_and_rejects_writes() {
+        for writes in [false, true] {
+            let (mut ws, cs) = setup_stores();
+            let paymaster = Address::from([0x12; 32]);
+            let mut other_bytes = *paymaster.as_bytes();
+            other_bytes[..12].fill(0x34);
+            let other = Address::from(other_bytes);
+            ws.set_account(
+                &other,
+                &Account::new_user_account(ShellHash::ZERO, U256::from(9)),
+            )
+            .unwrap();
+            let mut code = if writes {
+                vec![0x60, 0x02, 0x5f, 0x55]
+            } else {
+                vec![]
+            };
+            code.extend_from_slice(&[0x30, 0x7f]);
+            code.extend_from_slice(paymaster.as_bytes());
+            code.extend_from_slice(&[0x14, 0x7f]);
+            code.extend_from_slice(other.as_bytes());
+            code.extend_from_slice(&[
+                0x31, 0x60, 0x09, 0x14, 0x16, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+            ]);
+            install_paymaster(&mut ws, &cs, paymaster, code);
+            let before = ws.state_root().unwrap();
+            let input = PaymasterValidationInput {
+                chain_id: 1337,
+                sender: &other,
+                paymaster: &paymaster,
+                call_data: &[],
+                max_gas_cost: U256::ZERO,
+                context: &[],
+            };
+            let result = simulate_paymaster_with_address_context(
+                &ws,
+                &cs,
+                &input,
+                None,
+                Some(crate::native_context::NativeAddressContext::default()),
+            );
+            assert_eq!(result.is_ok(), !writes);
+            assert_eq!(ws.state_root().unwrap(), before);
+            assert_eq!(
+                ws.get_storage(&paymaster, &ShellHash::ZERO).unwrap(),
+                ShellHash::ZERO
+            );
+            // Public legacy simulation cannot satisfy the full ADDRESS check.
+            assert!(simulate_paymaster_validation(&ws, &cs, &input, None).is_err());
+        }
+    }
+
+    #[test]
+    fn native_address_context_height_selects_paymaster_full_identity_at_boundary() {
+        let (mut ws, cs) = setup_stores();
+        let paymaster = Address::from([0x12; 32]);
+        let sender = Address::from([0x34; 32]);
+        let mut code = vec![0x30, 0x7f];
+        code.extend_from_slice(paymaster.as_bytes());
+        code.extend_from_slice(&[0x14, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+        install_paymaster(&mut ws, &cs, paymaster, code);
+        cs.put_chain_config(
+            &serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let input = PaymasterValidationInput {
+            chain_id: 1337,
+            sender: &sender,
+            paymaster: &paymaster,
+            call_data: &[],
+            max_gas_cost: U256::ZERO,
+            context: &[],
+        };
+        let before = ws.state_root().unwrap();
+        for number in [1, 2, 3, 1] {
+            let header = BlockHeader {
+                number,
+                gas_limit: PAYMASTER_VALIDATE_GAS_CAP,
+                ..BlockHeader::default()
+            };
+            assert_eq!(
+                simulate_paymaster_validation(&ws, &cs, &input, Some(&header)).is_ok(),
+                number >= 2
+            );
+            assert_eq!(ws.state_root().unwrap(), before);
+        }
+    }
 
     fn setup_stores() -> (WorldState<MemoryDb>, ChainStore<MemoryDb>) {
         let ws = WorldState::new(Arc::new(MemoryDb::new()));
@@ -2418,6 +2668,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

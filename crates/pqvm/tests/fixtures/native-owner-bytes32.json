@@ -1,0 +1,138 @@
+{
+  "source": "pragma solidity ^0.8.20; interface I {function ownerOf(uint256 tokenId) external view returns(bytes32);} contract Reader {uint256 public selections; function lookup(address target,uint256 tokenId) external returns(bytes32){selections++;return I(target).ownerOf(tokenId);}} contract Owner {bytes32 public owner; error Missing(uint256 tokenId); function ownerOf(uint256 tokenId) external view returns(bytes32){if(tokenId!=0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)revert Missing(tokenId);return owner;}} contract Writer {function ownerOf(uint256 tokenId) external returns(bytes32){assembly {sstore(0,tokenId)}return bytes32(0);}}",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "selectors": {
+    "lookup(address,uint256)": "0xb033a6c3",
+    "ownerOf(uint256)": "0x6352211e",
+    "Missing(uint256)": "0xdd653a29"
+  },
+  "artifacts": {
+    "Reader": {
+      "contractName": "Reader",
+      "sourcePath": "Owner.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "tokenId",
+              "type": "uint256"
+            }
+          ],
+          "name": "lookup",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "selections",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x608080604052346015576101c2908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80639734e5611461010b5763b033a6c31461002f575f80fd5b346100f35760403660031901126100f357600435602435905f545f1981146100f7576001015f556040519060208201926331a9108f60e11b845260248301526024825261007d60448361013a565b600243106100f3575f92839251915afa3d9061009882610170565b906100a6604051928361013a565b8282526100b283610170565b602083019390601f19013685375f843e156100ef576100eb916020826100db9351010190610161565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b634e487b7160e01b5f52601160045260245ffd5b346100f3575f3660031901126100f3575f5460805260206080f35b634e487b7160e01b5f52604160045260245ffd5b90601f8019910116810190811067ffffffffffffffff82111761015c57604052565b610126565b908160209103126100f3575190565b67ffffffffffffffff811161015c57601f01601f19166020019056fea26469706673582212207e6b2ee01880e27349f6cad1da205a3c96f5c21159dcc7703a444f1c5f8325e364736f6c63430008230033",
+      "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80639734e5611461010b5763b033a6c31461002f575f80fd5b346100f35760403660031901126100f357600435602435905f545f1981146100f7576001015f556040519060208201926331a9108f60e11b845260248301526024825261007d60448361013a565b600243106100f3575f92839251915afa3d9061009882610170565b906100a6604051928361013a565b8282526100b283610170565b602083019390601f19013685375f843e156100ef576100eb916020826100db9351010190610161565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b634e487b7160e01b5f52601160045260245ffd5b346100f3575f3660031901126100f3575f5460805260206080f35b634e487b7160e01b5f52604160045260245ffd5b90601f8019910116810190811067ffffffffffffffff82111761015c57604052565b610126565b908160209103126100f3575190565b67ffffffffffffffff811161015c57601f01601f19166020019056fea26469706673582212207e6b2ee01880e27349f6cad1da205a3c96f5c21159dcc7703a444f1c5f8325e364736f6c63430008230033"
+    },
+    "Owner": {
+      "contractName": "Owner",
+      "sourcePath": "Owner.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "tokenId",
+              "type": "uint256"
+            }
+          ],
+          "name": "Missing",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "tokenId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ownerOf",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080806040523460135760b9908160188239f35b5f80fdfe60808060405260043610156011575f80fd5b5f3560e01c9081636352211e14604d5750638da5cb5b14602f575f80fd5b346049575f36600319011260495760205f54604051908152f35b5f80fd5b34604957602036600319011260495760043590600182016070576020905f548152f35b5063dd653a2960e01b5f5260045260245ffdfea264697066735822122053804eaf7b91cddb850154c57815b83f0b8e66f0d2ffc4fab9c780dfa7cf9ffd64736f6c63430008230033",
+      "deployedBytecode": "0x60808060405260043610156011575f80fd5b5f3560e01c9081636352211e14604d5750638da5cb5b14602f575f80fd5b346049575f36600319011260495760205f54604051908152f35b5f80fd5b34604957602036600319011260495760043590600182016070576020905f548152f35b5063dd653a2960e01b5f5260045260245ffdfea264697066735822122053804eaf7b91cddb850154c57815b83f0b8e66f0d2ffc4fab9c780dfa7cf9ffd64736f6c63430008230033"
+    },
+    "Writer": {
+      "contractName": "Writer",
+      "sourcePath": "Writer.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "tokenId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ownerOf",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080604052348015600e575f5ffd5b50609a80601a5f395ff3fe6080604052348015600e575f5ffd5b50600436106026575f3560e01c80636352211e14602a575b5f5ffd5b603c6035366004604e565b5f90815590565b60405190815260200160405180910390f35b5f60208284031215605d575f5ffd5b503591905056fea26469706673582212201bbd2df5a45fb9c3812bc4f6a76f563ddafa9ef9c28fb001ed885584ecec6fd364736f6c63430008230033",
+      "deployedBytecode": "0x6080604052348015600e575f5ffd5b50600436106026575f3560e01c80636352211e14602a575b5f5ffd5b603c6035366004604e565b5f90815590565b60405190815260200160405180910390f35b5f60208284031215605d575f5ffd5b503591905056fea26469706673582212201bbd2df5a45fb9c3812bc4f6a76f563ddafa9ef9c28fb001ed885584ecec6fd364736f6c63430008230033"
+    }
+  }
+}

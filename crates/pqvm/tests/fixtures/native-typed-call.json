@@ -1,0 +1,134 @@
+{
+  "source": "pragma solidity ^0.8.20; interface I {function echo(address value) external returns(address);} interface IV {function echo(address value) external view returns(address);} contract Typed {uint256 public selections; function invoke(address target,address value) external returns(address){selections++;return I(target).echo(value);} function inspect(address target,address value) external view returns(address){return IV(target).echo(value);}} contract Echo {address public last; error Denied(address value); function echo(address value) external returns(address){last=value;if(value==address(0))revert Denied(value);return value;}}",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "selectors": {
+    "invoke(address,address)": "0x0155755c",
+    "inspect(address,address)": "0x09285279",
+    "Denied(address)": "0xe7d05e27"
+  },
+  "artifacts": {
+    "Typed": {
+      "contractName": "Typed",
+      "sourcePath": "Typed.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "value",
+              "type": "address"
+            }
+          ],
+          "name": "inspect",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "value",
+              "type": "address"
+            }
+          ],
+          "name": "invoke",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "selections",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080806040523460155761025f908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c806309285279146100445780630155755c1461003f57639734e5611461003a575f80fd5b610152565b6100d4565b346100d05760403660031901126100d0576004356024356317fedf8d60e11b60a05260a45260246080526100786044610182565b600243106100d0575f809160a0608051915afa3d90610096826101f7565b9060208201925f843e156100cc576100c8916020826100b893510101906101cc565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b346100d05760403660031901126100d057600435602435905f545f19811461013e576001015f556040519060208201926317fedf8d60e11b84526024830152602482526101226044836101aa565b600243106100d0575f9283809351925af13d90610096826101f7565b634e487b7160e01b5f52601160045260245ffd5b346100d0575f3660031901126100d05760205f54604051908152f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff8211176101a557604052565b61016e565b90601f8019910116810190811067ffffffffffffffff8211176101a557604052565b908160209103126100d0575190565b67ffffffffffffffff81116101a557601f01601f191660200190565b90610201826101db565b61020e60405191826101aa565b828152809261021f601f19916101db565b019060203691013756fea2646970667358221220ec3131712accd545b6f81d635812e87146d83fe91fb40040bcd6dac1a2148e0a64736f6c63430008230033",
+      "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c806309285279146100445780630155755c1461003f57639734e5611461003a575f80fd5b610152565b6100d4565b346100d05760403660031901126100d0576004356024356317fedf8d60e11b60a05260a45260246080526100786044610182565b600243106100d0575f809160a0608051915afa3d90610096826101f7565b9060208201925f843e156100cc576100c8916020826100b893510101906101cc565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b346100d05760403660031901126100d057600435602435905f545f19811461013e576001015f556040519060208201926317fedf8d60e11b84526024830152602482526101226044836101aa565b600243106100d0575f9283809351925af13d90610096826101f7565b634e487b7160e01b5f52601160045260245ffd5b346100d0575f3660031901126100d05760205f54604051908152f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff8211176101a557604052565b61016e565b90601f8019910116810190811067ffffffffffffffff8211176101a557604052565b908160209103126100d0575190565b67ffffffffffffffff81116101a557601f01601f191660200190565b90610201826101db565b61020e60405191826101aa565b828152809261021f601f19916101db565b019060203691013756fea2646970667358221220ec3131712accd545b6f81d635812e87146d83fe91fb40040bcd6dac1a2148e0a64736f6c63430008230033"
+    },
+    "Echo": {
+      "contractName": "Echo",
+      "sourcePath": "Typed.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "value",
+              "type": "address"
+            }
+          ],
+          "name": "Denied",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "value",
+              "type": "address"
+            }
+          ],
+          "name": "echo",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "last",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080806040523460135760b7908160188239f35b5f80fdfe60808060405260043610156011575f80fd5b5f3560e01c90816347799da814606a5750632ffdbf1a14602f575f80fd5b346066576020366003190112606657600435805f558015605457602090604051908152f35b63e7d05e2760e01b5f5260045260245ffd5b5f80fd5b346066575f3660031901126066576020905f548152f3fea26469706673582212203adc84983e5cce4e11be49cb4eb43f673659b26d7ad007af4421ecd144a7f5e564736f6c63430008230033",
+      "deployedBytecode": "0x60808060405260043610156011575f80fd5b5f3560e01c90816347799da814606a5750632ffdbf1a14602f575f80fd5b346066576020366003190112606657600435805f558015605457602090604051908152f35b63e7d05e2760e01b5f5260045260245ffd5b5f80fd5b346066575f3660031901126066576020905f548152f3fea26469706673582212203adc84983e5cce4e11be49cb4eb43f673659b26d7ad007af4421ecd144a7f5e564736f6c63430008230033"
+    }
+  }
+}

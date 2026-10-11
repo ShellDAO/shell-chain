@@ -274,7 +274,35 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         tx_index: u32,
         cumulative_gas_used: u64,
     ) -> Result<TxExecutionResult, ExecutorError> {
+        let context = crate::native_context::NativeAddressContext::at_height(
+            self.state_db.chain_store(),
+            header.number,
+        )?;
+        self.execute_tx_with_address_context(
+            signed_tx,
+            header,
+            tx_index,
+            cumulative_gas_used,
+            context,
+        )
+    }
+
+    // Native creation semantics remain incomplete; this profile must not be
+    // released or enabled on deployed networks until creation hooks are complete.
+    fn execute_tx_with_address_context(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        tx_index: u32,
+        cumulative_gas_used: u64,
+        native_context: Option<crate::native_context::NativeAddressContext>,
+    ) -> Result<TxExecutionResult, ExecutorError> {
         let tx = &signed_tx.tx;
+        if native_context.is_some() && tx.to.is_none() {
+            return Err(ExecutorError::Revm(
+                "native creation profile is incomplete".into(),
+            ));
+        }
 
         // ── AA bundle hard guard (M2a) ────────────────────────
         // The mempool already validates structure + signatures; this guard
@@ -310,28 +338,54 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let sender_shell_addr = signed_tx.from;
         let sender_nonce_after = next_sender_nonce(tx.nonce)?;
 
-        // Register the sender's full 32-byte address so ShellStateDb can find
-        // it when revm queries by the 20-byte truncated form.
-        self.state_db.register_pq_address(signed_tx.from);
-
-        // Preserve the full beneficiary key when revm reads and credits fees.
-        self.state_db.register_pq_address(header.proposer);
-
-        // Build revm TxEnv
-        let kind = match &tx.to {
-            Some(addr) => TxKind::Call((*addr).into()),
+        let address_key =
+            |address: ShellAddress| -> Result<alloy_primitives::Address, ExecutorError> {
+                match &native_context {
+                    Some(context) => context
+                        .register(address)
+                        .map_err(|error| ExecutorError::Revm(error.into())),
+                    None => Ok(address.into()),
+                }
+            };
+        let caller = address_key(signed_tx.from)?;
+        let beneficiary = address_key(header.proposer)?;
+        let kind = match tx.to {
+            Some(address) => TxKind::Call(address_key(address)?),
             None => TxKind::Create,
         };
-
-        // Register the recipient's full 32-byte address so commit_pqvm_state
-        // stores the balance update under the correct 32-byte key rather than
-        // the zero-padded form of the truncated 20-byte EVM address.
-        if let Some(to) = &tx.to {
-            self.state_db.register_pq_address(*to);
+        let access_list = match &native_context {
+            Some(_) => AccessList(
+                tx.access_list
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|item| {
+                        Ok(RevmAccessListItem {
+                            address: address_key(item.address)?,
+                            storage_keys: item
+                                .storage_keys
+                                .iter()
+                                .map(|key| B256::from(*key))
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ExecutorError>>()?,
+            ),
+            None => Self::convert_access_list(&tx.access_list),
+        };
+        if let Some(context) = &native_context {
+            self.state_db.set_native_context(context.clone());
+        } else {
+            self.state_db.clear_native_context();
+            self.state_db.register_pq_address(signed_tx.from);
+            self.state_db.register_pq_address(header.proposer);
+            if let Some(to) = tx.to {
+                self.state_db.register_pq_address(to);
+            }
         }
 
         let tx_env = TxEnv::builder()
-            .caller(signed_tx.from.into())
+            .caller(caller)
             .gas_limit(tx.gas_limit)
             .max_fee_per_gas(tx.max_fee_per_gas as u128)
             .gas_priority_fee(Some(tx.max_priority_fee_per_gas as u128))
@@ -340,7 +394,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             .data(AlBytes::from(tx.data.as_ref().to_vec()))
             .nonce(tx.nonce)
             .chain_id(Some(self.chain_id))
-            .access_list(Self::convert_access_list(&tx.access_list))
+            .access_list(access_list)
             .blob_hashes(Self::convert_blob_hashes(&tx.blob_versioned_hashes))
             .max_fee_per_blob_gas(tx.max_fee_per_blob_gas.unwrap_or(0) as u128)
             .build_fill();
@@ -350,7 +404,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // (MCOPY). Legacy Ethereum opcodes removed by PQVM are overridden below.
         let mut block_env = BlockEnv {
             number: U256::from(header.number),
-            beneficiary: header.proposer.into(),
+            beneficiary,
             timestamp: U256::from(header.timestamp),
             gas_limit: header.gas_limit,
             basefee: if reconciled_fees {
@@ -383,10 +437,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     cfg.disable_base_fee = true;
                 });
 
+        let ctx = ctx.with_chain(native_context.clone().unwrap_or_default());
         let spec = SpecId::CANCUN;
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         // Wire PQVM native opcodes (0xB0–0xB2) into the instruction table.
         install_pqvm_instructions(&mut instructions);
+        if native_context.is_some() {
+            crate::native_context::install(&mut instructions);
+        }
         let mut evm = Evm::new(ctx, instructions, precompiles);
 
         // Execute
@@ -418,7 +476,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
         drop(evm);
         let exec_result = result_and_state.result;
-        let state = result_and_state.state;
+        let mut state = result_and_state.state;
+        if native_context.is_some() {
+            // Reads load accounts into the journal but must not create them
+            // in persistent state. Retain legacy commit behavior before the
+            // native profile's compatibility activation.
+            state.retain(|_, account| account.is_touched());
+        }
 
         // Build receipt
         let gas_spent = exec_result.gas().spent();
@@ -452,7 +516,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             .iter()
             .filter_map(|log| {
                 shell_core::Log::new(
-                    if full_log_addresses {
+                    if native_context.is_some() || full_log_addresses {
                         self.state_db.resolve_address(&log.address)
                     } else {
                         ShellAddress::from(log.address)
@@ -667,9 +731,29 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         native_account_manager: bool,
         native_validator_registry: bool,
     ) -> Result<TxExecutionResult, ExecutorError> {
+        let native_context = crate::native_context::NativeAddressContext::at_height(
+            self.state_db.chain_store(),
+            header.number,
+        )?;
         let bundle = signed_tx
             .aa_bundle()
             .ok_or_else(|| ExecutorError::Revm("execute_aa_bundle called on non-AA tx".into()))?;
+        if native_context.is_some() && bundle.inner_calls.iter().any(|inner| inner.to.is_none()) {
+            return Err(ExecutorError::Revm(
+                "native creation profile is incomplete".into(),
+            ));
+        }
+        let address_key =
+            |address: ShellAddress| -> Result<alloy_primitives::Address, ExecutorError> {
+                match &native_context {
+                    Some(context) => context
+                        .register(address)
+                        .map_err(|error| ExecutorError::Revm(error.into())),
+                    None => Ok(address.into()),
+                }
+            };
+        let caller = address_key(signed_tx.from)?;
+        let beneficiary = address_key(header.proposer)?;
         let tx = &signed_tx.tx;
         let sender = signed_tx.from;
         let payer = bundle.paymaster.unwrap_or(sender);
@@ -783,7 +867,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         // Build the shared block env once (re-used across inner calls).
         let mut block_env = BlockEnv {
             number: U256::from(header.number),
-            beneficiary: header.proposer.into(),
+            beneficiary,
             timestamp: U256::from(header.timestamp),
             gas_limit: header.gas_limit,
             basefee: base_fee,
@@ -893,19 +977,22 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 }
                 continue;
             }
-            // Resolve every explicit account at the revm boundary using its
-            // full Shell address, including the inner fee beneficiary.
-            self.state_db.register_pq_address(sender);
-            self.state_db.register_pq_address(header.proposer);
-            if let Some(to) = inner.to {
-                self.state_db.register_pq_address(to);
+            if let Some(context) = &native_context {
+                self.state_db.set_native_context(context.clone());
+            } else {
+                self.state_db.clear_native_context();
+                self.state_db.register_pq_address(sender);
+                self.state_db.register_pq_address(header.proposer);
+                if let Some(to) = inner.to {
+                    self.state_db.register_pq_address(to);
+                }
             }
-            let kind = match &inner.to {
-                Some(addr) => TxKind::Call((*addr).into()),
+            let kind = match inner.to {
+                Some(address) => TxKind::Call(address_key(address)?),
                 None => TxKind::Create,
             };
             let tx_env = TxEnv::builder()
-                .caller(sender.into())
+                .caller(caller)
                 .gas_limit(inner.gas_limit)
                 .max_fee_per_gas(tx.max_fee_per_gas as u128)
                 .gas_priority_fee(Some(tx.max_priority_fee_per_gas as u128))
@@ -933,9 +1020,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         // balance check to permit execution either way.
                         cfg.disable_balance_check = true;
                     });
+            let ctx = ctx.with_chain(native_context.clone().unwrap_or_default());
             let spec = SpecId::CANCUN;
             let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
             install_pqvm_instructions(&mut instructions);
+            if native_context.is_some() {
+                crate::native_context::install(&mut instructions);
+            }
             let mut evm = Evm::new(ctx, instructions, precompiles);
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
@@ -979,6 +1070,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
             let exec_result = result_and_state.result;
             let mut state = result_and_state.state;
+            if native_context.is_some() {
+                state.retain(|_, account| account.is_touched());
+            }
             let inner_gas = exec_result.gas().used();
             total_gas_spent = total_gas_spent.saturating_add(exec_result.gas().spent());
             total_gas_used = total_gas_used.saturating_add(inner_gas);
@@ -987,7 +1081,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 ExecutionResult::Success { logs, .. } => {
                     for log in logs {
                         if let Ok(l) = shell_core::Log::new(
-                            if full_log_addresses {
+                            if native_context.is_some() || full_log_addresses {
                                 address_registry
                                     .get(&log.address)
                                     .copied()
@@ -1005,7 +1099,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     // transaction. Remove that accounting artifact before
                     // committing so only the inner call's actual balance
                     // effects remain; AA settlement charges the payer once.
-                    let sender_state = state.get_mut(&sender.to_alloy()).ok_or_else(|| {
+                    let sender_state = state.get_mut(&caller).ok_or_else(|| {
                         ExecutorError::Revm("aa bundle inner execution omitted sender state".into())
                     })?;
                     let original_balance = sender_state.original_info.balance;
@@ -1557,6 +1651,1430 @@ mod tests {
     use shell_storage::{ChainStore, MemoryDb, WorldState};
     use std::sync::Arc;
 
+    #[test]
+    fn native_context_readonly_journal_commit_respects_activation() {
+        for activation in [None, Some(2)] {
+            for number in [1, 2, 3] {
+                let mut evm = setup_evm();
+                let config = serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation
+                })).unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(&config)
+                    .unwrap();
+                let sender = ShellAddress::from([0x11; 20]);
+                let recipient = ShellAddress::from([0x22; 20]);
+                let missing = ShellAddress::from([0x33; 20]);
+                fund_account(&mut evm, &sender, U256::from(100));
+                let mut code = vec![0x73];
+                code.extend_from_slice(missing.to_alloy().as_slice());
+                code.extend_from_slice(&[0x31, 0x50, 0x00]);
+                let hash = shell_primitives::keccak256(&code);
+                evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(
+                        &recipient,
+                        &Account {
+                            code_hash: Some(hash),
+                            ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+                let tx = make_system_tx_to(sender, recipient, Vec::new());
+                let mut header = sample_header();
+                header.number = number;
+                let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, 1);
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                // Preserve the historical journal materialization until the
+                // independently configured native profile activates.
+                assert_eq!(
+                    evm.state_db()
+                        .world_state()
+                        .get_account(&missing)
+                        .unwrap()
+                        .is_none(),
+                    activation.is_some_and(|height| number >= height)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_member_reads_distinguish_aliases_and_missing_accounts() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-members.json")).unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let selector = hex::decode(
+            fixture["selector"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            for target_kind in [0, 1, 2] {
+                let mut evm = setup_evm();
+                let config = serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+                }))
+                .unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(&config)
+                    .unwrap();
+                let sender = ShellAddress::from([0x11; 32]);
+                let recipient = ShellAddress::from([0x98; 32]);
+                let mut bytes = [0x12; 32];
+                bytes[..12].fill(0x34);
+                let foreign = ShellAddress::from(bytes);
+                bytes[..12].fill(0x56);
+                let alias = ShellAddress::from(bytes);
+                bytes[..12].fill(0x78);
+                let missing = ShellAddress::from(bytes);
+                let code = [0x60, 0x42, 0x00];
+                fund_account(&mut evm, &sender, U256::from(100));
+                fund_account(&mut evm, &foreign, U256::from(31));
+                fund_account(&mut evm, &alias, U256::from(53));
+                for (address, code) in [(recipient, runtime.as_slice()), (foreign, code.as_slice())]
+                {
+                    let hash = shell_primitives::keccak256(code);
+                    evm.state_db().chain_store().put_code(&hash, code).unwrap();
+                    let mut account = evm
+                        .state_db()
+                        .world_state()
+                        .get_account(&address)
+                        .unwrap()
+                        .unwrap_or_else(|| Account::new_user_account(ShellHash::ZERO, U256::ZERO));
+                    account.code_hash = Some(hash);
+                    evm.state_db_mut()
+                        .world_state_mut()
+                        .set_account(&address, &account)
+                        .unwrap();
+                }
+                let foreign_before = evm.state_db().world_state().get_account(&foreign).unwrap();
+                let alias_before = evm.state_db().world_state().get_account(&alias).unwrap();
+                let target = [foreign, alias, missing][target_kind];
+                let mut calldata = selector.clone();
+                calldata.extend_from_slice(target.as_bytes());
+                let mut tx = make_system_tx_to(sender, recipient, calldata);
+                tx.tx.gas_limit = 200_000;
+                let mut header = sample_header();
+                header.number = number;
+                let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(number >= 2));
+                if number < 2 {
+                    assert!(result.output.is_empty());
+                } else {
+                    let mut expected = vec![0; if target_kind == 0 { 160 } else { 128 }];
+                    expected[..32].copy_from_slice(
+                        &U256::from([31u64, 53, 0][target_kind]).to_be_bytes::<32>(),
+                    );
+                    if target_kind != 2 {
+                        let hash = shell_primitives::keccak256(if target_kind == 0 {
+                            code.as_slice()
+                        } else {
+                            &[]
+                        });
+                        expected[32..64].copy_from_slice(hash.as_bytes());
+                    }
+                    expected[64..96].copy_from_slice(&U256::from(96).to_be_bytes::<32>());
+                    if target_kind == 0 {
+                        expected[96..128].copy_from_slice(&U256::from(3).to_be_bytes::<32>());
+                        expected[128..131].copy_from_slice(&code);
+                    }
+                    assert_eq!(result.output, expected);
+                }
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                let store = evm.state_db().world_state().store().clone();
+                let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                let recovered = WorldState::at_root(store, &root).unwrap();
+                assert_eq!(recovered.get_account(&foreign).unwrap(), foreign_before);
+                assert_eq!(recovered.get_account(&alias).unwrap(), alias_before);
+                assert!(recovered.get_account(&missing).unwrap().is_none());
+                assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+                assert_eq!(recovered.get_balance(&sender).unwrap(), U256::from(100));
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_call_preserves_target_value_and_inner_rollback() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-call.json")).unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            for reverts in [false, true] {
+                for with_value in [false, true] {
+                    let mut evm = setup_evm();
+                    let config = serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2})).unwrap();
+                    evm.state_db()
+                        .chain_store()
+                        .put_chain_config(&config)
+                        .unwrap();
+                    let sender = ShellAddress::from([0x11; 32]);
+                    let recipient = ShellAddress::from([0x98; 32]);
+                    let mut bytes = [0x12; 32];
+                    bytes[..12].fill(0x34);
+                    let target = ShellAddress::from(bytes);
+                    bytes[..12].fill(0x56);
+                    let alias = ShellAddress::from(bytes);
+                    fund_account(&mut evm, &sender, U256::from(100));
+                    fund_account(&mut evm, &recipient, U256::from(20));
+                    fund_account(&mut evm, &target, U256::from(31));
+                    fund_account(&mut evm, &alias, U256::from(53));
+                    let target_code = hex::decode(if reverts {
+                        "335f55345f5260205ffd"
+                    } else {
+                        "335f55345f5260205ff3"
+                    })
+                    .unwrap();
+                    let alias_code = hex::decode("60ff5f55345f5260205ff3").unwrap();
+                    for (address, code) in [
+                        (recipient, runtime.as_slice()),
+                        (target, target_code.as_slice()),
+                        (alias, alias_code.as_slice()),
+                    ] {
+                        let hash = shell_primitives::keccak256(code);
+                        evm.state_db().chain_store().put_code(&hash, code).unwrap();
+                        let mut account = evm
+                            .state_db()
+                            .world_state()
+                            .get_account(&address)
+                            .unwrap()
+                            .unwrap();
+                        account.code_hash = Some(hash);
+                        evm.state_db_mut()
+                            .world_state_mut()
+                            .set_account(&address, &account)
+                            .unwrap();
+                    }
+                    let alias_before = evm.state_db().world_state().get_account(&alias).unwrap();
+                    let selector = fixture[if with_value {
+                        "selector"
+                    } else {
+                        "noValueSelector"
+                    }]
+                    .as_str()
+                    .unwrap();
+                    let mut data = hex::decode(selector.trim_start_matches("0x")).unwrap();
+                    data.extend_from_slice(target.as_bytes());
+                    data.extend_from_slice(
+                        &U256::from(if with_value { 96 } else { 64 }).to_be_bytes::<32>(),
+                    );
+                    if with_value {
+                        data.extend_from_slice(&U256::from(7).to_be_bytes::<32>());
+                    }
+                    data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                    let mut tx = make_system_tx_to(sender, recipient, data);
+                    tx.tx.gas_limit = 500_000;
+                    let mut header = sample_header();
+                    header.number = number;
+                    let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                    assert_eq!(result.receipt.status, u8::from(number >= 2));
+                    if number < 2 {
+                        assert!(result.output.is_empty());
+                    } else {
+                        let mut expected = vec![0; 128];
+                        expected[..32]
+                            .copy_from_slice(&U256::from(u8::from(!reverts)).to_be_bytes::<32>());
+                        expected[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+                        expected[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+                        expected[96..128].copy_from_slice(
+                            &U256::from(if with_value { 7 } else { 0 }).to_be_bytes::<32>(),
+                        );
+                        assert_eq!(result.output, expected);
+                    }
+                    commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                    let store = evm.state_db().world_state().store().clone();
+                    let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                    let recovered = WorldState::at_root(store, &root).unwrap();
+                    let success = number >= 2 && !reverts;
+                    let amount = if success && with_value { 7 } else { 0 };
+                    assert_eq!(
+                        recovered.get_balance(&recipient).unwrap(),
+                        U256::from(20 - amount)
+                    );
+                    assert_eq!(
+                        recovered.get_balance(&target).unwrap(),
+                        U256::from(31 + amount)
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        if success {
+                            ShellHash::from(*recipient.as_bytes())
+                        } else {
+                            ShellHash::ZERO
+                        }
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert_eq!(recovered.get_account(&alias).unwrap(), alias_before);
+                    assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+                    assert_eq!(recovered.get_balance(&sender).unwrap(), U256::from(100));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_modes_preserve_static_rules_and_delegate_context() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-call-modes.json")).unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            for mode in [0, 1, 2, 3] {
+                {
+                    let delegation = mode >= 2;
+                    let mut evm = setup_evm();
+                    let config = serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2})).unwrap();
+                    evm.state_db()
+                        .chain_store()
+                        .put_chain_config(&config)
+                        .unwrap();
+                    let sender = ShellAddress::from([0x11; 32]);
+                    let recipient = ShellAddress::from([0x98; 32]);
+                    let mut bytes = [0x12; 32];
+                    bytes[..12].fill(0x34);
+                    let target = ShellAddress::from(bytes);
+                    bytes[..12].fill(0x56);
+                    let alias = ShellAddress::from(bytes);
+                    fund_account(&mut evm, &sender, U256::from(100));
+                    fund_account(&mut evm, &recipient, U256::from(20));
+                    fund_account(&mut evm, &target, U256::from(31));
+                    fund_account(&mut evm, &alias, U256::from(53));
+                    let target_code = hex::decode(match mode {
+                        0 => "335f5260205ff3",
+                        1 => "335f55345f5260205ff3",
+                        2 => "335f55345f5260205ff3",
+                        _ => "335f55345f5260205ffd",
+                    })
+                    .unwrap();
+                    let alias_code = hex::decode("60ff5f55345f5260205ff3").unwrap();
+                    for (address, code) in [
+                        (recipient, runtime.as_slice()),
+                        (target, target_code.as_slice()),
+                        (alias, alias_code.as_slice()),
+                    ] {
+                        let hash = shell_primitives::keccak256(code);
+                        evm.state_db().chain_store().put_code(&hash, code).unwrap();
+                        let mut account = evm
+                            .state_db()
+                            .world_state()
+                            .get_account(&address)
+                            .unwrap()
+                            .unwrap();
+                        account.code_hash = Some(hash);
+                        evm.state_db_mut()
+                            .world_state_mut()
+                            .set_account(&address, &account)
+                            .unwrap();
+                    }
+                    let alias_before = evm.state_db().world_state().get_account(&alias).unwrap();
+                    let selector = fixture[if delegation {
+                        "delegateSelector"
+                    } else {
+                        "staticSelector"
+                    }]
+                    .as_str()
+                    .unwrap();
+                    let mut data = hex::decode(selector.trim_start_matches("0x")).unwrap();
+                    data.extend_from_slice(target.as_bytes());
+                    data.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
+                    data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+                    let mut tx = make_system_tx_to(sender, recipient, data);
+                    tx.tx.gas_limit = 1_000_000;
+                    tx.tx.value = U256::from(if delegation { 7 } else { 0 });
+                    let mut header = sample_header();
+                    header.number = number;
+                    let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                    assert_eq!(result.receipt.status, u8::from(number >= 2));
+                    if number < 2 {
+                        assert!(result.output.is_empty());
+                    } else {
+                        let mut expected = vec![0; if mode == 1 { 96 } else { 128 }];
+                        expected[..32].copy_from_slice(
+                            &U256::from(u8::from(mode == 0 || mode == 2)).to_be_bytes::<32>(),
+                        );
+                        expected[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+                        if mode != 1 {
+                            expected[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+                            if mode == 0 {
+                                expected[96..128].copy_from_slice(recipient.as_bytes());
+                            } else {
+                                expected[96..128]
+                                    .copy_from_slice(&U256::from(7).to_be_bytes::<32>());
+                            }
+                        }
+                        assert_eq!(result.output, expected);
+                    }
+                    commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                    let store = evm.state_db().world_state().store().clone();
+                    let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                    let recovered = WorldState::at_root(store, &root).unwrap();
+                    let activated = number >= 2;
+                    let success = activated && mode == 2;
+                    assert_eq!(
+                        recovered.get_balance(&recipient).unwrap(),
+                        U256::from(if activated && delegation { 27 } else { 20 })
+                    );
+                    assert_eq!(recovered.get_balance(&target).unwrap(), U256::from(31));
+                    assert_eq!(
+                        recovered.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                        if success {
+                            ShellHash::from(*sender.as_bytes())
+                        } else {
+                            ShellHash::ZERO
+                        }
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert_eq!(
+                        recovered.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                        ShellHash::ZERO
+                    );
+                    assert_eq!(recovered.get_account(&alias).unwrap(), alias_before);
+                    assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+                    assert_eq!(
+                        recovered.get_balance(&sender).unwrap(),
+                        U256::from(if activated && delegation { 93 } else { 100 })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_self_calls_preserve_full_context_and_static_rules() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-context-call.json"))
+                .unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            for mode in [0, 1, 2, 3] {
+                let mut evm = setup_evm();
+                let config = serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2})).unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(&config)
+                    .unwrap();
+                let sender = ShellAddress::from([if number < 2 { 0x11 } else { 0x12 }; 32]);
+                let mut bytes = [0x12; 32];
+                bytes[..12].fill(0x34);
+                let recipient = ShellAddress::from(bytes);
+                fund_account(&mut evm, &sender, U256::from(100));
+                fund_account(&mut evm, &recipient, U256::from(20));
+                let hash = shell_primitives::keccak256(&runtime);
+                evm.state_db()
+                    .chain_store()
+                    .put_code(&hash, &runtime)
+                    .unwrap();
+                let mut account = evm
+                    .state_db()
+                    .world_state()
+                    .get_account(&recipient)
+                    .unwrap()
+                    .unwrap();
+                account.code_hash = Some(hash);
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(&recipient, &account)
+                    .unwrap();
+                let selector = fixture[match mode {
+                    0 => "selector",
+                    1 => "delegateSelector",
+                    _ => "staticSelector",
+                }]
+                .as_str()
+                .unwrap();
+                let inner = hex::decode(
+                    fixture[if mode == 2 {
+                        "readSelector"
+                    } else {
+                        "pokeSelector"
+                    }]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+                )
+                .unwrap();
+                let mut data = hex::decode(selector.trim_start_matches("0x")).unwrap();
+                data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+                data.extend_from_slice(&U256::from(4).to_be_bytes::<32>());
+                data.extend_from_slice(&inner);
+                data.extend_from_slice(&[0; 28]);
+                let mut tx = make_system_tx_to(sender, recipient, data);
+                tx.tx.gas_limit = 1_000_000;
+                let mut header = sample_header();
+                header.number = number;
+                let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(number >= 2));
+                if number < 2 {
+                    assert!(result.output.is_empty());
+                } else {
+                    let mut expected = vec![0; if mode == 3 { 96 } else { 128 }];
+                    expected[..32]
+                        .copy_from_slice(&U256::from(u8::from(mode != 3)).to_be_bytes::<32>());
+                    expected[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+                    if mode != 3 {
+                        expected[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+                        expected[96..128].copy_from_slice(if mode == 1 {
+                            sender.as_bytes()
+                        } else {
+                            recipient.as_bytes()
+                        });
+                    }
+                    assert_eq!(result.output, expected);
+                }
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                let store = evm.state_db().world_state().store().clone();
+                let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                let recovered = WorldState::at_root(store, &root).unwrap();
+                assert_eq!(
+                    recovered.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                    if number >= 2 && mode < 2 {
+                        ShellHash::from(*if mode == 1 {
+                            sender.as_bytes()
+                        } else {
+                            recipient.as_bytes()
+                        })
+                    } else {
+                        ShellHash::ZERO
+                    }
+                );
+                assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+                assert_eq!(recovered.get_balance(&sender).unwrap(), U256::from(100));
+                assert_eq!(recovered.get_balance(&recipient).unwrap(), U256::from(20));
+                assert_eq!(
+                    recovered
+                        .get_account(&recipient)
+                        .unwrap()
+                        .unwrap()
+                        .code_hash,
+                    Some(hash)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_function_receiver_evaluates_once_and_rolls_back() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/native-function-receiver.json"
+        ))
+        .unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            for reverts in [false, true] {
+                let mut evm = setup_evm();
+                let config=serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2})).unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(&config)
+                    .unwrap();
+                let sender = ShellAddress::from([0x11; 32]);
+                let recipient = ShellAddress::from([0x98; 32]);
+                let mut bytes = [0x12; 32];
+                bytes[..12].fill(0x34);
+                let target = ShellAddress::from(bytes);
+                bytes[..12].fill(0x56);
+                let alias = ShellAddress::from(bytes);
+                for (address, balance) in
+                    [(sender, 100), (recipient, 20), (target, 31), (alias, 53)]
+                {
+                    fund_account(&mut evm, &address, U256::from(balance));
+                }
+                let code = hex::decode(if reverts {
+                    "335f55335f5260205ffd"
+                } else {
+                    "335f55335f5260205ff3"
+                })
+                .unwrap();
+                let alias_code = hex::decode("60ff5f5560ff5f5260205ff3").unwrap();
+                for (address, code) in [
+                    (recipient, runtime.as_slice()),
+                    (target, code.as_slice()),
+                    (alias, alias_code.as_slice()),
+                ] {
+                    let hash = shell_primitives::keccak256(code);
+                    evm.state_db().chain_store().put_code(&hash, code).unwrap();
+                    let mut account = evm
+                        .state_db()
+                        .world_state()
+                        .get_account(&address)
+                        .unwrap()
+                        .unwrap();
+                    account.code_hash = Some(hash);
+                    evm.state_db_mut()
+                        .world_state_mut()
+                        .set_account(&address, &account)
+                        .unwrap();
+                }
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_storage(
+                        &recipient,
+                        &ShellHash::ZERO,
+                        &ShellHash::from(*target.as_bytes()),
+                    )
+                    .unwrap();
+                let alias_before = evm.state_db().world_state().get_account(&alias).unwrap();
+                let mut data = hex::decode(
+                    fixture["selector"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                )
+                .unwrap();
+                data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+                data.extend_from_slice(&[0; 32]);
+                let mut tx = make_system_tx_to(sender, recipient, data);
+                tx.tx.gas_limit = 500_000;
+                let mut header = sample_header();
+                header.number = number;
+                let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, u8::from(number >= 2));
+                if number < 2 {
+                    assert!(result.output.is_empty());
+                } else {
+                    let mut expected = vec![0; 128];
+                    expected[..32]
+                        .copy_from_slice(&U256::from(u8::from(!reverts)).to_be_bytes::<32>());
+                    expected[32..64].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+                    expected[64..96].copy_from_slice(&U256::from(32).to_be_bytes::<32>());
+                    expected[96..].copy_from_slice(recipient.as_bytes());
+                    assert_eq!(result.output, expected);
+                }
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                let store = evm.state_db().world_state().store().clone();
+                let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                let recovered = WorldState::at_root(store, &root).unwrap();
+                assert_eq!(
+                    recovered.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(*target.as_bytes())
+                );
+                let counter_slot = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+                assert_eq!(
+                    recovered.get_storage(&recipient, &counter_slot).unwrap(),
+                    ShellHash::from(U256::from(u8::from(number >= 2)).to_be_bytes::<32>())
+                );
+                assert_eq!(
+                    recovered.get_storage(&target, &ShellHash::ZERO).unwrap(),
+                    if number >= 2 && !reverts {
+                        ShellHash::from(*recipient.as_bytes())
+                    } else {
+                        ShellHash::ZERO
+                    }
+                );
+                assert_eq!(
+                    recovered.get_storage(&alias, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(recovered.get_account(&alias).unwrap(), alias_before);
+                for (address, balance) in [(sender, 100), (recipient, 20), (target, 31)] {
+                    assert_eq!(
+                        recovered.get_balance(&address).unwrap(),
+                        U256::from(balance)
+                    );
+                }
+                assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_compound_reads_preserve_self_code_and_value() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-compound.json")).unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let calldata = hex::decode(
+            fixture["selector"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        assert!(runtime.len() > 32);
+        for number in [1, 2, 3] {
+            let mut evm = setup_evm();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+            }))
+            .unwrap();
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(&config)
+                .unwrap();
+            let sender = ShellAddress::from([if number < 2 { 0x11 } else { 0x12 }; 32]);
+            let mut bytes = [0x12; 32];
+            bytes[..12].fill(0x34);
+            let recipient = ShellAddress::from(bytes);
+            fund_account(&mut evm, &sender, U256::from(100));
+            let hash = shell_primitives::keccak256(&runtime);
+            evm.state_db()
+                .chain_store()
+                .put_code(&hash, &runtime)
+                .unwrap();
+            let mut account = Account::new_user_account(ShellHash::ZERO, U256::ZERO);
+            account.code_hash = Some(hash);
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(&recipient, &account)
+                .unwrap();
+            let mut tx = make_system_tx_to(sender, recipient, calldata.clone());
+            tx.tx.value = U256::from(7);
+            tx.tx.gas_limit = 500_000;
+            let mut header = sample_header();
+            header.number = number;
+            let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+            assert_eq!(result.receipt.status, u8::from(number >= 2));
+            if number < 2 {
+                assert!(result.output.is_empty());
+            } else {
+                let mut expected = vec![0; 128 + runtime.len().div_ceil(32) * 32];
+                expected[..32].copy_from_slice(&U256::from(7).to_be_bytes::<32>());
+                expected[32..64].copy_from_slice(hash.as_bytes());
+                expected[64..96].copy_from_slice(&U256::from(96).to_be_bytes::<32>());
+                expected[96..128].copy_from_slice(&U256::from(runtime.len()).to_be_bytes::<32>());
+                expected[128..128 + runtime.len()].copy_from_slice(&runtime);
+                assert_eq!(result.output, expected);
+            }
+            commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+            let store = evm.state_db().world_state().store().clone();
+            let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+            let recovered = WorldState::at_root(store, &root).unwrap();
+            assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+            assert_eq!(
+                recovered.get_balance(&sender).unwrap(),
+                U256::from(if number >= 2 { 93 } else { 100 })
+            );
+            assert_eq!(
+                recovered.get_balance(&recipient).unwrap(),
+                U256::from(if number >= 2 { 7 } else { 0 })
+            );
+            assert_eq!(
+                recovered
+                    .get_account(&recipient)
+                    .unwrap()
+                    .unwrap()
+                    .code_hash,
+                Some(hash)
+            );
+        }
+    }
+
+    #[test]
+    fn native_context_compiler_builtins_preserve_full_words_and_activation() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/native-builtins.json")).unwrap();
+        let runtime = hex::decode(
+            fixture["artifact"]["deployedBytecode"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let calldata = hex::decode(
+            fixture["selector"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        for number in [1, 2, 3] {
+            let mut evm = setup_evm();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+            }))
+            .unwrap();
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(&config)
+                .unwrap();
+            // Legacy EIP-3607 rejects a same-low160 caller/code alias before
+            // the native profile. Use a distinct caller for the height guard,
+            // and colliding identities at and after activation.
+            let sender = ShellAddress::from([if number < 2 { 0x11 } else { 0x12 }; 32]);
+            let mut bytes = [0x12; 32];
+            bytes[..12].fill(0x34);
+            let recipient = ShellAddress::from(bytes);
+            bytes[..12].fill(0x56);
+            let proposer = ShellAddress::from(bytes);
+            fund_account(&mut evm, &sender, U256::from(100));
+            let hash = shell_primitives::keccak256(&runtime);
+            evm.state_db()
+                .chain_store()
+                .put_code(&hash, &runtime)
+                .unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &recipient,
+                    &Account {
+                        code_hash: Some(hash),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+            let mut tx = make_system_tx_to(sender, recipient, calldata.clone());
+            tx.tx.value = U256::ZERO;
+            let mut header = sample_header();
+            header.number = number;
+            header.proposer = proposer;
+            let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+            assert_eq!(result.receipt.status, u8::from(number >= 2));
+            if number >= 2 {
+                let expected: Vec<u8> = [sender, sender, proposer, recipient]
+                    .iter()
+                    .flat_map(|address| address.as_bytes().iter().copied())
+                    .collect();
+                assert_eq!(result.output, expected);
+            } else {
+                assert!(result.output.is_empty());
+            }
+            commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+            assert_eq!(
+                evm.state_db()
+                    .world_state()
+                    .get_storage(&recipient, &ShellHash::ZERO)
+                    .unwrap(),
+                if number >= 2 {
+                    ShellHash::from(*sender.as_bytes())
+                } else {
+                    ShellHash::ZERO
+                }
+            );
+            assert_eq!(get_balance(&mut evm, &sender), U256::from(100));
+            assert_eq!(current_nonce(&mut evm, &sender), 1);
+            let store = evm.state_db().world_state().store().clone();
+            let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+            let recovered = WorldState::at_root(store, &root).unwrap();
+            assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+            assert_eq!(
+                recovered.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                if number >= 2 {
+                    ShellHash::from(*sender.as_bytes())
+                } else {
+                    ShellHash::ZERO
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn native_context_public_introspection_precompiles_and_fee_beneficiary() {
+        for reconciled in [false, true] {
+            let mut evm = setup_evm();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                "native_address_context_height":1,
+                "fee_accounting_activation_height":if reconciled { Some(0) } else { None }
+            }))
+            .unwrap();
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(&config)
+                .unwrap();
+            let sender = ShellAddress::from([0x12; 32]);
+            let mut bytes = *sender.as_bytes();
+            bytes[..12].fill(0x34);
+            let recipient = ShellAddress::from(bytes);
+            bytes[..12].fill(0x56);
+            let foreign = ShellAddress::from(bytes);
+            bytes[..12].fill(0x78);
+            let proposer = ShellAddress::from(bytes);
+            let mut alias_bytes = [0; 32];
+            alias_bytes[0] = 0x98;
+            alias_bytes[31] = 4;
+            let alias = ShellAddress::from(alias_bytes);
+            fund_account(&mut evm, &sender, U256::from(1_000_000));
+            fund_account(&mut evm, &proposer, U256::from(20));
+            fund_account(&mut evm, &foreign, U256::from(31));
+            let foreign_code = [0x60, 0x42, 0x00];
+            let alias_code = [0x60, 0x77, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+            let push_address = |code: &mut Vec<u8>, address: ShellAddress| {
+                code.push(0x7f);
+                code.extend_from_slice(address.as_bytes());
+            };
+            let store = |code: &mut Vec<u8>, offset: u16| {
+                code.push(0x61);
+                code.extend_from_slice(&offset.to_be_bytes());
+                code.push(0x52);
+            };
+            let mut code = Vec::new();
+            for (opcode, offset) in [(0x31, 0), (0x3b, 32), (0x3f, 64)] {
+                push_address(&mut code, foreign);
+                code.push(opcode);
+                store(&mut code, offset);
+            }
+            for (opcode, offset) in [(0x47, 96), (0x41, 128), (0x32, 160)] {
+                code.push(opcode);
+                store(&mut code, offset);
+            }
+            // EXTCODECOPY uses the complete target, even when its low bits
+            // coincide with the sender, recipient and block beneficiary.
+            code.extend_from_slice(&[0x60, 3, 0x5f, 0x60, 192]);
+            push_address(&mut code, foreign);
+            code.push(0x3c);
+            for (address, output) in [
+                (
+                    ShellAddress::from(crate::precompiles::PQ_BLAKE3_256_ADDR),
+                    224u16,
+                ),
+                (alias, 256),
+            ] {
+                code.extend_from_slice(&[0x60, 32, 0x61]);
+                code.extend_from_slice(&output.to_be_bytes());
+                code.extend_from_slice(&[0x5f, 0x5f]);
+                push_address(&mut code, address);
+                code.extend_from_slice(&[0x61, 0xff, 0xff, 0xfa]);
+                store(&mut code, output + 64);
+            }
+            code.extend_from_slice(&[0x61, 1, 96, 0x5f, 0xf3]);
+            for (address, runtime) in [
+                (recipient, code.as_slice()),
+                (foreign, foreign_code.as_slice()),
+                (alias, alias_code.as_slice()),
+            ] {
+                let hash = shell_primitives::keccak256(runtime);
+                evm.state_db()
+                    .chain_store()
+                    .put_code(&hash, runtime)
+                    .unwrap();
+                let mut account = evm
+                    .state_db()
+                    .world_state()
+                    .get_account(&address)
+                    .unwrap()
+                    .unwrap_or_else(|| Account::new_user_account(ShellHash::ZERO, U256::ZERO));
+                account.code_hash = Some(hash);
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(&address, &account)
+                    .unwrap();
+            }
+            let mut tx = make_system_tx_to(sender, recipient, Vec::new());
+            tx.tx.value = U256::from(7);
+            tx.tx.gas_limit = 200_000;
+            tx.tx.max_fee_per_gas = 1;
+            tx.tx.max_priority_fee_per_gas = 1;
+            let mut header = sample_header();
+            header.proposer = proposer;
+            let result = evm.execute_tx(&tx, &header, 0, 0).unwrap();
+            assert_eq!(result.receipt.status, 1);
+            let mut expected = vec![0; 352];
+            for (offset, value) in [(0, 31u64), (32, 3), (96, 7), (288, 1), (320, 1)] {
+                expected[offset..offset + 32]
+                    .copy_from_slice(&U256::from(value).to_be_bytes::<32>());
+            }
+            expected[64..96].copy_from_slice(shell_primitives::keccak256(&foreign_code).as_bytes());
+            expected[128..160].copy_from_slice(proposer.as_bytes());
+            expected[160..192].copy_from_slice(sender.as_bytes());
+            expected[192..195].copy_from_slice(&foreign_code);
+            // Published BLAKE3 empty-input vector, independent of VM output.
+            expected[224..256].copy_from_slice(
+                &hex::decode("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+                    .unwrap(),
+            );
+            expected[287] = 0x77;
+            assert_eq!(result.output, expected);
+            let gas = result.receipt.gas_used;
+            commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+            assert_eq!(
+                get_balance(&mut evm, &sender),
+                U256::from(1_000_000 - 7 - gas)
+            );
+            assert_eq!(get_balance(&mut evm, &recipient), U256::from(7));
+            assert_eq!(get_balance(&mut evm, &foreign), U256::from(31));
+            assert_eq!(
+                get_balance(&mut evm, &proposer),
+                U256::from(20 + if reconciled { 0 } else { gas })
+            );
+            assert_eq!(current_nonce(&mut evm, &sender), 1);
+        }
+    }
+
+    #[test]
+    fn native_context_transaction_entry_preserves_colliding_identities_and_commit() {
+        for revert in [false, true] {
+            let mut evm = setup_evm();
+            let sender = ShellAddress::from([0x12; 32]);
+            let mut recipient_bytes = *sender.as_bytes();
+            recipient_bytes[..12].fill(0x34);
+            let recipient = ShellAddress::from(recipient_bytes);
+            let mut proposer_bytes = recipient_bytes;
+            proposer_bytes[..12].fill(0x56);
+            let proposer = ShellAddress::from(proposer_bytes);
+            fund_account(&mut evm, &sender, U256::from(100));
+            fund_account(&mut evm, &proposer, U256::from(20));
+            // Persist CALLER, then return CALLER, ORIGIN, ADDRESS and COINBASE.
+            let mut runtime = [
+                0x33, 0x60, 0x00, 0x55, 0x33, 0x60, 0x00, 0x52, 0x32, 0x60, 0x20, 0x52, 0x30, 0x60,
+                0x40, 0x52, 0x41, 0x60, 0x60, 0x52, 0x60, 0x80, 0x60, 0x00, 0xf3,
+            ];
+            if revert {
+                *runtime.last_mut().unwrap() = 0xfd;
+            }
+            let hash = shell_primitives::keccak256(&runtime);
+            evm.state_db()
+                .chain_store()
+                .put_code(&hash, &runtime)
+                .unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &recipient,
+                    &Account {
+                        code_hash: Some(hash),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(recipient),
+                value: U256::from(7),
+                data: shell_primitives::Bytes::new(),
+                gas_limit: 100_000,
+                max_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                access_list: Some(vec![shell_core::AccessListItem {
+                    address: recipient,
+                    storage_keys: vec![ShellHash::ZERO],
+                }]),
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            // execute_tx accepts already validated input; this fixture does not
+            // exercise signature admission, which has separate acceptance work.
+            let signed = SignedTransaction::new(
+                sender,
+                tx,
+                PQSignature::new(SignatureType::Dilithium3, vec![0]),
+            );
+            let mut header = sample_header();
+            header.proposer = proposer;
+            evm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let result = evm
+                .execute_tx_with_address_context(
+                    &signed,
+                    &header,
+                    0,
+                    0,
+                    Some(crate::native_context::NativeAddressContext::default()),
+                )
+                .unwrap();
+            assert_eq!(result.receipt.status, u8::from(!revert));
+            let trace = evm.tracer.take().unwrap();
+            assert!(!trace.exceeded);
+            assert_eq!(trace.roots.len(), 1);
+            assert_eq!(trace.roots[0].from, sender);
+            assert_eq!(trace.roots[0].to, recipient);
+            let expected: Vec<u8> = [sender, sender, recipient, proposer]
+                .iter()
+                .flat_map(|address| address.as_bytes().iter().copied())
+                .collect();
+            assert_eq!(result.output, expected);
+            commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+            assert_eq!(
+                get_balance(&mut evm, &sender),
+                U256::from(if revert { 100 } else { 93 })
+            );
+            assert_eq!(
+                get_balance(&mut evm, &recipient),
+                U256::from(if revert { 0 } else { 7 })
+            );
+            assert_eq!(get_balance(&mut evm, &proposer), U256::from(20));
+            assert_eq!(current_nonce(&mut evm, &sender), 1);
+            assert_eq!(
+                evm.state_db()
+                    .world_state()
+                    .get_storage(&recipient, &ShellHash::ZERO)
+                    .unwrap(),
+                if revert {
+                    ShellHash::ZERO
+                } else {
+                    ShellHash::from(*sender.as_bytes())
+                }
+            );
+            assert!(evm.state_db().address_registry_snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_context_aa_bundle_commits_distinct_accounts_and_rolls_back_atomically() {
+        for revert in [false, true] {
+            let mut evm = setup_evm();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":1
+            }))
+            .unwrap();
+            evm.state_db()
+                .chain_store()
+                .put_chain_config(&config)
+                .unwrap();
+            let sender = ShellAddress::from([0x12; 32]);
+            let mut first_bytes = *sender.as_bytes();
+            first_bytes[..12].fill(0x34);
+            let first = ShellAddress::from(first_bytes);
+            let mut second_bytes = first_bytes;
+            second_bytes[..12].fill(0x56);
+            let second = ShellAddress::from(second_bytes);
+            fund_account(&mut evm, &sender, U256::from(1_000_000));
+            let missing = ShellAddress::from([0x78; 32]);
+            for (address, fails) in [(first, false), (second, revert)] {
+                // Record full caller under each recipient's full storage key.
+                let mut code = vec![0x7f];
+                code.extend_from_slice(missing.as_bytes());
+                code.extend_from_slice(&[0x31, 0x50]);
+                code.extend_from_slice(&[
+                    0x33,
+                    0x5f,
+                    0x55,
+                    0x5f,
+                    0x5f,
+                    if fails { 0xfd } else { 0xf3 },
+                ]);
+                let hash = shell_primitives::keccak256(&code);
+                evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(
+                        &address,
+                        &Account {
+                            code_hash: Some(hash),
+                            ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+            }
+            let calls = [first, second]
+                .into_iter()
+                .map(|address| shell_core::InnerCall {
+                    to: Some(address),
+                    value: U256::from(1),
+                    data: shell_primitives::Bytes::new(),
+                    gas_limit: 70_000,
+                })
+                .collect();
+            let signed = make_aa_signed(sender, 0, 200_000, 1, calls, None);
+            evm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let result = evm
+                .execute_aa_bundle(&signed, &sample_header(), 0, 0)
+                .unwrap();
+            assert_eq!(result.receipt.status, u8::from(!revert));
+            let trace = evm.tracer.take().unwrap();
+            assert_eq!(trace.roots.len(), 2);
+            for (index, address) in [first, second].into_iter().enumerate() {
+                assert_eq!(trace.roots[index].from, sender);
+                assert_eq!(trace.roots[index].to, address);
+                assert_eq!(
+                    get_balance(&mut evm, &address),
+                    U256::from(u64::from(!revert))
+                );
+                assert_eq!(
+                    evm.state_db()
+                        .world_state()
+                        .get_storage(&address, &ShellHash::ZERO)
+                        .unwrap(),
+                    if revert {
+                        ShellHash::ZERO
+                    } else {
+                        ShellHash::from(*sender.as_bytes())
+                    }
+                );
+            }
+            assert_eq!(
+                get_balance(&mut evm, &sender),
+                U256::from(1_000_000 - result.gas_used - if revert { 0 } else { 2 })
+            );
+            assert_eq!(get_nonce(&mut evm, &sender), 1);
+            assert!(evm.state_db().address_registry_snapshot().is_empty());
+            assert!(evm
+                .state_db()
+                .world_state()
+                .get_account(&missing)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn native_context_real_signatures_admission_import_replay_and_state_reopen() {
+        use shell_crypto::{DilithiumSigner, MlDsaSigner, MultiVerifier, Signer};
+        for signer in [
+            Box::new(MlDsaSigner::generate()) as Box<dyn Signer>,
+            Box::new(DilithiumSigner::generate()),
+        ] {
+            let sender =
+                ShellAddress::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let recipient = ShellAddress::from([0x98; 32]);
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce: 0,
+                to: Some(recipient),
+                value: U256::from(7),
+                data: shell_primitives::Bytes::new(),
+                gas_limit: 100_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signature = signer
+                .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed =
+                SignedTransaction::with_pubkey(sender, tx, signature, signer.public_key().to_vec());
+            let mut roots = vec![];
+            for import in [false, true] {
+                // Two independent stores start at the same declared state.
+                let store = Arc::new(MemoryDb::new());
+                let mut evm = ShellPqvm::new(
+                    ShellStateDb::new(
+                        WorldState::new(store.clone()),
+                        ChainStore::new(store.clone()),
+                    ),
+                    1337,
+                );
+                let config = serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":1
+                }))
+                .unwrap();
+                evm.state_db()
+                    .chain_store()
+                    .put_chain_config(&config)
+                    .unwrap();
+                fund_account(&mut evm, &sender, U256::from(1_000_000));
+                // Persist native caller and return caller + contract identity.
+                let code = vec![
+                    0x33, 0x5f, 0x55, 0x33, 0x5f, 0x52, 0x30, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5f,
+                    0xf3,
+                ];
+                let code_hash = shell_primitives::keccak256(&code);
+                evm.state_db()
+                    .chain_store()
+                    .put_code(&code_hash, &code)
+                    .unwrap();
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .set_account(
+                        &recipient,
+                        &Account {
+                            code_hash: Some(code_hash),
+                            ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                        },
+                    )
+                    .unwrap();
+                let initial_root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                let validate = |candidate: &SignedTransaction, evm: &mut ShellPqvm<MemoryDb>| {
+                    let (world, chain) = evm.state_db_mut().world_state_and_chain_store();
+                    if import {
+                        crate::tx_validation::validate_tx_for_import(
+                            candidate,
+                            world,
+                            chain,
+                            &MultiVerifier,
+                            1337,
+                        )
+                    } else {
+                        crate::tx_validation::validate_tx(
+                            candidate,
+                            world,
+                            chain,
+                            &MultiVerifier,
+                            1337,
+                        )
+                        .map(|_| ())
+                    }
+                };
+                let mut tampered = signed.clone();
+                tampered.signature.data[0] ^= 1;
+                assert!(validate(&tampered, &mut evm).is_err());
+                assert_eq!(
+                    evm.state_db_mut().world_state_mut().state_root().unwrap(),
+                    initial_root
+                );
+                assert_eq!(get_nonce(&mut evm, &sender), 0);
+                let mut aliased = signed.clone();
+                let mut bytes = *sender.as_bytes();
+                bytes[0] ^= 1;
+                aliased.from = ShellAddress::from(bytes);
+                fund_account(&mut evm, &aliased.from, U256::from(1_000_000));
+                let alias_root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                assert!(validate(&aliased, &mut evm).is_err());
+                assert_eq!(
+                    evm.state_db_mut().world_state_mut().state_root().unwrap(),
+                    alias_root
+                );
+                assert_eq!(get_nonce(&mut evm, &aliased.from), 0);
+                assert!(evm
+                    .state_db()
+                    .chain_store()
+                    .get_pubkey(&aliased.from)
+                    .unwrap()
+                    .is_none());
+                evm.state_db_mut()
+                    .world_state_mut()
+                    .rollback_to_root(&initial_root)
+                    .unwrap();
+                assert!(evm
+                    .state_db()
+                    .chain_store()
+                    .get_pubkey(&sender)
+                    .unwrap()
+                    .is_none());
+                validate(&signed, &mut evm).unwrap();
+                let context = crate::native_context::NativeAddressContext::default();
+                // Allocation order differs between producer and importer.
+                if import {
+                    context.register(recipient).unwrap();
+                }
+                let result = if import {
+                    // Import execution uses the same public height-selected entry as nodes.
+                    evm.execute_tx(&signed, &sample_header(), 0, 0)
+                } else {
+                    evm.execute_tx_with_address_context(
+                        &signed,
+                        &sample_header(),
+                        0,
+                        0,
+                        Some(context),
+                    )
+                }
+                .unwrap();
+                assert_eq!(result.receipt.status, 1);
+                assert_eq!(&result.output[..32], sender.as_bytes());
+                assert_eq!(&result.output[32..], recipient.as_bytes());
+                commit_pqvm_state(&result, evm.state_db_mut()).unwrap();
+                let root = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                roots.push(root);
+                let block_hash = ShellHash::from([0x77; 32]);
+                evm.state_db()
+                    .chain_store()
+                    .put_receipts(&block_hash, std::slice::from_ref(&result.receipt))
+                    .unwrap();
+                drop(evm);
+                // Reconstruct all VM/DB/cache handles; no transaction handle map survives.
+                // This is a MemoryDb root reopen, not a disk/process restart.
+                let recovered = WorldState::at_root(store.clone(), &root).unwrap();
+                let recovered_chain = ChainStore::new(store.clone());
+                assert_eq!(recovered.get_nonce(&sender).unwrap(), 1);
+                assert_eq!(
+                    recovered.get_balance(&sender).unwrap(),
+                    U256::from(1_000_000 - result.gas_used - 7)
+                );
+                assert_eq!(recovered.get_balance(&recipient).unwrap(), U256::from(7));
+                assert_eq!(
+                    recovered.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                    ShellHash::from(*sender.as_bytes())
+                );
+                assert_eq!(
+                    recovered_chain.get_receipts(&block_hash).unwrap().unwrap(),
+                    vec![result.receipt]
+                );
+                // Historical root remains independently readable after current writes.
+                let history = WorldState::at_root(store, &initial_root).unwrap();
+                assert_eq!(history.get_nonce(&sender).unwrap(), 0);
+                assert_eq!(
+                    history.get_storage(&recipient, &ShellHash::ZERO).unwrap(),
+                    ShellHash::ZERO
+                );
+            }
+            assert_eq!(roots[0], roots[1], "admission and imported replay state must agree independently of handle allocation order");
+        }
+    }
+
+    #[test]
+    fn native_address_context_height_selects_legacy_before_and_full_at_boundary() {
+        for activation in [None, Some(2)] {
+            let mut evm = setup_evm();
+            let sender = ShellAddress::from([0x42; 32]);
+            let recipient = ShellAddress::from([0x98; 32]);
+            fund_account(&mut evm, &sender, U256::from(1_000_000));
+            evm.state_db().chain_store().put_chain_config(&serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "genesis_hash":ShellHash::ZERO, "native_address_context_height":activation
+            })).unwrap()).unwrap();
+            let code = vec![0x33, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
+            let hash = shell_primitives::keccak256(&code);
+            evm.state_db().chain_store().put_code(&hash, &code).unwrap();
+            evm.state_db_mut()
+                .world_state_mut()
+                .set_account(
+                    &recipient,
+                    &Account {
+                        code_hash: Some(hash),
+                        ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                    },
+                )
+                .unwrap();
+            let mut signed = make_system_tx_to(sender, recipient, vec![]);
+            signed.tx.gas_limit = 100_000;
+            let mut gas = vec![];
+            // Descend once as historical replay may reuse an executor.
+            for number in [1, 2, 3, 1] {
+                let mut header = sample_header();
+                header.number = number;
+                let result = evm.execute_tx(&signed, &header, 0, 0).unwrap();
+                assert_eq!(result.receipt.status, 1);
+                let expected = if activation.is_some_and(|height| number >= height) {
+                    sender
+                } else {
+                    ShellAddress::from(sender.to_alloy())
+                };
+                assert_eq!(result.output, expected.as_bytes());
+                gas.push(result.gas_used);
+            }
+            assert!(gas.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+    }
+
     fn setup_evm() -> ShellPqvm<MemoryDb> {
         let ws = WorldState::new(Arc::new(MemoryDb::new()));
         let cs = ChainStore::new(Arc::new(MemoryDb::new()));
@@ -1587,6 +3105,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -1813,6 +3332,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -1869,125 +3389,132 @@ mod tests {
 
     #[test]
     fn bloom_activation_ordinary_and_aa_receipts_use_executed_height() {
-        for activation in [None, Some(0), Some(2)] {
-            for number in [1, 2] {
-                for aa in [false, true] {
-                    let mut evm = setup_evm();
-                    evm.state_db()
-                        .chain_store()
-                        .put_chain_config(&shell_storage::ChainConfig {
-                            chain_id: 1337,
-                            genesis_hash: ShellHash::ZERO,
-                            fee_accounting_activation_height: None,
-                            log_address_activation_height: None,
-                            algorithm_voting_window: None,
-                            algorithm_proposal_identity_height: None,
-                            algorithm_deprecation_height: None,
-                            algorithm_session_deprecation_height: None,
-                            algorithm_paymaster_deprecation_height: None,
-                            algorithm_activation_admission_height: None,
-                            validation_pqvm_height: None,
-                            validation_deprecation_height: None,
-                            session_registered_root_height: None,
-                            paymaster_registered_root_height: None,
-                            registered_key_algorithm_height: None,
-                            aa_account_manager_height: None,
-                            aa_validator_registry_height: None,
-                            emergency_governance_height: None,
-                            native_registry_view_height: None,
-                            pq_address_bounds_height: None,
-                            native_validator_events_height: None,
-                            prover_registry_height: None,
-                            algorithm_proposal_staging_height: None,
-                            algorithm_quorum_activation_height: None,
-                            algorithm_timelock_activation_height: None,
-                            bloom_activation_height: activation,
-                        })
-                        .unwrap();
-                    let sender = ShellAddress::from([0x42; 32]);
-                    let contract = ShellAddress::from([0x43; 32]);
-                    fund_account(&mut evm, &sender, U256::from(10_000_000u64));
-                    let mut runtime = vec![0x7f];
-                    runtime.extend_from_slice(&[0x11; 32]);
-                    runtime.extend_from_slice(&[0x60, 0, 0x60, 0, 0xa1, 0]);
-                    let hash = shell_primitives::keccak256(&runtime);
-                    evm.state_db()
-                        .chain_store()
-                        .put_code(&hash, &runtime)
-                        .unwrap();
-                    evm.state_db_mut()
-                        .world_state_mut()
-                        .set_account(
-                            &contract,
-                            &Account {
-                                code_hash: Some(hash),
-                                ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
-                            },
-                        )
-                        .unwrap();
-                    let nonce = current_nonce(&mut evm, &sender);
-                    let signed = if aa {
-                        make_aa_signed(
-                            sender,
-                            nonce,
-                            200_000,
-                            10,
-                            vec![shell_core::InnerCall {
-                                to: Some(contract),
-                                value: U256::ZERO,
-                                data: shell_primitives::Bytes::new(),
-                                gas_limit: 50_000,
-                            }],
-                            None,
-                        )
-                    } else {
-                        SignedTransaction::new(
-                            sender,
-                            Transaction {
+        for native_activation in [None, Some(2)] {
+            for activation in [None, Some(0), Some(2)] {
+                for number in [1, 2] {
+                    for aa in [false, true] {
+                        let mut evm = setup_evm();
+                        evm.state_db()
+                            .chain_store()
+                            .put_chain_config(&shell_storage::ChainConfig {
                                 chain_id: 1337,
+                                genesis_hash: ShellHash::ZERO,
+                                fee_accounting_activation_height: None,
+                                log_address_activation_height: None,
+                                algorithm_voting_window: None,
+                                algorithm_proposal_identity_height: None,
+                                algorithm_deprecation_height: None,
+                                algorithm_session_deprecation_height: None,
+                                algorithm_paymaster_deprecation_height: None,
+                                algorithm_activation_admission_height: None,
+                                validation_pqvm_height: None,
+                                validation_deprecation_height: None,
+                                session_registered_root_height: None,
+                                paymaster_registered_root_height: None,
+                                registered_key_algorithm_height: None,
+                                aa_account_manager_height: None,
+                                aa_validator_registry_height: None,
+                                emergency_governance_height: None,
+                                native_registry_view_height: None,
+                                pq_address_bounds_height: None,
+                                native_address_context_height: native_activation,
+                                native_validator_events_height: None,
+                                prover_registry_height: None,
+                                algorithm_proposal_staging_height: None,
+                                algorithm_quorum_activation_height: None,
+                                algorithm_timelock_activation_height: None,
+                                bloom_activation_height: activation,
+                            })
+                            .unwrap();
+                        let sender = ShellAddress::from([0x42; 32]);
+                        let contract = ShellAddress::from([0x43; 32]);
+                        fund_account(&mut evm, &sender, U256::from(10_000_000u64));
+                        let mut runtime = vec![0x7f];
+                        runtime.extend_from_slice(&[0x11; 32]);
+                        runtime.extend_from_slice(&[0x60, 0, 0x60, 0, 0xa1, 0]);
+                        let hash = shell_primitives::keccak256(&runtime);
+                        evm.state_db()
+                            .chain_store()
+                            .put_code(&hash, &runtime)
+                            .unwrap();
+                        evm.state_db_mut()
+                            .world_state_mut()
+                            .set_account(
+                                &contract,
+                                &Account {
+                                    code_hash: Some(hash),
+                                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                                },
+                            )
+                            .unwrap();
+                        let nonce = current_nonce(&mut evm, &sender);
+                        let signed = if aa {
+                            make_aa_signed(
+                                sender,
                                 nonce,
-                                to: Some(contract),
-                                value: U256::ZERO,
-                                data: shell_primitives::Bytes::new(),
-                                gas_limit: 100_000,
-                                max_fee_per_gas: 10,
-                                max_priority_fee_per_gas: 0,
-                                access_list: None,
-                                tx_type: 2,
-                                max_fee_per_blob_gas: None,
-                                blob_versioned_hashes: None,
-                            },
-                            PQSignature::new(SignatureType::Dilithium3, vec![0; 1]),
-                        )
-                    };
-                    let mut header = sample_header();
-                    header.number = number;
-                    let result = if aa {
-                        evm.execute_aa_bundle(&signed, &header, 0, 0)
-                    } else {
-                        evm.execute_tx(&signed, &header, 0, 0)
-                    }
-                    .unwrap();
-                    assert_eq!(result.receipt.status, 1);
-                    assert_eq!(result.receipt.logs.len(), 1);
-                    // Preserve the existing EVM log address mapping across this format upgrade.
-                    assert_eq!(
-                        result.receipt.logs[0].address,
-                        ShellAddress::from(contract.to_alloy())
-                    );
-                    let expected = if activation.is_some_and(|height| number >= height) {
-                        let mut reference = alloy_primitives::Bloom::ZERO;
-                        for log in &result.receipt.logs {
-                            reference.m3_2048(log.address.as_bytes());
-                            for topic in &log.topics {
-                                reference.m3_2048(topic.as_bytes());
-                            }
+                                200_000,
+                                10,
+                                vec![shell_core::InnerCall {
+                                    to: Some(contract),
+                                    value: U256::ZERO,
+                                    data: shell_primitives::Bytes::new(),
+                                    gas_limit: 50_000,
+                                }],
+                                None,
+                            )
+                        } else {
+                            SignedTransaction::new(
+                                sender,
+                                Transaction {
+                                    chain_id: 1337,
+                                    nonce,
+                                    to: Some(contract),
+                                    value: U256::ZERO,
+                                    data: shell_primitives::Bytes::new(),
+                                    gas_limit: 100_000,
+                                    max_fee_per_gas: 10,
+                                    max_priority_fee_per_gas: 0,
+                                    access_list: None,
+                                    tx_type: 2,
+                                    max_fee_per_blob_gas: None,
+                                    blob_versioned_hashes: None,
+                                },
+                                PQSignature::new(SignatureType::Dilithium3, vec![0; 1]),
+                            )
+                        };
+                        let mut header = sample_header();
+                        header.number = number;
+                        let result = if aa {
+                            evm.execute_aa_bundle(&signed, &header, 0, 0)
+                        } else {
+                            evm.execute_tx(&signed, &header, 0, 0)
                         }
-                        reference.as_slice().to_vec()
-                    } else {
-                        crate::bloom::logs_bloom(&result.receipt.logs).to_vec()
-                    };
-                    assert_eq!(result.receipt.logs_bloom.as_ref(), expected.as_slice());
+                        .unwrap();
+                        assert_eq!(result.receipt.status, 1);
+                        assert_eq!(result.receipt.logs.len(), 1);
+                        // Native handles must never escape into receipt addresses; legacy heights retain their mapping.
+                        assert_eq!(
+                            result.receipt.logs[0].address,
+                            if native_activation.is_some_and(|height| number >= height) {
+                                contract
+                            } else {
+                                ShellAddress::from(contract.to_alloy())
+                            }
+                        );
+                        let expected = if activation.is_some_and(|height| number >= height) {
+                            let mut reference = alloy_primitives::Bloom::ZERO;
+                            for log in &result.receipt.logs {
+                                reference.m3_2048(log.address.as_bytes());
+                                for topic in &log.topics {
+                                    reference.m3_2048(topic.as_bytes());
+                                }
+                            }
+                            reference.as_slice().to_vec()
+                        } else {
+                            crate::bloom::logs_bloom(&result.receipt.logs).to_vec()
+                        };
+                        assert_eq!(result.receipt.logs_bloom.as_ref(), expected.as_slice());
+                    }
                 }
             }
         }
@@ -2468,6 +3995,7 @@ mod tests {
                     emergency_governance_height: None,
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
+                    native_address_context_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,

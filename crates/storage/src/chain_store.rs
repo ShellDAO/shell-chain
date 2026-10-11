@@ -109,6 +109,9 @@ pub struct ChainConfig {
     /// First block rejecting oversized PQ address-derivation precompile inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_address_bounds_height: Option<u64>,
+    /// First block using full native address identities in contract execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_address_context_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
@@ -2084,6 +2087,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.pq_address_bounds_height,
             ),
             (
+                "native address context",
+                stored.native_address_context_height,
+                desired.native_address_context_height,
+            ),
+            (
                 "native validator events",
                 stored.native_validator_events_height,
                 desired.native_validator_events_height,
@@ -2463,6 +2471,9 @@ impl<S: KvStore> ChainStore<S> {
             pq_address_bounds_height: self
                 .get_chain_config()?
                 .and_then(|config| config.pq_address_bounds_height),
+            native_address_context_height: self
+                .get_chain_config()?
+                .and_then(|config| config.native_address_context_height),
             native_validator_events_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_validator_events_height),
@@ -2534,6 +2545,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_emergency_governance = trusted.emergency_governance_height;
         let trusted_native_registry_view = trusted.native_registry_view_height;
         let trusted_pq_address_bounds = trusted.pq_address_bounds_height;
+        let trusted_native_address_context = trusted.native_address_context_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
         let trusted_prover_registry = trusted.prover_registry_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
@@ -2703,6 +2715,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.emergency_governance_height != trusted_emergency_governance
                     || config.native_registry_view_height != trusted_native_registry_view
                     || config.pq_address_bounds_height != trusted_pq_address_bounds
+                    || config.native_address_context_height != trusted_native_address_context
                     || config.native_validator_events_height != trusted_native_validator_events
                     || config.prover_registry_height != trusted_prover_registry
                     || config.algorithm_proposal_staging_height
@@ -2970,6 +2983,15 @@ impl<S: KvStore> ChainStore<S> {
         }
         if snapshot_chain_config
             .as_ref()
+            .and_then(|config| config.native_address_context_height)
+            != trusted_native_address_context
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted native address context activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
             .and_then(|config| config.native_validator_events_height)
             != trusted_native_validator_events
         {
@@ -3207,6 +3229,7 @@ impl<S: KvStore> ChainStore<S> {
             emergency_governance_height: trusted_emergency_governance,
             native_registry_view_height: trusted_native_registry_view,
             pq_address_bounds_height: trusted_pq_address_bounds,
+            native_address_context_height: trusted_native_address_context,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
@@ -4904,6 +4927,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -4956,6 +4980,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -4994,6 +5019,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5022,6 +5048,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5082,6 +5109,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5110,6 +5138,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5170,6 +5199,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5198,6 +5228,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5257,6 +5288,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5285,6 +5317,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5389,6 +5422,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5422,6 +5456,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5487,6 +5522,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: trusted_height,
@@ -5515,6 +5551,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(6),
@@ -5583,6 +5620,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5614,6 +5652,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5681,6 +5720,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -5712,6 +5752,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -5779,6 +5820,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -5810,6 +5852,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -5923,6 +5966,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -5954,6 +5998,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6022,6 +6067,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6053,6 +6099,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6121,6 +6168,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6152,6 +6200,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6215,6 +6264,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6246,6 +6296,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6313,6 +6364,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: trusted_height,
@@ -6344,6 +6396,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: Some(6),
@@ -6568,6 +6621,51 @@ mod tests {
     }
 
     #[test]
+    fn native_address_context_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "native_address_context_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.native_address_context_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted native address context activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn native_validator_events_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -6679,6 +6777,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -6710,6 +6809,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -6783,6 +6883,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -6811,6 +6912,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7148,6 +7250,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7176,6 +7279,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7246,6 +7350,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -7381,6 +7486,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -8319,6 +8425,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -8866,6 +8973,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
@@ -9131,6 +9239,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9204,6 +9313,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -10515,6 +10625,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -10560,6 +10671,7 @@ mod tests {
             emergency_governance_height: None,
             native_registry_view_height: None,
             pq_address_bounds_height: None,
+            native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

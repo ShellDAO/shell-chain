@@ -348,7 +348,7 @@ curl -s http://localhost:8545 \
 ## State Query Block Tags
 
 State-reading methods currently execute against the live world state only:
-`eth_getBalance`, `eth_getTransactionCount`, `eth_call`, `eth_createAccessList`,
+`eth_getBalance`, `eth_getTransactionCount`, `eth_createAccessList`,
 `eth_getCode`, and `eth_getStorageAt` accept only `"latest"` or `"pending"` as
 their optional block tag. Historical state queries using `"earliest"`, `"safe"`,
 `"finalized"`, or a numeric block return `-32602` until historical state access is
@@ -356,6 +356,13 @@ implemented.
 
 Block, receipt, log, and fee-history methods keep their documented historical
 block support.
+
+The unreleased source also supports historical `eth_call` against retained
+canonical state using `"earliest"`, `"safe"`, `"finalized"`, or a numeric block.
+Execution uses that block's state root and header; unavailable blocks or state
+return an error rather than current-state data. Simulations discard all writes.
+Released binaries may still accept only `"latest"` and `"pending"`; verify the
+running version before using historical calls.
 
 ---
 
@@ -549,7 +556,7 @@ Executes a read-only call against the EVM (no state changes).
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `Object` | Yes | Call request: `{from?, to, data?, value?, gas?}` |
-| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | No | State block tag; historical calls require the unreleased source and retained canonical state described above |
 
 **Returns:** `String` — Hex-encoded return data.
 

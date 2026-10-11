@@ -1,0 +1,185 @@
+{
+  "sources": {
+    "Ledger": "pragma solidity ^0.8.35; interface I {function balanceOf(address beneficiary) external view returns(uint256);} contract Ledger {struct Entry {address token; address beneficiary;} mapping(uint256=>Entry) private entries; function set(uint256 id,address token,address beneficiary) external {entries[id]=Entry(token,beneficiary);} function lookup(uint256 id) external view returns(uint256) {return I(entries[id].token).balanceOf(entries[id].beneficiary);} }",
+    "SelectingLedger": "pragma solidity ^0.8.35; interface I {function balanceOf(address beneficiary) external view returns(uint256);} contract SelectingLedger {struct Entry {address token; address beneficiary;} mapping(uint256=>Entry) private entries; function set(uint256 id,address token,address beneficiary) external {entries[id]=Entry(token,beneficiary);} uint256 public selections; function select(uint256 id) internal returns(uint256) {selections++; return id;} function lookup(uint256 id) external returns(uint256) {return I(entries[id].token).balanceOf(entries[select(id)].beneficiary);} }",
+    "Token": "pragma solidity ^0.8.35; contract Token {mapping(address=>uint256) private balances; error Missing(address beneficiary); function balanceOf(address beneficiary) external view returns(uint256) {if(beneficiary==address(0)) revert Missing(beneficiary);return balances[beneficiary];}}",
+    "Writer": "pragma solidity ^0.8.35; contract Writer {fallback() external {assembly {sstore(0,calldataload(4)) mstore(0,99) return(0,32)}}}"
+  },
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "activationHeight": 2,
+  "selectors": {
+    "set(uint256,address,address)": "0x6fb57f01",
+    "lookup(uint256)": "0x0a874df6",
+    "balanceOf(address)": "0x70a08231",
+    "Missing(address)": "0xc928e8c0"
+  },
+  "artifacts": {
+    "Ledger": {
+      "contractName": "Ledger",
+      "sourcePath": "Ledger.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "lookup",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "beneficiary",
+              "type": "address"
+            }
+          ],
+          "name": "set",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080806040523460155761020a908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80630a874df61461003457636fb57f011461002f575f80fd5b6100f7565b346100f35760203660031901126100f3576004355f90815260208190526040902080546001909101546370a0823160e01b60a05260a452602460805261007a6044610164565b600243106100f3575f809160a0608051915afa3d90610098826101b8565b906100a66040519283610187565b8282526100b2836101b8565b602083019390601f19013685375f843e156100ef576100eb916020826100db93510101906101a9565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b346100f35760603660031901126100f3576040805190810160443560043560243567ffffffffffffffff841185851017610150576001936040528452602084019182525f525f60205260405f2092518355519101555f80f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff82111761015057604052565b90601f8019910116810190811067ffffffffffffffff82111761015057604052565b908160209103126100f3575190565b67ffffffffffffffff811161015057601f01601f19166020019056fea2646970667358221220476724597fa4925f84741017068323660f491dc1f31a07396a3f7fcf09889d9a64736f6c63430008230033",
+      "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80630a874df61461003457636fb57f011461002f575f80fd5b6100f7565b346100f35760203660031901126100f3576004355f90815260208190526040902080546001909101546370a0823160e01b60a05260a452602460805261007a6044610164565b600243106100f3575f809160a0608051915afa3d90610098826101b8565b906100a66040519283610187565b8282526100b2836101b8565b602083019390601f19013685375f843e156100ef576100eb916020826100db93510101906101a9565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b346100f35760603660031901126100f3576040805190810160443560043560243567ffffffffffffffff841185851017610150576001936040528452602084019182525f525f60205260405f2092518355519101555f80f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff82111761015057604052565b90601f8019910116810190811067ffffffffffffffff82111761015057604052565b908160209103126100f3575190565b67ffffffffffffffff811161015057601f01601f19166020019056fea2646970667358221220476724597fa4925f84741017068323660f491dc1f31a07396a3f7fcf09889d9a64736f6c63430008230033"
+    },
+    "SelectingLedger": {
+      "contractName": "SelectingLedger",
+      "sourcePath": "SelectingLedger.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "lookup",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "selections",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "beneficiary",
+              "type": "address"
+            }
+          ],
+          "name": "set",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x60808060405234601557610267908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80630a874df6146100445780636fb57f011461003f57639734e5611461003a575f80fd5b610190565b610132565b3461011a57602036600319011261011a57600435805f525f60205260405f2054906001545f19811461011e576001016001555f525f602052600160405f2001546370a0823160e01b60a05260a45260246080526100a160446101c1565b6002431061011a575f809160a0608051915afa3d906100bf82610215565b906100cd60405192836101e4565b8282526100d983610215565b602083019390601f19013685375f843e1561011657610112916020826101029351010190610206565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b634e487b7160e01b5f52601160045260245ffd5b3461011a57606036600319011261011a576040805190810160443560043560243567ffffffffffffffff84118585101761018b576001936040528452602084019182525f525f60205260405f2092518355519101555f80f35b6101ad565b3461011a575f36600319011261011a576020600154604051908152f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff82111761018b57604052565b90601f8019910116810190811067ffffffffffffffff82111761018b57604052565b9081602091031261011a575190565b67ffffffffffffffff811161018b57601f01601f19166020019056fea2646970667358221220f33353781fd6bdcfad3c05b4f018e44048c113a1467a5e673296f39b475ba3f264736f6c63430008230033",
+      "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80630a874df6146100445780636fb57f011461003f57639734e5611461003a575f80fd5b610190565b610132565b3461011a57602036600319011261011a57600435805f525f60205260405f2054906001545f19811461011e576001016001555f525f602052600160405f2001546370a0823160e01b60a05260a45260246080526100a160446101c1565b6002431061011a575f809160a0608051915afa3d906100bf82610215565b906100cd60405192836101e4565b8282526100d983610215565b602083019390601f19013685375f843e1561011657610112916020826101029351010190610206565b6040519081529081906020820190565b0390f35b5190fd5b5f80fd5b634e487b7160e01b5f52601160045260245ffd5b3461011a57606036600319011261011a576040805190810160443560043560243567ffffffffffffffff84118585101761018b576001936040528452602084019182525f525f60205260405f2092518355519101555f80f35b6101ad565b3461011a575f36600319011261011a576020600154604051908152f35b634e487b7160e01b5f52604160045260245ffd5b601f80199101166080016080811067ffffffffffffffff82111761018b57604052565b90601f8019910116810190811067ffffffffffffffff82111761018b57604052565b9081602091031261011a575190565b67ffffffffffffffff811161018b57601f01601f19166020019056fea2646970667358221220f33353781fd6bdcfad3c05b4f018e44048c113a1467a5e673296f39b475ba3f264736f6c63430008230033"
+    },
+    "Token": {
+      "contractName": "Token",
+      "sourcePath": "Token.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "beneficiary",
+              "type": "address"
+            }
+          ],
+          "name": "Missing",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "beneficiary",
+              "type": "address"
+            }
+          ],
+          "name": "balanceOf",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x608080604052346013576099908160188239f35b5f80fdfe60808060405260043610156011575f80fd5b5f3560e01c6370a08231146023575f80fd5b34605f576020366003190112605f57600435908115604c576020915f525f825260405f20548152f35b50630324a3a360e61b5f5260045260245ffd5b5f80fdfea264697066735822122087114f8b0e634a2abedee4e5deaf9e580e559315ddce99b8322a23cb5de6af3064736f6c63430008230033",
+      "deployedBytecode": "0x60808060405260043610156011575f80fd5b5f3560e01c6370a08231146023575f80fd5b34605f576020366003190112605f57600435908115604c576020915f525f825260405f20548152f35b50630324a3a360e61b5f5260045260245ffd5b5f80fdfea264697066735822122087114f8b0e634a2abedee4e5deaf9e580e559315ddce99b8322a23cb5de6af3064736f6c63430008230033"
+    },
+    "Writer": {
+      "contractName": "Writer",
+      "sourcePath": "Writer.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "stateMutability": "nonpayable",
+          "type": "fallback"
+        }
+      ],
+      "bytecode": "0x6080604052348015600e575f5ffd5b50605380601a5f395ff3fe6080604052348015600e575f5ffd5b506004355f5560635f5260205ff3fea264697066735822122017e8c0c86115386076ab34ee284489cfe23e0c2cf6df5449e808a1c74e2acb7e64736f6c63430008230033",
+      "deployedBytecode": "0x6080604052348015600e575f5ffd5b506004355f5560635f5260205ff3fea264697066735822122017e8c0c86115386076ab34ee284489cfe23e0c2cf6df5449e808a1c74e2acb7e64736f6c63430008230033"
+    }
+  }
+}

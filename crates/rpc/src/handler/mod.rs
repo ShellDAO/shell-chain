@@ -443,10 +443,38 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         &self,
         req: &crate::types::CallRequest,
     ) -> Result<(Vec<u8>, u64), ErrorObjectOwned> {
-        let store = self.chain_store.store().clone();
+        self.execute_call_at(req, None)
+    }
 
-        // Snapshot current state root so the temp WorldState sees committed data.
-        let (state_root, head_header) = {
+    fn execute_call_at(
+        &self,
+        req: &crate::types::CallRequest,
+        block: Option<&str>,
+    ) -> Result<(Vec<u8>, u64), ErrorObjectOwned> {
+        let store = self.chain_store.store().clone();
+        let requested_number = self.parse_block_number(block.unwrap_or("latest"))?;
+
+        // Historical calls use the selected canonical header and its committed root.
+        // Never substitute live state when a block or retained root is unavailable.
+        let (state_root, head_header) = if let Some(number) = requested_number {
+            let _state_guard = self.world_state.read();
+            let hash = self
+                .chain_store
+                .get_block_hash_by_number(number)
+                .map_err(internal_err)?
+                .ok_or_else(|| not_found_err(format!("block {number} not found")))?;
+            let header = self
+                .chain_store
+                .get_header_by_hash(&hash)
+                .map_err(internal_err)?
+                .ok_or_else(|| not_found_err(format!("header for block {number} not found")))?;
+            if header.number != number {
+                return Err(internal_err(
+                    "canonical header number does not match requested block",
+                ));
+            }
+            (header.state_root, Some(header))
+        } else {
             let mut ws = self.world_state.write();
             let head_header = match self.chain_store.get_head_hash().map_err(internal_err)? {
                 Some(hash) => Some(
@@ -3711,6 +3739,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eth_call_historical_http_uses_retained_root_and_header_without_writes() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::rpc_params;
+        let handler = setup();
+        let address = test_address(b"historical-call-contract");
+        // Return old SLOAD, NUMBER, TIMESTAMP, GASLIMIT; a simulated write must be discarded.
+        let code = hex::decode("5f5460005243602052426040524560605260015f5560805ff3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, hash)
+            .unwrap();
+        for (number, value, time, gas) in [
+            (0, 11, 1_700_000_001, 3_000_000),
+            (1, 22, 1_700_000_002, 4_000_000),
+            (42, 33, 1_700_000_042, 6_000_000),
+        ] {
+            handler
+                .world_state
+                .write()
+                .set_storage(
+                    &address,
+                    &ShellHash::ZERO,
+                    &ShellHash::from(U256::from(value).to_be_bytes::<32>()),
+                )
+                .unwrap();
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.timestamp = time;
+            block.header.gas_limit = gas;
+            block.header.state_root = handler.world_state.write().state_root().unwrap();
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            if number == 42 {
+                handler.chain_store.set_head(&block.hash()).unwrap();
+            }
+            // Header-only history remains usable when the body is absent.
+            handler.chain_store.delete_body(&block.hash()).unwrap();
+        }
+        *handler.finalized_number.write() = 1;
+        let store = handler.chain_store.store().clone();
+        let world = handler.world_state.clone();
+        let chain = handler.chain_store.clone();
+        let root = world.write().state_root().unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let request = serde_json::json!({ "to": address });
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(EthApiServer::into_rpc(handler));
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(url)
+            .unwrap();
+        for (tag, value, number, time, gas) in [
+            ("latest", 33, 42, 1_700_000_042, 6_000_000),
+            ("pending", 33, 42, 1_700_000_042, 6_000_000),
+            ("0x1", 22, 1, 1_700_000_002, 4_000_000),
+            ("earliest", 11, 0, 1_700_000_001, 3_000_000),
+            ("safe", 22, 1, 1_700_000_002, 4_000_000),
+            ("finalized", 22, 1, 1_700_000_002, 4_000_000),
+            ("0x0", 11, 0, 1_700_000_001, 3_000_000),
+        ] {
+            let output: String = client
+                .request("eth_call", rpc_params![request.clone(), tag])
+                .await
+                .unwrap();
+            assert_eq!(
+                output,
+                format!("0x{value:064x}{number:064x}{time:064x}{gas:064x}")
+            );
+            assert_eq!(world.write().state_root().unwrap(), root);
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        for (tag, expected) in [("0x29", -32001), ("invalid", -32602)] {
+            let error = client
+                .request::<String, _>("eth_call", rpc_params![request.clone(), tag])
+                .await
+                .unwrap_err();
+            let jsonrpsee::core::client::Error::Call(error) = error else {
+                panic!("unexpected transport error")
+            };
+            assert_eq!(error.code(), expected);
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        let mut missing = make_genesis_block();
+        missing.header.number = 2;
+        missing.header.state_root = ShellHash::from([0xee; 32]);
+        chain.put_block(&missing).unwrap();
+        chain.set_canonical(2, &missing.hash()).unwrap();
+        let checkpoint = store.scan_prefix(b"").unwrap();
+        assert!(client
+            .request::<String, _>("eth_call", rpc_params![request, "0x2"])
+            .await
+            .is_err());
+        assert_eq!(world.write().state_root().unwrap(), root);
+        assert_eq!(store.scan_prefix(b"").unwrap(), checkpoint);
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
     async fn eth_call_rejects_missing_canonical_head_header() {
         let handler = setup();
         handler
@@ -3775,6 +3911,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_address_context_rpc_call_selects_head_height_without_state_writes() {
+        for activation in [None, Some(2)] {
+            let handler = setup();
+            let caller = Address::from([0x42; 32]);
+            let address = Address::from([0x98; 32]);
+            let code = hex::decode("335f52335f553060205260406000f3").unwrap();
+            let code_hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&code_hash, &code).unwrap();
+            handler
+                .world_state
+                .write()
+                .set_code_hash(&address, code_hash)
+                .unwrap();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":42,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation
+            })).unwrap();
+            handler.chain_store.put_chain_config(&config).unwrap();
+            let root = handler.world_state.write().state_root().unwrap();
+            let request = crate::types::CallRequest {
+                from: Some(caller),
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: None,
+                access_list: None,
+            };
+            for number in [1, 2, 3, 1] {
+                let mut block = make_genesis_block();
+                block.header.number = number;
+                block.header.state_root = root;
+                handler.chain_store.put_block(&block).unwrap();
+                handler.chain_store.set_head(&block.hash()).unwrap();
+                let checkpoint = handler.chain_store.store().scan_prefix(b"").unwrap();
+                let output = EthApiServer::call(&handler, request.clone(), Some("latest".into()))
+                    .await
+                    .unwrap();
+                let full = activation.is_some_and(|height| number >= height);
+                let expected_caller = if full {
+                    caller
+                } else {
+                    Address::from(caller.to_alloy())
+                };
+                let expected_self = if full {
+                    address
+                } else {
+                    Address::from(address.to_alloy())
+                };
+                assert_eq!(
+                    output,
+                    format!(
+                        "0x{}{}",
+                        hex::encode(expected_caller.as_bytes()),
+                        hex::encode(expected_self.as_bytes())
+                    )
+                );
+                assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+                assert_eq!(
+                    handler.chain_store.store().scan_prefix(b"").unwrap(),
+                    checkpoint
+                );
+                assert!(
+                    EthApiServer::call(&handler, request.clone(), Some("0x1".into()))
+                        .await
+                        .is_err()
+                );
+            }
+            // Simulated SSTORE never appears in the live contract state.
+            assert_eq!(
+                handler
+                    .world_state
+                    .read()
+                    .get_storage(&address, &ShellHash::ZERO)
+                    .unwrap(),
+                ShellHash::ZERO
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_address_context_rpc_historical_signed_replay_uses_block_height() {
+        let handler = setup();
+        let signer = DilithiumSigner::generate();
+        let caller = signer_address(&signer);
+        let address = Address::from([0x98; 32]);
+        let config = serde_json::from_value(serde_json::json!({
+            "chain_id":42,"genesis_hash":ShellHash::ZERO,"native_address_context_height":2
+        }))
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        let code = hex::decode("335f52335f553060205260406000f3").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        let store = Arc::clone(handler.chain_store.store());
+        let mut state = WorldState::new(Arc::clone(&store));
+        state
+            .set_account(
+                &caller,
+                &shell_core::Account::new_user_account(ShellHash::ZERO, U256::from(1_000_000)),
+            )
+            .unwrap();
+        state.set_code_hash(&address, code_hash).unwrap();
+        let mut parent = make_genesis_block();
+        parent.header.state_root = state.state_root().unwrap();
+        handler.chain_store.put_block(&parent).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &parent.hash())
+            .unwrap();
+        handler.chain_store.set_head(&parent.hash()).unwrap();
+        let mut executor = ShellPqvm::new(ShellStateDb::new(state, ChainStore::new(store)), 42);
+        let mut blocks = Vec::new();
+        for number in 1..=3 {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce: number - 1,
+                to: Some(address),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 100_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signature = signer
+                .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            let signed =
+                SignedTransaction::with_pubkey(caller, tx, signature, signer.public_key().to_vec());
+            let world = executor.state_db_mut().world_state_mut();
+            shell_pqvm::validate_tx(
+                &signed,
+                world,
+                &handler.chain_store,
+                &shell_crypto::MultiVerifier,
+                42,
+            )
+            .unwrap();
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number,
+                    ..parent.header.clone()
+                },
+                transactions: vec![signed],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let result = executor
+                .execute_tx(&block.transactions[0], &block.header, 0, 0)
+                .unwrap();
+            assert_eq!(result.receipt.status, 1);
+            shell_pqvm::commit_pqvm_state(&result, executor.state_db_mut()).unwrap();
+            block.header.state_root = executor
+                .state_db_mut()
+                .world_state_mut()
+                .state_root()
+                .unwrap();
+            block.header.gas_used = result.gas_used;
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .put_receipts(&block.hash(), &[result.receipt])
+                .unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+            parent = block.clone();
+            blocks.push(block);
+        }
+        // Change live state after the historical blocks, including code and storage.
+        {
+            let mut live = handler.world_state.write();
+            live.rollback_to_root(&parent.header.state_root).unwrap();
+            live.set_code_hash(&address, ShellHash::ZERO).unwrap();
+            live.set_storage(&address, &ShellHash::ZERO, &ShellHash::from([0xff; 32]))
+                .unwrap();
+            live.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let root = handler.world_state.write().state_root().unwrap();
+        for block in blocks.iter().rev() {
+            let trace = DebugApiServer::trace_transaction(
+                &handler,
+                format!("{}", block.transactions[0].hash()),
+                None,
+            )
+            .await
+            .unwrap();
+            let full = block.header.number >= 2;
+            let expected_caller = if full {
+                caller
+            } else {
+                Address::from(caller.to_alloy())
+            };
+            let expected_self = if full {
+                address
+            } else {
+                Address::from(address.to_alloy())
+            };
+            assert_eq!(
+                trace["output"],
+                format!(
+                    "0x{}{}",
+                    hex::encode(expected_caller.as_bytes()),
+                    hex::encode(expected_self.as_bytes())
+                )
+            );
+            assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn fee_activation_eth_call_preserves_legacy_base_fee_and_does_not_charge() {
         let handler = setup();
         let address = test_address(b"base-fee-contract");
@@ -3808,6 +4165,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3878,6 +4236,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7692,6 +8051,7 @@ mod tests {
                 emergency_governance_height: None,
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
+                native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
