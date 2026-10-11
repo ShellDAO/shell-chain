@@ -855,10 +855,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         tx: crate::types::CallRequest,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
-        let (output, _gas_used) = self.execute_call(&tx)?;
+        let (output, _gas_used) = self.execute_call_at(&tx, block.as_deref())?;
         Ok(hex_bytes(&output))
     }
 

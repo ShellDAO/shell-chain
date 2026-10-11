@@ -443,10 +443,38 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         &self,
         req: &crate::types::CallRequest,
     ) -> Result<(Vec<u8>, u64), ErrorObjectOwned> {
-        let store = self.chain_store.store().clone();
+        self.execute_call_at(req, None)
+    }
 
-        // Snapshot current state root so the temp WorldState sees committed data.
-        let (state_root, head_header) = {
+    fn execute_call_at(
+        &self,
+        req: &crate::types::CallRequest,
+        block: Option<&str>,
+    ) -> Result<(Vec<u8>, u64), ErrorObjectOwned> {
+        let store = self.chain_store.store().clone();
+        let requested_number = self.parse_block_number(block.unwrap_or("latest"))?;
+
+        // Historical calls use the selected canonical header and its committed root.
+        // Never substitute live state when a block or retained root is unavailable.
+        let (state_root, head_header) = if let Some(number) = requested_number {
+            let _state_guard = self.world_state.read();
+            let hash = self
+                .chain_store
+                .get_block_hash_by_number(number)
+                .map_err(internal_err)?
+                .ok_or_else(|| not_found_err(format!("block {number} not found")))?;
+            let header = self
+                .chain_store
+                .get_header_by_hash(&hash)
+                .map_err(internal_err)?
+                .ok_or_else(|| not_found_err(format!("header for block {number} not found")))?;
+            if header.number != number {
+                return Err(internal_err(
+                    "canonical header number does not match requested block",
+                ));
+            }
+            (header.state_root, Some(header))
+        } else {
             let mut ws = self.world_state.write();
             let head_header = match self.chain_store.get_head_hash().map_err(internal_err)? {
                 Some(hash) => Some(
@@ -3708,6 +3736,114 @@ mod tests {
             result,
             "0x000000000000000000000000000000000000000000000000000000000000002a"
         );
+    }
+
+    #[tokio::test]
+    async fn eth_call_historical_http_uses_retained_root_and_header_without_writes() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::rpc_params;
+        let handler = setup();
+        let address = test_address(b"historical-call-contract");
+        // Return old SLOAD, NUMBER, TIMESTAMP, GASLIMIT; a simulated write must be discarded.
+        let code = hex::decode("5f5460005243602052426040524560605260015f5560805ff3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, hash)
+            .unwrap();
+        for (number, value, time, gas) in [
+            (0, 11, 1_700_000_001, 3_000_000),
+            (1, 22, 1_700_000_002, 4_000_000),
+            (42, 33, 1_700_000_042, 6_000_000),
+        ] {
+            handler
+                .world_state
+                .write()
+                .set_storage(
+                    &address,
+                    &ShellHash::ZERO,
+                    &ShellHash::from(U256::from(value).to_be_bytes::<32>()),
+                )
+                .unwrap();
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.timestamp = time;
+            block.header.gas_limit = gas;
+            block.header.state_root = handler.world_state.write().state_root().unwrap();
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            if number == 42 {
+                handler.chain_store.set_head(&block.hash()).unwrap();
+            }
+            // Header-only history remains usable when the body is absent.
+            handler.chain_store.delete_body(&block.hash()).unwrap();
+        }
+        *handler.finalized_number.write() = 1;
+        let store = handler.chain_store.store().clone();
+        let world = handler.world_state.clone();
+        let chain = handler.chain_store.clone();
+        let root = world.write().state_root().unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let request = serde_json::json!({ "to": address });
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(EthApiServer::into_rpc(handler));
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(url)
+            .unwrap();
+        for (tag, value, number, time, gas) in [
+            ("latest", 33, 42, 1_700_000_042, 6_000_000),
+            ("pending", 33, 42, 1_700_000_042, 6_000_000),
+            ("0x1", 22, 1, 1_700_000_002, 4_000_000),
+            ("earliest", 11, 0, 1_700_000_001, 3_000_000),
+            ("safe", 22, 1, 1_700_000_002, 4_000_000),
+            ("finalized", 22, 1, 1_700_000_002, 4_000_000),
+            ("0x0", 11, 0, 1_700_000_001, 3_000_000),
+        ] {
+            let output: String = client
+                .request("eth_call", rpc_params![request.clone(), tag])
+                .await
+                .unwrap();
+            assert_eq!(
+                output,
+                format!("0x{value:064x}{number:064x}{time:064x}{gas:064x}")
+            );
+            assert_eq!(world.write().state_root().unwrap(), root);
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        for (tag, expected) in [("0x29", -32001), ("invalid", -32602)] {
+            let error = client
+                .request::<String, _>("eth_call", rpc_params![request.clone(), tag])
+                .await
+                .unwrap_err();
+            let jsonrpsee::core::client::Error::Call(error) = error else {
+                panic!("unexpected transport error")
+            };
+            assert_eq!(error.code(), expected);
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        let mut missing = make_genesis_block();
+        missing.header.number = 2;
+        missing.header.state_root = ShellHash::from([0xee; 32]);
+        chain.put_block(&missing).unwrap();
+        chain.set_canonical(2, &missing.hash()).unwrap();
+        let checkpoint = store.scan_prefix(b"").unwrap();
+        assert!(client
+            .request::<String, _>("eth_call", rpc_params![request, "0x2"])
+            .await
+            .is_err());
+        assert_eq!(world.write().state_root().unwrap(), root);
+        assert_eq!(store.scan_prefix(b"").unwrap(), checkpoint);
+        handle.stop().unwrap();
+        handle.stopped().await;
     }
 
     #[tokio::test]

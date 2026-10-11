@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Execute historical `eth_call` using the selected canonical header and retained
+  state root. Preserve live calls and reject unavailable history instead of
+  substituting current state. Calls discard simulated writes.
+
 - Add an unreleased, default-off native address-context profile for full 32-byte
   contract calls, identity words, state keys and ordinary/AA log emitters.
   Preserve earlier execution before its immutable configured height. Native
