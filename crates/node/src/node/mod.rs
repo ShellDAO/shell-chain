@@ -8923,6 +8923,114 @@ mod tests {
     }
 
     #[cfg(feature = "rocksdb")]
+    struct NativeStructCli(std::process::Child);
+
+    #[cfg(feature = "rocksdb")]
+    impl Drop for NativeStructCli {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn native_struct_start_cli(
+        binary: &std::ffi::OsStr,
+        directory: &std::path::Path,
+        p2p: bool,
+        bootnode: Option<&str>,
+    ) -> (NativeStructCli, std::net::SocketAddr, Option<String>) {
+        std::fs::write(
+            directory.join("observer.toml"),
+            "[metrics]\nenabled = false\n",
+        )
+        .unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let log = std::fs::File::create(directory.join("cli.log")).unwrap();
+        let mut command = Command::new(binary);
+        command
+            .arg("--datadir")
+            .arg(directory)
+            .args([
+                "run",
+                "--network",
+                "dev",
+                "--chain-id",
+                "1337",
+                "--db",
+                "rocksdb",
+                "--consensus-engine",
+                "poa",
+                "--storage-profile",
+                "archive",
+                "--rpc-addr",
+            ])
+            .arg(address.to_string())
+            .arg("--config")
+            .arg(directory.join("observer.toml"));
+        let peer_address = if p2p {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let socket = listener.local_addr().unwrap();
+            // Fresh transport identity, independent of the consensus and transaction keys.
+            let identity = libp2p::identity::Keypair::generate_ed25519();
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            options
+                .open(directory.join("libp2p.key"))
+                .unwrap()
+                .write_all(&identity.to_protobuf_encoding().unwrap())
+                .unwrap();
+            command
+                .args(["--p2p", "--p2p-addr"])
+                .arg(socket.to_string());
+            if let Some(bootnode) = bootnode {
+                command.arg("--bootnode").arg(bootnode);
+            }
+            drop(listener);
+            Some(format!(
+                "/ip4/127.0.0.1/tcp/{}/p2p/{}",
+                socket.port(),
+                identity.public().to_peer_id()
+            ))
+        } else {
+            None
+        };
+        drop(reservation);
+        let mut child = NativeStructCli(
+            command
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if std::net::TcpStream::connect(address).is_ok() {
+                break;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "CLI startup failed; retained {}",
+                directory.display()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "CLI RPC timeout; retained {}",
+                directory.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (child, address, peer_address)
+    }
+
+    #[cfg(feature = "rocksdb")]
     fn native_struct_argument_process_exit(aa: bool) {
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_STRUCT_DIRECTORY";
         const READER: &str = "SHELL_TEST_NATIVE_STRUCT_READER";
@@ -9121,6 +9229,34 @@ mod tests {
                             &mut steps,
                         );
                         drop(replica);
+                        if std::env::var("SHELL_TEST_NATIVE_STRUCT_P2P").as_deref() == Ok("yes") {
+                            // Sync serves finalized blocks. Supply genuine quorum attestations,
+                            // without changing the original execution roots or forcing cursors.
+                            for step in &steps {
+                                let hash = step.block.hash();
+                                let certificate =
+                                    Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([
+                                        (
+                                            step.block.header.proposer,
+                                            proposer.sign(hash.as_bytes()).unwrap(),
+                                        ),
+                                    ]))
+                                    .unwrap();
+                                assert!(node.fast_finalize_with_certificate(
+                                    step.block.number(),
+                                    hash,
+                                    &certificate
+                                ));
+                            }
+                            assert_eq!(
+                                node.chain_store.get_finalized_number().unwrap(),
+                                Some(steps.last().unwrap().block.number())
+                            );
+                            assert_eq!(
+                                current_state_root(&node),
+                                steps.last().unwrap().block.header.state_root
+                            );
+                        }
                     }
                     drop(node);
                     drop(recovered_store);
@@ -9154,68 +9290,11 @@ mod tests {
                         drop(stores.index);
                         drop(stores.witness);
                         if let Some(binary) = std::env::var_os("SHELL_TEST_NATIVE_AA_CLI") {
-                            // A fresh non-authority dev key makes this isolated CLI an observer.
-                            // P2P is disabled by default; metrics are explicitly disabled.
-                            std::fs::write(
-                                directory.join("observer.toml"),
-                                "[metrics]\nenabled = false\n",
-                            )
-                            .unwrap();
-                            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                            let address = listener.local_addr().unwrap();
-                            drop(listener);
-                            let log = std::fs::File::create(directory.join("cli.log")).unwrap();
-                            let child = Command::new(binary)
-                                .arg("--datadir")
-                                .arg(&directory)
-                                .args([
-                                    "run",
-                                    "--network",
-                                    "dev",
-                                    "--chain-id",
-                                    "1337",
-                                    "--db",
-                                    "rocksdb",
-                                    "--consensus-engine",
-                                    "poa",
-                                    "--storage-profile",
-                                    "archive",
-                                    "--rpc-addr",
-                                ])
-                                .arg(address.to_string())
-                                .arg("--config")
-                                .arg(directory.join("observer.toml"))
-                                .stdout(log.try_clone().unwrap())
-                                .stderr(log)
-                                .spawn()
-                                .unwrap();
-                            // Always reap the owned process, including on a failed assertion.
-                            struct Process(std::process::Child);
-                            impl Drop for Process {
-                                fn drop(&mut self) {
-                                    let _ = self.0.kill();
-                                    let _ = self.0.wait();
-                                }
-                            }
-                            let mut child = Process(child);
-                            let deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(15);
-                            loop {
-                                if std::net::TcpStream::connect(address).is_ok() {
-                                    break;
-                                }
-                                assert!(
-                                    child.0.try_wait().unwrap().is_none(),
-                                    "CLI startup failed; retained {}",
-                                    directory.display()
-                                );
-                                assert!(
-                                    std::time::Instant::now() < deadline,
-                                    "CLI RPC timeout; retained {}",
-                                    directory.display()
-                                );
-                                std::thread::sleep(std::time::Duration::from_millis(20));
-                            }
+                            // Both CLI processes use fresh non-authority dev keys.
+                            let p2p = std::env::var("SHELL_TEST_NATIVE_STRUCT_P2P").as_deref()
+                                == Ok("yes");
+                            let (child, address, bootnode) =
+                                native_struct_start_cli(&binary, &directory, p2p, None);
                             let runtime = tokio::runtime::Runtime::new().unwrap();
                             runtime.block_on(native_struct_argument_http_verify(
                                 address,
@@ -9224,6 +9303,126 @@ mod tests {
                                 &receipt_gas,
                                 || {},
                             ));
+                            if let Some(bootnode) = bootnode {
+                                // The follower starts only from public genesis, never a copied database.
+                                let follower_directory = directory.join("peer");
+                                std::fs::create_dir(&follower_directory).unwrap();
+                                std::fs::copy(
+                                    directory.join("genesis.json"),
+                                    follower_directory.join("genesis.json"),
+                                )
+                                .unwrap();
+                                assert!(!follower_directory.join("db").exists());
+                                let (mut follower, follower_address, follower_peer) =
+                                    native_struct_start_cli(
+                                        &binary,
+                                        &follower_directory,
+                                        true,
+                                        Some(&bootnode),
+                                    );
+                                assert_ne!(
+                                    follower_peer.as_ref().unwrap().rsplit('/').next(),
+                                    bootnode.rsplit('/').next()
+                                );
+                                runtime.block_on(async {
+                                    let deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(30);
+                                    loop {
+                                        assert!(
+                                            follower.0.try_wait().unwrap().is_none(),
+                                            "follower exited; retained {}",
+                                            follower_directory.display()
+                                        );
+                                        let response = native_http_request(
+                                            follower_address,
+                                            "eth_blockNumber",
+                                            serde_json::json!([]),
+                                        )
+                                        .await;
+                                        let finalized = native_http_request(
+                                            follower_address,
+                                            "eth_getBlockByNumber",
+                                            serde_json::json!(["finalized", false]),
+                                        )
+                                        .await;
+                                        if response["result"]
+                                            == format!(
+                                                "0x{:x}",
+                                                steps.last().unwrap().block.number()
+                                            )
+                                            && finalized["result"]["hash"]
+                                                == steps.last().unwrap().block.hash().to_string()
+                                        {
+                                            break;
+                                        }
+                                        assert!(
+                                            tokio::time::Instant::now() < deadline,
+                                            "P2P synchronization timeout: {response}; retained {}",
+                                            directory.display()
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(250))
+                                            .await;
+                                    }
+                                    for endpoint in [address, follower_address] {
+                                        let response = native_http_request(
+                                            endpoint,
+                                            "eth_getBlockByNumber",
+                                            serde_json::json!(["latest", false]),
+                                        )
+                                        .await;
+                                        assert_eq!(
+                                            response["result"]["hash"],
+                                            steps.last().unwrap().block.hash().to_string()
+                                        );
+                                        let peers = native_http_request(
+                                            endpoint,
+                                            "net_peerCount",
+                                            serde_json::json!([]),
+                                        )
+                                        .await;
+                                        assert_eq!(peers["result"], "0x1");
+                                    }
+                                    native_struct_argument_http_verify(
+                                        follower_address,
+                                        &steps,
+                                        activation,
+                                        &receipt_gas,
+                                        || {},
+                                    )
+                                    .await;
+                                });
+                                drop(follower);
+                                let stores = shell_storage::RocksDbStore::open_all(
+                                    follower_directory.join("db"),
+                                    None,
+                                )
+                                .unwrap();
+                                let (node, recovered_store) = crate::builder::NodeBuilder::new(
+                                    config.clone(),
+                                    Arc::new(stores.state),
+                                )
+                                .build()
+                                .unwrap();
+                                assert_eq!(
+                                    node.chain_store.get_head_hash().unwrap(),
+                                    Some(steps.last().unwrap().block.hash())
+                                );
+                                assert_eq!(
+                                    current_state_root(&node),
+                                    steps.last().unwrap().block.header.state_root
+                                );
+                                assert_eq!(
+                                    node.chain_store.get_finalized_number().unwrap(),
+                                    Some(steps.last().unwrap().block.number())
+                                );
+                                native_struct_argument_history(&node, &steps, activation);
+                                drop(node);
+                                drop(recovered_store);
+                                drop(stores.chain);
+                                drop(stores.receipts);
+                                drop(stores.index);
+                                drop(stores.witness);
+                            }
                             drop(runtime);
                             drop(child);
                             let stores =
