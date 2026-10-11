@@ -9,8 +9,9 @@ case "${1:-all}" in
   pure-bytes32) test_name=native_pure_balance_bytes32_aa_survives_process_exit ;;
   pure-uint256) test_name=native_pure_balance_uint256 ;;
   pure) test_name=native_pure_balance_ ;;
+  struct) test_name=native_struct_argument_aa_survives_process_exit ;;
   all) test_name=aa_survives_process_exit ;;
-  *) echo "usage: $0 [address|bytes32|pure-address|pure-bytes32|pure-uint256|pure|all]" >&2; exit 2 ;;
+  *) echo "usage: $0 [address|bytes32|pure-address|pure-bytes32|pure-uint256|pure|struct|all]" >&2; exit 2 ;;
 esac
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"

@@ -7786,6 +7786,72 @@ mod tests {
             .unwrap()
         };
         let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        #[cfg(feature = "rocksdb")]
+        if std::env::var_os("SHELL_TEST_NATIVE_AA_CLI").is_some() {
+            if let Some(directory) = std::env::var_os("SHELL_TEST_NATIVE_STRUCT_DIRECTORY") {
+                let mut alloc = serde_json::Map::new();
+                for address in [sender, beneficiary] {
+                    alloc.insert(
+                        address.to_string(),
+                        serde_json::json!({"balance":initial_balance}),
+                    );
+                }
+                for (address, bytes) in [
+                    (ledger, code(reader)),
+                    (first, code("Token")),
+                    (second, code("Token")),
+                    (writer, code("Writer")),
+                    (short, hex::decode("60015ff3").unwrap()),
+                    (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+                ] {
+                    let mut storage = serde_json::Map::new();
+                    if [first, second].contains(&address) {
+                        for (token, owner, balance) in [
+                            (first, beneficiary, U256::MAX),
+                            (first, other, large),
+                            (second, beneficiary, U256::from(19)),
+                            (second, other, U256::ZERO),
+                            (first, native_struct_word(0, 0x23), U256::from(666)),
+                        ] {
+                            if token == address {
+                                storage.insert(
+                                    native_balance_slot(owner).to_string(),
+                                    serde_json::json!(ShellHash::from(balance.to_be_bytes::<32>())),
+                                );
+                            }
+                        }
+                    } else if address == ledger {
+                        storage.insert(
+                            native_struct_record_slot(0).to_string(),
+                            serde_json::json!(first),
+                        );
+                        storage.insert(
+                            native_struct_record_slot(1).to_string(),
+                            serde_json::json!(beneficiary),
+                        );
+                    }
+                    alloc.insert(address.to_string(), serde_json::json!({"balance":U256::ZERO,"code":hex::encode(bytes),"storage":storage}));
+                }
+                let config: shell_genesis::GenesisConfig = serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"timestamp":0,"network_type":"Dev",
+                    "native_address_context_height":activation,"fee_accounting_activation_height":0,
+                    "consensus":{"engine":"poa","authorities":[proposer],
+                        "authority_pubkeys":[hex::encode(proposer_signer.public_key())],"block_time_secs":1},
+                    "alloc":alloc
+                })).unwrap();
+                std::fs::write(
+                    std::path::PathBuf::from(directory).join("genesis.json"),
+                    serde_json::to_vec(&config).unwrap(),
+                )
+                .unwrap();
+                node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+                let genesis =
+                    shell_genesis::initialize_genesis(&config, node.store.clone()).unwrap();
+                *node.world_state.write() =
+                    WorldState::at_root(node.store.clone(), &genesis.header.state_root).unwrap();
+                return;
+            }
+        }
         node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
         node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0})).unwrap()).unwrap();
         fund_account(node, &sender, initial_balance);
@@ -8696,11 +8762,52 @@ mod tests {
         )
         .await
         .unwrap();
+        let before = node.store.scan_prefix(b"").unwrap();
+        let root = current_state_root(node);
+        let receipt_gas = native_struct_receipt_gas(node, steps);
+        native_struct_argument_http_verify(
+            server.http_addr,
+            steps,
+            activation,
+            &receipt_gas,
+            || {
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(node), root);
+            },
+        )
+        .await;
+        server.http_handle.stop().unwrap();
+        server.http_handle.stopped().await;
+    }
+
+    #[cfg(feature = "rocksdb")]
+    fn native_struct_receipt_gas<S: KvStore + 'static>(
+        node: &Node<S>,
+        steps: &[NativeStructStep],
+    ) -> Vec<u64> {
+        steps[steps.len() - 2..]
+            .iter()
+            .map(|step| {
+                node.chain_store
+                    .get_receipts(&step.block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .gas_used
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "rocksdb")]
+    async fn native_struct_argument_http_verify(
+        address: std::net::SocketAddr,
+        steps: &[NativeStructStep],
+        activation: Option<u64>,
+        receipt_gas: &[u64],
+        check_reads: impl Fn(),
+    ) {
         let sender = steps[0].block.transactions[0].from;
         let ledger = Address::from([0x98; 32]);
         let tip = steps.last().unwrap();
-        let before = node.store.scan_prefix(b"").unwrap();
-        let root = current_state_root(node);
         let mut lookup = shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
         lookup.extend_from_slice(&[0; 32]);
         let balances = [
@@ -8731,7 +8838,7 @@ mod tests {
             .map(|s| (format!("0x{:x}", s.block.number()), s))
             .chain([("latest".into(), tip), ("pending".into(), tip)])
         {
-            let response = native_http_request(server.http_addr, "eth_call", serde_json::json!([
+            let response = native_http_request(address, "eth_call", serde_json::json!([
                 {"from":sender.to_string(),"to":ledger.to_string(),"data":format!("0x{}",hex::encode(&lookup)),"gas":"0x7a120"},tag
             ])).await;
             if activation.is_some_and(|height| step.block.number() >= height) {
@@ -8749,8 +8856,7 @@ mod tests {
                 assert!(response.get("result").is_none(), "{response}");
                 assert_eq!(response["error"]["code"], -32000);
             }
-            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
-            assert_eq!(current_state_root(node), root);
+            check_reads();
         }
         for (method, params, expected) in [
             ("eth_chainId", serde_json::json!([]), "0x539".to_owned()),
@@ -8788,19 +8894,14 @@ mod tests {
                 tip.beneficiary.to_string(),
             ),
         ] {
-            let response = native_http_request(server.http_addr, method, params).await;
+            let response = native_http_request(address, method, params).await;
             assert!(response.get("error").is_none(), "{response}");
             assert_eq!(response["result"], expected);
         }
-        for step in &steps[steps.len() - 2..] {
+        for (step, gas_used) in steps[steps.len() - 2..].iter().zip(receipt_gas) {
             let hash = step.block.transactions[0].hash();
-            let receipts = node
-                .chain_store
-                .get_receipts(&step.block.hash())
-                .unwrap()
-                .unwrap();
             let response = native_http_request(
-                server.http_addr,
+                address,
                 "eth_getTransactionReceipt",
                 serde_json::json!([hash.to_string()]),
             )
@@ -8812,16 +8913,13 @@ mod tests {
                 ("blockNumber", format!("0x{:x}", step.block.number())),
                 ("from", sender.to_string()),
                 ("status", format!("0x{:x}", u8::from(step.success))),
-                ("gasUsed", format!("0x{:x}", receipts[0].gas_used)),
+                ("gasUsed", format!("0x{:x}", gas_used)),
             ] {
                 assert_eq!(response["result"][name], value);
             }
             assert!(response["result"]["to"].is_null());
         }
-        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
-        assert_eq!(current_state_root(node), root);
-        server.http_handle.stop().unwrap();
-        server.http_handle.stopped().await;
+        check_reads();
     }
 
     #[cfg(feature = "rocksdb")]
@@ -9034,10 +9132,12 @@ mod tests {
                         let stores =
                             shell_storage::RocksDbStore::open_all(directory.join("db"), None)
                                 .unwrap();
-                        let (node, recovered_store) =
-                            crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
-                                .build()
-                                .unwrap();
+                        let (node, recovered_store) = crate::builder::NodeBuilder::new(
+                            config.clone(),
+                            Arc::new(stores.state),
+                        )
+                        .build()
+                        .unwrap();
                         assert_eq!(
                             node.chain_store.get_head_hash().unwrap(),
                             Some(steps.last().unwrap().block.hash())
@@ -9045,6 +9145,7 @@ mod tests {
                         native_struct_argument_history(&node, &steps, activation);
                         let runtime = tokio::runtime::Runtime::new().unwrap();
                         runtime.block_on(native_struct_argument_http(&node, &steps, activation));
+                        let receipt_gas = native_struct_receipt_gas(&node, &steps);
                         drop(runtime);
                         drop(node);
                         drop(recovered_store);
@@ -9052,6 +9153,102 @@ mod tests {
                         drop(stores.receipts);
                         drop(stores.index);
                         drop(stores.witness);
+                        if let Some(binary) = std::env::var_os("SHELL_TEST_NATIVE_AA_CLI") {
+                            // A fresh non-authority dev key makes this isolated CLI an observer.
+                            // P2P is disabled by default; metrics are explicitly disabled.
+                            std::fs::write(
+                                directory.join("observer.toml"),
+                                "[metrics]\nenabled = false\n",
+                            )
+                            .unwrap();
+                            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                            let address = listener.local_addr().unwrap();
+                            drop(listener);
+                            let log = std::fs::File::create(directory.join("cli.log")).unwrap();
+                            let child = Command::new(binary)
+                                .arg("--datadir")
+                                .arg(&directory)
+                                .args([
+                                    "run",
+                                    "--network",
+                                    "dev",
+                                    "--chain-id",
+                                    "1337",
+                                    "--db",
+                                    "rocksdb",
+                                    "--consensus-engine",
+                                    "poa",
+                                    "--storage-profile",
+                                    "archive",
+                                    "--rpc-addr",
+                                ])
+                                .arg(address.to_string())
+                                .arg("--config")
+                                .arg(directory.join("observer.toml"))
+                                .stdout(log.try_clone().unwrap())
+                                .stderr(log)
+                                .spawn()
+                                .unwrap();
+                            // Always reap the owned process, including on a failed assertion.
+                            struct Process(std::process::Child);
+                            impl Drop for Process {
+                                fn drop(&mut self) {
+                                    let _ = self.0.kill();
+                                    let _ = self.0.wait();
+                                }
+                            }
+                            let mut child = Process(child);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(15);
+                            loop {
+                                if std::net::TcpStream::connect(address).is_ok() {
+                                    break;
+                                }
+                                assert!(
+                                    child.0.try_wait().unwrap().is_none(),
+                                    "CLI startup failed; retained {}",
+                                    directory.display()
+                                );
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "CLI RPC timeout; retained {}",
+                                    directory.display()
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            let runtime = tokio::runtime::Runtime::new().unwrap();
+                            runtime.block_on(native_struct_argument_http_verify(
+                                address,
+                                &steps,
+                                activation,
+                                &receipt_gas,
+                                || {},
+                            ));
+                            drop(runtime);
+                            drop(child);
+                            let stores =
+                                shell_storage::RocksDbStore::open_all(directory.join("db"), None)
+                                    .unwrap();
+                            let (node, recovered_store) =
+                                crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
+                                    .build()
+                                    .unwrap();
+                            assert_eq!(
+                                node.chain_store.get_head_hash().unwrap(),
+                                Some(steps.last().unwrap().block.hash())
+                            );
+                            assert_eq!(
+                                current_state_root(&node),
+                                steps.last().unwrap().block.header.state_root
+                            );
+                            native_struct_argument_history(&node, &steps, activation);
+                            drop(node);
+                            drop(recovered_store);
+                            drop(stores.chain);
+                            drop(stores.receipts);
+                            drop(stores.index);
+                            drop(stores.witness);
+                        }
                     }
                     std::fs::remove_dir_all(directory).unwrap();
                 }
