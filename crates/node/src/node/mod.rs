@@ -7556,6 +7556,8 @@ mod tests {
         sender_balance: U256,
         success: bool,
         output: Vec<u8>,
+        #[serde(default)]
+        inner_outputs: Option<Vec<Vec<u8>>>,
     }
 
     fn native_struct_word(high: u8, low: u8) -> Address {
@@ -7669,10 +7671,22 @@ mod tests {
                 .block_on(DebugApiServer::trace_transaction(
                     &handler,
                     step.block.transactions[0].hash().to_string(),
-                    None,
+                    step.inner_outputs
+                        .as_ref()
+                        .map(|_| serde_json::json!({"tracer":"callTracer"})),
                 ))
                 .unwrap();
-            assert_eq!(trace["output"], format!("0x{}", hex::encode(&step.output)));
+            if let Some(outputs) = &step.inner_outputs {
+                assert_eq!(trace["type"], "BATCH");
+                let calls = trace["calls"].as_array().unwrap();
+                assert_eq!(calls.len(), outputs.len());
+                for (call, output) in calls.iter().zip(outputs) {
+                    assert_eq!(call["to"], ledger.to_string());
+                    assert_eq!(call["output"], format!("0x{}", hex::encode(output)));
+                }
+            } else {
+                assert_eq!(trace["output"], format!("0x{}", hex::encode(&step.output)));
+            }
             let expected = balances
                 .iter()
                 .find(|(target, owner, _)| *target == step.token && *owner == step.beneficiary);
@@ -7720,7 +7734,18 @@ mod tests {
         if activation.is_some() {
             assert_eq!(
                 output.unwrap(),
-                format!("0x{}", hex::encode(U256::from(19).to_be_bytes::<32>()))
+                format!(
+                    "0x{}",
+                    hex::encode(
+                        balances
+                            .iter()
+                            .find(|(target, owner, _)| *target == tip.token
+                                && *owner == tip.beneficiary)
+                            .unwrap()
+                            .2
+                            .to_be_bytes::<32>()
+                    )
+                )
             );
         } else {
             assert!(output.is_err());
@@ -7730,16 +7755,14 @@ mod tests {
         assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
     }
 
-    fn native_struct_argument_signed_import<S: KvStore + 'static>(
-        leader: &Node<MemoryDb>,
-        follower: &Node<S>,
+    fn native_struct_argument_initialize<S: KvStore + 'static>(
+        node: &Node<S>,
+        proposer: Address,
         proposer_signer: &DilithiumSigner,
-        signer: &impl Signer,
+        sender: Address,
         reader: &str,
         activation: Option<u64>,
-    ) -> Vec<NativeStructStep> {
-        let proposer = leader.config.proposer_address.unwrap();
-        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+    ) {
         let ledger = Address::from([0x98; 32]);
         let first = native_struct_word(0x34, 0x12);
         let second = native_struct_word(0x56, 0x12);
@@ -7748,7 +7771,6 @@ mod tests {
         let other = native_struct_word(0x9a, 0x23);
         let writer = Address::from([0x67; 32]);
         let short = Address::from([0x68; 32]);
-        let missing = Address::from([0x69; 32]);
         let large = (U256::from(1) << 200usize) + U256::from(73);
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../pqvm/tests/fixtures/native-struct-argument.json"
@@ -7764,32 +7786,105 @@ mod tests {
             .unwrap()
         };
         let initial_balance = U256::from(10_000_000_000_000_000_000u64);
-        macro_rules! initialize { ($node:expr) => {{
-            let node = $node;
-            node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
-            node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0})).unwrap()).unwrap();
-            fund_account(node, &sender, initial_balance);
-            // The wrong-sender control is funded, so insufficient balance cannot explain rejection.
-            fund_account(node, &beneficiary, initial_balance);
-            for (address, bytes) in [(ledger, code(reader)), (first, code("Token")), (second, code("Token")),
-                (writer, code("Writer")), (short, hex::decode("60015ff3").unwrap()), (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap())] {
-                let hash = shell_primitives::keccak256(&bytes);
-                node.chain_store.put_code(&hash, &bytes).unwrap();
-                node.world_state.write().set_code_hash(&address, hash).unwrap();
-            }
-            for (token, owner, balance) in [(first, beneficiary, U256::MAX), (first, other, large),
-                (second, beneficiary, U256::from(19)), (second, other, U256::ZERO),
-                (first, native_struct_word(0, 0x23), U256::from(666))] {
-                node.world_state.write().set_storage(&token, &native_balance_slot(owner), &ShellHash::from(balance.to_be_bytes::<32>())).unwrap();
-            }
-            node.world_state.write().set_storage(&ledger, &native_struct_record_slot(0), &ShellHash::from(*first.as_bytes())).unwrap();
-            node.world_state.write().set_storage(&ledger, &native_struct_record_slot(1), &ShellHash::from(*beneficiary.as_bytes())).unwrap();
-            node.world_state.write().set_validators(&[proposer]).unwrap();
-            node.world_state.write().set_validator_weights(&[proposer], &[1]).unwrap();
-            store_consistent_genesis(node);
-        }}; }
-        initialize!(leader);
-        initialize!(follower);
+        node.register_authority_pubkey(proposer, proposer_signer.public_key().to_vec());
+        node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"native_address_context_height":activation,"fee_accounting_activation_height":0})).unwrap()).unwrap();
+        fund_account(node, &sender, initial_balance);
+        // The wrong-sender control is funded, so insufficient balance cannot explain rejection.
+        fund_account(node, &beneficiary, initial_balance);
+        for (address, bytes) in [
+            (ledger, code(reader)),
+            (first, code("Token")),
+            (second, code("Token")),
+            (writer, code("Writer")),
+            (short, hex::decode("60015ff3").unwrap()),
+            (alias, hex::decode("60ff5f5560ff5f5260205ff3").unwrap()),
+        ] {
+            let hash = shell_primitives::keccak256(&bytes);
+            node.chain_store.put_code(&hash, &bytes).unwrap();
+            node.world_state
+                .write()
+                .set_code_hash(&address, hash)
+                .unwrap();
+        }
+        for (token, owner, balance) in [
+            (first, beneficiary, U256::MAX),
+            (first, other, large),
+            (second, beneficiary, U256::from(19)),
+            (second, other, U256::ZERO),
+            (first, native_struct_word(0, 0x23), U256::from(666)),
+        ] {
+            node.world_state
+                .write()
+                .set_storage(
+                    &token,
+                    &native_balance_slot(owner),
+                    &ShellHash::from(balance.to_be_bytes::<32>()),
+                )
+                .unwrap();
+        }
+        node.world_state
+            .write()
+            .set_storage(
+                &ledger,
+                &native_struct_record_slot(0),
+                &ShellHash::from(*first.as_bytes()),
+            )
+            .unwrap();
+        node.world_state
+            .write()
+            .set_storage(
+                &ledger,
+                &native_struct_record_slot(1),
+                &ShellHash::from(*beneficiary.as_bytes()),
+            )
+            .unwrap();
+        node.world_state
+            .write()
+            .set_validators(&[proposer])
+            .unwrap();
+        node.world_state
+            .write()
+            .set_validator_weights(&[proposer], &[1])
+            .unwrap();
+        store_consistent_genesis(node);
+    }
+
+    fn native_struct_argument_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        signer: &impl Signer,
+        reader: &str,
+        activation: Option<u64>,
+    ) -> Vec<NativeStructStep> {
+        let proposer = leader.config.proposer_address.unwrap();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let ledger = Address::from([0x98; 32]);
+        let first = native_struct_word(0x34, 0x12);
+        let second = native_struct_word(0x56, 0x12);
+        let beneficiary = native_struct_word(0x78, 0x23);
+        let other = native_struct_word(0x9a, 0x23);
+        let writer = Address::from([0x67; 32]);
+        let short = Address::from([0x68; 32]);
+        let missing = Address::from([0x69; 32]);
+        let large = (U256::from(1) << 200usize) + U256::from(73);
+        let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        native_struct_argument_initialize(
+            leader,
+            proposer,
+            proposer_signer,
+            sender,
+            reader,
+            activation,
+        );
+        native_struct_argument_initialize(
+            follower,
+            proposer,
+            proposer_signer,
+            sender,
+            reader,
+            activation,
+        );
         let lookup = |id: u64| {
             let mut bytes =
                 shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
@@ -7945,6 +8040,7 @@ mod tests {
                 selections,
                 sender_balance: initial_balance - fees,
                 success,
+                inner_outputs: None,
                 output: if is_lookup && activation.is_none() {
                     Vec::new()
                 } else {
@@ -7995,6 +8091,345 @@ mod tests {
         steps
     }
 
+    fn native_struct_argument_aa_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer_signer: &DilithiumSigner,
+        signer: &impl Signer,
+        reader: &str,
+        activation: Option<u64>,
+    ) -> Vec<NativeStructStep> {
+        let proposer = leader.config.proposer_address.unwrap();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        native_struct_argument_initialize(
+            leader,
+            proposer,
+            proposer_signer,
+            sender,
+            reader,
+            activation,
+        );
+        native_struct_argument_initialize(
+            follower,
+            proposer,
+            proposer_signer,
+            sender,
+            reader,
+            activation,
+        );
+        let ledger = Address::from([0x98; 32]);
+        let first = native_struct_word(0x34, 0x12);
+        let second = native_struct_word(0x56, 0x12);
+        let beneficiary = native_struct_word(0x78, 0x23);
+        let other = native_struct_word(0x9a, 0x23);
+        let initial_balance = U256::from(10_000_000_000_000_000_000u64);
+        let large = (U256::from(1) << 200usize) + U256::from(73);
+        let lookup = || {
+            let mut data = shell_primitives::keccak256(b"lookup(uint256)").as_bytes()[..4].to_vec();
+            data.extend_from_slice(&[0; 32]);
+            data
+        };
+        let set = |target: Address, owner: Address| {
+            let mut data = shell_primitives::keccak256(b"set(uint256,address,address)").as_bytes()
+                [..4]
+                .to_vec();
+            data.extend_from_slice(&[0; 32]);
+            data.extend_from_slice(target.as_bytes());
+            data.extend_from_slice(owner.as_bytes());
+            data
+        };
+        let mut malformed = set(second, beneficiary);
+        malformed.pop();
+        let mut missing_owner =
+            shell_primitives::keccak256(b"Missing(address)").as_bytes()[..4].to_vec();
+        missing_owner.extend_from_slice(&[0; 32]);
+        let read = |word: U256| (lookup(), word.to_be_bytes::<32>().to_vec());
+        // Each tuple supplies independent contract outputs and committed record expectations.
+        let cases = [
+            (
+                vec![(set(first, other), vec![]), read(large)],
+                true,
+                first,
+                other,
+            ),
+            (
+                vec![(set(first, other), vec![]), read(large)],
+                true,
+                first,
+                other,
+            ),
+            (
+                vec![(set(first, beneficiary), vec![]), read(U256::MAX)],
+                true,
+                first,
+                beneficiary,
+            ),
+            (
+                vec![(set(second, beneficiary), vec![]), read(U256::from(19))],
+                true,
+                second,
+                beneficiary,
+            ),
+            (
+                vec![(set(second, other), vec![]), read(U256::ZERO)],
+                true,
+                second,
+                other,
+            ),
+            // Successful read increments the selecting counter before a later static failure.
+            (
+                vec![
+                    (set(first, beneficiary), vec![]),
+                    read(U256::MAX),
+                    (set(Address::from([0x67; 32]), beneficiary), vec![]),
+                    (lookup(), vec![]),
+                ],
+                false,
+                second,
+                other,
+            ),
+            (
+                vec![
+                    (set(Address::from([0x68; 32]), beneficiary), vec![]),
+                    (lookup(), vec![]),
+                ],
+                false,
+                second,
+                other,
+            ),
+            (
+                vec![
+                    (set(Address::from([0x69; 32]), beneficiary), vec![]),
+                    (lookup(), vec![]),
+                ],
+                false,
+                second,
+                other,
+            ),
+            (
+                vec![
+                    (set(first, Address::ZERO), vec![]),
+                    (lookup(), missing_owner),
+                ],
+                false,
+                second,
+                other,
+            ),
+            (
+                vec![
+                    (set(first, beneficiary), vec![]),
+                    read(U256::MAX),
+                    (malformed, vec![]),
+                ],
+                false,
+                second,
+                other,
+            ),
+            (
+                vec![(set(first, other), vec![]), read(large)],
+                true,
+                first,
+                other,
+            ),
+        ];
+        let mut token = first;
+        let mut owner = beneficiary;
+        let mut selections = 0;
+        let mut fees = U256::ZERO;
+        let mut steps = Vec::new();
+        for (nonce, (calls, can_succeed, target, requested_owner)) in cases.into_iter().enumerate()
+        {
+            let active = activation.is_some_and(|height| nonce as u64 + 1 >= height);
+            let success = active && can_succeed;
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce: nonce as u64,
+                to: None,
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 1_500_000,
+                max_fee_per_gas: 2 * shell_core::INITIAL_BASE_FEE,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: AA_BUNDLE_TX_TYPE,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let mut signed = SignedTransaction::with_aa_bundle(
+                sender,
+                tx,
+                PQSignature::new(signer.sig_type(), vec![]),
+                PubkeyMode::Embedded(signer.public_key().to_vec()),
+                AaBundle {
+                    inner_calls: calls
+                        .iter()
+                        .map(|(data, _)| InnerCall {
+                            to: Some(ledger),
+                            value: U256::ZERO,
+                            data: Bytes::from(data.clone()),
+                            gas_limit: 300_000,
+                        })
+                        .collect(),
+                    ..AaBundle::default()
+                },
+            )
+            .unwrap();
+            signed.signature = signer
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            let root = current_state_root(leader);
+            let before = leader.store.scan_prefix(b"").unwrap();
+            let mut tampered = signed.clone();
+            tampered.signature.data[0] ^= 1;
+            let mut changed = signed.clone();
+            let inner = &mut changed.aa_bundle.as_mut().unwrap().inner_calls[0];
+            let mut data = inner.data.0.to_vec();
+            data[36] ^= 1;
+            inner.data = Bytes::from(data);
+            let mut wrong_sender = signed.clone();
+            wrong_sender.from = beneficiary;
+            for bad in [tampered, changed, wrong_sender] {
+                assert!(leader
+                    .tx_pool
+                    .insert(
+                        bad,
+                        &mut leader.world_state.write(),
+                        leader.chain_store.as_ref(),
+                        &MultiVerifier
+                    )
+                    .is_err());
+                assert_eq!(current_state_root(leader), root);
+                assert_eq!(leader.store.scan_prefix(b"").unwrap(), before);
+            }
+            let hash = signed.hash();
+            leader
+                .tx_pool
+                .insert(
+                    signed,
+                    &mut leader.world_state.write(),
+                    leader.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            let block = leader.produce_block(proposer_signer, 100).unwrap();
+            assert_eq!(block.number(), nonce as u64 + 1);
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(block.transactions[0].hash(), hash);
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let receipts = leader
+                .chain_store
+                .get_receipts(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipts[0].status,
+                u8::from(success),
+                "{reader} {activation:?} AA block{}",
+                block.number()
+            );
+            assert_eq!(receipts[0].tx_hash, hash);
+            assert!(receipts[0].logs.is_empty());
+            assert!(receipts[0].gas_used > 0);
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap(),
+                receipts
+            );
+            fees += U256::from(receipts[0].gas_used)
+                * U256::from(
+                    (2 * shell_core::INITIAL_BASE_FEE).min(block.header.base_fee_per_gas + 1),
+                );
+            if success {
+                token = target;
+                owner = requested_owner;
+                if reader == "SelectingLedger" {
+                    selections += 1;
+                }
+            }
+            for node_state in [current_state_root(leader), current_state_root(follower)] {
+                assert_eq!(node_state, block.header.state_root);
+            }
+            let state =
+                WorldState::at_root(leader.store.clone(), &block.header.state_root).unwrap();
+            assert_eq!(state.get_nonce(&sender).unwrap(), nonce as u64 + 1);
+            assert_eq!(state.get_balance(&sender).unwrap(), initial_balance - fees);
+            assert_eq!(
+                state
+                    .get_storage(&ledger, &native_struct_record_slot(0))
+                    .unwrap(),
+                ShellHash::from(*token.as_bytes())
+            );
+            assert_eq!(
+                state
+                    .get_storage(&ledger, &native_struct_record_slot(1))
+                    .unwrap(),
+                ShellHash::from(*owner.as_bytes())
+            );
+            assert_eq!(
+                state
+                    .get_storage(&ledger, &ShellHash::from(U256::from(1).to_be_bytes::<32>()))
+                    .unwrap(),
+                ShellHash::from(U256::from(selections).to_be_bytes::<32>())
+            );
+            steps.push(NativeStructStep {
+                block,
+                token,
+                beneficiary: owner,
+                selections,
+                sender_balance: initial_balance - fees,
+                success,
+                output: vec![],
+                inner_outputs: Some(if active {
+                    calls.into_iter().map(|(_, output)| output).collect()
+                } else {
+                    vec![vec![], vec![]]
+                }),
+            });
+        }
+        for step in &steps {
+            assert_pruned_genesis_witness_recovery(follower, &step.block);
+        }
+        native_struct_argument_history(follower, &steps, activation);
+        steps
+    }
+
+    #[test]
+    fn native_struct_argument_aa_admission_import_and_replay() {
+        for reader in ["Ledger", "SelectingLedger"] {
+            for activation in [None, Some(2)] {
+                for algorithm in [0, 1] {
+                    let (leader, proposer) = setup_node();
+                    let follower =
+                        setup_node_with_authority(leader.config.proposer_address.unwrap());
+                    if algorithm == 0 {
+                        native_struct_argument_aa_import(
+                            &leader,
+                            &follower,
+                            &proposer,
+                            &DilithiumSigner::generate(),
+                            reader,
+                            activation,
+                        );
+                    } else {
+                        native_struct_argument_aa_import(
+                            &leader,
+                            &follower,
+                            &proposer,
+                            &MlDsaSigner::generate(),
+                            reader,
+                            activation,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_struct_argument_signed_admission_import_and_replay() {
         for reader in ["Ledger", "SelectingLedger"] {
@@ -8028,8 +8463,7 @@ mod tests {
     }
 
     #[cfg(feature = "rocksdb")]
-    #[test]
-    fn native_struct_argument_import_survives_process_exit() {
+    fn native_struct_argument_process_exit(aa: bool) {
         const DIRECTORY: &str = "SHELL_TEST_NATIVE_STRUCT_DIRECTORY";
         const READER: &str = "SHELL_TEST_NATIVE_STRUCT_READER";
         const ALGORITHM: &str = "SHELL_TEST_NATIVE_STRUCT_ALGORITHM";
@@ -8045,7 +8479,27 @@ mod tests {
             let activation = (std::env::var(ACTIVE).unwrap() == "yes").then_some(2);
             let reader = std::env::var(READER).unwrap();
             assert!(["Ledger", "SelectingLedger"].contains(&reader.as_str()));
-            let steps = if std::env::var(ALGORITHM).unwrap() == "mldsa" {
+            let steps = if aa {
+                if std::env::var(ALGORITHM).unwrap() == "mldsa" {
+                    native_struct_argument_aa_import(
+                        &leader,
+                        &follower,
+                        &proposer_signer,
+                        &MlDsaSigner::generate(),
+                        &reader,
+                        activation,
+                    )
+                } else {
+                    native_struct_argument_aa_import(
+                        &leader,
+                        &follower,
+                        &proposer_signer,
+                        &DilithiumSigner::generate(),
+                        &reader,
+                        activation,
+                    )
+                }
+            } else if std::env::var(ALGORITHM).unwrap() == "mldsa" {
                 native_struct_argument_signed_import(
                     &leader,
                     &follower,
@@ -8076,7 +8530,8 @@ mod tests {
             for algorithm in ["dilithium", "mldsa"] {
                 for activation in [None, Some(2)] {
                     let directory = std::env::temp_dir().join(format!(
-                        "shell-native-struct-{reader}-{algorithm}-{}-{}",
+                        "shell-native-struct-{}-{reader}-{algorithm}-{}-{}",
+                        if aa { "aa" } else { "ordinary" },
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -8087,7 +8542,11 @@ mod tests {
                     let status = Command::new(std::env::current_exe().unwrap())
                         .args([
                             "--exact",
-                            "node::tests::native_struct_argument_import_survives_process_exit",
+                            if aa {
+                                "node::tests::native_struct_argument_aa_survives_process_exit"
+                            } else {
+                                "node::tests::native_struct_argument_import_survives_process_exit"
+                            },
                             "--nocapture",
                         ])
                         .env(DIRECTORY, &directory)
@@ -8130,6 +8589,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_struct_argument_import_survives_process_exit() {
+        native_struct_argument_process_exit(false);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn native_struct_argument_aa_survives_process_exit() {
+        native_struct_argument_process_exit(true);
     }
 
     #[test]
