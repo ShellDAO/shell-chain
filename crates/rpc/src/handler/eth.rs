@@ -776,7 +776,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     .map_err(internal_err)?,
                 None => None,
             };
-            match header {
+            match header.as_ref() {
                 Some(h) => {
                     if num == latest {
                         next_base_fee = shell_core::fee::calculate_base_fee(
@@ -799,7 +799,12 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 }
             }
             if let (Some(reward), Some(percentiles)) = (&mut reward, reward_percentiles.as_ref()) {
-                reward.push(vec![hex_u64(0); percentiles.len()]);
+                let hash = header.as_ref().map(BlockHeader::hash);
+                let row = match hash {
+                    Some(hash) => self.fee_reward_percentiles(&hash, percentiles)?,
+                    None => vec![hex_u64(0); percentiles.len()],
+                };
+                reward.push(row);
             }
         }
 

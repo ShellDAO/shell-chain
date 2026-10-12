@@ -213,6 +213,15 @@ fee_history(block_count: String, newest_block: String, reward_percentiles: Optio
 
 Returns base fee history for a range of blocks (EIP-1559).
 
+Unreleased node source computes reward percentiles from effective priority
+fees weighted by actual receipt gas. Fee caps limit the tip; failed
+transactions contribute charged gas. Empty and zero-tip blocks yield zero
+rewards; omitted percentiles or an empty list keep `reward: []`.
+Fee inputs survive subsequent body pruning. Already-pruned legacy blocks
+without fee metadata cannot supply percentiles and return an error;
+queries without percentiles can still return header fees and gas usage.
+Positive-tip results on published node versions remain to be verified.
+
 ### eth_sendRawTransaction
 ```
 send_raw_transaction(data: String, ) → ShellHash

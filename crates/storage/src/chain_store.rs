@@ -428,6 +428,62 @@ impl<S: KvStore> ChainStore<S> {
         [prefix::BODY_BY_HASH, hash.as_bytes()].concat()
     }
 
+    fn priority_fees_key(hash: &ShellHash) -> Vec<u8> {
+        [b"ftip/".as_ref(), hash.as_bytes()].concat()
+    }
+
+    fn priority_fees(body: &StrippedBlock) -> Vec<u64> {
+        body.transactions
+            .iter()
+            .map(|tx| {
+                shell_core::miner_tip(
+                    tx.tx.max_fee_per_gas,
+                    tx.tx.max_priority_fee_per_gas,
+                    body.header.base_fee_per_gas,
+                )
+            })
+            .collect()
+    }
+
+    fn append_priority_fees(batch: &mut WriteBatch, hash: &ShellHash, body: &StrippedBlock) {
+        let fees: Vec<u8> = Self::priority_fees(body)
+            .into_iter()
+            .flat_map(u64::to_be_bytes)
+            .collect();
+        batch.put(Self::priority_fees_key(hash), fees);
+    }
+
+    /// Paid priority fees in user transaction order, retained after body pruning.
+    /// Legacy bodies are read without mutating storage; already-pruned legacy
+    /// blocks may lack this metadata and return None instead of invented zeros.
+    pub fn get_block_priority_fees(
+        &self,
+        hash: &ShellHash,
+    ) -> Result<Option<Vec<u64>>, StorageError> {
+        if let Some(bytes) = self.store.get(&Self::priority_fees_key(hash))? {
+            if !bytes.len().is_multiple_of(8) {
+                return Err(StorageError::Codec(
+                    "invalid block priority fee metadata".into(),
+                ));
+            }
+            return Ok(Some(
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_be_bytes(*chunk))
+                    .collect(),
+            ));
+        }
+        self.store
+            .get(&Self::body_key(hash))?
+            .map(|bytes| {
+                let body: StrippedBlock = decode_versioned(&bytes)?;
+                Ok(Self::priority_fees(&body))
+            })
+            .transpose()
+    }
+
     fn body_digest_key(hash: &ShellHash) -> Vec<u8> {
         [prefix::BODY_DIGEST_BY_HASH, hash.as_bytes()].concat()
     }
@@ -622,6 +678,7 @@ impl<S: KvStore> ChainStore<S> {
 
         // Split block into stripped body + witness bundle and store separately.
         let (stripped, bundle) = StrippedBlock::split(block);
+        Self::append_priority_fees(batch, &block_hash, &stripped);
         let body_bytes = encode_rlp(&stripped);
         batch.put(Self::body_key(&block_hash), body_bytes);
 
@@ -993,6 +1050,8 @@ impl<S: KvStore> ChainStore<S> {
                 // Normalize legacy encodings before hashing so a restored body
                 // can be compared using the current stripped-block encoding.
                 let body: StrippedBlock = decode_versioned(&bytes)?;
+                // Preserve fee-query inputs atomically before pruning legacy bodies.
+                Self::append_priority_fees(batch, hash, &body);
                 let digest = shell_primitives::blake3_hash(&encode_rlp(&body));
                 batch.put(Self::body_digest_key(hash), digest.as_bytes().to_vec());
             }
@@ -10048,6 +10107,35 @@ mod tests {
         cs.restore_pruned_witness(&block).unwrap();
         let reopened = ChainStore::new(db);
         assert_eq!(reopened.get_block_by_hash(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
+    fn priority_fees_atomic_block_metadata_and_legacy_pruning() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db.clone());
+        let mut block = make_block_with_txs(2);
+        block.header.base_fee_per_gas = 100;
+        block.transactions[0].tx.max_fee_per_gas = 107;
+        block.transactions[0].tx.max_priority_fee_per_gas = 50;
+        let hash = block.hash();
+        cs.commit_canonical_block(&block, Some(&[])).unwrap();
+        assert_eq!(cs.get_block_priority_fees(&hash).unwrap(), Some(vec![7]));
+        db.delete(&ChainStore::<MemoryDb>::priority_fees_key(&hash))
+            .unwrap();
+        let before = db.scan_prefix(b"").unwrap();
+        assert_eq!(cs.get_block_priority_fees(&hash).unwrap(), Some(vec![7]));
+        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        cs.prune_bodies_below(&[hash], 3).unwrap();
+        assert!(cs.get_block_by_hash(&hash).unwrap().is_none());
+        assert_eq!(
+            ChainStore::new(db.clone())
+                .get_block_priority_fees(&hash)
+                .unwrap(),
+            Some(vec![7])
+        );
+        db.put(&ChainStore::<MemoryDb>::priority_fees_key(&hash), &[1])
+            .unwrap();
+        assert!(cs.get_block_priority_fees(&hash).is_err());
     }
 
     #[test]
