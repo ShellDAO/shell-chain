@@ -11440,12 +11440,13 @@ mod tests {
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
         proposer: &DilithiumSigner,
-    ) -> (u64, serde_json::Value) {
+    ) -> Vec<(u64, serde_json::Value)> {
         use shell_rpc::api::EthApiServer;
         let signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         let recipient = Address::from([0x88; 32]);
         let contract = Address::from([0x89; 32]);
+        let reverting_contract = Address::from([0x8a; 32]);
         macro_rules! initialize { ($node:expr) => {{
             let node = $node;
             node.register_authority_pubkey(leader.config.proposer_address.unwrap(), proposer.public_key().to_vec());
@@ -11454,10 +11455,15 @@ mod tests {
             })).unwrap();
             node.chain_store.put_chain_config(&config).unwrap();
             fund_account(node, &sender, U256::from(10_000_000_000_000_000_000u64));
-            let code = hex::decode("600160005500").unwrap();
-            let code_hash = shell_primitives::keccak256(&code);
-            node.chain_store.put_code(&code_hash, &code).unwrap();
-            node.world_state.write().set_code_hash(&contract, code_hash).unwrap();
+            for (address, runtime) in [
+                (contract, "600160005500"),
+                (reverting_contract, "600160005560006000fd"),
+            ] {
+                let code = hex::decode(runtime).unwrap();
+                let code_hash = shell_primitives::keccak256(&code);
+                node.chain_store.put_code(&code_hash, &code).unwrap();
+                node.world_state.write().set_code_hash(&address, code_hash).unwrap();
+            }
             store_consistent_genesis(node);
         }}; }
         initialize!(leader);
@@ -11523,24 +11529,120 @@ mod tests {
         );
         let expected = serde_json::json!([["0x2", "0x32", "0x32"]]);
         let before = follower.store.scan_prefix(b"").unwrap();
-        let query = || {
+        let query = |number| {
             runtime
                 .block_on(EthApiServer::fee_history(
                     &handler,
                     "0x1".into(),
-                    format!("0x{:x}", block.number()),
+                    format!("0x{number:x}"),
                     Some(vec![0.0, 50.0, 100.0]),
                 ))
                 .unwrap()
         };
-        assert_eq!(query()["reward"], expected);
+        assert_eq!(query(block.number())["reward"], expected);
         assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
-        let later = leader.produce_block(proposer, 200).unwrap();
+
+        let before_revert = follower.world_state.read().get_balance(&sender).unwrap();
+        for (nonce, destination, tip) in [(3, reverting_contract, 50), (4, recipient, 2)] {
+            submit_signed_tx(
+                leader,
+                &signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce,
+                    to: Some(destination),
+                    value: U256::from(1),
+                    data: Bytes::default(),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE + 1000,
+                    max_priority_fee_per_gas: tip,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+        }
+        let reverted = leader.produce_block(proposer, 200).unwrap();
+        assert_eq!(reverted.transactions.len(), 2);
+        follower
+            .import_block(reverted.clone(), &MultiVerifier)
+            .unwrap();
+        let receipts = follower
+            .chain_store
+            .get_receipts(&reverted.hash())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipts[..reverted.transactions.len()]
+                .iter()
+                .map(|r| r.status)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(receipts[reverted.transactions.len()..]
+            .iter()
+            .all(|receipt| receipt.gas_used == 0));
+        assert!(receipts[0].gas_used > receipts[1].gas_used);
+        let paid: u128 = receipts
+            .iter()
+            .zip(&reverted.transactions)
+            .map(|(receipt, tx)| {
+                u128::from(receipt.gas_used)
+                    * u128::from(reverted.header.base_fee_per_gas + tx.tx.max_priority_fee_per_gas)
+            })
+            .sum();
+        macro_rules! assert_reverted_state {
+            ($node:expr) => {{
+                let state = $node.world_state.read();
+                assert_eq!(
+                    before_revert - state.get_balance(&sender).unwrap(),
+                    U256::from(paid) + U256::from(1)
+                );
+                assert_eq!(state.get_nonce(&sender).unwrap(), 5);
+                assert_eq!(
+                    state
+                        .get_storage(&reverting_contract, &ShellHash::ZERO)
+                        .unwrap(),
+                    ShellHash::ZERO
+                );
+                assert_eq!(state.get_balance(&reverting_contract).unwrap(), U256::ZERO);
+            }};
+        }
+        assert_reverted_state!(leader);
+        assert_reverted_state!(follower);
+        assert_eq!(
+            leader
+                .chain_store
+                .get_receipts(&reverted.hash())
+                .unwrap()
+                .unwrap(),
+            receipts
+        );
+        assert_eq!(current_state_root(leader), current_state_root(follower));
+        // The reverted transaction dominates gas weight. Dropping it would return [2, 2, 2].
+        assert_eq!(query(reverted.number())["reward"], expected);
+        let later = leader.produce_block(proposer, 300).unwrap();
         follower.import_block(later, &MultiVerifier).unwrap();
-        follower.chain_store.delete_body(&block.hash()).unwrap();
-        leader.chain_store.delete_body(&block.hash()).unwrap();
-        assert_eq!(query()["reward"], expected);
-        (block.number(), expected)
+        let before_pruning = follower.store.scan_prefix(b"").unwrap();
+        for historical in [&block, &reverted] {
+            follower
+                .chain_store
+                .delete_body(&historical.hash())
+                .unwrap();
+            leader.chain_store.delete_body(&historical.hash()).unwrap();
+        }
+        let after_pruning = follower.store.scan_prefix(b"").unwrap();
+        assert_ne!(before_pruning, after_pruning);
+        for historical in [&block, &reverted] {
+            assert_eq!(query(historical.number())["reward"], expected);
+        }
+        assert_eq!(follower.store.scan_prefix(b"").unwrap(), after_pruning);
+        vec![
+            (block.number(), expected.clone()),
+            (reverted.number(), expected),
+        ]
     }
 
     #[test]
@@ -11590,7 +11692,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let (number, expected): (u64, serde_json::Value) =
+        let fixtures: Vec<(u64, serde_json::Value)> =
             serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
                 .unwrap();
         let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
@@ -11620,16 +11722,18 @@ mod tests {
             Arc::new(RwLock::new(FinalityState::new())),
         );
         let before = recovered.store.scan_prefix(b"").unwrap();
-        let result = runtime
-            .block_on(EthApiServer::fee_history(
-                &handler,
-                "0x1".into(),
-                format!("0x{number:x}"),
-                Some(vec![0.0, 50.0, 100.0]),
-            ))
-            .unwrap();
-        assert_eq!(result["reward"], expected);
-        assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
+        for (number, expected) in &fixtures {
+            let result = runtime
+                .block_on(EthApiServer::fee_history(
+                    &handler,
+                    "0x1".into(),
+                    format!("0x{number:x}"),
+                    Some(vec![0.0, 50.0, 100.0]),
+                ))
+                .unwrap();
+            assert_eq!(&result["reward"], expected);
+            assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
+        }
         runtime.block_on(async {
             let (events, _) = tokio::sync::broadcast::channel(16);
             let server = shell_rpc::start_rpc_server(
@@ -11665,13 +11769,15 @@ mod tests {
             )
             .await;
             assert_eq!(original["result"]["reward"], serde_json::json!([]));
-            let actual = native_http_request(
-                server.http_addr,
-                "eth_feeHistory",
-                serde_json::json!(["0x1", format!("0x{number:x}"), [0, 50, 100]]),
-            )
-            .await;
-            assert_eq!(actual["result"]["reward"], expected);
+            for (number, expected) in &fixtures {
+                let actual = native_http_request(
+                    server.http_addr,
+                    "eth_feeHistory",
+                    serde_json::json!(["0x1", format!("0x{number:x}"), [0, 50, 100]]),
+                )
+                .await;
+                assert_eq!(&actual["result"]["reward"], expected);
+            }
             let invalid = native_http_request(
                 server.http_addr,
                 "eth_feeHistory",
