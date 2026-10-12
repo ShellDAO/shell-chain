@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add source regressions for stateful address/uint256 overloads: authentic
+  transaction admission and independent import, failed-write rollback, historical
+  RPC/replay and RocksDB recovery after abrupt process exit.
+
 - Execute historical `eth_call` using the selected canonical header and retained
   state root. Preserve live calls and reject unavailable history instead of
   substituting current state. Calls discard simulated writes.
