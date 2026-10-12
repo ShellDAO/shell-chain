@@ -11,6 +11,7 @@ struct Step {
     words: [ShellHash; 3],
     sender_balance: U256,
     success: bool,
+    inner_outputs: Option<Vec<Vec<u8>>>,
 }
 
 fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step]) {
@@ -86,12 +87,27 @@ fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step]) {
             ))
             .unwrap();
         assert_eq!(trace["failed"], !step.success);
+        if let Some(outputs) = &step.inner_outputs {
+            let trace = runtime
+                .block_on(DebugApiServer::trace_transaction(
+                    &handler,
+                    tx.hash().to_string(),
+                    Some(serde_json::json!({"tracer":"callTracer"})),
+                ))
+                .unwrap();
+            let calls = trace["calls"].as_array().unwrap();
+            assert_eq!(calls.len(), outputs.len());
+            for (call, output) in calls.iter().zip(outputs) {
+                assert_eq!(call["to"], CONTRACT.to_string());
+                assert_eq!(call["output"], format!("0x{}", hex::encode(output)));
+            }
+        }
         assert_eq!(current_state_root(node), tip_root);
         assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
     }
 }
 
-fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
+fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
     let (leader, proposer) = setup_node();
     let authority = leader.config.proposer_address.unwrap();
     let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
@@ -144,7 +160,7 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
     truncated.pop();
     // Expected words come from the original Solidity declarations: address identity,
     // integer +1, and a counter that advances only for committed successful calls.
-    let cases = [
+    let ordinary = [
         (
             address_input(first),
             true,
@@ -195,34 +211,161 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
             4,
         ),
     ];
+    let cases = if aa {
+        let first_word = ShellHash::from(*first.as_bytes());
+        let second_word = ShellHash::from(*second.as_bytes());
+        let one = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+        let mut truncated = address_input(second);
+        truncated.pop();
+        vec![
+            (
+                vec![address_input(first), integer_input(word)],
+                true,
+                first_word,
+                integer_result,
+                2,
+            ),
+            (
+                vec![address_input(second), integer_input(U256::ZERO)],
+                true,
+                second_word,
+                one,
+                4,
+            ),
+            // Each failure follows successful inner writes; all fields and the counter roll back.
+            (
+                vec![
+                    address_input(first),
+                    integer_input(word),
+                    address_input(Address::ZERO),
+                ],
+                false,
+                second_word,
+                one,
+                4,
+            ),
+            (
+                vec![address_input(first), integer_input(U256::MAX)],
+                false,
+                second_word,
+                one,
+                4,
+            ),
+            (
+                vec![address_input(first), truncated],
+                false,
+                second_word,
+                one,
+                4,
+            ),
+            (
+                vec![integer_input(word), address_input(first)],
+                true,
+                first_word,
+                integer_result,
+                6,
+            ),
+            (
+                vec![address_input(second), integer_input(U256::MAX)],
+                false,
+                first_word,
+                integer_result,
+                6,
+            ),
+        ]
+    } else {
+        ordinary
+            .into_iter()
+            .map(|(data, success, owner, amount, writes)| {
+                (vec![data], success, owner, amount, writes)
+            })
+            .collect()
+    };
+    let expected_output = |data: &[u8]| {
+        if data.len() != 36 {
+            return vec![];
+        }
+        if data[..4] == address_input(first)[..4] {
+            if data[4..] == [0; 32] {
+                vec![]
+            } else {
+                data[4..].to_vec()
+            }
+        } else {
+            let value = U256::from_be_slice(&data[4..]);
+            if value == U256::MAX {
+                let mut panic = hex::decode("4e487b71").unwrap();
+                panic.extend_from_slice(&U256::from(0x11).to_be_bytes::<32>());
+                panic
+            } else {
+                (value + U256::from(1)).to_be_bytes::<32>().to_vec()
+            }
+        }
+    };
     let mut fees = U256::ZERO;
     let mut steps = Vec::new();
-    for (nonce, (data, success, owner, amount, writes)) in cases.into_iter().enumerate() {
+    for (nonce, (calls, success, owner, amount, writes)) in cases.into_iter().enumerate() {
         let tx = Transaction {
             chain_id: 1337,
             nonce: nonce as u64,
-            to: Some(CONTRACT),
+            to: if aa { None } else { Some(CONTRACT) },
             value: U256::ZERO,
-            data: Bytes::from(data),
-            gas_limit: 500_000,
-            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
-            max_priority_fee_per_gas: 0,
+            data: if aa {
+                Bytes::new()
+            } else {
+                Bytes::from(calls[0].clone())
+            },
+            gas_limit: if aa { 1_500_000 } else { 500_000 },
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE * if aa { 2 } else { 1 },
+            max_priority_fee_per_gas: u64::from(aa),
             access_list: None,
-            tx_type: 2,
+            tx_type: if aa { AA_BUNDLE_TX_TYPE } else { 2 },
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         };
-        let signature = signer
-            .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+        let max_fee = tx.max_fee_per_gas;
+        let priority_fee = tx.max_priority_fee_per_gas;
+        let signed = if aa {
+            let mut signed = SignedTransaction::with_aa_bundle(
+                sender,
+                tx,
+                PQSignature::new(signer.sig_type(), vec![]),
+                PubkeyMode::Embedded(signer.public_key().to_vec()),
+                AaBundle {
+                    inner_calls: calls
+                        .iter()
+                        .map(|data| InnerCall {
+                            to: Some(CONTRACT),
+                            value: U256::ZERO,
+                            data: Bytes::from(data.clone()),
+                            gas_limit: 300_000,
+                        })
+                        .collect(),
+                    ..AaBundle::default()
+                },
+            )
             .unwrap();
-        let signed =
-            SignedTransaction::with_pubkey(sender, tx, signature, signer.public_key().to_vec());
+            signed.signature = signer
+                .sign(signed.sender_signing_hash().as_bytes())
+                .unwrap();
+            signed
+        } else {
+            let signature = signer
+                .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            SignedTransaction::with_pubkey(sender, tx, signature, signer.public_key().to_vec())
+        };
         let before = leader.store.scan_prefix(b"").unwrap();
         let root = current_state_root(&leader);
         let mut changed = signed.clone();
-        let mut changed_data = changed.tx.data.0.to_vec();
+        let changed_input = if aa {
+            &mut changed.aa_bundle.as_mut().unwrap().inner_calls[0].data
+        } else {
+            &mut changed.tx.data
+        };
+        let mut changed_data = changed_input.0.to_vec();
         changed_data[4] ^= 1;
-        changed.tx.data = Bytes::from(changed_data);
+        *changed_input = Bytes::from(changed_data);
         let mut tampered = signed.clone();
         tampered.signature.data[0] ^= 1;
         let mut wrong_sender = signed.clone();
@@ -271,10 +414,10 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
                 .unwrap(),
             receipts
         );
-        // Consensus guide: min(max fee, base fee + tip); these transactions use tip 0.
-        // Compute the oracle directly rather than calling the execution price helper.
+        // Compute the consensus guide's min(max fee, base fee + tip) directly.
+        // Included failed AA batches still consume one outer nonce and pay billed gas.
         fees += U256::from(receipts[0].gas_used)
-            * U256::from(shell_core::INITIAL_BASE_FEE.min(block.header.base_fee_per_gas));
+            * U256::from(max_fee.min(block.header.base_fee_per_gas + priority_fee));
         steps.push(Step {
             block,
             words: [
@@ -284,6 +427,7 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
             ],
             sender_balance: initial_balance - fees,
             success,
+            inner_outputs: aa.then(|| calls.iter().map(|data| expected_output(data)).collect()),
         });
         assert_eq!(
             current_state_root(&leader),
@@ -305,20 +449,20 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer) {
     std::process::exit(0);
 }
 
-#[test]
-fn native_overload_signed_import_survives_process_exit() {
+fn process_exit(aa: bool) {
     if let Some(directory) = std::env::var_os(DIRECTORY) {
         let directory = std::path::PathBuf::from(directory);
         if std::env::var("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM").as_deref() == Ok("mldsa") {
-            write_history(&directory, &MlDsaSigner::generate());
+            write_history(&directory, &MlDsaSigner::generate(), aa);
         } else {
-            write_history(&directory, &DilithiumSigner::generate());
+            write_history(&directory, &DilithiumSigner::generate(), aa);
         }
         unreachable!();
     }
     for algorithm in ["dilithium", "mldsa"] {
         let directory = std::env::temp_dir().join(format!(
-            "shell-native-overload-{algorithm}-{}-{}",
+            "shell-native-overload-{}-{algorithm}-{}-{}",
+            if aa { "aa" } else { "ordinary" },
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -326,7 +470,7 @@ fn native_overload_signed_import_survives_process_exit() {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "node::tests::native_overload_tests::native_overload_signed_import_survives_process_exit", "--nocapture"]).env(DIRECTORY, &directory).env("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM",algorithm).status().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", if aa {"node::tests::native_overload_tests::native_overload_aa_survives_process_exit"} else {"node::tests::native_overload_tests::native_overload_signed_import_survives_process_exit"}, "--nocapture"]).env(DIRECTORY, &directory).env("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM",algorithm).status().unwrap();
         assert!(
             status.success(),
             "overload writer failed; retained {}",
@@ -353,4 +497,14 @@ fn native_overload_signed_import_survives_process_exit() {
         drop(stores.witness);
         std::fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn native_overload_signed_import_survives_process_exit() {
+    process_exit(false);
+}
+
+#[test]
+fn native_overload_aa_survives_process_exit() {
+    process_exit(true);
 }
