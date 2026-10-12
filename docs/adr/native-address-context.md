@@ -53,14 +53,23 @@ Run the isolated signed-transaction and disk-recovery regression with the
 repository Rust toolchain and RocksDB build prerequisites:
 
 ```bash
-cargo test -p shell-node --features rocksdb --lib native_overload_signed_import_survives_process_exit -- --nocapture
+cargo test -p shell-node --features rocksdb --lib native_overload_ -- --nocapture
 ```
 
-The regression creates temporary accounts and node databases, signs transactions
-with Dilithium3 and ML-DSA-65, imports their blocks independently and verifies
+The regressions create temporary accounts and node databases, sign ordinary
+transactions and root-signed AA batches with Dilithium3 and ML-DSA-65, import
+their blocks independently and verify
 historical RPC results, replay, receipts, fees and state after abrupt writer
 exit. It retains failed databases for diagnosis and removes successful test
-databases. These address-value operations use no native identity or creation
-opcodes; this regression leaves the context profile unconfigured. Published
-packages, AA overload transactions, live network synchronization and native
-CREATE/CREATE2 require their own acceptance.
+databases. AA cases execute both overloaded setters in both orders, then test
+later zero-address refusal, integer overflow and truncated input after successful
+inner writes. Every earlier write and counter update rolls back on batch failure;
+the included outer transaction still consumes one nonce and pays its billed fee.
+Corrupt signatures, changed signed inner arguments and funded wrong senders
+must be refused without changing persisted state. Call traces retain each inner
+result, including exact overflow panic data.
+
+These address-value operations use no native identity or creation opcodes;
+the regressions leave the context profile unconfigured. Published packages,
+live network synchronization and native CREATE/CREATE2 require their own
+acceptance.
