@@ -468,8 +468,10 @@ impl<S: KvStore> ChainStore<S> {
             }
             return Ok(Some(
                 bytes
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("eight-byte fee")))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_be_bytes(*chunk))
                     .collect(),
             ));
         }
