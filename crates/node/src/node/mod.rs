@@ -1904,6 +1904,9 @@ impl<S: KvStore + 'static> Node<S> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rocksdb")]
+    mod native_overload_tests;
+
     use super::*;
     use crate::pruning::PruningConfig;
     use shell_consensus::{PoaConfig, PoaEngine, WPoaConfig, WPoaEngine};

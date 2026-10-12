@@ -1,0 +1,186 @@
+{
+  "source": "pragma solidity ^0.8.35;\ncontract StatefulOverloads {\n address public owner;\n uint256 public amount;\n uint256 public writes;\n function value(address v) internal pure returns(address) {return v;}\n function value(uint256 v) internal pure returns(uint256) {return v+1;}\n function set(address v) external returns(address) {owner=value(v);writes++;require(v!=address(0));return owner;}\n function set(uint256 v) external returns(uint256) {amount=value(v);writes++;return amount;}\n}\n",
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "sdkSourceCommit": "4050a8fb32f9b0ba74386b6a504bff5382020014",
+  "selectors": {
+    "set(address)": "0x2801617e",
+    "set(uint256)": "0x60fe47b1",
+    "owner()": "0x8da5cb5b",
+    "amount()": "0xaa8c217c",
+    "writes()": "0xc4b5c133"
+  },
+  "artifacts": {
+    "evm": {
+      "contractName": "StatefulOverloads",
+      "sourcePath": "StatefulOverloads.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [],
+          "name": "amount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "v",
+              "type": "address"
+            }
+          ],
+          "name": "set",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "v",
+              "type": "uint256"
+            }
+          ],
+          "name": "set",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "writes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080604052348015600e575f5ffd5b506102138061001c5f395ff3fe608060405234801561000f575f5ffd5b5060043610610055575f3560e01c80632801617e1461005957806360fe47b1146100895780638da5cb5b146100aa578063aa8c217c146100bc578063c4b5c133146100c5575b5f5ffd5b61006c61006736600461015a565b6100ce565b6040516001600160a01b0390911681526020015b60405180910390f35b61009c610097366004610187565b61011e565b604051908152602001610080565b5f5461006c906001600160a01b031681565b61009c60015481565b61009c60025481565b5f80546001600160a01b0319166001600160a01b0383161781556002805490826100f7836101b2565b90915550506001600160a01b03821661010e575f5ffd5b50505f546001600160a01b031690565b5f61012882610148565b60015560028054905f61013a836101b2565b909155505060015492915050565b5f6101548260016101ca565b92915050565b5f6020828403121561016a575f5ffd5b81356001600160a01b0381168114610180575f5ffd5b9392505050565b5f60208284031215610197575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f600182016101c3576101c361019e565b5060010190565b808201808211156101545761015461019e56fea26469706673582212205905e382577921cb5348b9ca8f3668ce3aede40fecb98c46b5ca487cf65dcce664736f6c63430008230033",
+      "deployedBytecode": "0x608060405234801561000f575f5ffd5b5060043610610055575f3560e01c80632801617e1461005957806360fe47b1146100895780638da5cb5b146100aa578063aa8c217c146100bc578063c4b5c133146100c5575b5f5ffd5b61006c61006736600461015a565b6100ce565b6040516001600160a01b0390911681526020015b60405180910390f35b61009c610097366004610187565b61011e565b604051908152602001610080565b5f5461006c906001600160a01b031681565b61009c60015481565b61009c60025481565b5f80546001600160a01b0319166001600160a01b0383161781556002805490826100f7836101b2565b90915550506001600160a01b03821661010e575f5ffd5b50505f546001600160a01b031690565b5f61012882610148565b60015560028054905f61013a836101b2565b909155505060015492915050565b5f6101548260016101ca565b92915050565b5f6020828403121561016a575f5ffd5b81356001600160a01b0381168114610180575f5ffd5b9392505050565b5f60208284031215610197575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f600182016101c3576101c361019e565b5060010190565b808201808211156101545761015461019e56fea26469706673582212205905e382577921cb5348b9ca8f3668ce3aede40fecb98c46b5ca487cf65dcce664736f6c63430008230033"
+    },
+    "pqvm": {
+      "contractName": "StatefulOverloads",
+      "sourcePath": "StatefulOverloads.sol",
+      "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [],
+          "name": "amount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "v",
+              "type": "address"
+            }
+          ],
+          "name": "set",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "v",
+              "type": "uint256"
+            }
+          ],
+          "name": "set",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "writes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x60808060405234601557610174908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80632801617e146100fa57806360fe47b1146100aa5780638da5cb5b1461008e578063aa8c217c146100715763c4b5c13314610050575f80fd5b3461006d575f36600319011261006d576020600254604051908152f35b5f80fd5b3461006d575f36600319011261006d576020600154604051908152f35b3461006d575f36600319011261006d5760205f54604051908152f35b3461006d57602036600319011261006d57600435600181018091116100e657806020916001556100db600254610130565b600255604051908152f35b634e487b7160e01b5f52601160045260245ffd5b3461006d57602036600319011261006d57600435805f5561011c600254610130565b600255801561006d57602090604051908152f35b5f1981146100e6576001019056fea26469706673582212208d3f1668ae58173c7725769d83897610e48fce712d7be195de1d91c325c49ac964736f6c63430008230033",
+      "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80632801617e146100fa57806360fe47b1146100aa5780638da5cb5b1461008e578063aa8c217c146100715763c4b5c13314610050575f80fd5b3461006d575f36600319011261006d576020600254604051908152f35b5f80fd5b3461006d575f36600319011261006d576020600154604051908152f35b3461006d575f36600319011261006d5760205f54604051908152f35b3461006d57602036600319011261006d57600435600181018091116100e657806020916001556100db600254610130565b600255604051908152f35b634e487b7160e01b5f52601160045260245ffd5b3461006d57602036600319011261006d57600435805f5561011c600254610130565b600255801561006d57602090604051908152f35b5f1981146100e6576001019056fea26469706673582212208d3f1668ae58173c7725769d83897610e48fce712d7be195de1d91c325c49ac964736f6c63430008230033"
+    }
+  }
+}

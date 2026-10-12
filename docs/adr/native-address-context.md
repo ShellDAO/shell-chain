@@ -38,3 +38,29 @@ import, committed-root reopening and historical replay across activation.
 Existing legacy execution and log/bloom schedules remain covered before the
 native activation boundary. Source acceptance does not establish a published
 compiler package, node binary, or deployed activation.
+
+## Stateful overload source regression
+
+The compiler must preserve the original selectors of `set(address)` and
+`set(uint256)` when address values become full ABI/storage words. The fixture
+`crates/pqvm/tests/fixtures/native-stateful-overloads.json` includes the original
+Solidity source, compiler version, SDK source commit and both compiler targets.
+Its address branch stores the complete argument; its integer branch stores the
+argument plus one. Zero-address refusal, truncated input and integer overflow
+must preserve the contract's owner, amount and write counter.
+
+Run the isolated signed-transaction and disk-recovery regression with the
+repository Rust toolchain and RocksDB build prerequisites:
+
+```bash
+cargo test -p shell-node --features rocksdb --lib native_overload_signed_import_survives_process_exit -- --nocapture
+```
+
+The regression creates temporary accounts and node databases, signs transactions
+with Dilithium3 and ML-DSA-65, imports their blocks independently and verifies
+historical RPC results, replay, receipts, fees and state after abrupt writer
+exit. It retains failed databases for diagnosis and removes successful test
+databases. These address-value operations use no native identity or creation
+opcodes; this regression leaves the context profile unconfigured. Published
+packages, AA overload transactions, live network synchronization and native
+CREATE/CREATE2 require their own acceptance.
