@@ -14,7 +14,7 @@ struct Step {
     inner_outputs: Option<Vec<Vec<u8>>>,
 }
 
-fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step]) {
+fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step], derived: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let _guard = runtime.enter();
     let (events, _) = tokio::sync::broadcast::channel(16);
@@ -47,9 +47,13 @@ fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step]) {
             .unwrap();
         assert_eq!(receipts[0].tx_hash, tx.hash());
         assert_eq!(receipts[0].status, u8::from(step.success));
-        for (slot, signature) in [b"owner()".as_slice(), b"amount()", b"writes()"]
-            .into_iter()
-            .enumerate()
+        for (slot, signature) in if derived {
+            [b"nativeOwner()".as_slice(), b"nativeAmount()", b"writes()"]
+        } else {
+            [b"owner()".as_slice(), b"amount()", b"writes()"]
+        }
+        .into_iter()
+        .enumerate()
         {
             assert_eq!(
                 state
@@ -107,7 +111,12 @@ fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step]) {
     }
 }
 
-fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
+fn write_history(
+    directory: &std::path::Path,
+    signer: &dyn Signer,
+    aa: bool,
+    variant: Option<&str>,
+) {
     let (leader, proposer) = setup_node();
     let authority = leader.config.proposer_address.unwrap();
     let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
@@ -116,10 +125,21 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
     let first = native_struct_word(0x34, 0x12);
     let second = native_struct_word(0x56, 0x12);
     let initial_balance = U256::from(10_000_000_000_000_000_000u64);
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../pqvm/tests/fixtures/native-stateful-overloads.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value = if let Some(variant) = variant {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../pqvm/tests/fixtures/native-derived-overloads.json"
+        ))
+        .unwrap();
+        let fixture = fixtures["variants"][variant].clone();
+        assert!(fixture.is_object(), "unknown derived overload variant");
+        fixture
+    } else {
+        serde_json::from_str(include_str!(
+            "../../../../pqvm/tests/fixtures/native-stateful-overloads.json"
+        ))
+        .unwrap()
+    };
+    let array = fixture["array"].as_bool().unwrap_or(false);
     let code = fixture["artifacts"]["pqvm"]["deployedBytecode"]
         .as_str()
         .unwrap()
@@ -146,15 +166,38 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
     initialize!(follower);
     let word = U256::from_be_bytes(*first.as_bytes());
     let integer_result = ShellHash::from((word + U256::from(1)).to_be_bytes::<32>());
-    let address_input = |value: Address| {
-        let mut data = shell_primitives::keccak256(b"set(address)").as_bytes()[..4].to_vec();
-        data.extend_from_slice(value.as_bytes());
+    let input = |signature: &[u8], value: &[u8; 32]| {
+        let mut data = shell_primitives::keccak256(signature).as_bytes()[..4].to_vec();
+        if array {
+            data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
+        }
+        data.extend_from_slice(value);
+        if array {
+            // A different second element distinguishes the original first-element semantics.
+            data.extend_from_slice(second.as_bytes());
+        }
         data
     };
+    let address_input = |value: Address| {
+        input(
+            if array {
+                b"set(address[])"
+            } else {
+                b"set(address)"
+            },
+            value.as_bytes(),
+        )
+    };
     let integer_input = |value: U256| {
-        let mut data = shell_primitives::keccak256(b"set(uint256)").as_bytes()[..4].to_vec();
-        data.extend_from_slice(&value.to_be_bytes::<32>());
-        data
+        input(
+            if array {
+                b"set(uint256[])"
+            } else {
+                b"set(uint256)"
+            },
+            &value.to_be_bytes::<32>(),
+        )
     };
     let mut truncated = address_input(first);
     truncated.pop();
@@ -211,7 +254,7 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
             4,
         ),
     ];
-    let cases = if aa {
+    let mut cases = if aa {
         let first_word = ShellHash::from(*first.as_bytes());
         let second_word = ShellHash::from(*second.as_bytes());
         let one = ShellHash::from(U256::from(1).to_be_bytes::<32>());
@@ -281,18 +324,46 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
             })
             .collect()
     };
+    if array {
+        let mut empty = address_input(first);
+        empty.truncate(68);
+        empty[36..68].fill(0);
+        cases.push(if aa {
+            (
+                vec![address_input(second), empty],
+                false,
+                ShellHash::from(*first.as_bytes()),
+                integer_result,
+                6,
+            )
+        } else {
+            (
+                vec![empty],
+                false,
+                ShellHash::from(*second.as_bytes()),
+                ShellHash::from(U256::from(1).to_be_bytes::<32>()),
+                4,
+            )
+        });
+    }
     let expected_output = |data: &[u8]| {
-        if data.len() != 36 {
+        if array && data.len() == 68 {
+            let mut panic = hex::decode("4e487b71").unwrap();
+            panic.extend_from_slice(&U256::from(0x32).to_be_bytes::<32>());
+            return panic;
+        }
+        if data.len() != if array { 132 } else { 36 } {
             return vec![];
         }
+        let argument = &data[if array { 68 } else { 4 }..if array { 100 } else { 36 }];
         if data[..4] == address_input(first)[..4] {
-            if data[4..] == [0; 32] {
+            if argument == [0; 32] {
                 vec![]
             } else {
-                data[4..].to_vec()
+                argument.to_vec()
             }
         } else {
-            let value = U256::from_be_slice(&data[4..]);
+            let value = U256::from_be_slice(argument);
             if value == U256::MAX {
                 let mut panic = hex::decode("4e487b71").unwrap();
                 panic.extend_from_slice(&U256::from(0x11).to_be_bytes::<32>());
@@ -438,8 +509,8 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
             steps.last().unwrap().block.header.state_root
         );
     }
-    verify(&leader, &steps);
-    verify(&follower, &steps);
+    verify(&leader, &steps, variant.is_some());
+    verify(&follower, &steps, variant.is_some());
     std::fs::write(
         directory.join("steps.json"),
         serde_json::to_vec(&steps).unwrap(),
@@ -449,62 +520,139 @@ fn write_history(directory: &std::path::Path, signer: &dyn Signer, aa: bool) {
     std::process::exit(0);
 }
 
-fn process_exit(aa: bool) {
+fn process_exit(aa: bool, derived: bool) {
     if let Some(directory) = std::env::var_os(DIRECTORY) {
         let directory = std::path::PathBuf::from(directory);
+        let variant = std::env::var("SHELL_TEST_NATIVE_OVERLOAD_VARIANT").ok();
         if std::env::var("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM").as_deref() == Ok("mldsa") {
-            write_history(&directory, &MlDsaSigner::generate(), aa);
+            write_history(&directory, &MlDsaSigner::generate(), aa, variant.as_deref());
         } else {
-            write_history(&directory, &DilithiumSigner::generate(), aa);
+            write_history(
+                &directory,
+                &DilithiumSigner::generate(),
+                aa,
+                variant.as_deref(),
+            );
         }
         unreachable!();
     }
-    for algorithm in ["dilithium", "mldsa"] {
-        let directory = std::env::temp_dir().join(format!(
-            "shell-native-overload-{}-{algorithm}-{}-{}",
-            if aa { "aa" } else { "ordinary" },
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", if aa {"node::tests::native_overload_tests::native_overload_aa_survives_process_exit"} else {"node::tests::native_overload_tests::native_overload_signed_import_survives_process_exit"}, "--nocapture"]).env(DIRECTORY, &directory).env("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM",algorithm).status().unwrap();
-        assert!(
-            status.success(),
-            "overload writer failed; retained {}",
-            directory.display()
-        );
-        let steps: Vec<Step> =
-            serde_json::from_slice(&std::fs::read(directory.join("steps.json")).unwrap()).unwrap();
-        let tip = &steps.last().unwrap().block;
-        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
-        let mut config = NodeConfig::dev(tip.header.proposer);
-        config.consensus =
-            crate::config::ConsensusEngineConfig::Poa(PoaConfig::new(vec![tip.header.proposer], 1));
-        let (node, recovered_store) =
-            crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
-                .build()
-                .unwrap();
-        verify(&node, &steps);
-        assert_eq!(current_state_root(&node), tip.header.state_root);
-        drop(node);
-        drop(recovered_store);
-        drop(stores.chain);
-        drop(stores.receipts);
-        drop(stores.index);
-        drop(stores.witness);
-        std::fs::remove_dir_all(directory).unwrap();
+    let variants = if derived {
+        vec![
+            Some("inherited"),
+            Some("internal"),
+            Some("free"),
+            Some("array"),
+        ]
+    } else {
+        vec![None]
+    };
+    for variant in variants {
+        for algorithm in ["dilithium", "mldsa"] {
+            let directory = std::env::temp_dir().join(format!(
+                "shell-native-overload-{}-{}-{algorithm}-{}-{}",
+                if aa { "aa" } else { "ordinary" },
+                variant.unwrap_or("base"),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let test_name = match (aa, derived) {
+                (false, false) => "native_overload_signed_import_survives_process_exit",
+                (true, false) => "native_overload_aa_survives_process_exit",
+                (false, true) => "native_overload_derived_signed_import_survives_process_exit",
+                (true, true) => "native_overload_derived_aa_survives_process_exit",
+            };
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!("node::tests::native_overload_tests::{test_name}"),
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, &directory)
+                .env("SHELL_TEST_NATIVE_OVERLOAD_ALGORITHM", algorithm);
+            if let Some(variant) = variant {
+                command.env("SHELL_TEST_NATIVE_OVERLOAD_VARIANT", variant);
+            }
+            let status = command.status().unwrap();
+            assert!(
+                status.success(),
+                "overload writer failed; retained {}",
+                directory.display()
+            );
+            let steps: Vec<Step> =
+                serde_json::from_slice(&std::fs::read(directory.join("steps.json")).unwrap())
+                    .unwrap();
+            let tip = &steps.last().unwrap().block;
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let mut config = NodeConfig::dev(tip.header.proposer);
+            config.consensus = crate::config::ConsensusEngineConfig::Poa(PoaConfig::new(
+                vec![tip.header.proposer],
+                1,
+            ));
+            let (node, recovered_store) =
+                crate::builder::NodeBuilder::new(config, Arc::new(stores.state))
+                    .build()
+                    .unwrap();
+            verify(&node, &steps, derived);
+            let recovered_root = current_state_root(&node);
+            assert_eq!(recovered_root, tip.header.state_root);
+            let state = node.world_state.read();
+            let sender = steps[0].block.transactions[0].from;
+            let words: Vec<ShellHash> = (0..3)
+                .map(|slot| {
+                    state
+                        .get_storage(
+                            &CONTRACT,
+                            &ShellHash::from(U256::from(slot).to_be_bytes::<32>()),
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let receipts: Vec<_> = steps.iter().map(|step| {
+                let receipt = node.chain_store.get_receipts(&step.block.hash()).unwrap().unwrap().remove(0);
+                serde_json::json!({"block_hash":step.block.hash(), "height":step.block.number(),
+                    "transaction_hash":receipt.tx_hash,"status":receipt.status,"gas_used":receipt.gas_used})
+            }).collect();
+            println!(
+                "native overload persisted acceptance {}",
+                serde_json::json!({
+                "variant":variant.unwrap_or("base"), "algorithm":algorithm,"aa":aa,
+                "head":node.chain_store.get_head_hash().unwrap(), "state_root":recovered_root,
+                "words":words,"nonce":state.get_nonce(&sender).unwrap(),
+                "balance":state.get_balance(&sender).unwrap(),"receipts":receipts})
+            );
+            drop(state);
+            drop(node);
+            drop(recovered_store);
+            drop(stores.chain);
+            drop(stores.receipts);
+            drop(stores.index);
+            drop(stores.witness);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }
 
 #[test]
 fn native_overload_signed_import_survives_process_exit() {
-    process_exit(false);
+    process_exit(false, false);
 }
 
 #[test]
 fn native_overload_aa_survives_process_exit() {
-    process_exit(true);
+    process_exit(true, false);
+}
+
+#[test]
+fn native_overload_derived_signed_import_survives_process_exit() {
+    process_exit(false, true);
+}
+
+#[test]
+fn native_overload_derived_aa_survives_process_exit() {
+    process_exit(true, true);
 }

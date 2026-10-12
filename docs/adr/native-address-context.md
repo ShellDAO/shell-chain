@@ -69,6 +69,17 @@ Corrupt signatures, changed signed inner arguments and funded wrong senders
 must be refused without changing persisted state. Call traces retain each inner
 result, including exact overflow panic data.
 
+The `native-derived-overloads.json` fixture retains the original inherited,
+internal, free-function and array helper definitions, then composes typed setters
+with `nativeOwner`, `nativeAmount` and `writes` storage. Each fixture includes
+its complete Solidity source, compiler version, SDK source commit, original
+selectors and both compiler targets. The same regression entry runs ordinary
+and AA sequences for every form with both signing algorithms. Array calls use
+two distinct elements and retain the first-element semantics; an additional
+empty-array case checks exact panic `0x32` and rollback of preceding AA writes.
+Recovered business words, nonce, balance and persisted receipts are emitted
+only after the fresh NodeBuilder and historical checks pass.
+
 These address-value operations use no native identity or creation opcodes;
 the regressions leave the context profile unconfigured. Published packages,
 live network synchronization and native CREATE/CREATE2 require their own
