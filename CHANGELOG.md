@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Extend real signed ordinary/AA overload execution and RocksDB recovery to
+  inherited, internal, free-function and array helper compositions. Preserve
+  full-word state, nonce/fees, independent import/replay and empty-array rollback.
+  Genesis predeployment is used; live advanced forms and public release remain
+  separate acceptance requirements.
+
 - Add source regressions for stateful address/uint256 overloads: authentic ordinary
   and AA admission, independent import, later-inner-failure atomic rollback,
   historical RPC/replay and RocksDB recovery after abrupt process exit.

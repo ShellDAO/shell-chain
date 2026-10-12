@@ -1,0 +1,1050 @@
+{
+  "compiler": "0.8.35+commit.47b9dedd.Emscripten.clang",
+  "sdkSourceCommit": "12717745acee52df7d6aeb7a9a7a46b112d9308b",
+  "variants": {
+    "inherited": {
+      "source": "pragma solidity ^0.8.35; contract Base {function f(address value) public pure virtual returns(address){return value;}} contract Derived is Base {function f(address value) public pure override returns(address){return value;} function f(uint256 value) public pure returns(uint256){return value+1;}}\ncontract StatefulDerived is Derived {\n address public nativeOwner;\n uint256 public nativeAmount;\n uint256 public writes;\n function set(address v) external returns(address) {nativeOwner=f(v);writes++;require(v!=address(0));return nativeOwner;}\n function set(uint256 v) external returns(uint256) {nativeAmount=f(v);writes++;return nativeAmount;}\n}\n",
+      "array": false,
+      "selectors": {
+        "set(address)": "0x2801617e",
+        "set(uint256)": "0x60fe47b1",
+        "nativeOwner()": "0xf89c52a8",
+        "nativeAmount()": "0xa69ef826",
+        "writes()": "0xc4b5c133"
+      },
+      "artifacts": {
+        "evm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x6080604052348015600e575f5ffd5b5061025c8061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061007a575f3560e01c8063b3de648b11610058578063b3de648b146100d8578063c4b5c133146100eb578063f89c52a8146100f4578063fc68521a14610106575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063a69ef826146100cf575b5f5ffd5b61009161008c3660046101a3565b610117565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101d0565b610167565b6040519081526020016100a5565b6100c160015481565b6100c16100e63660046101d0565b610191565b6100c160025481565b5f54610091906001600160a01b031681565b6100916101143660046101a3565b90565b5f80546001600160a01b0319166001600160a01b038316178155600280549082610140836101fb565b90915550506001600160a01b038216610157575f5ffd5b50505f546001600160a01b031690565b5f61017182610191565b60015560028054905f610183836101fb565b909155505060015492915050565b5f61019d826001610213565b92915050565b5f602082840312156101b3575f5ffd5b81356001600160a01b03811681146101c9575f5ffd5b9392505050565b5f602082840312156101e0575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f6001820161020c5761020c6101e7565b5060010190565b8082018082111561019d5761019d6101e756fea26469706673582212209ef95fa7b3a40143999464bc0a723e461f8fd50c0883bc5581591e50bf6a9b3764736f6c63430008230033",
+          "deployedBytecode": "0x608060405234801561000f575f5ffd5b506004361061007a575f3560e01c8063b3de648b11610058578063b3de648b146100d8578063c4b5c133146100eb578063f89c52a8146100f4578063fc68521a14610106575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063a69ef826146100cf575b5f5ffd5b61009161008c3660046101a3565b610117565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101d0565b610167565b6040519081526020016100a5565b6100c160015481565b6100c16100e63660046101d0565b610191565b6100c160025481565b5f54610091906001600160a01b031681565b6100916101143660046101a3565b90565b5f80546001600160a01b0319166001600160a01b038316178155600280549082610140836101fb565b90915550506001600160a01b038216610157575f5ffd5b50505f546001600160a01b031690565b5f61017182610191565b60015560028054905f610183836101fb565b909155505060015492915050565b5f61019d826001610213565b92915050565b5f602082840312156101b3575f5ffd5b81356001600160a01b03811681146101c9575f5ffd5b9392505050565b5f602082840312156101e0575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f6001820161020c5761020c6101e7565b5060010190565b8082018082111561019d5761019d6101e756fea26469706673582212209ef95fa7b3a40143999464bc0a723e461f8fd50c0883bc5581591e50bf6a9b3764736f6c63430008230033"
+        },
+        "pqvm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x608080604052346015576101d1908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461015757806360fe47b11461011b578063fc68521a146100fe578063a69ef826146100e1578063b3de648b146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b3461008257602036600319011261008257600435600181018091116100cd57602090604051908152f35b634e487b7160e01b5f52601160045260245ffd5b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b3461008257602036600319011261008257600435600181018091116100cd578060209160015561014c60025461018d565b600255604051908152f35b3461008257602036600319011261008257600435805f5561017960025461018d565b600255801561008257602090604051908152f35b5f1981146100cd576001019056fea2646970667358221220c8566491a173495da2f0f1cc28741026420cba61ae5b88235c012fb5da025d3264736f6c63430008230033",
+          "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461015757806360fe47b11461011b578063fc68521a146100fe578063a69ef826146100e1578063b3de648b146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b3461008257602036600319011261008257600435600181018091116100cd57602090604051908152f35b634e487b7160e01b5f52601160045260245ffd5b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b3461008257602036600319011261008257600435600181018091116100cd578060209160015561014c60025461018d565b600255604051908152f35b3461008257602036600319011261008257600435805f5561017960025461018d565b600255801561008257602090604051908152f35b5f1981146100cd576001019056fea2646970667358221220c8566491a173495da2f0f1cc28741026420cba61ae5b88235c012fb5da025d3264736f6c63430008230033"
+        }
+      }
+    },
+    "internal": {
+      "source": "pragma solidity ^0.8.35; contract Derived {function f(address value) internal pure returns(address){return value;} function f(uint256 value) internal pure returns(uint256){return value+1;} function owner(address value) public pure returns(address){return f(value);} function amount(uint256 value) public pure returns(uint256){return f(value);}}\ncontract StatefulDerived is Derived {\n address public nativeOwner;\n uint256 public nativeAmount;\n uint256 public writes;\n function set(address v) external returns(address) {nativeOwner=f(v);writes++;require(v!=address(0));return nativeOwner;}\n function set(uint256 v) external returns(uint256) {nativeAmount=f(v);writes++;return nativeAmount;}\n}\n",
+      "array": false,
+      "selectors": {
+        "set(address)": "0x2801617e",
+        "set(uint256)": "0x60fe47b1",
+        "nativeOwner()": "0xf89c52a8",
+        "nativeAmount()": "0xa69ef826",
+        "writes()": "0xc4b5c133"
+      },
+      "artifacts": {
+        "evm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "amount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "owner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x6080604052348015600e575f5ffd5b506102678061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80638b0d0258116100585780638b0d0258146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063666e1b39146100cf575b5f5ffd5b61009161008c3660046101ae565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101db565b610169565b6040519081526020016100a5565b6100916100dd3660046101ae565b610193565b6100c16100f03660046101db565b61019c565b6100c160015481565b6100c160025481565b5f54610091906001600160a01b031681565b5f80546001600160a01b0319166001600160a01b03831617815560028054908261014283610206565b90915550506001600160a01b038216610159575f5ffd5b50505f546001600160a01b031690565b5f610173826101a2565b60015560028054905f61018583610206565b909155505060015492915050565b5f815b92915050565b5f610196825b5f61019682600161021e565b5f602082840312156101be575f5ffd5b81356001600160a01b03811681146101d4575f5ffd5b9392505050565b5f602082840312156101eb575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f60018201610217576102176101f2565b5060010190565b80820180821115610196576101966101f256fea2646970667358221220e1bdc3cfead688ffbba46b0777749690fd0de22974ed373af52c55cc07edccec64736f6c63430008230033",
+          "deployedBytecode": "0x608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80638b0d0258116100585780638b0d0258146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063666e1b39146100cf575b5f5ffd5b61009161008c3660046101ae565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101db565b610169565b6040519081526020016100a5565b6100916100dd3660046101ae565b610193565b6100c16100f03660046101db565b61019c565b6100c160015481565b6100c160025481565b5f54610091906001600160a01b031681565b5f80546001600160a01b0319166001600160a01b03831617815560028054908261014283610206565b90915550506001600160a01b038216610159575f5ffd5b50505f546001600160a01b031690565b5f610173826101a2565b60015560028054905f61018583610206565b909155505060015492915050565b5f815b92915050565b5f610196825b5f61019682600161021e565b5f602082840312156101be575f5ffd5b81356001600160a01b03811681146101d4575f5ffd5b9392505050565b5f602082840312156101eb575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f60018201610217576102176101f2565b5060010190565b80820180821115610196576101966101f256fea2646970667358221220e1bdc3cfead688ffbba46b0777749690fd0de22974ed373af52c55cc07edccec64736f6c63430008230033"
+        },
+        "pqvm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "amount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "owner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x608080604052346015576101d7908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461013b57806360fe47b1146101035780638b0d0258146100dd578063666e1b39146100c0578063a69ef826146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b346100825760203660031901126100825760206100fb600435610193565b604051908152f35b34610082576020366003190112610082576020610121600435610193565b80600155610130600254610171565b600255604051908152f35b3461008257602036600319011261008257600435805f5561015d600254610171565b600255801561008257602090604051908152f35b5f19811461017f5760010190565b634e487b7160e01b5f52601160045260245ffd5b906001820180921161017f5756fea2646970667358221220b58353950bc1afeaf2d1a5f7d97682447fe47de811e19c1e1c09e873e84b922c64736f6c63430008230033",
+          "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461013b57806360fe47b1146101035780638b0d0258146100dd578063666e1b39146100c0578063a69ef826146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b346100825760203660031901126100825760206100fb600435610193565b604051908152f35b34610082576020366003190112610082576020610121600435610193565b80600155610130600254610171565b600255604051908152f35b3461008257602036600319011261008257600435805f5561015d600254610171565b600255801561008257602090604051908152f35b5f19811461017f5760010190565b634e487b7160e01b5f52601160045260245ffd5b906001820180921161017f5756fea2646970667358221220b58353950bc1afeaf2d1a5f7d97682447fe47de811e19c1e1c09e873e84b922c64736f6c63430008230033"
+        }
+      }
+    },
+    "free": {
+      "source": "pragma solidity ^0.8.35; function f(address value) pure returns(address){return value;} function f(uint256 value) pure returns(uint256){return value+1;} contract Derived {function owner(address value) public pure returns(address){return f(value);} function amount(uint256 value) public pure returns(uint256){return f(value);}}\ncontract StatefulDerived is Derived {\n address public nativeOwner;\n uint256 public nativeAmount;\n uint256 public writes;\n function set(address v) external returns(address) {nativeOwner=f(v);writes++;require(v!=address(0));return nativeOwner;}\n function set(uint256 v) external returns(uint256) {nativeAmount=f(v);writes++;return nativeAmount;}\n}\n",
+      "array": false,
+      "selectors": {
+        "set(address)": "0x2801617e",
+        "set(uint256)": "0x60fe47b1",
+        "nativeOwner()": "0xf89c52a8",
+        "nativeAmount()": "0xa69ef826",
+        "writes()": "0xc4b5c133"
+      },
+      "artifacts": {
+        "evm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "amount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "owner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x6080604052348015600e575f5ffd5b506102678061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80638b0d0258116100585780638b0d0258146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063666e1b39146100cf575b5f5ffd5b61009161008c3660046101ae565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101db565b610169565b6040519081526020016100a5565b6100916100dd3660046101ae565b610193565b6100c16100f03660046101db565b61019c565b6100c160015481565b6100c160025481565b5f54610091906001600160a01b031681565b5f80546001600160a01b0319166001600160a01b03831617815560028054908261014283610206565b90915550506001600160a01b038216610159575f5ffd5b50505f546001600160a01b031690565b5f610173826101a2565b60015560028054905f61018583610206565b909155505060015492915050565b5f815b92915050565b5f610196825b5f61019682600161021e565b5f602082840312156101be575f5ffd5b81356001600160a01b03811681146101d4575f5ffd5b9392505050565b5f602082840312156101eb575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f60018201610217576102176101f2565b5060010190565b80820180821115610196576101966101f256fea26469706673582212202772c4eadff9f40057696cb6c9136e66d9d9a054d1cb1b45d1df0ef62c7a608764736f6c63430008230033",
+          "deployedBytecode": "0x608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80638b0d0258116100585780638b0d0258146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b80632801617e1461007e57806360fe47b1146100ae578063666e1b39146100cf575b5f5ffd5b61009161008c3660046101ae565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100c16100bc3660046101db565b610169565b6040519081526020016100a5565b6100916100dd3660046101ae565b610193565b6100c16100f03660046101db565b61019c565b6100c160015481565b6100c160025481565b5f54610091906001600160a01b031681565b5f80546001600160a01b0319166001600160a01b03831617815560028054908261014283610206565b90915550506001600160a01b038216610159575f5ffd5b50505f546001600160a01b031690565b5f610173826101a2565b60015560028054905f61018583610206565b909155505060015492915050565b5f815b92915050565b5f610196825b5f61019682600161021e565b5f602082840312156101be575f5ffd5b81356001600160a01b03811681146101d4575f5ffd5b9392505050565b5f602082840312156101eb575f5ffd5b5035919050565b634e487b7160e01b5f52601160045260245ffd5b5f60018201610217576102176101f2565b5060010190565b80820180821115610196576101966101f256fea26469706673582212202772c4eadff9f40057696cb6c9136e66d9d9a054d1cb1b45d1df0ef62c7a608764736f6c63430008230033"
+        },
+        "pqvm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "value",
+                  "type": "uint256"
+                }
+              ],
+              "name": "amount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "value",
+                  "type": "address"
+                }
+              ],
+              "name": "owner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "v",
+                  "type": "address"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "v",
+                  "type": "uint256"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x608080604052346015576101d7908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461013b57806360fe47b1146101035780638b0d0258146100dd578063666e1b39146100c0578063a69ef826146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b346100825760203660031901126100825760206100fb600435610193565b604051908152f35b34610082576020366003190112610082576020610121600435610193565b80600155610130600254610171565b600255604051908152f35b3461008257602036600319011261008257600435805f5561015d600254610171565b600255801561008257602090604051908152f35b5f19811461017f5760010190565b634e487b7160e01b5f52601160045260245ffd5b906001820180921161017f5756fea264697066735822122015771de9c7f8561ce5a8edf0b2239b1fe65ebda30b01f52006ab2c50adf8721b64736f6c63430008230033",
+          "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80632801617e1461013b57806360fe47b1146101035780638b0d0258146100dd578063666e1b39146100c0578063a69ef826146100a3578063c4b5c133146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b34610082575f366003190112610082576020600254604051908152f35b34610082575f366003190112610082576020600154604051908152f35b346100825760203660031901126100825760206040516004358152f35b346100825760203660031901126100825760206100fb600435610193565b604051908152f35b34610082576020366003190112610082576020610121600435610193565b80600155610130600254610171565b600255604051908152f35b3461008257602036600319011261008257600435805f5561015d600254610171565b600255801561008257602090604051908152f35b5f19811461017f5760010190565b634e487b7160e01b5f52601160045260245ffd5b906001820180921161017f5756fea264697066735822122015771de9c7f8561ce5a8edf0b2239b1fe65ebda30b01f52006ab2c50adf8721b64736f6c63430008230033"
+        }
+      }
+    },
+    "array": {
+      "source": "pragma solidity ^0.8.35; contract Derived {function f(address[] memory values) public pure returns(address){return values[0];} function f(uint256[] memory values) public pure returns(uint256){return values[0]+1;}}\ncontract StatefulDerived is Derived {\n address public nativeOwner;\n uint256 public nativeAmount;\n uint256 public writes;\n function set(address[] memory v) external returns(address) {nativeOwner=f(v);writes++;require(v[0]!=address(0));return nativeOwner;}\n function set(uint256[] memory v) external returns(uint256) {nativeAmount=f(v);writes++;return nativeAmount;}\n}\n",
+      "array": true,
+      "selectors": {
+        "set(address[])": "0x11f2a107",
+        "set(uint256[])": "0x6ea9bfc5",
+        "nativeOwner()": "0xf89c52a8",
+        "nativeAmount()": "0xa69ef826",
+        "writes()": "0xc4b5c133"
+      },
+      "artifacts": {
+        "evm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "address[]",
+                  "name": "values",
+                  "type": "address[]"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256[]",
+                  "name": "values",
+                  "type": "uint256[]"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address[]",
+                  "name": "v",
+                  "type": "address[]"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256[]",
+                  "name": "v",
+                  "type": "uint256[]"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x6080604052348015600e575f5ffd5b506104368061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80637bc5bbbf116100585780637bc5bbbf146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b806311f2a1071461007e578063290c05ea146100ae5780636ea9bfc5146100c1575b5f5ffd5b61009161008c36600461027c565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100916100bc36600461027c565b61019b565b6100d46100cf366004610326565b6101bd565b6040519081526020016100a5565b6100d46100f0366004610326565b6101e7565b6100d460015481565b6100d460025481565b5f54610091906001600160a01b031681565b5f6101238261019b565b5f80546001600160a01b0319166001600160a01b03929092169190911781556002805491610150836103c1565b91905055505f6001600160a01b0316825f81518110610171576101716103d9565b60200260200101516001600160a01b03160361018b575f5ffd5b50505f546001600160a01b031690565b5f815f815181106101ae576101ae6103d9565b60200260200101519050919050565b5f6101c7826101e7565b60015560028054905f6101d9836103c1565b909155505060015492915050565b5f815f815181106101fa576101fa6103d9565b6020026020010151600161020e91906103ed565b92915050565b634e487b7160e01b5f52604160045260245ffd5b604051601f8201601f1916810167ffffffffffffffff8111828210171561025157610251610214565b604052919050565b5f67ffffffffffffffff82111561027257610272610214565b5060051b60200190565b5f6020828403121561028c575f5ffd5b813567ffffffffffffffff8111156102a2575f5ffd5b8201601f810184136102b2575f5ffd5b80356102c56102c082610259565b610228565b8082825260208201915060208360051b8501019250868311156102e6575f5ffd5b6020840193505b8284101561031c5783356001600160a01b038116811461030b575f5ffd5b8252602093840193909101906102ed565b9695505050505050565b5f60208284031215610336575f5ffd5b813567ffffffffffffffff81111561034c575f5ffd5b8201601f8101841361035c575f5ffd5b803561036a6102c082610259565b8082825260208201915060208360051b85010192508683111561038b575f5ffd5b6020840193505b8284101561031c578335825260209384019390910190610392565b634e487b7160e01b5f52601160045260245ffd5b5f600182016103d2576103d26103ad565b5060010190565b634e487b7160e01b5f52603260045260245ffd5b8082018082111561020e5761020e6103ad56fea26469706673582212205a8693a15be803d373c638b2d5f36482d7bb8057330ae656e1e5b7d1980e407064736f6c63430008230033",
+          "deployedBytecode": "0x608060405234801561000f575f5ffd5b506004361061007a575f3560e01c80637bc5bbbf116100585780637bc5bbbf146100e2578063a69ef826146100f5578063c4b5c133146100fe578063f89c52a814610107575f5ffd5b806311f2a1071461007e578063290c05ea146100ae5780636ea9bfc5146100c1575b5f5ffd5b61009161008c36600461027c565b610119565b6040516001600160a01b0390911681526020015b60405180910390f35b6100916100bc36600461027c565b61019b565b6100d46100cf366004610326565b6101bd565b6040519081526020016100a5565b6100d46100f0366004610326565b6101e7565b6100d460015481565b6100d460025481565b5f54610091906001600160a01b031681565b5f6101238261019b565b5f80546001600160a01b0319166001600160a01b03929092169190911781556002805491610150836103c1565b91905055505f6001600160a01b0316825f81518110610171576101716103d9565b60200260200101516001600160a01b03160361018b575f5ffd5b50505f546001600160a01b031690565b5f815f815181106101ae576101ae6103d9565b60200260200101519050919050565b5f6101c7826101e7565b60015560028054905f6101d9836103c1565b909155505060015492915050565b5f815f815181106101fa576101fa6103d9565b6020026020010151600161020e91906103ed565b92915050565b634e487b7160e01b5f52604160045260245ffd5b604051601f8201601f1916810167ffffffffffffffff8111828210171561025157610251610214565b604052919050565b5f67ffffffffffffffff82111561027257610272610214565b5060051b60200190565b5f6020828403121561028c575f5ffd5b813567ffffffffffffffff8111156102a2575f5ffd5b8201601f810184136102b2575f5ffd5b80356102c56102c082610259565b610228565b8082825260208201915060208360051b8501019250868311156102e6575f5ffd5b6020840193505b8284101561031c5783356001600160a01b038116811461030b575f5ffd5b8252602093840193909101906102ed565b9695505050505050565b5f60208284031215610336575f5ffd5b813567ffffffffffffffff81111561034c575f5ffd5b8201601f8101841361035c575f5ffd5b803561036a6102c082610259565b8082825260208201915060208360051b85010192508683111561038b575f5ffd5b6020840193505b8284101561031c578335825260209384019390910190610392565b634e487b7160e01b5f52601160045260245ffd5b5f600182016103d2576103d26103ad565b5060010190565b634e487b7160e01b5f52603260045260245ffd5b8082018082111561020e5761020e6103ad56fea26469706673582212205a8693a15be803d373c638b2d5f36482d7bb8057330ae656e1e5b7d1980e407064736f6c63430008230033"
+        },
+        "pqvm": {
+          "contractName": "StatefulDerived",
+          "sourcePath": "Derived.sol",
+          "solcVersion": "0.8.35+commit.47b9dedd.Emscripten.clang",
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "address[]",
+                  "name": "values",
+                  "type": "address[]"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256[]",
+                  "name": "values",
+                  "type": "uint256[]"
+                }
+              ],
+              "name": "f",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "pure",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeAmount",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "nativeOwner",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address[]",
+                  "name": "v",
+                  "type": "address[]"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "uint256[]",
+                  "name": "v",
+                  "type": "uint256[]"
+                }
+              ],
+              "name": "set",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "writes",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            }
+          ],
+          "bytecode": "0x608080604052346015576102b3908161001a8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80636ea9bfc5146101445780637bc5bbbf14610124578063a69ef82614610107578063290c05ea146100e6578063c4b5c133146100c957806311f2a107146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b346100825761009436610171565b6100b86100a082610244565b5191825f556100b0600254610222565b600255610244565b511561008257602090604051908152f35b34610082575f366003190112610082576020600254604051908152f35b346100825760206100fe6100f936610171565b610244565b51604051908152f35b34610082575f366003190112610082576020600154604051908152f35b3461008257602061013c61013736610171565b610265565b604051908152f35b3461008257602061015761013736610171565b80600155610166600254610222565b600255604051908152f35b6020600319820112610082576004359067ffffffffffffffff821161008257806023830112156100825781600401359167ffffffffffffffff831161020e578260051b9060405193601f19603f840116850185811067ffffffffffffffff82111761020e5760405284526024602085019282010192831161008257602401905b8282106101fe5750505090565b81358152602091820191016101f1565b634e487b7160e01b5f52604160045260245ffd5b5f1981146102305760010190565b634e487b7160e01b5f52601160045260245ffd5b8051156102515760200190565b634e487b7160e01b5f52603260045260245ffd5b61026e90610244565b5160018101809111610230579056fea26469706673582212204799081dbce64b1aaa878301d717f290a1742a5cc08cb27df7c6b8db4847a1dd64736f6c63430008230033",
+          "deployedBytecode": "0x60806040526004361015610011575f80fd5b5f3560e01c80636ea9bfc5146101445780637bc5bbbf14610124578063a69ef82614610107578063290c05ea146100e6578063c4b5c133146100c957806311f2a107146100865763f89c52a814610066575f80fd5b34610082575f3660031901126100825760205f54604051908152f35b5f80fd5b346100825761009436610171565b6100b86100a082610244565b5191825f556100b0600254610222565b600255610244565b511561008257602090604051908152f35b34610082575f366003190112610082576020600254604051908152f35b346100825760206100fe6100f936610171565b610244565b51604051908152f35b34610082575f366003190112610082576020600154604051908152f35b3461008257602061013c61013736610171565b610265565b604051908152f35b3461008257602061015761013736610171565b80600155610166600254610222565b600255604051908152f35b6020600319820112610082576004359067ffffffffffffffff821161008257806023830112156100825781600401359167ffffffffffffffff831161020e578260051b9060405193601f19603f840116850185811067ffffffffffffffff82111761020e5760405284526024602085019282010192831161008257602401905b8282106101fe5750505090565b81358152602091820191016101f1565b634e487b7160e01b5f52604160045260245ffd5b5f1981146102305760010190565b634e487b7160e01b5f52601160045260245ffd5b8051156102515760200190565b634e487b7160e01b5f52603260045260245ffd5b61026e90610244565b5160018101809111610230579056fea26469706673582212204799081dbce64b1aaa878301d717f290a1742a5cc08cb27df7c6b8db4847a1dd64736f6c63430008230033"
+        }
+      }
+    }
+  }
+}
