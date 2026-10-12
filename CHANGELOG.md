@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Update the locked `quinn-proto` dependency to 0.11.18 to address reported
+  peer-triggered panics and resource-exhaustion vulnerabilities. Networking
+  features and transport selection remain unchanged.
+
 - Compute `eth_feeHistory` reward percentiles from effective priority fees,
   weighted by actual receipt gas. Preserve fee inputs atomically with block
   artifacts and when pruning legacy bodies, so rewards remain queryable after
