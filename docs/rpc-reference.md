@@ -207,6 +207,21 @@ max_priority_fee_per_gas() → String
 Returns a suggested max priority fee per gas (EIP-1559).
 
 ### eth_feeHistory
+Unreleased node source computes `reward` as effective priority fees, sorted by
+fee and weighted by actual receipt gas consumed. Fee caps limit the effective
+tip; failed transactions still contribute their charged gas. Empty blocks or
+zero-tip transactions yield zero rewards. Omitting percentiles or passing `[]`
+keeps `reward: []`.
+
+Fee inputs remain available after body pruning for blocks stored by this
+implementation. Legacy intact bodies also remain queryable and preserve their
+fee inputs when subsequently pruned. Already-pruned legacy blocks with missing
+fee metadata cannot supply reward percentiles: the query returns an error,
+while queries without percentiles can still return header base fees and gas
+usage. Positive-tip percentile results on published node versions remain to be
+verified.
+
+
 ```
 fee_history(block_count: String, newest_block: String, reward_percentiles: Option<Vec<f64>>, ) → serde_json::Value
 ```

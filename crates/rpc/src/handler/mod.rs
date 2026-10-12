@@ -636,6 +636,79 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
     /// Look up a transaction and its containing block by hex-encoded hash.
     /// Returns (block, signed_tx, receipt, tx_index).
+    fn fee_reward_percentiles(
+        &self,
+        hash: &ShellHash,
+        percentiles: &[f64],
+    ) -> Result<Vec<String>, ErrorObjectOwned> {
+        let zero = || vec![hex_u64(0); percentiles.len()];
+        let tips = match self
+            .chain_store
+            .get_block_priority_fees(hash)
+            .map_err(internal_err)?
+        {
+            Some(tips) => tips,
+            None if self
+                .chain_store
+                .get_header_by_hash(hash)
+                .map_err(internal_err)?
+                .is_some_and(|header| header.gas_used == 0) =>
+            {
+                return Ok(zero())
+            }
+            None => {
+                return Err(internal_err(format!(
+                    "priority fee history for block {hash} is unavailable"
+                )))
+            }
+        };
+        if tips.is_empty() {
+            return Ok(zero());
+        }
+        let receipts = self
+            .chain_store
+            .get_receipts(hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| {
+                internal_err(format!(
+                    "receipts for block {hash} are unavailable during fee query"
+                ))
+            })?;
+        if receipts.len() < tips.len() {
+            return Err(internal_err("incomplete fee history receipts"));
+        }
+        let mut samples = Vec::new();
+        let mut total = 0u128;
+        for (index, tip) in tips.into_iter().enumerate() {
+            let receipt = &receipts[index];
+            if receipt.tx_index as usize != index {
+                return Err(internal_err("fee history receipt order mismatch"));
+            }
+            if receipt.gas_used > 0 {
+                total += u128::from(receipt.gas_used);
+                samples.push((tip, u128::from(receipt.gas_used)));
+            }
+        }
+        if samples.is_empty() {
+            return Ok(zero());
+        }
+        samples.sort_unstable_by_key(|(tip, _)| *tip);
+        Ok(percentiles
+            .iter()
+            .map(|percentile| {
+                let threshold = (total as f64 * percentile / 100.0) as u128;
+                let mut gas = 0u128;
+                for (tip, used) in &samples {
+                    gas += used;
+                    if gas >= threshold {
+                        return hex_u64(*tip);
+                    }
+                }
+                hex_u64(samples.last().expect("nonempty fee samples").0)
+            })
+            .collect())
+    }
+
     fn lookup_tx_with_block(
         &self,
         tx_hash: &str,
@@ -2794,8 +2867,149 @@ mod tests {
         assert_eq!(historical_after, historical_before);
     }
 
+    fn fee_reward_block() -> (Block, Vec<TransactionReceipt>) {
+        let signer = DilithiumSigner::generate();
+        let mut block = make_genesis_block();
+        block.header.base_fee_per_gas = 100;
+        let mut receipts = Vec::new();
+        for (index, (cap, tip, gas)) in [(1000, 9, 30_000), (1000, 2, 21_000), (107, 50, 63_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce: index as u64,
+                to: Some(test_address(b"fee-recipient")),
+                value: U256::ZERO,
+                data: Bytes::default(),
+                gas_limit: gas,
+                max_fee_per_gas: cap,
+                max_priority_fee_per_gas: tip,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let signature = signer.sign(tx.hash().as_bytes()).unwrap();
+            let signed = SignedTransaction::new(signer_address(&signer), tx, signature);
+            block.header.gas_used += gas;
+            receipts.push(TransactionReceipt {
+                tx_hash: signed.hash(),
+                block_number: 0,
+                tx_index: index as u32,
+                status: 1,
+                gas_used: gas,
+                cumulative_gas_used: block.header.gas_used,
+                contract_address: None,
+                logs_bloom: Bytes::default(),
+                logs: vec![],
+            });
+            block.transactions.push(signed);
+        }
+        (block, receipts)
+    }
+
     #[tokio::test]
-    async fn fee_history_returns_zero_priority_rewards_when_requested() {
+    async fn fee_history_rewards_use_paid_tips_and_actual_gas_weights() {
+        let handler = setup();
+        let (block, receipts) = fee_reward_block();
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        let result = EthApiServer::fee_history(
+            &handler,
+            "0x1".into(),
+            "latest".into(),
+            Some(vec![0.0, 25.0, 50.0, 75.0, 100.0]),
+        )
+        .await
+        .unwrap();
+        // Base 100: cap107 limits priority50 to7. Sorted paid tips are
+        // 2 (21k gas), 7 (63k), 9 (30k), independently of transaction order.
+        assert_eq!(
+            result["reward"],
+            serde_json::json!([["0x2", "0x7", "0x7", "0x9", "0x9"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_history_rewards_survive_legacy_body_pruning_without_query_writes() {
+        let handler = setup();
+        let (block, receipts) = fee_reward_block();
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        let fee_key = [b"ftip/".as_ref(), hash.as_bytes()].concat();
+        handler.chain_store.store().delete(&fee_key).unwrap(); // old database with an intact body
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let query = || {
+            EthApiServer::fee_history(
+                &handler,
+                "0x1".into(),
+                "0x0".into(),
+                Some(vec![0.0, 50.0, 100.0]),
+            )
+        };
+        let expected = query().await.unwrap();
+        assert_eq!(
+            expected["reward"],
+            serde_json::json!([["0x2", "0x7", "0x9"]])
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handler.chain_store.delete_witness_bundle(&hash).unwrap();
+        handler.chain_store.delete_body(&hash).unwrap();
+        let mut later = make_genesis_block();
+        later.header.number = 1;
+        later.header.parent_hash = hash;
+        handler
+            .chain_store
+            .commit_canonical_block(&later, Some(&[]))
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert_eq!(query().await.unwrap(), expected);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handler.chain_store.store().delete(&fee_key).unwrap(); // already-pruned legacy history
+        assert_eq!(query().await.unwrap_err().code(), -32603);
+        assert!(
+            EthApiServer::fee_history(&handler, "0x1".into(), "0x0".into(), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_history_rewards_reject_missing_or_misordered_receipts() {
+        let handler = setup();
+        let (block, mut receipts) = fee_reward_block();
+        let hash = block.hash();
+        handler
+            .chain_store
+            .commit_canonical_block(&block, None)
+            .unwrap();
+        let query =
+            || EthApiServer::fee_history(&handler, "0x1".into(), "latest".into(), Some(vec![50.0]));
+        assert_eq!(query().await.unwrap_err().code(), -32603);
+        receipts.swap(0, 1);
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        assert_eq!(query().await.unwrap_err().code(), -32603);
+        receipts.swap(0, 1);
+        receipts.truncate(1);
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        assert_eq!(query().await.unwrap_err().code(), -32603);
+    }
+
+    #[tokio::test]
+    async fn fee_history_empty_blocks_return_zero_priority_rewards() {
         let handler = setup();
         let mut block = make_genesis_block();
         block.header.base_fee_per_gas = 1_000_000_000;

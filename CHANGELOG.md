@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Compute `eth_feeHistory` reward percentiles from effective priority fees,
+  weighted by actual receipt gas. Preserve fee inputs atomically with block
+  artifacts and when pruning legacy bodies, so rewards remain queryable after
+  body pruning and RocksDB process recovery. Missing already-pruned legacy fee
+  data returns an error rather than false zero rewards; header-only fee queries
+  remain available. This change does not alter transaction fee charging.
+
 - Extend real signed ordinary/AA overload execution and RocksDB recovery to
   inherited, internal, free-function and array helper compositions. Preserve
   full-word state, nonce/fees, independent import/replay and empty-array rollback.

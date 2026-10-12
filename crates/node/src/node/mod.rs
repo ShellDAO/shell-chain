@@ -11436,6 +11436,265 @@ mod tests {
         (sender, contract, target, blocks)
     }
 
+    fn fee_history_signed_import<S: KvStore + 'static>(
+        leader: &Node<MemoryDb>,
+        follower: &Node<S>,
+        proposer: &DilithiumSigner,
+    ) -> (u64, serde_json::Value) {
+        use shell_rpc::api::EthApiServer;
+        let signer = DilithiumSigner::generate();
+        let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let recipient = Address::from([0x88; 32]);
+        let contract = Address::from([0x89; 32]);
+        macro_rules! initialize { ($node:expr) => {{
+            let node = $node;
+            node.register_authority_pubkey(leader.config.proposer_address.unwrap(), proposer.public_key().to_vec());
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"fee_accounting_activation_height":0
+            })).unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            fund_account(node, &sender, U256::from(10_000_000_000_000_000_000u64));
+            let code = hex::decode("600160005500").unwrap();
+            let code_hash = shell_primitives::keccak256(&code);
+            node.chain_store.put_code(&code_hash, &code).unwrap();
+            node.world_state.write().set_code_hash(&contract, code_hash).unwrap();
+            store_consistent_genesis(node);
+        }}; }
+        initialize!(leader);
+        initialize!(follower);
+        let initial = leader.world_state.read().get_balance(&sender).unwrap();
+        for (nonce, tip) in [9, 2, 50].into_iter().enumerate() {
+            submit_signed_tx(
+                leader,
+                &signer,
+                sender,
+                Transaction {
+                    chain_id: 1337,
+                    nonce: nonce as u64,
+                    to: Some(if nonce == 2 { contract } else { recipient }),
+                    value: U256::from(1),
+                    data: Bytes::default(),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE + 1000,
+                    max_priority_fee_per_gas: tip,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+        }
+        let block = leader.produce_block(proposer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 3);
+        follower
+            .import_block(block.clone(), &MultiVerifier)
+            .unwrap();
+        let receipts = follower
+            .chain_store
+            .get_receipts(&block.hash())
+            .unwrap()
+            .unwrap();
+        assert!(receipts[..3].iter().all(|receipt| receipt.status == 1));
+        assert!(receipts[2].gas_used > receipts[0].gas_used + receipts[1].gas_used);
+        let paid: u128 = receipts[..3]
+            .iter()
+            .zip(&block.transactions)
+            .map(|(receipt, tx)| {
+                u128::from(receipt.gas_used)
+                    * u128::from(block.header.base_fee_per_gas + tx.tx.max_priority_fee_per_gas)
+            })
+            .sum();
+        assert_eq!(
+            initial - follower.world_state.read().get_balance(&sender).unwrap(),
+            U256::from(paid) + U256::from(3)
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&follower.chain_store),
+            Arc::clone(&follower.world_state),
+            Arc::clone(&follower.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let expected = serde_json::json!([["0x2", "0x32", "0x32"]]);
+        let before = follower.store.scan_prefix(b"").unwrap();
+        let query = || {
+            runtime
+                .block_on(EthApiServer::fee_history(
+                    &handler,
+                    "0x1".into(),
+                    format!("0x{:x}", block.number()),
+                    Some(vec![0.0, 50.0, 100.0]),
+                ))
+                .unwrap()
+        };
+        assert_eq!(query()["reward"], expected);
+        assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
+        let later = leader.produce_block(proposer, 200).unwrap();
+        follower.import_block(later, &MultiVerifier).unwrap();
+        follower.chain_store.delete_body(&block.hash()).unwrap();
+        leader.chain_store.delete_body(&block.hash()).unwrap();
+        assert_eq!(query()["reward"], expected);
+        (block.number(), expected)
+    }
+
+    #[test]
+    fn fee_history_rewards_signed_execution_and_independent_import() {
+        let (leader, signer) = setup_node();
+        let follower = setup_node_with_authority(leader.config.proposer_address.unwrap());
+        fee_history_signed_import(&leader, &follower, &signer);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn fee_history_rewards_survive_pruning_and_process_exit() {
+        use shell_rpc::api::EthApiServer;
+        const DIRECTORY: &str = "SHELL_TEST_FEE_HISTORY_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, signer) = setup_node();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(
+                leader.config.proposer_address.unwrap(),
+                Arc::new(stores.state),
+            );
+            let fixture = fee_history_signed_import(&leader, &follower, &signer);
+            std::fs::write(
+                directory.join("fixture.json"),
+                serde_json::to_vec(&fixture).unwrap(),
+            )
+            .unwrap();
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-fee-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::fee_history_rewards_survive_pruning_and_process_exit",
+                "--nocapture",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (number, expected): (u64, serde_json::Value) =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+        let store = Arc::new(stores.state);
+        let chain = ChainStore::new(Arc::clone(&store));
+        let head = chain.get_head_block().unwrap().unwrap();
+        let (recovered, _recovered_store) =
+            crate::builder::NodeBuilder::new(NodeConfig::dev(head.header.proposer), store)
+                .build()
+                .unwrap();
+        assert_eq!(current_state_root(&recovered), head.header.state_root);
+        assert_eq!(
+            recovered.chain_store.get_head_hash().unwrap(),
+            Some(head.hash())
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let handler = shell_rpc::RpcHandler::new(
+            Arc::clone(&recovered.chain_store),
+            Arc::clone(&recovered.world_state),
+            Arc::clone(&recovered.tx_pool),
+            1337,
+            None,
+            events,
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(FinalityState::new())),
+        );
+        let before = recovered.store.scan_prefix(b"").unwrap();
+        let result = runtime
+            .block_on(EthApiServer::fee_history(
+                &handler,
+                "0x1".into(),
+                format!("0x{number:x}"),
+                Some(vec![0.0, 50.0, 100.0]),
+            ))
+            .unwrap();
+        assert_eq!(result["reward"], expected);
+        assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
+        runtime.block_on(async {
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let server = shell_rpc::start_rpc_server(
+                shell_rpc::RpcConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ws_addr: None,
+                    ..shell_rpc::RpcConfig::default()
+                },
+                Arc::clone(&recovered.chain_store),
+                Arc::clone(&recovered.world_state),
+                Arc::clone(&recovered.tx_pool),
+                1337,
+                None,
+                events,
+                None,
+                None,
+                Arc::new(RwLock::new(0)),
+                Arc::new(RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                Some(Arc::clone(&recovered.witness_store)),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let original = native_http_request(
+                server.http_addr,
+                "eth_feeHistory",
+                serde_json::json!(["0x5", "latest", []]),
+            )
+            .await;
+            assert_eq!(original["result"]["reward"], serde_json::json!([]));
+            let actual = native_http_request(
+                server.http_addr,
+                "eth_feeHistory",
+                serde_json::json!(["0x1", format!("0x{number:x}"), [0, 50, 100]]),
+            )
+            .await;
+            assert_eq!(actual["result"]["reward"], expected);
+            let invalid = native_http_request(
+                server.http_addr,
+                "eth_feeHistory",
+                serde_json::json!(["0x1", "latest", [101]]),
+            )
+            .await;
+            assert_eq!(invalid["error"]["code"], -32602);
+            assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
+            server.http_handle.stop().unwrap();
+            server.http_handle.stopped().await;
+        });
+        drop(handler);
+        drop(runtime);
+        drop(recovered);
+        drop(_recovered_store);
+        drop(chain);
+        drop(stores.chain);
+        drop(stores.receipts);
+        drop(stores.index);
+        drop(stores.witness);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn native_compiler_receiver_signed_blocks_import_and_replay() {
         let (leader, signer) = setup_node();
