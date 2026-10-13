@@ -2137,11 +2137,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_transactions_by_address_rejects_deep_legacy_offset() {
+    async fn get_transactions_by_address_accepts_deep_empty_legacy_offset() {
         let handler = setup();
         let address = test_address(b"legacy-deep-offset");
 
-        let err = ShellApiServer::get_transactions_by_address(
+        let result = ShellApiServer::get_transactions_by_address(
             &handler,
             address,
             Some(0),
@@ -2150,13 +2150,160 @@ mod tests {
             Some(100),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.message()
-                .contains("legacy address transaction pagination offset"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["page"], 101);
+        assert_eq!(result["transactions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn address_history_deep_pages_http_preserves_order_bounds_and_state() {
+        use jsonrpsee::core::client::{ClientT, Error as ClientError};
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+
+        let db = Arc::new(MemoryDb::new());
+        let handler = setup_with_store(db.clone());
+        let world = handler.world_state.clone();
+        let chain = handler.chain_store.clone();
+        let sender = DilithiumSigner::generate();
+        let address = signer_address(&sender);
+        let recipient = Address::from([0x44; 32]);
+        let original_root = {
+            let mut state = world.write();
+            state.set_balance(&address, U256::from(123)).unwrap();
+            state.state_root().unwrap()
+        };
+        let genesis = make_genesis_block();
+        chain.put_block(&genesis).unwrap();
+        chain.set_canonical(0, &genesis.hash()).unwrap();
+        chain.set_head(&genesis.hash()).unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{}", server.local_addr().unwrap()))
+            .unwrap();
+        let handle = server.start(ShellApiServer::into_rpc(handler));
+        let before = db.scan_prefix(b"").unwrap();
+        // Original finite empty-range discriminator, plus a huge valid offset.
+        for page in [0, 100, 101, u64::MAX] {
+            let limit = if page == u64::MAX { 1 } else { 100 };
+            let result: serde_json::Value = client
+                .request(
+                    "shell_getTransactionsByAddress",
+                    rpc_params![Address::ZERO, 0, 0, page, limit],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["total"], 0);
+            assert_eq!(result["page"], page);
+            assert_eq!(result["transactions"], serde_json::json!([]));
+            assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        }
+
+        // Real persisted index fixtures with authentic transaction signatures.
+        // This query regression does not claim block production or admission.
+        let mut parent = genesis.hash();
+        let mut nonce = 0u64;
+        for height in 1..=11 {
+            let mut block = make_genesis_block();
+            block.header.number = height;
+            block.header.timestamp += height;
+            block.header.parent_hash = parent;
+            let count = if height == 11 { 103 } else { 1000 };
+            for _ in 0..count {
+                let tx = Transaction {
+                    chain_id: 42,
+                    nonce,
+                    max_priority_fee_per_gas: 1,
+                    max_fee_per_gas: 10,
+                    gas_limit: 21_000,
+                    to: Some(recipient),
+                    value: U256::from(nonce + 1),
+                    data: Bytes::default(),
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let signature = sender
+                    .sign(tx.signing_hash(sender.sig_type() as u8).as_bytes())
+                    .unwrap();
+                block
+                    .transactions
+                    .push(SignedTransaction::new(address, tx, signature));
+                nonce += 1;
+            }
+            block.header.gas_used = block.transactions.len() as u64 * 21_000;
+            parent = block.hash();
+            chain.put_block(&block).unwrap();
+            chain.set_canonical(height, &parent).unwrap();
+            chain.set_head(&parent).unwrap();
+        }
+        assert_eq!(nonce, 10_103);
+        let before = db.scan_prefix(b"").unwrap();
+        for queried in [address, recipient] {
+            let tail: serde_json::Value = client
+                .request(
+                    "shell_getTransactionsByAddress",
+                    rpc_params![queried, 1, 11, 101, 100],
+                )
+                .await
+                .unwrap();
+            assert_eq!(tail["total"], 10_103);
+            assert_eq!(tail["fromBlock"], "0x1");
+            assert_eq!(tail["toBlock"], "0xb");
+            assert_eq!(tail["page"], 101);
+            assert_eq!(tail["limit"], 100);
+            let items = tail["transactions"].as_array().unwrap();
+            assert_eq!(items.len(), 3);
+            for (item, nonce) in items.iter().zip([997u64, 998, 999]) {
+                assert_eq!(item["nonce"], hex_u64(nonce));
+                assert_eq!(item["value"], hex_u256(U256::from(nonce + 1)));
+                assert_eq!(item["blockNumber"], "0x1");
+                assert_eq!(item["transactionIndex"], hex_u64(nonce));
+            }
+            for (from, to, page, limit, total) in [
+                (1, 11, 102, 100, 10_103),
+                (2, 11, 101, 100, 9_103),
+                (1, 1, 101, 100, 1000),
+                (11, 1, 101, 100, 0),
+                (1, 11, u64::MAX, 1, 10_103),
+            ] {
+                let result: serde_json::Value = client
+                    .request(
+                        "shell_getTransactionsByAddress",
+                        rpc_params![queried, from, to, page, limit],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["total"], total);
+                assert_eq!(result["transactions"], serde_json::json!([]));
+                assert_eq!(db.scan_prefix(b"").unwrap(), before);
+            }
+        }
+        for (from, to, page, limit) in [(1, 11, u64::MAX, 100), (0, 10_000, 0, 100)] {
+            let ClientError::Call(error) = client
+                .request::<serde_json::Value, _>(
+                    "shell_getTransactionsByAddress",
+                    rpc_params![address, from, to, page, limit],
+                )
+                .await
+                .unwrap_err()
+            else {
+                panic!("unexpected transport failure")
+            };
+            assert_eq!(error.code(), -32602);
+            assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        }
+        assert_eq!(world.read().get_balance(&address).unwrap(), U256::from(123));
+        assert_eq!(world.write().state_root().unwrap(), original_root);
+        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        handle.stop().unwrap();
+        handle.stopped().await;
     }
 
     #[tokio::test]

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Address history queries no longer reject legacy page offsets above 10,000.
+  Pages past the exact range total return an empty list without truncating large
+  offsets; integer overflow and existing exact-total range checks remain errors.
+  Real indexed-transaction HTTP coverage checks deep sender/recipient ordering,
+  inclusive range bounds, preserved metadata and unchanged chain state.
+
 - Implement `shell_verifyPqSignature` with actual ML-DSA-65 and legacy Dilithium3
   core verification. Reject malformed hexadecimal parameters, return false for
   invalid raw key/signature material, and preserve namespace exposure and chain

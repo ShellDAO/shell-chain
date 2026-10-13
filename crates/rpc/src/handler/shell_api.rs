@@ -1,7 +1,6 @@
 use super::*;
 
 const MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE: u64 = 10_000;
-const MAX_LEGACY_ADDRESS_TX_OFFSET: u64 = 10_000;
 const DEFAULT_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 200;
 const MAX_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 1000;
 const MAX_OPTIONAL_RPC_BYTE_FIELD_LEN: usize = 32 * 1024;
@@ -1327,21 +1326,21 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let offset = page
             .checked_mul(limit)
             .ok_or_else(|| invalid_params_err("page * limit overflow"))?;
-        if offset > MAX_LEGACY_ADDRESS_TX_OFFSET {
-            return Err(invalid_params_err(format!(
-                "legacy address transaction pagination offset is limited to {MAX_LEGACY_ADDRESS_TX_OFFSET}; use shell_getTransactionsByAddressV2 cursor pagination"
-            )));
-        }
         ensure_exact_address_total_allowed(from, to)?;
         let total = self
             .chain_store
             .count_txs_by_address(&address, from, to)
             .map_err(internal_err)?;
 
-        let tx_hashes = self
-            .chain_store
-            .get_txs_by_address(&address, from, to, offset as usize, limit as usize)
-            .map_err(internal_err)?;
+        let tx_hashes = if offset >= total {
+            Vec::new()
+        } else {
+            let offset = usize::try_from(offset)
+                .map_err(|_| invalid_params_err("page offset exceeds platform capacity"))?;
+            self.chain_store
+                .get_txs_by_address(&address, from, to, offset, limit as usize)
+                .map_err(internal_err)?
+        };
 
         // Resolve each tx hash to a full RPC transaction.
         let mut txs = Vec::with_capacity(tx_hashes.len());

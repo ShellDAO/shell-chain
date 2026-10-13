@@ -1378,6 +1378,20 @@ and inclusive block-range filters. There is no artificial deep-offset cap; under
 live load, clients should pin `toBlock` from the first page and reuse it for
 older pages to avoid gaps or duplicates while new blocks arrive.
 
+Unreleased node source accepts legacy offsets above 10,000. Pages past the exact
+range total return an empty `transactions` list while retaining the pagination
+metadata. Overflowing `page * limit` remains invalid, and existing exact-total
+block-range validation is unchanged. Published node versions must be checked
+before relying on the correction.
+
+From a node source checkout, run the real stored-index HTTP regression. It covers
+sender and recipient history, deep ordering, empty pages, range bounds and
+unchanged chain state; it does not run block production or transaction admission:
+
+```bash
+cargo test -p shell-rpc address_history_deep_pages_http -- --nocapture
+```
+
 **Parameters:**
 
 | Name | Type | Description |
