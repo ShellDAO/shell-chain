@@ -1248,21 +1248,43 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
 
 ### shell_verifyPqSignature
 
-Verifies a Dilithium3 post-quantum signature against a message and public key.
+Verifies an ML-DSA-65 post-quantum signature against a message and public key.
+Unreleased node source also preserves the legacy Dilithium3 verification promise
+using the existing core verifier. This three-parameter query accepts raw signature
+and key bytes and reports cryptographic validity; it does not determine a native
+account identity or authorize a transaction. Algorithm registry rules, signing
+domains and account permissions are unchanged.
+
+All three values must be `0x`-prefixed, whole-byte hexadecimal strings. `0x` is a
+valid empty message. Malformed hex returns `-32602`; invalid keys, unsupported raw
+formats, incorrect signature lengths and cryptographic mismatches return `false`.
+The query does not write chain state and follows the configured `shell` namespace
+exposure. The server's existing request-body limits apply. Published node versions
+must be verified before relying on this method.
+
+From a source checkout, run the self-contained real-key HTTP regression. On Unix
+platforms it also runs the example below, using `curl` and a POSIX shell with
+temporary keys held in memory:
+
+```bash
+cargo test -p shell-rpc verify_pq_signature -- --nocapture
+```
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Hex-encoded message |
-| 2 | `String` | Yes | Hex-encoded Dilithium3 signature |
-| 3 | `String` | Yes | Hex-encoded Dilithium3 public key |
+| 2 | `String` | Yes | Hex-encoded ML-DSA-65 or legacy Dilithium3 signature |
+| 3 | `String` | Yes | Hex-encoded public key |
 
 **Returns:** `Boolean` — `true` if the signature is valid.
 
 ```bash
+# Set SIGNATURE_HEX and PUBKEY_HEX to the actual 0x-prefixed raw signature
+# and public key for the message "hello" (0x68656c6c6f).
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_verifyPqSignature","params":["0xmessage...","0xsignature...","0xpubkey..."],"id":1}'
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"shell_verifyPqSignature\",\"params\":[\"0x68656c6c6f\",\"$SIGNATURE_HEX\",\"$PUBKEY_HEX\"],\"id\":1}"
 ```
 
 ---
