@@ -2183,8 +2183,9 @@ mod tests {
             .build("127.0.0.1:0")
             .await
             .unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
         let client = HttpClientBuilder::default()
-            .build(format!("http://{}", server.local_addr().unwrap()))
+            .build(endpoint.clone())
             .unwrap();
         let handle = server.start(ShellApiServer::into_rpc(handler));
         let before = db.scan_prefix(b"").unwrap();
@@ -2244,6 +2245,12 @@ mod tests {
             chain.set_head(&parent).unwrap();
         }
         assert_eq!(nonce, 10_103);
+        let mut latest = make_genesis_block();
+        latest.header.number = 15_000;
+        latest.header.parent_hash = parent;
+        chain.put_block(&latest).unwrap();
+        chain.set_canonical(15_000, &latest.hash()).unwrap();
+        chain.set_head(&latest.hash()).unwrap();
         let before = db.scan_prefix(b"").unwrap();
         for queried in [address, recipient] {
             let tail: serde_json::Value = client
@@ -2285,7 +2292,113 @@ mod tests {
                 assert_eq!(db.scan_prefix(b"").unwrap(), before);
             }
         }
-        for (from, to, page, limit) in [(1, 11, u64::MAX, 100), (0, 10_000, 0, 100)] {
+        for queried in [address, recipient] {
+            let wide: serde_json::Value = client
+                .request(
+                    "shell_getTransactionsByAddress",
+                    rpc_params![queried, 0, serde_json::Value::Null, 0, 20],
+                )
+                .await
+                .unwrap();
+            assert_eq!(wide["total"], 10_103);
+            assert_eq!(wide["toBlock"], "0x3a98");
+            let nonces: Vec<_> = wide["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    u64::from_str_radix(
+                        item["nonce"].as_str().unwrap().trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(nonces, (10_000..10_020).collect::<Vec<_>>());
+            let crossing: serde_json::Value = client
+                .request(
+                    "shell_getTransactionsByAddress",
+                    rpc_params![queried, 0, serde_json::Value::Null, 5, 20],
+                )
+                .await
+                .unwrap();
+            let crossing_nonces: Vec<_> = crossing["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    u64::from_str_radix(
+                        item["nonce"].as_str().unwrap().trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                crossing_nonces,
+                [vec![10_100, 10_101, 10_102], (9000..9017).collect()].concat()
+            );
+            let v2: serde_json::Value = client
+                .request(
+                    "shell_getTransactionsByAddressV2",
+                    rpc_params![queried, serde_json::json!({"fromBlock":0,"toBlock":15_000,"includeTotal":true,"limit":20})],
+                )
+                .await
+                .unwrap();
+            assert_eq!(v2["total"], 10_103);
+            assert_eq!(v2["items"].as_array().unwrap().len(), 20);
+            let summary: serde_json::Value = client
+                .request(
+                    "shell_getAddressSummary",
+                    rpc_params![
+                        queried,
+                        serde_json::json!({"includeTotal":true,"recentLimit":20})
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary["totalTransactions"], 10_103);
+            assert_eq!(summary["recentTransactions"]["total"], 10_103);
+            assert_eq!(
+                summary["balance"],
+                if queried == address { "0x7b" } else { "0x0" }
+            );
+            assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        }
+        #[cfg(unix)]
+        {
+            let guide = include_str!("../../../../docs/JSON_RPC_API.md")
+                .split("### shell_getTransactionsByAddress\n")
+                .nth(1)
+                .unwrap()
+                .split("### shell_getBlockWitnesses")
+                .next()
+                .unwrap();
+            let example = guide
+                .split("```bash\n")
+                .skip(1)
+                .map(|block| block.split("```").next().unwrap())
+                .find(|block| block.contains("curl -s http://localhost:8545"))
+                .unwrap()
+                .replace("http://localhost:8545", &endpoint);
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("sh")
+                    .args(["-c", &example])
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(output.status.success());
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["result"]["total"], 0);
+            assert_eq!(response["result"]["toBlock"], "0x3a98");
+            assert_eq!(response["result"]["transactions"], serde_json::json!([]));
+            assert_eq!(db.scan_prefix(b"").unwrap(), before);
+        }
+        {
+            let (from, to, page, limit) = (1u64, 11u64, u64::MAX, 100u64);
             let ClientError::Call(error) = client
                 .request::<serde_json::Value, _>(
                     "shell_getTransactionsByAddress",
@@ -2389,11 +2502,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_transactions_by_address_v2_rejects_wide_exact_total() {
+    async fn get_transactions_by_address_v2_accepts_wide_exact_total() {
         let handler = setup();
         let address = test_address(b"v2-wide-total");
 
-        let err = ShellApiServer::get_transactions_by_address_v2(
+        let result = ShellApiServer::get_transactions_by_address_v2(
             &handler,
             address,
             Some(RpcAddressTransactionsV2Options {
@@ -2404,12 +2517,10 @@ mod tests {
             }),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.message().contains("exact address transaction totals"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(result.total, Some(0));
+        assert!(result.items.is_empty());
     }
 
     #[tokio::test]

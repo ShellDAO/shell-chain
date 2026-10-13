@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::RwLock;
 
-use crate::kv_store::saturating_entry_len;
+use crate::kv_store::{prefix_range_bounds, saturating_entry_len, RangeEntryVisitor};
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 
 /// In-memory KV store for testing and lightweight use cases.
@@ -10,13 +11,13 @@ use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 /// rollback-safe — if a panic occurs mid-batch, partial writes persist.
 #[derive(Debug, Default)]
 pub struct MemoryDb {
-    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    data: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl MemoryDb {
     pub fn new() -> Self {
         Self {
-            data: RwLock::new(HashMap::new()),
+            data: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -148,6 +149,38 @@ impl KvStore for MemoryDb {
         Ok(entries)
     }
 
+    fn visit_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        visitor: &mut RangeEntryVisitor<'_>,
+    ) -> Result<(), StorageError> {
+        let (start, end) = prefix_range_bounds(prefix, start, end);
+        if end.as_ref().is_some_and(|end| &start >= end) {
+            return Ok(());
+        }
+        let data = self
+            .data
+            .read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut entries = data.range::<Vec<u8>, _>((
+            Bound::Included(start),
+            end.map_or(Bound::Unbounded, Bound::Excluded),
+        ));
+        while let Some((key, value)) = if reverse {
+            entries.next_back()
+        } else {
+            entries.next()
+        } {
+            if !visitor(key, value)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
         let data = self
             .data
@@ -174,21 +207,31 @@ impl KvStore for MemoryDb {
             .data
             .read()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let mut results: Vec<(Vec<u8>, Vec<u8>)> = data
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .filter(|(k, _)| after.is_none_or(|after_key| k.as_slice() > after_key))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        results.truncate(limit);
-        Ok(results)
+        let (start, end) = prefix_range_bounds(prefix, after.unwrap_or(prefix), None);
+        if end.as_ref().is_some_and(|end| &start >= end) {
+            return Ok(Vec::new());
+        }
+        Ok(data
+            .range::<Vec<u8>, _>((
+                Bound::Included(start),
+                end.map_or(Bound::Unbounded, Bound::Excluded),
+            ))
+            .filter(|(key, _)| after.is_none_or(|after| key.as_slice() > after))
+            .take(limit)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_history_range_visit_contract() {
+        let store = MemoryDb::new();
+        crate::kv_store::assert_address_history_range_visit(&store);
+    }
 
     #[test]
     fn address_history_range_scan_contract() {

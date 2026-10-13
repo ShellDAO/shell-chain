@@ -1378,18 +1378,25 @@ and inclusive block-range filters. There is no artificial deep-offset cap; under
 live load, clients should pin `toBlock` from the first page and reuse it for
 older pages to avoid gaps or duplicates while new blocks arrive.
 
-Unreleased node source accepts legacy offsets above 10,000. Pages past the exact
-range total return an empty `transactions` list while retaining the pagination
-metadata. Overflowing `page * limit` remains invalid, and existing exact-total
-block-range validation is unchanged. Published node versions must be checked
-before relying on the correction.
+Unreleased node source accepts legacy offsets above 10,000 and exact totals over
+ranges spanning more than 10,000 blocks, including the default `0` through latest
+range. Pages past the exact range total return an empty `transactions` list while
+retaining pagination metadata. Overflowing `page * limit` remains invalid. Counts
+and pages use the existing retained address index without query writes or an index
+migration. The v2 address-history and address-summary methods use the same exact
+counter when `includeTotal` is enabled. Published node versions must be checked
+before relying on these corrections.
 
-From a node source checkout, run the real stored-index HTTP regression. It covers
-sender and recipient history, deep ordering, empty pages, range bounds and
-unchanged chain state; it does not run block production or transaction admission:
+From a node source checkout, run the real stored-index HTTP regression and the
+native storage regressions. They cover sender and recipient history, deep ordering,
+wide default ranges, empty pages, shared exact totals, unchanged chain state, and
+forward-only index reads after RocksDB reopen. On Unix, the HTTP regression also executes the
+curl example below and requires `curl` and a POSIX shell. These regressions do
+not run block production or transaction admission:
 
 ```bash
 cargo test -p shell-rpc address_history_deep_pages_http -- --nocapture
+cargo test -p shell-storage --features rocksdb address_history -- --nocapture
 ```
 
 **Parameters:**
@@ -1416,7 +1423,7 @@ cargo test -p shell-rpc address_history_deep_pages_http -- --nocapture
 
 ```bash
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_getTransactionsByAddress","params":["0xabc...",0,null,0,20],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"shell_getTransactionsByAddress","params":["0x0000000000000000000000000000000000000000000000000000000000000000",0,null,0,20],"id":1}'
 ```
 
 ### shell_getBlockWitnesses

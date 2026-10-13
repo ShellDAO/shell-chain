@@ -8,6 +8,33 @@ pub(crate) fn saturating_entry_len(key_len: usize, value_len: usize) -> u64 {
 
 pub type EntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StorageError> + 'a;
 
+/// Return false to stop a borrowed range visit without reading remaining entries.
+pub type RangeEntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError> + 'a;
+
+pub(crate) fn prefix_range_bounds(
+    prefix: &[u8],
+    start: &[u8],
+    end: Option<&[u8]>,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    let lower = start.max(prefix).to_vec();
+    let mut next = prefix.to_vec();
+    while next.last() == Some(&u8::MAX) {
+        next.pop();
+    }
+    let prefix_end = if let Some(last) = next.last_mut() {
+        *last += 1;
+        Some(next)
+    } else {
+        None
+    };
+    let upper = match (prefix_end, end) {
+        (Some(prefix_end), Some(end)) => Some(prefix_end.min(end.to_vec())),
+        (Some(prefix_end), None) => Some(prefix_end),
+        (None, end) => end.map(<[u8]>::to_vec),
+    };
+    (lower, upper)
+}
+
 /// Operation in a write batch.
 #[derive(Debug, Clone)]
 pub enum WriteBatchOp {
@@ -107,6 +134,29 @@ pub trait KvStore: Send + Sync {
                 key.as_slice() >= start && end.is_none_or(|end| key.as_slice() < end)
             })
             .collect())
+    }
+
+    /// Visit matching keys from inclusive start to exclusive end. Native
+    /// backends borrow entries without materializing the range. The compatible
+    /// fallback uses the existing range scan. Reverse visits use descending keys.
+    fn visit_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        visitor: &mut RangeEntryVisitor<'_>,
+    ) -> Result<(), StorageError> {
+        let mut entries = self.scan_prefix_range(prefix, start, end)?;
+        if reverse {
+            entries.reverse();
+        }
+        for (key, value) in entries {
+            if !visitor(&key, &value)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Sum the byte lengths of keys and values matching `prefix`.
@@ -213,6 +263,67 @@ pub(crate) fn assert_address_history_range_scan(store: &impl KvStore) {
     assert!(keys(b"b/", None).is_empty());
     assert!(store
         .scan_prefix_range(b"missing/", b"", None)
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(test)]
+pub(crate) fn assert_address_history_range_visit(store: &impl KvStore) {
+    for key in [
+        b"a/0".as_slice(),
+        b"a/1",
+        b"a/2",
+        b"a/\xff",
+        b"b/0",
+        &[0xff, 0],
+        &[0xff, 0xff],
+    ] {
+        store.put(key, key).unwrap();
+    }
+    let keys = |prefix: &[u8], start: &[u8], end: Option<&[u8]>, reverse| {
+        let mut keys = Vec::new();
+        store
+            .visit_prefix_range(prefix, start, end, reverse, &mut |key, _| {
+                keys.push(key.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        keys
+    };
+    assert_eq!(
+        keys(b"a/", b"", Some(b"a/2"), false),
+        vec![b"a/0".to_vec(), b"a/1".to_vec()]
+    );
+    assert_eq!(
+        keys(b"a/", b"", Some(b"a/2"), true),
+        vec![b"a/1".to_vec(), b"a/0".to_vec()]
+    );
+    assert_eq!(
+        keys(b"a/", b"a/2", None, true),
+        vec![b"a/\xff".to_vec(), b"a/2".to_vec()]
+    );
+    assert_eq!(
+        keys(&[0xff], b"", None, true),
+        vec![vec![0xff, 0xff], vec![0xff, 0]]
+    );
+    assert!(keys(b"a/", b"a/2", Some(b"a/1"), true).is_empty());
+    assert!(keys(b"missing/", b"", None, true).is_empty());
+    let mut visited = Vec::new();
+    store
+        .visit_prefix_range(b"a/", b"", None, true, &mut |key, _| {
+            visited.push(key.to_vec());
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(visited, vec![b"a/\xff".to_vec()]);
+    let error = store
+        .visit_prefix_range(b"a/", b"", None, false, &mut |_, _| {
+            Err(StorageError::State("range visitor failure".into()))
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("range visitor failure"));
+    assert!(store
+        .scan_prefix_after(b"a/", Some(b"z"), 1)
         .unwrap()
         .is_empty());
 }
