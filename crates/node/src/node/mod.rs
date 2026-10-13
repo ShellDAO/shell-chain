@@ -11700,11 +11700,18 @@ mod tests {
         (sender, contract, target, blocks)
     }
 
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct FeeHistoryFixture {
+        number: u64,
+        reward: serde_json::Value,
+        state_reads: Vec<(String, serde_json::Value, String)>,
+    }
+
     fn fee_history_signed_import<S: KvStore + 'static>(
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
         proposer: &DilithiumSigner,
-    ) -> Vec<(u64, serde_json::Value)> {
+    ) -> Vec<FeeHistoryFixture> {
         use shell_rpc::api::EthApiServer;
         let signer = DilithiumSigner::generate();
         let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -11806,6 +11813,8 @@ mod tests {
         assert_eq!(query(block.number())["reward"], expected);
         assert_eq!(follower.store.scan_prefix(b"").unwrap(), before);
 
+        let first_balance =
+            U256::from(10_000_000_000_000_000_000u64) - U256::from(paid) - U256::from(3);
         let before_revert = follower.world_state.read().get_balance(&sender).unwrap();
         for (nonce, destination, tip) in [(3, reverting_contract, 50), (4, recipient, 2)] {
             submit_signed_tx(
@@ -11903,10 +11912,91 @@ mod tests {
             assert_eq!(query(historical.number())["reward"], expected);
         }
         assert_eq!(follower.store.scan_prefix(b"").unwrap(), after_pruning);
-        vec![
-            (block.number(), expected.clone()),
-            (reverted.number(), expected),
+        let fixtures = [
+            (&block, first_balance, 3u64),
+            (
+                &reverted,
+                first_balance - U256::from(paid) - U256::from(1),
+                5,
+            ),
         ]
+        .into_iter()
+        .map(|(block, balance, nonce)| {
+            let tag = format!("0x{:x}", block.number());
+            FeeHistoryFixture {
+                number: block.number(),
+                reward: expected.clone(),
+                state_reads: vec![
+                    (
+                        "eth_getBalance".into(),
+                        serde_json::json!([sender, tag]),
+                        format!("0x{balance:x}"),
+                    ),
+                    (
+                        "eth_getTransactionCount".into(),
+                        serde_json::json!([sender, tag]),
+                        format!("0x{nonce:x}"),
+                    ),
+                    (
+                        "eth_getCode".into(),
+                        serde_json::json!([contract, tag]),
+                        "0x600160005500".into(),
+                    ),
+                    (
+                        "eth_getStorageAt".into(),
+                        serde_json::json!([contract, "0x0", tag]),
+                        format!("0x{:064x}", 1),
+                    ),
+                    (
+                        "eth_getStorageAt".into(),
+                        serde_json::json!([reverting_contract, "0x0", tag]),
+                        format!("0x{:064x}", 0),
+                    ),
+                ],
+            }
+        })
+        .collect::<Vec<_>>();
+        // Reuse the same genuine execution/import fixture for historical state HTTP reads.
+        runtime.block_on(async {
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let server = shell_rpc::start_rpc_server(
+                shell_rpc::RpcConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ws_addr: None,
+                    ..shell_rpc::RpcConfig::default()
+                },
+                Arc::clone(&follower.chain_store),
+                Arc::clone(&follower.world_state),
+                Arc::clone(&follower.tx_pool),
+                1337,
+                None,
+                events,
+                None,
+                None,
+                Arc::new(RwLock::new(0)),
+                Arc::new(RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                Some(Arc::clone(&follower.witness_store)),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let address = server.http_addr;
+            for fixture in &fixtures {
+                for (method, params, expected) in &fixture.state_reads {
+                    let response = native_http_request(address, method, params.clone()).await;
+                    assert_eq!(response["result"], *expected, "{method}: {response}");
+                    assert_eq!(follower.store.scan_prefix(b"").unwrap(), after_pruning);
+                }
+            }
+            server.http_handle.stop().unwrap();
+            server.http_handle.stopped().await;
+        });
+        fixtures
     }
 
     #[test]
@@ -11956,7 +12046,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let fixtures: Vec<(u64, serde_json::Value)> =
+        let fixtures: Vec<FeeHistoryFixture> =
             serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
                 .unwrap();
         let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
@@ -11986,16 +12076,16 @@ mod tests {
             Arc::new(RwLock::new(FinalityState::new())),
         );
         let before = recovered.store.scan_prefix(b"").unwrap();
-        for (number, expected) in &fixtures {
+        for fixture in &fixtures {
             let result = runtime
                 .block_on(EthApiServer::fee_history(
                     &handler,
                     "0x1".into(),
-                    format!("0x{number:x}"),
+                    format!("0x{:x}", fixture.number),
                     Some(vec![0.0, 50.0, 100.0]),
                 ))
                 .unwrap();
-            assert_eq!(&result["reward"], expected);
+            assert_eq!(result["reward"], fixture.reward);
             assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
         }
         runtime.block_on(async {
@@ -12033,14 +12123,20 @@ mod tests {
             )
             .await;
             assert_eq!(original["result"]["reward"], serde_json::json!([]));
-            for (number, expected) in &fixtures {
+            for fixture in &fixtures {
                 let actual = native_http_request(
                     server.http_addr,
                     "eth_feeHistory",
-                    serde_json::json!(["0x1", format!("0x{number:x}"), [0, 50, 100]]),
+                    serde_json::json!(["0x1", format!("0x{:x}", fixture.number), [0, 50, 100]]),
                 )
                 .await;
-                assert_eq!(&actual["result"]["reward"], expected);
+                assert_eq!(actual["result"]["reward"], fixture.reward);
+                for (method, params, expected) in &fixture.state_reads {
+                    let response =
+                        native_http_request(server.http_addr, method, params.clone()).await;
+                    assert_eq!(response["result"], *expected, "{method}: {response}");
+                    assert_eq!(recovered.store.scan_prefix(b"").unwrap(), before);
+                }
             }
             let invalid = native_http_request(
                 server.http_addr,

@@ -438,6 +438,45 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         self.submit_tx(signed_tx)
     }
 
+    /// Read a selected retained canonical snapshot without flushing the live state.
+    fn read_state_at<T>(
+        &self,
+        block: Option<&str>,
+        read: impl FnOnce(&WorldState<S>) -> Result<T, ErrorObjectOwned>,
+    ) -> Result<T, ErrorObjectOwned> {
+        let number = self.parse_block_number(block.unwrap_or("latest"))?;
+        let state = self.world_state.read();
+        match number {
+            None => read(&state),
+            Some(number) => {
+                let header = self.canonical_state_header(number)?;
+                let snapshot =
+                    WorldState::at_root(self.chain_store.store().clone(), &header.state_root)
+                        .map_err(internal_err)?;
+                read(&snapshot)
+            }
+        }
+    }
+
+    fn canonical_state_header(&self, number: u64) -> Result<BlockHeader, ErrorObjectOwned> {
+        let hash = self
+            .chain_store
+            .get_block_hash_by_number(number)
+            .map_err(internal_err)?
+            .ok_or_else(|| not_found_err(format!("block {number} not found")))?;
+        let header = self
+            .chain_store
+            .get_header_by_hash(&hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| not_found_err(format!("header for block {number} not found")))?;
+        if header.number != number {
+            return Err(internal_err(
+                "canonical header number does not match requested block",
+            ));
+        }
+        Ok(header)
+    }
+
     /// Execute a call against a temporary EVM and return (output_bytes, gas_used).
     fn execute_call(
         &self,
@@ -468,21 +507,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         // Never substitute live state when a block or retained root is unavailable.
         let (state_root, head_header) = if let Some(number) = requested_number {
             let _state_guard = self.world_state.read();
-            let hash = self
-                .chain_store
-                .get_block_hash_by_number(number)
-                .map_err(internal_err)?
-                .ok_or_else(|| not_found_err(format!("block {number} not found")))?;
-            let header = self
-                .chain_store
-                .get_header_by_hash(&hash)
-                .map_err(internal_err)?
-                .ok_or_else(|| not_found_err(format!("header for block {number} not found")))?;
-            if header.number != number {
-                return Err(internal_err(
-                    "canonical header number does not match requested block",
-                ));
-            }
+            let header = self.canonical_state_header(number)?;
             (header.state_root, Some(header))
         } else {
             let mut ws = self.world_state.write();
@@ -939,24 +964,6 @@ pub(crate) fn parse_block_tag(s: &str) -> Result<BlockTag, ErrorObjectOwned> {
         "pending" => Ok(BlockTag::Pending),
         "earliest" => Ok(BlockTag::Number(0)),
         hex if hex.starts_with("0x") => parse_hex_u64(hex).map(BlockTag::Number),
-        _ => Err(invalid_block_tag_err()),
-    }
-}
-
-/// Current state backend only exposes the live world state. Reject historical
-/// state tags instead of returning latest-state data for a historical request.
-pub(crate) fn validate_state_block_is_latest(s: &str) -> Result<(), ErrorObjectOwned> {
-    match s {
-        "latest" | "pending" => Ok(()),
-        "safe" | "finalized" | "earliest" => Err(invalid_params_err(
-            "historical state queries are not supported; use latest or pending",
-        )),
-        hex if hex.starts_with("0x") => {
-            let _ = parse_hex_u64(hex)?;
-            Err(invalid_params_err(
-                "historical state queries are not supported; use latest or pending",
-            ))
-        }
         _ => Err(invalid_block_tag_err()),
     }
 }
@@ -1692,30 +1699,6 @@ mod tests {
             !err.message().contains("not-a-block-tag"),
             "block tag errors should not reflect caller input"
         );
-
-        let err = validate_state_block_is_latest(&value).unwrap_err();
-        assert!(err.message().contains("invalid block tag"));
-        assert!(
-            !err.message().contains("not-a-block-tag"),
-            "state block validation errors should not reflect caller input"
-        );
-    }
-
-    #[test]
-    fn state_block_validation_rejects_invalid_quantities_before_history_error() {
-        assert!(validate_state_block_is_latest("latest").is_ok());
-        assert!(validate_state_block_is_latest("pending").is_ok());
-
-        let historical = validate_state_block_is_latest("0x1").unwrap_err();
-        assert!(historical.message().contains("historical state"));
-
-        for value in ["1", "0x", "0x00", "0x01"] {
-            let err = validate_state_block_is_latest(value).unwrap_err();
-            assert!(
-                !err.message().contains("historical state"),
-                "invalid tag {value} should fail before historical-state handling"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2703,14 +2686,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_balance_rejects_historical_state_block() {
+    async fn get_balance_rejects_missing_historical_block() {
         let handler = setup();
         let addr = test_address(b"test-address-key");
         let err = EthApiServer::get_balance(&handler, addr, Some("0x0".into()))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), -32602);
-        assert!(err.message().contains("historical state queries"));
+        assert_eq!(err.code(), -32001);
+        assert!(err.message().contains("block 0 not found"));
     }
 
     #[tokio::test]
@@ -3986,6 +3969,170 @@ mod tests {
             result,
             "0x000000000000000000000000000000000000000000000000000000000000002a"
         );
+    }
+
+    #[tokio::test]
+    async fn historical_state_reads_http_select_retained_roots_without_writes() {
+        use jsonrpsee::core::client::ClientT;
+        let handler = setup();
+        let address = Address::from([0x91; 32]);
+        let store = handler.chain_store.store().clone();
+        let world = handler.world_state.clone();
+        let chain = handler.chain_store.clone();
+        let mut blocks = Vec::new();
+        for (number, balance, nonce, slot, code) in [
+            (0, 101u64, 7u64, 11u64, "600000"),
+            (1, 202, 8, 22, "600100"),
+            (2, 303, 9, 33, "600200"),
+        ] {
+            let bytes = hex::decode(code).unwrap();
+            let hash = shell_primitives::keccak256(&bytes);
+            chain.put_code(&hash, &bytes).unwrap();
+            let mut state = world.write();
+            state.set_balance(&address, U256::from(balance)).unwrap();
+            let mut account = state.get_account(&address).unwrap().unwrap();
+            account.nonce = nonce;
+            state.set_account(&address, &account).unwrap();
+            state.set_code_hash(&address, hash).unwrap();
+            state
+                .set_storage(
+                    &address,
+                    &ShellHash::ZERO,
+                    &ShellHash::from(U256::from(slot).to_be_bytes::<32>()),
+                )
+                .unwrap();
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.state_root = state.state_root().unwrap();
+            chain.put_block(&block).unwrap();
+            chain.set_canonical(number, &block.hash()).unwrap();
+            chain.set_head(&block.hash()).unwrap();
+            chain.delete_body(&block.hash()).unwrap();
+            blocks.push(block);
+        }
+        *handler.finalized_number.write() = 1;
+        let root = world.write().state_root().unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{}", server.local_addr().unwrap()))
+            .unwrap();
+        let handle = server.start(EthApiServer::into_rpc(handler));
+        for (tag, balance, nonce, slot, code) in [
+            ("latest", 303u64, 9u64, 33u64, "600200"),
+            ("pending", 303, 9, 33, "600200"),
+            ("0x1", 202, 8, 22, "600100"),
+            ("safe", 202, 8, 22, "600100"),
+            ("finalized", 202, 8, 22, "600100"),
+            ("earliest", 101, 7, 11, "600000"),
+            ("0x0", 101, 7, 11, "600000"),
+        ] {
+            for (method, params, expected) in [
+                (
+                    "eth_getBalance",
+                    serde_json::json!([address, tag]),
+                    format!("0x{balance:x}"),
+                ),
+                (
+                    "eth_getTransactionCount",
+                    serde_json::json!([address, tag]),
+                    format!("0x{nonce:x}"),
+                ),
+                (
+                    "eth_getCode",
+                    serde_json::json!([address, tag]),
+                    format!("0x{code}"),
+                ),
+                (
+                    "eth_getStorageAt",
+                    serde_json::json!([address, "0x0", tag]),
+                    format!("0x{slot:064x}"),
+                ),
+            ] {
+                let actual: String = client
+                    .request(method, params.as_array().unwrap().clone())
+                    .await
+                    .unwrap();
+                assert_eq!(actual, expected, "{method} {tag}");
+            }
+            assert_eq!(world.write().state_root().unwrap(), root);
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        // A canonical replacement must select its root, not cache the old height's state.
+        let mut replacement = blocks[0].clone();
+        replacement.header.number = 1;
+        chain.put_block(&replacement).unwrap();
+        chain.set_canonical(1, &replacement.hash()).unwrap();
+        let checkpoint = store.scan_prefix(b"").unwrap();
+        assert_eq!(
+            client
+                .request::<String, _>(
+                    "eth_getBalance",
+                    vec![serde_json::json!(address), serde_json::json!("0x1")]
+                )
+                .await
+                .unwrap(),
+            "0x65"
+        );
+        assert_eq!(store.scan_prefix(b"").unwrap(), checkpoint);
+        chain.set_canonical(1, &blocks[1].hash()).unwrap();
+        let mut missing = make_genesis_block();
+        missing.header.number = 3;
+        missing.header.state_root = ShellHash::from([0xee; 32]);
+        chain.put_block(&missing).unwrap();
+        chain.set_canonical(3, &missing.hash()).unwrap();
+        let checkpoint = store.scan_prefix(b"").unwrap();
+        for (tag, expected) in [
+            ("invalid", -32602),
+            ("0x00", -32602),
+            ("0x4", -32001),
+            ("0x3", -32603),
+        ] {
+            for method in [
+                "eth_getBalance",
+                "eth_getTransactionCount",
+                "eth_getCode",
+                "eth_getStorageAt",
+            ] {
+                let mut params = vec![serde_json::json!(address)];
+                if method == "eth_getStorageAt" {
+                    params.push(serde_json::json!("0x0"));
+                }
+                params.push(serde_json::json!(tag));
+                let error = client
+                    .request::<String, _>(method, params)
+                    .await
+                    .unwrap_err();
+                let jsonrpsee::core::client::Error::Call(error) = error else {
+                    panic!("transport error")
+                };
+                assert_eq!(error.code(), expected, "{method} {tag}");
+                assert_eq!(store.scan_prefix(b"").unwrap(), checkpoint);
+            }
+        }
+        // An account's missing historical code is an error, not an empty contract.
+        let (code_key, _) = store
+            .scan_prefix(b"")
+            .unwrap()
+            .into_iter()
+            .find(|(_, value)| value == &hex::decode("600100").unwrap())
+            .unwrap();
+        store.delete(&code_key).unwrap();
+        let checkpoint = store.scan_prefix(b"").unwrap();
+        assert!(client
+            .request::<String, _>(
+                "eth_getCode",
+                vec![serde_json::json!(address), serde_json::json!("0x1")]
+            )
+            .await
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), checkpoint);
+        assert_eq!(world.write().state_root().unwrap(), root);
+        handle.stop().unwrap();
+        handle.stopped().await;
     }
 
     #[tokio::test]
