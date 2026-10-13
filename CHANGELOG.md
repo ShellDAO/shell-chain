@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement `shell_getBlockSigners` with actual proposer and quorum evidence.
+  Retain authenticated signing keys and signatures outside the block hash,
+  atomically with production, import and finality artifacts, so historical
+  queries survive body pruning and changes to current key lookups. Verify
+  signatures and native address bindings on read; unavailable legacy evidence
+  returns an error instead of fabricated signer data.
+
 - Generate `eth_createAccessList` from actual account and storage accesses instead
   of echoing the supplied list. Merge and deduplicate supplied entries, retain
   accesses from reverted child calls, and simulate the final list at one

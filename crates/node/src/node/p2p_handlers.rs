@@ -464,18 +464,24 @@ impl<S: KvStore + 'static> Node<S> {
                                     return None;
                                 }
                             };
+                            let signer_evidence =
+                                self.commit_signer_evidence(&quorum_signatures, block_hash);
                             let advanced = {
                                 let mut finality = self.finality.write();
                                 let already_finalized =
                                     block_number <= finality.last_finalized_number();
                                 let persist_result = if already_finalized {
-                                    self.chain_store
-                                        .set_commit_certificate(&block_hash, &encoded)
+                                    self.chain_store.set_commit_certificate_with_signers(
+                                        &block_hash,
+                                        &encoded,
+                                        &signer_evidence,
+                                    )
                                 } else {
-                                    self.chain_store.set_finalized_with_certificate(
+                                    self.chain_store.set_finalized_with_certificate_and_signers(
                                         block_number,
                                         &block_hash,
                                         &encoded,
+                                        &signer_evidence,
                                     )
                                 };
                                 if let Err(e) = persist_result {
@@ -596,6 +602,30 @@ impl<S: KvStore + 'static> Node<S> {
                     addr,
                     shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, data),
                 ))
+            })
+            .collect()
+    }
+
+    fn commit_signer_evidence(
+        &self,
+        signatures: &HashMap<Address, shell_crypto::PQSignature>,
+        block_hash: ShellHash,
+    ) -> Vec<shell_core::BlockSignerEvidence> {
+        signatures
+            .iter()
+            .filter_map(|(address, signature)| {
+                let public_key = self.authority_pubkey(address).ok().flatten()?;
+                if !MultiVerifier
+                    .verify(&public_key, block_hash.as_bytes(), signature)
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+                Some(shell_core::BlockSignerEvidence {
+                    address: *address,
+                    public_key,
+                    signature: signature.clone(),
+                })
             })
             .collect()
     }
@@ -735,19 +765,29 @@ impl<S: KvStore + 'static> Node<S> {
             return false;
         }
 
+        let signatures =
+            Self::decode_commit_certificate(cert).expect("verified certificate encoding");
+        let signer_evidence = self.commit_signer_evidence(&signatures, block_hash);
+
         let advanced = {
             let mut finality = self.finality.write();
             if block_number <= finality.last_finalized_number() {
-                if let Err(e) = self.chain_store.set_commit_certificate(&block_hash, cert) {
+                if let Err(e) = self.chain_store.set_commit_certificate_with_signers(
+                    &block_hash,
+                    cert,
+                    &signer_evidence,
+                ) {
                     warn!(block_number, %block_hash, error = %e, "FF.7: failed to persist commit certificate");
                     return false;
                 }
                 false
             } else {
-                if let Err(e) =
-                    self.chain_store
-                        .set_finalized_with_certificate(block_number, &block_hash, cert)
-                {
+                if let Err(e) = self.chain_store.set_finalized_with_certificate_and_signers(
+                    block_number,
+                    &block_hash,
+                    cert,
+                    &signer_evidence,
+                ) {
                     warn!(block_number, %block_hash, error = %e, "FF.7: failed to persist finality");
                     return false;
                 }

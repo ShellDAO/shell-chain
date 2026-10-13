@@ -181,7 +181,7 @@ impl<S: KvStore + 'static> Node<S> {
         block: &Block,
         parent: &Block,
         finalized_import: bool,
-    ) -> Result<(), NodeError> {
+    ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
         let max_transactions = self.config.network_type.default_params().max_tx_per_block;
         if block.transactions.len() > max_transactions {
             return Err(NodeError::Startup(format!(
@@ -254,8 +254,12 @@ impl<S: KvStore + 'static> Node<S> {
         self.known_authorities
             .write()
             .entry(*proposer)
-            .or_insert(pubkey);
-        Ok(())
+            .or_insert(pubkey.clone());
+        Ok(shell_core::BlockSignerEvidence {
+            address: *proposer,
+            public_key: pubkey,
+            signature: seal.clone(),
+        })
     }
 
     pub(super) fn authority_pubkey(
@@ -1527,7 +1531,8 @@ impl<S: KvStore + 'static> Node<S> {
         let mut settlements = Vec::with_capacity(plan.new_chain.len());
         for block in &plan.new_chain {
             let block_hash = block.hash();
-            self.verify_import_consensus(block, &parent, false)
+            let signer = self
+                .verify_import_consensus(block, &parent, false)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_economics(block, &parent)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
@@ -1537,6 +1542,7 @@ impl<S: KvStore + 'static> Node<S> {
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             let (block_receipts, block_settlements) =
                 self.replay_preferred_fork_block(block, parent_state_root, overlay.clone())?;
+            overlay_chain_store.put_block_signers(&block_hash, &[signer])?;
             parent_state_root = block.header.state_root;
             receipts.push(block_receipts);
             settlements.push(block_settlements);
@@ -1724,7 +1730,7 @@ impl<S: KvStore + 'static> Node<S> {
         // fork-choice/reorg can inspect it later instead of dropping evidence.
         if transition == BlockImportTransition::SameHeightFork {
             let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent, finalized_import)?;
+            let signer = self.verify_import_consensus(&block, &parent, finalized_import)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
@@ -1733,7 +1739,8 @@ impl<S: KvStore + 'static> Node<S> {
                 self.queue_signed_equivocation_if_valid(&existing, &block)?;
             }
             let remote_hash = incoming_hash;
-            block_store.put_side_fork_block(&block)?;
+            self.chain_store
+                .put_side_fork_block_with_signers(&block, &[signer])?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
             let side_forks = block_store.side_fork_count(incoming);
             warn!(
@@ -1762,13 +1769,14 @@ impl<S: KvStore + 'static> Node<S> {
         // number->hash mapping with a disconnected block.
         if transition == BlockImportTransition::NextHeightFork {
             let parent = self.parent_for_import(&block)?;
-            self.verify_import_consensus(&block, &parent, finalized_import)?;
+            let signer = self.verify_import_consensus(&block, &parent, finalized_import)?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
             self.validate_side_fork_transactions(&block, &parent)?;
             let remote_hash = incoming_hash;
-            block_store.put_side_fork_block(&block)?;
+            self.chain_store
+                .put_side_fork_block_with_signers(&block, &[signer])?;
             consensus.register_fork_choice_block(remote_hash, block.header.parent_hash, incoming);
             let side_forks = block_store.side_fork_count(incoming);
             warn!(
@@ -1806,7 +1814,7 @@ impl<S: KvStore + 'static> Node<S> {
         // Verify consensus rules, including parent linkage, timestamp bounds,
         // and proposer seal.
         let parent = self.parent_for_import(&block)?;
-        self.verify_import_consensus(&block, &parent, finalized_import)?;
+        let proposer_evidence = self.verify_import_consensus(&block, &parent, finalized_import)?;
         self.verify_import_economics(&block, &parent)?;
         self.verify_incoming_witness_root(&block)?;
         self.verify_import_sig_aggregate_proof(&block)?;
@@ -2259,6 +2267,7 @@ impl<S: KvStore + 'static> Node<S> {
                 Some(settlement_tx_hash),
             )?)?;
         }
+        import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
         // Commit to storage.

@@ -545,6 +545,19 @@ impl<S: KvStore + 'static> Node<S> {
                 Ok(())
             },
         );
+        let stage_artifacts = stage_artifacts.and_then(|()| {
+            if let Some(signature) = &block.proposer_seal {
+                import_cs.put_block_signers(
+                    &block_hash,
+                    &[shell_core::BlockSignerEvidence {
+                        address: proposer_addr,
+                        public_key: signer.public_key().to_vec(),
+                        signature: signature.clone(),
+                    }],
+                )?;
+            }
+            Ok(())
+        });
         if let Err(err) = stage_artifacts {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
             return Err(err);

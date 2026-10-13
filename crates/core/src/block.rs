@@ -7,6 +7,67 @@ use crate::transaction::PubkeyMode;
 use crate::witness::{StrippedTransaction, TxWitness, WitnessBundle};
 use crate::{SignedTransaction, SystemTransaction};
 
+/// Authenticated signing evidence retained outside the consensus block encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockSignerEvidence {
+    pub address: Address,
+    pub public_key: Vec<u8>,
+    pub signature: PQSignature,
+}
+
+impl Encodable for BlockSignerEvidence {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let payload_length = self
+            .address
+            .length()
+            .saturating_add(self.public_key.as_slice().length())
+            .saturating_add(self.signature.length());
+        alloy_rlp::Header {
+            list: true,
+            payload_length,
+        }
+        .encode(out);
+        self.address.encode(out);
+        self.public_key.as_slice().encode(out);
+        self.signature.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self
+            .address
+            .length()
+            .saturating_add(self.public_key.as_slice().length())
+            .saturating_add(self.signature.length());
+        alloy_rlp::length_of_length(payload_length).saturating_add(payload_length)
+    }
+}
+
+impl Decodable for BlockSignerEvidence {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        if buf.len() < header.payload_length {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        let (mut payload, rest) = buf.split_at(header.payload_length);
+        let record = Self {
+            address: Address::decode(&mut payload)?,
+            public_key: alloy_rlp::Header::decode_bytes(&mut payload, false)?.to_vec(),
+            signature: PQSignature::decode(&mut payload)?,
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: header.payload_length - payload.len(),
+            });
+        }
+        *buf = rest;
+        Ok(record)
+    }
+}
+
 /// Block header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BlockHeader {

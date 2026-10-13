@@ -4592,6 +4592,154 @@ mod tests {
         }
     }
 
+    #[test]
+    fn block_signers_history_ignores_current_algorithm_policy_and_rejects_tampering() {
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        for signer in [
+            Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+            Box::new(shell_crypto::MlDsaSigner::generate()) as Box<dyn Signer>,
+        ] {
+            let handler = setup();
+            let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let mut block = make_genesis_block();
+            block.header.number = 1;
+            block.header.proposer = address;
+            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+            handler.chain_store.put_block(&block).unwrap();
+            handler.chain_store.set_canonical(1, &block.hash()).unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+            handler
+                .chain_store
+                .put_pubkey(&address, signer.public_key())
+                .unwrap();
+            // Legacy intact blocks can prove their key/identity without a sidecar.
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            let legacy = runtime
+                .block_on(ShellApiServer::get_block_signers(&handler, "latest".into()))
+                .unwrap();
+            assert_eq!(legacy["signers"][0]["signatureValid"], true);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            let evidence = shell_core::BlockSignerEvidence {
+                address,
+                public_key: signer.public_key().to_vec(),
+                signature: block.proposer_seal.clone().unwrap(),
+            };
+            handler
+                .chain_store
+                .set_commit_certificate(
+                    &block.hash(),
+                    &serde_json::to_vec(&std::collections::BTreeMap::from([(
+                        address.to_string(),
+                        evidence.signature.clone(),
+                    )]))
+                    .unwrap(),
+                )
+                .unwrap();
+            handler.chain_store.delete_body(&block.hash()).unwrap();
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            let legacy_certificate = runtime
+                .block_on(ShellApiServer::get_block_signers(&handler, "latest".into()))
+                .unwrap();
+            assert_eq!(legacy_certificate["signers"][0]["signatureValid"], true);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            handler
+                .chain_store
+                .put_pubkey(&address, DilithiumSigner::generate().public_key())
+                .unwrap();
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            assert!(runtime
+                .block_on(ShellApiServer::get_block_signers(&handler, "latest".into()))
+                .is_err());
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            handler
+                .chain_store
+                .put_pubkey(&address, signer.public_key())
+                .unwrap();
+            handler
+                .chain_store
+                .store()
+                .delete(&[b"CERT".as_slice(), block.hash().as_bytes()].concat())
+                .unwrap();
+            handler
+                .chain_store
+                .put_block_signers(&block.hash(), std::slice::from_ref(&evidence))
+                .unwrap();
+            let rogue = DilithiumSigner::generate();
+            let rogue_record = shell_core::BlockSignerEvidence {
+                address: Address::from_public_key(rogue.public_key(), rogue.sig_type().as_u8()),
+                public_key: rogue.public_key().to_vec(),
+                signature: rogue.sign(block.hash().as_bytes()).unwrap(),
+            };
+            handler
+                .chain_store
+                .put_block_signers(&block.hash(), &[rogue_record])
+                .unwrap();
+            handler.chain_store.delete_body(&block.hash()).unwrap();
+            let mut registry = AlgorithmRegistry::global().clone();
+            registry.deprecate(signer.sig_type());
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            let result = with_algorithm_registry_override(&registry, || {
+                runtime.block_on(ShellApiServer::get_block_signers(&handler, "latest".into()))
+            })
+            .unwrap();
+            assert_eq!(result["signers"][0]["signatureValid"], true);
+            assert_eq!(result["signers"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            for tamper in 0..3 {
+                let mut altered = evidence.clone();
+                match tamper {
+                    0 => altered.signature.data[0] ^= 1,
+                    1 => altered.public_key = DilithiumSigner::generate().public_key().to_vec(),
+                    _ => altered.signature = signer.sign(ShellHash::ZERO.as_bytes()).unwrap(),
+                }
+                handler
+                    .chain_store
+                    .put_block_signers(&block.hash(), &[altered])
+                    .unwrap();
+                let checkpoint = handler.chain_store.store().scan_prefix(b"").unwrap();
+                let result = runtime
+                    .block_on(ShellApiServer::get_block_signers(&handler, "latest".into()))
+                    .unwrap();
+                assert_eq!(result["signers"][0]["signatureValid"], false);
+                assert_eq!(
+                    handler.chain_store.store().scan_prefix(b"").unwrap(),
+                    checkpoint
+                );
+            }
+            // Already-pruned legacy evidence must not fabricate an empty list.
+            let mut missing = block.clone();
+            missing.header.number = 2;
+            handler.chain_store.put_block(&missing).unwrap();
+            handler
+                .chain_store
+                .set_canonical(2, &missing.hash())
+                .unwrap();
+            handler.chain_store.delete_body(&missing.hash()).unwrap();
+            let checkpoint = handler.chain_store.store().scan_prefix(b"").unwrap();
+            assert!(runtime
+                .block_on(ShellApiServer::get_block_signers(&handler, "0x2".into()))
+                .is_err());
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                checkpoint
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_access_list_discovers_storage_from_execution() {
         let handler = setup();

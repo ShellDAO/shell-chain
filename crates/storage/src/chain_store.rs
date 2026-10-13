@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
-use shell_core::{Block, BlockHeader, StrippedBlock, SystemTransaction, TransactionReceipt};
+use shell_core::{
+    Block, BlockHeader, BlockSignerEvidence, StrippedBlock, SystemTransaction, TransactionReceipt,
+};
 use shell_primitives::{Address, ShellHash, U256};
 
 use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
@@ -647,9 +649,18 @@ impl<S: KvStore> ChainStore<S> {
     /// Store a side-fork block without making it canonical and without updating
     /// transaction/address indexes that are reserved for canonical lookup.
     pub fn put_side_fork_block(&self, block: &Block) -> Result<(), StorageError> {
+        self.put_side_fork_block_with_signers(block, &[])
+    }
+
+    pub fn put_side_fork_block_with_signers(
+        &self,
+        block: &Block,
+        signers: &[BlockSignerEvidence],
+    ) -> Result<(), StorageError> {
         let block_hash = block.hash();
         let mut batch = WriteBatch::new();
         Self::append_block_parts(&mut batch, block, false);
+        Self::stage_block_signers(&mut batch, &block_hash, signers)?;
         batch.put(
             Self::side_fork_key(block.number(), &block_hash),
             block_hash.as_bytes().to_vec(),
@@ -3506,6 +3517,90 @@ impl<S: KvStore> ChainStore<S> {
         key
     }
 
+    fn block_signer_prefix(block_hash: &ShellHash) -> Vec<u8> {
+        let mut key = b"BSIG".to_vec();
+        key.extend_from_slice(block_hash.as_bytes());
+        key
+    }
+
+    fn stage_block_signers(
+        batch: &mut WriteBatch,
+        block_hash: &ShellHash,
+        signers: &[BlockSignerEvidence],
+    ) -> Result<(), StorageError> {
+        for signer in signers {
+            let mut key = Self::block_signer_prefix(block_hash);
+            key.extend_from_slice(signer.address.as_bytes());
+            let value = encode_rlp(signer);
+            batch.put(key, value);
+        }
+        Ok(())
+    }
+
+    /// Preserve the exact key and signature observed by block authentication.
+    /// Individual signer keys avoid lost updates between proposal and quorum evidence.
+    pub fn put_block_signers(
+        &self,
+        block_hash: &ShellHash,
+        signers: &[BlockSignerEvidence],
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        Self::stage_block_signers(&mut batch, block_hash, signers)?;
+        self.store.write_batch(batch)
+    }
+
+    /// Read retained evidence without depending on current authority keys or block bodies.
+    pub fn get_block_signers(
+        &self,
+        block_hash: &ShellHash,
+    ) -> Result<Vec<BlockSignerEvidence>, StorageError> {
+        let prefix = Self::block_signer_prefix(block_hash);
+        self.store
+            .scan_prefix(&prefix)?
+            .into_iter()
+            .map(|(key, value)| {
+                let signer: BlockSignerEvidence = decode_versioned(&value)?;
+                if key.strip_prefix(prefix.as_slice()) != Some(signer.address.as_bytes().as_slice())
+                {
+                    return Err(StorageError::Codec(
+                        "block signer evidence address mismatch".into(),
+                    ));
+                }
+                Ok(signer)
+            })
+            .collect()
+    }
+
+    /// Commit quorum signatures and their authenticated keys in the same write batch.
+    pub fn set_commit_certificate_with_signers(
+        &self,
+        block_hash: &ShellHash,
+        cert: &[u8],
+        signers: &[BlockSignerEvidence],
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(Self::commit_certificate_key(block_hash), cert.to_vec());
+        Self::stage_block_signers(&mut batch, block_hash, signers)?;
+        self.store.write_batch(batch)
+    }
+
+    pub fn set_finalized_with_certificate_and_signers(
+        &self,
+        number: u64,
+        block_hash: &ShellHash,
+        cert: &[u8],
+        signers: &[BlockSignerEvidence],
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(
+            prefix::FINALIZED_NUMBER.to_vec(),
+            number.to_be_bytes().to_vec(),
+        );
+        batch.put(Self::commit_certificate_key(block_hash), cert.to_vec());
+        Self::stage_block_signers(&mut batch, block_hash, signers)?;
+        self.store.write_batch(batch)
+    }
+
     pub fn set_commit_certificate(
         &self,
         block_hash: &ShellHash,
@@ -4436,6 +4531,58 @@ mod tests {
     use crate::{MemoryDb, WriteBatch};
     use shell_primitives::{Address, Bytes};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn block_signers_certificate_atomicity_and_body_pruning() {
+        use shell_crypto::{DilithiumSigner, Signer};
+        let store = Arc::new(FailingBatchStore::new());
+        let chain = ChainStore::new(store.clone());
+        let signer = DilithiumSigner::generate();
+        let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let block = Block {
+            header: BlockHeader {
+                number: 1,
+                proposer: address,
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let record = BlockSignerEvidence {
+            address,
+            public_key: signer.public_key().to_vec(),
+            signature: signer.sign(block.hash().as_bytes()).unwrap(),
+        };
+        let records = std::slice::from_ref(&record);
+        let before = store.scan_prefix(b"").unwrap();
+        store.fail_next_batch();
+        assert!(chain
+            .set_finalized_with_certificate_and_signers(1, &block.hash(), b"{}", records)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        store.fail_next_batch();
+        assert!(chain
+            .put_side_fork_block_with_signers(&block, records)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        chain
+            .put_side_fork_block_with_signers(&block, records)
+            .unwrap();
+        chain
+            .set_finalized_with_certificate_and_signers(1, &block.hash(), b"{}", records)
+            .unwrap();
+        chain.delete_body(&block.hash()).unwrap();
+        assert_eq!(
+            chain.get_block_signers(&block.hash()).unwrap(),
+            vec![record]
+        );
+        assert_eq!(chain.get_finalized_number().unwrap(), Some(1));
+        assert_eq!(
+            chain.get_commit_certificate(&block.hash()).unwrap(),
+            Some(b"{}".to_vec())
+        );
+    }
 
     #[derive(Debug, Default)]
     struct FailingBatchStore {
