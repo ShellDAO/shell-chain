@@ -4719,6 +4719,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_access_list_http_account_and_delegate_context() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::rpc_params;
+
+        let caller = Address::from([0x91; 32]);
+        let callee = Address::from([0x92; 32]);
+        let alias = Address::from(callee.to_alloy());
+        let key = |n: u64| ShellHash::from(U256::from(n).to_be_bytes::<32>());
+        // The two code accounts read different slots and attempt a simulated write.
+        let native_code = hex::decode("600054600052604d60025560206000f3").unwrap();
+        let legacy_code = hex::decode("61000154600052605860025560206000f3").unwrap();
+        for activation in [None, Some(2)] {
+            for number in [1, 2, 3, 1] {
+                let native = activation.is_some_and(|height| number >= height);
+                let resolved = if native { callee } else { alias };
+                for op in [0x31_u8, 0x3b, 0x3f, 0x3c, 0xf4] {
+                    let handler = setup();
+                    let config = serde_json::from_value(serde_json::json!({
+                        "chain_id":42,"genesis_hash":ShellHash::ZERO,
+                        "native_address_context_height":activation
+                    }))
+                    .unwrap();
+                    handler.chain_store.put_chain_config(&config).unwrap();
+                    let operand = hex::encode(callee.as_bytes());
+                    let caller_code = hex::decode(match op {
+                        // Copy the first byte of the selected code to zeroed memory.
+                        0x3c => format!("6001600060007f{operand}3c60206000f3"),
+                        // Delegate into selected code, returning its caller-storage read.
+                        0xf4 => format!("60206000600060007f{operand}620186a0f45060206000f3"),
+                        _ => format!("7f{operand}{op:02x}60005260206000f3"),
+                    })
+                    .unwrap();
+                    for (address, code) in [
+                        (caller, caller_code),
+                        (callee, native_code.clone()),
+                        (alias, legacy_code.clone()),
+                    ] {
+                        let hash = shell_primitives::keccak256(&code);
+                        handler.chain_store.put_code(&hash, &code).unwrap();
+                        handler
+                            .world_state
+                            .write()
+                            .set_code_hash(&address, hash)
+                            .unwrap();
+                    }
+                    {
+                        let mut world = handler.world_state.write();
+                        world.add_balance(&callee, U256::from(11)).unwrap();
+                        world.add_balance(&alias, U256::from(22)).unwrap();
+                        world.set_storage(&caller, &key(0), &key(13)).unwrap();
+                        world.set_storage(&caller, &key(1), &key(17)).unwrap();
+                        world.set_storage(&callee, &key(0), &key(29)).unwrap();
+                        world.set_storage(&alias, &key(1), &key(31)).unwrap();
+                    }
+                    let root = handler.world_state.write().state_root().unwrap();
+                    let mut block = make_genesis_block();
+                    block.header.number = number;
+                    block.header.state_root = root;
+                    handler.chain_store.put_block(&block).unwrap();
+                    handler.chain_store.set_head(&block.hash()).unwrap();
+                    let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+                    let server = jsonrpsee::server::ServerBuilder::default()
+                        .build("127.0.0.1:0")
+                        .await
+                        .unwrap();
+                    let endpoint = format!("http://{}", server.local_addr().unwrap());
+                    let handle = server.start(EthApiServer::into_rpc(handler.clone()));
+                    let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                        .build(endpoint)
+                        .unwrap();
+                    let mut request = serde_json::json!({"to":caller,"gas":"0x7a120"});
+                    let actual: serde_json::Value = client
+                        .request(
+                            "eth_createAccessList",
+                            rpc_params![request.clone(), "latest"],
+                        )
+                        .await
+                        .unwrap();
+                    let mut expected =
+                        vec![serde_json::json!({"address":resolved,"storageKeys":[]})];
+                    if op == 0xf4 {
+                        expected.push(serde_json::json!({
+                            "address":caller,"storageKeys":[key(if native {0} else {1}),key(2)]
+                        }));
+                    }
+                    expected.sort_by_key(|item| item["address"].as_str().unwrap().to_owned());
+                    assert_eq!(
+                        actual["accessList"],
+                        serde_json::json!(expected),
+                        "op={op:x}, activation={activation:?}, height={number}"
+                    );
+                    if op != 0xf4 {
+                        // 21000+2400 intrinsic, warm account100 and literal opcode/memory costs.
+                        assert_eq!(
+                            actual["gasUsed"],
+                            if op == 0x3c { "0x5be4" } else { "0x5bde" }
+                        );
+                    }
+                    let selected_code = if native { &native_code } else { &legacy_code };
+                    let output = match op {
+                        0x31 => format!("0x{:064x}", if native { 11 } else { 22 }),
+                        0x3b => format!("0x{:064x}", selected_code.len()),
+                        0x3f => shell_primitives::keccak256(selected_code).to_string(),
+                        0x3c => format!("0x{:02x}{}", selected_code[0], "00".repeat(31)),
+                        _ => format!("0x{:064x}", if native { 13 } else { 17 }),
+                    };
+                    for warmed in [false, true] {
+                        if warmed {
+                            request["accessList"] = actual["accessList"].clone();
+                        }
+                        let result: String = client
+                            .request("eth_call", rpc_params![request.clone(), "latest"])
+                            .await
+                            .unwrap();
+                        assert_eq!(result, output);
+                    }
+                    assert_eq!(handler.world_state.write().state_root().unwrap(), root);
+                    assert_eq!(
+                        handler.chain_store.store().scan_prefix(b"").unwrap(),
+                        before
+                    );
+                    handle.stop().unwrap();
+                    handle.stopped().await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn create_access_list_converges_for_gas_dependent_storage_reads() {
         let handler = setup();
         let address = test_address(b"gas-dependent-access-list");
