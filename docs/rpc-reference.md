@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (46 methods)
+- **`shell_`** (47 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -635,6 +635,13 @@ get_finality_info() → serde_json::Value
 ```
 
 Returns finality information: last finalized block, current head, and pending attestations.
+
+### shell_getBlockSigners
+```
+get_block_signers(block: String, ) → serde_json::Value
+```
+
+Returns actual proposer and quorum signer evidence for a canonical block.
 
 ### shell_finalityProof
 ```
