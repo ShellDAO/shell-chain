@@ -2549,9 +2549,14 @@ mod tests {
 
     #[tokio::test]
     async fn block_signers_http_production_import_pruning_and_current_key_change() {
+        let fallback = shell_crypto::SphincsSigner::generate();
+        // FIPS 205 Table 2: SHA2-256f uses n=32, a 2n public key and a 4n secret key.
+        assert_eq!(fallback.public_key().len(), 64);
+        assert_eq!(fallback.secret_key_bytes().len(), 128);
         for signer in [
             Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
             Box::new(shell_crypto::MlDsaSigner::generate()) as Box<dyn Signer>,
+            Box::new(fallback) as Box<dyn Signer>,
         ] {
             let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
             let node = setup_node_with_authority(address);
@@ -2565,6 +2570,10 @@ mod tests {
                 .import_block(block.clone(), &MultiVerifier)
                 .unwrap();
             let votes = HashMap::from([(address, signer.sign(block.hash().as_bytes()).unwrap())]);
+            if signer.sig_type() == SignatureType::SphincsSha2256f {
+                assert_eq!(votes[&address].data.len(), 49_856);
+                println!("SHA2-256f: public key 64 B, secret key 128 B, signature 49856 B");
+            }
             let certificate = Node::<MemoryDb>::encode_commit_certificate(&votes).unwrap();
             let rogue = DilithiumSigner::generate();
             let rogue_address =
