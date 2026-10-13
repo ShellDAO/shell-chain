@@ -224,9 +224,14 @@ algo_id || public_key  ──→  blake3()  ──→  32-byte address  ──�
 |-----------|-----------|------------|-----------|-------------|
 | **Dilithium3** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (128-bit) |
 | **ML-DSA-65** (shell-chain) | 1,952 B | 4,032 B | 3,309 B | NIST Level 3 (FIPS 204) |
-| **SLH-DSA-SHA2-256f** (shell-chain, secondary) | 32 B | 64 B | ~49,856 B | NIST Level 5 (256-bit) |
+| **SLH-DSA-SHA2-256f** (shell-chain, secondary) | 64 B | 128 B | ~49,856 B | NIST Level 5 (256-bit) |
 | ECDSA secp256k1 (Ethereum) | 64 B | 32 B | 64 B | 0-bit PQ (broken) |
 | Ed25519 (Solana) | 32 B | 64 B | 64 B | 0-bit PQ (broken) |
+
+For SHA2-256f, `n = 32` bytes is the length of one seed, not the complete key.
+The public key contains `2n` bytes (64 B), and the secret key contains `4n`
+bytes (128 B). These sizes follow [FIPS 205](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.205.pdf),
+Table 2 and the key-length checks in Section 4.
 
 Dilithium3 signatures are ~52× larger than ECDSA, but this is a necessary trade-off for quantum resistance.
 
