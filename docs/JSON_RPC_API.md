@@ -614,9 +614,31 @@ Creates an EIP-2930 access list for a transaction.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `Object` | Yes | Call request |
-| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | No | Block tag or canonical hex block number (retained state required) |
 
 **Returns:** Object with `accessList` and `gasUsed`.
+
+Unreleased node source discovers accessed accounts and storage keys by executing
+on isolated state. Supplied entries are merged and deduplicated; accesses in
+reverted child calls are retained. `gasUsed` reflects execution with the final
+returned list, including its intrinsic gas. Discovery passes use one captured
+header and state root; historical queries require retained canonical state and
+never substitute current state. Existing execution-profile restrictions apply.
+
+Generated lists are bounded by transaction limits: 256 addresses and 512 keys
+per address. A call that exceeds these limits or does not converge within eight
+simulations returns an error. Published node versions must be verified before
+relying on discovery or historical support.
+
+From a source checkout, run the self-contained acceptance regression:
+
+```bash
+cargo test -p shell-rpc create_access_list -- --nocapture
+```
+
+The regression uses temporary contracts and checks real HTTP history, returned
+list usability, gas-dependent discovery, reverted child accesses and state
+isolation. It does not enable the development execution profile on a network.
 
 ---
 

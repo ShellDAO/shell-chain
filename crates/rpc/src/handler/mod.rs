@@ -451,6 +451,16 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         req: &crate::types::CallRequest,
         block: Option<&str>,
     ) -> Result<(Vec<u8>, u64), ErrorObjectOwned> {
+        let (output, gas, _) = self.execute_call_with_access_list(req, block, false)?;
+        Ok((output, gas))
+    }
+
+    fn execute_call_with_access_list(
+        &self,
+        req: &crate::types::CallRequest,
+        block: Option<&str>,
+        collect: bool,
+    ) -> Result<(Vec<u8>, u64, Vec<shell_core::AccessListItem>), ErrorObjectOwned> {
         let store = self.chain_store.store().clone();
         let requested_number = self.parse_block_number(block.unwrap_or("latest"))?;
 
@@ -487,11 +497,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             };
             (ws.state_root().map_err(internal_err)?, head_header)
         };
-
-        let world_state = WorldState::at_root(store.clone(), &state_root).map_err(internal_err)?;
-        let chain_store = ChainStore::new(store);
-        let state_db = ShellStateDb::new(world_state, chain_store);
-        let mut evm = ShellPqvm::new(state_db, self.chain_id);
 
         let from = req.from.unwrap_or(Address::ZERO);
         // Cap gas to prevent DoS via unbounded simulated execution.
@@ -582,7 +587,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         };
 
         let sig = shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]);
-        let signed = SignedTransaction::new(from, tx, sig);
+        let mut signed = SignedTransaction::new(from, tx, sig);
 
         let header = head_header.unwrap_or(BlockHeader {
             parent_hash: ShellHash::ZERO,
@@ -605,19 +610,50 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             witness_root: None,
         });
 
-        let result = evm
-            .execute_tx(&signed, &header, 0, 0)
+        const MAX_ACCESS_LIST_SIMULATIONS: usize = 8;
+        // Bind all discovery passes to one header/root, with fresh private state per pass.
+        for _ in 0..if collect {
+            MAX_ACCESS_LIST_SIMULATIONS
+        } else {
+            1
+        } {
+            let overlay = Arc::new(shell_storage::OverlayStore::new(store.clone()));
+            let world_state =
+                WorldState::at_root(overlay.clone(), &state_root).map_err(internal_err)?;
+            let state_db = ShellStateDb::new(world_state, ChainStore::new(overlay));
+            let mut evm = ShellPqvm::new(state_db, self.chain_id);
+            let (result, accesses) = if collect {
+                evm.execute_access_list(&signed, &header)
+            } else {
+                evm.execute_tx(&signed, &header, 0, 0)
+                    .map(|result| (result, vec![]))
+            }
             .map_err(|e| internal_err(format!("PQVM execution failed: {e}")))?;
-
-        if !result.receipt.succeeded() {
-            return Err(ErrorObjectOwned::owned(
-                crate::error::SERVER_ERROR,
-                "execution failed",
-                Some(hex_bytes(&result.output)),
-            ));
+            if !result.receipt.succeeded() {
+                return Err(ErrorObjectOwned::owned(
+                    crate::error::SERVER_ERROR,
+                    "execution failed",
+                    Some(hex_bytes(&result.output)),
+                ));
+            }
+            if !collect
+                || accesses.as_slice() == signed.tx.access_list.as_deref().unwrap_or_default()
+            {
+                return Ok((
+                    result.output,
+                    if collect {
+                        result.gas_used
+                    } else {
+                        result.gas_spent
+                    },
+                    accesses,
+                ));
+            }
+            signed.tx.access_list = Some(accesses);
         }
-
-        Ok((result.output.clone(), result.gas_spent))
+        Err(internal_err(
+            "access list did not converge within 8 simulations",
+        ))
     }
 
     /// Parse a block number string with finality awareness.
@@ -3953,7 +3989,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eth_call_historical_http_uses_retained_root_and_header_without_writes() {
+    async fn eth_call_and_create_access_list_historical_http_uses_retained_root_and_header_without_writes(
+    ) {
         use jsonrpsee::core::client::ClientT;
         use jsonrpsee::rpc_params;
         let handler = setup();
@@ -4030,12 +4067,38 @@ mod tests {
                 output,
                 format!("0x{value:064x}{number:064x}{time:064x}{gas:064x}")
             );
+            let access: serde_json::Value = client
+                .request("eth_createAccessList", rpc_params![request.clone(), tag])
+                .await
+                .unwrap();
+            assert_eq!(
+                access["accessList"],
+                serde_json::json!([{"address":address,"storageKeys":[ShellHash::ZERO]}])
+            );
+            let mut warmed = request.clone();
+            warmed["accessList"] = access["accessList"].clone();
+            let warmed_output: String = client
+                .request("eth_call", rpc_params![warmed, tag])
+                .await
+                .unwrap();
+            assert_eq!(warmed_output, output);
             assert_eq!(world.write().state_root().unwrap(), root);
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
         }
         for (tag, expected) in [("0x29", -32001), ("invalid", -32602)] {
             let error = client
                 .request::<String, _>("eth_call", rpc_params![request.clone(), tag])
+                .await
+                .unwrap_err();
+            let jsonrpsee::core::client::Error::Call(error) = error else {
+                panic!("unexpected transport error")
+            };
+            assert_eq!(error.code(), expected);
+            let error = client
+                .request::<serde_json::Value, _>(
+                    "eth_createAccessList",
+                    rpc_params![request.clone(), tag],
+                )
                 .await
                 .unwrap_err();
             let jsonrpsee::core::client::Error::Call(error) = error else {
@@ -4051,7 +4114,11 @@ mod tests {
         chain.set_canonical(2, &missing.hash()).unwrap();
         let checkpoint = store.scan_prefix(b"").unwrap();
         assert!(client
-            .request::<String, _>("eth_call", rpc_params![request, "0x2"])
+            .request::<String, _>("eth_call", rpc_params![request.clone(), "0x2"])
+            .await
+            .is_err());
+        assert!(client
+            .request::<serde_json::Value, _>("eth_createAccessList", rpc_params![request, "0x2"])
             .await
             .is_err());
         assert_eq!(world.write().state_root().unwrap(), root);
@@ -4523,6 +4590,218 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn create_access_list_discovers_storage_from_execution() {
+        let handler = setup();
+        let address = test_address(b"access-list-storage-contract");
+        // PUSH1 0; SLOAD; POP; STOP: slot zero must be discovered without a supplied list.
+        let code = hex::decode("6000545000").unwrap();
+        let code_hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&code_hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, code_hash)
+            .unwrap();
+        handler.world_state.write().state_root().unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let actual = EthApiServer::create_access_list(
+            &handler,
+            crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: Some("0x186a0".into()),
+                access_list: None,
+            },
+            Some("latest".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actual["accessList"],
+            serde_json::json!([{
+                "address": address, "storageKeys": [ShellHash::ZERO],
+            }])
+        );
+        // 21000 intrinsic + 2400 address + 1900 key + 3 PUSH1 + 100 warm SLOAD + 2 POP.
+        assert_eq!(actual["gasUsed"], "0x633d");
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn create_access_list_retains_native_reverted_child_accesses() {
+        let handler = setup();
+        let config = serde_json::from_value(serde_json::json!({
+            "chain_id":42,"genesis_hash":ShellHash::ZERO,"native_address_context_height":0
+        }))
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        let caller = Address::from([0x91; 32]);
+        let mut bytes = [0x78; 32];
+        bytes[..12].fill(0x92);
+        let callee = Address::from(bytes);
+        bytes[..12].fill(0x93);
+        let alias = Address::from(bytes);
+        // CALL the full native callee; it reads slot1, writes slot2, then reverts.
+        let caller_code = hex::decode(format!(
+            "600060006000600060007f{}620186a0f15000",
+            hex::encode(callee.as_bytes())
+        ))
+        .unwrap();
+        for (address, code) in [
+            (caller, caller_code),
+            (callee, hex::decode("60015450600260025560006000fd").unwrap()),
+            (alias, hex::decode("600360035500").unwrap()),
+        ] {
+            let hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&hash, &code).unwrap();
+            handler
+                .world_state
+                .write()
+                .set_code_hash(&address, hash)
+                .unwrap();
+        }
+        handler.world_state.write().state_root().unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let key1 = ShellHash::from(U256::from(1).to_be_bytes::<32>());
+        let key2 = ShellHash::from(U256::from(2).to_be_bytes::<32>());
+        let expected = serde_json::json!([{"address":callee,"storageKeys":[key1,key2]}]);
+        for supplied in [
+            None,
+            Some(vec![crate::types::RpcAccessListItem {
+                address: callee,
+                storage_keys: vec![key2.to_string(), key2.to_string()],
+            }]),
+        ] {
+            let actual = EthApiServer::create_access_list(
+                &handler,
+                crate::types::CallRequest {
+                    from: None,
+                    to: Some(caller),
+                    data: None,
+                    value: None,
+                    gas: Some("0x7a120".into()),
+                    access_list: supplied,
+                },
+                Some("latest".into()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual["accessList"], expected);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            assert_eq!(
+                handler
+                    .world_state
+                    .read()
+                    .get_storage(&callee, &key2)
+                    .unwrap(),
+                ShellHash::ZERO
+            );
+            assert_eq!(
+                handler
+                    .world_state
+                    .read()
+                    .get_storage(&alias, &key2)
+                    .unwrap(),
+                ShellHash::ZERO
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_access_list_converges_for_gas_dependent_storage_reads() {
+        let handler = setup();
+        let address = test_address(b"gas-dependent-access-list");
+        // Read slot0, then compare GAS with75000: cold discovery reads slot1;
+        // warming the initial list adds intrinsic gas and changes the branch to slot2.
+        let code = hex::decode("60005450620124f85a1160125760025450005b6001545000").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, hash)
+            .unwrap();
+        handler.world_state.write().state_root().unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let result = EthApiServer::create_access_list(
+            &handler,
+            crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: Some("0x186a0".into()),
+                access_list: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let keys: Vec<ShellHash> = (0..3)
+            .map(|slot| ShellHash::from(U256::from(slot).to_be_bytes::<32>()))
+            .collect();
+        assert_eq!(
+            result["accessList"],
+            serde_json::json!([{"address":address,"storageKeys":keys}])
+        );
+        // 29100 intrinsic + two105-gas warm reads +3 PUSH3+2 GAS+3 GT+3 PUSH1+10 JUMPI.
+        assert_eq!(result["gasUsed"], "0x7293");
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn create_access_list_rejects_discovery_beyond_transaction_key_limit() {
+        let handler = setup();
+        let address = test_address(b"bounded-access-list");
+        let mut code = Vec::new();
+        for slot in 0..=shell_core::MAX_ACCESS_LIST_STORAGE_KEYS {
+            code.push(0x61); // PUSH2
+            code.extend_from_slice(&(slot as u16).to_be_bytes());
+            code.extend_from_slice(&[0x54, 0x50]); // SLOAD; POP
+        }
+        code.push(0);
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&address, hash)
+            .unwrap();
+        handler.world_state.write().state_root().unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let error = EthApiServer::create_access_list(
+            &handler,
+            crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: Some("0x989680".into()),
+                access_list: None,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), crate::error::INTERNAL_ERROR);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

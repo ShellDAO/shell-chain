@@ -256,6 +256,26 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         Ok((result, trace))
     }
 
+    /// Discover actual account/storage accesses without collecting opcode trace payloads.
+    /// Use an isolated state database; native system calls may mutate that private state.
+    pub fn execute_access_list(
+        &mut self,
+        signed_tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+    ) -> Result<(TxExecutionResult, Vec<shell_core::AccessListItem>), ExecutorError> {
+        self.tracer = Some(ExecutionTracer::for_access_list(
+            signed_tx.tx.access_list.as_deref().unwrap_or_default(),
+        ));
+        let result = self.execute_tx(signed_tx, header, 0, 0);
+        let tracer = self.tracer.take().expect("access collector installed");
+        let accesses = tracer
+            .accesses
+            .expect("access collector mode")
+            .finish()
+            .map_err(ExecutorError::Revm)?;
+        Ok((result?, accesses))
+    }
+
     /// Execute a single transaction that has already been validated.
     ///
     /// The caller is responsible for running `validate_tx()` first.
@@ -428,6 +448,19 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             self.state_db.chain_store(),
             header.number,
         )?;
+        if let Some(tracer) = &mut self.tracer {
+            tracer.exclude_access_list_accounts(
+                [signed_tx.from, header.proposer]
+                    .into_iter()
+                    .chain(tx.to)
+                    .chain(
+                        <ShellPrecompiles as revm::handler::PrecompileProvider<
+                            MainnetContext<&mut ShellStateDb<S>>,
+                        >>::warm_addresses(&precompiles)
+                        .map(|address| self.state_db.resolve_address(&address)),
+                    ),
+            );
+        }
         let ctx: MainnetContext<&mut ShellStateDb<S>> =
             Context::new(&mut self.state_db, SpecId::CANCUN)
                 .modify_block_chained(|b| *b = block_env)

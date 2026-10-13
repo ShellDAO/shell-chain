@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Generate `eth_createAccessList` from actual account and storage accesses instead
+  of echoing the supplied list. Merge and deduplicate supplied entries, retain
+  accesses from reverted child calls, and simulate the final list at one
+  captured header/state root for consistent gas. Support retained historical
+  state and discard all simulation writes. Discovery respects transaction list
+  limits and rejects calls that do not converge within eight simulations.
+
+
 - Update the locked `quinn-proto` dependency to 0.11.18 to address reported
   peer-triggered panics and resource-exhaustion vulnerabilities. Networking
   features and transport selection remain unchanged.
