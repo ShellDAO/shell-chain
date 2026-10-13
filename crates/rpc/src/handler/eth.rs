@@ -879,27 +879,17 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         tx: crate::types::CallRequest,
         block: Option<String>,
     ) -> Result<serde_json::Value, ErrorObjectOwned> {
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
-        let (_output, gas_used) = self.execute_call(&tx)?;
-        // Simplified implementation: return the provided access list (or empty)
-        // and the estimated gas.
-        let access_list = tx
-            .access_list
-            .unwrap_or_default()
+        let (_, gas_used, accesses) =
+            self.execute_call_with_access_list(&tx, block.as_deref(), true)?;
+        let access_list = accesses
             .into_iter()
             .map(|item| {
                 serde_json::json!({
-                    "address": item.address,
-                    "storageKeys": item.storage_keys,
+                    "address": item.address, "storageKeys": item.storage_keys,
                 })
             })
             .collect::<Vec<_>>();
-        Ok(serde_json::json!({
-            "accessList": access_list,
-            "gasUsed": hex_u64(gas_used),
-        }))
+        Ok(serde_json::json!({"accessList": access_list, "gasUsed": hex_u64(gas_used)}))
     }
 
     async fn get_code(

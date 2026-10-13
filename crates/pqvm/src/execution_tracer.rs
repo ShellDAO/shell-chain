@@ -9,8 +9,9 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter, InterpreterResult,
 };
 use serde::Serialize;
-use shell_primitives::{Address, Bytes};
+use shell_primitives::{Address, Bytes, ShellHash};
 use shell_storage::KvStore;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{decode_revert_reason, CallFrame, ShellStateDb};
 
@@ -53,9 +54,81 @@ pub struct ExecutionTrace {
     pub struct_logs: Vec<OpcodeTrace>,
 }
 
+/// Bounded access discovery; accesses in reverted frames are retained.
+pub(crate) struct AccessListCollector {
+    entries: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>,
+    excluded: BTreeSet<[u8; 32]>,
+    exceeded: bool,
+}
+
+impl AccessListCollector {
+    fn new(seed: &[shell_core::AccessListItem]) -> Self {
+        let mut collector = Self {
+            entries: BTreeMap::new(),
+            excluded: BTreeSet::new(),
+            exceeded: false,
+        };
+        for item in seed {
+            collector.account(item.address);
+            for key in &item.storage_keys {
+                collector.storage(item.address, *key);
+            }
+        }
+        collector
+    }
+
+    fn account(&mut self, address: Address) {
+        let address = *address.as_bytes();
+        if self.exceeded || self.excluded.contains(&address) || self.entries.contains_key(&address)
+        {
+            return;
+        }
+        if self.entries.len() >= shell_core::MAX_ACCESS_LIST_ENTRIES {
+            self.exceeded = true;
+            return;
+        }
+        self.entries.insert(address, BTreeSet::new());
+    }
+
+    fn storage(&mut self, address: Address, key: ShellHash) {
+        let address = *address.as_bytes();
+        let key = *key.as_bytes();
+        if self.exceeded {
+            return;
+        }
+        if !self.entries.contains_key(&address)
+            && self.entries.len() >= shell_core::MAX_ACCESS_LIST_ENTRIES
+        {
+            self.exceeded = true;
+            return;
+        }
+        let keys = self.entries.entry(address).or_default();
+        if !keys.contains(&key) && keys.len() >= shell_core::MAX_ACCESS_LIST_STORAGE_KEYS {
+            self.exceeded = true;
+            return;
+        }
+        keys.insert(key);
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<shell_core::AccessListItem>, String> {
+        if self.exceeded {
+            return Err("generated access list exceeds transaction access-list limits".into());
+        }
+        Ok(self
+            .entries
+            .into_iter()
+            .map(|(address, keys)| shell_core::AccessListItem {
+                address: Address::from(address),
+                storage_keys: keys.into_iter().map(ShellHash::from).collect(),
+            })
+            .collect())
+    }
+}
+
 /// Captures actual interpreter events without changing execution outcomes.
 pub(crate) struct ExecutionTracer {
     config: TraceConfig,
+    pub(crate) accesses: Option<AccessListCollector>,
     pub roots: Vec<CallFrame>,
     frames: Vec<CallFrame>,
     pub steps: Vec<OpcodeTrace>,
@@ -68,6 +141,7 @@ impl ExecutionTracer {
     pub fn new(config: TraceConfig) -> Self {
         Self {
             config,
+            accesses: None,
             roots: Vec::new(),
             frames: Vec::new(),
             steps: Vec::new(),
@@ -77,7 +151,27 @@ impl ExecutionTracer {
         }
     }
 
+    pub(crate) fn for_access_list(seed: &[shell_core::AccessListItem]) -> Self {
+        let mut tracer = Self::new(TraceConfig::default());
+        tracer.accesses = Some(AccessListCollector::new(seed));
+        tracer
+    }
+
+    pub(crate) fn exclude_access_list_accounts(
+        &mut self,
+        accounts: impl IntoIterator<Item = Address>,
+    ) {
+        if let Some(accesses) = &mut self.accesses {
+            accesses
+                .excluded
+                .extend(accounts.into_iter().map(|address| *address.as_bytes()));
+        }
+    }
+
     pub(crate) fn record_native_call(&mut self, frame: CallFrame) {
+        if self.accesses.is_some() {
+            return;
+        }
         let bytes = TRACE_RECORD_OVERHEAD
             .saturating_add(frame.input.len().saturating_mul(2))
             .saturating_add(
@@ -135,6 +229,10 @@ impl<S: KvStore + 'static, C> Inspector<ExecutionContext<'_, S, C>> for Executio
         ctx: &mut ExecutionContext<'_, S, C>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
+        if let Some(accesses) = &mut self.accesses {
+            accesses.account(ctx.db().resolve_address(&inputs.bytecode_address));
+            return None;
+        }
         if !self.reserve(TRACE_RECORD_OVERHEAD + inputs.input.len().saturating_mul(2)) {
             return None;
         }
@@ -161,7 +259,9 @@ impl<S: KvStore + 'static, C> Inspector<ExecutionContext<'_, S, C>> for Executio
         _inputs: &CallInputs,
         outcome: &mut CallOutcome,
     ) {
-        self.end(&outcome.result, None);
+        if self.accesses.is_none() {
+            self.end(&outcome.result, None);
+        }
     }
 
     fn create(
@@ -169,6 +269,9 @@ impl<S: KvStore + 'static, C> Inspector<ExecutionContext<'_, S, C>> for Executio
         ctx: &mut ExecutionContext<'_, S, C>,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
+        if self.accesses.is_some() {
+            return None;
+        }
         if !self.reserve(TRACE_RECORD_OVERHEAD + inputs.init_code().len().saturating_mul(2)) {
             return None;
         }
@@ -195,10 +298,31 @@ impl<S: KvStore + 'static, C> Inspector<ExecutionContext<'_, S, C>> for Executio
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
-        self.end(&outcome.result, outcome.address.map(Address::from));
+        if self.accesses.is_none() {
+            self.end(&outcome.result, outcome.address.map(Address::from));
+        }
     }
 
-    fn step(&mut self, interp: &mut Interpreter, _ctx: &mut ExecutionContext<'_, S, C>) {
+    fn step(&mut self, interp: &mut Interpreter, ctx: &mut ExecutionContext<'_, S, C>) {
+        if let Some(accesses) = &mut self.accesses {
+            let op = interp.bytecode.opcode();
+            if let Some(word) = interp.stack.data().last() {
+                if matches!(op, SLOAD | SSTORE) {
+                    let address = ctx.db().resolve_address(&interp.input.target_address);
+                    accesses.storage(address, ShellHash::from(word.to_be_bytes::<32>()));
+                } else if matches!(op, 0x31 | 0x3b | 0x3c | 0x3f) {
+                    let bytes = word.to_be_bytes::<32>();
+                    let address = if ctx.db().native_context_enabled() {
+                        Address::from(bytes)
+                    } else {
+                        ctx.db()
+                            .resolve_address(&alloy_primitives::Address::from_slice(&bytes[12..]))
+                    };
+                    accesses.account(address);
+                }
+            }
+            return;
+        }
         self.current_step = None;
         let stack_bytes = if self.config.disable_stack {
             0

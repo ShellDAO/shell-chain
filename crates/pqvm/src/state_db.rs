@@ -129,6 +129,10 @@ impl<S: KvStore + 'static> ShellStateDb<S> {
         self.native_context = Some(context);
     }
 
+    pub(crate) fn native_context_enabled(&self) -> bool {
+        self.native_context.is_some()
+    }
+
     pub(crate) fn clear_native_context(&mut self) {
         self.native_context = None;
     }
