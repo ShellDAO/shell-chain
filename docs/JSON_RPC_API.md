@@ -362,22 +362,31 @@ curl -s http://localhost:8545 \
 
 ## State Query Block Tags
 
-State-reading methods currently execute against the live world state only:
-`eth_getBalance`, `eth_getTransactionCount`, `eth_createAccessList`,
-`eth_getCode`, and `eth_getStorageAt` accept only `"latest"` or `"pending"` as
-their optional block tag. Historical state queries using `"earliest"`, `"safe"`,
-`"finalized"`, or a numeric block return `-32602` until historical state access is
-implemented.
+Unreleased node source supports `eth_getBalance`, `eth_getTransactionCount`,
+`eth_getCode`, `eth_getStorageAt`, `eth_call`, and `eth_createAccessList` against
+retained canonical state using `"earliest"`, `"safe"`, `"finalized"`, or a numeric
+block. Historical reads use the selected header's committed state root even
+when the block body has been pruned. Missing blocks, retained state, or historical
+contract bytecode return an error rather than current-state data or an empty
+contract. Queries do not write chain state; simulations discard all writes.
+
+`"latest"` and `"pending"` state reads retain their live-state behavior.
+`eth_getTransactionCount` with `"pending"` also includes contiguous queued
+transactions from the sender; historical nonce queries never include the pool.
+`"safe"` and `"finalized"` select the finalized cursor, while `"earliest"` selects
+genesis. Published binaries may still accept only `"latest"` and `"pending"`;
+verify the running version before using historical state reads.
+
+From a source checkout, run the isolated HTTP snapshot regression and the signed
+execution, independent import, pruning and fresh-process recovery regression:
+
+```bash
+cargo test -p shell-rpc historical_state_reads_http -- --nocapture
+cargo test -p shell-node --features rocksdb fee_history_rewards -- --nocapture
+```
 
 Block, receipt, log, and fee-history methods keep their documented historical
 block support.
-
-The unreleased source also supports historical `eth_call` against retained
-canonical state using `"earliest"`, `"safe"`, `"finalized"`, or a numeric block.
-Execution uses that block's state root and header; unavailable blocks or state
-return an error rather than current-state data. Simulations discard all writes.
-Released binaries may still accept only `"latest"` and `"pending"`; verify the
-running version before using historical calls.
 
 ---
 

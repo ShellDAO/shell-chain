@@ -673,12 +673,12 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         address: Address,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
-        let ws = self.world_state.read();
-        let balance = ws.get_balance(&address).map_err(internal_err)?;
-        Ok(hex_u256(balance))
+        self.read_state_at(block.as_deref(), |state| {
+            state
+                .get_balance(&address)
+                .map(hex_u256)
+                .map_err(internal_err)
+        })
     }
 
     async fn get_transaction_count(
@@ -687,12 +687,9 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
         let include_pending = matches!(block.as_deref(), Some("pending"));
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
-        let ws = self.world_state.read();
-        let mut nonce = ws.get_nonce(&address).map_err(internal_err)?;
-        drop(ws);
+        let mut nonce = self.read_state_at(block.as_deref(), |state| {
+            state.get_nonce(&address).map_err(internal_err)
+        })?;
         if include_pending {
             nonce = self.tx_pool.pending_nonce(&address, nonce);
         }
@@ -897,21 +894,18 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         address: Address,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
-        let ws = self.world_state.read();
-        let code_hash = ws.get_code_hash(&address).map_err(internal_err)?;
-        match code_hash {
-            Some(hash) => {
-                let code = self.chain_store.get_code(&hash).map_err(internal_err)?;
-                match code {
+        self.read_state_at(block.as_deref(), |state| {
+            match state.get_code_hash(&address).map_err(internal_err)? {
+                Some(hash) => match self.chain_store.get_code(&hash).map_err(internal_err)? {
                     Some(bytes) => Ok(hex_bytes(&bytes)),
-                    None => Ok("0x".into()),
-                }
+                    None if matches!(block.as_deref(), None | Some("latest" | "pending")) => {
+                        Ok("0x".into())
+                    }
+                    None => Err(internal_err("historical contract bytecode is unavailable")),
+                },
+                None => Ok("0x".into()),
             }
-            None => Ok("0x".into()),
-        }
+        })
     }
 
     async fn get_storage_at(
@@ -920,15 +914,12 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         position: String,
         block: Option<String>,
     ) -> Result<String, ErrorObjectOwned> {
-        if let Some(ref tag) = block {
-            validate_state_block_is_latest(tag)?;
-        }
         let key_u256 = parse_hex_u256(&position)?;
         let key = ShellHash::from(alloy_primitives::B256::from(key_u256));
-        let ws = self.world_state.read();
-        let value = ws.get_storage(&address, &key).map_err(internal_err)?;
-        // Return as zero-padded 32-byte hex string.
-        Ok(format!("0x{}", hex::encode(value.as_bytes())))
+        self.read_state_at(block.as_deref(), |state| {
+            let value = state.get_storage(&address, &key).map_err(internal_err)?;
+            Ok(format!("0x{}", hex::encode(value.as_bytes())))
+        })
     }
 
     async fn get_logs(

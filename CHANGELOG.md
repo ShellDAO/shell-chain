@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Read retained canonical balances, nonces, contract code and storage at historical
+  JSON-RPC block tags. Preserve live-state and pending-nonce behavior; reject
+  unavailable historical data instead of substituting current values. Share the
+  canonical header selection with historical call simulation.
+
+
 - Implement `shell_getBlockSigners` with actual proposer and quorum evidence.
   Retain authenticated signing keys and signatures outside the block hash,
   atomically with production, import and finality artifacts, so historical
