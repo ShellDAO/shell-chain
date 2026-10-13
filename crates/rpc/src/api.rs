@@ -576,6 +576,13 @@ pub trait ShellApi {
         &self,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns actual proposer and quorum signer evidence for a canonical block.
+    #[method(name = "getBlockSigners")]
+    async fn get_block_signers(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns the commit certificate (quorum signatures) for a finalized block.
     ///
     /// The certificate is a JSON object mapping validator address → signature hex.

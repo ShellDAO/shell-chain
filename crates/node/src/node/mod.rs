@@ -390,11 +390,6 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
         *live_ws = committed_world_state;
     }
 
-    fn put_side_fork_block(&self, block: &Block) -> Result<(), NodeError> {
-        self.chain_store.put_side_fork_block(block)?;
-        Ok(())
-    }
-
     fn side_fork_count(&self, block_number: u64) -> usize {
         self.chain_store
             .get_side_fork_hashes(block_number)
@@ -2550,6 +2545,267 @@ mod tests {
             .get_block_by_hash(&side_fork_hash)
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn block_signers_http_production_import_pruning_and_current_key_change() {
+        for signer in [
+            Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+            Box::new(shell_crypto::MlDsaSigner::generate()) as Box<dyn Signer>,
+        ] {
+            let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let node = setup_node_with_authority(address);
+            let follower = setup_node_with_authority(address);
+            for peer in [&node, &follower] {
+                peer.register_authority_pubkey(address, signer.public_key().to_vec());
+                store_consistent_genesis(peer);
+            }
+            let block = node.produce_block(signer.as_ref(), 0).unwrap();
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let votes = HashMap::from([(address, signer.sign(block.hash().as_bytes()).unwrap())]);
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&votes).unwrap();
+            let rogue = DilithiumSigner::generate();
+            let rogue_address =
+                Address::from_public_key(rogue.public_key(), rogue.sig_type().as_u8());
+            let mut non_validator = votes.clone();
+            non_validator.insert(rogue_address, rogue.sign(block.hash().as_bytes()).unwrap());
+            let rejected = Node::<MemoryDb>::encode_commit_certificate(&non_validator).unwrap();
+            let before = node.store.scan_prefix(b"").unwrap();
+            assert!(!node.fast_finalize_with_certificate(1, block.hash(), &rejected));
+            assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+            let mut round = WPoaRound::new(1, 0, node.consensus.read().validator_weights());
+            let _ = round.on_block_proposed(block.hash(), address);
+            *node.wpoa_round.lock() = Some(round);
+            assert!(node
+                .handle_wpoa_vote(address, block.hash(), 1, votes[&address].clone())
+                .is_some());
+            assert_eq!(node.finality.read().last_finalized_number(), 1);
+            for peer in [&node, &follower] {
+                assert!(peer.fast_finalize_with_certificate(
+                    block.number(),
+                    block.hash(),
+                    &certificate
+                ));
+                let records = peer.chain_store.get_block_signers(&block.hash()).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].public_key, signer.public_key());
+                assert_eq!(records[0].signature, votes[&address]);
+                assert_eq!(current_state_root(peer), block.header.state_root);
+            }
+            let later = node.produce_block(signer.as_ref(), 0).unwrap();
+            follower
+                .import_block(later.clone(), &MultiVerifier)
+                .unwrap();
+            let replacement = DilithiumSigner::generate();
+            for peer in [&node, &follower] {
+                // A changed live lookup must not replace the historical signing key.
+                peer.chain_store
+                    .put_pubkey(&address, replacement.public_key())
+                    .unwrap();
+                peer.chain_store.delete_body(&block.hash()).unwrap();
+                let before = peer.store.scan_prefix(b"").unwrap();
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let server = shell_rpc::start_rpc_server(
+                    shell_rpc::RpcConfig {
+                        listen_addr: "127.0.0.1:0".parse().unwrap(),
+                        ws_addr: None,
+                        ..shell_rpc::RpcConfig::default()
+                    },
+                    Arc::clone(&peer.chain_store),
+                    Arc::clone(&peer.world_state),
+                    Arc::clone(&peer.tx_pool),
+                    1337,
+                    None,
+                    events,
+                    None,
+                    None,
+                    Arc::new(RwLock::new(1)),
+                    Arc::clone(&peer.finality),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    None,
+                    None,
+                    Some(Arc::clone(&peer.witness_store)),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let endpoint = server.http_addr;
+                for (tag, number) in [
+                    ("0x1", 1),
+                    ("safe", 1),
+                    ("finalized", 1),
+                    ("latest", 2),
+                    ("pending", 2),
+                ] {
+                    let response = native_http_request(
+                        endpoint,
+                        "shell_getBlockSigners",
+                        serde_json::json!([tag]),
+                    )
+                    .await;
+                    assert!(response.get("error").is_none(), "{response}");
+                    let result = &response["result"];
+                    assert_eq!(
+                        *result,
+                        serde_json::json!({
+                            "blockNumber":format!("0x{number:x}"),
+                            "signers":[{"address":address,
+                                "pqPubkey":format!("0x{}",hex::encode(signer.public_key())),
+                                "signatureValid":true}],
+                        })
+                    );
+                }
+                let genesis = native_http_request(
+                    endpoint,
+                    "shell_getBlockSigners",
+                    serde_json::json!(["earliest"]),
+                )
+                .await;
+                assert_eq!(genesis["result"]["signers"], serde_json::json!([]));
+                for (tag, code) in [("invalid", -32602), ("0x99", -32001)] {
+                    let response = native_http_request(
+                        endpoint,
+                        "shell_getBlockSigners",
+                        serde_json::json!([tag]),
+                    )
+                    .await;
+                    assert_eq!(response["error"]["code"], code);
+                }
+                assert_eq!(peer.store.scan_prefix(b"").unwrap(), before);
+                // Corrupt the actual certificate, retaining its original signing key.
+                let mut corrupt = votes.clone();
+                corrupt.get_mut(&address).unwrap().data[0] ^= 1;
+                peer.chain_store
+                    .set_commit_certificate(
+                        &block.hash(),
+                        &Node::<MemoryDb>::encode_commit_certificate(&corrupt).unwrap(),
+                    )
+                    .unwrap();
+                let checkpoint = peer.store.scan_prefix(b"").unwrap();
+                let response = native_http_request(
+                    endpoint,
+                    "shell_getBlockSigners",
+                    serde_json::json!(["0x1"]),
+                )
+                .await;
+                assert_eq!(response["result"]["signers"][0]["signatureValid"], false);
+                assert_eq!(peer.store.scan_prefix(b"").unwrap(), checkpoint);
+                server.http_handle.stop().unwrap();
+                server.http_handle.stopped().await;
+            }
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn block_signers_survive_body_pruning_and_process_exit() {
+        const DIRECTORY: &str = "SHELL_TEST_BLOCK_SIGNERS_DIRECTORY";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let (leader, signer) = setup_node();
+            let address = leader.config.proposer_address.unwrap();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let follower = setup_node_with_store(address, Arc::new(stores.state));
+            leader.register_authority_pubkey(address, signer.public_key().to_vec());
+            store_consistent_genesis(&leader);
+            follower.register_authority_pubkey(address, signer.public_key().to_vec());
+            store_consistent_genesis(&follower);
+            let block = leader.produce_block(&signer, 0).unwrap();
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                address,
+                signer.sign(block.hash().as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            assert!(follower.fast_finalize_with_certificate(1, block.hash(), &cert));
+            let later = leader.produce_block(&signer, 0).unwrap();
+            follower
+                .import_block(later.clone(), &MultiVerifier)
+                .unwrap();
+            follower.chain_store.delete_body(&block.hash()).unwrap();
+            follower
+                .chain_store
+                .put_pubkey(&address, DilithiumSigner::generate().public_key())
+                .unwrap();
+            std::fs::write(directory.join("fixture.json"),serde_json::to_vec(&serde_json::json!({
+                "address":address,"pqPubkey":format!("0x{}",hex::encode(signer.public_key())),
+                "finalizedHash":block.hash(),"headHash":later.hash(),"root":later.header.state_root,
+            })).unwrap()).unwrap();
+            // Skip destructors: recovery must read the actual WAL in a new process.
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "shell-block-signers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::block_signers_survive_body_pruning_and_process_exit",
+                "--nocapture",
+            ])
+            .env(DIRECTORY, &directory)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap())
+                .unwrap();
+        {
+            let address: Address = serde_json::from_value(fixture["address"].clone()).unwrap();
+            let stores = shell_storage::RocksDbStore::open_all(directory.join("db"), None).unwrap();
+            let store = Arc::new(stores.state);
+            let (node, _stores) = crate::builder::NodeBuilder::new(NodeConfig::dev(address), store)
+                .build()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(current_state_root(&node)).unwrap(),
+                fixture["root"]
+            );
+            assert_eq!(
+                serde_json::to_value(node.chain_store.get_head_hash().unwrap().unwrap()).unwrap(),
+                fixture["headHash"]
+            );
+            assert_eq!(node.finality.read().last_finalized_number(), 1);
+            assert_eq!(
+                serde_json::to_value(node.finality.read().last_finalized_hash()).unwrap(),
+                fixture["finalizedHash"]
+            );
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let server = shell_rpc::start_rpc_server(
+                    shell_rpc::RpcConfig{listen_addr:"127.0.0.1:0".parse().unwrap(),ws_addr:None,..Default::default()},
+                    Arc::clone(&node.chain_store),Arc::clone(&node.world_state),Arc::clone(&node.tx_pool),
+                    1337,None,events,None,None,Arc::new(RwLock::new(1)),Arc::clone(&node.finality),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),None,None,
+                    Some(Arc::clone(&node.witness_store)),None,None,None,
+                ).await.unwrap();
+                let before = node.store.scan_prefix(b"").unwrap();
+                for (tag,number) in [("0x1",1),("finalized",1),("safe",1),("latest",2)] {
+                    let result = native_http_request(server.http_addr,"shell_getBlockSigners",serde_json::json!([tag])).await;
+                    assert_eq!(result["result"],serde_json::json!({
+                        "blockNumber":format!("0x{number:x}"),"signers":[{
+                            "address":fixture["address"],"pqPubkey":fixture["pqPubkey"],"signatureValid":true
+                        }]
+                    }));
+                }
+                assert_eq!(node.store.scan_prefix(b"").unwrap(),before);
+                server.http_handle.stop().unwrap();server.http_handle.stopped().await;
+            });
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8538,7 +8794,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rocksdb")]
     async fn native_http_request(
         address: std::net::SocketAddr,
         method: &str,

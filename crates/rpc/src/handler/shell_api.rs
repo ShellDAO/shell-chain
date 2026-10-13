@@ -1007,6 +1007,124 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         }))
     }
 
+    async fn get_block_signers(
+        &self,
+        block: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        use shell_crypto::Verifier;
+        let hash = match self.parse_block_number(&block)? {
+            Some(number) => self.chain_store.get_block_hash_by_number(number),
+            None => self.chain_store.get_head_hash(),
+        }
+        .map_err(internal_err)?
+        .ok_or_else(|| crate::error::not_found("block not found"))?;
+        let header = self
+            .chain_store
+            .get_header_by_hash(&hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| crate::error::not_found("block header not found"))?;
+        let mut records = std::collections::BTreeMap::new();
+        let mut proof_signers = std::collections::BTreeSet::from([header.proposer.to_string()]);
+        for record in self
+            .chain_store
+            .get_block_signers(&hash)
+            .map_err(internal_err)?
+        {
+            records.insert(record.address.to_string(), record);
+        }
+        // Legacy intact bodies can still supply proposer evidence. Only a key
+        // whose identity matches the signer can stand in for a retained key.
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            records.entry(header.proposer.to_string())
+        {
+            if let Some(seal) = self
+                .chain_store
+                .get_block_by_hash(&hash)
+                .map_err(internal_err)?
+                .and_then(|block| block.proposer_seal)
+            {
+                let public_key = self
+                    .chain_store
+                    .get_pubkey(&header.proposer)
+                    .map_err(internal_err)?
+                    .ok_or_else(|| {
+                        crate::error::server_error("proposer signing key unavailable")
+                    })?;
+                if Address::from_public_key(&public_key, seal.sig_type.as_u8()) != header.proposer {
+                    return Err(crate::error::server_error(
+                        "historical proposer signing key unavailable",
+                    ));
+                }
+                entry.insert(shell_core::BlockSignerEvidence {
+                    address: header.proposer,
+                    public_key,
+                    signature: seal,
+                });
+            }
+        }
+        if let Some(bytes) = self
+            .chain_store
+            .get_commit_certificate(&hash)
+            .map_err(internal_err)?
+        {
+            let signatures = decode_block_signer_certificate(&bytes)?;
+            for (address, signature) in signatures {
+                proof_signers.insert(address.to_string());
+                let record = match records.entry(address.to_string()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let public_key = self
+                            .chain_store
+                            .get_pubkey(&address)
+                            .map_err(internal_err)?
+                            .ok_or_else(|| {
+                                crate::error::server_error("quorum signer key unavailable")
+                            })?;
+                        if Address::from_public_key(&public_key, signature.sig_type.as_u8())
+                            != address
+                        {
+                            return Err(crate::error::server_error(
+                                "historical quorum signer key unavailable",
+                            ));
+                        }
+                        entry.insert(shell_core::BlockSignerEvidence {
+                            address,
+                            public_key,
+                            signature: signature.clone(),
+                        })
+                    }
+                };
+                // Verify the actual certificate bytes even when a retained
+                // key exists, so a corrupt certificate cannot inherit a verdict.
+                record.signature = signature;
+            }
+        }
+        if header.number != 0 && !records.contains_key(&header.proposer.to_string()) {
+            return Err(crate::error::server_error(
+                "proposer signing evidence unavailable",
+            ));
+        }
+        records.retain(|address, _| proof_signers.contains(address));
+        let signers: Vec<_> = records
+            .into_values()
+            .map(|record| {
+                let bound =
+                    Address::from_public_key(&record.public_key, record.signature.sig_type.as_u8())
+                        == record.address;
+                let signature_valid = bound
+                    && shell_crypto::MultiVerifier
+                        .verify(&record.public_key, hash.as_bytes(), &record.signature)
+                        .unwrap_or(false);
+                serde_json::json!({
+                    "address":record.address,
+                    "pqPubkey":format!("0x{}",hex::encode(record.public_key)),
+                    "signatureValid":signature_valid,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"blockNumber":hex_u64(header.number),"signers":signers}))
+    }
+
     async fn finality_proof(
         &self,
         block_hash: ShellHash,
@@ -1741,6 +1859,33 @@ fn parse_optional_hex_bytes(
         )));
     }
     hex::decode(hex).map_err(|e| invalid_params(format!("{field} invalid hex: {e}")))
+}
+
+fn decode_block_signer_certificate(
+    bytes: &[u8],
+) -> Result<Vec<(Address, shell_crypto::PQSignature)>, ErrorObjectOwned> {
+    let raw: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(bytes).map_err(internal_err)?;
+    raw.into_iter()
+        .map(|(raw_address, value)| {
+            let address = raw_address
+                .strip_prefix("Address(")
+                .and_then(|value| value.strip_suffix(')'))
+                .unwrap_or(&raw_address)
+                .parse::<Address>()
+                .map_err(internal_err)?;
+            let signature = if let Some(encoded) = value.as_str() {
+                shell_crypto::PQSignature::new(
+                    shell_crypto::SignatureType::Dilithium3,
+                    hex::decode(encoded.strip_prefix("0x").unwrap_or(encoded))
+                        .map_err(internal_err)?,
+                )
+            } else {
+                serde_json::from_value(value).map_err(internal_err)?
+            };
+            Ok((address, signature))
+        })
+        .collect()
 }
 
 fn resolve_witness_block<S: KvStore + 'static>(

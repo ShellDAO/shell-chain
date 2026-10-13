@@ -1185,10 +1185,36 @@ local node has no certificate for the requested hash.
 
 Returns the post-quantum signature details for validators who signed a specific block.
 
+Unreleased node source implements this method using authenticated proposer and
+quorum signing evidence. It retains the signing public keys and signatures
+separately from the header, so block hashes and consensus messages are unchanged.
+Retained evidence remains queryable after body pruning and changes to the live
+key lookup. `signatureValid` checks the actual signature against the captured
+block hash and the native signer identity; it reports historical cryptographic
+validity, independent of whether that algorithm may accept new transactions now.
+
+Legacy intact blocks and certificates remain queryable when the matching
+identity-bound key is available. Missing historical keys or proposer evidence
+return an error; current rotated keys are never substituted. Genesis without
+signatures returns an empty signer list. Invalid block tags and missing blocks
+are rejected. The query does not change chain state. Published node versions
+must be verified before relying on this method.
+
+From a source checkout, run the self-contained production, import, HTTP,
+pruning and fresh-process recovery regression:
+
+```bash
+cargo test -p shell-node --features rocksdb block_signers -- --nocapture
+```
+
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Block number (hex) or block tag |
+
+Tags select stored canonical headers: `latest` and `pending` use the current
+head, `safe` and `finalized` use the finalized cursor, and `earliest` selects
+genesis. The method does not fabricate signatures for an unsealed candidate.
 
 **Returns:**
 ```json
@@ -1196,12 +1222,17 @@ Returns the post-quantum signature details for validators who signed a specific 
   "blockNumber": "0x1a",
   "signers": [
     {
-      "address": "0x...",
+      "address": "0x<64 lowercase hex>",
       "pqPubkey": "0x...",
       "signatureValid": true
     }
   ]
 }
+```
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getBlockSigners","params":["latest"],"id":1}'
 ```
 
 ---
