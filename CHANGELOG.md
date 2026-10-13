@@ -6,9 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Default full-range address-history queries and v2 exact totals no longer reject
+  spans above 10,000 blocks. Native MemoryDb and RocksDB stream the existing
+  forward index, retaining query memory proportional to the requested page.
+  Counts and ordering remain compatible with forward-only older indexes without
+  migrations or query writes. Range/early-stop/error, deep-page, wide HTTP,
+  unchanged-state and disk-reopen regressions cover the shared path.
+
 - Address history queries no longer reject legacy page offsets above 10,000.
   Pages past the exact range total return an empty list without truncating large
-  offsets; integer overflow and existing exact-total range checks remain errors.
+  offsets; integer overflow remains an error.
   Real indexed-transaction HTTP coverage checks deep sender/recipient ordering,
   inclusive range bounds, preserved metadata and unchanged chain state.
 

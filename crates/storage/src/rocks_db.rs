@@ -30,7 +30,7 @@ use rocksdb::{
     DBCompressionType, DBWithThreadMode, MultiThreaded, Options, WriteBatch as RocksWriteBatch,
 };
 
-use crate::kv_store::{saturating_entry_len, EntryVisitor};
+use crate::kv_store::{prefix_range_bounds, saturating_entry_len, EntryVisitor, RangeEntryVisitor};
 use crate::{KvStore, StorageError, WriteBatch, WriteBatchOp};
 
 /// Column family names used by shell-chain.
@@ -464,6 +464,54 @@ impl KvStore for RocksDbStore {
         Ok(entries)
     }
 
+    fn visit_prefix_range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        visitor: &mut RangeEntryVisitor<'_>,
+    ) -> Result<(), StorageError> {
+        let (start, end) = prefix_range_bounds(prefix, start, end);
+        if end.as_ref().is_some_and(|end| &start >= end) {
+            return Ok(());
+        }
+        let cf = self.cf();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange(prefix));
+        let mode = if reverse {
+            end.as_ref().map_or(rocksdb::IteratorMode::End, |end| {
+                rocksdb::IteratorMode::From(end, rocksdb::Direction::Reverse)
+            })
+        } else {
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward)
+        };
+        for item in self.db.iterator_cf_opt(&cf, opts, mode) {
+            let (key, value) = item.map_err(|e| StorageError::Database(e.to_string()))?;
+            if reverse
+                && end
+                    .as_ref()
+                    .is_some_and(|end| key.as_ref() >= end.as_slice())
+            {
+                continue;
+            }
+            if !key.starts_with(prefix) || key.as_ref() < start.as_slice() {
+                break;
+            }
+            if !reverse
+                && end
+                    .as_ref()
+                    .is_some_and(|end| key.as_ref() >= end.as_slice())
+            {
+                break;
+            }
+            if !visitor(&key, &value)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn prefix_size_bytes(&self, prefix: &[u8]) -> Result<u64, StorageError> {
         let cf = self.cf();
         let mut opts = rocksdb::ReadOptions::default();
@@ -559,10 +607,43 @@ mod tests {
     }
 
     #[test]
+    fn address_history_range_visit_contract() {
+        let (_dir, stores) = open_temp();
+        let store = stores.chain;
+        crate::kv_store::assert_address_history_range_visit(&store);
+    }
+
+    #[test]
     fn address_history_range_scan_contract() {
         let (_dir, stores) = open_temp();
         let store = stores.chain;
         crate::kv_store::assert_address_history_range_scan(&store);
+    }
+
+    #[test]
+    fn address_history_forward_only_wide_range_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let stores = RocksDbStore::open_all(dir.path(), None).unwrap();
+            crate::chain_store::assert_forward_address_history(std::sync::Arc::new(stores.chain));
+        }
+        {
+            let stores = RocksDbStore::open_all(dir.path(), None).unwrap();
+            let store = std::sync::Arc::new(stores.chain);
+            let before = store.scan_prefix(b"").unwrap();
+            let chain = crate::ChainStore::new(store.clone());
+            let address = shell_primitives::Address::from([0x67; 32]);
+            assert_eq!(chain.count_txs_by_address(&address, 0, 15_000).unwrap(), 6);
+            assert_eq!(
+                chain.get_txs_by_address(&address, 0, 15_000, 0, 2).unwrap(),
+                vec![
+                    shell_primitives::ShellHash::from([8; 32]),
+                    shell_primitives::ShellHash::from([3; 32])
+                ]
+            );
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+            assert!(store.scan_prefix(b"ar/").unwrap().is_empty());
+        }
     }
 
     #[test]

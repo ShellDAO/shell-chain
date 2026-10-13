@@ -1,25 +1,8 @@
 use super::*;
 
-const MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE: u64 = 10_000;
 const DEFAULT_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 200;
 const MAX_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 1000;
 const MAX_OPTIONAL_RPC_BYTE_FIELD_LEN: usize = 32 * 1024;
-
-fn ensure_exact_address_total_allowed(
-    from_block: u64,
-    to_block: u64,
-) -> Result<(), ErrorObjectOwned> {
-    if from_block > to_block {
-        return Ok(());
-    }
-    let range = to_block.saturating_sub(from_block).saturating_add(1);
-    if range > MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE {
-        return Err(invalid_params_err(format!(
-            "exact address transaction totals are limited to {MAX_EXACT_ADDRESS_TOTAL_BLOCK_RANGE} blocks; use cursor pagination with includeTotal=false for wider ranges"
-        )));
-    }
-    Ok(())
-}
 
 fn normalize_validator_snapshot_proposer_window(
     proposer_window: Option<u64>,
@@ -172,7 +155,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             }
         }
         let total = if options.include_total.unwrap_or(false) {
-            ensure_exact_address_total_allowed(from_block, to_block)?;
             Some(
                 self.chain_store
                     .count_txs_by_address(&address, from_block, to_block)
@@ -1326,7 +1308,6 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let offset = page
             .checked_mul(limit)
             .ok_or_else(|| invalid_params_err("page * limit overflow"))?;
-        ensure_exact_address_total_allowed(from, to)?;
         let total = self
             .chain_store
             .count_txs_by_address(&address, from, to)

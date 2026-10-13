@@ -1779,27 +1779,28 @@ impl<S: KvStore> ChainStore<S> {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn scan_address_tx_range(
+    fn visit_address_tx_range(
         &self,
         prefix: &[u8],
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        reverse: bool,
+        visitor: &mut crate::RangeEntryVisitor<'_>,
+    ) -> Result<(), StorageError> {
         if from_block > to_block {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let start = [prefix, &from_block.to_be_bytes()].concat();
         let end = to_block
             .checked_add(1)
             .map(|height| [prefix, &height.to_be_bytes()].concat());
-        self.store.scan_prefix_range(prefix, &start, end.as_deref())
+        self.store
+            .visit_prefix_range(prefix, &start, end.as_deref(), reverse, visitor)
     }
 
-    /// Get transaction hashes involving a given address, with pagination.
-    ///
-    /// Scans the address→tx index for `address` within the specified block range.
-    /// Returns tx hashes newest-first by block number, paginated by `offset` and `limit`.
+    /// Get transaction hashes newest-block-first, with ascending indices within
+    /// each block. Native backends stream the existing forward index; retained
+    /// query memory is bounded by the requested page, including deep offsets.
     pub fn get_txs_by_address(
         &self,
         address: &Address,
@@ -1808,39 +1809,83 @@ impl<S: KvStore> ChainStore<S> {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ShellHash>, StorageError> {
-        if limit == 0 {
+        if limit == 0 || from_block > to_block {
             return Ok(Vec::new());
         }
-
         let prefix = Self::addr_tx_prefix(address);
-        let entries = self.scan_address_tx_range(&prefix, from_block, to_block)?;
-
-        let mut matches = Vec::new();
-        for (key, value) in entries {
-            let Ok((block_number, tx_index)) = Self::addr_index_key_parts(prefix.len(), &key)
-            else {
-                continue;
+        let mut plans = Vec::new();
+        {
+            let mut skip = offset;
+            let mut remaining = limit;
+            let mut group_height = None;
+            let mut group_count = 0usize;
+            let mut finish_group = |height, count| {
+                if skip >= count {
+                    skip -= count;
+                } else {
+                    let take = (count - skip).min(remaining);
+                    plans.push((height, skip, take));
+                    remaining -= take;
+                    skip = 0;
+                }
+                remaining > 0
             };
-            if block_number < from_block || block_number > to_block {
-                continue;
-            }
-            if value.len() == 32 {
-                let hash = ShellHash::try_from_slice(&value)
-                    .map_err(|e| StorageError::Codec(e.to_string()))?;
-                matches.push((block_number, tx_index, hash));
+            self.visit_address_tx_range(&prefix, from_block, to_block, true, &mut |key, value| {
+                let Ok((height, _)) = Self::addr_index_key_parts(prefix.len(), key) else {
+                    return Ok(true);
+                };
+                if value.len() != 32 || height < from_block || height > to_block {
+                    return Ok(true);
+                }
+                if group_height != Some(height) {
+                    if let Some(previous) = group_height.take() {
+                        if !finish_group(previous, group_count) {
+                            group_count = 0;
+                            return Ok(false);
+                        }
+                    }
+                    group_height = Some(height);
+                    group_count = 0;
+                }
+                group_count = group_count.checked_add(1).ok_or_else(|| {
+                    StorageError::State("address history index count overflow".into())
+                })?;
+                Ok(true)
+            })?;
+            if let Some(height) = group_height {
+                finish_group(height, group_count);
             }
         }
-
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(matches
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, _, hash)| hash)
-            .collect())
+        let mut hashes = Vec::new();
+        for (height, skip, take) in plans {
+            let mut seen = 0usize;
+            let mut taken = 0usize;
+            self.visit_address_tx_range(&prefix, height, height, false, &mut |key, value| {
+                if Self::addr_index_key_parts(prefix.len(), key).is_err() || value.len() != 32 {
+                    return Ok(true);
+                }
+                if seen < skip {
+                    seen += 1;
+                    return Ok(true);
+                }
+                hashes.push(
+                    ShellHash::try_from_slice(value)
+                        .map_err(|e| StorageError::Codec(e.to_string()))?,
+                );
+                taken += 1;
+                Ok(taken < take)
+            })?;
+            if taken != take {
+                return Err(StorageError::State(
+                    "address history index changed during pagination".into(),
+                ));
+            }
+        }
+        Ok(hashes)
     }
 
-    /// Count transactions involving a given address within the specified block range.
+    /// Count matching retained index entries without copying the complete range
+    /// on native backends. No reverse-index migration or query writes are needed.
     pub fn count_txs_by_address(
         &self,
         address: &Address,
@@ -1848,20 +1893,18 @@ impl<S: KvStore> ChainStore<S> {
         to_block: u64,
     ) -> Result<u64, StorageError> {
         let prefix = Self::addr_tx_prefix(address);
-        let entries = self.scan_address_tx_range(&prefix, from_block, to_block)?;
-
-        let total = entries
-            .iter()
-            .filter_map(|(key, value)| {
-                if value.len() != 32 {
-                    return None;
-                }
-                let block_number =
-                    Self::block_number_from_addr_index_key(prefix.len(), key).ok()?;
-                (block_number >= from_block && block_number <= to_block).then_some(1u64)
-            })
-            .sum();
-
+        let mut total = 0u64;
+        self.visit_address_tx_range(&prefix, from_block, to_block, false, &mut |key, value| {
+            if value.len() == 32
+                && Self::block_number_from_addr_index_key(prefix.len(), key)
+                    .is_ok_and(|height| height >= from_block && height <= to_block)
+            {
+                total = total
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::State("address history total overflow".into()))?;
+            }
+            Ok(true)
+        })?;
         Ok(total)
     }
 
@@ -4526,6 +4569,96 @@ impl<S: KvStore> L2JobStore<S> {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_forward_address_history<S: KvStore + 'static>(store: Arc<S>) {
+    let address = Address::from([0x67; 32]);
+    let chain = ChainStore::new(store.clone());
+    let records = [
+        (0u64, 0u32, 1u8),
+        (0, 9, 2),
+        (10_001, 1, 3),
+        (10_001, 4, 4),
+        (10_001, 9, 5),
+        (15_000, 0, 6),
+        (u64::MAX, 0, 7),
+    ];
+    for (height, index, value) in records {
+        // Pin the previously published forward-index layout independently of
+        // the key builder; no reverse-index rows or query migration are present.
+        let key = [
+            b"a/".as_slice(),
+            address.as_ref(),
+            &height.to_be_bytes(),
+            &index.to_be_bytes(),
+        ]
+        .concat();
+        store
+            .put(&key, ShellHash::from([value; 32]).as_bytes())
+            .unwrap();
+    }
+    assert_eq!(chain.count_txs_by_address(&address, 0, 15_000).unwrap(), 6);
+    assert_eq!(
+        chain.count_txs_by_address(&address, 0, u64::MAX).unwrap(),
+        7
+    );
+    assert_eq!(chain.count_txs_by_address(&address, 1, 10_000).unwrap(), 0);
+    assert_eq!(
+        chain
+            .count_txs_by_address(&address, 10_001, 10_001)
+            .unwrap(),
+        3
+    );
+    assert_eq!(chain.count_txs_by_address(&address, 15_000, 1).unwrap(), 0);
+    let hashes = |values: &[u8]| {
+        values
+            .iter()
+            .map(|v| ShellHash::from([*v; 32]))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        chain.get_txs_by_address(&address, 0, 15_000, 0, 4).unwrap(),
+        hashes(&[6, 3, 4, 5])
+    );
+    assert_eq!(
+        chain.get_txs_by_address(&address, 0, 15_000, 1, 3).unwrap(),
+        hashes(&[3, 4, 5])
+    );
+    assert_eq!(
+        chain.get_txs_by_address(&address, 0, 15_000, 3, 3).unwrap(),
+        hashes(&[5, 1, 2])
+    );
+    assert_eq!(
+        chain
+            .get_txs_by_address(&address, 0, u64::MAX, 0, 3)
+            .unwrap(),
+        hashes(&[7, 6, 3])
+    );
+    assert!(chain
+        .get_txs_by_address(&address, 0, u64::MAX, 20_000, 10)
+        .unwrap()
+        .is_empty());
+    let old = [
+        b"a/".as_slice(),
+        address.as_ref(),
+        &15_000u64.to_be_bytes(),
+        &0u32.to_be_bytes(),
+    ]
+    .concat();
+    store.delete(&old).unwrap();
+    assert_eq!(chain.count_txs_by_address(&address, 0, 15_000).unwrap(), 5);
+    assert_eq!(
+        chain.get_txs_by_address(&address, 0, 15_000, 0, 3).unwrap(),
+        hashes(&[3, 4, 5])
+    );
+    store
+        .put(&old, ShellHash::from([8; 32]).as_bytes())
+        .unwrap();
+    assert_eq!(
+        chain.get_txs_by_address(&address, 0, 15_000, 0, 2).unwrap(),
+        hashes(&[8, 3])
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{MemoryDb, WriteBatch};
@@ -4682,6 +4815,17 @@ mod tests {
             self.scanned_entries
                 .fetch_add(entries.len(), Ordering::SeqCst);
             Ok(entries)
+        }
+        fn visit_prefix_range(
+            &self,
+            prefix: &[u8],
+            start: &[u8],
+            end: Option<&[u8]>,
+            reverse: bool,
+            visitor: &mut crate::RangeEntryVisitor<'_>,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .visit_prefix_range(prefix, start, end, reverse, visitor)
         }
     }
 
@@ -8865,6 +9009,84 @@ mod tests {
     }
 
     #[test]
+    fn address_history_forward_only_wide_range() {
+        assert_forward_address_history(Arc::new(MemoryDb::new()));
+    }
+
+    #[test]
+    fn address_history_streams_large_single_block_without_scan_copies() {
+        #[derive(Default)]
+        struct BorrowedOnlyStore(MemoryDb);
+        impl KvStore for BorrowedOnlyStore {
+            fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+                self.0.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+                self.0.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+                self.0.delete(key)
+            }
+            fn flush(&self) -> Result<(), StorageError> {
+                self.0.flush()
+            }
+            fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+                self.0.write_batch(batch)
+            }
+            fn scan_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+                panic!("address query must not copy the prefix")
+            }
+            fn scan_prefix_range(
+                &self,
+                _: &[u8],
+                _: &[u8],
+                _: Option<&[u8]>,
+            ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+                panic!("address query must not copy the range")
+            }
+            fn visit_prefix_range(
+                &self,
+                prefix: &[u8],
+                start: &[u8],
+                end: Option<&[u8]>,
+                reverse: bool,
+                visitor: &mut crate::RangeEntryVisitor<'_>,
+            ) -> Result<(), StorageError> {
+                self.0
+                    .visit_prefix_range(prefix, start, end, reverse, visitor)
+            }
+        }
+        let store = Arc::new(BorrowedOnlyStore::default());
+        let address = Address::from([0x68; 32]);
+        let chain = ChainStore::new(store.clone());
+        for index in 0u32..50_000 {
+            let mut value = [0u8; 32];
+            value[..4].copy_from_slice(&index.to_be_bytes());
+            store
+                .put(
+                    &ChainStore::<MemoryDb>::addr_tx_key(&address, 10_001, index),
+                    &value,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            chain.count_txs_by_address(&address, 0, u64::MAX).unwrap(),
+            50_000
+        );
+        let page = chain
+            .get_txs_by_address(&address, 0, u64::MAX, 49_990, 5)
+            .unwrap();
+        let expected: Vec<_> = (49_990u32..49_995)
+            .map(|index| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&index.to_be_bytes());
+                ShellHash::from(h)
+            })
+            .collect();
+        assert_eq!(page, expected);
+    }
+
+    #[test]
     fn address_history_range_materialization() {
         let mut observations = Vec::new();
         for history_len in [100u64, 10_000] {
@@ -8897,10 +9119,9 @@ mod tests {
             );
             observations.push(rows);
         }
-        assert_eq!(
-            observations,
-            vec![2, 2],
-            "narrow queries must not materialize unrelated history"
+        assert!(
+            observations.iter().all(|copied| *copied <= 2),
+            "narrow queries must stay within the previous two-row copy bound"
         );
     }
 

@@ -23,7 +23,7 @@ pub use chain_store::{
     MIN_RECOVERY_TIMELOCK,
 };
 pub use error::StorageError;
-pub use kv_store::{EntryVisitor, KvStore, WriteBatch, WriteBatchOp};
+pub use kv_store::{EntryVisitor, KvStore, RangeEntryVisitor, WriteBatch, WriteBatchOp};
 pub use memory_db::MemoryDb;
 pub use merkle_trie::MerkleTrie;
 pub use overlay_store::OverlayStore;
