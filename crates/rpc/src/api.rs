@@ -342,6 +342,15 @@ pub trait LegacyEvmApi {
 /// Shell-chain extension API for PQ-specific features.
 #[rpc(server, namespace = "shell")]
 pub trait ShellApi {
+    /// Verifies a raw ML-DSA-65 or legacy Dilithium3 signature against its message and key.
+    #[method(name = "verifyPqSignature")]
+    async fn verify_pq_signature(
+        &self,
+        message: String,
+        signature: String,
+        pubkey: String,
+    ) -> Result<bool, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns the registered PQ public key for an address.
     #[method(name = "getPqPubkey")]
     async fn get_pq_pubkey(

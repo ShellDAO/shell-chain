@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (47 methods)
+- **`shell_`** (48 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -397,6 +397,13 @@ the selected snapshot and any snapshots created after it.
 
 
 ## shell_  namespace
+
+### shell_verifyPqSignature
+```
+verify_pq_signature(message: String, signature: String, pubkey: String, ) → bool
+```
+
+Verifies a raw ML-DSA-65 or legacy Dilithium3 signature against its message and key.
 
 ### shell_getPqPubkey
 ```

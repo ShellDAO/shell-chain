@@ -324,6 +324,42 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
+    async fn verify_pq_signature(
+        &self,
+        message: String,
+        signature: String,
+        pubkey: String,
+    ) -> Result<bool, ErrorObjectOwned> {
+        let decode = |value: &str, field: &str| {
+            let bytes = value
+                .strip_prefix("0x")
+                .ok_or_else(|| invalid_params_err(format!("{field} must be 0x-prefixed")))?;
+            hex::decode(bytes).map_err(|_| {
+                invalid_params_err(format!("{field} must contain whole hexadecimal bytes"))
+            })
+        };
+        let message = decode(&message, "message")?;
+        let mut signature = shell_crypto::PQSignature::new(
+            shell_crypto::SignatureType::MlDsa65,
+            decode(&signature, "signature")?,
+        );
+        let pubkey = decode(&pubkey, "pubkey")?;
+        // Preserve the canonical legacy promise using the existing core verifiers.
+        // Raw verification does not consult account or transaction permissions.
+        for algorithm in [
+            shell_crypto::SignatureType::MlDsa65,
+            shell_crypto::SignatureType::Dilithium3,
+        ] {
+            signature.sig_type = algorithm;
+            if shell_crypto::Verifier::verify(&MultiVerifier, &pubkey, &message, &signature)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn get_pq_pubkey(&self, address: Address) -> Result<Option<String>, ErrorObjectOwned> {
         let pk = self
             .chain_store

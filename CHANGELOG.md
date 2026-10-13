@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Implement `shell_verifyPqSignature` with actual ML-DSA-65 and legacy Dilithium3
+  core verification. Reject malformed hexadecimal parameters, return false for
+  invalid raw key/signature material, and preserve namespace exposure and chain
+  state. Raw verification does not authorize an account or transaction.
+
+
 - Read retained canonical balances, nonces, contract code and storage at historical
   JSON-RPC block tags. Preserve live-state and pending-nonce behavior; reject
   unavailable historical data instead of substituting current values. Share the

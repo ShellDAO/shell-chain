@@ -676,6 +676,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_pq_signature_http_real_crypto_and_namespace() {
+        use jsonrpsee::core::client::{ClientT, Error as ClientError};
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use shell_crypto::{DilithiumSigner, MlDsaSigner, Signer};
+        use shell_storage::{KvStore, MemoryDb};
+        for enabled in [true, false] {
+            let db = Arc::new(MemoryDb::new());
+            let chain = Arc::new(ChainStore::new(db.clone()));
+            let world = Arc::new(parking_lot::RwLock::new(WorldState::new(db.clone())));
+            let account = shell_primitives::Address::from([0x55; 32]);
+            let original_root = {
+                let mut state = world.write();
+                state
+                    .set_balance(&account, shell_primitives::U256::from(123))
+                    .unwrap();
+                state.state_root().unwrap()
+            };
+            let pool = Arc::new(TxPool::new(shell_mempool::MempoolConfig::default()));
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let server = start_rpc_server(
+                RpcConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ws_addr: None,
+                    rate_limit_per_sec: None,
+                    api_namespaces: if enabled {
+                        vec!["eth".into(), "shell".into()]
+                    } else {
+                        vec!["eth".into()]
+                    },
+                    ..RpcConfig::default()
+                },
+                chain,
+                world.clone(),
+                pool,
+                42,
+                None,
+                events,
+                None,
+                None,
+                Arc::new(parking_lot::RwLock::new(0)),
+                Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let client = HttpClientBuilder::default()
+                .build(format!("http://{}", server.http_addr))
+                .unwrap();
+            let before = db.scan_prefix(b"").unwrap();
+            assert_eq!(
+                client
+                    .request::<String, _>("eth_chainId", rpc_params![])
+                    .await
+                    .unwrap(),
+                "0x2a"
+            );
+            for signer in [
+                Box::new(MlDsaSigner::generate()) as Box<dyn Signer>,
+                Box::new(DilithiumSigner::generate()),
+            ] {
+                let wrong_key = MlDsaSigner::generate().public_key().to_vec();
+                for message in [
+                    b"hello".to_vec(),
+                    vec![],
+                    vec![0, 0, 1],
+                    vec![0x5a; 32 * 1024 + 1],
+                ] {
+                    let signature = signer.sign(&message).unwrap().data;
+                    let encoded = |bytes: &[u8]| format!("0x{}", hex::encode(bytes));
+                    let result = client
+                        .request::<bool, _>(
+                            "shell_verifyPqSignature",
+                            rpc_params![
+                                encoded(&message),
+                                encoded(&signature),
+                                encoded(signer.public_key())
+                            ],
+                        )
+                        .await;
+                    if !enabled {
+                        let ClientError::Call(error) = result.unwrap_err() else {
+                            panic!("unexpected transport error")
+                        };
+                        assert_eq!(error.code(), -32601);
+                        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+                        continue;
+                    }
+                    assert!(result.unwrap(), "genuine {:?} signature", signer.sig_type());
+                    #[cfg(unix)]
+                    if message == b"hello" {
+                        let guide = include_str!("../../../docs/JSON_RPC_API.md")
+                            .split("### shell_verifyPqSignature")
+                            .nth(1)
+                            .unwrap()
+                            .split("\n---\n")
+                            .next()
+                            .unwrap();
+                        let example = guide
+                            .split("```bash\n")
+                            .skip(1)
+                            .map(|block| block.split("```").next().unwrap())
+                            .find(|block| block.contains("curl -s http://localhost:8545"))
+                            .unwrap()
+                            .replace(
+                                "http://localhost:8545",
+                                &format!("http://{}", server.http_addr),
+                            );
+                        let signature = encoded(&signature);
+                        let pubkey = encoded(signer.public_key());
+                        let output = tokio::task::spawn_blocking(move || {
+                            std::process::Command::new("sh")
+                                .args(["-c", &example])
+                                .env("SIGNATURE_HEX", signature)
+                                .env("PUBKEY_HEX", pubkey)
+                                .env("NO_PROXY", "127.0.0.1,localhost")
+                                .output()
+                                .unwrap()
+                        })
+                        .await
+                        .unwrap();
+                        assert!(output.status.success());
+                        let response: serde_json::Value =
+                            serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(response["result"], true);
+                    }
+
+                    let mut changed_message = message.clone();
+                    changed_message.push(0xff);
+                    let mut changed_signature = signature.clone();
+                    changed_signature[0] ^= 1;
+                    let mut changed_key = signer.public_key().to_vec();
+                    changed_key[0] ^= 1;
+                    for (m, s, k) in [
+                        (
+                            message.as_slice(),
+                            changed_signature.as_slice(),
+                            signer.public_key(),
+                        ),
+                        (
+                            changed_message.as_slice(),
+                            signature.as_slice(),
+                            signer.public_key(),
+                        ),
+                        (
+                            message.as_slice(),
+                            signature.as_slice(),
+                            wrong_key.as_slice(),
+                        ),
+                        (
+                            message.as_slice(),
+                            signature.as_slice(),
+                            changed_key.as_slice(),
+                        ),
+                        (
+                            message.as_slice(),
+                            &signature[..signature.len() - 1],
+                            signer.public_key(),
+                        ),
+                        (
+                            message.as_slice(),
+                            signature.as_slice(),
+                            &signer.public_key()[..signer.public_key().len() - 1],
+                        ),
+                        (message.as_slice(), &[][..], signer.public_key()),
+                    ] {
+                        assert!(!client
+                            .request::<bool, _>(
+                                "shell_verifyPqSignature",
+                                rpc_params![encoded(m), encoded(s), encoded(k)]
+                            )
+                            .await
+                            .unwrap());
+                        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+                    }
+                }
+            }
+            if enabled {
+                for field in 0..3 {
+                    for invalid in ["", "00", "0x0", "0xgg"] {
+                        let mut params = vec![serde_json::json!("0x00"); 3];
+                        params[field] = serde_json::json!(invalid);
+                        let ClientError::Call(error) = client
+                            .request::<bool, _>("shell_verifyPqSignature", params)
+                            .await
+                            .unwrap_err()
+                        else {
+                            panic!("unexpected transport error")
+                        };
+                        assert_eq!(error.code(), -32602);
+                        assert!(!error.message().contains("0xgg"));
+                        assert_eq!(db.scan_prefix(b"").unwrap(), before);
+                    }
+                }
+                assert!(!client
+                    .request::<bool, _>(
+                        "shell_verifyPqSignature",
+                        rpc_params!["0x", "0x00", "0x00"]
+                    )
+                    .await
+                    .unwrap());
+                assert_eq!(db.scan_prefix(b"").unwrap(), before);
+            }
+            assert_eq!(
+                world.read().get_balance(&account).unwrap(),
+                shell_primitives::U256::from(123)
+            );
+            assert_eq!(world.write().state_root().unwrap(), original_root);
+            assert_eq!(db.scan_prefix(b"").unwrap(), before);
+            server.http_handle.stop().unwrap();
+            server.http_handle.stopped().await;
+        }
+    }
+
+    #[tokio::test]
     async fn public_unauthenticated_rpc_omits_governance_signing_methods() {
         let db = Arc::new(MemoryDb::new());
         let chain_store = Arc::new(ChainStore::new(db.clone()));
