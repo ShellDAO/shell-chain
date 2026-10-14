@@ -261,6 +261,33 @@ async function compare(hash) {
   assert.deepEqual(receipts[1], receipts[0]);
   const states = await Promise.all([0, 1].map(state));
   assert.deepEqual(states[1], states[0]);
+  let epochInfo;
+  if (epochScenario) {
+    const previous = await rpc(0, "eth_getBlockByNumber", [
+      "0x" + Math.max(0, height - 10).toString(16),
+      false,
+    ]);
+    const expected = {
+      currentEpoch: Math.floor(height / 5),
+      epochLength: 5,
+      blocksInEpoch: height % 5,
+      currentBlockTime:
+        (Number(BigInt(blocks[0].timestamp)) -
+          Number(BigInt(previous.timestamp))) /
+        Math.min(height, 10),
+      activeValidators: expectedMembers.length,
+    };
+    epochInfo = await Promise.all([0, 1].map((i) => rpc(i, "shell_getEpochInfo")));
+    for (let i = 0; i < 2; i++) {
+      assert.deepEqual(epochInfo[i], expected, "canonical epoch and active set");
+      assert.deepEqual(await state(i), states[i], "epoch reads preserve state");
+      assert.deepEqual(
+        await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+        blocks[i],
+        "epoch reads preserve the canonical head",
+      );
+    }
+  }
   for (let i = 0; i < 2; i++) {
     let finalized;
     for (let k = 0; k < 80; k++) {
@@ -275,6 +302,7 @@ async function compare(hash) {
     blockHash: blocks[0].hash,
     stateRoot: blocks[0].stateRoot,
     state: states[0],
+    ...(epochInfo ? { epochInfo } : {}),
   };
 }
 const nonce = async (signer) =>
@@ -436,7 +464,7 @@ async function runScenario() {
       await stop(1);
       await start(1, dirs[1], followerKey, `epoch-restart-${height}`, bootnode);
       await peerReady();
-      await compare(entry.hash);
+      entry.epochRestart = await compare(entry.hash);
     };
     await write("weight 3 pending", weight(3));
     await read("register candidate identity", outsider);
@@ -490,6 +518,33 @@ async function runScenario() {
     }
     result.epochRestarts = [7, 12, 17, 21];
     result.pendingGovernanceHistoryVerified = true;
+    const rpcDocs = await readFile(
+      new URL("../../docs/JSON_RPC_API.md", import.meta.url),
+      "utf8",
+    );
+    const epochExample = rpcDocs
+      .split("### shell_getEpochInfo")[1]
+      .split("### shell_getValidatorVotes")[0]
+      .split("```bash\n")
+      .slice(1)
+      .map((block) => block.split("```")[0])
+      .find((block) => block.includes("curl "));
+    assert.ok(epochExample, "canonical epoch curl example exists");
+    if (process.platform !== "win32") {
+      const example = spawnSync(
+        "sh",
+        ["-c", epochExample.replace("http://localhost:8545", `http://127.0.0.1:${ports[1]}`)],
+        {
+          encoding: "utf8",
+          timeout: 10000,
+          env: { ...process.env, NO_PROXY: "127.0.0.1,localhost" },
+        },
+      );
+      assert.equal(example.status, 0, example.stderr);
+      result.epochExample = JSON.parse(example.stdout);
+      assert.deepEqual(result.epochExample.result, at21.epochRestart.epochInfo[1]);
+    }
+    result.epochRpcVerified = true;
     result.finalHeight = height;
     result.passed = true;
     return;

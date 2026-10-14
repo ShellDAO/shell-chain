@@ -393,6 +393,13 @@ The existing two-node Registry acceptance covers pending weight, addition and
 removal changes, activation at subsequent boundaries, history and idle-tip
 restarts at heights 7, 12, 17 and 21:
 
+It also queries `shell_getEpochInfo` on both nodes around each boundary and
+after each restart. The epoch and block offset follow the canonical head;
+`activeValidators` follows the last activated membership even while the head
+Registry contains a pending addition or removal. The observed block interval
+uses canonical timestamps, and repeated queries preserve account and Registry
+state. The restarted follower executes the canonical Epoch curl example.
+
 ```sh
 cargo build -p shell-cli --features libp2p
 SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \

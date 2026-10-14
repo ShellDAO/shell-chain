@@ -24,5 +24,9 @@ across a concurrent epoch transition or reorganization. HTTP regressions cover
 genesis, epoch boundaries, continuous epochs, pruned headers, terminal height,
 read-only results and missing context. The existing real signed execution/import
 fixture also checks the query after body pruning and fresh-process RocksDB
-recovery with continuous epochs. Other epoch configurations during recovery,
-network reorganization and machine power loss remain separate assertions.
+recovery with continuous epochs. The two-node Registry acceptance additionally
+checks real ML-DSA-65 weight, addition and removal transactions with length-five
+epochs and graceful follower restarts between boundaries. Active member counts
+must survive restart independently of pending head Registry changes. This does
+not establish multi-authority availability, network reorganization or machine
+power-loss recovery.

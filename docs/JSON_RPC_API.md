@@ -1321,6 +1321,28 @@ recovery fixture uses real legacy Dilithium3 signed transactions and continuous
 epochs; it does not prove every algorithm, nonzero-epoch recovery, network
 reorganization or machine power-loss combination.
 
+For nonzero epochs with pending Registry changes, the existing two-node
+acceptance also checks this query before and after follower restarts. It uses
+real ML-DSA-65 signed weight, addition and removal transactions, length-five
+boundaries and restarts at heights 7, 12, 17 and 21. Both nodes must report the
+canonical epoch and active member count, even when the head Registry already
+contains a pending addition or removal; repeated queries must preserve state.
+The final restarted follower also runs the curl example below. Follow the
+epoch acceptance prerequisites in `docs/CONSENSUS_DETAILS.md`,
+including Node.js 20 or later, `curl`, a POSIX shell and a compatible built source
+SDK (`0.14.0-rc.1` tested):
+
+```bash
+cargo build -p shell-cli --features libp2p
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs --epoch-restart
+```
+
+This case uses one producer retaining quorum weight and graceful follower
+restarts with unchanged genesis. It does not establish multi-authority
+availability, network reorganization, machine power-loss recovery or public
+SDK/binary delivery.
+
 **Parameters:** None
 
 **Returns:**
