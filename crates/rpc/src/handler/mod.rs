@@ -7031,6 +7031,201 @@ mod tests {
     // ── shell_getNetworkStats ──────────────────────────────────────
 
     #[tokio::test]
+    async fn epoch_info_http_reads_canonical_epoch_and_active_engine() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use jsonrpsee::server::ServerBuilder;
+
+        let handler = setup();
+        let chain = handler.chain_store.clone();
+        let state = handler.world_state.clone();
+        let engine = Arc::new(parking_lot::RwLock::new(PoaEngine::new(
+            PoaConfig::new(
+                vec![
+                    test_address(b"epoch-active-a"),
+                    test_address(b"epoch-active-b"),
+                ],
+                2,
+            )
+            .with_epoch_length(5),
+        )));
+        let handler = handler.with_consensus_engine(engine.clone());
+        let mut parent = ShellHash::ZERO;
+        for height in 0..=6 {
+            let mut block = make_genesis_block();
+            block.header.number = height;
+            block.header.parent_hash = parent;
+            block.header.timestamp = 100 + 2 * height;
+            parent = block.hash();
+            chain.put_block(&block).unwrap();
+            chain.set_canonical(height, &parent).unwrap();
+        }
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let client = HttpClientBuilder::default()
+            .build(endpoint.clone())
+            .unwrap();
+        let handle = server.start(ShellApiServer::into_rpc(handler));
+        // Length-five canonical epochs: block 4 is in epoch zero, block 5
+        // starts epoch one, block 6 is one block past that boundary.
+        for (height, epoch, progress, interval) in [
+            (0, 0, 0, 0.0),
+            (4, 0, 4, 2.0),
+            (5, 1, 0, 2.0),
+            (6, 1, 1, 2.0),
+        ] {
+            let hash = chain.get_block_hash_by_number(height).unwrap().unwrap();
+            chain.set_head(&hash).unwrap();
+            let root = state.write().state_root().unwrap();
+            let before = chain.store().scan_prefix(b"").unwrap();
+            let response: serde_json::Value = client
+                .request("shell_getEpochInfo", rpc_params![])
+                .await
+                .unwrap();
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "currentEpoch": epoch, "epochLength": 5,
+                    "blocksInEpoch": progress, "currentBlockTime": interval,
+                    "activeValidators": 2,
+                })
+            );
+            // The empty head Registry is not the active engine's set.
+            assert!(state.read().get_validators().unwrap().is_empty());
+            assert_eq!(chain.store().scan_prefix(b"").unwrap(), before);
+            assert_eq!(state.write().state_root().unwrap(), root);
+        }
+        for height in 0..=6 {
+            let hash = chain.get_block_hash_by_number(height).unwrap().unwrap();
+            chain.delete_body(&hash).unwrap();
+        }
+        let before_pruned_query = chain.store().scan_prefix(b"").unwrap();
+        let pruned: serde_json::Value = client
+            .request("shell_getEpochInfo", rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(
+            pruned,
+            serde_json::json!({
+                "currentEpoch": 1, "epochLength": 5, "blocksInEpoch": 1,
+                "currentBlockTime": 2.0, "activeValidators": 2,
+            })
+        );
+        assert_eq!(chain.store().scan_prefix(b"").unwrap(), before_pruned_query);
+        *engine.write() =
+            PoaEngine::new(PoaConfig::new(vec![test_address(b"epoch-continuous")], 2));
+        let continuous: serde_json::Value = client
+            .request("shell_getEpochInfo", rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(continuous["currentEpoch"], 0);
+        assert_eq!(continuous["epochLength"], 0);
+        assert_eq!(continuous["blocksInEpoch"], 6);
+        assert_eq!(continuous["activeValidators"], 1);
+        #[cfg(unix)]
+        {
+            let guide = include_str!("../../../../docs/JSON_RPC_API.md")
+                .split("### shell_getEpochInfo\n")
+                .nth(1)
+                .unwrap()
+                .split("### shell_getValidatorVotes")
+                .next()
+                .unwrap();
+            let example = guide
+                .split("```bash\n")
+                .skip(1)
+                .map(|block| block.split("```").next().unwrap())
+                .find(|block| block.contains("curl -s http://localhost:8545"))
+                .unwrap()
+                .replace("http://localhost:8545", &endpoint);
+            let before = chain.store().scan_prefix(b"").unwrap();
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("sh")
+                    .args(["-c", &example])
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(output.status.success());
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["result"], continuous);
+            assert_eq!(chain.store().scan_prefix(b"").unwrap(), before);
+        }
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn epoch_info_rejects_missing_runtime_or_canonical_data() {
+        let handler = setup();
+        let err = ShellApiServer::get_epoch_info(&handler).await.unwrap_err();
+        assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
+        assert!(err.message().contains("consensus engine unavailable"));
+        let engine = Arc::new(parking_lot::RwLock::new(PoaEngine::new(PoaConfig::new(
+            vec![test_address(b"epoch-missing")],
+            2,
+        ))));
+        let handler = handler.with_consensus_engine(engine);
+        let err = ShellApiServer::get_epoch_info(&handler).await.unwrap_err();
+        assert_eq!(err.code(), crate::error::NOT_FOUND);
+        assert!(err.message().contains("canonical head unavailable"));
+        let mut block = make_genesis_block();
+        block.header.number = 12;
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        let err = ShellApiServer::get_epoch_info(&handler).await.unwrap_err();
+        assert_eq!(err.code(), crate::error::INTERNAL_ERROR);
+        handler.chain_store.set_canonical(12, &hash).unwrap();
+        assert!(ShellApiServer::get_epoch_info(&handler).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn epoch_info_terminal_height_and_invalid_timestamps() {
+        let handler =
+            setup().with_consensus_engine(Arc::new(parking_lot::RwLock::new(PoaEngine::new(
+                PoaConfig::new(vec![test_address(b"epoch-terminal")], 2).with_epoch_length(5),
+            ))));
+        for (height, timestamp) in [(u64::MAX - 10, 100), (u64::MAX, 120)] {
+            let mut block = make_genesis_block();
+            block.header.number = height;
+            block.header.timestamp = timestamp;
+            let hash = block.hash();
+            handler.chain_store.put_block(&block).unwrap();
+            handler.chain_store.set_canonical(height, &hash).unwrap();
+            handler.chain_store.set_head(&hash).unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let result = ShellApiServer::get_epoch_info(&handler).await.unwrap();
+        assert_eq!(result["currentEpoch"], 3_689_348_814_741_910_323u64);
+        assert_eq!(result["blocksInEpoch"], 0);
+        assert_eq!(result["currentBlockTime"], 2.0);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        let mut invalid = make_genesis_block();
+        invalid.header.number = u64::MAX - 10;
+        invalid.header.timestamp = 121;
+        let hash = invalid.hash();
+        handler.chain_store.put_block(&invalid).unwrap();
+        handler
+            .chain_store
+            .set_canonical(u64::MAX - 10, &hash)
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let err = ShellApiServer::get_epoch_info(&handler).await.unwrap_err();
+        assert_eq!(err.code(), crate::error::INTERNAL_ERROR);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn get_network_stats_returns_all_fields() {
         let handler = setup();
         let result = ShellApiServer::get_network_stats(&handler).await.unwrap();

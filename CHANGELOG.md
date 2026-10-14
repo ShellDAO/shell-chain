@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The documented `shell_getEpochInfo` method reads the canonical head, retained
+  timestamps and active consensus configuration instead of returning method not
+  found. Epoch boundaries and zero-length epochs follow the existing consensus
+  configuration; pending Registry changes are not reported as active authorities.
+
 - Default full-range address-history queries and v2 exact totals no longer reject
   spans above 10,000 blocks. Native MemoryDb and RocksDB stream the existing
   forward index, retaining query memory proportional to the requested page.
