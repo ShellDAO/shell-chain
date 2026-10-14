@@ -20,10 +20,16 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
 
         let name = format!("shell-node/{}", env!("CARGO_PKG_VERSION"));
 
+        let local_info = self.local_node_info.read().map_err(internal_err)?;
+
         Ok(NodeInfo {
             name,
-            id: self.admin_peer_id.clone(),
-            listen_addr: self.admin_p2p_listen.clone(),
+            id: local_info.peer_id.clone(),
+            listen_addr: local_info
+                .listen_addresses
+                .first()
+                .cloned()
+                .unwrap_or_default(),
             rpc_addr: self.admin_rpc_addr.clone(),
             chain_id: self.chain_id,
             uptime_seconds,

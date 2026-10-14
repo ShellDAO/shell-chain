@@ -826,6 +826,10 @@ impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
         self.inner.peer_count_handle()
     }
 
+    fn local_node_info_handle(&self) -> Arc<std::sync::RwLock<shell_network::LocalNodeInfo>> {
+        self.inner.local_node_info_handle()
+    }
+
     async fn shutdown(&self) -> Result<(), shell_network::NetworkError> {
         self.inner.shutdown().await
     }

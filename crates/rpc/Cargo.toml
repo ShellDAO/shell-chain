@@ -15,6 +15,7 @@ shell-stark-prover = { path = "../stark-prover" }
 shell-mempool = { path = "../mempool" }
 shell-pqvm = { path = "../pqvm" }
 shell-consensus = { path = "../consensus" }
+shell-network = { path = "../network" }
 jsonrpsee.workspace = true
 tokio.workspace = true
 serde.workspace = true

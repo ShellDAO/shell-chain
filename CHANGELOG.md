@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Network statistics now report actual bound P2P listeners and enabled protocols
+  instead of a fixed default address and protocol list. Node and admin identity
+  queries share the live transport context; shutdown clears it and restarts
+  rebuild it without storing stale listener metadata.
+
 - Historical backfill no longer leaves expired block bodies behind on rolling
   nodes after restart, including when the canonical head stays idle. Canonical
   restoration rewinds body-pruning progress atomically, and backfill reapplies
