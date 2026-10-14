@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Historical backfill no longer leaves expired block bodies behind on rolling
+  nodes after restart, including when the canonical head stays idle. Canonical
+  restoration rewinds body-pruning progress atomically, and backfill reapplies
+  the finalized retention window while protecting unfinished legacy witness
+  replay dependencies. Header and epoch-boundary state recovery are preserved.
+
 - The documented `shell_getEpochInfo` method reads the canonical head, retained
   timestamps and active consensus configuration instead of returning method not
   found. Epoch boundaries and zero-length epochs follow the existing consensus

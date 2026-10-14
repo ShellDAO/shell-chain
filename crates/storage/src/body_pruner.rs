@@ -105,6 +105,10 @@ impl BodyPruner {
             return Ok(BodyPruneResult::default());
         }
 
+        // Historical body restoration can rewind durable progress after this
+        // pruner was constructed. Revisit those bodies even at an unchanged head.
+        self.pruned_below = self.pruned_below.min(chain_store.body_pruned_below()?);
+
         // Expiry horizon: prune everything strictly before this block number.
         let expiry_horizon = retention_cutoff(current_head, self.retention_count);
 
@@ -301,6 +305,34 @@ mod tests {
     }
 
     #[test]
+    fn backfilled_body_is_expired_again_by_live_and_restarted_pruners() {
+        for restart in [false, true] {
+            let cs = setup_chain(12);
+            let block = empty_block(2);
+            let mut pruner = BodyPruner::new(5);
+            pruner.prune_before(9, &cs).unwrap();
+            assert_eq!(pruner.pruned_below(), 5);
+            assert!(!cs.has_body(&block.hash()).unwrap());
+
+            cs.put_backfill_block(&block, false).unwrap();
+            assert!(cs.has_body(&block.hash()).unwrap());
+            assert_eq!(cs.body_pruned_below().unwrap(), 2);
+            if restart {
+                pruner = BodyPruner::with_pruned_below(5, cs.body_pruned_below().unwrap());
+            }
+            let result = pruner.prune_before(9, &cs).unwrap();
+            assert_eq!(result.bodies_pruned, 1);
+            assert!(!cs.has_body(&block.hash()).unwrap());
+            assert_eq!(cs.body_pruned_below().unwrap(), 5);
+            assert_eq!(
+                cs.get_header_by_hash(&block.hash()).unwrap(),
+                Some(block.header)
+            );
+            assert!(cs.get_block_by_number(5).unwrap().is_some());
+        }
+    }
+
+    #[test]
     fn no_prune_when_head_below_retention() {
         // head=3, retention=10 → expiry_horizon=0 → nothing to prune
         let cs = setup_chain(5);
@@ -388,6 +420,7 @@ mod tests {
 
         let mut pruner = BodyPruner::new(1);
         pruner.pruned_below = first_number;
+        cs.prune_bodies_below(&[], first_number).unwrap();
         let result = pruner.prune_before(u64::MAX, &cs).unwrap();
 
         assert_eq!(result.blocks_checked, 2);

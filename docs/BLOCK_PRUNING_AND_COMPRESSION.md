@@ -176,6 +176,15 @@ or lower-layer-gap artifacts cannot prune witnesses or claim rewards.
 Body and witness pruning commit their deletion batch and first-unprocessed block
 number atomically. After restart, each pruner resumes from that durable cursor
 instead of rescanning canonical mappings that may already have been removed.
+Restoring a previously expired canonical body atomically rewinds the body
+cursor with the body write. Authentication or storage failure leaves both
+unchanged. Live and restarted pruners revisit this range. Historical backfill
+also applies finalized-height body retention at an unchanged head, so restarting
+an idle rolling node does not permanently restore expired bodies. An unfinished
+legacy witness replay temporarily protects its ancestor bodies; archive mode
+continues to retain restored bodies. See the
+[backfill retention decision](adr/backfilled-body-retention.md).
+
 Logical snapshots carry both cursors and reject progress ahead of the snapshot's
 finalized height.
 

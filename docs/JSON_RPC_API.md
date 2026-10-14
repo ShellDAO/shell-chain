@@ -1338,6 +1338,22 @@ SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-aa-registry.mjs --epoch-restart
 ```
 
+For a follower with actual rolling state and body pruning, run the same
+acceptance with:
+
+```bash
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs --epoch-pruned-restart
+```
+
+This variant retains all data on the producer and uses a light follower with
+one-block state/body retention. It checks that expired bodies remain absent,
+including after the final restart at an idle head, while the last finalized
+epoch snapshot still supplies its historical nonce and active authorities.
+Expired historical state must return an error rather than current values.
+The shortened window proves this isolated case, not the default retention
+window or public package availability.
+
 This case uses one producer retaining quorum weight and graceful follower
 restarts with unchanged genesis. It does not establish multi-authority
 availability, network reorganization, machine power-loss recovery or public

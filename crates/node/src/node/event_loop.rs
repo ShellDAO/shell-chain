@@ -2155,6 +2155,15 @@ impl<S: KvStore + 'static> Node<S> {
                                         }
                                         last_processed = Some(n);
                                     }
+                                    // Backfill can restore already-expired bodies at an idle head.
+                                    // Apply retention without waiting for another canonical commit;
+                                    // the pruner preserves outstanding legacy replay dependencies.
+                                    match self.chain_store.get_finalized_number() {
+                                        Ok(stored) => self.prune_expired_bodies(
+                                            stored.unwrap_or(0).max(self.finality.read().last_finalized_number()),
+                                        ),
+                                        Err(error) => warn!(%error, "body backfill: failed to read finalized height"),
+                                    }
                                     // Retry sequence/hash mismatches immediately. Persistence or
                                     // witness-validation failures remain deferred until this sweep
                                     // reaches the head, so later independent gaps can progress.
