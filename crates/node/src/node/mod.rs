@@ -1651,6 +1651,29 @@ impl<S: KvStore + 'static> Node<S> {
         self.shutdown_tx.send_replace(true);
     }
 
+    /// Apply body retention after canonical commits and historical restoration.
+    fn prune_expired_bodies(&self, finalized_number: u64) {
+        // Isolated legacy replay reads ancestor bodies from the base store.
+        // Keep its dependencies until authentication has completed.
+        if self.legacy_replay.lock().is_some() || self.legacy_backfill_dependency.lock().is_some() {
+            return;
+        }
+        let mut pruner = self.body_pruner.write();
+        match pruner.prune_before(finalized_number, &self.chain_store) {
+            Ok(result) if result.bodies_pruned > 0 => {
+                tracing::info!(
+                    pruned = result.bodies_pruned,
+                    finalized = finalized_number,
+                    "body pruner: expired old block bodies"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "body pruner: prune failed");
+            }
+        }
+    }
+
     /// Record a canonical state root, then run pruning bounded by finalized height.
     fn record_canonical_state_root(&self, block_number: u64, state_root: ShellHash) {
         let profile = StorageProfile::from_pruning_config(&self.config.pruning);
@@ -1754,26 +1777,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // D2: Drive BodyPruner — expire old block bodies after finality.
-        {
-            let mut bpruner = self.body_pruner.write();
-            if !bpruner.is_archive() {
-                match bpruner.prune_before(finalized_number, &self.chain_store) {
-                    Ok(result) => {
-                        if result.bodies_pruned > 0 {
-                            tracing::info!(
-                                pruned = result.bodies_pruned,
-                                block = block_number,
-                                finalized = finalized_number,
-                                "body pruner: expired old block bodies"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "body pruner: prune failed");
-                    }
-                }
-            }
-        }
+        self.prune_expired_bodies(finalized_number);
 
         // F-303: Drive StatePruner after dependent pruning so a successful body
         // or witness pass can advance canonical mapping cleanup in this cycle.
@@ -18675,6 +18679,37 @@ mod tests {
         let tracker = node.state_root_tracker.read();
         assert_eq!(tracker.len(), 10, "archive mode keeps all roots");
         assert_eq!(tracker.oldest().unwrap().block_number, 1);
+    }
+
+    #[test]
+    fn idle_backfill_expires_after_replay_dependency_is_consumed() {
+        let (node, signer) = setup_node_with_retention(2, 0);
+        store_genesis(&node);
+        for _ in 0..5 {
+            node.produce_block(&signer, 0).unwrap();
+        }
+        let old = node.chain_store.get_block_by_number(1).unwrap().unwrap();
+        let finalized = node.chain_store.get_block_by_number(3).unwrap().unwrap();
+        node.chain_store.set_finalized_number(3).unwrap();
+        node.finality
+            .write()
+            .set_finalized_direct(3, finalized.hash());
+        node.prune_expired_bodies(3);
+        assert!(!node.chain_store.has_body(&old.hash()).unwrap());
+        node.chain_store.put_backfill_block(&old, false).unwrap();
+        *node.legacy_backfill_dependency.lock() = Some(1);
+        node.prune_expired_bodies(3);
+        assert!(node.chain_store.has_body(&old.hash()).unwrap());
+        *node.legacy_backfill_dependency.lock() = None;
+        node.prune_expired_bodies(3);
+        assert!(!node.chain_store.has_body(&old.hash()).unwrap());
+        assert!(node
+            .chain_store
+            .get_header_by_hash(&old.hash())
+            .unwrap()
+            .is_some());
+        assert_eq!(node.head_number(), 5);
+        assert!(node.chain_store.has_body(&finalized.hash()).unwrap());
     }
 
     #[test]

@@ -1331,8 +1331,20 @@ impl<S: KvStore> ChainStore<S> {
                 ));
             }
         }
-        self.store.put(&Self::body_key(&hash), &body_bytes)?;
-        Ok(())
+        let mut batch = WriteBatch::new();
+        batch.put(Self::body_key(&hash), body_bytes);
+        // A backfilled canonical body must be eligible for expiry again, including
+        // after restart. Commit the rewind with the body so neither can be lost alone.
+        let pruned_below = self.body_pruned_below()?;
+        if block.number() < pruned_below
+            && self.get_block_hash_by_number(block.number())? == Some(hash)
+        {
+            batch.put(
+                prefix::BODY_PRUNED_BELOW.to_vec(),
+                block.number().to_be_bytes().to_vec(),
+            );
+        }
+        self.store.write_batch(batch)
     }
 
     // ── L3: Trie node reference counting ───────────────────────────────────────
@@ -10305,18 +10317,23 @@ mod tests {
         let block = make_block_with_txs(2);
         let hash = block.hash();
         cs.put_block(&block).unwrap();
-        cs.delete_body(&hash).unwrap();
+        cs.set_canonical(block.number(), &hash).unwrap();
+        let cursor = block.number() + 1;
+        cs.prune_bodies_below(&[hash], cursor).unwrap();
         cs.delete_witness_bundle(&hash).unwrap();
         let mut bad = block.clone();
         bad.transactions[0].signature.data[0] ^= 1;
         assert!(cs.put_backfill_block(&bad, true).is_err());
         assert!(!cs.has_body(&hash).unwrap());
         assert!(!cs.has_witness_bundle(&hash).unwrap());
+        assert_eq!(cs.body_pruned_below().unwrap(), cursor);
         db.fail_next_batch();
         assert!(cs.put_backfill_block(&block, true).is_err());
         assert!(!cs.has_body(&hash).unwrap());
         assert!(!cs.has_witness_bundle(&hash).unwrap());
+        assert_eq!(cs.body_pruned_below().unwrap(), cursor);
         cs.put_backfill_block(&block, true).unwrap();
+        assert_eq!(cs.body_pruned_below().unwrap(), block.number());
         assert_eq!(cs.get_block_by_hash(&hash).unwrap(), Some(block));
     }
 

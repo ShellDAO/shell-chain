@@ -73,7 +73,8 @@ const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
-const epochScenario = process.argv.includes("--epoch-restart");
+const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
+const epochScenario = process.argv.includes("--epoch-restart") || prunedEpochScenario;
 let expectedConsensusWeight = 1;
 let expectedMembers = [miner.getAddress()];
 const providers = ports.map((port) =>
@@ -89,10 +90,11 @@ function paced(request) {
 const rpc = (i, method, params = []) =>
   paced(() => providers[i].client.request({ method, params }));
 const nodes = [];
+const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -115,6 +117,10 @@ const result = {
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
+if (prunedEpochScenario)
+  result.adaptations.push(
+    "Full producer and light follower with one-block state/body retention; this scaled experiment does not establish the default 4096-block retention window.",
+  );
 async function save() {
   await writeFile(join(out, "runtime.json"), JSON.stringify(result, null, 2));
 }
@@ -165,18 +171,21 @@ async function start(i, data, key, label, bootnode) {
     "--rpc-api",
     "eth,net,web3,shell,debug,trace",
     "--storage-profile",
-    "full",
+    prunedEpochScenario && i === 1 ? "light" : "full",
     "--p2p",
     "--p2p-addr",
     "127.0.0.1:0",
     "--log-level",
     "info",
   ];
+  if (prunedEpochScenario && i === 1)
+    args.push("--pruning", "1", "--body-retention", "1");
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
+  nodeLogLabels[i] = label;
   let spawnError;
   child.once("error", (error) => {
     spawnError = error;
@@ -461,9 +470,52 @@ async function runScenario() {
     const write = (label, data) =>
       confirmed(label, miner, [native(data)], "0x1", true, true);
     const restart = async (entry) => {
+      if (prunedEpochScenario) {
+        const boundary = Math.floor(height / 5) * 5;
+        // The current finalized boundary body may still be inside retention at height 21.
+        const bodyHeight = height === 21 ? boundary - 5 : boundary;
+        const tag = "0x" + boundary.toString(16);
+        const bodyTag = "0x" + bodyHeight.toString(16);
+        const retained = await rpc(0, "eth_getBlockByNumber", [bodyTag, false]);
+        assert.ok(retained?.transactions.length > 0, "producer retains the boundary body");
+        assert.equal(await rpc(1, "eth_getBlockByNumber", [bodyTag, false]), null,
+          "follower actually pruned an old boundary body");
+        const boundaryNonces = await Promise.all([0, 1].map((i) =>
+          rpc(i, "eth_getTransactionCount", [miner.getAddress(), tag])));
+        assert.equal(boundaryNonces[1], boundaryNonces[0],
+          "follower retains the current epoch boundary state");
+        assert.notEqual(boundaryNonces[1], await rpc(1, "eth_getTransactionCount", [
+          miner.getAddress(), "latest"]), "boundary reads do not substitute the head");
+        let expiredBoundaryState;
+        if (boundary >= 10) {
+          const expiredTag = "0x" + (boundary - 5).toString(16);
+          await assert.rejects(() => rpc(1, "eth_getTransactionCount", [
+            miner.getAddress(), expiredTag]), (error) => {
+              expiredBoundaryState = { block: expiredTag, code: error.code, message: error.message };
+              return Number.isInteger(error.code) && ![-32601, -32602].includes(error.code);
+            }, "the preceding epoch state has expired while the current boundary remains readable");
+        }
+        const log = await readFile(join(out, nodeLogLabels[1] + "-node.log"), "utf8");
+        assert.ok(log.includes("body pruner: expired old block bodies"));
+        assert.ok(log.includes("state trie pruning deleted old snapshots"));
+        entry.epochPruning = { boundary, bodyHeight, boundaryNonces, bodyPruned: true, statePruned: true, expiredBoundaryState };
+      }
       await stop(1);
       await start(1, dirs[1], followerKey, `epoch-restart-${height}`, bootnode);
       await peerReady();
+      if (prunedEpochScenario) {
+        // Observe retention after the historical response, not before it arrives.
+        let complete = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          const log = await readFile(join(out, nodeLogLabels[1] + "-node.log"), "utf8");
+          if (log.includes("L4: historical body back-fill complete")) {
+            complete = true;
+            break;
+          }
+          await pause(250);
+        }
+        assert.ok(complete, "restarted follower completed historical backfill");
+      }
       entry.epochRestart = await compare(entry.hash);
     };
     await write("weight 3 pending", weight(3));
@@ -506,6 +558,19 @@ async function runScenario() {
     for (const entry of [pendingWeight, pendingAdd, pendingRemove]) {
       for (let i = 0; i < 2; i++) {
         const before = await state(i);
+        if (prunedEpochScenario && i === 1) {
+          assert.equal(await rpc(i, "eth_getBlockByNumber", [entry.receipt.blockNumber, false]), null,
+            "old replay bodies lie outside the rolling window");
+          await assert.rejects(() => rpc(i, "eth_getTransactionCount", [
+            miner.getAddress(), entry.receipt.blockNumber]),
+            (error) => {
+              entry.prunedStateRejection = { code: error.code, message: error.message };
+              return Number.isInteger(error.code) &&
+                ![-32601, -32602].includes(error.code);
+            }, "old state is unavailable rather than substituted with the head");
+          assert.deepEqual(await state(i), before);
+          continue;
+        }
         assert.deepEqual(
           await rpc(i, "debug_traceTransaction", [
             entry.hash,
@@ -517,7 +582,8 @@ async function runScenario() {
       }
     }
     result.epochRestarts = [7, 12, 17, 21];
-    result.pendingGovernanceHistoryVerified = true;
+    result.pendingGovernanceHistoryVerified = !prunedEpochScenario;
+    result.prunedEpochRecoveryVerified = prunedEpochScenario;
     const rpcDocs = await readFile(
       new URL("../../docs/JSON_RPC_API.md", import.meta.url),
       "utf8",
