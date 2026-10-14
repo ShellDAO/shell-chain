@@ -6481,6 +6481,7 @@ dependencies = [
  "shell-core",
  "shell-crypto",
  "shell-mempool",
+ "shell-network",
  "shell-pqvm",
  "shell-primitives",
  "shell-stark-prover",

@@ -921,12 +921,13 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         };
         let peer_count = self.peer_count.load(Ordering::Relaxed);
         let version = format!("ShellChain/v{}/rust", env!("CARGO_PKG_VERSION"));
+        let local_info = self.local_node_info.read().map_err(internal_err)?;
 
         Ok(serde_json::json!({
             "version": version,
             "chain_id": self.chain_id.to_string(),
             "block_height": block_height,
-            "peer_id": self.admin_peer_id.clone(),
+            "peer_id": local_info.peer_id.clone(),
             "peer_count": peer_count,
             "chainId": self.chain_id,
             "blockHeight": block_height,
@@ -940,16 +941,12 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
     async fn get_network_stats(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
         let peer_count = self.peer_count.load(Ordering::Relaxed);
-        let listen_addr = if self.admin_p2p_listen.is_empty() {
-            "/ip4/0.0.0.0/tcp/30303".to_string()
-        } else {
-            self.admin_p2p_listen.clone()
-        };
+        let local_info = self.local_node_info.read().map_err(internal_err)?;
         Ok(serde_json::json!({
             "peerCount": peer_count,
             "protocolVersion": "shell/1.0.0",
-            "listeningAddress": listen_addr,
-            "protocols": ["gossipsub", "kademlia", "mdns"],
+            "listeningAddress": local_info.listen_addresses.first().cloned().unwrap_or_default(),
+            "protocols": local_info.protocols,
         }))
     }
 

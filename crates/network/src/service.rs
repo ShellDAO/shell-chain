@@ -6,7 +6,15 @@ use crate::error::NetworkError;
 use crate::message::{NetworkEvent, NetworkMessage, PeerId};
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+/// Local transport identity and currently bound listener addresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalNodeInfo {
+    pub peer_id: String,
+    pub listen_addresses: Vec<String>,
+    pub protocols: Vec<String>,
+}
 
 /// Trait abstracting the P2P network layer.
 ///
@@ -46,6 +54,11 @@ pub trait NetworkService: Send + Sync {
     /// External consumers (e.g. RPC) can read this without async.
     fn peer_count_handle(&self) -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    /// Shared live local transport information; absent transports expose no listener.
+    fn local_node_info_handle(&self) -> Arc<RwLock<LocalNodeInfo>> {
+        Arc::new(RwLock::new(LocalNodeInfo::default()))
     }
 
     /// Shut down the network service gracefully.

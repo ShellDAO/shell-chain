@@ -1108,19 +1108,49 @@ curl -s http://localhost:8545 \
 
 ### shell_getNetworkStats
 
-Returns P2P network statistics.
+Returns live P2P network statistics. `peerCount` uses the same connected-peer
+counter as `net_peerCount`. `listeningAddress` is an actual bound multiaddr:
+when several listeners are available, the first address in sorted order is
+returned. A configured port of zero is replaced by the assigned port. This
+local address does not establish reachability from another network.
+`protocols` lists enabled gossipsub, Kademlia and mDNS behaviours; disabled
+behaviours are omitted.
 
 **Parameters:** None
 
-**Returns:**
+**Example result** (address, peer count and protocols depend on the running node):
 ```json
 {
-  "peerCount": 0,
+  "peerCount": 1,
   "protocolVersion": "shell/1.0.0",
-  "listeningAddress": "/ip4/0.0.0.0/tcp/30303",
-  "protocols": ["gossipsub", "kademlia", "mdns"]
+  "listeningAddress": "/ip4/127.0.0.1/tcp/40123",
+  "protocols": ["gossipsub", "kademlia"]
 }
 ```
+
+No bound listener yields an empty `listeningAddress`. With P2P disabled or its
+transport stopped, `protocols` is empty as well. Local transport metadata is
+rebuilt on startup rather than persisted; `shell_getNodeInfo.peer_id` and
+`admin_nodeInfo.id` read the same live identity.
+
+**Version:** This correction is in unreleased node source. Older binaries may
+return the fixed default address and protocol list; verify the installed
+version before using this response to diagnose connectivity.
+
+**Local acceptance:** From the node repository, build with the libp2p feature
+and run the existing Python 3 regression (standard library only):
+
+```bash
+cargo build -p shell-cli --features libp2p
+python3 tests/e2e/operator-p2p-monitoring.py --network-stats
+```
+
+The script creates fresh test keys and isolated RocksDB nodes, connects a
+follower to a 16-block backlog, compares canonical block hashes and live RPC
+listeners, then restarts the follower with P2P enabled and disabled. Results
+and isolated data are retained at the printed temporary directory. This checks
+local connectivity and restart behaviour; the default script mode separately
+checks transient catch-up monitoring.
 
 ---
 

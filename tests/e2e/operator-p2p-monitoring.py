@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sys
 import subprocess
 import tempfile
 import time
@@ -22,6 +23,7 @@ os.chmod(runtime, 0o700)
 audit = runtime / 'results'
 audit.mkdir()
 result = {'start': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'runtime': str(runtime), 'binary_version': subprocess.check_output([str(binary), '--version'], text=True).strip(), 'commands': [], 'samples': [], 'assertions': {}, 'scope': 'Two isolated dev nodes, fresh validator key, one-second blocks and a 16-block backlog. No public network or load validation.'}
+network_stats_case = "--network-stats" in sys.argv
 processes = {}
 logs = {}
 ports = {}
@@ -33,6 +35,10 @@ for name in ['validator', 'follower']:
         ports[name][kind] = s.getsockname()[1]
 for s in held:
     s.close()
+if network_stats_case:
+    for values in ports.values():
+        values['p2p'] = 0
+    result['scope'] = 'Actual network statistics on two isolated libp2p/RocksDB dev nodes with ephemeral listening ports. Existing backlog/canonical consistency checks retained; transient synchronization sampling is a separate default mode.'
 result['ports'] = ports
 
 def save():
@@ -81,8 +87,10 @@ def until(fn, seconds=60):
         time.sleep(0.05)
     raise TimeoutError(str(last))
 
-def start(name, bootnode=None):
-    cmd = [str(binary), 'run', '--datadir', str(runtime/name), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{ports[name]["rpc"]}', '--rpc-api', 'eth,net,web3,shell', '--metrics-addr', f'127.0.0.1:{ports[name]["metrics"]}', '--p2p', '--p2p-addr', f'127.0.0.1:{ports[name]["p2p"]}', '--block-time', '1000', '--max-idle-interval', '0', '--consensus-engine', 'wpoa', '--log-level', 'info']
+def start(name, bootnode=None, p2p_enabled=True):
+    cmd = [str(binary), 'run', '--datadir', str(runtime/name), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', f'127.0.0.1:{ports[name]["rpc"]}', '--rpc-api', 'eth,net,web3,shell', '--metrics-addr', f'127.0.0.1:{ports[name]["metrics"]}', '--block-time', '1000', '--max-idle-interval', '0', '--consensus-engine', 'wpoa', '--log-level', 'info']
+    if p2p_enabled:
+        cmd += ['--p2p', '--p2p-addr', f'127.0.0.1:{ports[name]["p2p"]}']
     if name == 'validator':
         cmd += ['--keystore', str(runtime/'validator.json'), '--password-file', str(runtime/'password'), '--node-role', 'validator']
     else:
@@ -92,6 +100,18 @@ def start(name, bootnode=None):
     logs[name] = (audit/(name+'.log')).open('w')
     processes[name] = subprocess.Popen(cmd, stdout=logs[name], stderr=subprocess.STDOUT)
     result['commands'].append({'label': 'start-'+name, 'command': cmd, 'pid': processes[name].pid})
+    save()
+
+def stop(name):
+    proc = processes.pop(name)
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill(); proc.wait()
+    logs.pop(name).close()
+    result['commands'].append({'label': 'stop-'+name, 'pid': proc.pid, 'exit_code': proc.returncode})
     save()
 
 def sample(name):
@@ -121,6 +141,12 @@ try:
     log = (audit/'validator.log').read_text()
     bootnode = re.findall(r'/ip4/127\.0\.0\.1/tcp/\d+/p2p/[A-Za-z0-9]+',log)[-1]
     result['bootnode'] = bootnode
+    if network_stats_case:
+        stats = rpc('validator', 'shell_getNetworkStats')
+        bound = bootnode.rsplit('/p2p/', 1)[0]
+        result['network_stats'] = {'validator': stats, 'validator_bound': bound}
+        save()
+        assert stats['listeningAddress'] == bound, ('RPC listener is not the actual bound socket', stats, bound)
     start('follower',bootnode)
     until(lambda: rpc('follower','eth_chainId') == '0x539')
     end = time.monotonic()+35
@@ -146,6 +172,36 @@ try:
         'syncing_observed': any(s['health']['syncing'] for s in samples),
         'not_ready_while_syncing': any(s['stable_sync'] for s in samples) and all(s['ready_status']==503 for s in samples if s['stable_sync']),
     }
+    if network_stats_case:
+        # The default mode still requires the original transient sync observations.
+        for assertion in ['syncing_observed', 'not_ready_while_syncing']:
+            result['assertions'].pop(assertion)
+        for name in ports:
+            bound, peer_id = re.findall(r'/ip4/127\.0\.0\.1/tcp/\d+/p2p/[A-Za-z0-9]+', (audit/(name+'.log')).read_text())[-1].rsplit('/p2p/', 1)
+            stats = rpc(name, 'shell_getNetworkStats')
+            result['network_stats'][name] = stats
+            result['network_stats'][name+'_bound'] = bound
+            assert int(bound.rsplit('/', 1)[1]) > 0
+            result['assertions'][name+'_actual_listener'] = stats['listeningAddress'] == bound
+            result['assertions'][name+'_live_peers'] = stats['peerCount'] == int(rpc(name, 'net_peerCount'), 16) and stats['peerCount'] >= 1
+            result['assertions'][name+'_enabled_protocols'] = stats['protocols'] == ['gossipsub', 'kademlia']
+            result['assertions'][name+'_actual_peer_id'] = rpc(name, 'shell_getNodeInfo')['peer_id'] == peer_id
+    if network_stats_case:
+        stop('follower')
+        (audit/'follower.log').rename(audit/'follower-before-restart.log')
+        start('follower', bootnode)
+        until(lambda: rpc('follower', 'shell_getNetworkStats')['peerCount'] >= 1)
+        bound = re.findall(r'/ip4/127\.0\.0\.1/tcp/\d+/p2p/[A-Za-z0-9]+', (audit/'follower.log').read_text())[-1].rsplit('/p2p/', 1)[0]
+        stats = rpc('follower', 'shell_getNetworkStats')
+        result['network_stats']['restarted_follower'] = {'actual': stats, 'bound': bound}
+        result['assertions']['restart_actual_listener'] = stats['listeningAddress'] == bound
+        stop('follower')
+        (audit/'follower.log').rename(audit/'follower-after-restart.log')
+        start('follower', p2p_enabled=False)
+        until(lambda: rpc('follower', 'eth_chainId') == '0x539')
+        disabled = rpc('follower', 'shell_getNetworkStats')
+        result['network_stats']['disabled_follower'] = disabled
+        result['assertions']['disabled_has_no_fabricated_transport'] = disabled['listeningAddress'] == '' and disabled['protocols'] == [] and disabled['peerCount'] == 0
     result['passed'] = all(result['assertions'].values())
     print(json.dumps(result['assertions']),flush=True)
 except BaseException as e:

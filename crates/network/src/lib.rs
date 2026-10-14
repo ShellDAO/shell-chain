@@ -31,4 +31,4 @@ pub use message::{
     MAX_MESSAGE_SIZE,
 };
 pub use security::{PeerBanList, PeerTracker};
-pub use service::NetworkService;
+pub use service::{LocalNodeInfo, NetworkService};

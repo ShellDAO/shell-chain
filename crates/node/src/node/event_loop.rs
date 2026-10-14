@@ -577,7 +577,7 @@ impl<S: KvStore + 'static> Node<S> {
                     } else {
                         None
                     },
-                    None, // admin_p2p_context: wire peer_id + p2p_listen when P2P layer is integrated
+                    Some(network.local_node_info_handle()),
                     Some(Arc::clone(&self.witness_store)), // B5: witness store wired
                     Some({
                         let p = &self.config.pruning;

@@ -83,11 +83,9 @@ pub struct RpcHandler<S: KvStore + 'static> {
     /// Admin context: RPC listen address and local P2P identity strings.
     /// Used by `admin_nodeInfo` and `admin_peers`.
     /// `admin_rpc_addr`   — HTTP/RPC listen address (e.g. "127.0.0.1:8545").
-    /// `admin_peer_id`    — libp2p PeerId (base58).
-    /// `admin_p2p_listen` — P2P multiaddr the node listens on.
+    /// Local P2P identity, bound addresses and enabled transport protocols are live.
     admin_rpc_addr: String,
-    admin_peer_id: String,
-    admin_p2p_listen: String,
+    local_node_info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
     /// Optional witness store for Phase B witness bundle queries (B4).
     witness_store: Option<Arc<WitnessStore<S>>>,
     /// Optional active storage profile descriptor surfaced via
@@ -125,8 +123,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             peer_count: Arc::clone(&self.peer_count),
             dev_control: self.dev_control.clone(),
             admin_rpc_addr: self.admin_rpc_addr.clone(),
-            admin_peer_id: self.admin_peer_id.clone(),
-            admin_p2p_listen: self.admin_p2p_listen.clone(),
+            local_node_info: Arc::clone(&self.local_node_info),
             witness_store: self.witness_store.clone(),
             storage_profile: self.storage_profile.clone(),
             consensus_engine: self.consensus_engine.clone(),
@@ -173,8 +170,9 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dev_control: None,
             admin_rpc_addr: String::new(),
-            admin_peer_id: String::new(),
-            admin_p2p_listen: String::new(),
+            local_node_info: Arc::new(std::sync::RwLock::new(
+                shell_network::LocalNodeInfo::default(),
+            )),
             witness_store: None,
             storage_profile: None,
             consensus_engine: None,
@@ -320,8 +318,20 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     /// The RPC listen address is populated separately from the bound server
     /// address after `start_rpc_server` returns.
     pub fn with_admin_context(mut self, peer_id: String, p2p_listen: String) -> Self {
-        self.admin_peer_id = peer_id;
-        self.admin_p2p_listen = p2p_listen;
+        self.local_node_info = Arc::new(std::sync::RwLock::new(shell_network::LocalNodeInfo {
+            peer_id,
+            listen_addresses: vec![p2p_listen],
+            protocols: vec!["gossipsub".into(), "kademlia".into(), "mdns".into()],
+        }));
+        self
+    }
+
+    /// Share actual transport state with all cloned RPC handlers.
+    pub fn with_local_node_info(
+        mut self,
+        info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
+    ) -> Self {
+        self.local_node_info = info;
         self
     }
 
@@ -7233,13 +7243,10 @@ mod tests {
         // peerCount reflects the live AtomicUsize (0 in the default test setup).
         assert_eq!(result["peerCount"], 0);
         assert_eq!(result["protocolVersion"], "shell/1.0.0");
-        // listeningAddress falls back to the default multiaddr when unset.
-        assert_eq!(result["listeningAddress"], "/ip4/0.0.0.0/tcp/30303");
+        // An absent transport has no bound address or enabled protocols.
+        assert_eq!(result["listeningAddress"], "");
         let protocols = result["protocols"].as_array().unwrap();
-        assert_eq!(protocols.len(), 3);
-        assert!(protocols.contains(&serde_json::json!("gossipsub")));
-        assert!(protocols.contains(&serde_json::json!("kademlia")));
-        assert!(protocols.contains(&serde_json::json!("mdns")));
+        assert!(protocols.is_empty());
     }
 
     #[tokio::test]
@@ -7249,6 +7256,35 @@ mod tests {
         handler.peer_count.store(7, Ordering::Relaxed);
         let result = ShellApiServer::get_network_stats(&handler).await.unwrap();
         assert_eq!(result["peerCount"], 7);
+    }
+
+    #[tokio::test]
+    async fn get_network_stats_observes_updates_through_cloned_handlers() {
+        let info = Arc::new(std::sync::RwLock::new(
+            shell_network::LocalNodeInfo::default(),
+        ));
+        let handler = setup().with_local_node_info(Arc::clone(&info));
+        let observer = handler.clone();
+        assert_eq!(
+            ShellApiServer::get_network_stats(&observer).await.unwrap()["listeningAddress"],
+            ""
+        );
+        *info.write().unwrap() = shell_network::LocalNodeInfo {
+            peer_id: "actual-peer".into(),
+            listen_addresses: vec!["/ip4/127.0.0.1/tcp/12345".into()],
+            protocols: vec!["gossipsub".into()],
+        };
+        let stats = ShellApiServer::get_network_stats(&observer).await.unwrap();
+        assert_eq!(stats["listeningAddress"], "/ip4/127.0.0.1/tcp/12345");
+        assert_eq!(stats["protocols"], serde_json::json!(["gossipsub"]));
+        assert_eq!(
+            ShellApiServer::get_node_info(&observer).await.unwrap()["peer_id"],
+            "actual-peer"
+        );
+        *info.write().unwrap() = shell_network::LocalNodeInfo::default();
+        let stopped = ShellApiServer::get_network_stats(&observer).await.unwrap();
+        assert_eq!(stopped["listeningAddress"], "");
+        assert_eq!(stopped["protocols"], serde_json::json!([]));
     }
 
     #[tokio::test]

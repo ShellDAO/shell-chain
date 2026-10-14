@@ -160,9 +160,8 @@ impl RpcServerHandle {
 /// When `config.ws_addr` is `None`, a single server on `config.listen_addr`
 /// handles both HTTP and WebSocket (the jsonrpsee default).
 ///
-/// `admin_p2p_context` is an optional tuple of `(peer_id, p2p_listen_addr)`:
-///   - `peer_id` is the base58-encoded libp2p PeerId.
-///   - `p2p_listen_addr` is the multiaddr the P2P layer listens on.
+/// `admin_p2p_context` shares the live P2P identity, bound listener addresses
+/// and enabled transport protocols.
 ///
 /// Both are surfaced by `admin_nodeInfo`. Pass `None` if unavailable.
 ///
@@ -182,7 +181,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     finality: Arc<parking_lot::RwLock<FinalityState>>,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     dev_control: Option<DynDevRpcControl>,
-    admin_p2p_context: Option<(String, String)>,
+    admin_p2p_context: Option<Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>>,
     witness_store: Option<Arc<WitnessStore<S>>>,
     storage_profile_info: Option<crate::types::StorageProfileInfo>,
     consensus_engine: Option<Arc<parking_lot::RwLock<dyn ConsensusEngine>>>,
@@ -243,8 +242,8 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     if let (Some(signer), Some(addr)) = (proposer_signer, proposer_address) {
         handler = handler.with_proposer(signer, addr);
     }
-    if let Some((peer_id, p2p_listen)) = admin_p2p_context {
-        handler = handler.with_admin_context(peer_id, p2p_listen);
+    if let Some(info) = admin_p2p_context {
+        handler = handler.with_local_node_info(info);
     }
     if let Some(ws) = witness_store {
         handler = handler.with_witness_store(ws);

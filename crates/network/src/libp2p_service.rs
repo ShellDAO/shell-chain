@@ -305,6 +305,7 @@ fn inbound_direct_message_is_peer_violation(error: &request_response::InboundFai
 /// Spawns a background task running the libp2p Swarm event loop.
 /// Communication with the swarm is via async channels.
 pub struct Libp2pNetwork {
+    local_node_info: Arc<std::sync::RwLock<crate::LocalNodeInfo>>,
     cmd_tx: mpsc::Sender<SwarmCommand>,
     command_byte_budget: Arc<Semaphore>,
     event_rx: mpsc::Receiver<QueuedNetworkEvent>,
@@ -346,6 +347,19 @@ impl Libp2pNetwork {
             .listen_on(listen_addr)
             .map_err(|e| NetworkError::Transport(e.to_string()))?;
 
+        let mut protocols = vec!["gossipsub".to_string()];
+        if swarm.behaviour().kademlia.as_ref().is_some() {
+            protocols.push("kademlia".to_string());
+        }
+        if swarm.behaviour().mdns.as_ref().is_some() {
+            protocols.push("mdns".to_string());
+        }
+        let local_node_info = Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo {
+            peer_id: swarm.local_peer_id().to_string(),
+            listen_addresses: Vec::new(),
+            protocols,
+        }));
+
         let boot_nodes = parse_boot_nodes(&config.boot_nodes);
         for addr in &boot_nodes {
             seed_and_dial_boot_node(&mut swarm, addr, "startup");
@@ -365,6 +379,7 @@ impl Libp2pNetwork {
         let attestation_topic = IdentTopic::new(&config.attestation_topic);
         let proofs_topic = IdentTopic::new(&config.proofs_topic);
         let loop_config = SwarmLoopConfig {
+            local_node_info: Arc::clone(&local_node_info),
             peer_count: Arc::clone(&peer_count),
             blocks_topic,
             txs_topic,
@@ -380,6 +395,7 @@ impl Libp2pNetwork {
         tokio::spawn(swarm_loop(swarm, cmd_rx, event_tx, loop_config));
 
         Ok(Self {
+            local_node_info,
             cmd_tx,
             command_byte_budget,
             event_rx,
@@ -851,6 +867,7 @@ fn max_established_connection_limit(config: &NetworkConfig) -> Option<u32> {
 }
 
 struct SwarmLoopConfig {
+    local_node_info: Arc<std::sync::RwLock<crate::LocalNodeInfo>>,
     peer_count: Arc<AtomicUsize>,
     blocks_topic: IdentTopic,
     txs_topic: IdentTopic,
@@ -887,11 +904,17 @@ impl SwarmLoopState {
     }
 }
 
-struct PeerCountResetGuard(Arc<AtomicUsize>);
+struct PeerCountResetGuard(
+    Arc<AtomicUsize>,
+    Arc<std::sync::RwLock<crate::LocalNodeInfo>>,
+);
 
 impl Drop for PeerCountResetGuard {
     fn drop(&mut self) {
         self.0.store(0, Ordering::Relaxed);
+        if let Ok(mut info) = self.1.write() {
+            *info = crate::LocalNodeInfo::default();
+        }
     }
 }
 
@@ -920,7 +943,10 @@ async fn swarm_loop(
     loop_config: SwarmLoopConfig,
 ) {
     let mut state = SwarmLoopState::new(loop_config.peer_security);
-    let _peer_count_reset = PeerCountResetGuard(Arc::clone(&loop_config.peer_count));
+    let _peer_count_reset = PeerCountResetGuard(
+        Arc::clone(&loop_config.peer_count),
+        Arc::clone(&loop_config.local_node_info),
+    );
 
     // Subscribe to gossipsub topics.
     if let Err(e) = swarm
@@ -1510,6 +1536,16 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             let local_peer_id = *swarm.local_peer_id();
             info!("Listening on {address}/p2p/{local_peer_id}");
+            if let Ok(mut info) = loop_config.local_node_info.write() {
+                info.listen_addresses = swarm.listeners().map(ToString::to_string).collect();
+                info.listen_addresses.sort();
+            }
+        }
+        SwarmEvent::ExpiredListenAddr { .. } | SwarmEvent::ListenerClosed { .. } => {
+            if let Ok(mut info) = loop_config.local_node_info.write() {
+                info.listen_addresses = swarm.listeners().map(ToString::to_string).collect();
+                info.listen_addresses.sort();
+            }
         }
         // Connection established.
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1711,6 +1747,10 @@ fn message_matches_topic(
 
 #[async_trait]
 impl NetworkService for Libp2pNetwork {
+    fn local_node_info_handle(&self) -> Arc<std::sync::RwLock<crate::LocalNodeInfo>> {
+        Arc::clone(&self.local_node_info)
+    }
+
     async fn broadcast(&self, msg: NetworkMessage) -> Result<(), NetworkError> {
         let topic = topic_kind_for_message(&msg);
 
@@ -1920,6 +1960,7 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
         let (_event_tx, event_rx) = mpsc::channel(1);
         let network = Libp2pNetwork {
+            local_node_info: Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
             cmd_tx,
             command_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES)),
             event_rx,
@@ -1972,6 +2013,7 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
         let (_event_tx, event_rx) = mpsc::channel(1);
         let network = Libp2pNetwork {
+            local_node_info: Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
             cmd_tx,
             command_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES)),
             event_rx,
@@ -2333,6 +2375,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_node_info_tracks_bound_listener_and_shutdown() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: false,
+            ..Default::default()
+        };
+        let network = Libp2pNetwork::new(&config).await.unwrap();
+        let info = network.local_node_info_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while info.read().unwrap().listen_addresses.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let bound = info.read().unwrap().clone();
+        assert!(!bound.peer_id.is_empty());
+        assert_eq!(bound.protocols, vec!["gossipsub"]);
+        assert!(bound.listen_addresses[0].starts_with("/ip4/127.0.0.1/tcp/"));
+        let port: u16 = bound.listen_addresses[0]
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(port > 0);
+        let connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        drop(connection);
+        network.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *info.read().unwrap() != crate::LocalNodeInfo::default() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(network.peer_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn libp2p_broadcast_respects_configured_message_limit() {
         let config = NetworkConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2496,7 +2581,10 @@ mod tests {
         let peer_count = Arc::new(AtomicUsize::new(3));
 
         {
-            let _guard = PeerCountResetGuard(Arc::clone(&peer_count));
+            let _guard = PeerCountResetGuard(
+                Arc::clone(&peer_count),
+                Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
+            );
         }
 
         assert_eq!(peer_count.load(Ordering::Relaxed), 0);
@@ -2731,6 +2819,7 @@ mod tests {
         let addr: Multiaddr = "/ip4/192.0.2.1/tcp/30303".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(1);
         let loop_config = SwarmLoopConfig {
+            local_node_info: Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
             peer_count: Arc::new(AtomicUsize::new(0)),
             blocks_topic: IdentTopic::new(&config.blocks_topic),
             txs_topic: IdentTopic::new(&config.txs_topic),
