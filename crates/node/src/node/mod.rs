@@ -11707,6 +11707,51 @@ mod tests {
         state_reads: Vec<(String, serde_json::Value, String)>,
     }
 
+    async fn assert_epoch_info_http<S: KvStore + 'static>(
+        node: &Node<S>,
+        address: std::net::SocketAddr,
+    ) {
+        // This signed execution/import fixture has continuous epochs and one
+        // active authority, including after rebuilding the node from disk.
+        assert_eq!(node.consensus.read().poa_config().epoch_length, 0);
+        let head_hash = node.chain_store.get_head_hash().unwrap().unwrap();
+        let head = node
+            .chain_store
+            .get_header_by_hash(&head_hash)
+            .unwrap()
+            .unwrap();
+        let window = head.number.min(10);
+        let earlier_hash = node
+            .chain_store
+            .get_block_hash_by_number(head.number - window)
+            .unwrap()
+            .unwrap();
+        let earlier = node
+            .chain_store
+            .get_header_by_hash(&earlier_hash)
+            .unwrap()
+            .unwrap();
+        let interval = if window == 0 {
+            0.0
+        } else {
+            (head.timestamp - earlier.timestamp) as f64 / window as f64
+        };
+        let root = current_state_root(node);
+        let before = node.store.scan_prefix(b"").unwrap();
+        let response =
+            native_http_request(address, "shell_getEpochInfo", serde_json::json!([])).await;
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "currentEpoch": 0, "epochLength": 0, "blocksInEpoch": head.number,
+                "currentBlockTime": interval, "activeValidators": 1,
+            }),
+            "{response}"
+        );
+        assert_eq!(current_state_root(node), root);
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+    }
+
     fn fee_history_signed_import<S: KvStore + 'static>(
         leader: &Node<MemoryDb>,
         follower: &Node<S>,
@@ -11980,12 +12025,13 @@ mod tests {
                 None,
                 Some(Arc::clone(&follower.witness_store)),
                 None,
-                None,
+                Some(Arc::clone(&follower.consensus)),
                 None,
             )
             .await
             .unwrap();
             let address = server.http_addr;
+            assert_epoch_info_http(follower, address).await;
             for fixture in &fixtures {
                 for (method, params, expected) in &fixture.state_reads {
                     let response = native_http_request(address, method, params.clone()).await;
@@ -12111,11 +12157,12 @@ mod tests {
                 None,
                 Some(Arc::clone(&recovered.witness_store)),
                 None,
-                None,
+                Some(Arc::clone(&recovered.consensus)),
                 None,
             )
             .await
             .unwrap();
+            assert_epoch_info_http(&recovered, server.http_addr).await;
             let original = native_http_request(
                 server.http_addr,
                 "eth_feeHistory",

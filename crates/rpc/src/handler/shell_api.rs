@@ -3,6 +3,7 @@ use super::*;
 const DEFAULT_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 200;
 const MAX_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW: u64 = 1000;
 const MAX_OPTIONAL_RPC_BYTE_FIELD_LEN: usize = 32 * 1024;
+const EPOCH_INFO_BLOCK_TIME_WINDOW: u64 = 10;
 
 fn normalize_validator_snapshot_proposer_window(
     proposer_window: Option<u64>,
@@ -996,6 +997,62 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "avgBlockTime": avg_block_time,
             "gasUsedTotal": hex_u256(gas_used_total),
             "latestBaseFee": hex_u64(base_fee),
+        }))
+    }
+
+    async fn get_epoch_info(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let engine_lock = self
+            .consensus_engine
+            .as_ref()
+            .ok_or_else(|| feature_not_enabled("consensus engine unavailable"))?;
+        let (config, active_validators) = {
+            let engine = engine_lock.read();
+            (
+                engine.poa_config().clone(),
+                engine.validator_weights().len(),
+            )
+        };
+        let head_hash = self
+            .chain_store
+            .get_head_hash()
+            .map_err(internal_err)?
+            .ok_or_else(|| not_found_err("canonical head unavailable"))?;
+        let head = self
+            .chain_store
+            .get_header_by_hash(&head_hash)
+            .map_err(internal_err)?
+            .ok_or_else(|| not_found_err("canonical head header unavailable"))?;
+        let height = head.number;
+        if self
+            .chain_store
+            .get_block_hash_by_number(height)
+            .map_err(internal_err)?
+            != Some(head_hash)
+        {
+            return Err(internal_err("head is not canonical"));
+        }
+        let window = height.min(EPOCH_INFO_BLOCK_TIME_WINDOW);
+        let current_block_time = if window == 0 {
+            0.0
+        } else {
+            let older = self.canonical_state_header(height - window)?;
+            let elapsed = head
+                .timestamp
+                .checked_sub(older.timestamp)
+                .ok_or_else(|| internal_err("canonical block timestamps are out of order"))?;
+            elapsed as f64 / window as f64
+        };
+        let blocks_in_epoch = if config.epoch_length == 0 {
+            height
+        } else {
+            height % config.epoch_length
+        };
+        Ok(serde_json::json!({
+            "currentEpoch": config.epoch_of(height),
+            "epochLength": config.epoch_length,
+            "blocksInEpoch": blocks_in_epoch,
+            "currentBlockTime": current_block_time,
+            "activeValidators": active_validators,
         }))
     }
 

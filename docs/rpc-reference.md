@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (48 methods)
+- **`shell_`** (49 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -635,6 +635,13 @@ get_chain_stats() → serde_json::Value
 ```
 
 Returns chain performance statistics for the performance dashboard.
+
+### shell_getEpochInfo
+```
+get_epoch_info() → serde_json::Value
+```
+
+Returns current canonical epoch data and the active consensus validator count.
 
 ### shell_getFinalityInfo
 ```

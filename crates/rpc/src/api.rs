@@ -579,6 +579,11 @@ pub trait ShellApi {
         &self,
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns current canonical epoch data and the active consensus validator count.
+    #[method(name = "getEpochInfo")]
+    async fn get_epoch_info(&self)
+        -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns finality information: last finalized block, current head, and pending attestations.
     #[method(name = "getFinalityInfo")]
     async fn get_finality_info(

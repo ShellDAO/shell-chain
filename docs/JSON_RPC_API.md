@@ -1293,17 +1293,50 @@ curl -s http://localhost:8545 \
 
 Returns information about the current consensus epoch.
 
+Unreleased node source reads the canonical head and configured consensus engine.
+`currentEpoch` refers to the head's epoch, rather than the next proposer slot.
+For a positive `epochLength`, `blocksInEpoch` is the head's zero-based block
+offset within that epoch. With length zero, epochs are disabled: `currentEpoch`
+is zero and `blocksInEpoch` is the head height. `activeValidators` counts the
+engine's active authorities, which can differ from pending head Registry changes.
+`currentBlockTime` is the mean timestamp interval over up to ten canonical
+intervals ending at the head, or zero at genesis. Missing engine, head or required
+canonical history returns an error. The query needs retained headers, not block
+bodies, and does not write state. Published node versions must be checked before
+relying on this method.
+
+From a node source checkout, run the isolated HTTP regression and the existing
+signed execution/import fixture, which also checks this query after body pruning
+and an abrupt child-process exit followed by RocksDB recovery:
+
+```bash
+cargo test -p shell-rpc epoch_info -- --nocapture
+cargo test -p shell-node --features rocksdb fee_history_rewards -- --nocapture
+```
+
+The isolated regression covers genesis, length-five boundaries, continuous
+epochs, active-engine counts, invalid context and unchanged state. On Unix it
+also runs the curl example below and requires `curl` and a POSIX shell. The
+recovery fixture uses real legacy Dilithium3 signed transactions and continuous
+epochs; it does not prove every algorithm, nonzero-epoch recovery, network
+reorganization or machine power-loss combination.
+
 **Parameters:** None
 
 **Returns:**
 ```json
 {
-  "currentEpoch": 5,
+  "currentEpoch": 0,
   "epochLength": 0,
   "blocksInEpoch": 1500,
   "currentBlockTime": 2.01,
   "activeValidators": 3
 }
+```
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getEpochInfo","params":[],"id":1}'
 ```
 
 ---
