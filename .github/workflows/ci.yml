@@ -23,6 +23,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: Validate native release workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release-binaries.yml
       - run: cargo fmt --all -- --check
       - name: Test release preflight checks
         run: scripts/test-release-preflight.sh
