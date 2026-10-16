@@ -25,7 +25,6 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/release-target
       CARGO_BUILD_JOBS: '2'
       RELEASE_COMMIT: ${{ inputs.commit }}
       RELEASE_TARGET: ${{ matrix.target }}
@@ -70,6 +69,8 @@ jobs:
           fi
 
       - name: Build and package the production binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-target
         shell: bash
         run: |
           set -euo pipefail
