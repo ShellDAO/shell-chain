@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - runner: macos-15
             target: aarch64-apple-darwin
@@ -32,6 +32,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -74,6 +78,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then
+            export MACOSX_DEPLOYMENT_TARGET=13.0
+          fi
           scripts/build-release-binary.sh
           test -z "$(git status --porcelain)"
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
@@ -96,6 +103,7 @@ jobs:
               'features': ['rocksdb', 'libp2p'],
               'rustc': subprocess.check_output(['rustc', '-vV'], text=True),
               'platform': platform.platform(),
+              'macos_deployment_target': os.environ.get('MACOSX_DEPLOYMENT_TARGET'),
           }
           (archive.parent / 'build.json').write_text(json.dumps(evidence, indent=2) + '\n')
           PY
