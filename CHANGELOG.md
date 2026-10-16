@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ## [0.27.5] — 2026-10-16 — V2 signing and reader workflow fixes
 
+### Security
+
+- Update the locked rustls dependency to 0.23.46 for
+  [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348.html)
+  (Brotli certificate decompression) and
+  [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349.html)
+  (client key-share prediction). Workspace, fuzz and transaction-generator
+  dependency graphs use the same patched release.
+
 ### Release compatibility
 
 - This source release uses V2 transaction signing with access-list commitments.
