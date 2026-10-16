@@ -2981,9 +2981,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3261,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "shell-consensus"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-rlp",
  "serde",
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "shell-crypto"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-rlp",
  "bip39",
@@ -3307,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "shell-fuzz"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-rlp",
  "libfuzzer-sys",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "shell-mempool"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "parking_lot",
  "serde_json",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "shell-network"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "shell-pqvm"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-primitives",
  "blake3",
@@ -3368,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "shell-primitives"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3381,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "shell-rpc"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "shell-stark-prover"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "blake3",
  "serde",
@@ -3428,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "shell-storage"
-version = "0.27.4"
+version = "0.27.5"
 dependencies = [
  "alloy-rlp",
  "base64",

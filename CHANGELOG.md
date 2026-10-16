@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.5] — 2026-10-16 — V2 signing and reader workflow fixes
+
+### Security
+
+- Update the locked rustls dependency to 0.23.46 for
+  [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348.html)
+  (Brotli certificate decompression) and
+  [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349.html)
+  (client key-share prediction). Workspace, fuzz and transaction-generator
+  dependency graphs use the same patched release.
+
+### Release compatibility
+
+- This source release uses V2 transaction signing with access-list commitments.
+  Use a matching V2 SDK, such as the 0.14.0 release-candidate series; the stable
+  0.13.0 SDK signs V1 transactions. Confirm package availability and the network's
+  signing format before selecting a client.
+- Existing V1 databases and network genesis configurations are not converted by
+  installing this binary. Use a fresh data directory for isolated V2 development;
+  an existing network requires a separately coordinated migration plan. Preserve
+  its database, keys and genesis until that plan is approved.
+- Optional protocol profiles retain their documented default-off activation
+  schedules. This release does not activate them on an existing network.
+
+
 ### Fixed
 
 - Network statistics now report actual bound P2P listeners and enabled protocols
@@ -408,9 +433,11 @@ All notable changes to this project will be documented in this file.
 
 ### Migration Guide
 
-- Alpha testnet operators must stop the node, back up any required state, run
-  `shell-node --datadir <path> removedb --force`, and initialize the chain from
-  the coordinated genesis configuration before restarting.
+- Do not start this V2 binary against an existing V1 data directory. A local
+  V2 development network must initialize a fresh directory with its intended
+  genesis configuration. Existing testnet migration is a separate coordinated
+  operation; publishing this version does not authorize a database reset or
+  change the live network's genesis.
 
 ### Performance
 
