@@ -2303,11 +2303,12 @@ impl<S: KvStore + 'static> Node<S> {
                                 .cloned()
                             {
                                 let nonce = request.nonce;
+                                let start_number = request.start_number;
                                 if network
                                     .send_to_peer(
                                         &peer,
                                         NetworkMessage::BodyRequest {
-                                            start_number: request.start_number,
+                                            start_number,
                                             count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                                             nonce,
                                         },
@@ -2321,7 +2322,7 @@ impl<S: KvStore + 'static> Node<S> {
                                     ));
                                     info!(
                                         %peer,
-                                        start_number = request.start_number,
+                                        start_number,
                                         "L4: resumed historical body back-fill with connected peer"
                                     );
                                 }
@@ -3809,9 +3810,13 @@ mod cadence_tests {
     #[test]
     fn discovered_body_peer_preserves_the_inflight_broadcast_response() {
         let requested_at = std::time::Instant::now();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis() as u64;
         let requested_peer = PeerId("requested".into());
         let request = BodyRequestState {
-            nonce: 7,
+            nonce,
             start_number: 42,
             peer: None,
             requested_at,
@@ -3823,25 +3828,25 @@ mod cadence_tests {
 
         assert!(body_response_matches_request(
             Some(&bound),
-            7,
+            nonce,
             Some(42),
             &requested_peer,
         ));
         assert!(!body_response_matches_request(
             Some(&bound),
-            8,
+            nonce.wrapping_add(1),
             Some(42),
             &requested_peer,
         ));
         assert!(!body_response_matches_request(
             Some(&bound),
-            7,
+            nonce,
             Some(43),
             &requested_peer,
         ));
         assert!(!body_response_matches_request(
             Some(&bound),
-            7,
+            nonce,
             Some(42),
             &PeerId("other".into()),
         ));
