@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.6] — 2026-10-17 — Historical backfill request correlation
+
 ### Fixed
 
 - Preserve the active historical-body request nonce when discovering or choosing
