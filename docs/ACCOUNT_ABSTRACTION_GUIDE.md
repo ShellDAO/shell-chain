@@ -551,12 +551,13 @@ keys remain in its private temporary directory. It does not test multiple-author
 quorum or prove public package availability. See the
 [execution decision](adr/aa-validator-registry.md) for the atomicity boundary.
 
-## Contract-paymaster gas simulation (unreleased)
+## Contract-paymaster gas simulation
 
 `shell_estimatePaymasterGas` can execute the same bounded STATICCALL used by
-admission when `gas_limit` is supplied. This is available in updated source
-builds, not the currently published v0.27.4 binary. Existing requests without
-`gas_limit` and older servers return `simulation_status: "cap_only"` with null
+admission when `gas_limit` is supplied. Use the public
+[node v0.27.6 binary](https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.6)
+and the npm prerelease `shell-sdk@0.14.0-rc.2` for this workflow. Requests without
+`gas_limit` and servers without simulation support return `simulation_status: "cap_only"` with null
 `validation_gas` and `within_cap`.
 
 Supply the actual outer bundle `gas_limit`, `max_fee_per_gas`, `sender`,
