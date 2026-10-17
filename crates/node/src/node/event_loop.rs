@@ -203,6 +203,14 @@ struct BodyRequestState {
 }
 
 impl BodyRequestState {
+    fn bind_peer(mut self, peer: PeerId, now: std::time::Instant) -> Self {
+        // Peer discovery refines the route of the same pending request. A
+        // response to its earlier broadcast must keep the current nonce.
+        self.peer = Some(peer);
+        self.requested_at = now;
+        self
+    }
+
     fn is_stale(&self, now: std::time::Instant) -> bool {
         now.saturating_duration_since(self.requested_at) >= BODY_BACKFILL_REQUEST_TIMEOUT
     }
@@ -2026,16 +2034,16 @@ impl<S: KvStore + 'static> Node<S> {
                                     if let Some(request) = body_request.as_ref().cloned() {
                                         if let Some(preferred) = self.peer_caps.best_peer_for_block(request.start_number) {
                                             if request.peer.as_ref() != Some(&preferred) {
-                                                let nonce = Self::wall_clock_millis().max(request.nonce.saturating_add(1));
+                                                let nonce = request.nonce;
                                                 if network.send_to_peer(&preferred, NetworkMessage::BodyRequest {
                                                     start_number: request.start_number,
                                                     count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                                                     nonce,
                                                 }).await.is_ok() {
-                                                    body_request = Some(BodyRequestState {
-                                                        nonce, peer: Some(preferred),
-                                                        requested_at: std::time::Instant::now(), ..request
-                                                    });
+                                                    body_request = Some(request.bind_peer(
+                                                        preferred,
+                                                        std::time::Instant::now(),
+                                                    ));
                                                 }
                                             }
                                         }
@@ -2294,13 +2302,13 @@ impl<S: KvStore + 'static> Node<S> {
                                 .filter(|request| request.peer.is_none())
                                 .cloned()
                             {
-                                let nonce = Self::wall_clock_millis()
-                                    .max(request.nonce.saturating_add(1));
+                                let nonce = request.nonce;
+                                let start_number = request.start_number;
                                 if network
                                     .send_to_peer(
                                         &peer,
                                         NetworkMessage::BodyRequest {
-                                            start_number: request.start_number,
+                                            start_number,
                                             count: crate::historical_sync::BODY_BACKFILL_BATCH_SIZE,
                                             nonce,
                                         },
@@ -2308,15 +2316,13 @@ impl<S: KvStore + 'static> Node<S> {
                                     .await
                                     .is_ok()
                                 {
-                                    body_request = Some(BodyRequestState {
-                                        nonce,
-                                        start_number: request.start_number,
-                                        peer: Some(peer.clone()),
-                                        requested_at: std::time::Instant::now(),
-                                    });
+                                    body_request = Some(request.bind_peer(
+                                        peer.clone(),
+                                        std::time::Instant::now(),
+                                    ));
                                     info!(
                                         %peer,
-                                        start_number = request.start_number,
+                                        start_number,
                                         "L4: resumed historical body back-fill with connected peer"
                                     );
                                 }
@@ -3798,6 +3804,51 @@ mod cadence_tests {
             7,
             Some(42),
             &other_peer
+        ));
+    }
+
+    #[test]
+    fn discovered_body_peer_preserves_the_inflight_broadcast_response() {
+        let requested_at = std::time::Instant::now();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis() as u64;
+        let requested_peer = PeerId("requested".into());
+        let request = BodyRequestState {
+            nonce,
+            start_number: 42,
+            peer: None,
+            requested_at,
+        };
+        let bound = request.bind_peer(
+            requested_peer.clone(),
+            requested_at + std::time::Duration::from_millis(1),
+        );
+
+        assert!(body_response_matches_request(
+            Some(&bound),
+            nonce,
+            Some(42),
+            &requested_peer,
+        ));
+        assert!(!body_response_matches_request(
+            Some(&bound),
+            nonce.wrapping_add(1),
+            Some(42),
+            &requested_peer,
+        ));
+        assert!(!body_response_matches_request(
+            Some(&bound),
+            nonce,
+            Some(43),
+            &requested_peer,
+        ));
+        assert!(!body_response_matches_request(
+            Some(&bound),
+            nonce,
+            Some(42),
+            &PeerId("other".into()),
         ));
     }
 

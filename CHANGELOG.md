@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve the active historical-body request nonce when discovering or choosing
+  a serving peer. A response to the initial broadcast remains valid after the
+  same range is routed directly, avoiding a needless timeout during restart
+  recovery. Request range, peer binding and timeout-retry checks remain enforced.
+
 ## [0.27.5] — 2026-10-16 — V2 signing and reader workflow fixes
 
 ### Security
