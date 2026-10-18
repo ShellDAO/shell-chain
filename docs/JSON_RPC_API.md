@@ -405,6 +405,21 @@ mining with synthetic timestamps. It does not establish the pending native
 CREATE address scheme, independent import, pruned-state retention, multi-authority
 consensus or machine power-loss recovery.
 
+To verify retained state after the transaction bodies have expired, use the
+same dependencies and a node built with libp2p support, then run:
+
+```sh
+node tests/e2e/native-aa-lifecycle.mjs --historical-pruned-bodies
+```
+
+This mode uses natural isolated wPoA production with one authority and six
+signed transactions. It sets retention to 64 state roots and one block body in
+the light profile, checks that the bodies of the deployment and two storage writes are
+unavailable, then verifies the same literal historical code, storage and nonce
+values before and after a process reopen. This is a scaled retention test; it
+does not establish the default 4096-block window, independent block import or
+queries for state roots that have themselves expired.
+
 Block, receipt, log, and fee-history methods keep their documented historical
 block support.
 
