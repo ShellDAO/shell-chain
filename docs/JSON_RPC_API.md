@@ -398,7 +398,7 @@ Returns the balance of an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address (`0x...` canonical) |
-| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | No | State block tag (`"latest"`, `"pending"`, `"earliest"`, `"safe"`, `"finalized"`, or a hex block number; historical state must be retained) |
 
 **Returns:** `String` — Hex-encoded balance in wei.
 
@@ -422,7 +422,7 @@ Returns the nonce (transaction count) for an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address (`0x...` canonical) |
-| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | No | State block tag (`"latest"`, `"pending"`, `"earliest"`, `"safe"`, `"finalized"`, or a hex block number; historical state must be retained) |
 
 **Returns:** `String` — Hex-encoded nonce.
 
@@ -659,7 +659,7 @@ Returns the bytecode at an address.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address |
-| 2 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | No | State block tag (`"latest"`, `"pending"`, `"earliest"`, `"safe"`, `"finalized"`, or a hex block number; historical state must be retained) |
 
 **Returns:** `String` — Hex-encoded bytecode, or `"0x"` for accounts without
 runtime code.
@@ -674,10 +674,21 @@ Returns a storage slot value.
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Address |
-| 2 | `String` | Yes | Storage position (hex-encoded, 32-byte key) |
-| 3 | `String` | No | State block tag (`"latest"` or `"pending"` only) |
+| 2 | `String` | Yes | Storage position as a canonical hex quantity (for example `0x0`; no leading zero padding) |
+| 3 | `String` | No | State block tag (`"latest"`, `"pending"`, `"earliest"`, `"safe"`, `"finalized"`, or a hex block number; historical state must be retained) |
 
 **Returns:** `String` — Zero-padded 32-byte hex value.
+
+The position is a 256-bit index encoded as a minimal hex quantity, as specified
+by [EIP-1474](https://eips.ethereum.org/EIPS/eip-1474#eth_getstorageat).
+Slot zero is `0x0`, not a zero-padded 32-byte string. The returned **value** is
+always a zero-padded 32-byte hex string.
+
+```bash
+curl -s http://localhost:8545 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["0x<64 hex>","0x0","latest"],"id":1}'
+```
 
 ---
 
