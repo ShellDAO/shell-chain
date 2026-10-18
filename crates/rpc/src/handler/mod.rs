@@ -1836,6 +1836,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validator_votes_signed_headers_survive_pruning_reopen_and_canonical_change() {
+        use jsonrpsee::core::client::{ClientT, Error as ClientError};
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use jsonrpsee::server::ServerBuilder;
+        use shell_crypto::Verifier;
+        use shell_storage::{RocksDbConfig, RocksDbStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            RocksDbStore::open_all(
+                dir.path(),
+                Some(RocksDbConfig {
+                    block_cache_mb: 8,
+                    write_buffer_mb: 4,
+                    ..RocksDbConfig::default()
+                }),
+            )
+            .unwrap()
+        };
+        let first = DilithiumSigner::generate();
+        let second = DilithiumSigner::generate();
+        let idle = test_address(b"idle-votes-authority");
+        let a = signer_address(&first);
+        let b = signer_address(&second);
+        let mut imported = Vec::new();
+        let mut parent = ShellHash::ZERO;
+        for number in 0..=201 {
+            let signer = if number % 2 == 0 { &second } else { &first };
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.parent_hash = parent;
+            block.header.proposer = signer_address(signer);
+            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+            assert!(MultiVerifier
+                .verify(
+                    signer.public_key(),
+                    block.hash().as_bytes(),
+                    block.proposer_seal.as_ref().unwrap()
+                )
+                .unwrap());
+            parent = block.hash();
+            imported.push(block);
+        }
+        let stores = open();
+        let handler = setup_with_store(Arc::new(stores.chain.clone()));
+        let empty = ShellApiServer::get_validator_votes(&handler).await.unwrap();
+        assert_eq!(empty["validators"], serde_json::json!([]));
+        assert!(empty["fromBlock"].is_null());
+        assert!(empty["blockHash"].is_null());
+        // Both proposer identities are genuine; genesis must not contribute.
+        for block in &imported {
+            handler.chain_store.put_block(block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(block.number(), &block.hash())
+                .unwrap();
+        }
+        handler.chain_store.set_head(&imported[201].hash()).unwrap();
+        // A removed authority's recent production must remain visible. The
+        // active engine is authoritative even when the head registry is empty.
+        let engine = Arc::new(parking_lot::RwLock::new(PoaEngine::new(PoaConfig::new(
+            vec![a, idle],
+            2,
+        ))));
+        let handler = handler.with_consensus_engine(engine);
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = ShellApiServer::get_validator_votes(&handler).await.unwrap();
+        assert_eq!(expected["fromBlock"], "0x2");
+        assert_eq!(expected["toBlock"], "0xc9");
+        assert_eq!(expected["window"], 200);
+        assert_eq!(
+            expected["blockHash"],
+            serde_json::json!(imported[201].hash())
+        );
+        let rows = expected["validators"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for (address, produced, last) in [
+            (a, 100, Some("0xc9")),
+            (b, 100, Some("0xc8")),
+            (idle, 0, None),
+        ] {
+            let row = rows
+                .iter()
+                .find(|r| r["address"] == address.to_string())
+                .unwrap();
+            assert_eq!(row["blocksProduced"], produced);
+            assert_eq!(row["lastBlockProduced"], serde_json::json!(last));
+            assert!(row["uptime"].is_null());
+        }
+        assert!(rows
+            .windows(2)
+            .all(|pair| pair[0]["address"].as_str() < pair[1]["address"].as_str()));
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        let hashes: Vec<_> = imported.iter().map(Block::hash).collect();
+        handler.chain_store.delete_bodies(&hashes).unwrap();
+        assert!(handler.chain_store.get_head_block().unwrap().is_none());
+        assert_eq!(
+            ShellApiServer::get_validator_votes(&handler).await.unwrap(),
+            expected
+        );
+        drop(handler);
+        drop(stores);
+
+        let stores = open();
+        let handler =
+            setup_with_store(Arc::new(stores.chain.clone())).with_consensus_engine(Arc::new(
+                parking_lot::RwLock::new(PoaEngine::new(PoaConfig::new(vec![a, idle], 2))),
+            ));
+        let chain = handler.chain_store.clone();
+        let before = chain.store().scan_prefix(b"").unwrap();
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let client = HttpClientBuilder::default().build(&endpoint).unwrap();
+        let mut module = ShellApiServer::into_rpc(handler);
+        crate::server::register_validator_votes_rpc(&mut module).unwrap();
+        for params in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!({})),
+        ] {
+            let mut request =
+                serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"shell_getValidatorVotes"});
+            if let Some(params) = params {
+                request["params"] = params;
+            }
+            let (raw, _) = module
+                .raw_json_request(&request.to_string(), 1)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["result"], expected);
+        }
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":1,
+            "method":"shell_getValidatorVotes", "params":{"window":1}});
+        let (raw, _) = module
+            .raw_json_request(&request.to_string(), 1)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        let handle = server.start(module);
+        let actual: serde_json::Value = client
+            .request("shell_getValidatorVotes", rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let err = client
+            .request::<serde_json::Value, _>("shell_getValidatorVotes", rpc_params![1])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Call(ref e) if e.code() == -32602));
+        assert_eq!(chain.store().scan_prefix(b"").unwrap(), before);
+        // Replacing only the canonical tip excludes the formerly selected tip.
+        let mut replacement = imported[201].clone();
+        replacement.header.proposer = b;
+        replacement.proposer_seal = Some(second.sign(replacement.hash().as_bytes()).unwrap());
+        chain.put_block(&replacement).unwrap();
+        let unchanged: serde_json::Value = client
+            .request("shell_getValidatorVotes", rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged, expected,
+            "an unselected fork contributes nothing"
+        );
+        chain.set_canonical(201, &replacement.hash()).unwrap();
+        chain.set_head(&replacement.hash()).unwrap();
+        let changed: serde_json::Value = client
+            .request("shell_getValidatorVotes", rpc_params![])
+            .await
+            .unwrap();
+        let rows = changed["validators"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["address"] == a.to_string()).unwrap()["blocksProduced"],
+            99
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["address"] == b.to_string()).unwrap()["blocksProduced"],
+            101
+        );
+        assert_eq!(changed["blockHash"], serde_json::json!(replacement.hash()));
+        let guide = include_str!("../../../../docs/JSON_RPC_API.md")
+            .split("### shell_getValidatorVotes\n")
+            .nth(1)
+            .unwrap()
+            .split("\n---")
+            .next()
+            .unwrap();
+        let example = guide
+            .split("```bash\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap()
+            .replace("http://localhost:8545", &endpoint);
+        #[cfg(unix)]
+        {
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("sh")
+                    .args(["-c", &example])
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(output.status.success());
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["result"], changed);
+        }
+        let mut broken = replacement;
+        broken.header.number = 202;
+        broken.header.parent_hash = ShellHash::from([0x99; 32]);
+        chain.put_block(&broken).unwrap();
+        chain.set_head(&broken.hash()).unwrap();
+        let before = chain.store().scan_prefix(b"").unwrap();
+        assert!(client
+            .request::<serde_json::Value, _>("shell_getValidatorVotes", rpc_params![])
+            .await
+            .is_err());
+        assert_eq!(chain.store().scan_prefix(b"").unwrap(), before);
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
     async fn validator_snapshot_rejects_zero_proposer_window_as_invalid_params() {
         let handler = setup();
         let err = ShellApiServer::get_validator_snapshot(

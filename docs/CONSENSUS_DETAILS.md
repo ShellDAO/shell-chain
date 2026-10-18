@@ -705,3 +705,21 @@ resolve through the transaction-local full-address registry, even if the older
 log-address schedule is absent. Internal execution handles never appear as
 public log addresses. Receipt bloom hashing still follows its own activation
 schedule. Before native activation, existing log-address rules remain intact.
+
+
+### Validator activity observations
+
+On source builds containing `shell_getValidatorVotes`, the read-only RPC walks
+at most 200 retained headers backward from one canonical head hash, excluding
+genesis. It derives production counts without maintaining a second mutable
+activity index. The same headers remain available after body pruning and a
+restart. A changed head or incomplete ancestry produces an error rather than
+mixing branches or silently presenting partial counts. Current authorities with
+no production and recent producers no longer in the active set remain visible.
+
+This window is an RPC observation limit, not an epoch length or consensus rule.
+The response identifies its range and head hash. Weighted proposer frequency
+and a quorum certificate's signer subset cannot establish machine availability;
+`uptime` remains null until an availability measurement and its observation
+source are defined. The RPC does not reinterpret production counts as votes
+cast. This method is not present in node v0.27.6 or the current testnet.

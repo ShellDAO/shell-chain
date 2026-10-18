@@ -1411,22 +1411,47 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
 
 ### shell_getValidatorVotes
 
-Returns voting activity statistics for validators in recent blocks.
+Returns canonical block production activity. Available on source builds containing
+this method; node v0.27.6 and the current testnet do not expose it yet.
 
-**Parameters:** None
+**Parameters:** None (omit `params`, or pass `[]` / `{}`). Nonempty parameters
+return `-32602`.
 
-**Returns:**
+The window covers at most 200 non-genesis blocks ending at `blockHash` /
+`toBlock`. `fromBlock` is null when there are no produced blocks. Counts and
+last heights come from persisted headers, including after body pruning and
+restart. Rows include current consensus authorities with zero activity and any
+other producer observed in the window, sorted by address. `lastBlockProduced`
+is null when an authority produced no block in the window; it is not a lifetime
+last-produced height. Missing ancestry returns an error, not a partial count.
+Retry if the chain head changes during the query.
+
+`uptime` is null: authenticated production and quorum certificate inclusion do
+not measure machine availability. Numerical uptime is still pending a defined
+measurement and complete observation source. Production share must not be
+interpreted as availability or as the number of consensus votes cast.
+
+**Returns (illustrative two-block window):**
 ```json
 {
   "validators": [
     {
       "address": "0x...",
-      "blocksProduced": 500,
-      "lastBlockProduced": "0x1a",
-      "uptime": 99.8
+      "blocksProduced": 2,
+      "lastBlockProduced": "0x2",
+      "uptime": null
     }
-  ]
+  ],
+  "window": 200,
+  "fromBlock": "0x1",
+  "toBlock": "0x2",
+  "blockHash": "0x..."
 }
+```
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getValidatorVotes","params":[],"id":1}'
 ```
 
 ---

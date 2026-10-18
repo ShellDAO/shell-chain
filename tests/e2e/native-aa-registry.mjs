@@ -270,6 +270,23 @@ async function compare(hash) {
   assert.deepEqual(receipts[1], receipts[0]);
   const states = await Promise.all([0, 1].map(state));
   assert.deepEqual(states[1], states[0]);
+  // The configured single authority produces every non-genesis block. Check
+  // the same durable activity on the independently importing/pruned follower.
+  const validatorVotes = await Promise.all([0, 1].map((i) => rpc(i, "shell_getValidatorVotes")));
+  assert.deepEqual(validatorVotes[1], validatorVotes[0]);
+  assert.equal(validatorVotes[0].blockHash, blocks[0].hash);
+  assert.equal(validatorVotes[0].toBlock, blocks[0].number);
+  assert.equal(validatorVotes[0].fromBlock, "0x" + Math.max(1, height - 199).toString(16));
+  assert.equal(validatorVotes[0].window, 200);
+  assert.deepEqual(validatorVotes[0].validators, expectedMembers.map((address) => ({
+    address,
+    blocksProduced: address === miner.getAddress() ? Math.min(height, 200) : 0,
+    lastBlockProduced: address === miner.getAddress() ? blocks[0].number : null,
+    uptime: null,
+  })).sort((a, b) => a.address.localeCompare(b.address)));
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(await state(i), states[i], "activity reads preserve state");
+  }
   let epochInfo;
   if (epochScenario) {
     const previous = await rpc(0, "eth_getBlockByNumber", [
@@ -311,6 +328,7 @@ async function compare(hash) {
     blockHash: blocks[0].hash,
     stateRoot: blocks[0].stateRoot,
     state: states[0],
+    validatorVotes,
     ...(epochInfo ? { epochInfo } : {}),
   };
 }
