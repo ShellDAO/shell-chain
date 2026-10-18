@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct the JSON-RPC storage position documentation to use a canonical hex
+  quantity, including `0x0` for slot zero; only the returned value is padded to
+  32 bytes. Align basic state-query parameter tables with retained historical
+  block-tag support and include a storage request example.
+
 ## [0.27.7] — 2026-10-18 — Canonical validator activity
 
 ### Added
