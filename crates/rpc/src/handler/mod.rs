@@ -1835,6 +1835,7 @@ mod tests {
         assert!(result.status.is_none());
     }
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn validator_votes_signed_headers_survive_pruning_reopen_and_canonical_change() {
         use jsonrpsee::core::client::{ClientT, Error as ClientError};

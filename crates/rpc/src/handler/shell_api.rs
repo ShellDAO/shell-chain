@@ -753,12 +753,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         const WINDOW: u64 = DEFAULT_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW;
         let mut counts = std::collections::BTreeMap::<String, (u64, Option<u64>)>::new();
         let active: Vec<Address> = match &self.consensus_engine {
-            Some(engine) => engine
-                .read()
-                .validator_weights()
-                .into_iter()
-                .map(|(address, _)| address)
-                .collect(),
+            Some(engine) => engine.read().validator_weights().into_keys().collect(),
             None => self
                 .world_state
                 .read()

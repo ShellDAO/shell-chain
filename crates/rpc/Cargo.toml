@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Enables durable RPC acceptance tests without changing the default storage backend.
+rocksdb = ["shell-storage/rocksdb"]
+
 [dependencies]
 shell-primitives.workspace = true
 shell-crypto.workspace = true
