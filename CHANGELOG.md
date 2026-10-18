@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Implement `shell_getValidatorVotes` production counts using the latest 200
+  canonical non-genesis headers, with explicit range and head hash, zero-activity
+  authorities, pruning/restart support, and strict empty-parameter validation.
+  Uptime remains null until a supported availability measurement is defined;
+  production share is not reported as uptime or votes cast.
+
 ## [0.27.6] — 2026-10-17 — Historical backfill request correlation
 
 ### Fixed

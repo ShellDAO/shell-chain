@@ -63,6 +63,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: Test durable validator activity RPC
+        run: cargo test --locked -p shell-rpc --features rocksdb validator_votes_signed_headers_survive_pruning_reopen_and_canonical_change -- --nocapture
       - run: cargo test --workspace
       - name: Test interactive password fallback
         run: |

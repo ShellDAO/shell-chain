@@ -749,6 +749,80 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         ws.get_validators().map_err(internal_err)
     }
 
+    async fn get_validator_votes(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        const WINDOW: u64 = DEFAULT_VALIDATOR_SNAPSHOT_PROPOSER_WINDOW;
+        let mut counts = std::collections::BTreeMap::<String, (u64, Option<u64>)>::new();
+        let active: Vec<Address> = match &self.consensus_engine {
+            Some(engine) => engine.read().validator_weights().into_keys().collect(),
+            None => self
+                .world_state
+                .read()
+                .get_validators()
+                .map_err(internal_err)?,
+        };
+        for address in active {
+            counts.insert(address.to_string(), (0, None));
+        }
+        let head_hash = self.chain_store.get_head_hash().map_err(internal_err)?;
+        let mut cursor = head_hash;
+        let mut to = 0;
+        let mut from = None;
+        let mut previous_number: Option<u64> = None;
+        for _ in 0..WINDOW {
+            let Some(hash) = cursor else { break };
+            let header = self
+                .chain_store
+                .get_header_by_hash(&hash)
+                .map_err(internal_err)?
+                .ok_or_else(|| {
+                    crate::error::server_error("canonical activity header unavailable")
+                })?;
+            if let Some(previous) = previous_number {
+                if header.number.checked_add(1) != Some(previous) {
+                    return Err(crate::error::server_error(
+                        "canonical activity ancestry is incomplete",
+                    ));
+                }
+            } else {
+                to = header.number;
+            }
+            // Genesis is configuration, not a produced consensus block.
+            if header.number == 0 {
+                break;
+            }
+            from = Some(header.number);
+            let entry = counts
+                .entry(header.proposer.to_string())
+                .or_insert((0, None));
+            entry.0 += 1;
+            entry.1 = Some(entry.1.unwrap_or(0).max(header.number));
+            previous_number = Some(header.number);
+            cursor = Some(header.parent_hash);
+        }
+        // A single ancestry anchor avoids mixing competing branches during a reorg.
+        if self.chain_store.get_head_hash().map_err(internal_err)? != head_hash {
+            return Err(crate::error::server_error(
+                "chain head changed; retry activity query",
+            ));
+        }
+        let validators: Vec<_> = counts
+            .into_iter()
+            .map(|(address, (blocks, last))| {
+                serde_json::json!({
+                    "address": address, "blocksProduced": blocks,
+                    "lastBlockProduced": last.map(hex_u64),
+                    // Weighted proposer frequency and quorum subsets are not availability.
+                    "uptime": null,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "validators": validators, "window": WINDOW,
+            "fromBlock": from.map(hex_u64), "toBlock": hex_u64(to),
+            "blockHash": head_hash,
+        }))
+    }
+
     async fn add_validator(&self, _address: String) -> Result<bool, ErrorObjectOwned> {
         // DISABLED (F-039/F-040): Direct WorldState mutation via RPC causes
         // split-brain — validator changes must go through a system contract

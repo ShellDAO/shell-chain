@@ -449,6 +449,13 @@ pub trait ShellApi {
     #[method(name = "getValidators")]
     async fn get_validators(&self) -> Result<Vec<Address>, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns production counts over the latest 200 canonical non-genesis blocks.
+    /// Retained headers survive body pruning; unmeasured uptime is null.
+    #[method(name = "getValidatorVotes")]
+    async fn get_validator_votes(
+        &self,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Disabled legacy direct-mutation method. Use `proposeAddValidator`.
     #[method(name = "addValidator")]
     async fn add_validator(

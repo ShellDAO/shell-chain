@@ -38,6 +38,31 @@ use crate::handler::RpcHandler;
 use crate::subscriptions::{BlockEvent, EthPubSubServer};
 use crate::tls;
 
+// The generated no-argument methods ignore extra params. Enforce this method's
+// documented request shape at the wire boundary before any storage reads.
+pub(crate) fn register_validator_votes_rpc<S: KvStore + 'static>(
+    module: &mut jsonrpsee::RpcModule<RpcHandler<S>>,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    module.remove_method("shell_getValidatorVotes");
+    module.register_async_method("shell_getValidatorVotes", |params, handler, _| async move {
+        if let Some(raw) = params.as_str() {
+            let empty = match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Null) => true,
+                Ok(serde_json::Value::Array(values)) => values.is_empty(),
+                Ok(serde_json::Value::Object(values)) => values.is_empty(),
+                _ => false,
+            };
+            if !empty {
+                return Err(crate::handler::invalid_params_err(
+                    "shell_getValidatorVotes takes no parameters",
+                ));
+            }
+        }
+        ShellApiServer::get_validator_votes(handler.as_ref()).await
+    })?;
+    Ok(())
+}
+
 /// Configuration for the JSON-RPC server.
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -337,6 +362,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     }
     if ns.iter().any(|n| n == "shell") {
         let mut shell_module = ShellApiServer::into_rpc(handler.clone());
+        register_validator_votes_rpc(&mut shell_module)?;
         if restrict_governance_signing {
             for method in GOVERNANCE_SIGNING_METHODS {
                 if shell_module.remove_method(method).is_none() {

@@ -11,7 +11,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
-- **`shell_`** (49 methods)
+- **`shell_`** (50 methods)
 
 All methods use JSON-RPC 2.0. Hex quantities are `0x`-prefixed strings.
 
@@ -503,6 +503,14 @@ get_validators() → Vec<Address>
 ```
 
 Returns the current validator set from world state.
+
+### shell_getValidatorVotes
+```
+get_validator_votes() → serde_json::Value
+```
+
+Returns production counts over the latest 200 canonical non-genesis blocks.
+Retained headers survive body pruning; unmeasured uptime is null.
 
 ### shell_addValidator
 ```
