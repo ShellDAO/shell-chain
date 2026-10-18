@@ -5634,7 +5634,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-docgen"
-version = "0.27.6"
+version = "0.27.7"
 dependencies = [
  "tempfile",
 ]
