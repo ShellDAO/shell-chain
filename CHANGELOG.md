@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add a `--historical-state` lifecycle acceptance mode that deploys a real
+  contract, signs storage writes and checks literal prior code/storage/nonce
+  values after later changes and a RocksDB process reopen. Run it in CI using
+  the existing node build and SDK installation.
+
 ### Fixed
 
 - Correct the JSON-RPC storage position documentation to use a canonical hex

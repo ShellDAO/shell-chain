@@ -208,7 +208,7 @@ async function start(data, label) {
   }
   throw Error("startup timeout");
 }
-try {
+async function runScenario() {
   const data = join(out, "data");
   await mkdir(data);
   const genesis = {
@@ -304,6 +304,79 @@ try {
     );
     return height;
   }
+  if (process.argv.includes("--historical-state")) {
+    result.scenario = "historical-contract-state";
+    result.adaptations[2] = "Existing isolated lifecycle genesis and legacy/default creation profile; this mode does not select or validate the pending native CREATE address scheme.";
+    const runtime = "60003560005500"; // CALLDATALOAD(0), SSTORE(slot 0), STOP.
+    const initCode = "0x61000761000f6000396100076000f3" + runtime;
+    let nextNonce = 0;
+    async function direct(label, to, data) {
+      const tx = buildTransaction({ chainId: 1337, nonce: nextNonce, to,
+        value: 0n, data, gasLimit: 3000000 });
+      const hash = await send(await miner.buildSignedTransaction({
+        tx, includePublicKey: true,
+      }));
+      await mine();
+      const receipt = await rpc("eth_getTransactionReceipt", [hash]);
+      assert.equal(receipt?.status, "0x1", label);
+      assert.equal(Number(BigInt(receipt.blockNumber)), height);
+      nextNonce++;
+      assert.equal(await rpc("eth_getTransactionCount", [miner.getAddress(), "latest"]),
+        "0x" + nextNonce.toString(16));
+      result.transactions.push({ label, hash, receipt });
+      return receipt;
+    }
+    const deployed = await direct("deploy storage runtime", null, initCode);
+    const contract = deployed.contractAddress;
+    assert.ok(contract, "creation returns a queryable legacy-profile address");
+    assert.equal(await rpc("eth_getCode", [contract, "latest"]), "0x" + runtime);
+    const word = (n) => "0x" + n.toString(16).padStart(64, "0");
+    await direct("set slot zero to 42", contract, word(42));
+    assert.equal(await rpc("eth_getStorageAt", [contract, "0x0", "latest"]), word(42));
+    await direct("set slot zero to 99", contract, word(99));
+    const current = async () => ({
+      height: await rpc("eth_blockNumber"),
+      nonce: await rpc("eth_getTransactionCount", [miner.getAddress(), "latest"]),
+      code: await rpc("eth_getCode", [contract, "latest"]),
+      storage: await rpc("eth_getStorageAt", [contract, "0x0", "latest"]),
+    });
+    const before = await current();
+    const expected = [
+      ["earliest", "0x", word(0), "0x0"],
+      ["0x0", "0x", word(0), "0x0"],
+      ["0x1", "0x" + runtime, word(0), "0x1"],
+      ["0x2", "0x" + runtime, word(42), "0x2"],
+      ["0x3", "0x" + runtime, word(99), "0x3"],
+      ["latest", "0x" + runtime, word(99), "0x3"],
+    ];
+    result.historicalStates = [];
+    async function checkHistory(phase) {
+      for (const [tag, code, storage, nonce] of expected) {
+        const observed = {
+          phase, tag,
+          code: await rpc("eth_getCode", [contract, tag]),
+          storage: await rpc("eth_getStorageAt", [contract, "0x0", tag]),
+          nonce: await rpc("eth_getTransactionCount", [miner.getAddress(), tag]),
+        };
+        assert.equal(observed.code, code, phase + ": code at " + tag);
+        assert.equal(observed.storage, storage, phase + ": slot at " + tag);
+        assert.equal(observed.nonce, nonce, phase + ": nonce at " + tag);
+        result.historicalStates.push(observed);
+      }
+    }
+    await checkHistory("after later writes");
+    assert.deepEqual(await current(), before, "historical reads preserve current state");
+    await stop();
+    await start(data, "historical-state-restart");
+    await checkHistory("after process reopen");
+    assert.deepEqual(await current(), before, "reopened historical reads preserve current state");
+    result.contract = contract;
+    result.historicalContractStateVerified = true;
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
+
   const account = old.getAddress(),
     vote = encodeSubmitRecoveryCalldata(
       account,
@@ -841,6 +914,9 @@ try {
   result.directRotationAndUnsignedRejectionVerified = true;
   result.finalHeight = height;
   result.passed = true;
+}
+try {
+  await runScenario();
 } catch (e) {
   result.error = String(e);
   throw e;

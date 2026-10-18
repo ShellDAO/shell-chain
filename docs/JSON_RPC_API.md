@@ -385,6 +385,26 @@ cargo test -p shell-rpc historical_state_reads_http -- --nocapture
 cargo test -p shell-node --features rocksdb fee_history_rewards -- --nocapture
 ```
 
+For real contract creation and storage writes, use the lifecycle script's
+`--historical-state` mode from a checkout containing that option. It requires
+Node.js 20 or later, a RocksDB-capable node v0.27.7 binary (or compatible source
+build), and the matching public `shell-sdk@0.14.0-rc.2` package. Set `NODE_BIN`
+to that binary and `SHELL_SDK_ENTRY` to the package's `dist/index.js`, then run:
+
+```sh
+node tests/e2e/native-aa-lifecycle.mjs --historical-state
+```
+
+The isolated fixture creates fresh funded accounts, deploys a storage contract,
+and signs two writes changing slot zero from 0 to 42 to 99. It checks the literal
+old code, slot and nonce values after later writes and an actual process reopen,
+and verifies that historical queries preserve current state. The node stops on
+exit; private temporary test data is retained for inspection. This case uses the
+existing legacy creation-address profile, full storage and explicit development
+mining with synthetic timestamps. It does not establish the pending native
+CREATE address scheme, independent import, pruned-state retention, multi-authority
+consensus or machine power-loss recovery.
+
 Block, receipt, log, and fee-history methods keep their documented historical
 block support.
 
