@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.7] — 2026-10-18 — Canonical validator activity
+
 ### Added
 
 - Implement `shell_getValidatorVotes` production counts using the latest 200
