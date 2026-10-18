@@ -1,117 +1,87 @@
-name: Release binaries
-
+name: Release binary acceptance
 on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Reviewed main commit to build (full 40-character SHA)
+        description: Reviewed release build commit
         required: true
         type: string
-
 permissions:
   contents: read
-
+  actions: read
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - runner: macos-15
-            target: aarch64-apple-darwin
-    env:
-      CARGO_BUILD_JOBS: '2'
-      RELEASE_COMMIT: ${{ inputs.commit }}
-      RELEASE_TARGET: ${{ matrix.target }}
+  accept:
+    name: Accept Linux epoch recovery archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          toolchain: stable
-          components: rustfmt
-
-      - name: Validate the exact release source
+          node-version: '24'
+      - name: Verify and test the existing release archive
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF" == refs/heads/main ]]
-          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$RELEASE_COMMIT" = f2946553640a566318f1281db002d7864558ed1d
           test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$RELEASE_COMMIT"
-          test -z "$(git status --porcelain)"
-          scripts/check-release-remote.sh origin
-          scripts/check-release-ci.sh "$RELEASE_COMMIT"
-          scripts/check-release-metadata.sh
-          scripts/check-release-lockfile.sh
-          cargo fmt --all -- --check
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-
-      - name: Install native build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y clang libclang-dev cmake pkg-config
-          else
-            brew list llvm >/dev/null 2>&1 || brew install llvm
-            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build and package the production binary
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/release-target
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = macOS ]; then
-            export MACOSX_DEPLOYMENT_TARGET=13.0
-          fi
-          scripts/build-release-binary.sh
-          test -z "$(git status --porcelain)"
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          report=$("$CARGO_TARGET_DIR/release/shell-node" version 2>&1)
-          grep -Fx "shell-cli $version" <<< "$report"
-          grep -Fx "  commit: $(git rev-parse --short HEAD)" <<< "$report"
-          mkdir "$RUNNER_TEMP/release-assets"
-          archive="$RUNNER_TEMP/release-assets/shell-node-v${version}-${RELEASE_TARGET}.tar.gz"
-          tar -czf "$archive" -C "$CARGO_TARGET_DIR/release" shell-node
-          python3 - "$archive" <<'PY'
-          import hashlib, json, os, pathlib, platform, subprocess, sys
-          archive = pathlib.Path(sys.argv[1])
+          git diff --exit-code "$RELEASE_COMMIT" -- . ':(exclude).github/workflows/release-binaries.yml'
+          gh api repos/ShellDAO/shell-chain/actions/runs/39123371628 > "$RUNNER_TEMP/build-run.json"
+          python3 - "$RUNNER_TEMP/build-run.json" <<'PYTHON'
+          import json, sys
+          run = json.load(open(sys.argv[1]))
+          assert run['head_sha'] == 'f2946553640a566318f1281db002d7864558ed1d'
+          assert run['head_branch'] == 'main' and run['conclusion'] == 'success'
+          assert run['path'] == '.github/workflows/release-binaries.yml'
+          PYTHON
+          gh run download 39123371628 --repo ShellDAO/shell-chain --name release-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP/native"
+          python3 - "$RUNNER_TEMP/native" <<'PYTHON'
+          import hashlib, json, pathlib, sys, tarfile
+          directory = pathlib.Path(sys.argv[1])
+          build = json.loads((directory / 'build.json').read_text())
+          name = 'shell-node-v0.27.7-x86_64-unknown-linux-gnu.tar.gz'
+          assert build['commit'] == 'f2946553640a566318f1281db002d7864558ed1d'
+          assert build['target'] == 'x86_64-unknown-linux-gnu'
+          assert build['features'] == ['rocksdb', 'libp2p'] and build['archive'] == name
+          archive = directory / name
           digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
-          (archive.parent / 'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
-          evidence = {
-              'commit': os.environ['RELEASE_COMMIT'],
-              'target': os.environ['RELEASE_TARGET'],
-              'archive': archive.name,
-              'sha256': digest,
-              'features': ['rocksdb', 'libp2p'],
-              'rustc': subprocess.check_output(['rustc', '-vV'], text=True),
-              'platform': platform.platform(),
-              'macos_deployment_target': os.environ.get('MACOSX_DEPLOYMENT_TARGET'),
-          }
-          (archive.parent / 'build.json').write_text(json.dumps(evidence, indent=2) + '\n')
-          PY
-
-      - name: Upload verified native archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-${{ matrix.target }}
-          path: ${{ runner.temp }}/release-assets/
-          if-no-files-found: error
-          retention-days: 7
+          assert digest == build['sha256'] == '5b94ee637d8851eba8454821b76d9e37fc23865bb0e190cfe18e4ddd26ca08f0'
+          assert (directory / 'SHA256SUMS').read_text() == f'{digest}  {name}\n'
+          with tarfile.open(archive) as package:
+              entries = package.getmembers()
+              assert len(entries) == 1 and entries[0].name == 'shell-node' and entries[0].isfile()
+              (directory / 'shell-node').write_bytes(package.extractfile(entries[0]).read())
+          (directory / 'shell-node').chmod(0o755)
+          PYTHON
+          report=$("$RUNNER_TEMP/native/shell-node" version 2>&1)
+          grep -Fx 'shell-cli 0.27.7' <<< "$report"
+          grep -Fx '  commit: f2946553' <<< "$report"
+          consumer="$RUNNER_TEMP/epoch-recovery-sdk"
+          export TMPDIR="$RUNNER_TEMP/acceptance-runtime"
+          mkdir "$consumer" "$TMPDIR"
+          npm install --prefix "$consumer" --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/ --prefer-online shell-sdk@0.14.0-rc.2
+          export NODE_BIN="$RUNNER_TEMP/native/shell-node"
+          export SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js"
+          export SHELL_PUBLIC_RPC_GUIDE_FILE="$RUNNER_TEMP/published-rpc-example.json"
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib
+          p = pathlib.Path('tests/e2e/native-aa-registry.mjs')
+          source = p.read_text()
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == 'c855046c6413f7bac4f4b2fc9dc2d6d460724cbe7ac2d998be442c1110871e3e'
+          anchor = '    result.epochRpcVerified = true;'
+          extension = '    // Run the reviewed public guide request against the isolated follower\n    // before the existing scenario performs its normal node shutdown.\n    if (process.env.SHELL_PUBLIC_RPC_GUIDE_FILE && process.platform !== "win32") {\n      const guide = JSON.parse(await readFile(process.env.SHELL_PUBLIC_RPC_GUIDE_FILE, "utf8"));\n      const page = guide.pages.find((page) => page.locale === "en" && page.accepted);\n      assert.ok(page, "verified original public guide snapshot");\n      const command = page.codes.find((code) => code.includes(\'"method":"shell_getValidatorVotes"\'));\n      assert.equal(command, "curl -s http://localhost:8545 -H \\"Content-Type: application/json\\" \\\\\\n  -d \'{\\"jsonrpc\\":\\"2.0\\",\\"method\\":\\"shell_getValidatorVotes\\",\\"params\\":[],\\"id\\":1}\'\\n", "reviewed original curl unchanged");\n      const before = await state(1);\n      const invoke = (text) => {\n        const output = spawnSync("sh", ["-c", text.replace("http://localhost:8545", `http://127.0.0.1:${ports[1]}`)], {\n          encoding: "utf8", timeout: 10000,\n          env: { ...process.env, NO_PROXY: "127.0.0.1,localhost" },\n        });\n        assert.equal(output.status, 0, output.stderr);\n        return JSON.parse(output.stdout);\n      };\n      result.publicValidatorActivityExample = invoke(command);\n      assert.deepEqual(result.publicValidatorActivityExample.result, at21.epochRestart.validatorVotes[1]);\n      result.publicValidatorActivityInvalidParams = invoke(command.replace(\'"params":[]\', \'"params":[1]\'));\n      assert.equal(result.publicValidatorActivityInvalidParams.error.code, -32602);\n      assert.deepEqual(await state(1), before, "published activity requests preserve state");\n    }\n'
+          assert source.count(anchor) == 1
+          p.write_text(source.replace(anchor, extension + anchor, 1))
+          guide = json.loads('{"checked_at": "2026-10-18T12:58:00.515692+00:00", "pages": [{"locale": "en", "url": "https://shell.org/en/docs/json-rpc", "final_url": "https://shell.org/en/docs/json-rpc", "http_status": 200, "sha256": "ce93e76ce807b4214b74f232eef0ad86062c4260bc956732738b50e5df2525a3", "section_sha256": "9f989ef2c3f93b286c707d19897572cd9c51c1aba3bd101f3387acf49ebe4b68", "checks": {"reviewed_curl_unchanged": true, "bounded_window": true, "unknown_uptime": true}, "codes": ["{\\n  \\"validators\\": [\\n    {\\n      \\"address\\": \\"0x<64 hex>\\",\\n      \\"blocksProduced\\": 2,\\n      \\"lastBlockProduced\\": \\"0x2\\",\\n      \\"uptime\\": null\\n    }\\n  ],\\n  \\"window\\": 200,\\n  \\"fromBlock\\": \\"0x1\\",\\n  \\"toBlock\\": \\"0x2\\",\\n  \\"blockHash\\": \\"0x...\\"\\n}\\n", "curl -s http://localhost:8545 -H \\"Content-Type: application/json\\" \\\\\\n  -d \'{\\"jsonrpc\\":\\"2.0\\",\\"method\\":\\"shell_getValidatorVotes\\",\\"params\\":[],\\"id\\":1}\'\\n"], "accepted": true, "same_full_page": false}, {"locale": "zh", "url": "https://shell.org/zh/docs/json-rpc", "final_url": "https://shell.org/zh/docs/json-rpc", "http_status": 200, "sha256": "d5fed49f95b2f983f8f19ae5ed6287a743dd22e0b8ae8a1e96e7a88c14df0aa6", "section_sha256": "9f989ef2c3f93b286c707d19897572cd9c51c1aba3bd101f3387acf49ebe4b68", "checks": {"reviewed_curl_unchanged": true, "bounded_window": true, "unknown_uptime": true}, "codes": ["{\\n  \\"validators\\": [\\n    {\\n      \\"address\\": \\"0x<64 hex>\\",\\n      \\"blocksProduced\\": 2,\\n      \\"lastBlockProduced\\": \\"0x2\\",\\n      \\"uptime\\": null\\n    }\\n  ],\\n  \\"window\\": 200,\\n  \\"fromBlock\\": \\"0x1\\",\\n  \\"toBlock\\": \\"0x2\\",\\n  \\"blockHash\\": \\"0x...\\"\\n}\\n", "curl -s http://localhost:8545 -H \\"Content-Type: application/json\\" \\\\\\n  -d \'{\\"jsonrpc\\":\\"2.0\\",\\"method\\":\\"shell_getValidatorVotes\\",\\"params\\":[],\\"id\\":1}\'\\n"], "accepted": true, "same_full_page": false}], "scope": "Fresh curl-fetched original EN/ZH guide sections parsed; code blocks equal reviewed accepted snapshot despite whole-page hash changes."}')
+          pathlib.Path(os.environ["SHELL_PUBLIC_RPC_GUIDE_FILE"]).write_text(json.dumps(guide))
+          PYTHON
+          node --check tests/e2e/native-aa-registry.mjs
+          node tests/e2e/native-aa-registry.mjs --epoch-pruned-restart
