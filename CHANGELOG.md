@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
   values after later changes and a RocksDB process reopen. Run it in CI using
   the existing node build and SDK installation.
 
+- Add a `--historical-pruned-bodies` lifecycle mode using natural wPoA blocks
+  and real signed transactions to verify retained historical contract state
+  after body pruning and a process reopen. Reuse the existing CI node build.
+
 ### Fixed
 
 - Correct the JSON-RPC storage position documentation to use a canonical hex

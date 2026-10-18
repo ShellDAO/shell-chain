@@ -36,6 +36,7 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const historicalPrunedBodies = process.argv.includes("--historical-pruned-bodies");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -172,7 +173,7 @@ async function start(data, label) {
     "--metrics-addr",
     "127.0.0.1:0",
     "--block-time",
-    "600000",
+    historicalPrunedBodies ? "2000" : "600000",
     "--max-idle-interval",
     "1209600000",
     "--network",
@@ -186,8 +187,11 @@ async function start(data, label) {
     "--rpc-api",
     "eth,net,web3,shell,debug,trace,evm",
     "--storage-profile",
-    "full",
+    historicalPrunedBodies ? "light" : "full",
   ];
+  if (historicalPrunedBodies)
+    command.push("--pruning", "64", "--body-retention", "1",
+      "--p2p", "--p2p-addr", "127.0.0.1:0");
   const fd = openSync(join(out, label + "-node.log"), "w");
   node = spawn(binary, command, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
@@ -247,6 +251,16 @@ async function runScenario() {
   await writeFile(join(data, "genesis.json"), JSON.stringify(genesis, null, 2));
   await start(data, "initial");
   const mine = async () => {
+    if (historicalPrunedBodies) {
+      const next = height + 1;
+      for (let i = 0; i < 240; i++) {
+        const observed = Number(BigInt(await rpc("eth_blockNumber")));
+        assert.ok(observed <= next, "one pending transaction produces one block");
+        if (observed === next) { height = next; return; }
+        await pause(250);
+      }
+      throw Error("natural transaction block production timeout");
+    }
     height++;
     await rpc("evm_setNextBlockTimestamp", [genesis.timestamp + height * 2]);
     await rpc("evm_mine", [1]);
@@ -304,8 +318,9 @@ async function runScenario() {
     );
     return height;
   }
-  if (process.argv.includes("--historical-state")) {
-    result.scenario = "historical-contract-state";
+  if (process.argv.includes("--historical-state") || historicalPrunedBodies) {
+    result.scenario = historicalPrunedBodies
+      ? "historical-contract-pruned-bodies" : "historical-contract-state";
     result.adaptations[2] = "Existing isolated lifecycle genesis and legacy/default creation profile; this mode does not select or validate the pending native CREATE address scheme.";
     const runtime = "60003560005500"; // CALLDATALOAD(0), SSTORE(slot 0), STOP.
     const initCode = "0x61000761000f6000396100076000f3" + runtime;
@@ -340,6 +355,18 @@ async function runScenario() {
       code: await rpc("eth_getCode", [contract, "latest"]),
       storage: await rpc("eth_getStorageAt", [contract, "0x0", "latest"]),
     });
+    async function checkPrunedBodies(phase) {
+      for (const tag of ["0x1", "0x2", "0x3"])
+        assert.equal(await rpc("eth_getBlockByNumber", [tag, false]), null,
+          phase + ": the transaction-bearing body at " + tag + " has expired");
+      assert.ok(await rpc("eth_getBlockByNumber", ["latest", false]),
+        phase + ": the current block body remains queryable");
+    }
+    if (historicalPrunedBodies) {
+      for (let i = 0; i < 3; i++)
+        await direct("advance retention window " + (i + 1), miner.getAddress(), "0x");
+      await checkPrunedBodies("before historical reads");
+    }
     const before = await current();
     const expected = [
       ["earliest", "0x", word(0), "0x0"],
@@ -347,7 +374,7 @@ async function runScenario() {
       ["0x1", "0x" + runtime, word(0), "0x1"],
       ["0x2", "0x" + runtime, word(42), "0x2"],
       ["0x3", "0x" + runtime, word(99), "0x3"],
-      ["latest", "0x" + runtime, word(99), "0x3"],
+      ["latest", "0x" + runtime, word(99), historicalPrunedBodies ? "0x6" : "0x3"],
     ];
     result.historicalStates = [];
     async function checkHistory(phase) {
@@ -368,10 +395,15 @@ async function runScenario() {
     assert.deepEqual(await current(), before, "historical reads preserve current state");
     await stop();
     await start(data, "historical-state-restart");
+    if (historicalPrunedBodies) await checkPrunedBodies("after process reopen");
     await checkHistory("after process reopen");
     assert.deepEqual(await current(), before, "reopened historical reads preserve current state");
     result.contract = contract;
     result.historicalContractStateVerified = true;
+    if (historicalPrunedBodies) {
+      result.retainedStateAfterBodyPruningVerified = true;
+      result.adaptations[1] = "Actual signed transactions and natural isolated wPoA production/finality, light profile with 64 state roots and one body retained; scaled retention only.";
+    }
     result.finalHeight = height;
     result.passed = true;
     return;
