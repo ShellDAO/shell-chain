@@ -191,8 +191,18 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     }
 
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
-        // Shell-chain has no sync protocol yet; always report "not syncing".
-        Ok(serde_json::Value::Bool(false))
+        Ok(match self.sync_status() {
+            SyncStatus::NotSyncing => serde_json::Value::Bool(false),
+            SyncStatus::Syncing {
+                starting_block,
+                current_block,
+                highest_block,
+            } => serde_json::json!({
+                "startingBlock": hex_u64(starting_block),
+                "currentBlock": hex_u64(current_block),
+                "highestBlock": hex_u64(highest_block),
+            }),
+        })
     }
 
     async fn mining(&self) -> Result<bool, ErrorObjectOwned> {

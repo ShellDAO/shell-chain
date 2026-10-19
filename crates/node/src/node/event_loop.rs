@@ -806,9 +806,11 @@ impl<S: KvStore + 'static> Node<S> {
                     true
                 }
             });
-            self.metrics.syncing.set(i64::from(
-                sync_requested && !production_readiness.can_produce(),
-            ));
+            let syncing = sync_requested && !production_readiness.can_produce();
+            self.metrics.syncing.set(i64::from(syncing));
+            if let Some(handle) = rpc_handle.as_ref() {
+                handle.update_sync_status(syncing, self.head_number());
+            }
             self.metrics
                 .production_ready
                 .set(i64::from(production_readiness.can_produce()));

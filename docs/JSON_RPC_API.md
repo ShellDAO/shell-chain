@@ -212,7 +212,34 @@ curl -s http://localhost:8545 \
 
 ### eth_syncing
 
-Returns sync status. A node may temporarily report syncing while block range catch-up is in flight; otherwise it returns `false`.
+Returns the node's live block-range catch-up status. The HTTP method and the
+WebSocket `syncing` subscription use the same node status. New subscriptions
+receive the current status before subsequent changes. `false` means no active
+catch-up request; it does not certify peer availability or network health.
+
+During catch-up, `startingBlock`, `currentBlock` and `highestBlock` are hex
+quantities. `startingBlock` remains the height at which this session started,
+even if the canonical head moves backward. `currentBlock` is the validated canonical head; `highestBlock` is the
+highest validated canonical height observed during this catch-up session. Peers
+do not advertise their tips, so this field is not a network-wide target height.
+A new catch-up session resets the observed range.
+
+Build the node with `cargo build --locked -p shell-cli --bin shell-node --features libp2p`.
+With Node.js 24+ and a compatible built SDK (`shell-sdk@0.14.0-rc.2`), run:
+
+```bash
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --sync-status
+```
+
+This creates fresh keys and isolated RocksDB nodes, produces 21 real signed
+blocks, then checks both sync interfaces while a fresh follower imports them and
+verifies the same canonical block hash before and after a follower process reopen. It exits nonzero if actual catch-up is
+not observed. It does not use public funds or change a running network.
+
+This live reporting fix is unreleased. v0.27.7 still reports `false` from HTTP
+and sends only an initial `false` on the subscription during actual catch-up.
 
 **Parameters:** None
 

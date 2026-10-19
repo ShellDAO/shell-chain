@@ -21,6 +21,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Connect `eth_syncing` and WebSocket `syncing` notifications to the node's live
+  block-range catch-up status. Retain the current status for late subscribers
+  and share it across HTTP and dedicated WebSocket listeners. Progress reports
+  validated canonical heights, without inventing an unadvertised peer tip.
+  Keep the signed two-node `--sync-status` acceptance in the existing CI build.
+
 - Correct the JSON-RPC storage position documentation to use a canonical hex
   quantity, including `0x0` for slot zero; only the returned value is padded to
   32 bytes. Align basic state-query parameter tables with retained historical

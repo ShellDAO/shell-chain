@@ -33,6 +33,7 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -71,6 +72,7 @@ async function unusedPort() {
 }
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
+const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
@@ -94,7 +96,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -143,7 +145,7 @@ for (const signal of ["SIGINT", "SIGTERM"])
       process.exit(signal === "SIGINT" ? 130 : 143),
     );
   });
-async function start(i, data, key, label, bootnode) {
+async function start(i, data, key, label, bootnode, waitForRpc = true) {
   const args = [
     "run",
     "--datadir",
@@ -155,7 +157,7 @@ async function start(i, data, key, label, bootnode) {
     "--rpc-addr",
     `127.0.0.1:${ports[i]}`,
     "--metrics-addr",
-    "127.0.0.1:0",
+    syncStatusScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
     "--block-time",
     "2000",
     "--max-idle-interval",
@@ -190,6 +192,7 @@ async function start(i, data, key, label, bootnode) {
   child.once("error", (error) => {
     spawnError = error;
   });
+  if (!waitForRpc) return;
   for (let k = 0; k < 160; k++) {
     if (spawnError) throw spawnError;
     assert.equal(child.exitCode, null, "node exited");
@@ -480,6 +483,112 @@ async function runScenario() {
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (syncStatusScenario) {
+    // Create the backlog through the existing real signed transaction path.
+    for (let block = 1; block <= 21; block++)
+      await confirmed(`sync backlog ${block}`, miner, [
+        buildInnerCall(outsider.getAddress(), "0x", 100000, 1n),
+      ], "0x1", false);
+    const producerBlock = await rpc(0, "eth_getBlockByNumber", ["0x15", false]);
+    await start(1, dirs[1], followerKey, "follower", bootnode, false);
+    let socket;
+    const events = [];
+    let syncingId, headsId;
+    try {
+      for (let attempt = 0; attempt < 400; attempt++) {
+        try {
+          socket = await new Promise((done, fail) => {
+            const candidate = new WebSocket(`ws://127.0.0.1:${ports[1]}`);
+            candidate.addEventListener("open", () => done(candidate), { once: true });
+            candidate.addEventListener("error", () => fail(Error("WS not ready")), { once: true });
+          });
+          break;
+        } catch { await pause(20); }
+      }
+      assert.ok(socket, "follower WebSocket listening");
+      socket.addEventListener("message", ({ data }) => {
+        const message = JSON.parse(data);
+        events.push(message);
+        if (message.id === 1) syncingId = message.result;
+        if (message.id === 2) headsId = message.result;
+      });
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["syncing"] }));
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_subscribe", params: ["newHeads"] }));
+      const samples = [];
+      let completeAt;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        assert.equal(nodes[1].exitCode, null, "follower exited during catch-up");
+        const health = await (await fetch(`http://127.0.0.1:${metricsPorts[1]}/health`,
+          { signal: AbortSignal.timeout(3000) })).json();
+        const syncing = await providers[1].client.request({ method: "eth_syncing", params: [] });
+        const head = await providers[1].client.request({ method: "eth_blockNumber", params: [] });
+        samples.push({ health, syncing, head });
+        if (head === "0x15" && !health.syncing) {
+          completeAt ??= Date.now();
+          if (Date.now() - completeAt > 1000) break;
+        }
+        await pause(25);
+      }
+      result.syncStatus = { events, samples, producerHash: producerBlock.hash };
+      assert.ok(syncingId && headsId, "both subscriptions acknowledged");
+      const syncEvents = events.filter((e) => e.params?.subscription === syncingId)
+        .map((e) => e.params.result);
+      const headEvents = events.filter((e) => e.params?.subscription === headsId);
+      assert.ok(headEvents.length > 0, "real imported heads reach the subscription");
+      assert.ok(samples.some((s) => s.health.syncing), "actual catch-up observed; otherwise inconclusive");
+      assert.ok(samples.some((s) => s.syncing !== false), "HTTP reports actual catch-up");
+      const active = syncEvents.filter((e) => e?.syncing === true);
+      assert.ok(active.length > 0, "WebSocket reports actual catch-up");
+      for (const event of active) {
+        const { startingBlock, currentBlock, highestBlock } = event.status;
+        for (const value of [startingBlock, currentBlock, highestBlock])
+          assert.match(value, /^0x(?:0|[1-9a-f][0-9a-f]*)$/);
+        assert.ok(BigInt(startingBlock) <= BigInt(currentBlock));
+        assert.ok(BigInt(currentBlock) <= BigInt(highestBlock));
+        assert.ok(BigInt(highestBlock) <= 21n, "no fabricated peer target height");
+      }
+      assert.equal(syncEvents.at(-1), false, "WebSocket reports catch-up completion");
+      assert.equal(samples.at(-1).syncing, false, "HTTP reports catch-up completion");
+      const importedBlock = await rpc(1, "eth_getBlockByNumber", ["0x15", false]);
+      assert.equal(importedBlock.hash, producerBlock.hash, "independently imported canonical block");
+      result.finalHeight = height;
+    } finally { socket?.close(); }
+    await stop(1);
+    await start(1, dirs[1], followerKey, "sync-restarted-follower", bootnode);
+    await peerReady();
+    let idleSamples = 0;
+    for (let attempt = 0; attempt < 80 && idleSamples < 5; attempt++) {
+      idleSamples = await rpc(1, "eth_syncing") === false ? idleSamples + 1 : 0;
+      await pause(100);
+    }
+    assert.equal(idleSamples, 5, "reopened follower returns to idle");
+    const reopenedBlock = await rpc(1, "eth_getBlockByNumber", ["0x15", false]);
+    assert.equal(reopenedBlock.hash, producerBlock.hash, "canonical import survives process reopen");
+    const reopenedSocket = new WebSocket(`ws://127.0.0.1:${ports[1]}`);
+    try {
+      await new Promise((done, fail) => {
+        reopenedSocket.addEventListener("open", done, { once: true });
+        reopenedSocket.addEventListener("error", fail, { once: true });
+      });
+      const initial = new Promise((done, fail) => {
+        const timeout = setTimeout(() => fail(Error("reopened sync status timeout")), 3000);
+        reopenedSocket.addEventListener("message", ({ data }) => {
+          const message = JSON.parse(data);
+          if (message.method === "eth_subscription") {
+            clearTimeout(timeout);
+            done(message.params.result);
+          }
+        });
+      });
+      reopenedSocket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["syncing"] }));
+      assert.equal(await initial, false, "reopened subscription starts from actual idle status");
+      result.syncStatus.reopenVerified = true;
+    } finally { reopenedSocket.close(); }
+    result.liveSyncStatusVerified = true;
+    result.passed = true;
+    return;
+  }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
   if (epochScenario) {

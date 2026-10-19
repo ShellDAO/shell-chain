@@ -35,7 +35,7 @@ use crate::api::{
 };
 use crate::dev_control::DynDevRpcControl;
 use crate::handler::RpcHandler;
-use crate::subscriptions::{BlockEvent, EthPubSubServer};
+use crate::subscriptions::{BlockEvent, EthPubSubServer, SyncStatus};
 use crate::tls;
 
 // The generated no-argument methods ignore extra params. Enforce this method's
@@ -166,9 +166,39 @@ pub struct RpcServerHandle {
     /// TLS termination proxy handle, present when TLS cert+key are configured.
     pub tls_proxy: Option<TlsProxyHandle>,
     pending_tx_events: tokio::sync::broadcast::Sender<ShellHash>,
+    sync_status: Arc<parking_lot::Mutex<SyncStatus>>,
+    sync_events: tokio::sync::broadcast::Sender<SyncStatus>,
 }
 
 impl RpcServerHandle {
+    /// Publish the node's active catch-up state and validated canonical height.
+    /// The protocol does not advertise peer tips: `highest_block` is the highest
+    /// validated height observed in this session, not a guessed network height.
+    pub fn update_sync_status(&self, syncing: bool, current_block: u64) {
+        let mut status = self.sync_status.lock();
+        let next = if syncing {
+            let (starting_block, highest_block) = match *status {
+                SyncStatus::Syncing {
+                    starting_block,
+                    highest_block,
+                    ..
+                } => (starting_block, highest_block.max(current_block)),
+                SyncStatus::NotSyncing => (current_block, current_block),
+            };
+            SyncStatus::Syncing {
+                starting_block,
+                current_block,
+                highest_block,
+            }
+        } else {
+            SyncStatus::NotSyncing
+        };
+        if *status != next {
+            *status = next.clone();
+            let _ = self.sync_events.send(next);
+        }
+    }
+
     /// Notify `newPendingTransactions` subscribers about a transaction admitted
     /// outside the RPC handler, such as one received from a peer.
     pub fn notify_pending_transaction(&self, hash: ShellHash) {
@@ -283,6 +313,8 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         handler = handler.with_proof_amendment_store(pas);
     }
     let pending_tx_events = handler.pending_tx_event_sender().clone();
+    let sync_status = handler.sync_status_handle();
+    let sync_events = handler.sync_event_sender().clone();
     // Populate the RPC listen address from the configured public address.
     // (The actual bound port may differ when using ephemeral port 0, but for
     // admin_nodeInfo the configured address is what operators care about.)
@@ -460,6 +492,8 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             ws_handle: Some(ws_handle),
             tls_proxy,
             pending_tx_events: pending_tx_events.clone(),
+            sync_status: Arc::clone(&sync_status),
+            sync_events: sync_events.clone(),
         })
     } else {
         // Single port: both HTTP and WS on listen_addr (jsonrpsee default).
@@ -497,6 +531,8 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
             ws_handle: None,
             tls_proxy,
             pending_tx_events,
+            sync_status,
+            sync_events,
         })
     }
 }
@@ -1448,6 +1484,139 @@ mod tests {
             valid.is_ok(),
             "rejected subscriptions leaked per-connection capacity: {valid:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_sync_status_is_shared_by_http_and_both_websocket_listeners() {
+        use serde_json::{json, Value};
+        use std::time::Duration;
+
+        for dedicated_ws in [false, true] {
+            let db = Arc::new(MemoryDb::new());
+            let (block_events, _) = tokio::sync::broadcast::channel(16);
+            let server = start_rpc_server(
+                RpcConfig {
+                    listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ws_addr: dedicated_ws.then(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+                    rate_limit_per_sec: None,
+                    api_namespaces: vec!["eth".into()],
+                    ..RpcConfig::default()
+                },
+                Arc::new(ChainStore::new(db.clone())),
+                Arc::new(parking_lot::RwLock::new(WorldState::new(db))),
+                Arc::new(TxPool::new(MempoolConfig::default())),
+                42,
+                None,
+                block_events,
+                None,
+                None,
+                Arc::new(parking_lot::RwLock::new(0)),
+                Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let http = HttpClientBuilder::default()
+                .build(format!("http://{}", server.http_addr))
+                .unwrap();
+            let ws = WsClientBuilder::default()
+                .build(format!(
+                    "ws://{}",
+                    server.ws_addr.unwrap_or(server.http_addr)
+                ))
+                .await
+                .unwrap();
+            let mut early = ws
+                .subscribe::<Value, _>("eth_subscribe", rpc_params!["syncing"], "eth_unsubscribe")
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), early.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                json!(false)
+            );
+            assert_eq!(
+                http.request::<Value, _>("eth_syncing", rpc_params![])
+                    .await
+                    .unwrap(),
+                json!(false)
+            );
+
+            server.update_sync_status(true, 10);
+            server.update_sync_status(true, 12);
+            server.update_sync_status(true, 12); // unchanged progress must not duplicate events
+            server.update_sync_status(true, 9); // only validated observed heights are reported
+            let expected = [
+                json!({"startingBlock":"0xa", "currentBlock":"0xa", "highestBlock":"0xa"}),
+                json!({"startingBlock":"0xa", "currentBlock":"0xc", "highestBlock":"0xc"}),
+                json!({"startingBlock":"0xa", "currentBlock":"0x9", "highestBlock":"0xc"}),
+            ];
+            for status in &expected {
+                let notification = tokio::time::timeout(Duration::from_secs(1), early.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(notification, json!({"syncing":true, "status":status}));
+            }
+            assert_eq!(
+                http.request::<Value, _>("eth_syncing", rpc_params![])
+                    .await
+                    .unwrap(),
+                expected[2]
+            );
+            let mut late = ws
+                .subscribe::<Value, _>("eth_subscribe", rpc_params!["syncing"], "eth_unsubscribe")
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), late.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                json!({"syncing":true,"status":expected[2]})
+            );
+            server.update_sync_status(false, 12);
+            for subscription in [&mut early, &mut late] {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), subscription.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    json!(false)
+                );
+            }
+            assert_eq!(
+                http.request::<Value, _>("eth_syncing", rpc_params![])
+                    .await
+                    .unwrap(),
+                json!(false)
+            );
+            server.update_sync_status(true, 15);
+            assert_eq!(
+                http.request::<Value, _>("eth_syncing", rpc_params![])
+                    .await
+                    .unwrap(),
+                json!({"startingBlock":"0xf","currentBlock":"0xf","highestBlock":"0xf"})
+            );
+            if let Some(handle) = server.ws_handle {
+                handle.stop().unwrap();
+                handle.stopped().await;
+            }
+            server.http_handle.stop().unwrap();
+            server.http_handle.stopped().await;
+        }
     }
 
     #[tokio::test]
