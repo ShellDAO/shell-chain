@@ -5260,6 +5260,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn block_signers_wire_validates_positional_and_named_params() {
+        use crate::server::{start_rpc_server, RpcConfig};
+        use jsonrpsee::core::client::{ClientT, Error as ClientError};
+        use jsonrpsee::core::params::ObjectParams;
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use jsonrpsee::ws_client::WsClientBuilder;
+        use shell_crypto::{MlDsaSigner, Signer};
+
+        async fn check(client: &impl ClientT, expected: &serde_json::Value) {
+            let actual: serde_json::Value = client
+                .request("shell_getBlockSigners", rpc_params!["latest"])
+                .await
+                .unwrap();
+            assert_eq!(&actual, expected);
+            let mut named = ObjectParams::new();
+            named.insert("block", "latest").unwrap();
+            let actual: serde_json::Value = client
+                .request("shell_getBlockSigners", named)
+                .await
+                .unwrap();
+            assert_eq!(&actual, expected);
+            for params in [
+                rpc_params![],
+                rpc_params![1],
+                rpc_params![serde_json::Value::Null],
+                rpc_params!["latest", "0x1"],
+                rpc_params!["latest", serde_json::Value::Null],
+            ] {
+                let error = client
+                    .request::<serde_json::Value, _>("shell_getBlockSigners", params)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, ClientError::Call(ref e) if e.code() == -32602));
+            }
+            for extra in [false, true] {
+                let mut named = ObjectParams::new();
+                if extra {
+                    named.insert("block", "latest").unwrap();
+                }
+                named.insert("unexpected", "0x1").unwrap();
+                let error = client
+                    .request::<serde_json::Value, _>("shell_getBlockSigners", named)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, ClientError::Call(ref e) if e.code() == -32602));
+            }
+        }
+
+        for dedicated_ws in [false, true] {
+            let handler = setup();
+            let signer = MlDsaSigner::generate();
+            let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let mut block = make_genesis_block();
+            block.header.number = 1;
+            block.header.proposer = address;
+            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+            handler.chain_store.put_block(&block).unwrap();
+            handler.chain_store.set_canonical(1, &block.hash()).unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+            handler
+                .chain_store
+                .put_pubkey(&address, signer.public_key())
+                .unwrap();
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            let expected = serde_json::json!({
+                "blockNumber": "0x1",
+                "signers": [{
+                    "address": address.to_string(),
+                    "pqPubkey": format!("0x{}", hex::encode(signer.public_key())),
+                    "signatureValid": true,
+                }],
+            });
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let server = start_rpc_server(
+                RpcConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ws_addr: dedicated_ws.then(|| "127.0.0.1:0".parse().unwrap()),
+                    api_namespaces: vec!["shell".into()],
+                    ..RpcConfig::default()
+                },
+                handler.chain_store.clone(),
+                handler.world_state.clone(),
+                handler.tx_pool.clone(),
+                42,
+                None,
+                events,
+                None,
+                None,
+                Arc::new(parking_lot::RwLock::new(0)),
+                Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let http = HttpClientBuilder::default()
+                .build(format!("http://{}", server.http_addr))
+                .unwrap();
+            check(&http, &expected).await;
+            let ws = WsClientBuilder::default()
+                .build(format!(
+                    "ws://{}",
+                    server.ws_addr.unwrap_or(server.http_addr)
+                ))
+                .await
+                .unwrap();
+            check(&ws, &expected).await;
+            drop(ws);
+            server.http_handle.stop().unwrap();
+            if let Some(handle) = server.ws_handle {
+                handle.stop().unwrap();
+                handle.stopped().await;
+            }
+            server.http_handle.stopped().await;
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
+    }
+
     #[test]
     fn block_signers_history_ignores_current_algorithm_policy_and_rejects_tampering() {
         use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry};
