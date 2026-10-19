@@ -33,6 +33,7 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const blockSignersScenario = process.argv.includes("--block-signers");
 const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -76,6 +77,7 @@ const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort(
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
+const pruneFollower = prunedEpochScenario || blockSignersScenario;
 const epochScenario = process.argv.includes("--epoch-restart") || prunedEpochScenario;
 let expectedConsensusWeight = 1;
 let expectedMembers = [miner.getAddress()];
@@ -96,7 +98,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -119,7 +121,7 @@ const result = {
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
-if (prunedEpochScenario)
+if (pruneFollower)
   result.adaptations.push(
     "Full producer and light follower with one-block state/body retention; this scaled experiment does not establish the default 4096-block retention window.",
   );
@@ -173,14 +175,14 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--rpc-api",
     "eth,net,web3,shell,debug,trace",
     "--storage-profile",
-    prunedEpochScenario && i === 1 ? "light" : "full",
+    pruneFollower && i === 1 ? "light" : "full",
     "--p2p",
     "--p2p-addr",
     "127.0.0.1:0",
     "--log-level",
     "info",
   ];
-  if (prunedEpochScenario && i === 1)
+  if (pruneFollower && i === 1)
     args.push("--pruning", "1", "--body-retention", "1");
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
@@ -591,6 +593,131 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (blockSignersScenario) {
+    // Use signed transfers and normal import/finality, with independently known keys.
+    for (let block = 1; block <= 21; block++)
+      await confirmed(`signer history ${block}`, miner, [
+        buildInnerCall(outsider.getAddress(), "0x", 100000, 1n),
+      ], "0x1", false);
+    const last = result.transactions.at(-1);
+    await compare(last.hash);
+    const first = result.transactions[0];
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await rpc(1, "eth_getTransactionByHash", [first.hash]) === null) break;
+      await pause(250);
+    }
+    assert.ok(await rpc(0, "eth_getTransactionByHash", [first.hash]),
+      "full producer retains the signed transaction body");
+    assert.equal(await rpc(1, "eth_getTransactionByHash", [first.hash]), null,
+      "light follower actually pruned the signed transaction body");
+    const expectedKey = "0x" + Buffer.from(miner.getPublicKey()).toString("hex");
+    const violations = [];
+    const observations = [];
+    const invalidParams = [[], [1], [null], ["latest", "0x1"], {},
+      { block: 1 }, { block: "latest", unexpected: 1 }];
+    const inspect = async (i, label) => {
+      const snapshot = async () => ({
+        head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+        nonce: await rpc(i, "eth_getTransactionCount", [miner.getAddress(), "latest"]),
+        balance: await rpc(i, "eth_getBalance", [miner.getAddress(), "latest"]),
+      });
+      const before = await snapshot();
+      const finalized = await rpc(i, "eth_getBlockByNumber", ["finalized", false]);
+      const history = {};
+      for (const tag of ["latest", "pending", "safe", "finalized", "0x1", "0x2", "0x15", "earliest"]) {
+        const answer = await rpc(i, "shell_getBlockSigners", [tag]);
+        if (tag === "earliest") {
+          assert.deepEqual(answer, { blockNumber: "0x0", signers: [] });
+        } else {
+          const number = ["latest", "pending"].includes(tag) ? before.head.number
+            : ["safe", "finalized"].includes(tag) ? finalized.number : tag;
+          assert.equal(answer.blockNumber, number);
+          assert.equal(answer.signers.length, 1, "one configured authority signs each block");
+          assert.equal(answer.signers[0].address, miner.getAddress());
+          assert.equal(answer.signers[0].pqPubkey, expectedKey,
+            "historical signer key matches the generated authority, not the follower key");
+          assert.equal(answer.signers[0].signatureValid, true);
+        }
+        history[tag] = answer;
+      }
+      for (const tag of ["nonsense", "0xzz", "0xffffffffffffffff"])
+        await assert.rejects(() => rpc(i, "shell_getBlockSigners", [tag]));
+      const request = async (params) => paced(async () => {
+        const response = await fetch(`http://127.0.0.1:${ports[i]}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "shell_getBlockSigners", params, id: 1 }),
+          signal: AbortSignal.timeout(5000),
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+      });
+      assert.deepEqual((await request({ block: "latest" })).result, history.latest);
+      for (const params of invalidParams) {
+        const answer = await request(params);
+        if (answer.error?.code !== -32602)
+          violations.push({ label, transport: "http", params, answer });
+      }
+      const socket = new WebSocket(`ws://127.0.0.1:${ports[i]}`);
+      try {
+        await new Promise((done, fail) => {
+          socket.addEventListener("open", done, { once: true });
+          socket.addEventListener("error", fail, { once: true });
+        });
+        let id = 0;
+        const wsRequest = (params) => paced(() => new Promise((done, fail) => {
+          const requestId = ++id;
+          const timeout = setTimeout(() => {
+            socket.removeEventListener("message", receive);
+            fail(Error("block signers WebSocket request timed out"));
+          }, 5000);
+          const receive = ({ data }) => {
+            const answer = JSON.parse(data);
+            if (answer.id !== requestId) return;
+            clearTimeout(timeout);
+            socket.removeEventListener("message", receive);
+            done(answer);
+          };
+          socket.addEventListener("message", receive);
+          socket.send(JSON.stringify({ jsonrpc: "2.0", method: "shell_getBlockSigners", params, id: requestId }));
+        }));
+        assert.deepEqual((await wsRequest(["latest"])).result, history.latest);
+        assert.deepEqual((await wsRequest({ block: "latest" })).result, history.latest);
+        for (const params of invalidParams) {
+          const answer = await wsRequest(params);
+          if (answer.error?.code !== -32602)
+            violations.push({ label, transport: "websocket", params, answer });
+        }
+      } finally { socket.close(); }
+      assert.deepEqual(await snapshot(), before, "signer queries and rejections preserve head and account state");
+      if (observations.length) assert.deepEqual(history, observations[0].history);
+      observations.push({ label, history, readOnly: true });
+      result.blockSigners = { observations, violations };
+      await save();
+    };
+    await inspect(0, "full-producer");
+    await inspect(1, "pruned-follower");
+    await stop(1);
+    await start(1, dirs[1], followerKey, "signers-restarted-follower", bootnode);
+    await peerReady();
+    // Backfill may briefly restore an old body; observe the final retained window.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const log = await readFile(join(out, "signers-restarted-follower-node.log"), "utf8");
+      if (log.includes("L4: historical body back-fill complete") &&
+          await rpc(1, "eth_getTransactionByHash", [first.hash]) === null) break;
+      await pause(250);
+    }
+    assert.equal(await rpc(1, "eth_getTransactionByHash", [first.hash]), null,
+      "reopened light follower retains the pruned window");
+    await inspect(1, "pruned-follower-reopened");
+    result.finalHeight = height;
+    result.blockSigners.positiveHistoryVerified = true;
+    result.blockSigners.reopenVerified = true;
+    await save();
+    assert.deepEqual(violations, [], "missing, wrong-type and extra parameters must return -32602");
+    result.blockSignersVerified = true;
+    result.passed = true;
+    return;
+  }
   if (epochScenario) {
     const read = (label, signer = miner) =>
       confirmed(label, signer, [], "0x1", true, true);
@@ -685,7 +812,7 @@ async function runScenario() {
     for (const entry of [pendingWeight, pendingAdd, pendingRemove]) {
       for (let i = 0; i < 2; i++) {
         const before = await state(i);
-        if (prunedEpochScenario && i === 1) {
+        if (pruneFollower && i === 1) {
           assert.equal(await rpc(i, "eth_getBlockByNumber", [entry.receipt.blockNumber, false]), null,
             "old replay bodies lie outside the rolling window");
           await assert.rejects(() => rpc(i, "eth_getTransactionCount", [

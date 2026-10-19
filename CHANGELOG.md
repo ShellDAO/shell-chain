@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.9] — 2026-10-20 — Strict block signer queries
+
+### Added
+
+- Add a `--block-signers` native acceptance mode using fresh ML-DSA keys,
+  real signed transfers, independent import, body pruning and a RocksDB reopen.
+  Verify retained signer keys, HTTP/WebSocket parameter rejection and read-only
+  state using the existing CI node build and public SDK installation.
+
 ### Fixed
 
 - Reject extra positional and named `shell_getBlockSigners` parameters with
