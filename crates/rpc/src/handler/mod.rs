@@ -58,6 +58,8 @@ pub struct RpcHandler<S: KvStore + 'static> {
     pending_tx_events: tokio::sync::broadcast::Sender<ShellHash>,
     /// Broadcast sender for sync status changes (eth_subscribe syncing).
     sync_events: tokio::sync::broadcast::Sender<SyncStatus>,
+    /// Current status retained for HTTP requests and new subscriptions.
+    sync_status: Arc<parking_lot::Mutex<SyncStatus>>,
     /// Tracks active subscriptions and enforces a global limit.
     subscription_tracker: SubscriptionTracker,
     /// Optional signer for governance proposals (set when node is a validator).
@@ -111,6 +113,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             block_events: self.block_events.clone(),
             pending_tx_events: self.pending_tx_events.clone(),
             sync_events: self.sync_events.clone(),
+            sync_status: Arc::clone(&self.sync_status),
             subscription_tracker: self.subscription_tracker.clone(),
             proposer_signer: self.proposer_signer.clone(),
             proposer_address: self.proposer_address,
@@ -158,6 +161,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             block_events,
             pending_tx_events,
             sync_events,
+            sync_status: Arc::new(parking_lot::Mutex::new(SyncStatus::NotSyncing)),
             subscription_tracker: SubscriptionTracker::default(),
             proposer_signer: None,
             proposer_address: None,
@@ -355,6 +359,23 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     /// Returns a reference to the sync status broadcast sender.
     pub fn sync_event_sender(&self) -> &tokio::sync::broadcast::Sender<SyncStatus> {
         &self.sync_events
+    }
+
+    pub(crate) fn sync_status_handle(&self) -> Arc<parking_lot::Mutex<SyncStatus>> {
+        Arc::clone(&self.sync_status)
+    }
+
+    pub(crate) fn sync_status(&self) -> SyncStatus {
+        self.sync_status.lock().clone()
+    }
+
+    pub(crate) fn subscribe_sync_status(
+        &self,
+    ) -> (SyncStatus, tokio::sync::broadcast::Receiver<SyncStatus>) {
+        // Publication uses the same lock, so no transition can be lost between
+        // subscribing and taking the initial snapshot.
+        let status = self.sync_status.lock();
+        (status.clone(), self.sync_events.subscribe())
     }
 
     /// Returns a reference to the subscription tracker.

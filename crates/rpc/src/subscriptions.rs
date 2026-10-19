@@ -82,7 +82,7 @@ pub enum SyncStatus {
         current_block: u64,
         highest_block: u64,
     },
-    /// Node is fully synced and not downloading blocks.
+    /// Node has no active catch-up request; this does not prove network health.
     NotSyncing,
 }
 
@@ -518,7 +518,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                 slot_guard.disarm();
             }
             "syncing" => {
-                let rx = self.sync_event_sender().subscribe();
+                let (initial, rx) = self.subscribe_sync_status();
                 if let Err(err) =
                     validate_parameterless_subscription_params("syncing", params.as_ref())
                 {
@@ -529,7 +529,7 @@ impl<S: KvStore + 'static> EthPubSubServer for RpcHandler<S> {
                 let forward_guard = SubscriptionSlotGuard::new(tracker.clone(), conn_id);
                 tokio::spawn(async move {
                     let _guard = forward_guard;
-                    forward_syncing(rx, sink).await;
+                    forward_syncing(rx, sink, initial).await;
                 });
                 slot_guard.disarm();
             }
@@ -734,13 +734,13 @@ async fn forward_pending_txs(
 }
 
 /// Forward sync status changes to subscribers.
-/// Sends an initial "not syncing" event, then relays any subsequent changes.
+/// Sends the retained current status, then relays subsequent changes.
 async fn forward_syncing(
     mut rx: broadcast::Receiver<SyncStatus>,
     sink: jsonrpsee::SubscriptionSink,
+    initial: SyncStatus,
 ) {
-    // Emit initial status: node is not syncing (no formal sync states yet).
-    let initial = serde_json::json!(false);
+    let initial = sync_status_to_json(&initial);
     let Ok(msg) = SubscriptionMessage::from_json(&initial) else {
         tracing::error!("failed to serialize initial sync status");
         return;
