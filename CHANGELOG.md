@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.8] — 2026-10-19 — Live catch-up status
+
 ### Added
 
 - Add a `--historical-state` lifecycle acceptance mode that deploys a real
