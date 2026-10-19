@@ -238,8 +238,9 @@ blocks, then checks both sync interfaces while a fresh follower imports them and
 verifies the same canonical block hash before and after a follower process reopen. It exits nonzero if actual catch-up is
 not observed. It does not use public funds or change a running network.
 
-This live reporting fix is unreleased. v0.27.7 still reports `false` from HTTP
-and sends only an initial `false` on the subscription during actual catch-up.
+Live reporting requires a verified v0.27.8-or-later binary containing this fix,
+or a source build that includes it. v0.27.7 reports `false` from HTTP and sends
+only an initial `false` on the subscription during actual catch-up.
 
 **Parameters:** None
 
