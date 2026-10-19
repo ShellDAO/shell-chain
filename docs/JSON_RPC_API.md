@@ -1339,16 +1339,27 @@ on isolated ML-DSA full and pruned light RocksDB nodes, including process reopen
 Other algorithm, profile and reorganization combinations need separate verification.
 
 The method accepts exactly one block string: a positional array such as
-`["latest"]`, or a named object such as `{"block":"latest"}`. Source builds
-containing this correction reject missing, mistyped and extra values with
-`-32602`. v0.27.8 silently ignores extra positional and named values.
+`["latest"]`, or a named object such as `{"block":"latest"}`. Builds containing
+the v0.27.9 correction reject missing, mistyped and extra values with `-32602`.
+v0.27.8 silently ignores extra positional and named values. Verify the actual
+binary version and published release assets before relying on strict rejection.
 
-From a source checkout, run the self-contained production, import, HTTP,
-pruning and fresh-process recovery regression:
+From a matching v0.27.9-or-later source checkout, with Node.js 24 and a compatible
+V2 SDK such as the public `shell-sdk@0.14.0-rc.2`, run:
 
 ```bash
-cargo test -p shell-node --features rocksdb block_signers -- --nocapture
+NODE_BIN="${NODE_BIN:-target/debug/shell-node}" \
+  SHELL_SDK_ENTRY="${SHELL_SDK_ENTRY:-../shell-sdk/dist/index.js}" \
+  node tests/e2e/native-aa-registry.mjs --block-signers
 ```
+
+The command creates temporary ML-DSA accounts and isolated full/light RocksDB
+nodes, submits real signed transfers, compares signer evidence after independent
+import and actual body pruning, then reopens the follower. It checks captured
+keys, historical tags, HTTP/WebSocket argument errors and unchanged account/head
+state. A native archive supplies the executable; the matching source checkout
+supplies the script. This scaled one-authority experiment does not verify other
+algorithms, quorum thresholds, key rotation or reorganization scenarios.
 
 **Parameters:**
 | # | Type | Required | Description |
