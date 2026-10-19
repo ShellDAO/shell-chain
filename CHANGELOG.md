@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
   and real signed transactions to verify retained historical contract state
   after body pruning and a process reopen. Reuse the existing CI node build.
 
+- Add a `--fee-history-rewards` lifecycle mode using real signed transfers,
+  failed execution and a fee cap to verify gas-weighted positive-tip percentiles,
+  charged balances, read-only queries and a process reopen on v0.27.7.
+
 ### Fixed
 
 - Correct the JSON-RPC storage position documentation to use a canonical hex

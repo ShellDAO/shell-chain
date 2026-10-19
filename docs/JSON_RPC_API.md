@@ -324,7 +324,7 @@ Returns historical base fee and gas usage data.
 
 **Returns:** Object with `oldestBlock`, `baseFeePerGas`, `gasUsedRatio`, `reward`.
 
-Unreleased node source computes `reward` as effective priority fees, sorted by
+Node v0.27.7 and compatible source compute `reward` as effective priority fees, sorted by
 fee and weighted by actual receipt gas consumed. Fee caps limit the effective
 tip; failed transactions still contribute their charged gas. Empty blocks or
 zero-tip transactions yield zero rewards. Omitting percentiles or passing `[]`
@@ -335,8 +335,29 @@ implementation. Legacy intact bodies also remain queryable and preserve their
 fee inputs when subsequently pruned. Already-pruned legacy blocks with missing
 fee metadata cannot supply reward percentiles: the query returns an error,
 while queries without percentiles can still return header base fees and gas
-usage. Positive-tip percentile results on published node versions remain to be
-verified.
+usage.
+
+The published [v0.27.7 binary](https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.7)
+has been verified with ML-DSA-65 transactions in an isolated full-profile fixture
+with fee accounting enabled. This covers gas-weighted positive tips, failed
+transaction gas, fee caps and a process reopen. Other signature algorithms,
+activation settings and storage profiles require separate verification.
+
+For this positive-tip flow, use a node checkout containing the optional lifecycle
+mode below, Node.js 20 or later, the v0.27.7 binary and public
+`shell-sdk@0.14.0-rc.2`. Set `NODE_BIN` to the binary and `SHELL_SDK_ENTRY` to the
+package's `dist/index.js`, then run:
+
+```sh
+node tests/e2e/native-aa-lifecycle.mjs --fee-history-rewards
+```
+
+The script creates fresh funded test accounts and a contract with an INVALID
+opcode. It signs three transactions in one block so the gas-weighted median
+differs from medians weighted by transaction count or gas limits. It checks
+actual charged balances, failed value rollback, a fee-capped tip, read-only
+queries and a persistent node reopen. It uses explicit development mining and
+synthetic timestamps; private test data is retained after the node stops.
 
 
 ```bash

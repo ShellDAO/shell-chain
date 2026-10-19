@@ -75,7 +75,7 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24'
-      - name: Test epoch recovery and historical state pruning
+      - name: Test epoch recovery, historical state and fee rewards
         shell: bash
         run: |
           set -euo pipefail
@@ -94,7 +94,10 @@ jobs:
               TMPDIR="$runtime" node tests/e2e/native-aa-lifecycle.mjs --historical-state &&
             NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
               SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
-              TMPDIR="$runtime" node tests/e2e/native-aa-lifecycle.mjs --historical-pruned-bodies
+              TMPDIR="$runtime" node tests/e2e/native-aa-lifecycle.mjs --historical-pruned-bodies &&
+            NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
+              SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
+              TMPDIR="$runtime" node tests/e2e/native-aa-lifecycle.mjs --fee-history-rewards
           }; then
             for report in "$runtime"/*/runtime.json; do
               test ! -f "$report" || cat "$report"

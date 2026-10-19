@@ -318,6 +318,108 @@ async function runScenario() {
     );
     return height;
   }
+  if (process.argv.includes("--fee-history-rewards")) {
+    result.scenario = "fee-history-positive-tips";
+    const q = (n) => "0x" + BigInt(n).toString(16);
+    const deployTx = buildTransaction({ chainId: 1337, nonce: 0, to: null,
+      value: 0n, data: "0x6001600c60003960016000f3fe", gasLimit: 3000000,
+      maxFeePerGas: 2000000000, maxPriorityFeePerGas: 0 });
+    const deployHash = await send(await miner.buildSignedTransaction({
+      tx: deployTx, includePublicKey: true,
+    }));
+    await mine();
+    const deployed = await rpc("eth_getTransactionReceipt", [deployHash]);
+    assert.equal(deployed?.status, "0x1");
+    const contract = deployed.contractAddress;
+    assert.equal(await rpc("eth_getCode", [contract, "latest"]), "0xfe");
+    result.transactions.push({ label: "deploy INVALID runtime", hash: deployHash, receipt: deployed });
+    const parent = await rpc("eth_getBlockByNumber", ["latest", false]);
+    const parentBase = BigInt(parent.baseFeePerGas);
+    const target = BigInt(parent.gasLimit) / 2n;
+    const used = BigInt(parent.gasUsed);
+    assert.ok(used < target, "fixture parent below the EIP-1559 gas target");
+    // EIP-1559: target is half the limit, base change denominator is eight.
+    const expectedBase = parentBase - parentBase * (target - used) / target / 8n;
+    const snapshot = async () => ({
+      height: await rpc("eth_blockNumber"),
+      balance: await rpc("eth_getBalance", [old.getAddress(), "latest"]),
+      nonce: await rpc("eth_getTransactionCount", [old.getAddress(), "latest"]),
+      recipient: await rpc("eth_getBalance", [g1.getAddress(), "latest"]),
+      contractBalance: await rpc("eth_getBalance", [contract, "latest"]),
+      code: await rpc("eth_getCode", [contract, "latest"]),
+    });
+    const before = await snapshot();
+    const cappedTip = parentBase + 3000000n - expectedBase;
+    assert.ok(cappedTip > 1000000n && cappedTip < 900000000n);
+    const offers = [
+      { label: "low tip large gas limit", to: g1.getAddress(), value: 1n,
+        gasLimit: 1000000, priority: 1000000, cap: expectedBase + 2000000000n },
+      { label: "failed INVALID execution", to: contract, value: 2n,
+        gasLimit: 100000, priority: 900000000, cap: expectedBase + 2000000000n },
+      { label: "fee cap limits priority", to: g1.getAddress(), value: 3n,
+        gasLimit: 30000, priority: 1000000000, cap: parentBase + 3000000n },
+    ];
+    const hashes = [];
+    for (let nonce = 0; nonce < offers.length; nonce++) {
+      const offer = offers[nonce];
+      const tx = buildTransaction({ chainId: 1337, nonce, to: offer.to,
+        value: offer.value, data: "0x", gasLimit: offer.gasLimit,
+        maxFeePerGas: Number(offer.cap), maxPriorityFeePerGas: offer.priority });
+      hashes.push(await send(await old.buildSignedTransaction({ tx, includePublicKey: true })));
+    }
+    await mine();
+    const block = await rpc("eth_getBlockByNumber", ["latest", false]);
+    assert.equal(block.number, "0x2");
+    assert.equal(BigInt(block.baseFeePerGas), expectedBase);
+    const literalGas = [21000n, 100000n, 21000n];
+    const literalTips = [1000000n, 900000000n, cappedTip];
+    let cumulativeGas = 0n, charged = 0n;
+    for (let i = 0; i < hashes.length; i++) {
+      const receipt = await rpc("eth_getTransactionReceipt", [hashes[i]]);
+      assert.equal(receipt?.blockNumber, "0x2", offers[i].label);
+      assert.equal(receipt.status, i === 1 ? "0x0" : "0x1", offers[i].label);
+      assert.equal(BigInt(receipt.gasUsed), literalGas[i], offers[i].label);
+      assert.equal(BigInt(receipt.effectiveGasPrice), expectedBase + literalTips[i]);
+      cumulativeGas += literalGas[i];
+      assert.equal(BigInt(receipt.cumulativeGasUsed), cumulativeGas);
+      charged += literalGas[i] * (expectedBase + literalTips[i]);
+      result.transactions.push({ label: offers[i].label, hash: hashes[i], receipt });
+    }
+    assert.equal(BigInt(block.gasUsed), 142000n);
+    const after = await snapshot();
+    assert.equal(after.nonce, "0x3", "failed transaction consumes its nonce");
+    assert.equal(BigInt(before.balance) - BigInt(after.balance), charged + 4n);
+    assert.equal(BigInt(after.recipient) - BigInt(before.recipient), 4n);
+    assert.equal(after.contractBalance, before.contractBalance, "failed value transfer rolls back");
+    assert.equal(after.code, "0xfe");
+    const percentiles = [0, 10, 25, 50, 75, 100];
+    // Sorted effective tips have actual gas weights 21000, 21000, 100000.
+    // The median is 900m; transaction-count weighting selects the capped tip
+    // and gas-limit weighting selects 1m.
+    const literalRewards = [1000000n, 1000000n, cappedTip,
+      900000000n, 900000000n, 900000000n].map(q);
+    result.feeHistory = [];
+    async function checkRewards(phase) {
+      const history = await rpc("eth_feeHistory", ["0x1", "0x2", percentiles]);
+      assert.equal(history.oldestBlock, "0x2");
+      assert.deepEqual(history.reward, [literalRewards]);
+      assert.equal(BigInt(history.baseFeePerGas[0]), expectedBase);
+      assert.ok(Math.abs(history.gasUsedRatio[0] - 142000 / 30000000) < 1e-14);
+      for (const params of [["0x1", "0x2"], ["0x1", "0x2", []]])
+        assert.deepEqual((await rpc("eth_feeHistory", params)).reward, []);
+      result.feeHistory.push({ phase, percentiles, history });
+      assert.deepEqual(await snapshot(), after, "fee-history queries preserve current state");
+    }
+    await checkRewards("after signed block execution");
+    await stop();
+    await start(data, "fee-history-restart");
+    await checkRewards("after process reopen");
+    result.positiveTipFeeHistoryVerified = true;
+    result.failedGasAndFeeCapVerified = true;
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
   if (process.argv.includes("--historical-state") || historicalPrunedBodies) {
     result.scenario = historicalPrunedBodies
       ? "historical-contract-pruned-bodies" : "historical-contract-state";
