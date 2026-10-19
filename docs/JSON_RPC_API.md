@@ -1319,8 +1319,7 @@ local node has no certificate for the requested hash.
 
 Returns the post-quantum signature details for validators who signed a specific block.
 
-Unreleased node source implements this method using authenticated proposer and
-quorum signing evidence. It retains the signing public keys and signatures
+This method uses authenticated proposer and quorum signing evidence. It retains the signing public keys and signatures
 separately from the header, so block hashes and consensus messages are unchanged.
 Retained evidence remains queryable after body pruning and changes to the live
 key lookup. `signatureValid` checks the actual signature against the captured
@@ -1333,6 +1332,16 @@ return an error; current rotated keys are never substituted. Genesis without
 signatures returns an empty signer list. Invalid block tags and missing blocks
 are rejected. The query does not change chain state. Published node versions
 must be verified before relying on this method.
+
+The original single-block request below is verified with
+[node v0.27.8](https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.8)
+on isolated ML-DSA full and pruned light RocksDB nodes, including process reopen.
+Other algorithm, profile and reorganization combinations need separate verification.
+
+The method accepts exactly one block string: a positional array such as
+`["latest"]`, or a named object such as `{"block":"latest"}`. Source builds
+containing this correction reject missing, mistyped and extra values with
+`-32602`. v0.27.8 silently ignores extra positional and named values.
 
 From a source checkout, run the self-contained production, import, HTTP,
 pruning and fresh-process recovery regression:

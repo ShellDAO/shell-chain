@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject extra positional and named `shell_getBlockSigners` parameters with
+  `-32602` before querying storage, while preserving the documented block selector
+  and valid named `block` requests on HTTP and WebSocket listeners.
+
 ## [0.27.8] — 2026-10-19 — Live catch-up status
 
 ### Added

@@ -63,6 +63,30 @@ pub(crate) fn register_validator_votes_rpc<S: KvStore + 'static>(
     Ok(())
 }
 
+// jsonrpsee's generated methods permit trailing positional and unknown named
+// parameters. Validate this method's complete request before reading storage.
+fn register_block_signers_rpc<S: KvStore + 'static>(
+    module: &mut jsonrpsee::RpcModule<RpcHandler<S>>,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NamedParams {
+        block: String,
+    }
+
+    module.remove_method("shell_getBlockSigners");
+    module.register_async_method("shell_getBlockSigners", |params, handler, _| async move {
+        let block = if params.is_object() {
+            params.parse::<NamedParams>()?.block
+        } else {
+            let (block,) = params.parse::<(String,)>()?;
+            block
+        };
+        ShellApiServer::get_block_signers(handler.as_ref(), block).await
+    })?;
+    Ok(())
+}
+
 /// Configuration for the JSON-RPC server.
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -395,6 +419,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     if ns.iter().any(|n| n == "shell") {
         let mut shell_module = ShellApiServer::into_rpc(handler.clone());
         register_validator_votes_rpc(&mut shell_module)?;
+        register_block_signers_rpc(&mut shell_module)?;
         if restrict_governance_signing {
             for method in GOVERNANCE_SIGNING_METHODS {
                 if shell_module.remove_method(method).is_none() {
