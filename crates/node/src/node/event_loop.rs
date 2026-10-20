@@ -1482,6 +1482,30 @@ impl<S: KvStore + 'static> Node<S> {
                                         finalized = finalized_number,
                                         "responding to block request"
                                     );
+                                    // A returning validator may need an unfinalized block
+                                    // before it can supply the missing quorum vote. Keep
+                                    // finalized sync responses unchanged and replay that
+                                    // block through normal live validation and voting.
+                                    if blocks.is_empty()
+                                        && safe_count > 0
+                                        && start_number > finalized_number
+                                    {
+                                        if let Ok(Some(block)) =
+                                            self.chain_store.get_block_by_number(start_number)
+                                        {
+                                            debug!(
+                                                number = start_number,
+                                                %peer,
+                                                "reannouncing pending block for live validation"
+                                            );
+                                            let _ = network
+                                                .send_to_peer(
+                                                    &peer,
+                                                    NetworkMessage::NewBlock(Box::new(block)),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                     let commit_certificates = blocks
                                         .iter()
                                         .filter_map(|block| {

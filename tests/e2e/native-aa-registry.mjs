@@ -33,7 +33,10 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const blockSignersScenario = process.argv.includes("--block-signers");
+const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
+const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
+const blockSignersScenario =
+  process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -48,7 +51,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    "mldsa65",
+    sphincsSignersScenario || quorumRecoveryScenario ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -98,7 +101,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -117,7 +120,9 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    "Two isolated CLI/RocksDB nodes, loopback libp2p, one ML-DSA authority and one non-authority follower; normal block production and finality.",
+    quorumRecoveryScenario
+      ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
+      : `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
@@ -435,6 +440,11 @@ async function runScenario() {
     { encoding: "utf8" },
   );
   assert.equal(keyResult.status, 0, keyResult.stderr);
+  const otherAuthority = quorumRecoveryScenario
+    ? await decryptKeystore(JSON.parse(await readFile(followerKey, "utf8")), password)
+    : null;
+  if (otherAuthority) signers.push(otherAuthority);
+  const authorities = otherAuthority ? [miner, otherAuthority] : [miner];
   const genesis = {
     chain_id: 1337,
     chain_name: "native-aa-registry-acceptance",
@@ -452,11 +462,10 @@ async function runScenario() {
     fee_accounting_activation_height: 0,
     consensus: {
       engine: "wpoa",
-      authorities: [miner.getAddress()],
-      authority_pubkeys: [
-        "0x" + Buffer.from(miner.getPublicKey()).toString("hex"),
-      ],
-      weights: [1],
+      authorities: authorities.map((signer) => signer.getAddress()),
+      authority_pubkeys: authorities.map((signer) =>
+        "0x" + Buffer.from(signer.getPublicKey()).toString("hex")),
+      weights: authorities.map(() => 1),
       stakes: [],
       block_time_secs: 2,
       max_future_secs: 300,
@@ -593,12 +602,116 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (quorumRecoveryScenario) {
+    assert.equal(miner.signatureType, "SphincsSha2256f");
+    assert.equal(miner.getPublicKey().length, 64);
+    const expectedKeys = new Map(authorities.map((signer) => [
+      signer.getAddress(), "0x" + Buffer.from(signer.getPublicKey()).toString("hex"),
+    ]));
+    result.adaptations.push("Two equal-weight SLH-DSA/ML-DSA authorities on full RocksDB; one temporarily goes offline. No quorum threshold or live-network change.");
+    const members = await Promise.all([0, 1].map((i) => rpc(i, "shell_consensusInfo")));
+    for (const view of members) {
+      assert.deepEqual(view.validators.map((v) => v.address).sort(), [...expectedKeys.keys()].sort());
+      assert.ok(view.validators.every((v) => v.weight === 1));
+    }
+    const finalized = async (i, entry) => {
+      let block;
+      for (let attempt = 0; attempt < 85; attempt++) {
+        block = await rpc(i, "eth_getBlockByNumber", ["finalized", false]);
+        if (block?.hash === entry.receipt.blockHash) break;
+        await pause(250);
+      }
+      assert.equal(block?.hash, entry.receipt.blockHash, "both genuine authority votes finalize the block");
+    };
+    const recipientBefore = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+    const transfer = (label) => confirmed(label, miner, [
+      buildInnerCall(outsider.getAddress(), "0x", 100000, 1n),
+    ], "0x1", false);
+    const first = await transfer("two-authority finalized baseline");
+    await finalized(0, first);
+    await finalized(1, first);
+    await stop(1);
+    const second = await transfer("sealed block awaits missing authority vote");
+    result.quorumRecovery = { offlineFinality: [], observations: [] };
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const block = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+      result.quorumRecovery.offlineFinality.push(block.number);
+      await save();
+      assert.equal(block.hash, first.receipt.blockHash, "one of two validators cannot finalize a new block");
+      await pause(500);
+    }
+    const lone = await rpc(0, "shell_getBlockSigners", ["0x2"]);
+    assert.equal(lone.signers.length, 1);
+    assert.equal(lone.signers[0].address, miner.getAddress());
+    assert.equal(lone.signers[0].pqPubkey, expectedKeys.get(miner.getAddress()));
+    assert.equal(lone.signers[0].signatureValid, true);
+    result.quorumRecovery.beforeReturn = lone;
+    await start(1, dirs[1], followerKey, "quorum-returned-authority", bootnode);
+    await peerReady();
+    let returned;
+    for (let attempt = 0; attempt < 85; attempt++) {
+      returned = await rpc(1, "eth_getBlockByNumber", ["latest", false]);
+      result.quorumRecovery.returnedHead = { number: returned.number, hash: returned.hash };
+      await save();
+      if (returned.hash === second.receipt.blockHash) break;
+      await pause(250);
+    }
+    assert.equal(returned.hash, second.receipt.blockHash, "returning validator recovers the missing sealed block without another transaction");
+    await finalized(0, second);
+    await finalized(1, second);
+    const inspect = async (i, role) => {
+      const snapshot = async () => ({
+        head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+        nonce: await rpc(i, "eth_getTransactionCount", [miner.getAddress(), "latest"]),
+        recipient: await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"]),
+      });
+      const before = await snapshot();
+      assert.equal(before.head.hash, second.receipt.blockHash);
+      assert.equal(BigInt(before.recipient), recipientBefore + 2n);
+      const history = {};
+      for (const tag of ["0x1", "0x2", "latest", "finalized"]) {
+        const answer = await rpc(i, "shell_getBlockSigners", [tag]);
+        assert.deepEqual(answer.signers.map((v) => v.address).sort(), [...expectedKeys.keys()].sort());
+        for (const signer of answer.signers) {
+          assert.equal(signer.pqPubkey, expectedKeys.get(signer.address));
+          assert.equal(signer.signatureValid, true);
+        }
+        history[tag] = answer;
+      }
+      assert.deepEqual(await snapshot(), before, "quorum history queries preserve head and accounts");
+      if (result.quorumRecovery.observations.length)
+        assert.deepEqual(history, result.quorumRecovery.observations[0].history);
+      result.quorumRecovery.observations.push({ role, history, readOnly: true });
+      await save();
+    };
+    await inspect(0, "authority-0");
+    await inspect(1, "returned-authority-1");
+    await stop(1);
+    await start(1, dirs[1], followerKey, "quorum-reopened-authority", bootnode);
+    await peerReady();
+    await finalized(1, second);
+    await inspect(1, "reopened-authority-1");
+    result.quorumRecoveryVerified = true;
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
   if (blockSignersScenario) {
+    if (sphincsSignersScenario) {
+      assert.equal(miner.signatureType, "SphincsSha2256f");
+      assert.equal(miner.getPublicKey().length, 64, "SLH-DSA-SHA2-256f public-key width");
+    }
+    result.signerAlgorithm = miner.signatureType;
+    const recipientBefore = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
     // Use signed transfers and normal import/finality, with independently known keys.
     for (let block = 1; block <= 21; block++)
       await confirmed(`signer history ${block}`, miner, [
         buildInnerCall(outsider.getAddress(), "0x", 100000, 1n),
       ], "0x1", false);
+    assert.equal(
+      BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])),
+      recipientBefore + 21n, "all signed transfers credit their recipient",
+    );
     const last = result.transactions.at(-1);
     await compare(last.hash);
     const first = result.transactions[0];
