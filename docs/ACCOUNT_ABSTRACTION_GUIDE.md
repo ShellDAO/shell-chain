@@ -551,6 +551,32 @@ keys remain in its private temporary directory. It does not test multiple-author
 quorum or prove public package availability. See the
 [execution decision](adr/aa-validator-registry.md) for the atomicity boundary.
 
+## Historical block signers after pruning
+
+From the current source checkout, use Node.js 24, the public
+`shell-sdk@0.14.0-rc.2`, and a [v0.27.9 native executable](https://github.com/ShellDAO/shell-chain/releases/tag/v0.27.9)
+or a compatible local build:
+
+```sh
+NODE_BIN="${NODE_BIN:-target/debug/shell-node}" \
+  SHELL_SDK_ENTRY="${SHELL_SDK_ENTRY:-../shell-sdk/dist/index.js}" \
+  node tests/e2e/native-aa-registry.mjs --block-signers-sphincs
+```
+
+This mode generates a fresh SLH-DSA-SHA2-256f authority and sends 21 real signed
+one-wei transfers. It checks the recipient balance, independent block import,
+actual body pruning on a light RocksDB follower, captured 64-byte signer keys,
+historical tags, HTTP/WebSocket argument rejection and read-only queries. It then
+reopens the follower and checks the same historical evidence again. Use
+`--block-signers` for the existing ML-DSA mode. Both modes stop their child nodes;
+private temporary node data and encrypted keys are retained.
+
+The `--block-signers-sphincs` mode is supplied by the current source checkout,
+not the v0.27.9 tagged script; the v0.27.9 archive supplies the executable. This
+one-authority, one-block-retention experiment does not establish the default
+retention window, other profiles, quorum thresholds, key rotation or reorganization
+behavior, and does not activate a running network.
+
 ## Contract-paymaster gas simulation
 
 `shell_estimatePaymasterGas` can execute the same bounded STATICCALL used by
