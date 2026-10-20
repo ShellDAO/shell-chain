@@ -103,7 +103,10 @@ jobs:
               TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --sync-status &&
             NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
               SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
-              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --block-signers
+              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --block-signers &&
+            NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
+              SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
+              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --block-signers-sphincs
           }; then
             for report in "$runtime"/*/runtime.json; do
               test ! -f "$report" || cat "$report"

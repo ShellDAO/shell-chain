@@ -33,7 +33,9 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const blockSignersScenario = process.argv.includes("--block-signers");
+const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
+const blockSignersScenario =
+  process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -48,7 +50,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    "mldsa65",
+    sphincsSignersScenario ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -117,7 +119,7 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    "Two isolated CLI/RocksDB nodes, loopback libp2p, one ML-DSA authority and one non-authority follower; normal block production and finality.",
+    `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
@@ -594,11 +596,21 @@ async function runScenario() {
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
   if (blockSignersScenario) {
+    if (sphincsSignersScenario) {
+      assert.equal(miner.signatureType, "SphincsSha2256f");
+      assert.equal(miner.getPublicKey().length, 64, "SLH-DSA-SHA2-256f public-key width");
+    }
+    result.signerAlgorithm = miner.signatureType;
+    const recipientBefore = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
     // Use signed transfers and normal import/finality, with independently known keys.
     for (let block = 1; block <= 21; block++)
       await confirmed(`signer history ${block}`, miner, [
         buildInnerCall(outsider.getAddress(), "0x", 100000, 1n),
       ], "0x1", false);
+    assert.equal(
+      BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])),
+      recipientBefore + 21n, "all signed transfers credit their recipient",
+    );
     const last = result.transactions.at(-1);
     await compare(last.hash);
     const first = result.transactions[0];
