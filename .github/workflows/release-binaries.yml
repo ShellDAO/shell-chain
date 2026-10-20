@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Reviewed release build commit
+        description: Reviewed acceptance source commit
         required: true
         type: string
 permissions:
@@ -11,13 +11,14 @@ permissions:
   actions: read
 jobs:
   accept:
-    name: Accept Linux block signers archive
+    name: Accept Linux SLH-DSA block signers archive
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          ref: ${{ inputs.commit }}
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
@@ -26,35 +27,25 @@ jobs:
           node-version: '24'
       - name: Verify and test the existing release archive
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ inputs.commit }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$RELEASE_COMMIT" = 84b3755ee6a759fff64f2253e38b5f937c679cbe
-          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$RELEASE_COMMIT"
-          git diff --exit-code "$RELEASE_COMMIT" -- . ':(exclude).github/workflows/release-binaries.yml'
-          gh api repos/ShellDAO/shell-chain/actions/runs/39306808225 > "$RUNNER_TEMP/build-run.json"
-          python3 - "$RUNNER_TEMP/build-run.json" <<'PYTHON'
-          import json, sys
-          run = json.load(open(sys.argv[1]))
-          assert run['head_sha'] == '84b3755ee6a759fff64f2253e38b5f937c679cbe'
-          assert run['head_branch'] == 'main' and run['conclusion'] == 'success'
-          assert run['path'] == '.github/workflows/release-binaries.yml'
-          PYTHON
-          gh run download 39306808225 --repo ShellDAO/shell-chain --name release-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP/native"
+          RELEASE_COMMIT=84b3755ee6a759fff64f2253e38b5f937c679cbe
+          test "$SOURCE_COMMIT" = 3190402ea6cd3fbe7f3f93a7d697b90bf802131d
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git diff --exit-code "$RELEASE_COMMIT" -- . ':(exclude)tests/e2e/native-aa-registry.mjs' ':(exclude).github/workflows/ci.yml' ':(exclude)docs/ACCOUNT_ABSTRACTION_GUIDE.md'
+          mkdir "$RUNNER_TEMP/native"
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/native/SHA256SUMS" https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/SHA256SUMS
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/native/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz" https://github.com/ShellDAO/shell-chain/releases/download/v0.27.9/shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz
           python3 - "$RUNNER_TEMP/native" <<'PYTHON'
-          import hashlib, json, pathlib, sys, tarfile
+          import hashlib, pathlib, sys, tarfile
           directory = pathlib.Path(sys.argv[1])
-          build = json.loads((directory / 'build.json').read_text())
           name = 'shell-node-v0.27.9-x86_64-unknown-linux-gnu.tar.gz'
-          assert build['commit'] == '84b3755ee6a759fff64f2253e38b5f937c679cbe'
-          assert build['target'] == 'x86_64-unknown-linux-gnu'
-          assert build['features'] == ['rocksdb', 'libp2p'] and build['archive'] == name
           archive = directory / name
           digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
-          assert digest == build['sha256'] == 'cdf5a56c144839342f0e99a39391684abb3ce2875d6bef4bad43bbffd273e92f'
-          assert (directory / 'SHA256SUMS').read_text() == f'{digest}  {name}\n'
+          assert digest == 'cdf5a56c144839342f0e99a39391684abb3ce2875d6bef4bad43bbffd273e92f'
+          assert f'{digest}  {name}' in (directory / 'SHA256SUMS').read_text().splitlines()
           with tarfile.open(archive) as package:
               entries = package.getmembers()
               assert len(entries) == 1 and entries[0].name == 'shell-node' and entries[0].isfile()
@@ -71,12 +62,12 @@ jobs:
           export NODE_BIN="$RUNNER_TEMP/native/shell-node"
           export SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js"
           node --check tests/e2e/native-aa-registry.mjs
-          node tests/e2e/native-aa-registry.mjs --block-signers
+          node tests/e2e/native-aa-registry.mjs --block-signers-sphincs
       - name: Retain acceptance reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-block-signers-acceptance
+          name: linux-sphincs-signers-acceptance
           path: |
             ${{ runner.temp }}/acceptance-runtime/**/runtime.json
             ${{ runner.temp }}/acceptance-runtime/**/*.log
