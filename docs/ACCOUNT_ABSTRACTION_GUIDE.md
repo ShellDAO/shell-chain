@@ -577,6 +577,32 @@ one-authority, one-block-retention experiment does not establish the default
 retention window, other profiles, quorum thresholds, key rotation or reorganization
 behavior, and does not activate a running network.
 
+### Returning validators and quorum
+
+The source correction for returning validators reannounces a missing, sealed
+but unfinalized block through ordinary live block validation and voting. The
+finalized block-response range and quorum threshold stay unchanged. The public
+v0.27.9 binary lacks this correction and can leave a returning validator behind
+when its vote is required to finalize the missing block.
+
+Build a checkout containing the correction with
+`cargo build --locked -p shell-cli --features libp2p --bin shell-node`, then use
+Node.js 24 and the compatible public SDK above:
+
+```sh
+NODE_BIN="${NODE_BIN:-target/debug/shell-node}" \
+  SHELL_SDK_ENTRY="${SHELL_SDK_ENTRY:-../shell-sdk/dist/index.js}" \
+  node tests/e2e/native-aa-registry.mjs --quorum-recovery
+```
+
+This command creates two fresh equal-weight SLH-DSA/ML-DSA authorities on full
+RocksDB nodes. It verifies that one online authority can seal a transaction block
+but cannot finalize it, then restores the second authority and requires catch-up
+and genuine two-authority finality without another transaction. Historical signer
+keys, recipient value, read-only queries and a subsequent process reopen are
+checked. Nodes stop on exit. This does not establish Byzantine recovery,
+unequal-weight policies, other storage profiles or a live-network upgrade.
+
 ## Contract-paymaster gas simulation
 
 `shell_estimatePaymasterGas` can execute the same bounded STATICCALL used by

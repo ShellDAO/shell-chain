@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.10] — 2026-10-20 — Returning validator recovery
+
+### Fixed
+
+- Reannounce a requested sealed but unfinalized block through ordinary live
+  validation and voting, so a returning validator can supply its missing quorum
+  vote. Keep finalized block responses bounded and retain existing signature,
+  execution, certificate and quorum checks.
+
+### Added
+
+- Add `--quorum-recovery` native acceptance with two real equal-weight
+  SLH-DSA/ML-DSA authorities. Verify no finality with one authority offline,
+  recovery without another transaction, captured signer history and RocksDB
+  process reopen, using the existing CI node build and public SDK.
+- Include the `--block-signers-sphincs` source acceptance in the release checkout
+  for genuine fallback signatures, actual body pruning and retained signer keys.
+
+
 ## [0.27.9] — 2026-10-20 — Strict block signer queries
 
 ### Added
