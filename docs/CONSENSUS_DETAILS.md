@@ -432,9 +432,19 @@ For the 3-validator testnet profile with weights `[2, 1, 1]`, total weight is 4
 and quorum is 3. Finality therefore requires the weight-2 validator plus at
 least one weight-1 validator, or all three validators.
 
-A zero total active weight never satisfies finality, even though the numeric
-threshold formula evaluates to zero. Live votes and synchronized commit
-certificates both enforce this nonzero-total invariant.
+A zero total active weight never satisfies finality. Live votes and synchronized
+commit certificates both enforce this nonzero-total invariant.
+
+The current repository's `native-aa-registry.mjs --fork-sync-weighted` acceptance
+also works with the published v0.27.11 binary and public SDK 0.14.0-rc.2. It uses
+fresh authorities with weights `[1, 3]`: the weight-1 authority seals a provisional
+block in its assigned slot, while the weight-3 authority later finalizes alone.
+An independent control and a continuously running provisional observer converge
+on the same certified branch, receipts and signer keys, including after a RocksDB
+process reopen. This bounded full-storage test does not establish other weight
+sets, key rotation, power-loss recovery or Byzantine safety. The weighted script
+mode was added after the v0.27.11 tag; use the current repository script rather
+than the older script bundled with that tag.
 
 `FinalityState` tracks:
 - `last_finalized_number` — highest finalized block number

@@ -34,7 +34,8 @@ const binary = resolve(
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
-const forkSyncScenario = process.argv.includes("--fork-sync");
+const weightedForkScenario = process.argv.includes("--fork-sync-weighted");
+const forkSyncScenario = process.argv.includes("--fork-sync") || weightedForkScenario;
 const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
@@ -103,7 +104,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -467,7 +468,7 @@ async function runScenario() {
       authorities: authorities.map((signer) => signer.getAddress()),
       authority_pubkeys: authorities.map((signer) =>
         "0x" + Buffer.from(signer.getPublicKey()).toString("hex")),
-      weights: authorities.map(() => 1),
+      weights: authorities.map((_, index) => weightedForkScenario && index === 1 ? 3 : 1),
       stakes: [],
       block_time_secs: 2,
       max_future_secs: 300,
@@ -605,7 +606,14 @@ async function runScenario() {
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
   if (forkSyncScenario) {
-    result.adaptations.push("Two equal-weight temporary authorities and two non-authority observers; one provisional suffix and a genuine competing quorum-certified branch. This does not establish Byzantine fault tolerance or production activation.");
+    result.adaptations.push(weightedForkScenario
+      ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."
+      : "Two equal-weight temporary authorities and two non-authority observers; one provisional suffix and a genuine competing quorum-certified branch. This does not establish Byzantine fault tolerance or production activation.");
+    const commonHeight = weightedForkScenario ? 3 : 1;
+    const branchHeight = commonHeight + 1;
+    const tipHeight = branchHeight + 1;
+    let finalHeight = tipHeight;
+    let transferred = 13;
     const recipient = outsider.getAddress();
     const initialBalance = BigInt(genesis.alloc[recipient].balance);
     const extraDirs = [join(out, "observer"), join(out, "control")];
@@ -635,6 +643,10 @@ async function runScenario() {
         const balance = await rpc(index, "eth_getBalance", [recipient, "latest"]);
         if (Number(BigInt(head.number)) === expectedHeight && Number(BigInt(finalized.number)) === expectedFinality) {
           assert.equal(BigInt(balance), initialBalance + BigInt(transferred));
+          if (weightedForkScenario) {
+            const safe = await rpc(index, "eth_getBlockByNumber", ["safe", false]);
+            assert.equal(safe.hash, finalized.hash, "safe aliases weighted finality");
+          }
           return { head, finalized, balance };
         }
         await pause(100);
@@ -658,8 +670,15 @@ async function runScenario() {
       throw Error("fork transfer receipt timeout: " + label);
     }
     const commonTx = await transfer(1, "common finalized block");
-    const common = await observe(0, 1, 1, 1);
-    await observe(1, 1, 1, 1);
+    const commonTransactions = [commonTx];
+    // In the declared [1, 3] WRR order, the low-weight authority proposes at 4.
+    // Reach that slot with genuine zero-value transfers before taking its peer offline.
+    if (weightedForkScenario) {
+      commonTransactions.push(await transfer(0, "common proposer-slot advance 2"));
+      commonTransactions.push(await transfer(0, "common proposer-slot advance 3"));
+    }
+    const common = await observe(0, commonHeight, commonHeight, 1);
+    await observe(1, commonHeight, commonHeight, 1);
     await stop(1);
     await stop(0);
     const branchDirs = [join(out, "branch-b-producer"), join(out, "branch-b-authority")];
@@ -667,21 +686,45 @@ async function runScenario() {
     await cp(dirs[1], branchDirs[1], { recursive: true });
     await start(0, dirs[0], keyPath, "fork-a-producer");
     await start(2, extraDirs[0], extraKeys[0], "fork-observer", await address("fork-a-producer"));
-    await observe(2, 1, 1, 1);
+    await observe(2, commonHeight, commonHeight, 1);
     const orphanTx = await transfer(2, "unfinalized old suffix");
-    const provisional = await observe(2, 2, 1, 3);
+    const provisional = await observe(2, branchHeight, commonHeight, 3);
     await stop(0);
     await start(0, branchDirs[0], keyPath, "fork-b-producer");
     const branchBoot = await address("fork-b-producer");
     await start(1, branchDirs[1], followerKey, "fork-b-authority", branchBoot);
     await start(3, extraDirs[1], extraKeys[1], "fork-control", branchBoot);
     const branchTx = await transfer(4, "certified competing block");
-    const branchTwo = await observe(0, 2, 2, 5);
+    const branchTwo = await observe(0, branchHeight, branchHeight, 5);
     assert.notEqual(branchTwo.head.hash, provisional.head.hash);
     const tipTx = await transfer(8, "certified competing descendant");
-    const expected = await observe(3, 3, 3, 13);
-    const expectedSigners = await rpc(3, "shell_getBlockSigners", ["0x2"]);
-    assert.deepEqual(expectedSigners.signers, authorities.map((signer) => ({
+    let expected = await observe(3, tipHeight, tipHeight, transferred);
+    let heavyTx;
+    if (weightedForkScenario) {
+      // Connect the independent control directly to the authority that remains online.
+      await stop(3);
+      await start(3, extraDirs[1], extraKeys[1], "weighted-control", await address("fork-b-authority"));
+      await stop(0);
+      const signed = await miner.buildSignedTransaction({
+        tx: buildTransaction({ chainId: 1337, nonce: 5, to: recipient, value: 16n, gasLimit: 100000 }),
+        includePublicKey: true,
+      });
+      heavyTx = await paced(() => providers[1].sendTransaction(signed));
+      finalHeight = 6;
+      transferred = 29;
+      const heavyOnly = await observe(1, finalHeight, finalHeight, transferred);
+      result.weightedFinality = { weights: [1, 3], totalWeight: 4, quorum: 3, onlineAuthorityIdentities: 1, heavyOnly };
+      await save();
+      expected = await observe(3, finalHeight, finalHeight, transferred);
+      const receipt = await rpc(1, "eth_getTransactionReceipt", [heavyTx]);
+      assert.equal(receipt.status, "0x1");
+      result.transactions.push({ label: "one high-weight authority finalizes alone", hash: heavyTx, receipt });
+    }
+    const signerHeight = weightedForkScenario ? finalHeight : branchHeight;
+    const signerTag = "0x" + signerHeight.toString(16);
+    const expectedSigners = await rpc(3, "shell_getBlockSigners", [signerTag]);
+    const certifiedAuthorities = weightedForkScenario ? [otherAuthority] : authorities;
+    assert.deepEqual(expectedSigners.signers, certifiedAuthorities.map((signer) => ({
       address: signer.getAddress(),
       pqPubkey: "0x" + Buffer.from(signer.getPublicKey()).toString("hex"),
       signatureValid: true,
@@ -690,11 +733,11 @@ async function runScenario() {
     // remote authority restarts to establish the new inbound route.
     await stop(1);
     await start(1, branchDirs[1], followerKey, "fork-bridge", await address("fork-observer"));
-    const adopted = await observe(2, 3, 3, 13);
+    const adopted = await observe(2, finalHeight, finalHeight, transferred);
     assert.equal(adopted.head.hash, expected.head.hash);
-    assert.equal((await rpc(2, "eth_getBlockByNumber", ["0x1", false])).hash, common.head.hash);
-    assert.deepEqual(await rpc(2, "shell_getBlockSigners", ["0x2"]), expectedSigners);
-    assert.equal(await rpc(2, "eth_getTransactionCount", [miner.getAddress(), "latest"]), "0x3");
+    assert.equal((await rpc(2, "eth_getBlockByNumber", ["0x" + commonHeight.toString(16), false])).hash, common.head.hash);
+    assert.deepEqual(await rpc(2, "shell_getBlockSigners", [signerTag]), expectedSigners);
+    assert.equal(await rpc(2, "eth_getTransactionCount", [miner.getAddress(), "latest"]), weightedForkScenario ? "0x6" : "0x3");
     const docs = await readFile(new URL("../../docs/JSON_RPC_API.md", import.meta.url), "utf8");
     const curl = docs.split("### shell_getBlockSigners")[1].split("### shell_verifyPqSignature")[0]
       .split("```bash\n").slice(1).map((block) => block.split("```")[0]).find((block) => block.includes("curl "));
@@ -706,17 +749,17 @@ async function runScenario() {
     result.forkOriginalCurl = JSON.parse(originalRequest.stdout);
     assert.deepEqual(result.forkOriginalCurl.result, await rpc(3, "shell_getBlockSigners", ["latest"]));
     assert.equal(await rpc(2, "eth_getTransactionReceipt", [orphanTx]), null);
-    for (const hash of [commonTx, branchTx, tipTx])
+    for (const hash of [...commonTransactions, branchTx, tipTx, ...(heavyTx ? [heavyTx] : [])])
       assert.deepEqual(await rpc(2, "eth_getTransactionReceipt", [hash]), await rpc(3, "eth_getTransactionReceipt", [hash]));
     for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
     await start(2, extraDirs[0], extraKeys[0], "fork-observer-reopen");
-    const reopened = await observe(2, 3, 3, 13);
+    const reopened = await observe(2, finalHeight, finalHeight, transferred);
     assert.equal(reopened.head.hash, expected.head.hash);
-    assert.deepEqual(await rpc(2, "shell_getBlockSigners", ["0x2"]), expectedSigners);
+    assert.deepEqual(await rpc(2, "shell_getBlockSigners", [signerTag]), expectedSigners);
     assert.equal(await rpc(2, "eth_getTransactionReceipt", [orphanTx]), null);
     result.forkSync = { common, provisional, expected, adopted, reopened, expectedSigners };
     result.forkSyncVerified = true;
-    result.finalHeight = 3;
+    result.finalHeight = finalHeight;
     result.passed = true;
     return;
   }
