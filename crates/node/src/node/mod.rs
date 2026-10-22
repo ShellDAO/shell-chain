@@ -138,6 +138,17 @@ fn next_block_request_start(head_number: u64) -> Option<u64> {
     head_number.checked_add(1)
 }
 
+fn missing_block_parent_start(
+    block_number: u64,
+    parent_known: bool,
+    finalized: u64,
+) -> Option<u64> {
+    (!parent_known)
+        .then_some(block_number.checked_sub(1))
+        .flatten()
+        .filter(|parent| *parent > finalized)
+}
+
 fn canonical_mapping_retention(body_retention: u64, witness_retention: u64) -> u64 {
     if body_retention == 0 || witness_retention == 0 {
         return u64::MAX;
@@ -1425,23 +1436,38 @@ impl<S: KvStore + 'static> Node<S> {
         sync_request: &mut Option<BlockRequestState>,
         reason: &'static str,
     ) -> bool {
-        let head_number = self.head_number();
-        info!(
-            head = head_number,
-            reason,
-            peer = target_peer.map(|p| p.0.as_str()).unwrap_or("broadcast"),
-            "requesting blocks from peer"
-        );
-        let Some(start_number) = next_block_request_start(head_number) else {
-            tracing::warn!(
-                head = head_number,
-                reason,
-                "skipping missing-block request at terminal block height"
-            );
+        let Some(start_number) = next_block_request_start(self.head_number()) else {
             *sync_requested = false;
             *sync_request = None;
             return false;
         };
+        self.request_blocks_from(
+            network,
+            target_peer,
+            start_number,
+            sync_requested,
+            sync_request,
+            reason,
+        )
+        .await
+    }
+
+    async fn request_blocks_from<N: NetworkService + ?Sized>(
+        &self,
+        network: &NetworkInterface<'_, N>,
+        target_peer: Option<&shell_network::PeerId>,
+        start_number: u64,
+        sync_requested: &mut bool,
+        sync_request: &mut Option<BlockRequestState>,
+        reason: &'static str,
+    ) -> bool {
+        info!(
+            head = self.head_number(),
+            start_number,
+            reason,
+            peer = target_peer.map(|p| p.0.as_str()).unwrap_or("broadcast"),
+            "requesting blocks from peer"
+        );
         let generated_nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3087,6 +3113,128 @@ mod tests {
         assert!(finalized_error
             .to_string()
             .contains("crosses finalized block"));
+    }
+
+    #[test]
+    fn certified_same_height_fork_replays_before_finalizing() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let authority = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+        let canonical = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+        let mut side = canonical.clone();
+        side.header.timestamp += 1;
+        side.proposer_seal = Some(signer.sign(side.hash().as_bytes()).unwrap());
+        node.import_block(side.clone(), &MultiVerifier).unwrap();
+        let signature = signer.sign(side.hash().as_bytes()).unwrap();
+        let mut invalid = signature.clone();
+        invalid.data[0] ^= 1;
+        let invalid_cert =
+            Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(authority, invalid)]))
+                .unwrap();
+        assert!(node
+            .adopt_certified_fork(1, side.hash(), &invalid_cert)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(canonical.hash())
+        );
+        let cert =
+            Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(authority, signature)]))
+                .unwrap();
+        assert!(node
+            .adopt_certified_fork(1, side.hash(), &cert)
+            .unwrap()
+            .is_some());
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(side.hash()));
+        assert!(node.fast_finalize_with_certificate(1, side.hash(), &cert));
+        let canonical_cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+            authority,
+            signer.sign(canonical.hash().as_bytes()).unwrap(),
+        )]))
+        .unwrap();
+        assert!(node
+            .adopt_certified_fork(1, canonical.hash(), &canonical_cert)
+            .unwrap()
+            .is_none());
+        assert_eq!(*node.finality.read().last_finalized_hash(), side.hash());
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(side.hash()));
+    }
+
+    #[test]
+    fn certified_fork_recovers_ancestors_below_live_head() {
+        let (node, signer) = setup_node();
+        store_consistent_genesis(&node);
+        let authority = node.config.proposer_address.unwrap();
+        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+        let canonical_one = make_block_at_1(&node, &signer, None);
+        node.import_block(canonical_one.clone(), &MultiVerifier)
+            .unwrap();
+        let child = |parent: &Block| {
+            let mut block = parent.clone();
+            block.header.parent_hash = parent.hash();
+            block.header.number += 1;
+            block.header.timestamp += 1;
+            block.header.base_fee_per_gas = calculate_base_fee(
+                parent.header.gas_used,
+                parent.header.gas_limit,
+                parent.header.base_fee_per_gas,
+            );
+            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+            block
+        };
+        let canonical_two = child(&canonical_one);
+        node.import_block(canonical_two.clone(), &MultiVerifier)
+            .unwrap();
+        let mut side_one = canonical_one;
+        side_one.header.timestamp += 1;
+        side_one.proposer_seal = Some(signer.sign(side_one.hash().as_bytes()).unwrap());
+        node.import_block(side_one.clone(), &MultiVerifier).unwrap();
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(canonical_two.hash())
+        );
+        assert!(node
+            .chain_store
+            .get_block_by_hash(&side_one.hash())
+            .unwrap()
+            .is_some());
+        let side_two = child(&side_one);
+        node.import_block(side_two.clone(), &MultiVerifier).unwrap();
+        let cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+            authority,
+            signer.sign(side_two.hash().as_bytes()).unwrap(),
+        )]))
+        .unwrap();
+        assert!(node
+            .adopt_certified_fork(2, side_two.hash(), &cert)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            node.chain_store.get_block_hash_by_number(1).unwrap(),
+            Some(side_one.hash())
+        );
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(side_two.hash())
+        );
+        assert!(node.fast_finalize_with_certificate(2, side_two.hash(), &cert));
+        assert_eq!(*node.finality.read().last_finalized_hash(), side_two.hash());
+    }
+
+    #[test]
+    fn missing_parent_requests_never_cross_finality() {
+        assert_eq!(missing_block_parent_start(3, false, 1), Some(2));
+        assert_eq!(missing_block_parent_start(3, true, 1), None);
+        assert_eq!(missing_block_parent_start(2, false, 1), None);
+        assert_eq!(missing_block_parent_start(0, false, 0), None);
+        assert_eq!(
+            missing_block_parent_start(u64::MAX, false, 0),
+            Some(u64::MAX - 1)
+        );
     }
 
     #[test]

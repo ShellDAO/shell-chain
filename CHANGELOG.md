@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fetch missing parents above the finalized checkpoint when block sync encounters
+  a competing unfinalized suffix. Replay authenticated quorum-certified forks on
+  followers before advancing finality, and retry the outstanding ancestor range.
+
+### Added
+
+- Add `native-aa-registry.mjs --fork-sync` acceptance for a live observer switching
+  from a provisional suffix to an independently imported certified branch, including
+  canonical receipts, historical signer evidence and RocksDB process reopen.
+
 ## [0.27.10] — 2026-10-20 — Returning validator recovery
 
 ### Fixed
