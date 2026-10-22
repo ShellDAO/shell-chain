@@ -437,7 +437,7 @@ commit certificates both enforce this nonzero-total invariant.
 
 The current repository's `native-aa-registry.mjs --fork-sync-weighted` acceptance
 also works with the published v0.27.11 binary and public SDK 0.14.0-rc.2. It uses
-fresh authorities with weights `[1, 3]`: the weight-1 authority seals a provisional
+fresh ML-DSA authorities with weights `[1, 3]`: the weight-1 authority seals a provisional
 block in its assigned slot, while the weight-3 authority later finalizes alone.
 An independent control and a continuously running provisional observer converge
 on the same certified branch, receipts and signer keys, including after a RocksDB

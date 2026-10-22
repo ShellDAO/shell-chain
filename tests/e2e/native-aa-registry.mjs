@@ -54,7 +54,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || twoAuthorities ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || (twoAuthorities && !weightedForkScenario) ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -123,7 +123,9 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    twoAuthorities
+    weightedForkScenario
+      ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
+      : twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
       : `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
@@ -637,10 +639,12 @@ async function runScenario() {
     }
     async function observe(index, expectedHeight, expectedFinality, transferred) {
       const deadline = Date.now() + 90000;
+      let last;
       while (Date.now() < deadline) {
         const head = await rpc(index, "eth_getBlockByNumber", ["latest", false]);
         const finalized = await rpc(index, "eth_getBlockByNumber", ["finalized", false]);
         const balance = await rpc(index, "eth_getBalance", [recipient, "latest"]);
+        last = { head, finalized, balance };
         if (Number(BigInt(head.number)) === expectedHeight && Number(BigInt(finalized.number)) === expectedFinality) {
           assert.equal(BigInt(balance), initialBalance + BigInt(transferred));
           if (weightedForkScenario) {
@@ -651,6 +655,8 @@ async function runScenario() {
         }
         await pause(100);
       }
+      result.forkObservationFailure = { index, expectedHeight, expectedFinality, transferred, last };
+      await save();
       throw Error(`fork sync timeout: node ${index}, height ${expectedHeight}, finalized ${expectedFinality}`);
     }
     async function transfer(value, label) {
@@ -693,7 +699,9 @@ async function runScenario() {
     await start(0, branchDirs[0], keyPath, "fork-b-producer");
     const branchBoot = await address("fork-b-producer");
     await start(1, branchDirs[1], followerKey, "fork-b-authority", branchBoot);
+    await peerReady();
     await start(3, extraDirs[1], extraKeys[1], "fork-control", branchBoot);
+    await observe(3, commonHeight, commonHeight, 1);
     const branchTx = await transfer(4, "certified competing block");
     const branchTwo = await observe(0, branchHeight, branchHeight, 5);
     assert.notEqual(branchTwo.head.hash, provisional.head.hash);
