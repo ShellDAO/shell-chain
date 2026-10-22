@@ -1606,6 +1606,21 @@ impl<S: KvStore + 'static> Node<S> {
                                                 if let Some(plan) = &adoption {
                                                     publish_reorg_block_events(&self.chain_store, plan, &block_event_tx);
                                                 }
+                                                // A suffix probe may return a block we already have
+                                                // with a certificate we missed. Apply that evidence
+                                                // even when import does not move the canonical tip.
+                                                if let Some(cert) = verified_certificate {
+                                                    if self.fast_finalize_with_certificate(
+                                                        num, bhash, cert,
+                                                    ) {
+                                                        let fin = self.finality.read().last_finalized_number();
+                                                        *finalized_number.write() = fin;
+                                                    }
+                                                    self.metrics.update_finality(
+                                                        self.head_number(),
+                                                        self.finality.read().last_finalized_number(),
+                                                    );
+                                                }
                                                 let head_after_import = self.head_number();
                                                 let canonical_advanced =
                                                     (head_after_import > head_before_import || adoption.is_some())
@@ -1639,19 +1654,6 @@ impl<S: KvStore + 'static> Node<S> {
                                                 );
                                                 debug!(number = num, "synced block");
                                                 self.slash_timed_out_challenges(num);
-                                                if let Some(cert) = verified_certificate {
-                                                    if self.fast_finalize_with_certificate(
-                                                        num, bhash, cert,
-                                                    ) {
-                                                        let fin = self.finality.read().last_finalized_number();
-                                                        *finalized_number.write() = fin;
-                                                    }
-                                                    self.metrics.update_finality(
-                                                        num,
-                                                        self.finality.read().last_finalized_number(),
-                                                    );
-                                                }
-
                                                 // The reorg publisher already emitted replacement-chain events.
                                                 if adoption.is_some() { continue; }
                                                 // Notify eth_subscribe listeners.
@@ -2629,16 +2631,24 @@ impl<S: KvStore + 'static> Node<S> {
                         // NewBlock gossip is best-effort. If a node misses the producer's
                         // announcement and no later block creates an explicit gap, it would
                         // otherwise stay stale until a reconnect/routing event. Periodically
-                        // ask peers for head+1 as a cheap head probe; an empty response clears
-                        // the sync request without moving readiness out of Ready.
-                        let _ = self.request_missing_blocks(
-                            &network,
-                            None,
-                            &mut sync_requested,
-                            &mut sync_request,
-                            "periodic-head-probe",
-                        )
-                        .await;
+                        // Probe the unfinalized suffix too: a peer may have a certified
+                        // competitor at our tip without any later block. Starting at
+                        // head+1 would never retrieve that block and its certificate.
+                        // Never request a replacement at or below local finality.
+                        let probe_base = self.head_number().min(
+                            self.finality.read().last_finalized_number(),
+                        );
+                        if let Some(start_number) = next_block_request_start(probe_base) {
+                            let _ = self.request_blocks_from(
+                                &network,
+                                None,
+                                start_number,
+                                &mut sync_requested,
+                                &mut sync_request,
+                                "periodic-head-probe",
+                            )
+                            .await;
+                        }
                         sync_retry_attempts_without_progress = 0;
                         sync_retry_timer.reset_after(Duration::from_secs(
                             SYNC_RETRY_BASE_INTERVAL_SECS,

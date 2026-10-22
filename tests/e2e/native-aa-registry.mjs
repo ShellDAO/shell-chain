@@ -34,7 +34,8 @@ const binary = resolve(
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
-const weightedForkScenario = process.argv.includes("--fork-sync-weighted");
+const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
+const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
 const forkSyncScenario = process.argv.includes("--fork-sync") || weightedForkScenario;
 const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
@@ -54,7 +55,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || (twoAuthorities && !weightedForkScenario) ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario) ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -104,7 +105,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -123,7 +124,7 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    weightedForkScenario
+    sameHeightForkScenario
       ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
       : twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
@@ -659,12 +660,13 @@ async function runScenario() {
       await save();
       throw Error(`fork sync timeout: node ${index}, height ${expectedHeight}, finalized ${expectedFinality}`);
     }
-    async function transfer(value, label) {
-      const tx = buildTransaction({ chainId: 1337, nonce: await nonce(miner), to: recipient, value: BigInt(value), gasLimit: 100000 });
+    async function transfer(value, label, index = 0) {
+      const senderNonce = Number(BigInt(await rpc(index, "eth_getTransactionCount", [miner.getAddress(), "latest"])));
+      const tx = buildTransaction({ chainId: 1337, nonce: senderNonce, to: recipient, value: BigInt(value), gasLimit: 100000 });
       const signed = await miner.buildSignedTransaction({ tx, includePublicKey: true });
-      const hash = await paced(() => providers[0].sendTransaction(signed));
+      const hash = await paced(() => providers[index].sendTransaction(signed));
       for (let attempt = 0; attempt < 240; attempt++) {
-        const receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        const receipt = await rpc(index, "eth_getTransactionReceipt", [hash]);
         if (receipt) {
           assert.equal(receipt.status, "0x1");
           result.transactions.push({ label, hash, receipt });
@@ -696,19 +698,31 @@ async function runScenario() {
     const orphanTx = await transfer(2, "unfinalized old suffix");
     const provisional = await observe(2, branchHeight, commonHeight, 3);
     await stop(0);
-    await start(0, branchDirs[0], keyPath, "fork-b-producer");
-    const branchBoot = await address("fork-b-producer");
-    await start(1, branchDirs[1], followerKey, "fork-b-authority", branchBoot);
-    await peerReady();
+    if (sameHeightForkScenario) {
+      // The heavy authority creates a certified competing tip while isolated
+      // from the provisional branch. Do not create a higher descendant.
+      await start(1, branchDirs[1], followerKey, "fork-b-authority");
+    } else {
+      await start(0, branchDirs[0], keyPath, "fork-b-producer");
+      await start(1, branchDirs[1], followerKey, "fork-b-authority", await address("fork-b-producer"));
+      await peerReady();
+    }
+    const branchBoot = await address(sameHeightForkScenario ? "fork-b-authority" : "fork-b-producer");
     await start(3, extraDirs[1], extraKeys[1], "fork-control", branchBoot);
     await observe(3, commonHeight, commonHeight, 1);
-    const branchTx = await transfer(4, "certified competing block");
-    const branchTwo = await observe(0, branchHeight, branchHeight, 5);
+    const branchTx = await transfer(4, "certified competing block", sameHeightForkScenario ? 1 : 0);
+    const branchTwo = await observe(sameHeightForkScenario ? 1 : 0, branchHeight, branchHeight, 5);
     assert.notEqual(branchTwo.head.hash, provisional.head.hash);
-    const tipTx = await transfer(8, "certified competing descendant");
-    let expected = await observe(3, tipHeight, tipHeight, transferred);
+    let tipTx;
+    if (sameHeightForkScenario) {
+      finalHeight = branchHeight;
+      transferred = 5;
+    } else {
+      tipTx = await transfer(8, "certified competing descendant");
+    }
+    let expected = await observe(3, finalHeight, finalHeight, transferred);
     let heavyTx;
-    if (weightedForkScenario) {
+    if (weightedForkScenario && !sameHeightForkScenario) {
       // Connect the independent control directly to the authority that remains online.
       await stop(3);
       await start(3, extraDirs[1], extraKeys[1], "weighted-control", await address("fork-b-authority"));
@@ -745,7 +759,7 @@ async function runScenario() {
     assert.equal(adopted.head.hash, expected.head.hash);
     assert.equal((await rpc(2, "eth_getBlockByNumber", ["0x" + commonHeight.toString(16), false])).hash, common.head.hash);
     assert.deepEqual(await rpc(2, "shell_getBlockSigners", [signerTag]), expectedSigners);
-    assert.equal(await rpc(2, "eth_getTransactionCount", [miner.getAddress(), "latest"]), weightedForkScenario ? "0x6" : "0x3");
+    assert.equal(await rpc(2, "eth_getTransactionCount", [miner.getAddress(), "latest"]), sameHeightForkScenario ? "0x4" : weightedForkScenario ? "0x6" : "0x3");
     const docs = await readFile(new URL("../../docs/JSON_RPC_API.md", import.meta.url), "utf8");
     const curl = docs.split("### shell_getBlockSigners")[1].split("### shell_verifyPqSignature")[0]
       .split("```bash\n").slice(1).map((block) => block.split("```")[0]).find((block) => block.includes("curl "));
@@ -757,7 +771,7 @@ async function runScenario() {
     result.forkOriginalCurl = JSON.parse(originalRequest.stdout);
     assert.deepEqual(result.forkOriginalCurl.result, await rpc(3, "shell_getBlockSigners", ["latest"]));
     assert.equal(await rpc(2, "eth_getTransactionReceipt", [orphanTx]), null);
-    for (const hash of [...commonTransactions, branchTx, tipTx, ...(heavyTx ? [heavyTx] : [])])
+    for (const hash of [...commonTransactions, branchTx, ...(tipTx ? [tipTx] : []), ...(heavyTx ? [heavyTx] : [])])
       assert.deepEqual(await rpc(2, "eth_getTransactionReceipt", [hash]), await rpc(3, "eth_getTransactionReceipt", [hash]));
     for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
     await start(2, extraDirs[0], extraKeys[0], "fork-observer-reopen");
