@@ -112,7 +112,13 @@ jobs:
               TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --quorum-recovery &&
             NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
               SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
-              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --fork-sync
+              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --fork-sync &&
+            NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
+              SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
+              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --fork-sync-weighted &&
+            NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
+              SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
+              TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --fork-sync-same-height
           }; then
             for report in "$runtime"/*/runtime.json; do
               test ! -f "$report" || cat "$report"

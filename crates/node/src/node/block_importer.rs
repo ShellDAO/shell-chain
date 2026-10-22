@@ -1531,8 +1531,17 @@ impl<S: KvStore + 'static> Node<S> {
         let mut settlements = Vec::with_capacity(plan.new_chain.len());
         for block in &plan.new_chain {
             let block_hash = block.hash();
+            // A synchronized certificate may authenticate a proposer selected in
+            // a past view. Recheck the stored evidence before using the same
+            // historical-header rules as certified block import.
+            let certified = self
+                .chain_store
+                .get_commit_certificate(&block_hash)?
+                .is_some_and(|cert| {
+                    self.verify_commit_certificate(block.number(), block_hash, &cert)
+                });
             let signer = self
-                .verify_import_consensus(block, &parent, false)
+                .verify_import_consensus(block, &parent, certified)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_economics(block, &parent)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;

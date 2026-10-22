@@ -3238,6 +3238,71 @@ mod tests {
     }
 
     #[test]
+    fn certified_fork_replay_revalidates_past_view_certificate() {
+        let light = DilithiumSigner::generate();
+        let heavy = DilithiumSigner::generate();
+        let light_address = Address::from_public_key(light.public_key(), light.sig_type().as_u8());
+        let heavy_address = Address::from_public_key(heavy.public_key(), heavy.sig_type().as_u8());
+        let mut node = setup_node_with_authority(heavy_address);
+        node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+            WPoaConfig::with_weights(
+                PoaConfig::new(vec![light_address, heavy_address], 1),
+                vec![1, 3],
+            ),
+            Arc::new(MultiVerifier),
+        )));
+        node.register_authority_pubkey(light_address, light.public_key().to_vec());
+        node.register_authority_pubkey(heavy_address, heavy.public_key().to_vec());
+        store_consistent_genesis(&node);
+        let canonical = make_block_at_1(&node, &heavy, None);
+        node.import_block(canonical.clone(), &MultiVerifier)
+            .unwrap();
+        let mut side = canonical.clone();
+        // A past-view proposer is only legal after the protocol's 10s timeout.
+        side.header.timestamp += 10;
+        side.header.proposer = light_address;
+        side.proposer_seal = Some(light.sign(side.hash().as_bytes()).unwrap());
+        let side_hash = side.hash();
+        assert!(node.import_block(side.clone(), &MultiVerifier).is_err());
+        node.import_finalized_block(side, &MultiVerifier).unwrap();
+        node.fork_choice
+            .write()
+            .update_attested_weight(&side_hash, 3);
+        let plan = node.preferred_fork_plan().unwrap().unwrap();
+        let wrong_hash_certificate =
+            Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                heavy_address,
+                heavy.sign(canonical.hash().as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+        for invalid in [vec![0], wrong_hash_certificate] {
+            node.chain_store
+                .set_commit_certificate(&side_hash, &invalid)
+                .unwrap();
+            let before = node.store.scan_prefix(&[]).unwrap();
+            assert!(node.adopt_preferred_fork(&plan).is_err());
+            assert_eq!(node.store.scan_prefix(&[]).unwrap(), before);
+            assert_eq!(
+                node.chain_store.get_head_hash().unwrap(),
+                Some(canonical.hash())
+            );
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+        }
+        let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+            heavy_address,
+            heavy.sign(side_hash.as_bytes()).unwrap(),
+        )]))
+        .unwrap();
+        assert!(node
+            .adopt_certified_fork(1, side_hash, &certificate)
+            .unwrap()
+            .is_some());
+        assert!(node.fast_finalize_with_certificate(1, side_hash, &certificate));
+        assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(side_hash));
+        assert_eq!(*node.finality.read().last_finalized_hash(), side_hash);
+    }
+
+    #[test]
     fn quorum_preferred_same_height_fork_is_adopted() {
         let (node, signer) = setup_node();
         store_consistent_genesis(&node);
@@ -22502,6 +22567,110 @@ mod tests {
             assert_eq!(
                 follower.chain_store.get_finalized_number().unwrap(),
                 Some(1)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn suffix_probe_recovers_certificate_for_existing_canonical_tip() {
+            use shell_network::{
+                NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+            };
+            use std::time::Duration;
+
+            let (producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let mut follower = setup_node_with_authority(authority);
+            follower.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                store_consistent_genesis(node);
+            }
+            let block = producer.produce_block(&signer, 10).unwrap();
+            let block_hash = block.hash();
+            follower
+                .import_block(block.clone(), &MultiVerifier)
+                .unwrap();
+            assert_eq!(follower.head_number(), 1);
+            assert_eq!(follower.finality.read().last_finalized_number(), 0);
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            follower.config.proposer_address = None;
+            follower.config.rpc_enabled = false;
+            follower.config.metrics.enabled = false;
+            let follower = Arc::new(follower);
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let mut sender = bus.join(&NetworkConfig::default());
+            let handle = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(Arc::new(signer), &mut network).await }
+            });
+            let mut probes = 0;
+            let recovered = tokio::time::timeout(Duration::from_secs(20), async {
+                while follower.finality.read().last_finalized_number() == 0 {
+                    if let Ok(Some(NetworkEvent::MessageReceived {
+                        message:
+                            NetworkMessage::BlockRequest {
+                                start_number,
+                                nonce,
+                                ..
+                            },
+                        ..
+                    })) =
+                        tokio::time::timeout(Duration::from_millis(100), sender.next_event()).await
+                    {
+                        let (blocks, commit_certificates) = if start_number == 1 {
+                            probes += 1;
+                            // Untrusted evidence must not finalize even an existing block.
+                            let cert = if probes == 1 {
+                                vec![0]
+                            } else {
+                                certificate.clone()
+                            };
+                            (vec![block.clone()], vec![(block_hash, cert)])
+                        } else {
+                            (vec![], vec![])
+                        };
+                        sender
+                            .broadcast(NetworkMessage::BlockResponse {
+                                blocks,
+                                commit_certificates,
+                                nonce,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            })
+            .await;
+            follower.shutdown();
+            handle.await.unwrap().unwrap();
+            recovered.expect("a suffix probe must recover missing finality without a new block");
+            assert!(
+                probes >= 2,
+                "invalid certificate must be rejected before valid evidence arrives"
+            );
+            assert_eq!(follower.head_number(), 1);
+            assert_eq!(
+                follower.chain_store.get_head_hash().unwrap(),
+                Some(block_hash)
+            );
+            assert_eq!(
+                follower.chain_store.get_finalized_number().unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap(),
+                Some(certificate)
             );
         }
 

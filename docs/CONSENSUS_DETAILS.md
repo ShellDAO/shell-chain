@@ -432,9 +432,22 @@ For the 3-validator testnet profile with weights `[2, 1, 1]`, total weight is 4
 and quorum is 3. Finality therefore requires the weight-2 validator plus at
 least one weight-1 validator, or all three validators.
 
-A zero total active weight never satisfies finality, even though the numeric
-threshold formula evaluates to zero. Live votes and synchronized commit
-certificates both enforce this nonzero-total invariant.
+A zero total active weight never satisfies finality. Live votes and synchronized
+commit certificates both enforce this nonzero-total invariant.
+
+The current repository's `native-aa-registry.mjs --fork-sync-weighted` acceptance
+uses public SDK 0.14.0-rc.2 and a matching native build. It uses
+fresh SLH-DSA/ML-DSA authorities with weights `[1, 3]`: the weight-1 authority seals a provisional
+block in its assigned slot, while the weight-3 authority later finalizes alone.
+An independent control and a continuously running provisional observer converge
+on the same certified branch, receipts and signer keys, including after a RocksDB
+process reopen. This bounded full-storage test does not establish other weight
+sets, key rotation, power-loss recovery or Byzantine safety. Published v0.27.11
+passed bounded weighted cases but can stall on a certified competing tip,
+including after a proposer view change. Use the correction described under
+[competing suffix synchronization](#synchronizing-a-competing-unfinalized-suffix)
+for that case. The weighted script mode was added after the v0.27.11 tag; use
+the current repository script rather than the older script bundled with that tag.
 
 `FinalityState` tracks:
 - `last_finalized_number` — highest finalized block number
@@ -519,6 +532,14 @@ continues to replay and verify the selected branch before committing it.
 ---
 
 ### Synchronizing a competing unfinalized suffix
+
+Current source also probes from the finalized checkpoint plus one while the
+local tip is unfinalized. A certified competing block at the same height can
+therefore be fetched and replayed without waiting for a higher descendant.
+The new `--fork-sync-same-height` native acceptance keeps the old observer live,
+produces no descendant, and checks canonical hashes, balances, receipts, signer
+evidence and RocksDB reopen. This correction is not in the v0.27.11 binary;
+use a build containing it for that scenario.
 
 The v0.27.11 source builds containing the fork-parent synchronization fix request
 missing ancestors above the finalized checkpoint instead of repeatedly asking
