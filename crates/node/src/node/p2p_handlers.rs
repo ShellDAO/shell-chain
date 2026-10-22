@@ -714,6 +714,54 @@ impl<S: KvStore + 'static> Node<S> {
         true
     }
 
+    /// Replay an authenticated side branch before the canonical-only finality path runs.
+    pub(super) fn adopt_certified_fork(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+    ) -> Result<Option<ForkAdoptionPlan>, NodeError> {
+        if block_number <= self.finality.read().last_finalized_number()
+            || self.chain_store.get_block_hash_by_number(block_number)? == Some(block_hash)
+        {
+            return Ok(None);
+        }
+        let Some(header) = self.chain_store.get_header_by_hash(&block_hash)? else {
+            return Ok(None);
+        };
+        if header.number != block_number
+            || !self.verify_commit_certificate(block_number, block_hash, cert)
+        {
+            return Ok(None);
+        }
+        let signatures =
+            Self::decode_commit_certificate(cert).expect("verified certificate encoding");
+        let evidence = self.commit_signer_evidence(&signatures, block_hash);
+        self.chain_store
+            .set_commit_certificate_with_signers(&block_hash, cert, &evidence)?;
+        let weights = self.consensus.read().validator_weights();
+        let signed_weight = signatures
+            .keys()
+            .filter_map(|signer| weights.get(signer).copied())
+            .fold(0u64, u64::saturating_add);
+        self.fork_choice
+            .write()
+            .update_attested_weight(&block_hash, signed_weight);
+        let Some(plan) = self.preferred_fork_plan()? else {
+            return Ok(None);
+        };
+        if plan.preferred_hash != block_hash {
+            return Ok(None);
+        }
+        if let Err(error) = self.adopt_preferred_fork(&plan) {
+            if let NodeError::InvalidFork { block_hash, .. } = &error {
+                self.fork_choice.write().remove_subtree(block_hash);
+            }
+            return Err(error);
+        }
+        Ok(Some(plan))
+    }
+
     pub fn fast_finalize_with_certificate(
         &self,
         block_number: u64,

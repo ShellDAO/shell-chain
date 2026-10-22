@@ -1726,9 +1726,9 @@ impl<S: KvStore + 'static> Node<S> {
             canonical_hash_at_incoming,
         )?;
 
-        // Fork detection: same height, different hash. Keep the side block so
-        // fork-choice/reorg can inspect it later instead of dropping evidence.
-        if transition == BlockImportTransition::SameHeightFork {
+        // Retain authenticated ancestors anywhere in the unfinalized suffix,
+        // including below the live head, so a competing descendant can be replayed.
+        if transition == BlockImportTransition::UnfinalizedFork {
             let parent = self.parent_for_import(&block)?;
             let signer = self.verify_import_consensus(&block, &parent, finalized_import)?;
             self.verify_import_economics(&block, &parent)?;

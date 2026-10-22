@@ -518,6 +518,36 @@ continues to replay and verify the selected branch before committing it.
 
 ---
 
+### Synchronizing a competing unfinalized suffix
+
+Unreleased source builds containing the fork-parent synchronization fix request
+missing ancestors above the finalized checkpoint instead of repeatedly asking
+for a descendant with an unknown parent. A verified quorum certificate can make
+an authenticated side branch eligible for deterministic replay on non-authority
+followers. Canonical mappings, state, receipts and signer evidence switch through
+the existing replay path before finality advances. This never permits replacing
+a finalized block.
+
+The public v0.27.10 binary can stall when its live provisional suffix differs from
+a peer's certified branch. Source acceptance for the correction is:
+
+```bash
+NODE_BIN="${NODE_BIN:-target/debug/shell-node}" \
+  SHELL_SDK_ENTRY="${SHELL_SDK_ENTRY:-../shell-sdk/dist/index.js}" \
+  node tests/e2e/native-aa-registry.mjs --fork-sync
+```
+
+Use Node.js 24, a matching native build with libp2p/RocksDB and a compatible V2
+SDK. The command creates its own temporary keys and isolated nodes. It snapshots
+a common finalized block, keeps a follower running on a provisional suffix,
+then connects an independently verified competing certified branch. It checks
+canonical state, orphaned receipts, historical signing evidence and RocksDB
+reopen. The experiment covers two equal-weight authorities and full storage;
+it does not establish Byzantine fault tolerance, other storage profiles or
+production-scale retention. A source pass is separate from availability in a
+published native release.
+
+
 ## Slashing
 
 The slashing system detects two categories of misbehaviour:

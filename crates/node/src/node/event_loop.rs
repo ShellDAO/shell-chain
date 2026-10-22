@@ -1570,6 +1570,8 @@ impl<S: KvStore + 'static> Node<S> {
                                     let response_is_empty = blocks.is_empty();
                                     let verifier = MultiVerifier;
                                     let mut last_ok: Option<u64> = None;
+                                    let mut missing_parent = None;
+                                    let mut next_fork_block = None;
                                     let certs: HashMap<ShellHash, Vec<u8>> =
                                         commit_certificates.into_iter().collect();
                                     for block in blocks {
@@ -1577,6 +1579,9 @@ impl<S: KvStore + 'static> Node<S> {
                                         let hdr = block.header.clone();
                                         let bhash = block.hash();
                                         let head_before_import = self.head_number();
+                                        let parent_start = self.chain_store.get_header_by_hash(&hdr.parent_hash).ok().and_then(|parent| {
+                                            missing_block_parent_start(num, parent.is_some(), self.finality.read().last_finalized_number())
+                                        });
                                         let verified_certificate = certs.get(&bhash).filter(|cert| {
                                             self.verify_commit_certificate(num, bhash, cert)
                                         });
@@ -1589,9 +1594,21 @@ impl<S: KvStore + 'static> Node<S> {
                                         });
                                         match import_result {
                                             Ok(()) => {
+                                                let adoption = if let Some(cert) = verified_certificate {
+                                                    match tokio::task::block_in_place(|| self.adopt_certified_fork(num, bhash, cert)) {
+                                                        Ok(plan) => plan,
+                                                        Err(error) => {
+                                                            warn!(number = num, %error, "certified fork replay failed");
+                                                            break;
+                                                        }
+                                                    }
+                                                } else { None };
+                                                if let Some(plan) = &adoption {
+                                                    publish_reorg_block_events(&self.chain_store, plan, &block_event_tx);
+                                                }
                                                 let head_after_import = self.head_number();
                                                 let canonical_advanced =
-                                                    head_after_import > head_before_import
+                                                    (head_after_import > head_before_import || adoption.is_some())
                                                         && head_after_import == num;
                                                 if !canonical_advanced {
                                                     debug!(
@@ -1600,6 +1617,12 @@ impl<S: KvStore + 'static> Node<S> {
                                                         head = head_after_import,
                                                         "BlockResponse import did not advance canonical head"
                                                     );
+                                                    if response_matches_sync && num <= head_after_import
+                                                        && self.chain_store.get_block_by_hash(&bhash)?.is_some()
+                                                    {
+                                                        let canonical = self.chain_store.get_block_hash_by_number(num)? == Some(bhash);
+                                                        next_fork_block = next_block_request_start(if canonical { head_after_import } else { num });
+                                                    }
                                                     continue;
                                                 }
                                                 if early_commit_certificate.finalize_imported(&self) {
@@ -1629,6 +1652,8 @@ impl<S: KvStore + 'static> Node<S> {
                                                     );
                                                 }
 
+                                                // The reorg publisher already emitted replacement-chain events.
+                                                if adoption.is_some() { continue; }
                                                 // Notify eth_subscribe listeners.
                                                 let receipts =
                                                     block_event_receipts(&self.chain_store, bhash)?;
@@ -1646,9 +1671,17 @@ impl<S: KvStore + 'static> Node<S> {
                                                     error = %e,
                                                     "block sync import failed"
                                                 );
+                                                missing_parent = parent_start;
                                                 break;
                                             }
                                         }
+                                    }
+                                    if let Some(start_number) = missing_parent.or(next_fork_block) {
+                                        if self.request_blocks_from(&network, Some(&peer), start_number, &mut sync_requested, &mut sync_request, "fork-ancestor-sync").await {
+                                            production_readiness.note_sync_requested(self.head_number(), std::time::Instant::now(), catch_up_timeout, "missing-fork-parent");
+                                        }
+                                        sync_retry_timer.reset_after(Duration::from_secs(SYNC_RETRY_BASE_INTERVAL_SECS));
+                                        continue;
                                     }
                                     // Request next batch if we imported blocks
                                     // (there may be more to catch up on).
@@ -2274,6 +2307,11 @@ impl<S: KvStore + 'static> Node<S> {
                                     certificate,
                                 } => {
                                     debug!(%peer, block = block_number, %block_hash, "FF.7: received commit certificate");
+                                    match tokio::task::block_in_place(|| self.adopt_certified_fork(block_number, block_hash, &certificate)) {
+                                        Ok(Some(plan)) => publish_reorg_block_events(&self.chain_store, &plan, &block_event_tx),
+                                        Ok(None) => {},
+                                        Err(error) => warn!(block_number, %block_hash, %error, "certified fork replay failed"),
+                                    }
                                     if self.fast_finalize_with_certificate(
                                         block_number,
                                         block_hash,
@@ -2558,14 +2596,15 @@ impl<S: KvStore + 'static> Node<S> {
                             ));
                             continue;
                         }
-                        let request_sent = self.request_missing_blocks(
-                            &network,
-                            None,
-                            &mut sync_requested,
-                            &mut sync_request,
-                            "sync-retry",
-                        )
-                        .await;
+                        // A parent backfill may precede the local head. Retry that range,
+                        // rather than returning to the child whose parent is still absent.
+                        let retry_start = sync_request.as_ref()
+                            .filter(|request| request.start_number > self.finality.read().last_finalized_number())
+                            .map(|request| request.start_number)
+                            .or_else(|| next_block_request_start(self.head_number()));
+                        let request_sent = if let Some(start_number) = retry_start {
+                            self.request_blocks_from(&network, None, start_number, &mut sync_requested, &mut sync_request, "sync-retry").await
+                        } else { false };
                         if request_sent {
                             sync_retry_attempts_without_progress =
                                 sync_retry_attempts_without_progress.saturating_add(1);
