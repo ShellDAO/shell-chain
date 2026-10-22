@@ -520,7 +520,7 @@ continues to replay and verify the selected branch before committing it.
 
 ### Synchronizing a competing unfinalized suffix
 
-Unreleased source builds containing the fork-parent synchronization fix request
+The v0.27.11 source builds containing the fork-parent synchronization fix request
 missing ancestors above the finalized checkpoint instead of repeatedly asking
 for a descendant with an unknown parent. A verified quorum certificate can make
 an authenticated side branch eligible for deterministic replay on non-authority
