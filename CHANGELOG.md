@@ -4,11 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.11] — 2026-10-22 — Certified fork synchronization
+
 ### Fixed
 
 - Fetch missing parents above the finalized checkpoint when block sync encounters
   a competing unfinalized suffix. Replay authenticated quorum-certified forks on
   followers before advancing finality, and retry the outstanding ancestor range.
+- Update TLS certificate validation, root certificate stores and compiler redirect
+  dependencies to patched releases; retain all existing supply-chain checks.
 
 ### Added
 

@@ -1338,7 +1338,7 @@ The original single-block request below is verified with
 on isolated ML-DSA full and pruned light RocksDB nodes, including process reopen.
 Other algorithm, profile and reorganization combinations need separate verification.
 
-Unreleased source builds containing the fork-parent synchronization correction
+The v0.27.11 source builds containing the fork-parent synchronization correction
 also provide `native-aa-registry.mjs --fork-sync` to check canonical signer
 selection after a live provisional suffix is replaced by a certified branch.
 See [Consensus Details](CONSENSUS_DETAILS.md#synchronizing-a-competing-unfinalized-suffix)
