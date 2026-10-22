@@ -1338,6 +1338,13 @@ The original single-block request below is verified with
 on isolated ML-DSA full and pruned light RocksDB nodes, including process reopen.
 Other algorithm, profile and reorganization combinations need separate verification.
 
+The v0.27.11 source builds containing the fork-parent synchronization correction
+also provide `native-aa-registry.mjs --fork-sync` to check canonical signer
+selection after a live provisional suffix is replaced by a certified branch.
+See [Consensus Details](CONSENSUS_DETAILS.md#synchronizing-a-competing-unfinalized-suffix)
+for prerequisites and limits. The public v0.27.10 binary can stall in that
+scenario; this source check does not claim an updated public release.
+
 The method accepts exactly one block string: a positional array such as
 `["latest"]`, or a named object such as `{"block":"latest"}`. Builds containing
 the v0.27.9 correction reject missing, mistyped and extra values with `-32602`.

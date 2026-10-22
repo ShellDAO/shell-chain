@@ -6,7 +6,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockImportTransition {
     DuplicateOrStale,
-    SameHeightFork,
+    UnfinalizedFork,
     NextHeightFork,
     CanonicalNext,
     Gap { incoming: u64, expected: u64 },
@@ -40,8 +40,11 @@ impl ChainStateMachine {
             });
         }
 
-        if incoming_number == head_number && incoming_hash != head_hash {
-            return Ok(BlockImportTransition::SameHeightFork);
+        if incoming_number <= head_number
+            && incoming_number > finalized_number
+            && canonical_hash_at_incoming != Some(incoming_hash)
+        {
+            return Ok(BlockImportTransition::UnfinalizedFork);
         }
         if incoming_number <= head_number {
             return Ok(BlockImportTransition::DuplicateOrStale);
@@ -133,12 +136,24 @@ mod tests {
     fn classifies_side_forks_without_mutating_canonical_head() {
         assert_eq!(
             ChainStateMachine::classify_import(7, h(1), 7, h(2), h(0), 0, Some(h(1))).unwrap(),
-            BlockImportTransition::SameHeightFork
+            BlockImportTransition::UnfinalizedFork
         );
         assert_eq!(
             ChainStateMachine::classify_import(7, h(1), 8, h(3), h(9), 0, None).unwrap(),
             BlockImportTransition::NextHeightFork
         );
+    }
+
+    #[test]
+    fn retains_unfinalized_fork_ancestors_below_the_head() {
+        assert_eq!(
+            ChainStateMachine::classify_import(7, h(1), 6, h(2), h(0), 5, Some(h(3))).unwrap(),
+            BlockImportTransition::UnfinalizedFork
+        );
+        assert!(matches!(
+            ChainStateMachine::classify_import(7, h(1), 5, h(2), h(0), 5, Some(h(3))),
+            Err(NodeError::ConflictsWithFinalized { .. })
+        ));
     }
 
     #[test]

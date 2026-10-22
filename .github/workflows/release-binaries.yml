@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Reviewed acceptance source commit
+        description: Reviewed release build commit
         required: true
         type: string
 permissions:
@@ -11,7 +11,7 @@ permissions:
   actions: read
 jobs:
   accept:
-    name: Accept public Linux quorum recovery archive
+    name: Accept Linux certified fork synchronization archive
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -27,24 +27,35 @@ jobs:
           node-version: '24'
       - name: Verify and test the existing release archive
         env:
-          SOURCE_COMMIT: ${{ inputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-          RELEASE_COMMIT=8bbf31da1e16949f5d0adf82820692fb003b3e4c
-          test "$SOURCE_COMMIT" = 8bbf31da1e16949f5d0adf82820692fb003b3e4c
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          mkdir "$RUNNER_TEMP/native"
-          curl --fail --location --retry 2 --output "$RUNNER_TEMP/native/SHA256SUMS" https://github.com/ShellDAO/shell-chain/releases/download/v0.27.10/SHA256SUMS
-          curl --fail --location --retry 2 --output "$RUNNER_TEMP/native/shell-node-v0.27.10-x86_64-unknown-linux-gnu.tar.gz" https://github.com/ShellDAO/shell-chain/releases/download/v0.27.10/shell-node-v0.27.10-x86_64-unknown-linux-gnu.tar.gz
+          test "$RELEASE_COMMIT" = e280cc3de1fa4406c32a908bbe1f2a7402c511f7
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$RELEASE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          gh api repos/ShellDAO/shell-chain/actions/runs/39729808179 > "$RUNNER_TEMP/build-run.json"
+          python3 - "$RUNNER_TEMP/build-run.json" <<'PYTHON'
+          import json, sys
+          run = json.load(open(sys.argv[1]))
+          assert run['head_sha'] == 'e280cc3de1fa4406c32a908bbe1f2a7402c511f7'
+          assert run['head_branch'] == 'main' and run['conclusion'] == 'success'
+          assert run['path'] == '.github/workflows/release-binaries.yml'
+          PYTHON
+          gh run download 39729808179 --repo ShellDAO/shell-chain --name release-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP/native"
           python3 - "$RUNNER_TEMP/native" <<'PYTHON'
-          import hashlib, pathlib, sys, tarfile
+          import hashlib, json, pathlib, sys, tarfile
           directory = pathlib.Path(sys.argv[1])
-          name = 'shell-node-v0.27.10-x86_64-unknown-linux-gnu.tar.gz'
+          build = json.loads((directory / 'build.json').read_text())
+          name = 'shell-node-v0.27.11-x86_64-unknown-linux-gnu.tar.gz'
+          assert build['commit'] == 'e280cc3de1fa4406c32a908bbe1f2a7402c511f7'
+          assert build['target'] == 'x86_64-unknown-linux-gnu'
+          assert build['features'] == ['rocksdb', 'libp2p'] and build['archive'] == name
           archive = directory / name
           digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
-          assert digest == 'b1a1dcbbe740a7c0e9f9009a09e4ca276e2219824c1a82a898b2118e9bd072f8'
-          assert f'{digest}  {name}' in (directory / 'SHA256SUMS').read_text().splitlines()
+          assert digest == build['sha256'] == 'b77fbe52523cc5cd649b63090c45710b75a8f9810610c16ee93e70f2db5f7d82'
+          assert (directory / 'SHA256SUMS').read_text() == f'{digest}  {name}\n'
           with tarfile.open(archive) as package:
               entries = package.getmembers()
               assert len(entries) == 1 and entries[0].name == 'shell-node' and entries[0].isfile()
@@ -52,8 +63,8 @@ jobs:
           (directory / 'shell-node').chmod(0o755)
           PYTHON
           report=$("$RUNNER_TEMP/native/shell-node" version 2>&1)
-          grep -Fx 'shell-cli 0.27.10' <<< "$report"
-          grep -Fx '  commit: 8bbf31da' <<< "$report"
+          grep -Fx 'shell-cli 0.27.11' <<< "$report"
+          grep -Fx '  commit: e280cc3d' <<< "$report"
           consumer="$RUNNER_TEMP/block-signers-sdk"
           export TMPDIR="$RUNNER_TEMP/acceptance-runtime"
           mkdir "$consumer" "$TMPDIR"
@@ -61,12 +72,12 @@ jobs:
           export NODE_BIN="$RUNNER_TEMP/native/shell-node"
           export SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js"
           node --check tests/e2e/native-aa-registry.mjs
-          node tests/e2e/native-aa-registry.mjs --quorum-recovery
+          node tests/e2e/native-aa-registry.mjs --fork-sync
       - name: Retain acceptance reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-public-quorum-acceptance
+          name: linux-fork-sync-acceptance
           path: |
             ${{ runner.temp }}/acceptance-runtime/**/runtime.json
             ${{ runner.temp }}/acceptance-runtime/**/*.log

@@ -3,7 +3,7 @@
 // Run instructions and version requirements: docs/ACCOUNT_ABSTRACTION_GUIDE.md.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { readFile, writeFile, mkdtemp, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, mkdir, cp } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,6 +34,8 @@ const binary = resolve(
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
+const forkSyncScenario = process.argv.includes("--fork-sync");
+const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
@@ -51,7 +53,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || quorumRecoveryScenario ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || twoAuthorities ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -101,7 +103,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -120,7 +122,7 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    quorumRecoveryScenario
+    twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
       : `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
     "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
@@ -148,7 +150,7 @@ async function stop(i) {
 }
 for (const signal of ["SIGINT", "SIGTERM"])
   process.once(signal, () => {
-    Promise.all([stop(0), stop(1)]).finally(() =>
+    Promise.all(nodes.map((_, index) => stop(index))).finally(() =>
       process.exit(signal === "SIGINT" ? 130 : 143),
     );
   });
@@ -440,7 +442,7 @@ async function runScenario() {
     { encoding: "utf8" },
   );
   assert.equal(keyResult.status, 0, keyResult.stderr);
-  const otherAuthority = quorumRecoveryScenario
+  const otherAuthority = twoAuthorities
     ? await decryptKeystore(JSON.parse(await readFile(followerKey, "utf8")), password)
     : null;
   if (otherAuthority) signers.push(otherAuthority);
@@ -602,6 +604,122 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (forkSyncScenario) {
+    result.adaptations.push("Two equal-weight temporary authorities and two non-authority observers; one provisional suffix and a genuine competing quorum-certified branch. This does not establish Byzantine fault tolerance or production activation.");
+    const recipient = outsider.getAddress();
+    const initialBalance = BigInt(genesis.alloc[recipient].balance);
+    const extraDirs = [join(out, "observer"), join(out, "control")];
+    const extraKeys = [join(out, "observer-key.json"), join(out, "control-key.json")];
+    for (let index = 0; index < 2; index++) {
+      ports.push(await unusedPort());
+      providers.push(createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[index + 2]}` }));
+      await mkdir(extraDirs[index]);
+      await writeFile(join(extraDirs[index], "genesis.json"), JSON.stringify(genesis));
+      const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", extraKeys[index]], { encoding: "utf8" });
+      assert.equal(generated.status, 0, generated.stderr);
+    }
+    async function address(label) {
+      for (let attempt = 0; attempt < 80; attempt++) {
+        const value = (await readFile(join(out, label + "-node.log"), "utf8"))
+          .match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+        if (value) return value;
+        await pause(100);
+      }
+      throw Error("missing native peer address: " + label);
+    }
+    async function observe(index, expectedHeight, expectedFinality, transferred) {
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline) {
+        const head = await rpc(index, "eth_getBlockByNumber", ["latest", false]);
+        const finalized = await rpc(index, "eth_getBlockByNumber", ["finalized", false]);
+        const balance = await rpc(index, "eth_getBalance", [recipient, "latest"]);
+        if (Number(BigInt(head.number)) === expectedHeight && Number(BigInt(finalized.number)) === expectedFinality) {
+          assert.equal(BigInt(balance), initialBalance + BigInt(transferred));
+          return { head, finalized, balance };
+        }
+        await pause(100);
+      }
+      throw Error(`fork sync timeout: node ${index}, height ${expectedHeight}, finalized ${expectedFinality}`);
+    }
+    async function transfer(value, label) {
+      const tx = buildTransaction({ chainId: 1337, nonce: await nonce(miner), to: recipient, value: BigInt(value), gasLimit: 100000 });
+      const signed = await miner.buildSignedTransaction({ tx, includePublicKey: true });
+      const hash = await paced(() => providers[0].sendTransaction(signed));
+      for (let attempt = 0; attempt < 240; attempt++) {
+        const receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        if (receipt) {
+          assert.equal(receipt.status, "0x1");
+          result.transactions.push({ label, hash, receipt });
+          await save();
+          return hash;
+        }
+        await pause(100);
+      }
+      throw Error("fork transfer receipt timeout: " + label);
+    }
+    const commonTx = await transfer(1, "common finalized block");
+    const common = await observe(0, 1, 1, 1);
+    await observe(1, 1, 1, 1);
+    await stop(1);
+    await stop(0);
+    const branchDirs = [join(out, "branch-b-producer"), join(out, "branch-b-authority")];
+    await cp(dirs[0], branchDirs[0], { recursive: true });
+    await cp(dirs[1], branchDirs[1], { recursive: true });
+    await start(0, dirs[0], keyPath, "fork-a-producer");
+    await start(2, extraDirs[0], extraKeys[0], "fork-observer", await address("fork-a-producer"));
+    await observe(2, 1, 1, 1);
+    const orphanTx = await transfer(2, "unfinalized old suffix");
+    const provisional = await observe(2, 2, 1, 3);
+    await stop(0);
+    await start(0, branchDirs[0], keyPath, "fork-b-producer");
+    const branchBoot = await address("fork-b-producer");
+    await start(1, branchDirs[1], followerKey, "fork-b-authority", branchBoot);
+    await start(3, extraDirs[1], extraKeys[1], "fork-control", branchBoot);
+    const branchTx = await transfer(4, "certified competing block");
+    const branchTwo = await observe(0, 2, 2, 5);
+    assert.notEqual(branchTwo.head.hash, provisional.head.hash);
+    const tipTx = await transfer(8, "certified competing descendant");
+    const expected = await observe(3, 3, 3, 13);
+    const expectedSigners = await rpc(3, "shell_getBlockSigners", ["0x2"]);
+    assert.deepEqual(expectedSigners.signers, authorities.map((signer) => ({
+      address: signer.getAddress(),
+      pqPubkey: "0x" + Buffer.from(signer.getPublicKey()).toString("hex"),
+      signatureValid: true,
+    })).sort((a, b) => a.address.localeCompare(b.address)));
+    // Preserve the observer's provisional suffix. Only the already-finalized
+    // remote authority restarts to establish the new inbound route.
+    await stop(1);
+    await start(1, branchDirs[1], followerKey, "fork-bridge", await address("fork-observer"));
+    const adopted = await observe(2, 3, 3, 13);
+    assert.equal(adopted.head.hash, expected.head.hash);
+    assert.equal((await rpc(2, "eth_getBlockByNumber", ["0x1", false])).hash, common.head.hash);
+    assert.deepEqual(await rpc(2, "shell_getBlockSigners", ["0x2"]), expectedSigners);
+    assert.equal(await rpc(2, "eth_getTransactionCount", [miner.getAddress(), "latest"]), "0x3");
+    const docs = await readFile(new URL("../../docs/JSON_RPC_API.md", import.meta.url), "utf8");
+    const curl = docs.split("### shell_getBlockSigners")[1].split("### shell_verifyPqSignature")[0]
+      .split("```bash\n").slice(1).map((block) => block.split("```")[0]).find((block) => block.includes("curl "));
+    assert.ok(curl, "original one-block curl example");
+    const originalRequest = spawnSync("sh", ["-c", curl.replace("http://localhost:8545", `http://127.0.0.1:${ports[2]}`)], {
+      encoding: "utf8", timeout: 10000, env: { ...process.env, NO_PROXY: "127.0.0.1,localhost" },
+    });
+    assert.equal(originalRequest.status, 0, originalRequest.stderr);
+    result.forkOriginalCurl = JSON.parse(originalRequest.stdout);
+    assert.deepEqual(result.forkOriginalCurl.result, await rpc(3, "shell_getBlockSigners", ["latest"]));
+    assert.equal(await rpc(2, "eth_getTransactionReceipt", [orphanTx]), null);
+    for (const hash of [commonTx, branchTx, tipTx])
+      assert.deepEqual(await rpc(2, "eth_getTransactionReceipt", [hash]), await rpc(3, "eth_getTransactionReceipt", [hash]));
+    for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
+    await start(2, extraDirs[0], extraKeys[0], "fork-observer-reopen");
+    const reopened = await observe(2, 3, 3, 13);
+    assert.equal(reopened.head.hash, expected.head.hash);
+    assert.deepEqual(await rpc(2, "shell_getBlockSigners", ["0x2"]), expectedSigners);
+    assert.equal(await rpc(2, "eth_getTransactionReceipt", [orphanTx]), null);
+    result.forkSync = { common, provisional, expected, adopted, reopened, expectedSigners };
+    result.forkSyncVerified = true;
+    result.finalHeight = 3;
+    result.passed = true;
+    return;
+  }
   if (quorumRecoveryScenario) {
     assert.equal(miner.signatureType, "SphincsSha2256f");
     assert.equal(miner.getPublicKey().length, 64);
@@ -1250,8 +1368,7 @@ try {
   result.error = String(error);
   throw error;
 } finally {
-  await stop(1);
-  await stop(0);
+  for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
   result.nodesStopped = nodes.every((x) => !x);
   result.endedAt = new Date().toISOString();
   await save();

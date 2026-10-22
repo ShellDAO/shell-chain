@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.11] — 2026-10-22 — Certified fork synchronization
+
+### Fixed
+
+- Fetch missing parents above the finalized checkpoint when block sync encounters
+  a competing unfinalized suffix. Replay authenticated quorum-certified forks on
+  followers before advancing finality, and retry the outstanding ancestor range.
+- Update TLS certificate validation, root certificate stores and compiler redirect
+  dependencies to patched releases; retain all existing supply-chain checks.
+
+### Added
+
+- Add `native-aa-registry.mjs --fork-sync` acceptance for a live observer switching
+  from a provisional suffix to an independently imported certified branch, including
+  canonical receipts, historical signer evidence and RocksDB process reopen.
+
 ## [0.27.10] — 2026-10-20 — Returning validator recovery
 
 ### Fixed
