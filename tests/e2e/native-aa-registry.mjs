@@ -647,6 +647,10 @@ async function runScenario() {
         const balance = await rpc(index, "eth_getBalance", [recipient, "latest"]);
         last = { head, finalized, balance };
         if (Number(BigInt(head.number)) === expectedHeight && Number(BigInt(finalized.number)) === expectedFinality) {
+          // Separate RPC reads can straddle adoption of a same-height fork.
+          // Retry a changed head before combining its hash with newer finality/state.
+          const currentHead = await rpc(index, "eth_getBlockByNumber", ["latest", false]);
+          if (currentHead.hash !== head.hash) continue;
           assert.equal(BigInt(balance), initialBalance + BigInt(transferred));
           if (weightedForkScenario) {
             const safe = await rpc(index, "eth_getBlockByNumber", ["safe", false]);

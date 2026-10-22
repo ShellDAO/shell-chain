@@ -533,13 +533,13 @@ continues to replay and verify the selected branch before committing it.
 
 ### Synchronizing a competing unfinalized suffix
 
-Current source also probes from the finalized checkpoint plus one while the
+The v0.27.12 source builds probe from the finalized checkpoint plus one while the
 local tip is unfinalized. A certified competing block at the same height can
 therefore be fetched and replayed without waiting for a higher descendant.
 The new `--fork-sync-same-height` native acceptance keeps the old observer live,
 produces no descendant, and checks canonical hashes, balances, receipts, signer
 evidence and RocksDB reopen. This correction is not in the v0.27.11 binary;
-use a build containing it for that scenario.
+use a v0.27.12 source build containing it for that scenario.
 
 The v0.27.11 source builds containing the fork-parent synchronization fix request
 missing ancestors above the finalized checkpoint instead of repeatedly asking

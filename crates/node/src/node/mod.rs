@@ -22570,6 +22570,112 @@ mod tests {
             );
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn slow_view_change_signing_keeps_network_executor_available() {
+            use shell_network::{
+                NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+            };
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Duration;
+
+            struct SlowSigner {
+                inner: DilithiumSigner,
+                first: std::sync::Mutex<
+                    Option<(
+                        tokio::sync::oneshot::Sender<()>,
+                        std::sync::mpsc::Receiver<()>,
+                    )>,
+                >,
+                network_progressed: Arc<AtomicBool>,
+            }
+            impl Signer for SlowSigner {
+                fn sign(&self, message: &[u8]) -> Result<PQSignature, shell_crypto::CryptoError> {
+                    if message.starts_with(b"SHELL_VIEWCHG_V1") {
+                        if let Some((started, progress)) = self.first.lock().unwrap().take() {
+                            let _ = started.send(());
+                            self.network_progressed.store(
+                                progress.recv_timeout(Duration::from_secs(2)).is_ok(),
+                                Ordering::SeqCst,
+                            );
+                        }
+                    }
+                    self.inner.sign(message)
+                }
+                fn public_key(&self) -> &[u8] {
+                    self.inner.public_key()
+                }
+                fn sig_type(&self) -> SignatureType {
+                    self.inner.sig_type()
+                }
+            }
+
+            let (mut node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            let other = DilithiumSigner::generate();
+            let other_address =
+                Address::from_public_key(other.public_key(), other.sig_type().as_u8());
+            node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority, other_address], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            node.consensus.write().note_block_progress(0);
+            node.register_authority_pubkey(other_address, other.public_key().to_vec());
+            node.config.block_time_ms = 20;
+            node.config.max_idle_interval_ms = 0;
+            node.config.rpc_enabled = false;
+            node.config.metrics.enabled = false;
+            store_consistent_genesis(&node);
+            let node = Arc::new(node);
+            let pubkey = signer.public_key().to_vec();
+            let sig_type = signer.sig_type();
+            let (started, signing_started) = tokio::sync::oneshot::channel();
+            let (progress, progressed) = std::sync::mpsc::channel();
+            let network_progressed = Arc::new(AtomicBool::new(false));
+            let signer = SlowSigner {
+                inner: signer,
+                first: std::sync::Mutex::new(Some((started, progressed))),
+                network_progressed: Arc::clone(&network_progressed),
+            };
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let task = tokio::spawn({
+                let node = Arc::clone(&node);
+                async move { node.run(Arc::new(signer), &mut network).await }
+            });
+            let receiver = tokio::spawn(async move {
+                signing_started.await.unwrap();
+                let mut peer = bus.join(&NetworkConfig::default());
+                // The same executor must continue driving peer I/O while signing is busy.
+                let _ = progress.send(());
+                loop {
+                    if let Some(NetworkEvent::MessageReceived {
+                        message: NetworkMessage::WPoaViewChange(message),
+                        ..
+                    }) = peer.next_event().await
+                    {
+                        break message;
+                    }
+                }
+            });
+            let received = tokio::time::timeout(Duration::from_secs(10), receiver).await;
+            node.shutdown();
+            task.await.unwrap().unwrap();
+            let message = received
+                .expect("signed timeout vote reaches the peer")
+                .unwrap();
+            assert!(MultiVerifier
+                .verify(
+                    &pubkey,
+                    &message.own_signing_message(),
+                    &PQSignature::new(sig_type, message.signature.clone())
+                )
+                .unwrap());
+            assert!(
+                network_progressed.load(Ordering::SeqCst),
+                "slow timeout signing must not monopolize the async executor"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn suffix_probe_recovers_certificate_for_existing_canonical_tip() {
             use shell_network::{
