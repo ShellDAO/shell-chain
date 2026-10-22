@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.12] — 2026-10-22 — Certified competing tips
+
+### Fixed
+
+- Discover a quorum-certified competing block at an unfinalized local tip without
+  waiting for a higher descendant. Keep synchronization above the finalized
+  checkpoint and retain deterministic replay before changing canonical state.
+- Recover missed finality evidence when a synchronized block is already stored
+  locally. Reverify each stored quorum certificate before accepting a proposer
+  from a historical view during fork replay.
+
+### Added
+
+- Add native unequal-weight and same-height fork acceptance covering independent
+  canonical state, receipts, genuine signer evidence, orphan removal and RocksDB
+  reopen. Reject malformed and wrong-block certificates without state changes.
+
 ## [0.27.11] — 2026-10-22 — Certified fork synchronization
 
 ### Fixed
