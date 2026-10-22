@@ -1210,7 +1210,9 @@ impl<S: KvStore + 'static> Node<S> {
                                 view,
                                 &highest_qc_hash,
                             );
-                            match signer.sign(&signing_message) {
+                            // SLH-DSA signing can exceed a block tick. Let Tokio drive
+                            // peer I/O on a replacement worker while this computation runs.
+                            match tokio::task::block_in_place(|| signer.sign(&signing_message)) {
                                 Ok(signature) => {
                                     let msg = ViewChangeMessage::new(
                                         chain_id,

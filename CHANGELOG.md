@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 - Recover missed finality evidence when a synchronized block is already stored
   locally. Reverify each stored quorum certificate before accepting a proposer
   from a historical view during fork replay.
+- Keep peer networking responsive while generating a slow post-quantum
+  view-change signature, including on a single-worker async runtime.
 
 ### Added
 
