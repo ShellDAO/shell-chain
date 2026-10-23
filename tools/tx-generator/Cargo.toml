@@ -19,7 +19,7 @@ shell-core = { path = "../../crates/core" }
 shell-pqvm = { path = "../../crates/pqvm" }
 shell-primitives = { path = "../../crates/primitives" }
 
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
