@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.13] — 2026-10-23 — HD wallet recovery
+
+### Fixed
+
+- Update `ctutils` to 0.4.4 and Tokio to 1.53.3 for RUSTSEC-2026-0385 and
+  RUSTSEC-2026-0386, without adding advisory exceptions.
+- Normalize PQ-HD mnemonic input with NFKD, lowercase and canonical word spacing
+  before validation and seed derivation. Preserve BIP-39 passphrase case and
+  whitespace while applying NFKD. Existing encrypted seeds and account keys are
+  unchanged.
+
+### Added
+
+- Restore a mnemonic-backed wallet with `shell-node pq-hd restore`, including
+  secure recovery-phrase/passphrase file inputs for noninteractive use. Save only
+  the encrypted HD seed, refuse existing output paths and retain account identity
+  when deriving either supported algorithm after a process restart.
+
 ## [0.27.12] — 2026-10-22 — Certified competing tips
 
 ### Fixed

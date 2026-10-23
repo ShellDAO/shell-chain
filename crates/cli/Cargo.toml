@@ -36,6 +36,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 rpassword.workspace = true
+zeroize.workspace = true
 toml.workspace = true
 ureq.workspace = true
 alloy-rlp.workspace = true
