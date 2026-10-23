@@ -1,117 +1,120 @@
-name: Release binaries
-
+name: PQ-HD native release acceptance
 on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Reviewed main commit to build (full 40-character SHA)
+        description: Reviewed node source commit
         required: true
         type: string
-
+      mode:
+        description: Verify produced artifacts or anonymous public downloads
+        required: true
+        type: choice
+        options: [produced, public]
+      build_run:
+        description: Successful production binary workflow run
+        required: true
+        type: string
+        default: '40041095469'
+      archive_sha256:
+        description: Independently verified Linux archive checksum
+        required: true
+        type: string
 permissions:
   contents: read
-
+  actions: read
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - runner: macos-15
-            target: aarch64-apple-darwin
-    env:
-      CARGO_BUILD_JOBS: '2'
-      RELEASE_COMMIT: ${{ inputs.commit }}
-      RELEASE_TARGET: ${{ matrix.target }}
+  accept:
+    name: Accept Linux PQ-HD recovery archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          toolchain: stable
-          components: rustfmt
-
-      - name: Validate the exact release source
+          node-version: '24'
+      - name: Verify exact native archive and source
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          MODE: ${{ inputs.mode }}
+          BUILD_RUN: ${{ inputs.build_run }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF" == refs/heads/main ]]
-          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
-          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$RELEASE_COMMIT"
-          test -z "$(git status --porcelain)"
-          scripts/check-release-remote.sh origin
-          scripts/check-release-ci.sh "$RELEASE_COMMIT"
-          scripts/check-release-metadata.sh
-          scripts/check-release-lockfile.sh
-          cargo fmt --all -- --check
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-
-      - name: Install native build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y clang libclang-dev cmake pkg-config
+          test "$SOURCE_COMMIT" = 7b6304fd7a31fedc3ff8d11294e5381cb97b1758
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir "$RUNNER_TEMP/native"
+          if [ "$MODE" = produced ]; then
+            gh run view "$BUILD_RUN" --repo ShellDAO/shell-chain \
+              --json headSha,status,conclusion,workflowName > "$RUNNER_TEMP/production-run.json"
+            python3 - "$RUNNER_TEMP/production-run.json" <<'PYTHON'
+          import json, os, sys
+          run = json.load(open(sys.argv[1]))
+          assert run['headSha'] == os.environ['SOURCE_COMMIT']
+          assert run['workflowName'] == 'Release binaries'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          PYTHON
+            gh run download "$BUILD_RUN" --repo ShellDAO/shell-chain \
+              --name release-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP/native"
           else
-            brew list llvm >/dev/null 2>&1 || brew install llvm
-            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+            test "$MODE" = public
+            curl --fail --location --retry 2 --output "$RUNNER_TEMP/native/SHA256SUMS" \
+              https://github.com/ShellDAO/shell-chain/releases/download/v0.27.13/SHA256SUMS
+            curl --fail --location --retry 2 \
+              --output "$RUNNER_TEMP/native/shell-node-v0.27.13-x86_64-unknown-linux-gnu.tar.gz" \
+              https://github.com/ShellDAO/shell-chain/releases/download/v0.27.13/shell-node-v0.27.13-x86_64-unknown-linux-gnu.tar.gz
           fi
-
-      - name: Build and package the production binary
+          python3 - "$RUNNER_TEMP/native" <<'PYTHON'
+          import hashlib, json, os, pathlib, sys, tarfile
+          directory = pathlib.Path(sys.argv[1])
+          name = 'shell-node-v0.27.13-x86_64-unknown-linux-gnu.tar.gz'
+          archive = directory / name
+          digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
+          assert digest == os.environ['ARCHIVE_SHA256']
+          assert f'{digest}  {name}' in (directory / 'SHA256SUMS').read_text().splitlines()
+          if os.environ['MODE'] == 'produced':
+              build = json.loads((directory / 'build.json').read_text())
+              assert build['commit'] == os.environ['SOURCE_COMMIT']
+              assert build['target'] == 'x86_64-unknown-linux-gnu'
+              assert set(build['features']) == {'rocksdb', 'libp2p'}
+              assert build['archive'] == name and build['sha256'] == digest
+          with tarfile.open(archive) as package:
+              members = package.getmembers()
+              assert len(members) == 1 and members[0].name == 'shell-node' and members[0].isfile()
+              (directory / 'shell-node').write_bytes(package.extractfile(members[0]).read())
+          (directory / 'shell-node').chmod(0o755)
+          PYTHON
+      - name: Recover and reload fresh encrypted wallets
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/release-target
+          SOURCE_COMMIT: ${{ inputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$RUNNER_OS" = macOS ]; then
-            export MACOSX_DEPLOYMENT_TARGET=13.0
-          fi
-          scripts/build-release-binary.sh
-          test -z "$(git status --porcelain)"
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          report=$("$CARGO_TARGET_DIR/release/shell-node" version 2>&1)
-          grep -Fx "shell-cli $version" <<< "$report"
-          grep -Fx "  commit: $(git rev-parse --short HEAD)" <<< "$report"
-          mkdir "$RUNNER_TEMP/release-assets"
-          archive="$RUNNER_TEMP/release-assets/shell-node-v${version}-${RELEASE_TARGET}.tar.gz"
-          tar -czf "$archive" -C "$CARGO_TARGET_DIR/release" shell-node
-          python3 - "$archive" <<'PY'
-          import hashlib, json, os, pathlib, platform, subprocess, sys
-          archive = pathlib.Path(sys.argv[1])
-          digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
-          (archive.parent / 'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
-          evidence = {
-              'commit': os.environ['RELEASE_COMMIT'],
-              'target': os.environ['RELEASE_TARGET'],
-              'archive': archive.name,
-              'sha256': digest,
-              'features': ['rocksdb', 'libp2p'],
-              'rustc': subprocess.check_output(['rustc', '-vV'], text=True),
-              'platform': platform.platform(),
-              'macos_deployment_target': os.environ.get('MACOSX_DEPLOYMENT_TARGET'),
-          }
-          (archive.parent / 'build.json').write_text(json.dumps(evidence, indent=2) + '\n')
-          PY
-
-      - name: Upload verified native archive
+          consumer="$RUNNER_TEMP/pq-hd-sdk"
+          mkdir "$consumer"
+          echo '{"private":true}' > "$consumer/package.json"
+          npm install --prefix "$consumer" --ignore-scripts --no-audit --no-fund \
+            --registry=https://registry.npmjs.org/ --prefer-online shell-sdk@0.14.0-rc.3
+          export NODE_BIN="$RUNNER_TEMP/native/shell-node"
+          export SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js"
+          export PQ_HD_REPORT="$RUNNER_TEMP/pq-hd-report.json"
+          node --check scripts/accept-pq-hd-release.mjs
+          node scripts/accept-pq-hd-release.mjs
+      - name: Retain public acceptance evidence
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-${{ matrix.target }}
-          path: ${{ runner.temp }}/release-assets/
-          if-no-files-found: error
+          name: pq-hd-${{ inputs.mode }}-linux-0.27.13
+          path: |
+            ${{ runner.temp }}/pq-hd-report.json
+            ${{ runner.temp }}/native/SHA256SUMS
+            ${{ runner.temp }}/native/build.json
+          if-no-files-found: warn
           retention-days: 7
