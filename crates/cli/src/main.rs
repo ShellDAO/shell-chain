@@ -483,6 +483,25 @@ enum GenesisCommands {
 
 #[derive(Subcommand)]
 enum PqHdCommands {
+    /// Restore an encrypted HD wallet from a recovery phrase.
+    Restore {
+        /// Output path for the new encrypted HD keystore (must not exist).
+        #[arg(long, default_value = "hd-keystore.json")]
+        output: PathBuf,
+
+        /// PQ algorithm for account 0: `mldsa65` (default) or `slhdsa`.
+        #[arg(long, default_value = "mldsa65")]
+        algo: String,
+
+        /// UTF-8 recovery phrase file; omit to enter the phrase without echo.
+        #[arg(long)]
+        mnemonic_file: Option<PathBuf>,
+
+        /// UTF-8 BIP-39 passphrase file, including all spaces and newlines.
+        /// With --mnemonic-file, omission means an empty BIP-39 passphrase.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
     /// Generate a new BIP-39 mnemonic and save an encrypted HD keystore.
     ///
     /// The recovery phrase is printed ONCE to stderr — write it down.
@@ -896,6 +915,18 @@ async fn main() {
         Commands::Account { command } => commands::account::execute(command),
         Commands::Wallet { command } => commands::wallet::execute(command, password_args),
         Commands::PqHd { action } => match action {
+            PqHdCommands::Restore {
+                output,
+                algo,
+                mnemonic_file,
+                passphrase_file,
+            } => commands::pqhd::execute(commands::pqhd::PqHdCommand::Restore {
+                output,
+                algo,
+                mnemonic_file,
+                passphrase_file,
+                password_args,
+            }),
             PqHdCommands::Generate { output, algo } => {
                 commands::pqhd::execute(commands::pqhd::PqHdCommand::Generate {
                     output,

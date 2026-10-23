@@ -413,3 +413,39 @@ Shell-chain is quantum-ready today. No migration will be needed when quantum com
 ---
 
 *Last updated: 2026-05-22*
+
+
+## Recover a PQ-HD wallet
+
+The source `pq-hd restore` command recreates an encrypted HD seed from a recovery
+phrase. It requires a node release containing that command; v0.27.12 only has
+`generate`, `derive` and the interactive address preview.
+
+Recovery phrases follow Shell PQ-HD v1: NFKD, lowercase and canonical word
+spacing. BIP-39 passphrases use NFKD but retain case and whitespace. Keep the
+recovery phrase, optional BIP-39 passphrase and new keystore password in separate
+private UTF-8 files, protected with permissions such as `0600` on Unix:
+
+```sh
+shell-node pq-hd restore --mnemonic-file recovery.txt \
+  --passphrase-file bip39-passphrase.txt --password-file keystore-password.txt \
+  --output restored-hd.json --algo mldsa65
+shell-node pq-hd derive --keystore restored-hd.json \
+  --password-file keystore-password.txt --algo mldsa65 --account 0
+shell-node pq-hd derive --keystore restored-hd.json \
+  --password-file keystore-password.txt --algo slhdsa --account 0
+```
+
+Passphrase-file contents are used in full, including spaces and newlines; do not
+add a line ending unless it is part of the BIP-39 passphrase. Omit that option
+for an empty BIP-39 passphrase when using `--mnemonic-file`. Without input files,
+the command prompts without echo. The output must be a new file and contains
+only an encrypted seed, never the mnemonic. Derive and compare the known account
+address before using the recovered wallet. Existing encrypted HD seed files
+remain usable with `derive` and need no conversion.
+
+For addresses created by SDK 0.14.0-rc.2 or earlier with boundary mnemonic spaces
+or a non-NFKD Unicode passphrase, use the SDK's explicit legacy seed recovery
+function with the original input. Those previous SDK inputs can identify a
+different wallet from standard PQ-HD derivation; canonical recovery does not
+change or migrate its assets.

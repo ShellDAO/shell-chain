@@ -20,13 +20,14 @@
 //! - ML-DSA-65 pk: raw FIPS 204 bytes, length **1952**, `algo_id = 0x01`.
 //! - SLH-DSA-SHA2-256f pk: raw FIPS 205 bytes, length **64**, `algo_id = 0x02`.
 //!
-//! See ADR-011 in `workspace/projects/shell-chain/adrs/ADR-011-pq-hd-wallet.md`.
+//! See the Shell PQ-HD v1 whitepaper specification and the shared test vectors.
 
 use fips204::ml_dsa_65;
 use fips204::traits::{KeyGen as Fips204KeyGen, SerDes as Fips204SerDes};
 use fips205::slh_dsa_sha2_256f;
 use fips205::traits::SerDes as Fips205SerDes;
 use rand_core::{CryptoRng, RngCore};
+use std::borrow::Cow;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::CryptoError;
@@ -161,7 +162,18 @@ fn blake3_keyed_xof(key: &[u8; 32], data: &[u8], xof_len: usize) -> Zeroizing<Ve
 
 /// Validate a BIP-39 mnemonic (English wordlist).
 pub fn validate_mnemonic(mnemonic: &str) -> bool {
-    bip39::Mnemonic::parse_normalized(mnemonic).is_ok()
+    parse_mnemonic(mnemonic).is_ok()
+}
+
+fn parse_mnemonic(mnemonic: &str) -> Result<bip39::Mnemonic, bip39::Error> {
+    let mut nfkd = Cow::Borrowed(mnemonic);
+    bip39::Mnemonic::normalize_utf8_cow(&mut nfkd);
+    let lowercase = Zeroizing::new(nfkd.to_lowercase());
+    if let Cow::Owned(text) = &mut nfkd {
+        text.zeroize();
+    }
+    // BIP-39 parsing discards surrounding whitespace and canonicalizes words.
+    bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &lowercase)
 }
 
 /// Generate a fresh BIP-39 mnemonic (256-bit entropy, 24 words).
@@ -175,13 +187,12 @@ pub fn generate_mnemonic() -> Result<bip39::Mnemonic, CryptoError> {
 
 /// Derive the 512-bit seed from a BIP-39 mnemonic using PBKDF2-HMAC-SHA512.
 ///
-/// Normalization: applies BIP-39 normalization (NFKD) before PBKDF2. This
-/// matches the TypeScript implementation for standard BIP-39 mnemonics.
+/// Normalize the mnemonic with NFKD, lowercase and canonical word spacing.
+/// BIP-39 passphrase NFKD preserves its case and whitespace.
 ///
 /// Returns a 64-byte seed.
 pub fn mnemonic_to_seed(mnemonic: &str, passphrase: &str) -> Result<[u8; 64], CryptoError> {
-    let m = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, mnemonic)
-        .or_else(|_| bip39::Mnemonic::parse_normalized(mnemonic))
+    let m = parse_mnemonic(mnemonic)
         .map_err(|error| CryptoError::InvalidInput(format!("invalid mnemonic: {error}")))?;
     Ok(m.to_seed(passphrase))
 }
@@ -488,6 +499,28 @@ mod tests {
     fn invalid_mnemonic_returns_error() {
         let error = mnemonic_to_seed("not a valid recovery phrase", "").unwrap_err();
         assert!(matches!(error, CryptoError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn mnemonic_normalization_preserves_wallet_identity() {
+        let mnemonic = generate_mnemonic().unwrap().to_string();
+        let full_width: String = mnemonic
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphabetic() {
+                    char::from_u32(c.to_ascii_uppercase() as u32 + 0xfee0).unwrap()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let input = format!(" \t{}\n", full_width.replace(' ', "\u{3000}  "));
+        let expected = mnemonic_to_seed(&mnemonic, " é㍍ ").unwrap();
+        let recovered = mnemonic_to_seed(&input, " e\u{301}㍍ ");
+        assert!(validate_mnemonic(&input));
+        assert!(recovered.is_ok());
+        assert!(recovered.unwrap() == expected);
+        assert!(mnemonic_to_seed(&mnemonic, "é㍍").unwrap() != expected);
     }
 
     // ── Master node ────────────────────────────────────────────────────────────
