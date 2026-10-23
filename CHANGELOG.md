@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Update `ctutils` to 0.4.4 and Tokio to 1.53.3 for RUSTSEC-2026-0385 and
+  RUSTSEC-2026-0386, without adding advisory exceptions.
 - Normalize PQ-HD mnemonic input with NFKD, lowercase and canonical word spacing
   before validation and seed derivation. Preserve BIP-39 passphrase case and
   whitespace while applying NFKD. Existing encrypted seeds and account keys are
