@@ -371,7 +371,10 @@ impl ProofBacklog {
         let mut entries = first.entries.len();
         let mut end_block = first.block_number;
 
-        while take < max_sources {
+        // Stop at the first complete canonical range, independently of how
+        // many successors another worker has already received.
+        while take < max_sources && !(layer == 1 && min_l1_entries > 0 && entries >= min_l1_entries)
+        {
             let Some(next) = self.pending.get(take) else {
                 break;
             };
@@ -1025,6 +1028,29 @@ mod tests {
         assert_eq!(merged.source_hashes.len(), 1);
         assert_eq!(b.len(), 1);
         assert_eq!(b.peek().unwrap().block_number, u64::MAX);
+    }
+
+    #[test]
+    fn complete_first_l1_range_is_independent_of_a_later_successor() {
+        let mut short = ProofBacklog::new();
+        let mut longer = ProofBacklog::new();
+        let task = ProofTask::new([1; 32], 1, vec![make_entry(1); MIN_L1_STARK_TXS]);
+        short.push(task.clone());
+        longer.push(task);
+        longer.push(ProofTask::new(
+            [2; 32],
+            2,
+            vec![make_entry(2); MIN_L1_STARK_TXS],
+        ));
+        let a = short
+            .pop_contiguous_with_min_entries(1024, MIN_L1_STARK_TXS)
+            .unwrap();
+        let b = longer
+            .pop_contiguous_with_min_entries(1024, MIN_L1_STARK_TXS)
+            .unwrap();
+        assert_eq!(a.source_hashes, b.source_hashes);
+        assert_eq!(a.block_number, b.block_number);
+        assert_eq!(longer.len(), 1);
     }
 
     #[test]

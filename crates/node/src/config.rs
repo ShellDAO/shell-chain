@@ -244,6 +244,9 @@ pub struct NodeConfig {
     pub prover_max_concurrent_proofs: usize,
     /// Order of CPU proof computation; publication remains canonical.
     pub prover_priority: crate::ProvingPriority,
+    /// Explicit, identical cohort of independently keyed L1 prover workers.
+    /// Empty retains independent legacy scheduling.
+    pub prover_worker_cohort: Vec<shell_primitives::Address>,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -308,6 +311,7 @@ impl NodeConfig {
             enable_stark_aggregation: params.stark_aggregation,
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,
+            prover_worker_cohort: Vec::new(),
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }

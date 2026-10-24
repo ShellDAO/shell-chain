@@ -4196,6 +4196,25 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         Self { store }
     }
 
+    /// Bind this local prover database to one explicitly configured worker cohort.
+    /// The value is local scheduling metadata, never part of consensus state.
+    /// Refuse a different cohort on reopen rather than silently reassign work.
+    pub fn bind_worker_cohort(&self, workers: &[Address]) -> Result<(), StorageError> {
+        const KEY: &[u8] = b"prover-worker-cohort/v1";
+        let bytes = serde_json::to_vec(workers)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        if let Some(previous) = self.store.get(KEY)? {
+            if previous != bytes {
+                return Err(StorageError::InvalidInput(
+                    "prover worker cohort differs from the persisted assignment; restore the existing configuration".into(),
+                ));
+            }
+        } else if !workers.is_empty() {
+            self.store.put(KEY, &bytes)?;
+        }
+        Ok(())
+    }
+
     fn key(block_hash: &ShellHash) -> Vec<u8> {
         let mut k = PA_PREFIX.to_vec();
         k.extend_from_slice(block_hash.as_bytes());
