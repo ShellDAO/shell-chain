@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.14] — 2026-10-24 — PQ batch gas boundary
+
+### Fixed
+
+- Classify batches above the 256-signature precompile limit as out of gas,
+  as required by the whitepaper. Empty and malformed batches retain their
+  existing rejection behavior; verification pricing and account state are unchanged.
+
 ## [0.27.13] — 2026-10-23 — HD wallet recovery
 
 ### Fixed

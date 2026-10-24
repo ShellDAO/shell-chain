@@ -316,9 +316,15 @@ fn run_mldsa65_batch_verify<const ALLOW_DEPRECATED: bool>(
     };
     let count = u32::from_be_bytes(count_bytes.try_into().expect("slice length checked"));
 
+    // The whitepaper's batch cap is an out-of-gas limit, independent of
+    // calldata framing and the gas supplied by the caller.
+    if count > MAX_BATCH_SIGNATURES {
+        result.result = InstructionResult::PrecompileOOG;
+        return result;
+    }
     // Reject empty batches so the universal "all signatures valid" result
     // cannot authorize a call without presenting a signature.
-    if count == 0 || count > MAX_BATCH_SIGNATURES {
+    if count == 0 {
         result.result = InstructionResult::PrecompileError;
         return result;
     }
@@ -945,14 +951,14 @@ mod tests {
     /// C-1: count > MAX_BATCH_SIGNATURES must be rejected immediately.
     #[test]
     fn batch_verify_rejects_oversized_count() {
-        let mut input = Vec::new();
-        input.extend_from_slice(&(MAX_BATCH_SIGNATURES + 1).to_be_bytes());
-        let result = run_mldsa65_batch_verify::<false>(u64::MAX, &input);
-        assert_eq!(
-            result.result,
-            InstructionResult::PrecompileError,
-            "C-1: expected PrecompileError for count > MAX_BATCH_SIGNATURES"
-        );
+        for count in [MAX_BATCH_SIGNATURES + 1, u32::MAX] {
+            let input = count.to_be_bytes();
+            for gas_limit in [0, u64::MAX] {
+                let result = run_mldsa65_batch_verify::<false>(gas_limit, &input);
+                assert_eq!(result.result, InstructionResult::PrecompileOOG);
+                assert!(result.output.is_empty());
+            }
+        }
     }
 
     #[test]

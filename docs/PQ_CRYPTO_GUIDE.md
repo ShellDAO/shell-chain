@@ -449,3 +449,23 @@ or a non-NFKD Unicode passphrase, use the SDK's explicit legacy seed recovery
 function with the original input. Those previous SDK inputs can identify a
 different wallet from standard PQ-HD derivation; canonical recovery does not
 change or migrate its assets.
+
+## Check the batch precompile gas boundary
+
+With a RocksDB-enabled node binary and `shell-sdk@0.14.0-rc.3` installed,
+run this acceptance command from the repository checkout:
+
+```sh
+NODE_BIN="$(command -v shell-node)" \
+SHELL_SDK_ENTRY="$(node -p 'require.resolve("shell-sdk")')" \
+node tests/e2e/native-pq-batch.mjs
+```
+
+It starts an isolated local node with fresh test keys and small genesis
+contracts. The contracts assemble 256 valid signature tuples in memory to stay
+within the RPC calldata limit. Exactly 3,072,000 forwarded gas succeeds, one
+less fails the child call, and a corrupt signature returns false while the
+caller continues. Head, state root, balance and nonce remain unchanged.
+The over-cap header must also be rejected. RPC reports execution failures
+generically; the core regression checks the specific out-of-gas classification.
+This check does not measure parallel speedup or establish production throughput.
