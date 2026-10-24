@@ -1059,8 +1059,12 @@ async function runScenario() {
       await peerReady();
       if (prunedEpochScenario) {
         // Observe retention after the historical response, not before it arrives.
+        // Allow a missed startup response to recover through the node's
+        // 30-second request timeout and retry tick before failing the test.
+        const backfillStarted = Date.now();
+        const backfillDeadline = backfillStarted + 60_000;
         let complete = false;
-        for (let attempt = 0; attempt < 80; attempt++) {
+        while (Date.now() < backfillDeadline) {
           const log = await readFile(join(out, nodeLogLabels[1] + "-node.log"), "utf8");
           if (log.includes("L4: historical body back-fill complete")) {
             complete = true;
@@ -1068,6 +1072,7 @@ async function runScenario() {
           }
           await pause(250);
         }
+        entry.epochBackfillWaitMs = Date.now() - backfillStarted;
         assert.ok(complete, "restarted follower completed historical backfill");
       }
       entry.epochRestart = await compare(entry.hash);
