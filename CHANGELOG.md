@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover lost pending-block attestations by unicasting the active validator's
+  already-cast vote when a peer requests the matching canonical height. Retry
+  uses the original signature and retains strict quorum and certificate checks.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -22478,6 +22478,321 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn replays_cached_vote_after_lost_attestation() {
+            use shell_network::{
+                Libp2pNetwork, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+            };
+            use std::time::Duration;
+
+            let proposer = shell_crypto::MlDsaSigner::generate();
+            let voter = shell_crypto::MlDsaSigner::generate();
+            let authority =
+                Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+            let voter_address =
+                Address::from_public_key(voter.public_key(), voter.sig_type().as_u8());
+            let voter_pubkey = voter.public_key().to_vec();
+            let recipient = Address::from([91; 32]);
+            #[cfg(feature = "rocksdb")]
+            let database_paths = {
+                let root = std::env::temp_dir().join(format!(
+                    "shell-vote-retry-{}-{authority}",
+                    std::process::id()
+                ));
+                println!("Vote retry databases: {}", root.display());
+                [root.join("producer"), root.join("follower")]
+            };
+            #[cfg(feature = "rocksdb")]
+            let stores = database_paths.each_ref().map(|path| {
+                Arc::new(
+                    shell_storage::RocksDbStore::open_all(path, None)
+                        .unwrap()
+                        .state,
+                )
+            });
+            #[cfg(not(feature = "rocksdb"))]
+            let stores = [Arc::new(MemoryDb::new()), Arc::new(MemoryDb::new())];
+            let mut producer = setup_node_with_store(authority, Arc::clone(&stores[0]));
+            let mut follower = setup_node_with_store(authority, Arc::clone(&stores[1]));
+            for node in [&mut producer, &mut follower] {
+                node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                    WPoaConfig::from_poa(PoaConfig::new(vec![voter_address, authority], 1)),
+                    Arc::new(MultiVerifier),
+                )));
+                node.register_authority_pubkey(authority, proposer.public_key().to_vec());
+                node.register_authority_pubkey(voter_address, voter.public_key().to_vec());
+                fund_account(node, &authority, U256::from(1_000_000_000_000_000_000u64));
+                store_consistent_genesis(node);
+            }
+            let transaction = submit_signed_tx(
+                &producer,
+                &proposer,
+                authority,
+                Transaction {
+                    chain_id: 1337,
+                    nonce: 0,
+                    to: Some(recipient),
+                    value: U256::from(1u64),
+                    data: Bytes::default(),
+                    gas_limit: 21_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                },
+            );
+            let block = producer.produce_block(&proposer, 10).unwrap();
+            let block_hash = block.hash();
+            assert_eq!(block.transactions.len(), 1);
+            let mut round = WPoaRound::new(1, 0, producer.consensus.read().validator_weights());
+            round.on_block_proposed(block_hash, authority);
+            *producer.wpoa_round.lock() = Some(round);
+            assert!(producer
+                .handle_wpoa_vote(
+                    authority,
+                    block_hash,
+                    1,
+                    proposer.sign(block_hash.as_bytes()).unwrap()
+                )
+                .is_none());
+            follower.config.proposer_address = Some(voter_address);
+            follower.config.rpc_enabled = false;
+            follower.config.metrics.enabled = false;
+            follower.config.max_idle_interval_ms = u64::MAX;
+            let follower = Arc::new(follower);
+            let config = NetworkConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                enable_mdns: false,
+                enable_kademlia: false,
+                enable_relay: false,
+                enable_dcutr: false,
+                enable_autonat: false,
+                ..Default::default()
+            };
+            let mut network = Libp2pNetwork::new(&config).await.unwrap();
+            let info = network.local_node_info_handle();
+            let address = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(address) = info.read().unwrap().listen_addresses.first().cloned() {
+                        break address;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let target = shell_network::PeerId(info.read().unwrap().peer_id.clone());
+            let mut peer = Libp2pNetwork::new(&NetworkConfig {
+                boot_nodes: vec![format!("{address}/p2p/{}", target.0)],
+                ..config
+            })
+            .await
+            .unwrap();
+            let task = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(Arc::new(voter), &mut network).await }
+            });
+            let outcome = async {
+                // A round trip proves both actual GossipSub subscriptions are ready.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        peer.broadcast(NetworkMessage::Ping).await.unwrap();
+                        if let Ok(Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        })) = tokio::time::timeout(Duration::from_millis(250), peer.next_event())
+                            .await
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("authenticated gossip path ready");
+                peer.send_to_peer(&target, NetworkMessage::NewBlock(Box::new(block.clone())))
+                    .await
+                    .unwrap();
+                let first_vote = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(NetworkEvent::MessageReceived {
+                            message:
+                                NetworkMessage::WPoaVote {
+                                    voter,
+                                    block_hash: hash,
+                                    block_number,
+                                    signature,
+                                },
+                            ..
+                        }) = peer.next_event().await
+                        {
+                            assert_eq!((voter, hash, block_number), (voter_address, block_hash, 1));
+                            break signature;
+                        }
+                    }
+                })
+                .await
+                .expect("first real attestation observed then deliberately discarded");
+                assert!(MultiVerifier
+                    .verify(&voter_pubkey, block_hash.as_bytes(), &first_vote)
+                    .unwrap());
+                assert_eq!(follower.head_number(), 1);
+                assert_eq!(follower.finality.read().last_finalized_number(), 0);
+                assert_eq!(producer.finality.read().last_finalized_number(), 0);
+                async fn probe_without_vote(
+                    peer: &mut Libp2pNetwork, target: &shell_network::PeerId,
+                    start_number: u64, nonce: u64,
+                ) {
+                    peer.send_to_peer(target, NetworkMessage::BlockRequest {
+                        start_number, count: 1, nonce,
+                    }).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if let Some(NetworkEvent::MessageReceived { message, .. }) = peer.next_event().await {
+                                assert!(!matches!(message, NetworkMessage::WPoaVote { .. }), "unmatched probe must not replay a vote");
+                                if matches!(message, NetworkMessage::BlockResponse { nonce: n, .. } if n == nonce) { break; }
+                            }
+                        }
+                    }).await.expect("unmatched probe is actually handled");
+                    let _ = tokio::time::timeout(Duration::from_millis(150), async {
+                        loop {
+                            if let Some(NetworkEvent::MessageReceived { message, .. }) = peer.next_event().await {
+                                assert!(!matches!(message, NetworkMessage::WPoaVote { .. }), "no late vote for unmatched probe");
+                            }
+                        }
+                    }).await;
+                }
+                probe_without_vote(&mut peer, &target, 2, 702).await;
+                // Even an existing signature cannot be relabelled to a foreign round hash.
+                {
+                    let mut round = follower.wpoa_round.lock();
+                    if let shell_consensus::wpoa_state::RoundPhase::Voting { block_hash, .. } = &mut round.as_mut().unwrap().phase {
+                        *block_hash = hash(199);
+                    } else { panic!("pending voting round"); }
+                }
+                probe_without_vote(&mut peer, &target, 1, 703).await;
+                {
+                    let mut round = follower.wpoa_round.lock();
+                    if let shell_consensus::wpoa_state::RoundPhase::Voting { block_hash: pending_hash, .. } = &mut round.as_mut().unwrap().phase {
+                        *pending_hash = block_hash;
+                    } else { panic!("pending voting round"); }
+                }
+                // Ignore the first vote, then deliver the next genuine pending-height probe.
+                peer.send_to_peer(
+                    &target,
+                    NetworkMessage::BlockRequest {
+                        start_number: 1,
+                        count: 1,
+                        nonce: 701,
+                    },
+                )
+                .await
+                .unwrap();
+                let replay = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if let Some(NetworkEvent::MessageReceived {
+                            message:
+                                NetworkMessage::WPoaVote {
+                                    voter,
+                                    block_hash: hash,
+                                    block_number,
+                                    signature,
+                                },
+                            ..
+                        }) = peer.next_event().await
+                        {
+                            assert_eq!((voter, hash, block_number), (voter_address, block_hash, 1));
+                            break signature;
+                        }
+                    }
+                })
+                .await;
+                let signature = replay
+                    .map_err(|_| "pending-height request did not recover the discarded vote")?;
+                assert_eq!(
+                    signature.data, first_vote.data,
+                    "retry reuses the already-cast signature"
+                );
+                let certificate = producer
+                    .handle_wpoa_vote(voter_address, block_hash, 1, signature)
+                    .expect("both distinct genuine votes reach strict quorum");
+                peer.send_to_peer(
+                    &target,
+                    NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: 1,
+                        certificate,
+                    },
+                )
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while follower.finality.read().last_finalized_number() != 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| "quorum certificate did not finalize the follower")?;
+                for node in [&producer, follower.as_ref()] {
+                    assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(1));
+                    assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(block_hash));
+                    let receipt = node.chain_store.get_receipt_by_tx_hash(&transaction).unwrap().unwrap();
+                    assert_eq!((receipt.tx_hash, receipt.block_number, receipt.status, receipt.gas_used), (transaction, 1, 1, 21_000));
+                    assert!(node.chain_store.get_commit_certificate(&block_hash).unwrap().is_some());
+                    assert_eq!(
+                        node.world_state
+                            .write()
+                            .get_account(&recipient)
+                            .unwrap()
+                            .unwrap()
+                            .balance,
+                        U256::from(1u64)
+                    );
+                }
+                Ok::<(), &str>(())
+            }
+            .await;
+            follower.shutdown();
+            task.await.unwrap().unwrap();
+            peer.shutdown().await.unwrap();
+            outcome.expect("one discarded vote must not strand a healthy two-authority chain");
+            #[cfg(feature = "rocksdb")]
+            {
+                drop(producer);
+                drop(follower);
+                drop(stores);
+                for path in database_paths {
+                    let db = Arc::new(
+                        shell_storage::RocksDbStore::open_all(path, None)
+                            .unwrap()
+                            .state,
+                    );
+                    let chain = ChainStore::new(Arc::clone(&db));
+                    assert_eq!(chain.get_finalized_number().unwrap(), Some(1));
+                    assert_eq!(chain.get_head_hash().unwrap(), Some(block_hash));
+                    assert!(chain.get_commit_certificate(&block_hash).unwrap().is_some());
+                    let receipt = chain.get_receipt_by_tx_hash(&transaction).unwrap().unwrap();
+                    assert_eq!(
+                        (
+                            receipt.tx_hash,
+                            receipt.block_number,
+                            receipt.status,
+                            receipt.gas_used
+                        ),
+                        (transaction, 1, 1, 21_000)
+                    );
+                    let root = chain.get_head_block().unwrap().unwrap().header.state_root;
+                    let state = WorldState::at_root(db, &root).unwrap();
+                    assert_eq!(
+                        state.get_account(&recipient).unwrap().unwrap().balance,
+                        U256::from(1u64)
+                    );
+                    assert_eq!(state.get_account(&authority).unwrap().unwrap().nonce, 1);
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn event_loop_finalizes_certificate_received_before_block() {
             use shell_network::{NetworkBus, NetworkConfig, NetworkMessage, NetworkService};
             use std::time::Duration;
