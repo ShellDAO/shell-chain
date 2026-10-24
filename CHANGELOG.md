@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Feed admitted peers' Identify listen addresses into Kademlia so nodes can
+  discover peers beyond their configured boot nodes with mDNS disabled.
+  Existing connection limits, bans, and GossipSub scoring remain enforced.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
