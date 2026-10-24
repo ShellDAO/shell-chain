@@ -1495,6 +1495,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         if let Ok(Some(block)) =
                                             self.chain_store.get_block_by_number(start_number)
                                         {
+                                            let pending_hash = block.hash();
                                             debug!(
                                                 number = start_number,
                                                 %peer,
@@ -1506,6 +1507,32 @@ impl<S: KvStore + 'static> Node<S> {
                                                     NetworkMessage::NewBlock(Box::new(block)),
                                                 )
                                                 .await;
+                                            // A duplicate proposal does not cast another vote.
+                                            // Recover a lost gossip attestation by unicasting only
+                                            // the signature already recorded for this exact block.
+                                            let vote = if can_produce_blocks {
+                                                let voter = self.config.proposer_address
+                                                    .expect("validated block producer has proposer address");
+                                                self.wpoa_round.lock().as_ref().and_then(|round| {
+                                                    match &round.phase {
+                                                        shell_consensus::wpoa_state::RoundPhase::Voting { block_hash, votes, .. }
+                                                            if round.block_number == start_number
+                                                                && *block_hash == pending_hash =>
+                                                        {
+                                                            votes.get(&voter).cloned().map(|signature| NetworkMessage::WPoaVote {
+                                                                block_hash: *block_hash,
+                                                                block_number: start_number,
+                                                                voter,
+                                                                signature,
+                                                            })
+                                                        }
+                                                        _ => None,
+                                                    }
+                                                })
+                                            } else { None };
+                                            if let Some(vote) = vote {
+                                                let _ = network.send_to_peer(&peer, vote).await;
+                                            }
                                         }
                                     }
                                     let commit_certificates = blocks
