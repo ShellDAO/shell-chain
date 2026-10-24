@@ -120,6 +120,29 @@ error instead of generating a replacement. Valid links to readable genesis
 files remain supported. New development genesis files are fully written before
 publication and never replace a destination created concurrently.
 
+**Peer discovery (Unreleased fix):** With P2P enabled, Kademlia uses the
+configured boot nodes to discover additional peers. Admitted peers advertising
+`/shell-chain/kad/1.0.0` contribute their Identify listen addresses to the DHT;
+this also works with mDNS disabled. Addresses remain associated with the
+authenticated peer ID. Connection limits, bans, and GossipSub scoring still
+apply; discovery does not grant a peer explicit GossipSub membership.
+
+For a local three-node acceptance with fresh test accounts, install
+`shell-sdk@0.14.0-rc.3` and run:
+
+```bash
+NODE_BIN=/path/to/shell-node \
+SHELL_SDK_ENTRY=/path/to/node_modules/shell-sdk/dist/index.js \
+node tests/e2e/native-kademlia-discovery.mjs
+```
+
+Use a native build with RocksDB and libp2p support that includes this fix.
+The script allocates isolated ports and data directories, disables mDNS,
+checks discovery through a shared seed, stops the seed, and verifies signed
+transfers and the recipient's persisted balance. It stops its nodes on exit
+and retains the temporary data directory for inspection. Older releases may
+remain connected only to their configured boot nodes.
+
 **Network Profile Defaults:**
 
 | Profile | Block Time | Chain ID default |

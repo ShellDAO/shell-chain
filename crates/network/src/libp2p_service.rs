@@ -1405,6 +1405,30 @@ fn handle_swarm_event(
                 }
             }
         }
+        SwarmEvent::Behaviour(ShellBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
+            let peer = PeerId(peer_id.to_string());
+            // Rust libp2p does not automatically feed Identify addresses into
+            // Kademlia. Only admitted peers advertising our DHT may seed it.
+            if peer_ban_list.is_banned(&peer) || !peer_tracker.contains_peer(&peer) {
+                return;
+            }
+            if info
+                .protocols
+                .iter()
+                .any(|protocol| protocol.as_ref() == "/shell-chain/kad/1.0.0")
+            {
+                if let Some(kad) = swarm.behaviour_mut().kademlia.as_mut() {
+                    for address in info.listen_addrs {
+                        // add_address rejects a conflicting embedded peer ID.
+                        kad.add_address(&peer_id, address);
+                    }
+                }
+            }
+        }
         // Kademlia routing table updated.
         SwarmEvent::Behaviour(ShellBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
             peer,
@@ -2415,6 +2439,200 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(network.peer_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn identify_only_seeds_admitted_matching_dht_peers() {
+        for enabled in [true, false] {
+            let config = NetworkConfig {
+                enable_mdns: false,
+                enable_kademlia: enabled,
+                ban_threshold: 1,
+                enable_relay: false,
+                enable_dcutr: false,
+                enable_autonat: false,
+                ..Default::default()
+            };
+            let mut swarm = build_swarm(&config).unwrap();
+            let key = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = key.public().to_peer_id();
+            let addr: Multiaddr = "/ip4/192.0.2.1/tcp/30303".parse().unwrap();
+            let (event_tx, _event_rx) = mpsc::channel(1);
+            let loop_config = SwarmLoopConfig {
+                local_node_info: Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
+                peer_count: Arc::new(AtomicUsize::new(0)),
+                blocks_topic: IdentTopic::new(&config.blocks_topic),
+                txs_topic: IdentTopic::new(&config.txs_topic),
+                attestation_topic: IdentTopic::new(&config.attestation_topic),
+                proofs_topic: IdentTopic::new(&config.proofs_topic),
+                bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
+                boot_nodes: Vec::new(),
+                max_msg_size: config.max_message_size,
+                event_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES)),
+                peer_security: PeerSecurityConfig::from(&config),
+            };
+            let mut state = SwarmLoopState::new(PeerSecurityConfig::from(&config));
+
+            let event = |protocols, address| {
+                SwarmEvent::Behaviour(ShellBehaviourEvent::Identify(identify::Event::Received {
+                    connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+                    peer_id,
+                    info: identify::Info {
+                        public_key: key.public(),
+                        protocol_version: "/shell-chain/1.0.0".into(),
+                        agent_version: "discovery-test".into(),
+                        listen_addrs: vec![address],
+                        protocols,
+                        observed_addr: "/ip4/192.0.2.2/tcp/40404".parse().unwrap(),
+                        signed_peer_record: None,
+                    },
+                }))
+            };
+            let count = |swarm: &mut Swarm<ShellBehaviour>| -> usize {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .as_mut()
+                    .map(|kad| kad.kbuckets().map(|bucket| bucket.num_entries()).sum())
+                    .unwrap_or(0)
+            };
+            let protocols = || vec![libp2p::StreamProtocol::new("/shell-chain/kad/1.0.0")];
+            handle_swarm_event(
+                event(protocols(), addr.clone()),
+                &mut swarm,
+                &event_tx,
+                &loop_config,
+                &mut state,
+            );
+            assert_eq!(count(&mut swarm), 0, "unadmitted peer must not seed DHT");
+            let peer = PeerId(peer_id.to_string());
+            state.peer_tracker.try_add_peer(peer.clone()).unwrap();
+            handle_swarm_event(
+                event(vec![], addr.clone()),
+                &mut swarm,
+                &event_tx,
+                &loop_config,
+                &mut state,
+            );
+            assert_eq!(count(&mut swarm), 0, "non-DHT peer must not seed DHT");
+            let wrong_address = format!("{addr}/p2p/{}", Libp2pPeerId::random())
+                .parse()
+                .unwrap();
+            handle_swarm_event(
+                event(protocols(), wrong_address),
+                &mut swarm,
+                &event_tx,
+                &loop_config,
+                &mut state,
+            );
+            assert_eq!(count(&mut swarm), 0, "mismatched peer ID must not seed DHT");
+            state.peer_ban_list.record_violation(&peer);
+            handle_swarm_event(
+                event(protocols(), addr.clone()),
+                &mut swarm,
+                &event_tx,
+                &loop_config,
+                &mut state,
+            );
+            assert_eq!(count(&mut swarm), 0, "banned peer must not seed DHT");
+            state = SwarmLoopState::new(PeerSecurityConfig::from(&config));
+            state.peer_tracker.try_add_peer(peer).unwrap();
+            handle_swarm_event(
+                event(protocols(), addr),
+                &mut swarm,
+                &event_tx,
+                &loop_config,
+                &mut state,
+            );
+            assert_eq!(
+                count(&mut swarm),
+                usize::from(enabled),
+                "only an enabled DHT learns the admitted address"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kademlia_discovers_leaves_through_identified_seed() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: true,
+            enable_relay: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let mut seed = Libp2pNetwork::new(&config).await.unwrap();
+        let info = seed.local_node_info_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while info.read().unwrap().listen_addresses.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let bound = info.read().unwrap().clone();
+        let config = NetworkConfig {
+            boot_nodes: vec![format!(
+                "{}/p2p/{}",
+                bound.listen_addresses[0], bound.peer_id
+            )],
+            ..config
+        };
+        let first = Libp2pNetwork::new(&config).await.unwrap();
+        // The seed must learn an inbound node's advertised listening address,
+        // rather than its ephemeral source port, before it can introduce it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(seed.next_event().await,
+                    Some(NetworkEvent::RoutingTableUpdated { peer_count }) if peer_count > 0)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Identify must populate the seed's DHT routing table");
+        let mut second = Libp2pNetwork::new(&config).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while first.peer_count().await < 2 || second.peer_count().await < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("leaves must discover each other through only the seed");
+        seed.shutdown().await.unwrap();
+        let second_id = PeerId(
+            second
+                .local_node_info_handle()
+                .read()
+                .unwrap()
+                .peer_id
+                .clone(),
+        );
+        let first_id = PeerId(
+            first
+                .local_node_info_handle()
+                .read()
+                .unwrap()
+                .peer_id
+                .clone(),
+        );
+        first
+            .send_to_peer(&second_id, NetworkMessage::Ping)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(second.next_event().await,
+                    Some(NetworkEvent::MessageReceived { peer, message: NetworkMessage::Ping }) if peer == first_id) {
+                    break;
+                }
+            }
+        }).await.expect("direct traffic must survive seed shutdown");
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
     }
 
     #[tokio::test]
