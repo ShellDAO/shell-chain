@@ -320,6 +320,23 @@ impl Libp2pNetwork {
     /// Begins listening on `config.listen_addr` and dials any boot nodes.
     /// Peer discovery via mDNS starts automatically.
     pub async fn new(config: &NetworkConfig) -> Result<Self, NetworkError> {
+        let relay_listeners = parse_relay_listeners(config)?;
+        let external_addresses = config
+            .external_addresses
+            .iter()
+            .map(|value| {
+                let address: Multiaddr = value.parse().map_err(|error| {
+                    NetworkError::Transport(format!("invalid external address: {error}"))
+                })?;
+                if !is_tcp_endpoint(&address) {
+                    return Err(NetworkError::Transport(
+                        "external addresses must be TCP endpoints without peer IDs or circuits"
+                            .into(),
+                    ));
+                }
+                Ok(address)
+            })
+            .collect::<Result<Vec<_>, NetworkError>>()?;
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, event_rx) = mpsc::channel(256);
         let command_byte_budget = Arc::new(Semaphore::new(MAX_PENDING_COMMAND_BYTES));
@@ -347,7 +364,19 @@ impl Libp2pNetwork {
             .listen_on(listen_addr)
             .map_err(|e| NetworkError::Transport(e.to_string()))?;
 
-        let mut protocols = vec!["gossipsub".to_string()];
+        for address in external_addresses {
+            swarm.add_external_address(address);
+        }
+        for address in relay_listeners {
+            swarm
+                .listen_on(address)
+                .map_err(|error| NetworkError::Transport(format!("relay listener: {error}")))?;
+        }
+        let mut protocols = if config.enable_gossip {
+            vec!["gossipsub".to_string()]
+        } else {
+            Vec::new()
+        };
         if swarm.behaviour().kademlia.as_ref().is_some() {
             protocols.push("kademlia".to_string());
         }
@@ -390,6 +419,7 @@ impl Libp2pNetwork {
             max_msg_size,
             event_byte_budget,
             peer_security: PeerSecurityConfig::from(config),
+            enable_gossip: config.enable_gossip,
         };
 
         tokio::spawn(swarm_loop(swarm, cmd_rx, event_tx, loop_config));
@@ -878,6 +908,7 @@ struct SwarmLoopConfig {
     max_msg_size: usize,
     event_byte_budget: Arc<Semaphore>,
     peer_security: PeerSecurityConfig,
+    enable_gossip: bool,
 }
 
 struct SwarmLoopState {
@@ -948,34 +979,37 @@ async fn swarm_loop(
         Arc::clone(&loop_config.local_node_info),
     );
 
-    // Subscribe to gossipsub topics.
-    if let Err(e) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&loop_config.blocks_topic)
-    {
-        warn!("Failed to subscribe to blocks topic: {e}");
-    }
-    if let Err(e) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&loop_config.txs_topic)
-    {
-        warn!("Failed to subscribe to txs topic: {e}");
-    }
-    if let Err(e) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&loop_config.attestation_topic)
-    {
-        warn!("Failed to subscribe to attestation topic: {e}");
-    }
-    if let Err(e) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&loop_config.proofs_topic)
-    {
-        warn!("Failed to subscribe to proofs topic: {e}");
+    // Standalone relays forward encrypted circuits, not application gossip.
+    if loop_config.enable_gossip {
+        // Subscribe to gossipsub topics.
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&loop_config.blocks_topic)
+        {
+            warn!("Failed to subscribe to blocks topic: {e}");
+        }
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&loop_config.txs_topic)
+        {
+            warn!("Failed to subscribe to txs topic: {e}");
+        }
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&loop_config.attestation_topic)
+        {
+            warn!("Failed to subscribe to attestation topic: {e}");
+        }
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&loop_config.proofs_topic)
+        {
+            warn!("Failed to subscribe to proofs topic: {e}");
+        }
     }
 
     // Periodic Kademlia bootstrap refresh (every 5 minutes).
@@ -1535,7 +1569,8 @@ fn handle_swarm_event(
         // New listen address bound.
         SwarmEvent::NewListenAddr { address, .. } => {
             let local_peer_id = *swarm.local_peer_id();
-            info!("Listening on {address}/p2p/{local_peer_id}");
+            let advertised = address.clone().with_p2p(local_peer_id).unwrap_or(address);
+            info!("Listening on {advertised}");
             if let Ok(mut info) = loop_config.local_node_info.write() {
                 info.listen_addresses = swarm.listeners().map(ToString::to_string).collect();
                 info.listen_addresses.sort();
@@ -1548,7 +1583,9 @@ fn handle_swarm_event(
             }
         }
         // Connection established.
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
             let peer = PeerId(peer_id.to_string());
             // F-305: Check ban list before accepting connection.
             if peer_ban_list.is_banned(&peer) {
@@ -1573,7 +1610,7 @@ fn handle_swarm_event(
                     return;
                 }
             }
-            debug!("Connected to {peer_id}");
+            debug!(relayed = endpoint.is_relayed(), "Connected to {peer_id}");
             update_peer_count(peer_tracker, &loop_config.peer_count);
         }
         // Connection closed.
@@ -1830,15 +1867,62 @@ async fn acquire_command_byte_permit(
         .map_err(|_| NetworkError::ChannelClosed)
 }
 
-/// Extract the libp2p PeerId from a multiaddr containing a `/p2p/<peer_id>` component.
-fn extract_peer_id(addr: &Multiaddr) -> Option<Libp2pPeerId> {
-    addr.iter().find_map(|proto| {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-            Some(peer_id)
-        } else {
-            None
+fn is_tcp_endpoint(address: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    let mut parts = address.iter();
+    matches!(
+        parts.next(),
+        Some(
+            Protocol::Ip4(_)
+                | Protocol::Ip6(_)
+                | Protocol::Dns(_)
+                | Protocol::Dns4(_)
+                | Protocol::Dns6(_)
+        )
+    ) && matches!(parts.next(), Some(Protocol::Tcp(port)) if port != 0)
+        && parts.next().is_none()
+}
+
+/// Parse inbound circuit-reservation addresses before creating listeners.
+fn parse_relay_listeners(config: &NetworkConfig) -> Result<Vec<Multiaddr>, NetworkError> {
+    if !config.enable_relay && !config.relay_listen_addresses.is_empty() {
+        return Err(NetworkError::Transport(
+            "relay listeners require the relay client".into(),
+        ));
+    }
+    let mut listeners = Vec::new();
+    for value in &config.relay_listen_addresses {
+        let address: Multiaddr = value
+            .parse()
+            .map_err(|error| NetworkError::Transport(format!("invalid relay listener: {error}")))?;
+        let mut prefix = address.clone();
+        if !matches!(prefix.pop(), Some(libp2p::multiaddr::Protocol::P2pCircuit))
+            || !matches!(prefix.pop(), Some(libp2p::multiaddr::Protocol::P2p(_)))
+            || !is_tcp_endpoint(&prefix)
+        {
+            return Err(NetworkError::Transport(
+                "relay listener must end in /p2p/<relay-id>/p2p-circuit after a transport address"
+                    .into(),
+            ));
         }
-    })
+        if !listeners.contains(&address) {
+            listeners.push(address);
+        }
+    }
+    Ok(listeners)
+}
+
+/// Extract the destination peer ID, including the final ID after a circuit relay.
+fn extract_peer_id(addr: &Multiaddr) -> Option<Libp2pPeerId> {
+    addr.iter()
+        .filter_map(|proto| {
+            if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
+                Some(peer_id)
+            } else {
+                None
+            }
+        })
+        .last()
 }
 
 #[cfg(test)]
@@ -2375,6 +2459,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_reservation_accepts_real_authenticated_circuit() {
+        let base = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = Libp2pNetwork::new(&NetworkConfig {
+            listen_addr: server_addr,
+            external_addresses: vec![format!("/ip4/127.0.0.1/tcp/{}", server_addr.port())],
+            enable_relay: false,
+            enable_relay_server: true,
+            enable_gossip: false,
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+        let info = server.local_node_info_handle();
+        let server_info = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let info = info.read().unwrap().clone();
+                if !info.listen_addresses.is_empty() {
+                    break info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            server_info.protocols.is_empty(),
+            "standalone relay must not join application gossip"
+        );
+        let reservation = format!(
+            "{}/p2p/{}/p2p-circuit",
+            server_info.listen_addresses[0], server_info.peer_id
+        );
+        let mut receiver = Libp2pNetwork::new(&NetworkConfig {
+            relay_listen_addresses: vec![reservation],
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+        let info = receiver.local_node_info_handle();
+        let circuit = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let info = info.read().unwrap().clone();
+                if let Some(address) = info
+                    .listen_addresses
+                    .iter()
+                    .find(|addr| addr.contains("/p2p-circuit"))
+                {
+                    let address: Multiaddr = address.parse().unwrap();
+                    break address
+                        .with_p2p(info.peer_id.parse().unwrap())
+                        .unwrap()
+                        .to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("relay must grant an actual inbound reservation");
+        let receiver_id = PeerId(info.read().unwrap().peer_id.clone());
+        let sender = Libp2pNetwork::new(&NetworkConfig {
+            boot_nodes: vec![circuit.clone()],
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+        let sender_id = PeerId(
+            sender
+                .local_node_info_handle()
+                .read()
+                .unwrap()
+                .peer_id
+                .clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while receiver.peer_count().await < 2 || sender.peer_count().await < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("both endpoints must authenticate the relayed connection: {error:?}; receiver {:?} count{}, sender {:?} count{}", receiver.local_node_info_handle().read().unwrap(), receiver.peer_count.load(Ordering::Relaxed), sender.local_node_info_handle().read().unwrap(), sender.peer_count.load(Ordering::Relaxed)));
+        sender
+            .send_to_peer(&receiver_id, NetworkMessage::Ping)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(receiver.next_event().await,
+                    Some(NetworkEvent::MessageReceived { peer, message: NetworkMessage::Ping }) if peer == sender_id) {
+                    break;
+                }
+            }
+        }).await.expect("authenticated payload must cross the circuit");
+        // An unreserved destination must fail at the relay, never alias the hop.
+        let wrong_destination = Libp2pPeerId::random();
+        let mut invalid: Multiaddr = circuit.parse().unwrap();
+        invalid.pop();
+        invalid.push(libp2p::multiaddr::Protocol::P2p(wrong_destination));
+        let mut rejected = build_swarm(&base).unwrap();
+        rejected.dial(invalid).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rejected.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. }
+                        if peer_id == wrong_destination =>
+                    {
+                        panic!("an unreserved destination must not establish a circuit");
+                    }
+                    SwarmEvent::OutgoingConnectionError {
+                        peer_id: Some(peer_id),
+                        ..
+                    } if peer_id == wrong_destination => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("relay must actively reject the unreserved target");
+        drop(rejected);
+        sender.shutdown().await.unwrap();
+        receiver.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_external_addresses_require_usable_tcp_endpoints() {
+        for value in [
+            "not-an-address",
+            "/ip4/127.0.0.1",
+            "/ip4/127.0.0.1/tcp/0",
+            "/ip4/127.0.0.1/tcp/4001/p2p-circuit",
+        ] {
+            let config = NetworkConfig {
+                external_addresses: vec![value.into()],
+                ..Default::default()
+            };
+            assert!(matches!(
+                Libp2pNetwork::new(&config).await,
+                Err(NetworkError::Transport(_))
+            ));
+        }
+        for value in [
+            "/ip4/127.0.0.1/tcp/4001",
+            "/ip6/::1/tcp/4001",
+            "/dns4/relay.example/tcp/4001",
+        ] {
+            assert!(is_tcp_endpoint(&value.parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn relay_listeners_require_valid_reservation_addresses_and_client() {
+        let relay = Libp2pPeerId::random();
+        let target = Libp2pPeerId::random();
+        let prefix = format!("/ip4/127.0.0.1/tcp/30303/p2p/{relay}");
+        let valid = format!("{prefix}/p2p-circuit");
+        let mut config = NetworkConfig {
+            relay_listen_addresses: vec![valid.clone(), valid.clone()],
+            ..Default::default()
+        };
+        assert_eq!(parse_relay_listeners(&config).unwrap().len(), 1);
+        for invalid in [
+            "bad-address".to_string(),
+            prefix,
+            "/ip4/127.0.0.1/tcp/30303/p2p-circuit".to_string(),
+            format!("{valid}/p2p/{target}"),
+        ] {
+            config.relay_listen_addresses = vec![invalid];
+            assert!(parse_relay_listeners(&config).is_err());
+        }
+        config.relay_listen_addresses = vec![valid.clone()];
+        config.enable_relay = false;
+        assert!(parse_relay_listeners(&config).is_err());
+        let circuit: Multiaddr = format!("{valid}/p2p/{target}").parse().unwrap();
+        assert_eq!(
+            extract_peer_id(&circuit),
+            Some(target),
+            "destination must not alias its relay"
+        );
+    }
+
+    #[tokio::test]
     async fn local_node_info_tracks_bound_listener_and_shutdown() {
         let config = NetworkConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2830,6 +3105,7 @@ mod tests {
             max_msg_size: config.max_message_size,
             event_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES)),
             peer_security: PeerSecurityConfig::from(&config),
+            enable_gossip: config.enable_gossip,
         };
         let mut state = SwarmLoopState::new(PeerSecurityConfig::from(&config));
 

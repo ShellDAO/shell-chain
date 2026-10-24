@@ -10,6 +10,7 @@ mod import_state;
 mod init;
 mod key;
 pub mod pqhd;
+mod relay;
 mod removedb;
 mod rpc;
 pub mod run;
@@ -25,6 +26,7 @@ pub use genesis::{
 pub use import_state::import_state;
 pub use init::init;
 pub use key::{key_generate, key_inspect, key_migrate};
+pub use relay::relay;
 pub use removedb::removedb;
 pub use run::run;
 pub use version::version;

@@ -74,6 +74,15 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Serve circuit-relay traffic without joining chain gossip or opening chain state.
+    Relay {
+        /// TCP listen address for relay clients (requires --features libp2p).
+        #[arg(long, default_value = "127.0.0.1:30303")]
+        listen_addr: std::net::SocketAddr,
+        /// Explicit reachable transport address advertised to relay clients (repeatable).
+        #[arg(long, required = true)]
+        external_addr: Vec<String>,
+    },
     /// Start the node.
     Run {
         /// Path to TOML configuration file.
@@ -137,6 +146,10 @@ enum Commands {
         /// Enable mDNS local peer discovery (disable in production/cloud).
         #[arg(long)]
         enable_mdns: bool,
+
+        /// Reserve an inbound circuit at this relay multiaddr (repeatable).
+        #[arg(long)]
+        relay_listen: Vec<String>,
 
         /// Number of recent state roots to retain (0 = archive mode, keeps all).
         #[arg(long, default_value = "0")]
@@ -650,6 +663,7 @@ async fn main() {
             bootnode,
             bootnodes,
             enable_mdns,
+            relay_listen,
             pruning,
             checkpoint_url,
             rpc_cors,
@@ -822,6 +836,14 @@ async fn main() {
                 p2p_addr: effective_p2p_addr,
                 bootnodes: all_bootnodes,
                 enable_mdns: effective_enable_mdns,
+                relay_listen_addresses: if relay_listen.is_empty() {
+                    file_config.p2p.relay_listen_addresses.unwrap_or_default()
+                } else {
+                    relay_listen
+                },
+                enable_kademlia: file_config.p2p.enable_kademlia.unwrap_or(true),
+                enable_dcutr: file_config.p2p.enable_dcutr.unwrap_or(true),
+                enable_autonat: file_config.p2p.enable_autonat.unwrap_or(true),
                 pruning: effective_pruning,
                 checkpoint_url,
                 rpc_cors: effective_rpc_cors,
@@ -859,6 +881,10 @@ async fn main() {
             })
             .await
         }
+        Commands::Relay {
+            listen_addr,
+            external_addr,
+        } => commands::relay(cli.datadir, listen_addr, external_addr).await,
         Commands::Init {
             genesis,
             chain_id,
