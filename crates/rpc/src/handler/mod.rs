@@ -326,6 +326,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             peer_id,
             listen_addresses: vec![p2p_listen],
             protocols: vec!["gossipsub".into(), "kademlia".into(), "mdns".into()],
+            peer_bandwidth: None,
         }));
         self
     }
@@ -7654,10 +7655,18 @@ mod tests {
             peer_id: "actual-peer".into(),
             listen_addresses: vec!["/ip4/127.0.0.1/tcp/12345".into()],
             protocols: vec!["gossipsub".into()],
+            peer_bandwidth: Some(vec![shell_network::PeerBandwidthStats {
+                peer_id: "actual-peer".into(),
+                inbound_bytes: 41,
+                outbound_bytes: 73,
+            }]),
         };
         let stats = ShellApiServer::get_network_stats(&observer).await.unwrap();
         assert_eq!(stats["listeningAddress"], "/ip4/127.0.0.1/tcp/12345");
         assert_eq!(stats["protocols"], serde_json::json!(["gossipsub"]));
+        assert_eq!(stats["bandwidth"]["peers"][0]["inboundBytes"], 41);
+        assert_eq!(stats["bandwidth"]["peers"][0]["outboundBytes"], 73);
+        assert_eq!(stats["bandwidth"]["peers"][0]["peerId"], "actual-peer");
         assert_eq!(
             ShellApiServer::get_node_info(&observer).await.unwrap()["peer_id"],
             "actual-peer"
@@ -7666,6 +7675,7 @@ mod tests {
         let stopped = ShellApiServer::get_network_stats(&observer).await.unwrap();
         assert_eq!(stopped["listeningAddress"], "");
         assert_eq!(stopped["protocols"], serde_json::json!([]));
+        assert!(stopped["bandwidth"]["peers"].is_null());
     }
 
     #[tokio::test]

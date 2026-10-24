@@ -1021,6 +1021,12 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "protocolVersion": "shell/1.0.0",
             "listeningAddress": local_info.listen_addresses.first().cloned().unwrap_or_default(),
             "protocols": local_info.protocols,
+            "bandwidth": {
+                "unit": "decryptedSubstreamBytes",
+                "scope": "currentConnections",
+                "sampleIntervalSeconds": 1,
+                "peers": local_info.peer_bandwidth,
+            },
         }))
     }
 

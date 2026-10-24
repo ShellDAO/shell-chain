@@ -21,7 +21,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{StreamProtocol, SwarmEvent};
 use libp2p::{
     autonat, connection_limits, dcutr, identify, mdns, noise, relay, tcp, yamux, Multiaddr,
-    PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
+    PeerId as Libp2pPeerId, Swarm, Transport,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::interval;
@@ -31,6 +31,7 @@ use crate::bandwidth::BandwidthTracker;
 use crate::config::NetworkConfig;
 use crate::error::NetworkError;
 use crate::message::{NetworkEvent, NetworkMessage, NetworkTopic, PeerId};
+use crate::peer_bandwidth::{MeteredMuxer, PeerBandwidthTracker};
 use crate::service::NetworkService;
 
 const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
@@ -332,7 +333,8 @@ impl Libp2pNetwork {
         ));
 
         let keypair = load_or_create_identity(config.identity_key_path.as_deref())?;
-        let mut swarm = build_swarm_with_identity(config, keypair)?;
+        let peer_bandwidth = Arc::new(PeerBandwidthTracker::default());
+        let mut swarm = build_swarm_metered(config, keypair, Arc::clone(&peer_bandwidth))?;
 
         // Listen on configured address.
         let listen_addr: Multiaddr = format!(
@@ -358,6 +360,7 @@ impl Libp2pNetwork {
             peer_id: swarm.local_peer_id().to_string(),
             listen_addresses: Vec::new(),
             protocols,
+            peer_bandwidth: Some(Vec::new()),
         }));
 
         let boot_nodes = parse_boot_nodes(&config.boot_nodes);
@@ -386,6 +389,7 @@ impl Libp2pNetwork {
             attestation_topic,
             proofs_topic,
             bandwidth: Arc::clone(&bandwidth),
+            peer_bandwidth,
             boot_nodes,
             max_msg_size,
             event_byte_budget,
@@ -540,9 +544,18 @@ fn build_swarm(config: &NetworkConfig) -> Result<Swarm<ShellBehaviour>, NetworkE
     build_swarm_with_identity(config, libp2p::identity::Keypair::generate_ed25519())
 }
 
+#[cfg(test)]
 fn build_swarm_with_identity(
     config: &NetworkConfig,
     keypair: libp2p::identity::Keypair,
+) -> Result<Swarm<ShellBehaviour>, NetworkError> {
+    build_swarm_metered(config, keypair, Arc::new(PeerBandwidthTracker::default()))
+}
+
+fn build_swarm_metered(
+    config: &NetworkConfig,
+    keypair: libp2p::identity::Keypair,
+    peer_bandwidth: Arc<PeerBandwidthTracker>,
 ) -> Result<Swarm<ShellBehaviour>, NetworkError> {
     let enable_mdns = config.enable_mdns;
     let enable_kademlia = config.enable_kademlia;
@@ -793,43 +806,41 @@ fn build_swarm_with_identity(
             })
         };
 
-    // Build the swarm. When relay is enabled we add a relay client transport
-    // so the node can connect through relay nodes. The builder signature
-    // differs (two-arg vs one-arg closure for `with_behaviour`), hence two
-    // code paths.
-    let swarm = if enable_relay {
-        SwarmBuilder::with_existing_identity(keypair.clone())
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
-            .map_err(|e| NetworkError::Transport(format!("transport: {e}")))?
-            .with_dns()
-            .map_err(|e| NetworkError::Transport(format!("dns transport: {e}")))?
-            .with_relay_client(noise::Config::new, yamux::Config::default)
-            .map_err(|e| NetworkError::Transport(format!("relay transport: {e}")))?
-            .with_behaviour(|key, relay| make_behaviour(key, Some(relay)))
-            .map_err(|e| NetworkError::Transport(format!("behaviour: {e}")))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
+    // Meter after authentication/multiplexing so every successful protocol IO
+    // operation is attributed to its authenticated remote peer, including relays.
+    let (relay_transport, relay_behaviour) = relay::client::new(keypair.public().to_peer_id());
+    let relay_transport = if enable_relay {
+        libp2p::core::transport::OptionalTransport::some(relay_transport)
     } else {
-        SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
-            .map_err(|e| NetworkError::Transport(format!("transport: {e}")))?
-            .with_dns()
-            .map_err(|e| NetworkError::Transport(format!("dns transport: {e}")))?
-            .with_behaviour(|key| make_behaviour(key, None))
-            .map_err(|e| NetworkError::Transport(format!("behaviour: {e}")))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
+        libp2p::core::transport::OptionalTransport::none()
     };
+    let transport = tcp::tokio::Transport::new(tcp::Config::default())
+        .or_transport(relay_transport)
+        .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+        .authenticate(
+            noise::Config::new(&keypair)
+                .map_err(|e| NetworkError::Transport(format!("transport: {e}")))?,
+        )
+        .multiplex(yamux::Config::default())
+        .map(move |(peer, muxer), _| {
+            let metered = MeteredMuxer::new(muxer, peer.to_string(), &peer_bandwidth);
+            (peer, libp2p::core::muxing::StreamMuxerBox::new(metered))
+        })
+        .boxed();
+    let transport = libp2p::dns::tokio::Transport::system(transport)
+        .map_err(|e| NetworkError::Transport(format!("dns transport: {e}")))?;
+    let transport =
+        libp2p::core::transport::timeout::TransportTimeout::new(transport, Duration::from_secs(10))
+            .boxed();
+    let behaviour = make_behaviour(&keypair, enable_relay.then_some(relay_behaviour))
+        .map_err(|e| NetworkError::Transport(format!("behaviour: {e}")))?;
+    let swarm = Swarm::new(
+        transport,
+        behaviour,
+        keypair.public().to_peer_id(),
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(60)),
+    );
 
     if enable_peer_scoring {
         info!("GossipSub peer scoring enabled");
@@ -874,6 +885,7 @@ struct SwarmLoopConfig {
     attestation_topic: IdentTopic,
     proofs_topic: IdentTopic,
     bandwidth: Arc<BandwidthTracker>,
+    peer_bandwidth: Arc<PeerBandwidthTracker>,
     boot_nodes: Vec<Multiaddr>,
     max_msg_size: usize,
     event_byte_budget: Arc<Semaphore>,
@@ -1093,6 +1105,9 @@ async fn swarm_loop(
             }
             _ = bw_tick.tick() => {
                 loop_config.bandwidth.reset_if_needed();
+                if let Ok(mut info) = loop_config.local_node_info.write() {
+                    info.peer_bandwidth = Some(loop_config.peer_bandwidth.snapshot());
+                }
             }
         }
     }
@@ -2375,6 +2390,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_peer_bandwidth_tracks_real_direct_streams_and_disconnects() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_relay: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let hub = Libp2pNetwork::new(&config).await.unwrap();
+        let info = hub.local_node_info_handle();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while info.read().unwrap().listen_addresses.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let bound = info.read().unwrap().clone();
+        let config = NetworkConfig {
+            boot_nodes: vec![format!(
+                "{}/p2p/{}",
+                bound.listen_addresses[0], bound.peer_id
+            )],
+            ..config
+        };
+        let mut first = Libp2pNetwork::new(&config).await.unwrap();
+        let second = Libp2pNetwork::new(&config).await.unwrap();
+        let first_info = first.local_node_info_handle();
+        let first_id = first_info.read().unwrap().peer_id.clone();
+        let second_id = second
+            .local_node_info_handle()
+            .read()
+            .unwrap()
+            .peer_id
+            .clone();
+        let snapshot = || info.read().unwrap().peer_bandwidth.clone().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while hub.peer_count().await != 2 || snapshot().len() != 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = snapshot();
+        let message = NetworkMessage::CommitCertificate {
+            block_hash: shell_primitives::ShellHash::ZERO,
+            block_number: 1,
+            certificate: vec![7; 128 * 1024],
+        };
+        let payload_len = crate::message::serialize_checked(&message, config.max_message_size)
+            .unwrap()
+            .len() as u64;
+        hub.send_to_peer(&PeerId(first_id.clone()), message)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    peer,
+                    message: NetworkMessage::CommitCertificate { certificate, .. },
+                }) = first.next_event().await
+                {
+                    assert_eq!(peer.0, bound.peer_id);
+                    assert_eq!(certificate, vec![7; 128 * 1024]);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let total = |stats: &[crate::PeerBandwidthStats], id: &str| {
+            stats
+                .iter()
+                .find(|s| s.peer_id == id)
+                .unwrap()
+                .outbound_bytes
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while total(&snapshot(), &first_id) < total(&before, &first_id) + payload_len {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = snapshot();
+        // Background Identify/GossipSub control traffic is small; an untargeted
+        // connection must not be charged another peer's large message.
+        assert!(total(&after, &second_id) - total(&before, &second_id) < payload_len);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let stats = first_info.read().unwrap().peer_bandwidth.clone().unwrap();
+                if stats
+                    .iter()
+                    .any(|s| s.peer_id == bound.peer_id && s.inbound_bytes >= payload_len)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while snapshot().iter().any(|s| s.peer_id == first_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(snapshot().iter().any(|s| s.peer_id == second_id));
+        second.shutdown().await.unwrap();
+        hub.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn local_node_info_tracks_bound_listener_and_shutdown() {
         let config = NetworkConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2826,6 +2959,7 @@ mod tests {
             attestation_topic: IdentTopic::new(&config.attestation_topic),
             proofs_topic: IdentTopic::new(&config.proofs_topic),
             bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
+            peer_bandwidth: Arc::new(PeerBandwidthTracker::default()),
             boot_nodes: Vec::new(),
             max_msg_size: config.max_message_size,
             event_byte_budget: Arc::new(Semaphore::new(MAX_PENDING_EVENT_BYTES)),

@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Report live authenticated per-peer inbound/outbound substream byte totals in
+  `shell_getNetworkStats.bandwidth`, including direct messages and forwarded
+  GossipSub traffic. Counters describe current connections and expire on disconnect;
+  existing application-message rate limits retain their behavior.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

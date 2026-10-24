@@ -1219,7 +1219,15 @@ behaviours are omitted.
   "peerCount": 1,
   "protocolVersion": "shell/1.0.0",
   "listeningAddress": "/ip4/127.0.0.1/tcp/40123",
-  "protocols": ["gossipsub", "kademlia"]
+  "protocols": ["gossipsub", "kademlia"],
+  "bandwidth": {
+    "unit": "decryptedSubstreamBytes",
+    "scope": "currentConnections",
+    "sampleIntervalSeconds": 1,
+    "peers": [
+      {"peerId": "<authenticated remote peer ID>", "inboundBytes": 4096, "outboundBytes": 8192}
+    ]
+  }
 }
 ```
 
@@ -1228,26 +1236,31 @@ transport stopped, `protocols` is empty as well. Local transport metadata is
 rebuilt on startup rather than persisted; `shell_getNodeInfo.peer_id` and
 `admin_nodeInfo.id` read the same live identity.
 
-**Version:** This correction is in unreleased node source. Older binaries may
-return the fixed default address and protocol list; verify the installed
-version before using this response to diagnose connectivity.
+`bandwidth.peers` is sampled once per second from successful authenticated
+substream reads and writes. It includes protocol negotiation and payloads for
+Identify, GossipSub (including forwarding), direct messages, discovery and relay
+streams. Noise handshakes, Yamux framing and TCP/IP overhead are excluded.
+Partial writes count only bytes written; pending and failed operations add no bytes.
 
-**Local acceptance:** From the node repository, build with the libp2p feature
-and run the existing Python 3 regression (standard library only):
+Each row combines the peer's currently open connections. Closing a connection
+removes its contribution; a node restart starts fresh counters. These totals are
+not persisted historical traffic. A transport without accounting returns
+`peers: null`; an enabled transport with no current connections returns `[]`.
+The configured aggregate application-message bandwidth limits retain their
+existing units and behavior.
 
-```bash
-cargo build -p shell-cli --features libp2p
-python3 tests/e2e/operator-p2p-monitoring.py --network-stats
-```
+Manual native acceptance: run
+[`tests/e2e/native-peer-bandwidth.mjs`](../tests/e2e/native-peer-bandwidth.mjs)
+with `NODE_BIN` pointing to a RocksDB/libp2p node binary and `SHELL_SDK_ENTRY`
+pointing to an installed `shell-sdk@0.14.0-rc.3` entry. It creates two temporary
+local nodes and keys, verifies signed transaction propagation and counter growth,
+and checks disconnect/reconnect behavior. It leaves its private test data under
+the system temporary directory for inspection.
 
-The script creates fresh test keys and isolated RocksDB nodes, connects a
-follower to a 16-block backlog, compares canonical block hashes and live RPC
-listeners, then restarts the follower with P2P enabled and disabled. Results
-and isolated data are retained at the printed temporary directory. This checks
-local connectivity and restart behaviour; the default script mode separately
-checks transient catch-up monitoring.
+**Version:** Per-peer bandwidth fields are in unreleased node source. Published
+binaries may return only the aggregate network metadata shown above the
+`bandwidth` field.
 
----
 
 ### shell_getChainStats
 

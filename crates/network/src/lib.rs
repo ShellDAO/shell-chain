@@ -32,3 +32,7 @@ pub use message::{
 };
 pub use security::{PeerBanList, PeerTracker};
 pub use service::{LocalNodeInfo, NetworkService};
+
+#[cfg(feature = "libp2p")]
+mod peer_bandwidth;
+pub use service::PeerBandwidthStats;
