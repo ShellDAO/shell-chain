@@ -1,6 +1,7 @@
 //! Network service trait defining the P2P interface.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::NetworkError;
 use crate::message::{NetworkEvent, NetworkMessage, PeerId};
@@ -8,12 +9,24 @@ use crate::message::{NetworkEvent, NetworkMessage, PeerId};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
+/// Totals for the peer's currently open connections, since each connection opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerBandwidthStats {
+    pub peer_id: String,
+    pub inbound_bytes: u64,
+    pub outbound_bytes: u64,
+}
+
 /// Local transport identity and currently bound listener addresses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalNodeInfo {
     pub peer_id: String,
     pub listen_addresses: Vec<String>,
     pub protocols: Vec<String>,
+    /// Successful decrypted substream bytes for current connections, sampled once per second.
+    /// None means this transport does not provide accounting.
+    pub peer_bandwidth: Option<Vec<PeerBandwidthStats>>,
 }
 
 /// Trait abstracting the P2P network layer.

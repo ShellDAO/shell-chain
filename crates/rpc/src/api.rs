@@ -574,7 +574,13 @@ pub trait ShellApi {
     #[method(name = "getNodeInfo")]
     async fn get_node_info(&self) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Returns network statistics for the performance dashboard.
+    /// Returns live network statistics. In unreleased source, `bandwidth.peers` reports
+    /// per-peer `inboundBytes` and `outboundBytes`, sampled each second from successful
+    /// decrypted substream IO. The unit is `decryptedSubstreamBytes`, excluding Noise,
+    /// Yamux and TCP/IP overhead. Totals cover current connections; closing a connection
+    /// removes its contribution and restart resets accounting. `peers: null` means the
+    /// transport does not supply accounting; `[]` means no current connections.
+    /// See [the complete method reference](JSON_RPC_API.md#shell_getnetworkstats).
     #[method(name = "getNetworkStats")]
     async fn get_network_stats(
         &self,
