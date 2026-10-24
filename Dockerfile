@@ -2,7 +2,7 @@
 #
 # Multi-arch build (M10):
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#       -t ghcr.io/shelldao/shell-chain:v0.27.13 --push .
+#       -t ghcr.io/shelldao/shell-chain:v0.27.14 --push .
 #
 # Single-arch local build:
 #   docker build -t shell-node:latest .
