@@ -191,7 +191,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--p2p-addr",
     "127.0.0.1:0",
     "--log-level",
-    "info",
+    forkSyncScenario ? "info,shell_node=debug,shell_network=debug" : "info",
   ];
   if (pruneFollower && i === 1)
     args.push("--pruning", "1", "--body-retention", "1");
@@ -679,6 +679,22 @@ async function runScenario() {
         }
         await pause(100);
       }
+      result.forkTransferFailure = { label, hash, senderNonce, observations: [] };
+      for (let node = 0; node < 2; node++) {
+        if (!nodes[node]) continue;
+        try {
+          result.forkTransferFailure.observations.push({
+            node,
+            head: await rpc(node, "eth_getBlockByNumber", ["latest", false]),
+            finalized: await rpc(node, "eth_getBlockByNumber", ["finalized", false]),
+            receipt: await rpc(node, "eth_getTransactionReceipt", [hash]),
+            info: await rpc(node, "shell_getNodeInfo"),
+          });
+        } catch (error) {
+          result.forkTransferFailure.observations.push({ node, error: String(error) });
+        }
+      }
+      await save();
       throw Error("fork transfer receipt timeout: " + label);
     }
     const commonTx = await transfer(1, "common finalized block");
@@ -1440,6 +1456,12 @@ try {
   await runScenario();
 } catch (error) {
   result.error = String(error);
+  if (forkSyncScenario) {
+    for (const label of nodeLogLabels.filter(Boolean)) {
+      const log = await readFile(join(out, label + "-node.log"), "utf8").catch(String);
+      console.error(`--- ${label} ---\n${log}`);
+    }
+  }
   throw error;
 } finally {
   for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
