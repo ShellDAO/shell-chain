@@ -31,14 +31,89 @@ use tracing::{error, info, warn};
 
 use parking_lot::Mutex;
 use shell_crypto::Signer;
-use shell_primitives::ShellHash;
+use shell_primitives::{Address, ShellHash};
 use shell_stark_prover::{
     prove_sig_batch, L1StallDiagnosis, L2ProverTask, ProofAmendment, ProofBacklog, ProofTask,
     DEFAULT_MAX_L1_RANGE_SOURCES, MIN_L1_STARK_TXS, PROOF_AMENDMENT_VERSION,
 };
-use shell_storage::{KvStore, ProofAmendmentStore};
+use shell_storage::{ChainStore, KvStore, ProofAmendmentStore, StorageError};
 
 use crate::{config::L2StarkMode, metrics::Metrics};
+
+/// Bound local reservations while an explicitly configured cohort member is offline.
+const MAX_WORKER_COHORT: usize = 64;
+const MAX_DEFERRED_COHORT_RANGES: usize = 64;
+
+/// Opt-in static L1 assignment from canonical sources and an identical cohort.
+/// Membership is independent of peer arrival timing and does not change proof
+/// validity, rewards, validator membership, or consensus state.
+pub(crate) struct WorkerCohort<S: KvStore> {
+    workers: Vec<Address>,
+    local: Address,
+    chain: ChainStore<S>,
+    deferred: VecDeque<ProofTask>,
+}
+
+impl<S: KvStore> WorkerCohort<S> {
+    pub(crate) fn open(
+        store: Arc<S>,
+        mut workers: Vec<Address>,
+        local: Address,
+    ) -> Result<Option<Self>, StorageError> {
+        workers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        if workers.len() > MAX_WORKER_COHORT
+            || workers.windows(2).any(|pair| pair[0] == pair[1])
+            || (!workers.is_empty() && !workers.contains(&local))
+        {
+            return Err(StorageError::InvalidInput(
+                "worker_cohort must contain the local prover and at most 64 distinct addresses"
+                    .into(),
+            ));
+        }
+        ProofAmendmentStore::new(Arc::clone(&store)).bind_worker_cohort(&workers)?;
+        Ok((!workers.is_empty()).then(|| Self {
+            workers,
+            local,
+            chain: ChainStore::new(store),
+            deferred: VecDeque::new(),
+        }))
+    }
+
+    fn owner(&self, task: &ProofTask) -> Address {
+        let source = task
+            .source_hashes
+            .first()
+            .copied()
+            .unwrap_or_else(|| ShellHash::from(task.block_hash));
+        let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
+        self.workers[(prefix % self.workers.len() as u64) as usize]
+    }
+
+    fn reap(
+        &mut self,
+        amendments: &ProofAmendmentStore<S>,
+        backlog: &Mutex<ProofBacklog>,
+    ) -> Result<(), StorageError> {
+        for _ in 0..self.deferred.len() {
+            // Observe before removing metadata, retaining reservations on I/O errors.
+            let task = self.deferred.front().expect("bounded deferred range");
+            let done = amendments.has_amendment(&ShellHash::from(task.block_hash))?
+                || self.chain.get_block_hash_by_number(task.block_number)?
+                    != Some(ShellHash::from(task.block_hash));
+            let task = self.deferred.pop_front().expect("observed deferred range");
+            if done {
+                backlog.lock().complete_in_flight(
+                    task.layer,
+                    task.block_number,
+                    &task.source_hashes,
+                );
+            } else {
+                self.deferred.push_back(task);
+            }
+        }
+        Ok(())
+    }
+}
 
 // ── ProverConfig ──────────────────────────────────────────────────────────────
 
@@ -138,6 +213,7 @@ pub struct ProverService<S: KvStore + Send + Sync + 'static> {
     amendment_store: ProofAmendmentStore<S>,
     amendment_tx: Option<mpsc::Sender<ProofAmendment>>,
     config: ProverConfig,
+    worker_cohort: Option<WorkerCohort<S>>,
     metrics: Option<Arc<Metrics>>,
     /// The node's own address, used as `prover` field in [`ProofAmendment`].
     prover_address: shell_primitives::Address,
@@ -174,6 +250,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             amendment_store,
             amendment_tx: None,
             config,
+            worker_cohort: None,
             metrics: None,
             prover_address,
             prover_signer: None,
@@ -210,6 +287,11 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     /// Pause proof generation until the node has completed startup sync.
     pub fn with_readiness(mut self, readiness_rx: watch::Receiver<bool>) -> Self {
         self.readiness_rx = Some(readiness_rx);
+        self
+    }
+
+    pub(crate) fn with_worker_cohort(mut self, cohort: Option<WorkerCohort<S>>) -> Self {
+        self.worker_cohort = cohort;
         self
     }
 
@@ -264,6 +346,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
         let mut jobs: VecDeque<(ProofTask, _)> = VecDeque::new();
         let limit = self.config.max_concurrent_proofs.max(1);
         let mut latest_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut admission_failed = false;
         loop {
             if jobs.is_empty() {
                 for worker in latest_workers.drain(..) {
@@ -275,7 +358,7 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             // Stop admission on shutdown, but drain all reserved CPU jobs.
             // Persist and hand off results in canonical admission order.
             // Check shutdown signal.
-            if *shutdown_rx.borrow() && jobs.is_empty() {
+            if (*shutdown_rx.borrow() || admission_failed) && jobs.is_empty() {
                 info!("ProverService received shutdown signal, stopping");
                 break;
             }
@@ -302,6 +385,18 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                 continue;
             }
 
+            if !admission_failed {
+                if let Some(cohort) = self.worker_cohort.as_mut() {
+                    if let Err(error) = cohort.reap(&self.amendment_store, &self.backlog) {
+                        error!(%error, "cannot observe deferred prover ranges; stopping admission");
+                        admission_failed = true;
+                        if jobs.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Reserve contiguous source ranges before starting independent CPU work.
             // Results may finish in any order; only the front job can be persisted
             // and published, so later ranges never overtake their predecessor.
@@ -316,9 +411,14 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             let admit = !latest_first || jobs.is_empty();
             let mut reserved: Vec<ProofTask> = Vec::new();
             while admit
+                && !admission_failed
                 && jobs.len() + reserved.len() < capacity
                 && !*shutdown_rx.borrow()
                 && self.readiness_rx.as_ref().is_none_or(|rx| *rx.borrow())
+                && self
+                    .worker_cohort
+                    .as_ref()
+                    .is_none_or(|cohort| cohort.deferred.len() < MAX_DEFERRED_COHORT_RANGES)
             {
                 let task = {
                     let mut backlog = self.backlog.lock();
@@ -343,6 +443,41 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                     let _ = tx.send(ProverServiceTestEvent::BacklogPolled);
                 }
                 let Some(task) = task else { break };
+                if task.layer == 1 {
+                    if let Some(cohort) = self.worker_cohort.as_mut() {
+                        let canonical = cohort.chain.get_block_hash_by_number(task.block_number);
+                        let existing = self
+                            .amendment_store
+                            .has_amendment(&ShellHash::from(task.block_hash));
+                        match (canonical, existing) {
+                            (Ok(Some(hash)), Ok(false))
+                                if hash == ShellHash::from(task.block_hash) => {}
+                            (Ok(_), Ok(_)) => {
+                                self.backlog.lock().complete_in_flight(
+                                    task.layer,
+                                    task.block_number,
+                                    &task.source_hashes,
+                                );
+                                continue;
+                            }
+                            (Err(error), _) | (_, Err(error)) => {
+                                error!(%error, "cannot inspect assigned prover range; preserving reservation");
+                                cohort.deferred.push_back(task);
+                                admission_failed = true;
+                                break;
+                            }
+                        }
+                        let owner = cohort.owner(&task);
+                        if owner != cohort.local {
+                            info!(%owner, block = task.block_number, "deferring L1 proof range to cohort owner");
+                            let mut task = task;
+                            task.entries.clear();
+                            cohort.deferred.push_back(task);
+                            continue;
+                        }
+                        info!(%owner, block = task.block_number, "admitting L1 proof range for cohort owner");
+                    }
+                }
                 reserved.push(task);
             }
             if latest_first && !reserved.is_empty() {
@@ -499,6 +634,15 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
             }
         }
 
+        if let Some(cohort) = self.worker_cohort.as_mut() {
+            for task in cohort.deferred.drain(..) {
+                self.backlog.lock().complete_in_flight(
+                    task.layer,
+                    task.block_number,
+                    &task.source_hashes,
+                );
+            }
+        }
         info!("ProverService stopped");
     }
 
@@ -724,6 +868,257 @@ mod tests {
 
     async fn shutdown_cleanly(handle: ProverServiceHandle) {
         handle.shutdown_cleanly().await;
+    }
+
+    #[tokio::test]
+    async fn worker_cohort_assigns_real_proofs_once_and_retains_assignment_on_reopen() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let addresses = signers
+            .each_ref()
+            .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()));
+        let mut sorted = addresses.to_vec();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let stores = [Arc::new(MemoryDb::new()), Arc::new(MemoryDb::new())];
+        // Independent canonical source IDs choose opposite owners; these are
+        // queue-level inputs. Native acceptance separately uses actual block hashes.
+        let mut hashes = [[0u8; 32]; 2];
+        hashes[0][31] = 1;
+        hashes[1][7] = 1;
+        hashes[1][31] = 2;
+        let entries = vec![
+            shell_stark_prover::SigBatchEntry {
+                msg_hash: [7; 32],
+                pk_hash: [9; 32]
+            };
+            MIN_L1_STARK_TXS
+        ];
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for i in 0..2 {
+            let chain = ChainStore::new(stores[i].clone());
+            let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+            for (n, h) in hashes.iter().enumerate() {
+                chain
+                    .set_canonical(n as u64 + 1, &ShellHash::from(*h))
+                    .unwrap();
+                backlog
+                    .lock()
+                    .push(ProofTask::new(*h, n as u64 + 1, entries.clone()));
+            }
+            let mut configured = addresses.to_vec();
+            if i == 1 {
+                configured.reverse();
+            }
+            let cohort = WorkerCohort::open(stores[i].clone(), configured, addresses[i]).unwrap();
+            let (tx, rx) = mpsc::channel(2);
+            handles.push(
+                ProverService::new(
+                    backlog,
+                    ProofAmendmentStore::new(stores[i].clone()),
+                    ProverConfig::default(),
+                    addresses[i],
+                )
+                .with_worker_cohort(cohort)
+                .with_signer(signers[i].clone())
+                .with_amendment_sender(tx)
+                .start(),
+            );
+            receivers.push(rx);
+        }
+        let mut proofs = Vec::new();
+        for i in 0..2 {
+            let a = tokio::time::timeout(Duration::from_secs(5), receivers[i].recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.prover, addresses[i]);
+            assert_eq!(a.prover, sorted[(a.block_number - 1) as usize]);
+            shell_stark_prover::verify_sig_batch(&a.proof).unwrap();
+            a.verify_prover_authentication().unwrap();
+            proofs.push(a);
+        }
+        assert_ne!(proofs[0].covered_hashes(), proofs[1].covered_hashes());
+        for handle in handles {
+            handle.shutdown().await;
+        }
+        for i in 0..2 {
+            let store = ProofAmendmentStore::new(stores[i].clone());
+            for a in &proofs {
+                store
+                    .put_amendments_atomic(a.storage_artifacts().unwrap())
+                    .unwrap();
+            }
+            let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+            for (n, h) in hashes.iter().enumerate() {
+                backlog
+                    .lock()
+                    .push(ProofTask::new(*h, n as u64 + 1, entries.clone()));
+            }
+            let cohort =
+                WorkerCohort::open(stores[i].clone(), addresses.to_vec(), addresses[i]).unwrap();
+            let (tx, mut rx) = mpsc::channel(2);
+            let handle = ProverService::new(backlog, store, ProverConfig::default(), addresses[i])
+                .with_worker_cohort(cohort)
+                .with_signer(signers[i].clone())
+                .with_amendment_sender(tx)
+                .start();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                    .await
+                    .is_err(),
+                "no cached proof recomputation"
+            );
+            handle.shutdown().await;
+            assert!(
+                WorkerCohort::open(stores[i].clone(), vec![], addresses[i]).is_err(),
+                "cannot silently disable persisted cohort"
+            );
+            assert!(
+                WorkerCohort::open(stores[i].clone(), vec![addresses[i]], addresses[i]).is_err(),
+                "cannot silently reassign persisted cohort"
+            );
+        }
+        let fresh = Arc::new(MemoryDb::new());
+        assert!(WorkerCohort::open(
+            fresh.clone(),
+            vec![addresses[0], addresses[0]],
+            addresses[0]
+        )
+        .is_err());
+        assert!(WorkerCohort::open(fresh, vec![addresses[1]], addresses[0]).is_err());
+    }
+
+    #[test]
+    fn worker_cohort_releases_orphans_but_retains_reservations_on_storage_error() {
+        struct FaultStore {
+            db: MemoryDb,
+            fail: std::sync::atomic::AtomicBool,
+        }
+        impl KvStore for FaultStore {
+            fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+                if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StorageError::Database("read fault".into()));
+                }
+                self.db.get(k)
+            }
+            fn put(&self, k: &[u8], v: &[u8]) -> Result<(), StorageError> {
+                self.db.put(k, v)
+            }
+            fn delete(&self, k: &[u8]) -> Result<(), StorageError> {
+                self.db.delete(k)
+            }
+            fn flush(&self) -> Result<(), StorageError> {
+                self.db.flush()
+            }
+            fn write_batch(&self, b: shell_storage::WriteBatch) -> Result<(), StorageError> {
+                self.db.write_batch(b)
+            }
+            fn scan_prefix(&self, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+                self.db.scan_prefix(p)
+            }
+        }
+        let store = Arc::new(FaultStore {
+            db: MemoryDb::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let local = Address::from([1; 32]);
+        let other = Address::from([2; 32]);
+        let mut cohort = WorkerCohort::open(store.clone(), vec![other, local], local)
+            .unwrap()
+            .unwrap();
+        let hash = ShellHash::from([7; 32]);
+        cohort.chain.set_canonical(1, &hash).unwrap();
+        let backlog = Mutex::new(ProofBacklog::new());
+        backlog.lock().push(ProofTask::new([7; 32], 1, vec![]));
+        let task = backlog.lock().pop_contiguous_for_proving(1, 0).unwrap();
+        cohort.deferred.push_back(task);
+        let amendments = ProofAmendmentStore::new(store.clone());
+        cohort.reap(&amendments, &backlog).unwrap();
+        assert_eq!(cohort.deferred.len(), 1);
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(cohort.reap(&amendments, &backlog).is_err());
+        assert_eq!(cohort.deferred.len(), 1);
+        assert!(backlog.lock().contains_source(1, &hash));
+        store
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        cohort
+            .chain
+            .set_canonical(1, &ShellHash::from([8; 32]))
+            .unwrap();
+        cohort.reap(&amendments, &backlog).unwrap();
+        assert!(cohort.deferred.is_empty());
+        assert!(!backlog.lock().contains_source(1, &hash));
+        assert_eq!(
+            backlog.lock().first_uncovered_block_for_layer(1, 1, 1),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cohort_bounds_offline_owner_reservations_and_releases_on_shutdown() {
+        let store = Arc::new(MemoryDb::new());
+        let local = Address::from([1; 32]);
+        let other = Address::from([2; 32]);
+        let chain = ChainStore::new(store.clone());
+        let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+        for n in 0..=MAX_DEFERRED_COHORT_RANGES {
+            let mut hash = [0u8; 32];
+            hash[7] = 1;
+            hash[31] = n as u8;
+            chain
+                .set_canonical(n as u64 + 1, &ShellHash::from(hash))
+                .unwrap();
+            backlog.lock().push(ProofTask::new(
+                hash,
+                n as u64 + 1,
+                vec![
+                    shell_stark_prover::SigBatchEntry {
+                        msg_hash: [3; 32],
+                        pk_hash: [4; 32]
+                    };
+                    MIN_L1_STARK_TXS
+                ],
+            ));
+        }
+        let cohort = WorkerCohort::open(store.clone(), vec![local, other], local).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = ProverService::new(
+            backlog.clone(),
+            ProofAmendmentStore::new(store),
+            ProverConfig::default(),
+            local,
+        )
+        .with_worker_cohort(cohort)
+        .with_amendment_sender(tx)
+        .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backlog.lock().len() > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            backlog.lock().len(),
+            1,
+            "bounded deferred slots leave later ranges queued"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "offline ownership must not silently transfer"
+        );
+        handle.shutdown().await;
+        assert_eq!(
+            backlog.lock().covered_block_count_for_layer(1),
+            1,
+            "shutdown releases only deferred reservations"
+        );
     }
 
     #[test]

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Optional fixed L1 prover worker cohorts partition canonical proof ranges across
+  distinct workers and retain membership across database reopen. This initial
+  mode requires an explicitly configured healthy cohort; dynamic membership and
+  automatic failover remain separate work.
+
+### Fixed
+
+- Stop a qualifying L1 range at its first complete block even when additional
+  successors are locally queued, keeping worker range boundaries consistent.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

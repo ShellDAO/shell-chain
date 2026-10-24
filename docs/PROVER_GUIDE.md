@@ -324,6 +324,59 @@ computed first; proof publication still waits for their predecessors.
 Priority scheduling is an unreleased implementation change. Older binaries may
 parse the setting without changing the actual proving order.
 
+
+### worker_cohort (unreleased)
+
+For a fixed group of L1 workers, put the same list of their distinct prover
+addresses in each worker's configuration. Every worker must use its own key,
+be registered under the network's existing prover-registry rules, and follow
+the same canonical chain. For example, after replacing both values with the
+actual 32-byte addresses of two registered workers:
+
+```toml
+[prover]
+worker_cohort = [
+  "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "0x2222222222222222222222222222222222222222222222222222222222222222",
+]
+```
+
+The node sorts the addresses, chooses one owner from the first canonical source
+hash of each minimum-size L1 range, and runs CPU proving only on that owner.
+Other workers retain bounded reservations while observing the resulting proof.
+Range boundaries do not depend on how many later blocks a worker has received.
+Proof authentication, canonical settlement ordering, and rewards retain their
+normal validation rules. Cached proofs prevent recomputation after reopening.
+
+The cohort is persisted in each local prover database. Reordered lists are
+accepted; duplicate addresses, a missing local signer, and a different list on
+reopen are rejected. Restore the original configuration after an accidental
+change. Do not delete chain data to bypass a membership error.
+
+This initial mode supports a fixed, healthy cohort of at most 64 workers.
+It does not automatically recruit registered provers, transfer an offline
+worker's assignments, or define a membership-change protocol. Do not change
+membership during a run or assume this provides exactly-once computation across
+partitions or crashes. Omitting the setting on a fresh database retains legacy
+independent scheduling. This feature is unreleased; older binaries may ignore
+the setting and generate duplicate work.
+
+Build a node with RocksDB and libp2p, then run the isolated acceptance with Node.js
+and a compatible Shell SDK build (transaction wire format v2):
+
+```sh
+SHELL_NODE_BIN=./target/debug/shell-node \
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+node tests/e2e/prover-cohort.mjs
+```
+
+The entry creates fresh keys and an isolated three-node chain, registers two
+provers, submits 512 genuine one-wei transfers, and requires exactly one generated
+proof across the workers. It checks the finalized receipts and balances, rejects
+a changed persisted cohort, and reopens all three RocksDB nodes without proof
+recomputation. It retains private keys and databases for inspection and stops
+its own processes. It does not qualify automatic failover or production scale.
+
 ---
 
 ## ProofAmendment Lifecycle

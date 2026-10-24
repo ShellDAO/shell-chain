@@ -503,6 +503,16 @@ impl<S: KvStore + 'static> Node<S> {
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let worker_cohort = if self.config.node_role.runs_prover() {
+            crate::prover_service::WorkerCohort::open(
+                Arc::clone(&self.store),
+                self.config.prover_worker_cohort.clone(),
+                self.config.proposer_address.unwrap_or(local_signer_address),
+            )
+            .map_err(|error| NodeError::Startup(format!("invalid prover worker cohort: {error}")))?
+        } else {
+            None
+        };
         let mut task_lifecycle = NodeTaskLifecycle::new();
 
         // Spawn the Prometheus metrics HTTP server if enabled.
@@ -701,6 +711,7 @@ impl<S: KvStore + 'static> Node<S> {
             .with_signer(Arc::clone(&signer))
             .with_amendment_sender(prover_amendment_tx)
             .with_readiness(prover_readiness_rx)
+            .with_worker_cohort(worker_cohort)
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
             task_lifecycle.attach_prover_service(handle);
