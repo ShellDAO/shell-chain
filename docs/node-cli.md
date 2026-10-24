@@ -67,6 +67,7 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--bootnode <MULTIADDR>` | — | Bootstrap peer multiaddr (repeatable) |
 | `--bootnodes <MULTIADDRS>` | — | Comma-separated bootstrap peer multiaddrs |
 | `--enable-mdns` | `false` | Enable mDNS local peer discovery (disable in cloud) |
+| `--relay-listen <MULTIADDR>` | — | Reserve inbound traffic at a circuit relay (repeatable; Unreleased) |
 | `--pruning <N>` | `0` | Retain last N state roots (0 = archive, keep all) |
 | `--checkpoint-url <URL>` | — | Import a snapshot before genesis initialization when the database has no canonical head |
 | `--rpc-cors <ORIGINS>` | — | CORS allowed origins (comma-separated, `*` for all) |
@@ -154,6 +155,75 @@ shell-node \
   --metrics-addr 0.0.0.0:9090 \
   --storage-profile full
 ```
+
+---
+
+### 2.1.1 Standalone Circuit Relay (Unreleased)
+
+A native build with libp2p support can serve circuit-relay traffic without
+opening a chain database, loading a validator keystore, or subscribing to
+application GossipSub topics:
+
+```bash
+shell-node relay --datadir relay-data --listen-addr 0.0.0.0:4001 \
+  --external-addr /ip4/203.0.113.10/tcp/4001
+```
+
+Replace the documentation address with the relay's reachable address and
+configure its network routing accordingly. `--external-addr` is required and
+repeatable; supply transport endpoints without `/p2p` IDs or `/p2p-circuit`.
+The command prints readiness JSON containing the actual `peer_id` and
+`listen_addresses`. Its transport identity is kept in `relay.key`; it does not
+use the chain node's `libp2p.key`. Existing reservation, circuit-count, duration,
+and byte limits still apply. Ordinary chain nodes keep relay serving disabled.
+
+A chain node can request an inbound reservation with:
+
+```bash
+shell-node run --p2p --relay-listen \
+  /ip4/203.0.113.10/tcp/4001/p2p/RELAY_PEER_ID/p2p-circuit
+```
+
+Replace `RELAY_PEER_ID` with the readiness JSON's `peer_id`. Use the usual
+trusted genesis, keystore, chain ID, and RPC options for the intended network. After the reservation is accepted, the node logs a complete
+listening circuit address ending in `/p2p-circuit/p2p/NODE_PEER_ID`. Another node
+can use that complete address as its `--bootnode`. Each relay and destination
+ID appears once; do not append another destination ID to the announced address.
+The reservation is renewed while the process runs; after a restart the node
+requests it again using its persisted transport identity.
+
+The same reservation addresses are accepted in a run configuration:
+
+```toml
+[p2p]
+enabled = true
+relay_listen_addresses = ["/ip4/203.0.113.10/tcp/4001/p2p/RELAY_PEER_ID/p2p-circuit"]
+```
+
+Explicit `--relay-listen` values override that list. Optional
+`enable_kademlia`, `enable_dcutr`, and `enable_autonat` TOML booleans default to
+`true`; mDNS keeps its existing default of `false`. Leaving DCUtR enabled allows
+an established circuit to upgrade to a direct connection when the network permits.
+
+For bounded local acceptance with fresh test accounts, install
+`shell-sdk@0.14.0-rc.3` and run:
+
+```bash
+NODE_BIN=/path/to/shell-node \
+SHELL_SDK_ENTRY=/path/to/node_modules/shell-sdk/dist/index.js \
+node tests/e2e/native-relay-circuit.mjs
+```
+
+The transport-level reservation and invalid-target rejection regressions can
+also be run with `cargo test --locked -p shell-network --features libp2p relay_`.
+
+The script starts a standalone relay and two chain nodes on isolated ports,
+disables alternate discovery and direct upgrades for this experiment, verifies
+actual relayed connections and signed transfers, reopens their databases, and
+checks a short relay-outage window. It stops all its processes and retains the
+temporary test data. This local TCP experiment does not qualify Internet NAT
+hole-punching or other network topologies. The native relay commands are not
+available in release 0.27.13.
 
 ---
 

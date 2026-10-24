@@ -61,6 +61,10 @@ pub struct P2pSection {
     pub listen_addr: Option<String>,
     pub bootnodes: Option<Vec<String>>,
     pub enable_mdns: Option<bool>,
+    pub relay_listen_addresses: Option<Vec<String>>,
+    pub enable_kademlia: Option<bool>,
+    pub enable_dcutr: Option<bool>,
+    pub enable_autonat: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

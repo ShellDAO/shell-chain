@@ -45,6 +45,10 @@ pub struct RunArgs {
     pub p2p_addr: String,
     pub bootnodes: Vec<String>,
     pub enable_mdns: bool,
+    pub relay_listen_addresses: Vec<String>,
+    pub enable_kademlia: bool,
+    pub enable_dcutr: bool,
+    pub enable_autonat: bool,
     pub pruning: u64,
     pub checkpoint_url: Option<String>,
     pub rpc_cors: Option<String>,
@@ -303,6 +307,9 @@ fn validate_transaction_protocol<S: KvStore + 'static>(
 
 /// Start the node: load genesis, initialize state, and run the event loop.
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.p2p && !args.relay_listen_addresses.is_empty() {
+        return Err("relay listeners require P2P networking".into());
+    }
     let _: NetworkType = args.network.parse()?;
 
     // F-096: Canonicalize and validate data directory.
@@ -1018,6 +1025,10 @@ async fn run_with_store<S: KvStore + 'static>(
                 listen_addr: p2p_listen,
                 boot_nodes,
                 enable_mdns: args.enable_mdns,
+                relay_listen_addresses: args.relay_listen_addresses,
+                enable_kademlia: args.enable_kademlia,
+                enable_dcutr: args.enable_dcutr,
+                enable_autonat: args.enable_autonat,
                 identity_key_path: Some(args.datadir.join("libp2p.key")),
                 ..NetworkConfig::default()
             };
@@ -1084,7 +1095,14 @@ async fn run_with_store<S: KvStore + 'static>(
         }
         #[cfg(not(feature = "libp2p"))]
         {
-            let _ = (&args.p2p_addr, &args.bootnodes, args.enable_mdns);
+            let _ = (
+                &args.p2p_addr,
+                &args.bootnodes,
+                args.enable_mdns,
+                args.enable_kademlia,
+                args.enable_dcutr,
+                args.enable_autonat,
+            );
             return Err("libp2p support not compiled. Rebuild with: cargo build -p shell-cli --features libp2p".into());
         }
     } else {
@@ -1184,6 +1202,10 @@ mod tests {
             p2p_addr: "0.0.0.0:30303".into(),
             bootnodes: vec![],
             enable_mdns: false,
+            relay_listen_addresses: vec![],
+            enable_kademlia: true,
+            enable_dcutr: true,
+            enable_autonat: true,
             pruning: 0,
             checkpoint_url: None,
             rpc_cors: None,

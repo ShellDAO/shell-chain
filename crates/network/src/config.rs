@@ -34,6 +34,12 @@ pub struct NetworkConfig {
     pub proofs_topic: String,
     /// Maximum number of peers to maintain.
     pub max_peers: usize,
+    /// Subscribe to application GossipSub topics (false for standalone relays).
+    pub enable_gossip: bool,
+    /// Relay addresses ending in /p2p/<relay-id>/p2p-circuit to reserve for inbound traffic.
+    pub relay_listen_addresses: Vec<String>,
+    /// Explicit reachable addresses advertised by this node (no embedded peer ID).
+    pub external_addresses: Vec<String>,
     /// Enable mDNS local peer discovery (disable in production/cloud).
     pub enable_mdns: bool,
     /// Enable Kademlia DHT for global peer discovery.
@@ -82,6 +88,9 @@ impl Default for NetworkConfig {
             attestation_topic: "/shell/attestation/1".into(),
             proofs_topic: "/shell/proofs/1".into(),
             max_peers: 50,
+            enable_gossip: true,
+            relay_listen_addresses: vec![],
+            external_addresses: vec![],
             enable_mdns: false,
             enable_kademlia: true,
             enable_peer_scoring: true,

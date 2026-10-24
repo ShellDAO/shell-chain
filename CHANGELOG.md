@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add a standalone native circuit-relay service with explicit advertised
+  endpoints and no chain state or application gossip, plus inbound relay
+  reservations for chain nodes through CLI or TOML configuration. Existing
+  server limits and default discovery/direct-upgrade settings are preserved.
+
+### Fixed
+
+- Keep relay and destination peer IDs distinct when dialing complete circuit
+  addresses, and announce already-qualified relay listeners without duplicating
+  the destination peer ID.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
