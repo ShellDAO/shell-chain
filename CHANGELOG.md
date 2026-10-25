@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add a connected native prover-cohort acceptance mode that keeps the authority
+  running through worker sync, overlapping CPU proofs and ordered settlement,
+  then checks exact rewards and all-node database reopen.
 - Record L1 CPU proof start, completion and duration inside each proof worker,
   allowing a native concurrency check to distinguish overlapping computation
   from queued work or ordered result delivery.

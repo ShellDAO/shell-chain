@@ -129,3 +129,18 @@ before resuming local handoff. Both check stored proof bytes, source pointers,
 one settlement and its exact reward; the second also preserves the canonical
 settlement transaction link. The deterministic in-process scheduling check
 does not qualify native disk-crash recovery or wider network scheduling.
+
+### Connected native proof work
+
+Run the same acceptance entry with `SHELL_COHORT_CONNECTED=1` and its existing
+`SHELL_NODE_BIN` and `SHELL_SDK_ENTRY` inputs. Use this unreleased cohort node
+implementation built with `libp2p`; the connected scenario was verified with
+published `shell-sdk@0.14.0-rc.2`. The authority stays online while
+two registered standalone provers synchronize, generate disjoint scheduled
+ranges and deliver their original proof bytes for ordered settlement. CPU start
+and completion logs must show overlapping calls; successful settlement alone
+does not satisfy the concurrency assertion. The entry checks peer connectivity,
+exact rewards, balances, nonce, finality, and all three physical database reopens
+without regenerating settled work. This bounded development-network scenario
+retains explicit scheduled membership; automatic recruitment, offline takeover,
+partitions and production throughput remain unqualified.

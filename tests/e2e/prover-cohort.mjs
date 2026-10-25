@@ -34,7 +34,8 @@ const lateJoin = process.env.SHELL_COHORT_LATE_JOIN === '1';
 const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
 const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
-assert.ok(!(delayedPredecessor && parallelWorkers) && (!(delayedPredecessor || parallelWorkers) || !reconfigure), 'Run parallel, delayed predecessor and membership scenarios separately');
+const connectedWorkers = process.env.SHELL_COHORT_CONNECTED === '1';
+assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and membership scenarios separately');
 const nodeCount = lateJoin ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
@@ -161,7 +162,7 @@ function count(text) {
     return Number(m[1]);
 }
 async function checkDelayedPredecessor(boot, validators) {
-    result.adaptation = parallelWorkers ? 'Explicit scheduled ownership and overlapping native CPU proof calls, 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
+    result.adaptation = connectedWorkers ? 'Explicit scheduled ownership, connected native workers and an authority kept running during proof computation; 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : parallelWorkers ? 'Explicit scheduled ownership and overlapping native CPU proof calls, 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
     const provider = createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[0]}` });
     const recipient = '0x' + 'ab'.repeat(32);
     // Accumulate two genuine windows before either CPU proof worker starts.
@@ -218,7 +219,49 @@ async function checkDelayedPredecessor(boot, validators) {
     for (const i of [1, 2]) await writeFile(join(out, `node${i}.toml`), config);
     const record = i => rpc(0, 'shell_getRegisteredProver', [keys[i].address]);
     let laterGenerated, originalProofHash, generated, ranges;
-    if (parallelWorkers) {
+    if (connectedWorkers) {
+        // Keep the authority online through both workers' normal sync and proving.
+        await Promise.all([1, 2].map(i => start(i, boot)));
+        await until(async () => (await Promise.all([1, 2].map(async i => count(await metricText(i))))).every(n => n === 1), 90);
+        await until(async () => (await record(1)).proofs_submitted === 1 && (await record(2)).proofs_submitted === 1, 90);
+        generated = await Promise.all([1, 2].map(async i => count(await metricText(i))));
+        assert.deepEqual(generated, [1, 1], 'connected workers generate only their assigned ranges');
+        const intervals = [], proofSha256 = [], peerCounts = [];
+        ranges = [];
+        for (const i of [1, 2]) {
+            const log = await readFile(join(out, `node${i}.log`), 'utf8');
+            const starts = log.split('\n').filter(line => line.includes('STARK CPU proof started'));
+            const ends = log.split('\n').filter(line => line.includes('STARK CPU proof finished'));
+            assert.equal(starts.length, 1);
+            assert.equal(ends.length, 1);
+            assert.match(ends[0], /success=true/);
+            const begin = Date.parse(starts[0].split(/\s+/)[0]);
+            const end = Date.parse(ends[0].split(/\s+/)[0]);
+            assert.ok(Number.isFinite(begin) && end > begin);
+            intervals.push({ worker: i, begin, end, startLog: starts[0], endLog: ends[0] });
+            const stored = [...log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)];
+            assert.equal(stored.length, 1);
+            const range = { worker: i, end: Number(stored[0][1]), start: Number(stored[0][1]) - Number(stored[0][2]) + 1 };
+            assert.equal(range.start, expectedRanges[i - 1].start);
+            assert.equal(range.end, expectedRanges[i - 1].end);
+            ranges.push(range);
+            const peers = Number(BigInt(await rpc(i, 'net_peerCount')));
+            assert.ok(peers > 0, 'proof worker remains connected to the running native network');
+            peerCounts.push(peers);
+            assert.ok(log.split('\n').some(line => line.includes('peer connected') && Date.parse(line.split(/\s+/)[0]) <= begin), 'normal peer connection precedes actual CPU proving');
+            const block = await rpc(i, 'eth_getBlockByNumber', ['0x' + range.end.toString(16), false]);
+            const saved = await rpc(i, 'shell_getProofAmendment', [block.hash]);
+            assert.equal(saved.proof_entries, expectedRanges[i - 1].entries);
+            proofSha256.push(createHash('sha256').update(Buffer.from(saved.proof.slice(2), 'hex')).digest('hex'));
+        }
+        const overlapMs = Math.min(...intervals.map(x => x.end)) - Math.max(...intervals.map(x => x.begin));
+        result.connectedCpu = { intervals, overlapMs, generated, ranges, proofSha256, peerCounts, topology: 'Both workers connected to a continuously running native authority; CPU overlap measured without treating useful work as a throughput benchmark' };
+        assert.ok(overlapMs > 0, 'independent connected native CPU proof calls must overlap');
+        assert.equal(count(await metricText(0)), 0, 'authority does no CPU proving');
+        laterGenerated = generated[1];
+        result.completionOrder = { fromBlock, laterRange: ranges[1], connectedWorkers: true };
+        await save();
+    } else if (parallelWorkers) {
         // Synchronize both databases using the normal validator role, which does
         // no CPU proof work. Restart both normal prover processes together so
         // their independent assigned ranges are available at startup.
@@ -349,11 +392,11 @@ async function checkDelayedPredecessor(boot, validators) {
         assert.equal(amendment.start_block, expectedRanges[batch].start);
         assert.equal(amendment.end_block, expectedRanges[batch].end);
         assert.equal(amendment.proof.n_sigs, expectedRanges[batch].entries);
-        if (parallelWorkers) {
+        if (parallelWorkers || connectedWorkers) {
             const proofHex = '0x' + Buffer.from(amendment.proof.proof_bytes).toString('hex');
-            assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), result.parallelCpu.proofSha256[batch], 'settlement uses the actual overlapping CPU proof bytes');
+            assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), (parallelWorkers ? result.parallelCpu : result.connectedCpu).proofSha256[batch], 'settlement uses the original native CPU proof bytes');
         }
-        if (batch === 1 && !parallelWorkers) {
+        if (batch === 1 && !parallelWorkers && !connectedWorkers) {
             const proofHex = '0x' + Buffer.from(amendment.proof.proof_bytes).toString('hex');
             assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), originalProofHash, 'settlement uses the original later proof bytes');
         }
@@ -397,7 +440,7 @@ async function checkDelayedPredecessor(boot, validators) {
     await pause(1500);
     for (const i of [1, 2]) assert.equal(count(await metricText(i)), 0, 'settled ranges are not regenerated after all nodes reopen');
     result.workers = [1, 2].map(i => ({ i, generated: i === 1 ? generated[0] : laterGenerated, generationLogs: [], record: result.completionOrder.records[i - 1] }));
-    result.status = parallelWorkers ? 'PASS: overlapping native CPU proof calls, disjoint canonical ranges, exact rewards, 1024 genuine transfers and all native reopens' : 'PASS: later proof completed first, persisted across cold reopen, both original ranges settled once, 1024 genuine transfers and all native reopens';
+    result.status = connectedWorkers ? 'PASS: connected native workers, disjoint proof ranges, original proof settlement, exact rewards, 1024 genuine transfers and all native reopens' : parallelWorkers ? 'PASS: overlapping native CPU proof calls, disjoint canonical ranges, exact rewards, 1024 genuine transfers and all native reopens' : 'PASS: later proof completed first, persisted across cold reopen, both original ranges settled once, 1024 genuine transfers and all native reopens';
 }
 try {
     result.binaryVersion = cli('version', [
@@ -465,7 +508,7 @@ try {
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
         await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n');
-    if (delayedPredecessor || parallelWorkers) {
+    if (delayedPredecessor || parallelWorkers || connectedWorkers) {
         await checkDelayedPredecessor(boot, validators);
     } else {
         await start(1, boot);
