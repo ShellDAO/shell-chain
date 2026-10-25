@@ -298,6 +298,8 @@ fn decode_challenge_response_amendment(
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
+    view_change_signing:
+        tokio::task::JoinSet<Result<shell_crypto::PQSignature, shell_crypto::CryptoError>>,
 }
 
 impl NodeTaskLifecycle {
@@ -305,6 +307,7 @@ impl NodeTaskLifecycle {
         Self {
             tasks: tokio::task::JoinSet::new(),
             prover_service: None,
+            view_change_signing: tokio::task::JoinSet::new(),
         }
     }
 
@@ -324,6 +327,14 @@ impl NodeTaskLifecycle {
             prover_service.shutdown().await;
         }
 
+        // A running CPU signer cannot be aborted. Drain the one tracked job
+        // before releasing node resources; shutdown never broadcasts its result.
+        while let Some(result) = self.view_change_signing.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "view-change signing task exited unexpectedly during shutdown");
+            }
+        }
+
         self.tasks.abort_all();
         while let Some(result) = self.tasks.join_next().await {
             if let Err(err) = result {
@@ -336,6 +347,23 @@ impl NodeTaskLifecycle {
 }
 
 impl<S: KvStore + 'static> Node<S> {
+    /// Signing may outlive a height, view, finality or authority transition.
+    /// Never apply or broadcast a result under a different protocol context.
+    pub(super) fn view_change_signing_context_is_current(
+        &self,
+        message: &ViewChangeMessage,
+    ) -> bool {
+        let current_view = self.consensus.read().current_view();
+        let finalized_hash = *self.finality.read().last_finalized_hash();
+        message.chain_id == self.config.chain_id
+            && self.config.proposer_address == Some(message.validator)
+            && self.local_validator_weight().is_some()
+            && ChainStateMachine::next_block_number(self.head_number()).ok()
+                == Some(message.block_number)
+            && current_view == message.view
+            && finalized_hash == message.highest_qc_hash
+    }
+
     fn update_challenge_lifecycle<T>(
         &self,
         update: impl FnOnce(&mut ChallengeLifecycle) -> T,
@@ -666,6 +694,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut sync_requested = false;
         let mut sync_request: Option<BlockRequestState> = None;
         let mut early_commit_certificate = EarlyCommitCertificate::default();
+        let mut pending_view_change: Option<ViewChangeMessage> = None;
         let mut body_request: Option<BodyRequestState> = None;
         let mut deferred_body_gap: Option<u64> = None;
         let startup_peers = network.peer_count().await;
@@ -1193,7 +1222,10 @@ impl<S: KvStore + 'static> Node<S> {
 
                     // W.5: If the proposer fails to produce within the timeout,
                     // broadcast a signed view-change vote for the current height.
-                    if self.consensus.read().engine_type() == EngineType::WPoA && can_produce_blocks {
+                    if self.consensus.read().engine_type() == EngineType::WPoA
+                        && can_produce_blocks
+                        && pending_view_change.is_none()
+                    {
                         let now_ms = Self::wall_clock_millis();
                         let timed_out = self
                             .consensus
@@ -1228,45 +1260,52 @@ impl<S: KvStore + 'static> Node<S> {
                                 view,
                                 &highest_qc_hash,
                             );
-                            // SLH-DSA signing can exceed a block tick. Let Tokio drive
-                            // peer I/O on a replacement worker while this computation runs.
-                            match tokio::task::block_in_place(|| signer.sign(&signing_message)) {
-                                Ok(signature) => {
-                                    let msg = ViewChangeMessage::new(
-                                        chain_id,
-                                        block_number,
-                                        view,
-                                        highest_qc_hash,
-                                        validator,
-                                        signature.data,
-                                    );
-                                    let total_weight: u64 = self
-                                        .consensus
-                                        .read()
-                                        .validator_weights()
-                                        .values()
-                                        .copied()
-                                        .sum();
-                                    let quorum = self
-                                        .consensus
-                                        .write()
-                                        .handle_view_change_message(msg.clone(), total_weight);
-                                    warn!(
-                                        view,
-                                        block_number,
-                                        timeout_ms = VIEW_CHANGE_TIMEOUT_MS,
-                                        quorum,
-                                        "W.5: proposer timeout — broadcasting view change"
-                                    );
-                                    let _ = network
-                                        .broadcast(NetworkMessage::WPoaViewChange(Box::new(msg)))
-                                        .await;
-                                }
-                                Err(error) => {
-                                    warn!(%error, view, block_number, "W.5: failed to sign view change");
-                                }
-                            }
+                            let message = ViewChangeMessage::new(
+                                chain_id,
+                                block_number,
+                                view,
+                                highest_qc_hash,
+                                validator,
+                                Vec::new(),
+                            );
+                            let signing_key = Arc::clone(&signer);
+                            task_lifecycle.view_change_signing.spawn_blocking(move || {
+                                signing_key.sign(&signing_message)
+                            });
+                            pending_view_change = Some(message);
                         }
+                    }
+                }
+
+                Some(result) = task_lifecycle.view_change_signing.join_next(),
+                    if pending_view_change.is_some() => {
+                    let mut message = pending_view_change.take().expect("tracked signing context");
+                    if !self.view_change_signing_context_is_current(&message) {
+                        debug!(
+                            block = message.block_number,
+                            view = message.view,
+                            "discarding stale view-change signing result"
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(Ok(signature)) => {
+                            message.signature = signature.data;
+                            let total_weight = self.consensus.read().validator_weights()
+                                .values().copied().sum();
+                            let quorum = self.consensus.write()
+                                .handle_view_change_message(message.clone(), total_weight);
+                            warn!(
+                                view = message.view,
+                                block_number = message.block_number,
+                                timeout_ms = VIEW_CHANGE_TIMEOUT_MS,
+                                quorum,
+                                "W.5: proposer timeout — broadcasting view change"
+                            );
+                            let _ = network.broadcast(NetworkMessage::WPoaViewChange(Box::new(message))).await;
+                        }
+                        Ok(Err(error)) => warn!(%error, "W.5: failed to sign view change"),
+                        Err(error) => warn!(%error, "W.5: view-change signing task failed"),
                     }
                 }
 

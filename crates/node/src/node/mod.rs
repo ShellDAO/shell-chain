@@ -22971,8 +22971,50 @@ mod tests {
             );
         }
 
+        #[test]
+        fn view_change_signing_completion_rejects_obsolete_protocol_context() {
+            let (mut node, signer) = setup_wpoa_node();
+            store_consistent_genesis(&node);
+            let context = || {
+                ViewChangeMessage::new(
+                    node.config.chain_id,
+                    node.head_number() + 1,
+                    node.consensus.read().current_view(),
+                    *node.finality.read().last_finalized_hash(),
+                    node.config.proposer_address.unwrap(),
+                    Vec::new(),
+                )
+            };
+            let before = context();
+            assert!(node.view_change_signing_context_is_current(&before));
+            node.produce_block(&signer, 0).unwrap();
+            assert!(
+                !node.view_change_signing_context_is_current(&before),
+                "a completed signature for the previous next height cannot be broadcast"
+            );
+            let current = context();
+            assert!(node.view_change_signing_context_is_current(&current));
+            let mut obsolete = current.clone();
+            obsolete.view += 1;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.highest_qc_hash = ShellHash::from([0xA5; 32]);
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.chain_id += 1;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.validator = Address::ZERO;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            node.config.proposer_address = None;
+            assert!(
+                !node.view_change_signing_context_is_current(&current),
+                "an identity that is no longer the local authority cannot publish a pending result"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-        async fn slow_view_change_signing_keeps_network_executor_available() {
+        async fn slow_view_change_signing_keeps_node_event_loop_responsive() {
             use shell_network::{
                 NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
             };
@@ -23039,6 +23081,7 @@ mod tests {
             };
             let bus = NetworkBus::new(64);
             let mut network = bus.join(&NetworkConfig::default());
+            let target = network.local_peer_id().clone();
             let task = tokio::spawn({
                 let node = Arc::clone(&node);
                 async move { node.run(Arc::new(signer), &mut network).await }
@@ -23046,15 +23089,32 @@ mod tests {
             let receiver = tokio::spawn(async move {
                 signing_started.await.unwrap();
                 let mut peer = bus.join(&NetworkConfig::default());
-                // The same executor must continue driving peer I/O while signing is busy.
-                let _ = progress.send(());
+                peer.send_to_peer(&target, NetworkMessage::Ping)
+                    .await
+                    .unwrap();
+                let mut progress = Some(progress);
+                let mut signed = None;
+                let mut pong = false;
                 loop {
-                    if let Some(NetworkEvent::MessageReceived {
-                        message: NetworkMessage::WPoaViewChange(message),
-                        ..
-                    }) = peer.next_event().await
-                    {
-                        break message;
+                    match peer.next_event().await {
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        }) => {
+                            pong = true;
+                            if let Some(progress) = progress.take() {
+                                let _ = progress.send(());
+                            }
+                        }
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::WPoaViewChange(message),
+                            ..
+                        }) => signed = Some(message),
+                        _ => {}
+                    }
+                    match (pong, signed.take()) {
+                        (true, Some(message)) => break message,
+                        (_, message) => signed = message,
                     }
                 }
             });
@@ -23073,7 +23133,7 @@ mod tests {
                 .unwrap());
             assert!(
                 network_progressed.load(Ordering::SeqCst),
-                "slow timeout signing must not monopolize the async executor"
+                "slow timeout signing must not stop the node from consuming inbound peer messages"
             );
         }
 

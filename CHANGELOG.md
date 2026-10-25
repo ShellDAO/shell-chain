@@ -18,6 +18,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep the node event loop responsive while a slow post-quantum view-change
+  signature is computed. Track one signing job, discard results after their
+  height, view, finality or authority context changes, and drain it on shutdown.
 - Re-advertise persisted L1 frontier proofs when peers reconnect and on the
   existing retry timer, so offline-completed work reaches validators and settles
   without recomputation. Retries revalidate canonical order and authentication.
