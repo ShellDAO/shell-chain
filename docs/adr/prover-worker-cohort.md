@@ -1,6 +1,6 @@
-# Fixed L1 prover worker cohorts
+# L1 prover worker cohorts
 
-Status: explicit cohorts and coordinated future epochs; unreleased.
+Status: explicit cohorts, coordinated future epochs and optional registry-derived membership; unreleased.
 
 The whitepaper describes disjoint proof work across Prover nodes. Independent
 local queues currently let two healthy registered workers compute the same L1
@@ -144,3 +144,74 @@ exact rewards, balances, nonce, finality, and all three physical database reopen
 without regenerating settled work. This bounded development-network scenario
 retains explicit scheduled membership; automatic recruitment, offline takeover,
 partitions and production throughput remain unqualified.
+
+## Registry-derived membership
+
+A standalone prover may instead select automatic canonical membership:
+
+```toml
+[prover]
+worker_cohort_from_registry = true
+```
+
+The option defaults to false and cannot be combined with `worker_cohort` or
+`worker_cohort_schedule`. The network must already configure
+`prover_registry_height`; the option does not activate registration or change
+that height. Initialize a fresh database with this compatible node and sync
+through ordinary block execution. Registration still uses the normal native
+registry transaction and does not grant validator authority. All coordinating
+workers must use the same membership mode. Unconfigured independent workers
+are not prevented from computing duplicate work.
+
+Read registered identities from the finalized canonical state and retain only
+records registered at or before a range's last source height. For backlog older
+than every registration, use the first finalized registration height. Sort
+addresses and reuse the first source hash modulo member count. Thus later
+registrations join subsequent ranges without rewriting old ownership, even
+when an older historical state root has been pruned. A range waits until its
+last source is finalized and at least one eligible registration exists. Deferred
+work becoming locally owned releases its reservation for ordinary canonical
+reseeding, rather than executing an entry-cleared task.
+
+The registry's current append-only, immutable registration-height semantics are
+required for this historical derivation. A future deregistration or replacement
+protocol must revisit this rule before use. The operational cohort supports at
+most 64 registered members; a larger set is rejected rather than truncated.
+An assigned member going offline still retains its historical ranges. This
+mode adds recruitment, not a timeout, lease or takeover mechanism.
+
+Address preimages live in an auxiliary local candidate index. Candidates from
+rolled-back or orphaned execution are harmless: every discovery reads actual
+registry storage at the selected trie root and verifies public-key identity.
+Read candidates in bounded pages without imposing a cap on orphaned hints.
+The hints, selected mode and writer coverage cursor are outside consensus state
+roots and do not change genesis hashes, proof authentication, rewards or wire
+formats. Ordinary non-cohort behavior remains available on old databases.
+
+Fresh genesis initialization atomically certifies an empty index only when no
+custom native-registry storage was supplied. Canonical execution/import captures
+registrations and advances coverage with the block publication. Rewinds retain
+candidate preimages but move coverage atomically with the canonical head. If an
+older writer advances the database without capture, a later compatible writer
+cannot silently certify that gap. Startup and assignment fail closed.
+Snapshot candidates and coverage are not authenticated by the snapshot state
+root; import ignores them and invalidates the destination's discovery certificate.
+Legacy and snapshot index rebuilding remain unavailable in this initial mode.
+A persisted registry mode cannot silently downgrade to independent scheduling
+or a static list. Do not manually create or copy completeness markers.
+
+The manual native acceptance uses the existing single entry:
+
+```sh
+SHELL_COHORT_REGISTRY=1 node tests/e2e/prover-cohort.mjs
+```
+
+Set `SHELL_NODE_BIN` to this compatible unreleased node built with `libp2p`, and
+`SHELL_SDK_ENTRY` to a compatible SDK module (`shell-sdk@0.14.0-rc.2` is the
+acceptance baseline). The isolated development network creates its own keys,
+uses activation height zero, registers two workers, settles genuine transfers,
+then normally registers a fresh third worker without editing the original
+workers' configuration. It checks that worker's later range, original proof
+bytes, exact canonical rewards, independent state/finality agreement and four
+physical database reopens without regeneration. It does not qualify production
+partitions, index rebuilding, or offline takeover.

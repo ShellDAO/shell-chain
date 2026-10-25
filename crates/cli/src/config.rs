@@ -77,6 +77,7 @@ pub struct ProverSection {
     pub proving_priority: Option<shell_node::ProvingPriority>,
     pub worker_cohort: Vec<shell_primitives::Address>,
     pub worker_cohort_schedule: Vec<shell_node::ProverWorkerEpoch>,
+    pub worker_cohort_from_registry: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

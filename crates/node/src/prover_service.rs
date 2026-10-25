@@ -44,7 +44,7 @@ use crate::{config::L2StarkMode, metrics::Metrics};
 const MAX_WORKER_COHORT: usize = 64;
 const MAX_DEFERRED_COHORT_RANGES: usize = 64;
 
-/// Opt-in static L1 assignment from canonical sources and an identical cohort.
+/// Opt-in L1 assignment from canonical sources and coordinated membership.
 /// Membership is independent of peer arrival timing and does not change proof
 /// validity, rewards, validator membership, or consensus state.
 pub(crate) struct WorkerCohort<S: KvStore> {
@@ -52,9 +52,10 @@ pub(crate) struct WorkerCohort<S: KvStore> {
     local: Address,
     chain: ChainStore<S>,
     deferred: VecDeque<ProofTask>,
+    registry_mode: bool,
 }
 
-impl<S: KvStore> WorkerCohort<S> {
+impl<S: KvStore + 'static> WorkerCohort<S> {
     #[cfg(test)]
     pub(crate) fn open(
         store: Arc<S>,
@@ -70,6 +71,9 @@ impl<S: KvStore> WorkerCohort<S> {
         schedule: Vec<crate::config::ProverWorkerEpoch>,
         local: Address,
     ) -> Result<Option<Self>, StorageError> {
+        if store.get(b"prover-worker-cohort/v1")?.as_deref() == Some(b"registry:v3") {
+            return Err(StorageError::InvalidInput("registry-derived worker cohort cannot be disabled or replaced by a static schedule".into()));
+        }
         let mut epochs = vec![(0, workers)];
         epochs.extend(
             schedule
@@ -111,7 +115,110 @@ impl<S: KvStore> WorkerCohort<S> {
             local,
             chain,
             deferred: VecDeque::new(),
+            registry_mode: false,
         }))
+    }
+
+    pub(crate) fn open_registry(store: Arc<S>, local: Address) -> Result<Self, StorageError> {
+        let chain = ChainStore::new(Arc::clone(&store));
+        if chain
+            .get_chain_config()?
+            .and_then(|config| config.prover_registry_height)
+            .is_none()
+        {
+            return Err(StorageError::InvalidInput(
+                "registry-derived cohort requires configured prover_registry_height".into(),
+            ));
+        }
+        let genesis = chain.get_block_hash_by_number(0)?.ok_or_else(|| {
+            StorageError::State("missing canonical genesis for prover discovery".into())
+        })?;
+        let head = chain.get_head_block()?.ok_or_else(|| {
+            StorageError::State("missing canonical head for prover discovery".into())
+        })?;
+        shell_storage::WorldState::at_root_with_cache_mb(
+            Arc::clone(&store),
+            &head.header.state_root,
+            0,
+        )?
+        .registered_prover_members(genesis)?;
+        let key = b"prover-worker-cohort/v1";
+        match store.get(key)? {
+            Some(bytes) if bytes != b"registry:v3" => {
+                return Err(StorageError::InvalidInput(
+                    "registry-derived cohort conflicts with persisted static assignments".into(),
+                ))
+            }
+            Some(_) => {}
+            None => store.put(key, b"registry:v3")?,
+        }
+        Ok(Self {
+            epochs: Vec::new(),
+            local,
+            chain,
+            deferred: VecDeque::new(),
+            registry_mode: true,
+        })
+    }
+
+    fn assigned_owner(&self, task: &ProofTask) -> Result<Option<Address>, StorageError> {
+        if !self.registry_mode {
+            return Ok(Some(self.owner(task)));
+        }
+        let finalized = self.chain.get_finalized_number()?.unwrap_or(0);
+        if task.block_number > finalized {
+            return Ok(None);
+        }
+        let genesis = self
+            .chain
+            .get_block_hash_by_number(0)?
+            .ok_or_else(|| StorageError::State("missing canonical genesis".into()))?;
+        let tip_hash = self
+            .chain
+            .get_block_hash_by_number(finalized)?
+            .ok_or_else(|| StorageError::State("missing finalized block".into()))?;
+        let tip = self
+            .chain
+            .get_header_by_hash(&tip_hash)?
+            .ok_or_else(|| StorageError::State("missing finalized header".into()))?;
+        let store = Arc::clone(self.chain.store());
+        let current = shell_storage::WorldState::at_root_with_cache_mb(
+            Arc::clone(&store),
+            &tip.state_root,
+            0,
+        )?
+        .registered_prover_members(genesis)?;
+        let Some(first) = current.iter().map(|(_, height)| *height).min() else {
+            return Ok(None);
+        };
+        // A source range predating the first prover uses that first canonical
+        // registration, so old backlog cannot remain permanently unassigned.
+        let reference = task.block_number.max(first);
+        if reference > finalized {
+            return Ok(None);
+        }
+        // The current registry is append-only and its registration height is
+        // immutable. Filter finalized records by the range's reference height;
+        // no old state root or body must survive for historical assignment.
+        let members: Vec<_> = current
+            .into_iter()
+            .filter(|(_, height)| *height <= reference)
+            .collect();
+        if members.is_empty() {
+            return Ok(None);
+        }
+        if members.len() > MAX_WORKER_COHORT {
+            return Err(StorageError::InvalidInput(
+                "registry-derived cohort exceeds 64 workers".into(),
+            ));
+        }
+        let source = task
+            .source_hashes
+            .first()
+            .copied()
+            .unwrap_or_else(|| ShellHash::from(task.block_hash));
+        let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
+        Ok(Some(members[(prefix % members.len() as u64) as usize].0))
     }
 
     fn owner(&self, task: &ProofTask) -> Address {
@@ -146,7 +253,8 @@ impl<S: KvStore> WorkerCohort<S> {
             let task = self.deferred.front().expect("bounded deferred range");
             let done = amendments.has_amendment(&ShellHash::from(task.block_hash))?
                 || self.chain.get_block_hash_by_number(task.block_number)?
-                    != Some(ShellHash::from(task.block_hash));
+                    != Some(ShellHash::from(task.block_hash))
+                || (self.registry_mode && self.assigned_owner(task)? == Some(self.local));
             let task = self.deferred.pop_front().expect("observed deferred range");
             if done {
                 backlog.lock().complete_in_flight(
@@ -523,7 +631,21 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                 break;
                             }
                         }
-                        let owner = cohort.owner(&task);
+                        let owner = match cohort.assigned_owner(&task) {
+                            Ok(Some(owner)) => owner,
+                            Ok(None) => {
+                                let mut task = task;
+                                task.entries.clear();
+                                cohort.deferred.push_back(task);
+                                continue;
+                            }
+                            Err(error) => {
+                                error!(%error, "cannot discover canonical prover membership; preserving reservation");
+                                cohort.deferred.push_back(task);
+                                admission_failed = true;
+                                break;
+                            }
+                        };
                         if owner != cohort.local {
                             info!(%owner, block = task.block_number, "deferring L1 proof range to cohort owner");
                             let mut task = task;
@@ -924,6 +1046,246 @@ mod tests {
 
     async fn shutdown_cleanly(handle: ProverServiceHandle) {
         handle.shutdown_cleanly().await;
+    }
+
+    fn registry_cohort_fixture(
+        store: Arc<MemoryDb>,
+        signers: &[Arc<DilithiumSigner>; 2],
+    ) -> [shell_core::Block; 3] {
+        let authority =
+            Address::from_public_key(signers[0].public_key(), signers[0].sig_type().as_u8());
+        let config = shell_genesis::GenesisConfig::from_json(&serde_json::json!({
+            "chain_id":1337, "chain_name":"registry-cohort", "network_type":"Dev", "timestamp":1,
+            "gas_limit":30000000, "extra_data":"registry-cohort", "alloc":{}, "boot_nodes":[], "prover_registry_height":0,
+            "consensus":{"engine":"poa", "authorities":[authority], "block_time_secs":1, "max_future_secs":60}
+        }).to_string()).unwrap();
+        let genesis = shell_genesis::initialize_genesis(&config, store.clone()).unwrap();
+        let chain = ChainStore::new(store.clone());
+        let mut state =
+            shell_storage::WorldState::at_root(store.clone(), &genesis.header.state_root).unwrap();
+        let mut blocks = vec![genesis];
+        for (i, signer) in signers.iter().enumerate() {
+            let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            state
+                .set_registered_prover(
+                    &address,
+                    &shell_storage::RegisteredProver {
+                        public_key: signer.public_key().to_vec(),
+                        algorithm: signer.sig_type().as_u8(),
+                        registered_at: i as u64 + 1,
+                        proofs_submitted: 0,
+                        last_proof_block: 0,
+                    },
+                )
+                .unwrap();
+            let mut block = blocks.last().unwrap().clone();
+            block.header.parent_hash = blocks.last().unwrap().hash();
+            block.header.number = i as u64 + 1;
+            block.header.state_root = state.state_root().unwrap();
+            block.header.timestamp += 1;
+            if i == 1 {
+                let mut members = signers
+                    .each_ref()
+                    .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()))
+                    .to_vec();
+                members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                while members[(u64::from_be_bytes(block.hash().as_bytes()[..8].try_into().unwrap())
+                    % 2) as usize]
+                    != address
+                {
+                    block.header.timestamp += 1;
+                }
+            }
+            chain.commit_canonical_block(&block, None).unwrap();
+            blocks.push(block);
+        }
+        chain.set_finalized_number(2).unwrap();
+        blocks.try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_cohort_discovers_real_jobs_and_preserves_historical_membership() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let addresses = signers
+            .each_ref()
+            .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()));
+        let stores = [Arc::new(MemoryDb::new()), Arc::new(MemoryDb::new())];
+        let entries = vec![
+            shell_stark_prover::SigBatchEntry {
+                msg_hash: [7; 32],
+                pk_hash: [9; 32]
+            };
+            MIN_L1_STARK_TXS
+        ];
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for i in 0..2 {
+            let blocks = registry_cohort_fixture(stores[i].clone(), &signers);
+            let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+            for block in &blocks[1..] {
+                backlog.lock().push(ProofTask::new(
+                    *block.hash().as_bytes(),
+                    block.number(),
+                    entries.clone(),
+                ));
+            }
+            let cohort = WorkerCohort::open_registry(stores[i].clone(), addresses[i]).unwrap();
+            let first = ProofTask::new(*blocks[1].hash().as_bytes(), 1, entries.clone());
+            assert_eq!(
+                cohort.assigned_owner(&first).unwrap(),
+                Some(addresses[0]),
+                "later registration cannot steal old canonical work"
+            );
+            let (tx, rx) = mpsc::channel(2);
+            handles.push(
+                ProverService::new(
+                    backlog,
+                    ProofAmendmentStore::new(stores[i].clone()),
+                    ProverConfig::default(),
+                    addresses[i],
+                )
+                .with_worker_cohort(Some(cohort))
+                .with_signer(signers[i].clone())
+                .with_amendment_sender(tx)
+                .start(),
+            );
+            receivers.push(rx);
+        }
+        let mut proofs = Vec::new();
+        for i in 0..2 {
+            let proof = tokio::time::timeout(Duration::from_secs(5), receivers[i].recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.prover, addresses[i]);
+            assert_eq!(proof.block_number, i as u64 + 1);
+            shell_stark_prover::verify_sig_batch(&proof.proof).unwrap();
+            proof.verify_prover_authentication().unwrap();
+            proofs.push(proof);
+        }
+        assert_ne!(proofs[0].covered_hashes(), proofs[1].covered_hashes());
+        for handle in handles {
+            handle.shutdown_cleanly().await;
+        }
+        for i in 0..2 {
+            let reopened = WorkerCohort::open_registry(stores[i].clone(), addresses[i]).unwrap();
+            let task = ProofTask::new(*proofs[0].block_hash.as_bytes(), 1, entries.clone());
+            assert_eq!(reopened.assigned_owner(&task).unwrap(), Some(addresses[0]));
+            assert!(WorkerCohort::open(stores[i].clone(), vec![], addresses[i]).is_err());
+            assert!(
+                WorkerCohort::open(stores[i].clone(), addresses.to_vec(), addresses[i]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registry_cohort_rejects_writer_gap_without_blessing_later_blocks() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let address =
+            Address::from_public_key(signers[0].public_key(), signers[0].sig_type().as_u8());
+        let db = Arc::new(MemoryDb::new());
+        let blocks = registry_cohort_fixture(db.clone(), &signers);
+        let chain = ChainStore::new(db.clone());
+        let mut unsupported = blocks[2].clone();
+        unsupported.header.number = 3;
+        unsupported.header.parent_hash = blocks[2].hash();
+        chain.put_block(&unsupported).unwrap();
+        chain.set_canonical(3, &unsupported.hash()).unwrap();
+        chain.set_head(&unsupported.hash()).unwrap();
+        assert!(WorkerCohort::open_registry(db.clone(), address).is_err());
+        let mut later = unsupported.clone();
+        later.header.number = 4;
+        later.header.parent_hash = unsupported.hash();
+        chain.commit_canonical_block(&later, None).unwrap();
+        assert!(
+            WorkerCohort::open_registry(db, address).is_err(),
+            "a capturing writer cannot certify an earlier unsupported gap"
+        );
+    }
+
+    #[test]
+    fn registry_cohort_rewind_filters_orphaned_members_and_rejects_no_activation() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let address =
+            Address::from_public_key(signers[0].public_key(), signers[0].sig_type().as_u8());
+        let db = Arc::new(MemoryDb::new());
+        let blocks = registry_cohort_fixture(db.clone(), &signers);
+        let chain = ChainStore::new(db.clone());
+        chain
+            .commit_canonical_rewind(
+                &blocks[2..],
+                &[2],
+                &blocks[1].hash(),
+                0,
+                shell_primitives::U256::ZERO,
+                1,
+            )
+            .unwrap();
+        let cohort = WorkerCohort::open_registry(db.clone(), address).unwrap();
+        let members = shell_storage::WorldState::at_root(db.clone(), &blocks[1].header.state_root)
+            .unwrap()
+            .registered_prover_members(blocks[0].hash())
+            .unwrap();
+        assert_eq!(
+            members,
+            vec![(address, 1)],
+            "orphaned registration hints are not membership"
+        );
+        assert_eq!(
+            cohort
+                .assigned_owner(&ProofTask::new(*blocks[1].hash().as_bytes(), 1, vec![]))
+                .unwrap(),
+            Some(address)
+        );
+        let mut config = chain.get_chain_config().unwrap().unwrap();
+        config.prover_registry_height = None;
+        let no_activation = Arc::new(MemoryDb::new());
+        ChainStore::new(no_activation.clone())
+            .put_chain_config(&config)
+            .unwrap();
+        assert!(WorkerCohort::open_registry(no_activation, address).is_err());
+    }
+
+    #[test]
+    fn registry_cohort_waits_for_finality_and_releases_local_deferred_work() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let address =
+            Address::from_public_key(signers[0].public_key(), signers[0].sig_type().as_u8());
+        let db = Arc::new(MemoryDb::new());
+        let blocks = registry_cohort_fixture(db.clone(), &signers);
+        let chain = ChainStore::new(db.clone());
+        chain.set_finalized_number(0).unwrap();
+        let mut cohort = WorkerCohort::open_registry(db.clone(), address).unwrap();
+        let task = ProofTask::new(*blocks[1].hash().as_bytes(), 1, vec![]);
+        assert!(cohort.assigned_owner(&task).unwrap().is_none());
+        cohort.deferred.push_back(task.clone());
+        chain.set_finalized_number(2).unwrap();
+        cohort
+            .reap(
+                &ProofAmendmentStore::new(db.clone()),
+                &Mutex::new(ProofBacklog::new()),
+            )
+            .unwrap();
+        assert!(
+            cohort.deferred.is_empty(),
+            "normal canonical seeding can recover newly eligible local work"
+        );
+        let old = ProofTask::new(*blocks[0].hash().as_bytes(), 0, vec![]);
+        assert_eq!(cohort.assigned_owner(&old).unwrap(), Some(address));
+        let unindexed = Arc::new(MemoryDb::new());
+        assert!(WorkerCohort::open_registry(unindexed, address).is_err());
     }
 
     #[tokio::test]

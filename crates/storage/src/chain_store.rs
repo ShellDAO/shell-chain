@@ -838,6 +838,9 @@ impl<S: KvStore> ChainStore<S> {
             batch.delete(Self::number_key(*number));
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        if let Some(previous) = self.get_head_hash()? {
+            self.append_prover_discovery_progress(&mut batch, previous, *new_head)?;
+        }
         batch.put(
             prefix::TOTAL_TX_COUNT.to_vec(),
             total_tx_count.to_be_bytes().to_vec(),
@@ -918,6 +921,9 @@ impl<S: KvStore> ChainStore<S> {
             batch.delete(Self::number_key(*number));
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        if let Some(previous) = self.get_head_hash()? {
+            self.append_prover_discovery_progress(&mut batch, previous, *new_head)?;
+        }
         self.append_reorg_totals(&mut batch, old_chain, new_chain, new_head)?;
 
         Ok(batch)
@@ -1536,6 +1542,46 @@ impl<S: KvStore> ChainStore<S> {
         Ok(())
     }
 
+    /// An older writer or an incomplete snapshot must not silently certify a
+    /// partial candidate index as the complete registered set.
+    pub fn validate_prover_discovery_coverage(&self) -> Result<(), StorageError> {
+        let snapshot = self.store.snapshot_prefixes(
+            &[
+                prefix::HEAD_BLOCK,
+                crate::prover_registry::PROVER_DISCOVERY_HEAD,
+            ],
+            1024,
+        )?;
+        let covered = snapshot.get(crate::prover_registry::PROVER_DISCOVERY_HEAD);
+        let head = snapshot.get(prefix::HEAD_BLOCK);
+        if covered.is_none_or(|bytes| bytes.len() != 32) || covered != head {
+            return Err(StorageError::State(
+                "prover discovery index does not cover the canonical head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn append_prover_discovery_progress(
+        &self,
+        batch: &mut WriteBatch,
+        expected: ShellHash,
+        next: ShellHash,
+    ) -> Result<(), StorageError> {
+        if self
+            .store
+            .get(crate::prover_registry::PROVER_DISCOVERY_HEAD)?
+            .as_deref()
+            == Some(expected.as_bytes())
+        {
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec(),
+                next.as_bytes().to_vec(),
+            );
+        }
+        Ok(())
+    }
+
     /// Build the batch containing all canonical block artifacts.
     fn canonical_block_batch(
         &self,
@@ -1561,6 +1607,7 @@ impl<S: KvStore> ChainStore<S> {
             block_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::HEAD_BLOCK.to_vec(), block_hash.as_bytes().to_vec());
+        self.append_prover_discovery_progress(&mut batch, block.header.parent_hash, block_hash)?;
 
         Ok(batch)
     }
@@ -1654,6 +1701,17 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         config: &ChainConfig,
     ) -> Result<(), StorageError> {
+        self.commit_genesis_block_with_prover_discovery(block, config, false)
+    }
+
+    /// New compatible genesis creation can atomically certify a complete, empty
+    /// local candidate index. Custom registry storage must leave it unavailable.
+    pub fn commit_genesis_block_with_prover_discovery(
+        &self,
+        block: &Block,
+        config: &ChainConfig,
+        complete_prover_discovery: bool,
+    ) -> Result<(), StorageError> {
         config.validate_algorithm_governance()?;
 
         if self
@@ -1679,6 +1737,16 @@ impl<S: KvStore> ChainStore<S> {
             genesis_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::CHAIN_CONFIG.to_vec(), config_bytes);
+        if complete_prover_discovery {
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec(),
+                genesis_hash.as_bytes().to_vec(),
+            );
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_GENESIS.to_vec(),
+                genesis_hash.as_bytes().to_vec(),
+            );
+        }
 
         self.store.write_batch(batch)
     }
@@ -3243,6 +3311,11 @@ impl<S: KvStore> ChainStore<S> {
         let mut batch_bytes = 0usize;
         let mut pending_publication = crate::WriteBatch::new();
         while let Some(entry) = snap_reader.next_entry()? {
+            // Candidate coverage is a local writer-history certificate, never
+            // state-root-authenticated snapshot data.
+            if entry.key.starts_with(b"prover-discovery/") {
+                continue;
+            }
             if matches!(
                 entry.key.as_slice(),
                 prefix::HEAD_BLOCK
@@ -3374,6 +3447,8 @@ impl<S: KvStore> ChainStore<S> {
         // failed streaming import must retain a mutually consistent old view.
         // Missing snapshot keys delete stale destination progress in the same
         // batch rather than mixing the imported chain with old counters.
+        pending_publication.delete(crate::prover_registry::PROVER_DISCOVERY_GENESIS.to_vec());
+        pending_publication.delete(crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec());
         self.store.write_batch(pending_publication)?;
 
         Ok(metadata)
@@ -8092,6 +8167,15 @@ mod tests {
         cs.set_finalized_number(9).unwrap();
         store
             .put(
+                crate::prover_registry::PROVER_DISCOVERY_GENESIS,
+                &[0xAA; 32],
+            )
+            .unwrap();
+        store
+            .put(crate::prover_registry::PROVER_DISCOVERY_HEAD, &[0xAA; 32])
+            .unwrap();
+        store
+            .put(
                 prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
                 &9u64.to_be_bytes(),
             )
@@ -8139,6 +8223,21 @@ mod tests {
                 )
                 .unwrap();
             writer.write_entry(b"snapshot-key", b"value").unwrap();
+            writer
+                .write_entry(
+                    crate::prover_registry::PROVER_DISCOVERY_GENESIS,
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    crate::prover_registry::PROVER_DISCOVERY_HEAD,
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(b"prover-discovery/candidates/v1/forged", b"value")
+                .unwrap();
             writer.finalize().unwrap();
         }
 
@@ -8146,6 +8245,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(cs.get_head_hash().unwrap(), Some(block_hash));
+        assert!(store
+            .get(crate::prover_registry::PROVER_DISCOVERY_GENESIS)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(crate::prover_registry::PROVER_DISCOVERY_HEAD)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(b"prover-discovery/candidates/v1/forged")
+            .unwrap()
+            .is_none());
         assert_eq!(cs.get_finalized_number().unwrap(), None);
         assert!(store
             .get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)

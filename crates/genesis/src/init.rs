@@ -134,7 +134,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
     let genesis_hash = block.hash();
 
     chain_store
-        .commit_genesis_block(
+        .commit_genesis_block_with_prover_discovery(
             &block,
             &ChainConfig {
                 log_address_activation_height: config.log_address_activation_height,
@@ -166,6 +166,15 @@ pub fn initialize_genesis<S: KvStore + 'static>(
                 chain_id: config.chain_id,
                 genesis_hash,
             },
+            config
+                .alloc
+                .get(&shell_storage::validator_registry_addr())
+                .is_none_or(|entry| {
+                    entry
+                        .storage
+                        .as_ref()
+                        .is_none_or(|storage| storage.is_empty())
+                }),
         )
         .map_err(|e| GenesisError::StateInit(e.to_string()))?;
 
@@ -1013,6 +1022,28 @@ mod tests {
             .is_none());
         assert!(chain_store.get_block_by_number(0).unwrap().is_none());
         assert!(chain_store.get_chain_config().unwrap().is_none());
+        assert!(store.get(b"prover-discovery/genesis/v1").unwrap().is_none());
+        assert!(store.get(b"prover-discovery/head/v1").unwrap().is_none());
+    }
+
+    #[test]
+    fn genesis_custom_registry_storage_cannot_certify_discovery() {
+        let mut config = test_genesis();
+        config.alloc.insert(
+            shell_storage::validator_registry_addr(),
+            AllocEntry {
+                balance: U256::ZERO,
+                nonce: 0,
+                code: None,
+                storage: Some(HashMap::from([(ShellHash::ZERO, ShellHash::from([1; 32]))])),
+            },
+        );
+        let db = Arc::new(MemoryDb::new());
+        let block = initialize_genesis(&config, db.clone()).unwrap();
+        assert!(WorldState::at_root(db, &block.header.state_root)
+            .unwrap()
+            .registered_prover_members(block.hash())
+            .is_err());
     }
 
     #[test]

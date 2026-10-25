@@ -35,8 +35,9 @@ const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
 const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
 const connectedWorkers = process.env.SHELL_COHORT_CONNECTED === '1';
-assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and membership scenarios separately');
-const nodeCount = lateJoin ? 4 : 3;
+const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1';
+assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
+const nodeCount = lateJoin || registryWorkers ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
 async function port() {
@@ -507,7 +508,7 @@ try {
     const boot = log.match(/\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[A-Za-z0-9]+/g)?.at(-1);
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
-        await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n');
+        await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\n' + (registryWorkers ? 'worker_cohort_from_registry=true\n' : 'worker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n'));
     if (delayedPredecessor || parallelWorkers || connectedWorkers) {
         await checkDelayedPredecessor(boot, validators);
     } else {
@@ -614,7 +615,7 @@ try {
         });
         await writeFile(join(out, 'changed-cohort.log'), wrong.stdout + wrong.stderr);
         assert.notEqual(wrong.status, 0);
-        assert.match(wrong.stdout + wrong.stderr, /persisted assignment/);
+        assert.match(wrong.stdout + wrong.stderr, registryWorkers ? /registry-derived worker cohort/ : /persisted assignment/);
         result.changedCohortRejected = {
             status: wrong.status
         };
@@ -636,6 +637,99 @@ try {
         await pause(1500);
         for (let i = 1; i < 3; i++)
             assert.equal(count(await metricText(i)), 0, 'persisted proofs must not be recomputed after all native nodes restart');
+        if (registryWorkers) {
+            const firstEnd = Number(result.workers.flatMap(w => w.generationLogs).join('\n').match(/range ending at block #(\d+)/)[1]);
+            const firstBlock = await rpc(0, 'eth_getBlockByNumber', ['0x' + firstEnd.toString(16), false]);
+            const initialProof = await rpc(0, 'shell_getProofAmendment', [firstBlock.hash]);
+            const initialDigest = createHash('sha256').update(Buffer.from(initialProof.proof.slice(2), 'hex')).digest('hex');
+            const next = await rpc(0, 'eth_getBlockByNumber', ['0x' + (firstEnd + 1).toString(16), false]);
+            const rank = Number(BigInt('0x' + next.hash.slice(2, 18)) % 3n);
+            // Select an unused fresh identity for this deterministic owner slot;
+            // existing worker configuration and membership history stay untouched.
+            let chosen = false;
+            await writeFile(join(out, 'unused-initial-key3.json'), await readFile(join(out, 'key3.json')));
+            for (let attempt = 0; attempt < 64; attempt++) {
+                const candidatePath = join(out, `candidate-key3-${attempt}.json`);
+                cli('joining-key', ['--password-file', password, 'key', 'generate', '--algorithm', 'mldsa65', '--output', candidatePath]);
+                const candidate = JSON.parse(await readFile(candidatePath, 'utf8'));
+                const members = [...keys.slice(1, 3).map(k => k.address.toLowerCase()), candidate.address.toLowerCase()].sort();
+                if (members.indexOf(candidate.address.toLowerCase()) === rank) {
+                    keys[3] = candidate;
+                    await writeFile(join(out, 'key3.json'), await readFile(candidatePath));
+                    chosen = true;
+                    break;
+                }
+            }
+            assert.ok(chosen, 'fresh joining identity occupies the next deterministic slot');
+            result.addresses = keys.map(k => k.address);
+            const hash = await rpc(0, 'shell_proposeRegisterProver', [keys[3].public_key, 1]);
+            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+            assert.equal(receipt.status, '0x1');
+            await until(async () => !!(await rpc(0, 'shell_getRegisteredProver', [keys[3].address])));
+            await writeFile(join(out, 'node3.toml'), '[network]\nenable_mdns=false\n[prover]\nworker_cohort_from_registry=true\n');
+            await start(3, boot);
+            await until(async () => BigInt(await rpc(3, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 512n);
+            assert.equal(count(await metricText(3)), 0, 'joining worker does not regenerate settled historical work');
+            for (let offset = 512; offset < 1024; offset += 16) {
+                const hashes = [];
+                for (let nonce = offset; nonce < offset + 16; nonce++) {
+                    const tx = await sender.buildSignedTransaction({tx:buildTransaction({chainId:1337,nonce,to:recipient,value:1n,gasLimit:21000}),includePublicKey:true});
+                    hashes.push(await paced(() => provider.sendTransaction(tx)));
+                }
+                for (const tx of hashes) {
+                    const item = await until(() => rpc(0, 'eth_getTransactionReceipt', [tx]));
+                    assert.equal(item.status, '0x1'); result.receipts.push(item);
+                }
+                await save();
+            }
+            await until(async () => (await rpc(0, 'shell_getRegisteredProver', [keys[3].address])).proofs_submitted === 1,90);
+            assert.equal(count(await metricText(3)), 1);
+            for (const i of [1,2]) assert.equal(count(await metricText(i)), 0, 'old workers discover the new owner without a schedule change');
+            const record = await rpc(0, 'shell_getRegisteredProver', [keys[3].address]);
+            const end = record.last_proof_block;
+            const block = await rpc(0, 'eth_getBlockByNumber', ['0x' + end.toString(16), false]);
+            const proof = await rpc(3, 'shell_getProofAmendment', [block.hash]);
+            const digest = createHash('sha256').update(Buffer.from(proof.proof.slice(2), 'hex')).digest('hex');
+            const known = new Set([...result.receipts.map(item => item.transactionHash), result.registration1.hash,result.registration2.hash,hash]);
+            let nonEmpty = 0;
+            for (let height = firstEnd+1; height <= end; height++) {
+                const source = await rpc(0,'eth_getBlockByNumber',['0x'+height.toString(16),true]);
+                if(source.transactions.some(tx => known.has(tx.hash))) nonEmpty++;
+            }
+            const reward = 50_000_000_000_000_000_000n * BigInt(nonEmpty);
+            assert.equal(BigInt(await rpc(0,'eth_getBalance',[keys[3].address,'latest'])),reward);
+            for (const i of [0,1,2,3]) {
+                await until(async () => BigInt(await rpc(i,'eth_getBalance',[recipient,'latest']))===1024n &&
+                    (await rpc(i,'shell_getRegisteredProver',[keys[3].address])).proofs_submitted===1);
+                assert.equal(createHash('sha256').update(Buffer.from((await rpc(i,'shell_getProofAmendment',[block.hash])).proof.slice(2),'hex')).digest('hex'),digest);
+                assert.equal(createHash('sha256').update(Buffer.from((await rpc(i,'shell_getProofAmendment',[firstBlock.hash])).proof.slice(2),'hex')).digest('hex'),initialDigest);
+                assert.deepEqual(await rpc(i,'shell_getValidators'),validators);
+            }
+            const anchor = await rpc(0,'eth_getBlockByNumber',['latest',false]);
+            for (const i of [0,1,2,3]) {
+                await until(async () => BigInt((await rpc(i,'eth_getBlockByNumber',['finalized',false])).number)>=BigInt(anchor.number));
+                const same = await rpc(i,'eth_getBlockByNumber',[anchor.number,false]);
+                assert.equal(same.hash,anchor.hash); assert.equal(same.stateRoot,anchor.stateRoot);
+                assert.equal(BigInt(await rpc(i,'eth_getBalance',[keys[3].address,'latest'])),reward);
+            }
+            await stopAll(); await start(0);
+            for(const i of [1,2,3]) await start(i,boot);
+            await pause(1500);
+            for(const i of [0,1,2,3]) {
+                assert.equal(BigInt(await rpc(i,'eth_getTransactionCount',[sender.getAddress(),'latest'])),1024n);
+                assert.equal((await rpc(i,'shell_getRegisteredProver',[keys[3].address])).proofs_submitted,1);
+                assert.equal(BigInt(await rpc(i,'eth_getBalance',[keys[3].address,'latest'])),reward);
+                for (const [sourceHash, expected] of [[block.hash,digest],[firstBlock.hash,initialDigest]]) {
+                    const stored = await rpc(i,'shell_getProofAmendment',[sourceHash]);
+                    assert.equal(createHash('sha256').update(Buffer.from(stored.proof.slice(2),'hex')).digest('hex'),expected);
+                }
+                assert.equal((await rpc(i,'eth_getBlockByNumber',[anchor.number,false])).hash,anchor.hash);
+                if(i>0) assert.equal(count(await metricText(i)),0,'registry cohort reopens without recomputation');
+            }
+            result.registryMembership={initialEnd:firstEnd,joiningAddress:keys[3].address,registrationHash:hash,registrationBlock:receipt.blockNumber,newRange:{start:firstEnd+1,end},proofSha256:digest,initialProofSha256:initialDigest,reward:reward.toString(),allFourReopened:true,canonicalAnchor:{number:anchor.number,hash:anchor.hash,stateRoot:anchor.stateRoot}};
+            result.accepted=1024;result.recipientBalance='1024';
+            result.adaptation='Opt-in canonical registry-derived ownership, fresh compatible discovery indexes, 1024 genuine transfers and a later registered worker; no manual worker address lists or epochs. Offline takeover and snapshot/legacy index rebuild remain unqualified.';
+        }
         if (reconfigure) {
             if (lateJoin) {
                 const hash = await rpc(0, 'shell_proposeRegisterProver', [keys[3].public_key, 1]);
@@ -765,7 +859,7 @@ try {
             result.adaptation = 'Explicit coordinated future memberships, local registry activation0, 1536 genuine transfers. Automatic recruitment and offline takeover remain unqualified.';
         }
         result.reopenPassed = true;
-        result.status = reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
+        result.status = registryWorkers ? 'PASS: automatic canonical membership, live later recruitment, 1024 genuine transfers, original proof history, exact reward and all four native reopens' : reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
     }
     await save();
     console.log(JSON.stringify({

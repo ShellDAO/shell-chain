@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add optional registry-derived L1 worker membership. Compatible fresh nodes
+  discover canonically registered provers without coordinated address lists or
+  epoch edits, retain historical ownership, and persist the selected mode across
+  restart. Discovery requires complete local registration capture; legacy and
+  snapshot databases fail closed until index rebuilding is available. Offline
+  takeover remains separate work.
 - Add a connected native prover-cohort acceptance mode that keeps the authority
   running through worker sync, overlapping CPU proofs and ordered settlement,
   then checks exact rewards and all-node database reopen.
@@ -16,8 +22,8 @@ All notable changes to this project will be documented in this file.
   distinct workers and retain membership across database reopen. This initial
   mode accepts coordinated, append-only future membership epochs selected by
   the first source height of each range. Historical assignment and scheduled
-  database downgrade protection survive reopen; automatic recruitment and
-  offline takeover remain separate work.
+  database downgrade protection survive reopen; offline takeover remains
+  separate work.
 
 ### Fixed
 

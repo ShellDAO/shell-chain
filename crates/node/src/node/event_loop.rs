@@ -540,12 +540,25 @@ impl<S: KvStore + 'static> Node<S> {
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         let worker_cohort = if self.config.node_role.runs_prover() {
-            crate::prover_service::WorkerCohort::open_scheduled(
-                Arc::clone(&self.store),
-                self.config.prover_worker_cohort.clone(),
-                self.config.prover_worker_cohort_schedule.clone(),
-                self.config.proposer_address.unwrap_or(local_signer_address),
-            )
+            if self.config.prover_worker_cohort_from_registry {
+                if !self.config.prover_worker_cohort.is_empty()
+                    || !self.config.prover_worker_cohort_schedule.is_empty()
+                {
+                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts".into()));
+                }
+                crate::prover_service::WorkerCohort::open_registry(
+                    Arc::clone(&self.store),
+                    self.config.proposer_address.unwrap_or(local_signer_address),
+                )
+                .map(Some)
+            } else {
+                crate::prover_service::WorkerCohort::open_scheduled(
+                    Arc::clone(&self.store),
+                    self.config.prover_worker_cohort.clone(),
+                    self.config.prover_worker_cohort_schedule.clone(),
+                    self.config.proposer_address.unwrap_or(local_signer_address),
+                )
+            }
             .map_err(|error| NodeError::Startup(format!("invalid prover worker cohort: {error}")))?
         } else {
             None

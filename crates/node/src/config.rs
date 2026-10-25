@@ -257,6 +257,8 @@ pub struct NodeConfig {
     pub prover_worker_cohort: Vec<shell_primitives::Address>,
     /// Append-only, coordinated future changes to the initial worker cohort.
     pub prover_worker_cohort_schedule: Vec<ProverWorkerEpoch>,
+    /// Derive worker membership from canonical registered prover identities.
+    pub prover_worker_cohort_from_registry: bool,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -323,6 +325,7 @@ impl NodeConfig {
             prover_priority: crate::ProvingPriority::Sequential,
             prover_worker_cohort: Vec::new(),
             prover_worker_cohort_schedule: Vec::new(),
+            prover_worker_cohort_from_registry: false,
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }
