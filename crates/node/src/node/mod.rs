@@ -22478,6 +22478,159 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn early_certificate_requests_missing_block_without_waiting_for_gossip_probe() {
+            use shell_network::{
+                NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+            };
+            use std::time::Duration;
+
+            let (producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let mut follower = setup_node_with_authority(authority);
+            follower.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                store_consistent_genesis(node);
+            }
+            let block = producer.produce_block(&signer, 10).unwrap();
+            let block_hash = block.hash();
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            follower.config.proposer_address = None;
+            follower.config.rpc_enabled = false;
+            follower.config.metrics.enabled = false;
+            let follower = Arc::new(follower);
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let mut sender = bus.join(&NetworkConfig::default());
+            let handle = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(Arc::new(signer), &mut network).await }
+            });
+            let receive_request = async |sender: &mut shell_network::ChannelNetwork| loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    message:
+                        NetworkMessage::BlockRequest {
+                            start_number,
+                            count,
+                            nonce,
+                        },
+                    ..
+                }) = sender.next_event().await
+                {
+                    break (start_number, count, nonce);
+                }
+            };
+            // Observe but do not answer the startup gossip probe. Verified
+            // evidence must recover even while that earlier request is pending.
+            let (_, _, startup_nonce) =
+                tokio::time::timeout(Duration::from_secs(2), receive_request(&mut sender))
+                    .await
+                    .expect("startup head probe");
+            // Untrusted evidence must neither trigger I/O nor advance the chain.
+            for (number, bytes) in [(1, vec![0]), (2, certificate.clone())] {
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: number,
+                        certificate: bytes,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let untrusted =
+                tokio::time::timeout(Duration::from_millis(100), receive_request(&mut sender))
+                    .await;
+            assert!(
+                untrusted.is_err(),
+                "invalid/out-of-window evidence must not fetch blocks"
+            );
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: 1,
+                    certificate: certificate.clone(),
+                })
+                .await
+                .unwrap();
+            // The announcement itself is deliberately absent. Recover its sealed
+            // block through the existing request/response validation path instead.
+            let request =
+                tokio::time::timeout(Duration::from_secs(1), receive_request(&mut sender)).await;
+            if let Ok((start_number, count, nonce)) = request {
+                assert_eq!((start_number, count), (1, 1));
+                assert_eq!(follower.head_number(), 0);
+                assert_eq!(follower.finality.read().last_finalized_number(), 0);
+                // A duplicate certificate must not amplify requests while the
+                // existing bounded request is still awaiting its response.
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: 1,
+                        certificate: certificate.clone(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(tokio::time::timeout(
+                    Duration::from_millis(100),
+                    receive_request(&mut sender)
+                )
+                .await
+                .is_err());
+                // A delayed empty response to the older gossip probe must not
+                // cancel retrieval triggered by newly received quorum evidence.
+                sender
+                    .broadcast(NetworkMessage::BlockResponse {
+                        blocks: vec![],
+                        commit_certificates: vec![],
+                        nonce: startup_nonce,
+                    })
+                    .await
+                    .unwrap();
+                sender
+                    .broadcast(NetworkMessage::BlockResponse {
+                        blocks: vec![block],
+                        commit_certificates: vec![],
+                        nonce,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let finalized = tokio::time::timeout(Duration::from_secs(2), async {
+                while follower.finality.read().last_finalized_number() != 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            follower.shutdown();
+            handle.await.unwrap().unwrap();
+            request.expect("valid next-height evidence must request its missing block before the periodic gossip probe");
+            finalized
+                .expect("the normally imported block must finalize using retained quorum evidence");
+            assert_eq!(
+                follower.chain_store.get_head_hash().unwrap(),
+                Some(block_hash)
+            );
+            assert_eq!(
+                follower.chain_store.get_finalized_number().unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap(),
+                Some(certificate)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn event_loop_finalizes_certificate_received_before_block() {
             use shell_network::{NetworkBus, NetworkConfig, NetworkMessage, NetworkService};
             use std::time::Duration;

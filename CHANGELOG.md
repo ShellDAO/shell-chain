@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Retrieve a missing next-height block directly from the sender of its verified
+  quorum certificate, without waiting for a periodic gossip probe. Duplicate or
+  invalid certificates do not amplify requests, and older empty probe responses
+  cannot cancel retrieval. Normal import and finality validation remain required.
 - Stop a qualifying L1 range at its first complete block even when additional
   successors are locally queued, keeping worker range boundaries consistent.
 

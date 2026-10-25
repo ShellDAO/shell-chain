@@ -39,12 +39,20 @@ impl EarlyCommitCertificate {
         number: u64,
         hash: ShellHash,
         certificate: Vec<u8>,
-    ) {
+    ) -> bool {
         if node.head_number().checked_add(1) == Some(number)
             && node.verify_commit_certificate(number, hash, &certificate)
         {
+            let newly_retained =
+                self.pending
+                    .as_ref()
+                    .is_none_or(|(pending_number, pending_hash, _)| {
+                        *pending_number != number || *pending_hash != hash
+                    });
             self.pending = Some((number, hash, certificate));
+            return newly_retained;
         }
+        false
     }
 
     fn finalize_imported<S: KvStore + 'static>(&mut self, node: &Node<S>) -> bool {
@@ -2338,10 +2346,35 @@ impl<S: KvStore + 'static> Node<S> {
                                         if fin > *fn_w {
                                             *fn_w = fin;
                                         }
-                                    } else {
-                                        early_commit_certificate.retain(
-                                            &self, block_number, block_hash, certificate,
-                                        );
+                                    } else if early_commit_certificate.retain(
+                                        &self, block_number, block_hash, certificate,
+                                    ) {
+                                        // The block announcement may have been lost. A verified
+                                        // next-height certificate identifies a useful source;
+                                        // bypass a pending gossip probe with a bounded unicast.
+                                        // Duplicate certificates do not issue more requests.
+                                        // Start a new request so an older empty gossip response
+                                        // cannot exhaust this certificate-triggered retrieval.
+                                        sync_request = None;
+                                        if self.request_blocks_from(
+                                            &network,
+                                            Some(&peer),
+                                            block_number,
+                                            &mut sync_requested,
+                                            &mut sync_request,
+                                            "early-commit-certificate",
+                                        ).await {
+                                            production_readiness.note_sync_requested(
+                                                self.head_number(),
+                                                std::time::Instant::now(),
+                                                catch_up_timeout,
+                                                "early-commit-certificate",
+                                            );
+                                            sync_retry_attempts_without_progress = 0;
+                                            sync_retry_timer.reset_after(Duration::from_secs(
+                                                SYNC_RETRY_BASE_INTERVAL_SECS,
+                                            ));
+                                        }
                                     }
                                 }
                                 // W.5: Receive a signed wPoA view-change vote from a peer validator.
