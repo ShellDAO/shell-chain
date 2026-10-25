@@ -157,8 +157,9 @@ worker_cohort_from_registry = true
 The option defaults to false and cannot be combined with `worker_cohort` or
 `worker_cohort_schedule`. The network must already configure
 `prover_registry_height`; the option does not activate registration or change
-that height. Initialize a fresh database with this compatible node and sync
-through ordinary block execution. Registration still uses the normal native
+that height. Fresh databases capture registration during ordinary block
+execution. Existing databases can reconstruct missing discovery from complete
+retained canonical history before networking starts. Registration still uses the normal native
 registry transaction and does not grant validator authority. All coordinating
 workers must use the same membership mode. Unconfigured independent workers
 are not prevented from computing duplicate work.
@@ -196,7 +197,29 @@ older writer advances the database without capture, a later compatible writer
 cannot silently certify that gap. Startup and assignment fail closed.
 Snapshot candidates and coverage are not authenticated by the snapshot state
 root; import ignores them and invalidates the destination's discovery certificate.
-Legacy and snapshot index rebuilding remain unavailable in this initial mode.
+Before networking starts, an opted-in prover can rebuild missing local coverage
+from its trusted genesis configuration and retained canonical history. The
+rebuild requires the existing genesis native-metadata checkpoint plus every
+canonical body and transaction witness through the captured head. Reconstruct
+genesis privately and require its hash to match the local trust anchor; custom
+raw native-registry genesis storage still cannot certify an empty initial set.
+Reuse normal fork replay for real signatures, native and AA execution, receipts,
+state roots and proof settlements. Capturing effects during execution also
+covers calls whose registration calldata was constructed by a contract.
+
+Replay uses a private canonical view and its own volatile settlement progress,
+so already-settled live proofs cannot make their historical inclusion look like
+a duplicate. Private execution and history overlays are each bounded at 64 MiB.
+Only after the entire
+captured history validates and the target head still matches, atomically publish
+the address hints and coverage certificate. Do not publish replayed state,
+public-key metadata, algorithm policy, receipts or proof artifacts to the live
+database. An existing valid certificate avoids replay. Missing/pruned history,
+invalid execution, a changed head, an incompatible persisted cohort or a storage
+failure leaves membership uncertified; restore the required archival inputs or
+use ordinary fresh synchronization. The bounded overlay is not a production
+scale performance claim.
+
 A persisted registry mode cannot silently downgrade to independent scheduling
 or a static list. Do not manually create or copy completeness markers.
 
@@ -215,3 +238,16 @@ workers' configuration. It checks that worker's later range, original proof
 bytes, exact canonical rewards, independent state/finality agreement and four
 physical database reopens without regeneration. It does not qualify production
 partitions, index rebuilding, or offline takeover.
+
+The same native entry with `SHELL_COHORT_REBUILD=1` adds full-history snapshot
+migration. This bounded development scenario retains 4096 witness blocks so
+its complete replay inputs remain available; it does not prove that retention
+scale or reconstruct missing signatures from a proof. It exports and imports
+three standalone workers through the public CLI, reconstructs their invalidated local indexes before network startup, and
+checks original proof bytes, balances and settlement counters before reconnecting.
+A later genuine transfer window must produce one actual proof across the rebuilt
+workers and one exact canonical reward. All four databases then reopen with
+persistent discovery and original proof history, without repeating replay or
+proof generation. Snapshot certification is earned by replay, never copied from
+the imported certificate. This manual mode uses the same compatible binary/SDK
+inputs and isolated accounts as the registry membership acceptance.

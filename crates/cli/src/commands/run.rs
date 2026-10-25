@@ -1009,6 +1009,15 @@ async fn run_with_store<S: KvStore + 'static>(
         node.register_authority_pubkey(*address, pubkey);
     }
 
+    if args.prover_worker_cohort_from_registry && node_role.runs_prover() {
+        if let Some(members) = node.rebuild_prover_discovery(&genesis_config)? {
+            info!(
+                members,
+                "rebuilt canonical prover discovery before network startup"
+            );
+        }
+    }
+
     // Set up the network backend.
     if args.p2p {
         #[cfg(feature = "libp2p")]

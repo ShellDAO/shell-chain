@@ -6,12 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Rebuild missing prover discovery metadata before an opted-in worker starts
+  networking. Replay retained canonical bodies and witnesses privately from
+  trusted genesis, verify actual execution and state roots, then publish only
+  discovery hints and coverage atomically. Live state and proof history stay
+  intact; unavailable history or failed replay does not certify a partial set.
 - Add optional registry-derived L1 worker membership. Compatible fresh nodes
   discover canonically registered provers without coordinated address lists or
   epoch edits, retain historical ownership, and persist the selected mode across
-  restart. Discovery requires complete local registration capture; legacy and
-  snapshot databases fail closed until index rebuilding is available. Offline
-  takeover remains separate work.
+  restart. Missing local registration capture can be rebuilt from complete
+  canonical history; unavailable history fails closed. Offline takeover remains
+  separate work.
 - Add a connected native prover-cohort acceptance mode that keeps the authority
   running through worker sync, overlapping CPU proofs and ordered settlement,
   then checks exact rewards and all-node database reopen.

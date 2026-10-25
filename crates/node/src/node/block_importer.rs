@@ -850,6 +850,149 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    /// Repair auxiliary membership only before starting this node's services.
+    /// The caller must hold exclusive database startup ownership.
+    pub fn rebuild_prover_discovery(
+        &self,
+        genesis_config: &shell_genesis::GenesisConfig,
+    ) -> Result<Option<usize>, NodeError> {
+        if !self.config.prover_worker_cohort.is_empty()
+            || !self.config.prover_worker_cohort_schedule.is_empty()
+        {
+            return Err(NodeError::Startup(
+                "registry-derived membership conflicts with explicit cohorts".into(),
+            ));
+        }
+        if self
+            .store
+            .get(b"prover-worker-cohort/v1")?
+            .is_some_and(|mode| mode != b"registry:v3")
+        {
+            return Err(NodeError::Startup(
+                "registry-derived membership conflicts with persisted static assignments".into(),
+            ));
+        }
+        let chain = self.chain_store.as_ref();
+        let cfg = chain.get_chain_config()?.ok_or(NodeError::NoGenesis)?;
+        if cfg.prover_registry_height.is_none() {
+            return Err(NodeError::Startup(
+                "prover discovery rebuild requires configured prover_registry_height".into(),
+            ));
+        }
+        let head = chain.get_head_block()?.ok_or(NodeError::NoGenesis)?;
+        if chain.has_complete_prover_discovery(cfg.genesis_hash)? {
+            WorldState::at_root_with_cache_mb(self.store.clone(), &head.header.state_root, 0)?
+                .registered_prover_members(cfg.genesis_hash)?;
+            return Ok(None);
+        }
+        let seed = Arc::new(shell_storage::MemoryDb::new());
+        let genesis = shell_genesis::initialize_genesis(genesis_config, seed.clone())
+            .map_err(|error| NodeError::Startup(format!("prover discovery genesis: {error}")))?;
+        if genesis.hash() != cfg.genesis_hash
+            || chain.get_block_hash_by_number(0)? != Some(genesis.hash())
+            || genesis_config.chain_id != cfg.chain_id
+        {
+            return Err(NodeError::Startup(
+                "prover discovery rebuild genesis mismatch".into(),
+            ));
+        }
+        // Custom raw registry allocations cannot prove an initially empty set.
+        WorldState::at_root(seed.clone(), &genesis.header.state_root)?
+            .registered_prover_members(genesis.hash())?;
+        let overlay = Arc::new(
+            chain
+                .native_replay_overlay()?
+                .with_write_limit(64 * 1024 * 1024)?,
+        );
+        let replay_chain = ChainStore::new(overlay.clone());
+        if !replay_chain.restore_genesis_metadata_checkpoint(&genesis.hash())? {
+            return Err(NodeError::Startup(
+                "prover discovery genesis metadata checkpoint unavailable".into(),
+            ));
+        }
+        // Reconstruct even pruned genesis trie nodes privately. Retain the source
+        // chain configuration, including already scheduled compatible upgrades.
+        for (key, value) in seed.scan_prefix(b"")? {
+            if key != b"CFG" {
+                overlay.put(&key, &value)?;
+            }
+        }
+        let state = WorldState::at_root(overlay.clone(), &genesis.header.state_root)?;
+        let mut registry = load_algorithm_registry(&state)
+            .map_err(|error| NodeError::Startup(format!("prover discovery registry: {error}")))?;
+        // Validation must observe historical canonical and settlement progress,
+        // not this live node's already-compressed tip. Only the private overlay
+        // is rewound; retained source bodies/witnesses still come from `chain`.
+        replay_chain.commit_canonical_rewind(
+            &[],
+            &(1..=head.number()).collect::<Vec<_>>(),
+            &genesis.hash(),
+            0,
+            shell_primitives::U256::ZERO,
+            0,
+        )?;
+        for key in [
+            b"BODY_PRUNED_BELOW".as_slice(),
+            b"WITNESS_PRUNED_BELOW",
+            b"STATE_TRIE_PRUNED_BELOW",
+        ] {
+            overlay.put(key, &0u64.to_be_bytes())?;
+        }
+        let mut replay_config = self.config.clone();
+        replay_config.state_cache_size_mb = 0;
+        let (validation_node, _) =
+            crate::builder::NodeBuilder::new(replay_config, overlay.clone()).build()?;
+        let mut parent = genesis.header;
+        for number in 1..=head.number() {
+            let block = chain.get_block_by_number(number)?.ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "prover discovery canonical body #{number} unavailable"
+                ))
+            })?;
+            if block.number() != number
+                || block.header.parent_hash != parent.hash()
+                || chain.get_block_hash_by_number(number)? != Some(block.hash())
+            {
+                return Err(NodeError::Startup(
+                    "prover discovery ancestry mismatch".into(),
+                ));
+            }
+            if !block.transactions.is_empty() && !chain.has_witness_bundle(&block.hash())? {
+                return Err(NodeError::Startup(format!(
+                    "prover discovery witness #{number} unavailable"
+                )));
+            }
+            let execution = Arc::new(
+                shell_storage::OverlayStore::new(overlay.clone())
+                    .with_write_limit(64 * 1024 * 1024)?,
+            );
+            let (receipts, settlements) = validation_node.replay_fork_block_with_registry(
+                &block,
+                parent.state_root,
+                execution.clone(),
+                &mut registry,
+            )?;
+            // Commit this block only into the private history view.
+            execution.commit()?;
+            replay_chain.commit_canonical_block(&block, Some(&receipts))?;
+            for amendment in settlements {
+                let mut settled = validation_node.settled_stark_sources.lock();
+                for source in amendment.covered_hashes() {
+                    settled.insert((amendment.layer, source));
+                }
+            }
+            parent = block.header;
+        }
+        if parent.hash() != head.hash() {
+            return Err(NodeError::Startup("prover discovery target changed".into()));
+        }
+        let members = WorldState::at_root_with_cache_mb(overlay, &head.header.state_root, 0)?
+            .prover_discovery_candidates()?;
+        let addresses: Vec<_> = members.iter().map(|(address, _)| *address).collect();
+        chain.publish_rebuilt_prover_discovery(cfg.genesis_hash, head.hash(), &addresses)?;
+        Ok(Some(addresses.len()))
+    }
+
     fn replay_fork_block_with_registry(
         &self,
         block: &Block,

@@ -26,6 +26,52 @@ fn key(address: &Address, field: u64) -> ShellHash {
     blake3_hash(&bytes)
 }
 
+impl<S: KvStore> crate::ChainStore<S> {
+    /// Check certificate availability without hiding database read failures.
+    pub fn has_complete_prover_discovery(&self, genesis: ShellHash) -> Result<bool, StorageError> {
+        if self.store().get(PROVER_DISCOVERY_GENESIS)?.as_deref() != Some(genesis.as_bytes()) {
+            return Ok(false);
+        }
+        match self.validate_prover_discovery_coverage() {
+            Ok(()) => Ok(true),
+            Err(StorageError::State(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Publish only discovery hints after a caller has replayed the complete
+    /// canonical history privately while holding exclusive startup ownership.
+    pub fn publish_rebuilt_prover_discovery(
+        &self,
+        genesis: ShellHash,
+        expected_head: ShellHash,
+        members: &[Address],
+    ) -> Result<(), StorageError> {
+        if self.get_head_hash()? != Some(expected_head)
+            || self.get_block_hash_by_number(0)? != Some(genesis)
+        {
+            return Err(StorageError::State(
+                "canonical chain changed during prover discovery rebuild".into(),
+            ));
+        }
+        let mut batch = crate::WriteBatch::new();
+        for address in members {
+            let mut key = CANDIDATES.to_vec();
+            key.extend_from_slice(address.as_bytes());
+            batch.put(key, vec![]);
+        }
+        batch.put(
+            PROVER_DISCOVERY_GENESIS.to_vec(),
+            genesis.as_bytes().to_vec(),
+        );
+        batch.put(
+            PROVER_DISCOVERY_HEAD.to_vec(),
+            expected_head.as_bytes().to_vec(),
+        );
+        self.store().write_batch(batch)
+    }
+}
+
 impl<S: KvStore + 'static> WorldState<S> {
     /// Enumerate candidate preimages against this exact trie root. The local
     /// index is never registration evidence; rolled-back and orphaned candidates
@@ -41,6 +87,13 @@ impl<S: KvStore + 'static> WorldState<S> {
         }
         crate::ChainStore::new(std::sync::Arc::clone(self.store()))
             .validate_prover_discovery_coverage()?;
+        self.prover_discovery_candidates()
+    }
+
+    /// Return valid hinted records at this root without certifying completeness.
+    /// Private full-history replay uses this before publishing coverage. Worker
+    /// assignment must use `registered_prover_members` instead.
+    pub fn prover_discovery_candidates(&self) -> Result<Vec<(Address, u64)>, StorageError> {
         let mut members = Vec::new();
         let mut cursor: Option<Vec<u8>> = None;
         loop {

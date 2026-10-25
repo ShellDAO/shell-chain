@@ -30,12 +30,14 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 const nodes = [];
 const ports = [], p2p = [], metrics = [];
 const keys = [];
+const datadirs = [];
 const lateJoin = process.env.SHELL_COHORT_LATE_JOIN === '1';
 const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
 const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
 const connectedWorkers = process.env.SHELL_COHORT_CONNECTED === '1';
-const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1';
+const rebuildWorkers = process.env.SHELL_COHORT_REBUILD === '1';
+const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1' || rebuildWorkers;
 assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
 const nodeCount = lateJoin || registryWorkers ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
@@ -129,8 +131,10 @@ for (const sig of [
 async function start(i, boot, role = i === 0 ? 'validator' : 'prover') {
     result.nodesStopped = false;
     const args = [
-        '--password-file', password, 'run', '--keystore', join(out, `key${i}.json`), '--config', join(out, `node${i}.toml`), '--datadir', join(out, `db${i}`), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', `127.0.0.1:${metrics[i]}`, '--p2p', '--p2p-addr', `127.0.0.1:${p2p[i]}`, '--node-role', role, '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--block-time', '1000', '--max-idle-interval', '0', '--log-level', 'info'
+        '--password-file', password, 'run', '--keystore', join(out, `key${i}.json`), '--config', join(out, `node${i}.toml`), '--datadir', datadirs[i] ?? join(out, `db${i}`), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', `127.0.0.1:${metrics[i]}`, '--p2p', '--p2p-addr', `127.0.0.1:${p2p[i]}`, '--node-role', role, '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--block-time', '1000', '--max-idle-interval', '0', '--log-level', 'info'
     ];
+    if (rebuildWorkers)
+        args.push('--witness-retention','4096');
     if (boot)
         args.push('--bootnode', boot);
     if (logPhases[i]++) {
@@ -729,6 +733,98 @@ try {
             result.registryMembership={initialEnd:firstEnd,joiningAddress:keys[3].address,registrationHash:hash,registrationBlock:receipt.blockNumber,newRange:{start:firstEnd+1,end},proofSha256:digest,initialProofSha256:initialDigest,reward:reward.toString(),allFourReopened:true,canonicalAnchor:{number:anchor.number,hash:anchor.hash,stateRoot:anchor.stateRoot}};
             result.accepted=1024;result.recipientBalance='1024';
             result.adaptation='Opt-in canonical registry-derived ownership, fresh compatible discovery indexes, 1024 genuine transfers and a later registered worker; no manual worker address lists or epochs. Offline takeover and snapshot/legacy index rebuild remain unqualified.';
+            if (rebuildWorkers) {
+                const beforeBalances = [], beforeCounts = [];
+                for (const i of [1,2,3]) {
+                    beforeBalances[i] = BigInt(await rpc(0,'eth_getBalance',[keys[i].address,'latest']));
+                    beforeCounts[i] = (await rpc(0,'shell_getRegisteredProver',[keys[i].address])).proofs_submitted;
+                }
+                await stopAll();
+                for (const i of [1,2,3]) {
+                    const snapshot = join(out,`worker${i}.snapshot.jsonl`);
+                    cli(`export-worker${i}`,['--datadir',join(out,`db${i}`),'export-state','--output',snapshot]);
+                    const destination = join(out,`db${i}-snapshot`);
+                    cli(`init-snapshot${i}`,['--datadir',destination,'init','--genesis',join(out,'genesis.json'),'--chain-id','1337','--network','dev']);
+                    cli(`import-worker${i}`,['--datadir',destination,'import-state','--snapshot',snapshot]);
+                    datadirs[i] = destination;
+                }
+                // Finish private history reconstruction before resuming the
+                // authority, so maintenance time does not create empty sources.
+                for (const i of [1,2,3]) {
+                    await start(i,boot);
+                    assert.match(await readFile(join(out,`node${i}.log`),'utf8'),/rebuilt canonical prover discovery before network startup/);
+                    assert.equal(count(await metricText(i)),0,'snapshot reconstruction does not generate CPU proofs');
+                    assert.equal(BigInt(await rpc(i,'eth_getTransactionCount',[sender.getAddress(),'latest'])),1024n);
+                    for (const [sourceHash,expected] of [[block.hash,digest],[firstBlock.hash,initialDigest]]) {
+                        const stored = await rpc(i,'shell_getProofAmendment',[sourceHash]);
+                        assert.equal(createHash('sha256').update(Buffer.from(stored.proof.slice(2),'hex')).digest('hex'),expected);
+                    }
+                }
+                await start(0);
+                await until(async () => Number(BigInt(await rpc(0,'net_peerCount'))) > 0);
+                for (let offset=1024;offset<1536;offset+=16) {
+                    const hashes=[];
+                    for(let nonce=offset;nonce<offset+16;nonce++) {
+                        const tx=await sender.buildSignedTransaction({tx:buildTransaction({chainId:1337,nonce,to:recipient,value:1n,gasLimit:21000}),includePublicKey:true});
+                        hashes.push(await paced(()=>provider.sendTransaction(tx)));
+                    }
+                    for(const hash of hashes) {
+                        const receipt=await until(()=>rpc(0,'eth_getTransactionReceipt',[hash]));
+                        assert.equal(receipt.status,'0x1');result.receipts.push(receipt);
+                    }
+                    await save();
+                }
+                await until(async()=> {
+                    const counts=await Promise.all([1,2,3].map(async i=>count(await metricText(i))));
+                    return counts.reduce((a,b)=>a+b,0)>=1;
+                },90);
+                const generated=await Promise.all([1,2,3].map(async i=>count(await metricText(i))));
+                assert.equal(generated.reduce((a,b)=>a+b,0),1);
+                const owner=generated.indexOf(1)+1;
+                const record=await until(async()=> {
+                    const rec=await rpc(0,'shell_getRegisteredProver',[keys[owner].address]);
+                    return rec.proofs_submitted===beforeCounts[owner]+1 && rec;
+                });
+                const lastEnd=record.last_proof_block;
+                const sourceBlock=await rpc(0,'eth_getBlockByNumber',['0x'+lastEnd.toString(16),false]);
+                const amendment=await rpc(owner,'shell_getProofAmendment',[sourceBlock.hash]);
+                const proofDigest=createHash('sha256').update(Buffer.from(amendment.proof.slice(2),'hex')).digest('hex');
+                const known=new Set([...result.receipts.map(r=>r.transactionHash),result.registration1.hash,result.registration2.hash,result.registryMembership.registrationHash]);
+                let nonEmpty=0;
+                for(let height=end+1;height<=lastEnd;height++) {
+                    const current=await rpc(0,'eth_getBlockByNumber',['0x'+height.toString(16),true]);
+                    if(current.transactions.some(tx=>known.has(tx.hash)))nonEmpty++;
+                }
+                const increment=50_000_000_000_000_000_000n*BigInt(nonEmpty);
+                const finalAnchor=await rpc(0,'eth_getBlockByNumber',['latest',false]);
+                for(const i of [0,1,2,3]) {
+                    await until(async()=>BigInt((await rpc(i,'eth_getBlockByNumber',['finalized',false])).number)>=BigInt(finalAnchor.number));
+                    const same=await rpc(i,'eth_getBlockByNumber',[finalAnchor.number,false]);
+                    assert.equal(same.hash,finalAnchor.hash);assert.equal(same.stateRoot,finalAnchor.stateRoot);
+                    assert.equal(BigInt(await rpc(i,'eth_getBalance',[recipient,'latest'])),1536n);
+                    for(const member of [1,2,3]) {
+                        assert.equal(BigInt(await rpc(i,'eth_getBalance',[keys[member].address,'latest'])),beforeBalances[member]+(member===owner?increment:0n));
+                        assert.equal((await rpc(i,'shell_getRegisteredProver',[keys[member].address])).proofs_submitted,beforeCounts[member]+(member===owner?1:0));
+                    }
+                }
+                await stopAll();
+                await start(0);for(const i of [1,2,3])await start(i,boot);
+                for(const i of [0,1,2,3]) {
+                    assert.equal(BigInt(await rpc(i,'eth_getTransactionCount',[sender.getAddress(),'latest'])),1536n);
+                    assert.equal(BigInt(await rpc(i,'eth_getBalance',[keys[owner].address,'latest'])),beforeBalances[owner]+increment);
+                    for(const [sourceHash,expected] of [[firstBlock.hash,initialDigest],[block.hash,digest],[sourceBlock.hash,proofDigest]]) {
+                        const stored=await rpc(i,'shell_getProofAmendment',[sourceHash]);
+                        assert.equal(createHash('sha256').update(Buffer.from(stored.proof.slice(2),'hex')).digest('hex'),expected);
+                    }
+                    if(i>0) {
+                        assert.equal(count(await metricText(i)),0,'rebuilt discovery and settled proofs persist without recomputation');
+                        assert.doesNotMatch(await readFile(join(out,`node${i}.log`),'utf8'),/rebuilt canonical prover discovery before network startup/);
+                    }
+                }
+                result.registryRebuild={importedWorkers:3,canonicalReplayObserved:true,newRange:{start:end+1,end:lastEnd},owner:keys[owner].address,proofSha256:proofDigest,rewardIncrement:increment.toString(),allFourReopened:true,canonicalAnchor:{number:finalAnchor.number,hash:finalAnchor.hash,stateRoot:finalAnchor.stateRoot}};
+                result.accepted=1536;result.recipientBalance='1536';
+                result.adaptation='Opt-in canonical registry membership, three full-history snapshot imports, private signature/execution/root replay and auxiliary index publication, then an actual later proof and reward across rebuilt workers. Missing/pruned bodies, witnesses or genesis metadata remain a failure; offline takeover is unqualified.';
+            }
         }
         if (reconfigure) {
             if (lateJoin) {
@@ -859,7 +955,7 @@ try {
             result.adaptation = 'Explicit coordinated future memberships, local registry activation0, 1536 genuine transfers. Automatic recruitment and offline takeover remain unqualified.';
         }
         result.reopenPassed = true;
-        result.status = registryWorkers ? 'PASS: automatic canonical membership, live later recruitment, 1024 genuine transfers, original proof history, exact reward and all four native reopens' : reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
+        result.status = rebuildWorkers ? 'PASS: three full-history snapshot indexes rebuilt, 1536 genuine transfers, actual later proof and exact reward, original history and all four reopens' : registryWorkers ? 'PASS: automatic canonical membership, live later recruitment, 1024 genuine transfers, original proof history, exact reward and all four native reopens' : reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
     }
     await save();
     console.log(JSON.stringify({

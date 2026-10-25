@@ -2121,6 +2121,14 @@ mod tests {
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.inner.scan_prefix(prefix)
         }
+
+        fn snapshot_prefixes(
+            &self,
+            prefixes: &[&[u8]],
+            max_bytes: usize,
+        ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+            self.inner.snapshot_prefixes(prefixes, max_bytes)
+        }
     }
 
     #[test]
@@ -4277,6 +4285,148 @@ mod tests {
             U256::from(50_000_000_000_000_000_000u128)
         );
         assert!(node.stark_reward_value(20_047, &invalid).is_err());
+    }
+
+    #[test]
+    fn prover_discovery_rebuild_replays_real_registration_without_live_state_writes() {
+        for failure in 0..11 {
+            let signer = DilithiumSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let prover = DilithiumSigner::generate();
+            let address = Address::from_public_key(prover.public_key(), prover.sig_type().as_u8());
+            let config: shell_genesis::GenesisConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "chain_name":"discovery-rebuild", "network_type":"Dev",
+                "timestamp":0, "gas_limit":30000000, "extra_data":"discovery-rebuild",
+                "prover_registry_height":0, "boot_nodes":[],
+                "alloc":{(authority.to_string()):{"balance":"1000000000000000000000000"}},
+                "consensus":{"engine":"poa","authorities":[authority],"block_time_secs":1,"max_future_secs":60}
+            })).unwrap();
+            let store = Arc::new(FailingBatchDb::new());
+            let genesis = shell_genesis::initialize_genesis(&config, store.clone()).unwrap();
+            let (mut node, _) =
+                crate::builder::NodeBuilder::new(NodeConfig::dev(authority), store.clone())
+                    .build()
+                    .unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let mut tx = signed_tx_with_gas_limit(100_000).tx;
+            tx.max_fee_per_gas = shell_core::INITIAL_BASE_FEE;
+            tx.to = Some(shell_pqvm::registry_address());
+            tx.data = Bytes::from(shell_pqvm::encode_register_prover_calldata(
+                prover.public_key(),
+                prover.sig_type().as_u8(),
+            ));
+            let transaction = submit_signed_tx(&node, &signer, authority, tx);
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .status,
+                1
+            );
+            assert!(node
+                .world_state
+                .read()
+                .get_registered_prover(&address)
+                .unwrap()
+                .is_some());
+            assert!(node.chain_store.has_witness_bundle(&block.hash()).unwrap());
+            for (key, _) in store.scan_prefix(b"prover-discovery/").unwrap() {
+                store.delete(&key).unwrap();
+            }
+            assert!(
+                crate::prover_service::WorkerCohort::open_registry(store.clone(), address).is_err(),
+                "old database baseline must reject an uncertified member list"
+            );
+            let root = current_state_root(&node);
+            let mut supplied = config.clone();
+            match failure {
+                1 => node.chain_store.delete_body(&block.hash()).unwrap(),
+                2 => supplied.timestamp += 1,
+                3 => store.fail_next_batch(),
+                4 => {
+                    for (key, _) in store.scan_prefix(b"w/").unwrap() {
+                        store.delete(&key).unwrap();
+                    }
+                }
+                5 => {
+                    let mut tampered = block.clone();
+                    tampered.transactions.clear();
+                    node.chain_store.put_block(&tampered).unwrap();
+                }
+                6 => store.fail_next_get(),
+                7 => {
+                    for (key, _) in store.scan_prefix(b"amc/").unwrap() {
+                        store.delete(&key).unwrap();
+                    }
+                }
+                8 => store
+                    .put(b"prover-worker-cohort/v1", authority.as_bytes())
+                    .unwrap(),
+                9 => node.config.prover_worker_cohort = vec![authority],
+                10 => {
+                    let alias = ShellHash::from([0xE4; 32]);
+                    for prefix in [b"b/".as_slice(), b"w/", b"h/"] {
+                        let original = [prefix, block.hash().as_bytes()].concat();
+                        let copy = [prefix, alias.as_bytes()].concat();
+                        if let Some(value) = store.get(&original).unwrap() {
+                            store.put(&copy, &value).unwrap();
+                        }
+                    }
+                    node.chain_store.set_canonical(1, &alias).unwrap();
+                }
+                _ => {}
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            let result = node.rebuild_prover_discovery(&supplied);
+            if failure == 0 {
+                assert_eq!(result.unwrap(), Some(1));
+                assert_eq!(node.rebuild_prover_discovery(&config).unwrap(), None);
+                assert_eq!(
+                    node.world_state
+                        .read()
+                        .registered_prover_members(genesis.hash())
+                        .unwrap(),
+                    vec![(address, 1)]
+                );
+                assert!(
+                    crate::prover_service::WorkerCohort::open_registry(store.clone(), address)
+                        .is_ok()
+                );
+                // The cohort marker is an intentional later startup write.
+                let filtered = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+                    rows.into_iter()
+                        .filter(|(key, _)| {
+                            !key.starts_with(b"prover-discovery/")
+                                && !key.starts_with(b"prover-worker-cohort/")
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(filtered(store.scan_prefix(b"").unwrap()), filtered(before));
+                assert_eq!(
+                    node.chain_store
+                        .get_tx_location(&transaction)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    block.hash()
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "failure case {failure}; certificate={:?}",
+                    store.get(b"prover-discovery/head/v1").unwrap()
+                );
+                assert_eq!(
+                    store.scan_prefix(b"").unwrap(),
+                    before,
+                    "failed replay/publication must not write canonical/native metadata"
+                );
+            }
+            assert_eq!(current_state_root(&node), root);
+        }
     }
 
     #[test]
