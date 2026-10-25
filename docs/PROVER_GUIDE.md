@@ -432,6 +432,25 @@ once in source order, with their exact rewards. All three databases reopen again
 with the balances, nonces, finalized hashes and prover counters intact. This
 controls worker startup order; it does not transfer an absent owner's work.
 
+For a bounded concurrency check, use `SHELL_COHORT_PARALLEL=1` separately from
+all other options. It accumulates 1,024 genuine transfers and synchronizes the
+workers as validators before restarting both as isolated dev provers while the
+authority is stopped. It then reconnects the native nodes and requires settlement
+from those persisted proofs without regeneration. It requires overlapping
+start/finish intervals recorded inside the two actual CPU proof calls, distinct
+input-derived ranges, exactly one generated proof per worker, ordered settlement
+with exact rewards, and consistent state after reopening all three databases.
+The validator must generate no proof. An overlap failure leaves concurrency
+unqualified even when settlement succeeds. This local workload does not measure
+throughput, speedup or CPU core utilization.
+
+Persisted L1 frontier proofs are re-advertised directly to newly connected
+peers and on the existing periodic retry. Recovery admits at most the two pending
+settlement slots, rechecks canonical order, prover authentication and source
+binding, and retains artifacts on storage or transport errors. A later proof
+waits for its predecessor; settled proofs stop retrying. This does not move work
+from an absent owner.
+
 The entry retains private keys and databases for inspection and stops its own
 processes. It does not qualify automatic recruitment, failover or production scale.
 

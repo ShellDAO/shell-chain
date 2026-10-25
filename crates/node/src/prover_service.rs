@@ -322,7 +322,16 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
     ) -> Result<shell_stark_prover::SigBatchProof, String> {
         // Start inside the worker: queueing and ordered handoff are not CPU proving time.
         let _timer = metrics.map(|m| m.stark_proof_duration_seconds.start_timer());
-        prove_sig_batch(entries)
+        let started = Instant::now();
+        info!(entries = entries.len(), "STARK CPU proof started");
+        let result = prove_sig_batch(entries);
+        info!(
+            entries = entries.len(),
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            success = result.is_ok(),
+            "STARK CPU proof finished"
+        );
+        result
     }
 
     /// Set the signer used to authenticate locally generated amendments.

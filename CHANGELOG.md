@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Record L1 CPU proof start, completion and duration inside each proof worker,
+  allowing a native concurrency check to distinguish overlapping computation
+  from queued work or ordered result delivery.
 - Optional fixed L1 prover worker cohorts partition canonical proof ranges across
   distinct workers and retain membership across database reopen. This initial
   mode accepts coordinated, append-only future membership epochs selected by
@@ -15,6 +18,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Re-advertise persisted L1 frontier proofs when peers reconnect and on the
+  existing retry timer, so offline-completed work reaches validators and settles
+  without recomputation. Retries revalidate canonical order and authentication.
 - Retain valid L1 proofs completed ahead of their frontier until the preceding
   range arrives, including across recovery. Later completion does not trigger
   proof regeneration; settlement and block import still require canonical order.

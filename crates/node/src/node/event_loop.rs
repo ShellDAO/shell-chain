@@ -2477,6 +2477,10 @@ impl<S: KvStore + 'static> Node<S> {
                                 "peer-connected",
                             )
                             .await;
+                            self.rebroadcast_stark_frontier_amendments(
+                                &network,
+                                Some(&peer),
+                            ).await;
                         }
                         Some(NetworkEvent::PeerDisconnected(peer)) => {
                             info!(%peer, "peer disconnected");
@@ -2567,6 +2571,9 @@ impl<S: KvStore + 'static> Node<S> {
                 }
 
                 _ = tx_rebroadcast_timer.tick() => {
+                    if network.peer_count().await > 0 {
+                        self.rebroadcast_stark_frontier_amendments(&network, None).await;
+                    }
                     if network.peer_count().await > 0 && !self.tx_pool.is_empty() {
                         self.rebroadcast_pending_transactions(
                             &network,
@@ -2993,6 +3000,76 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
         Ok(recovered)
+    }
+
+    /// Retry only the bounded, canonical L1 settlement frontier. Recovery must
+    /// not turn a disconnected completed proof into new CPU work or scan ahead
+    /// of a missing predecessor merely to advertise later ranges.
+    pub(super) fn stark_frontier_amendments_for_rebroadcast(
+        &self,
+    ) -> Result<Vec<ProofAmendment>, NodeError> {
+        self.recover_stark_frontier_amendments()?;
+        let amendments: Vec<_> = self
+            .pending_stark_settlements
+            .lock()
+            .iter()
+            .filter(|amendment| amendment.layer == 1)
+            .take(MAX_PENDING_STARK_SETTLEMENTS)
+            .cloned()
+            .collect();
+        // Validate a fresh sequence against canonical state, without counting
+        // each pending amendment as an overlap with itself.
+        self.validate_stark_settlement_sequence(&amendments)?;
+        for amendment in &amendments {
+            self.validate_prover_admission(amendment)?;
+            self.validate_stark_proof_source_binding(amendment)?;
+        }
+        Ok(amendments)
+    }
+
+    async fn rebroadcast_stark_frontier_amendments<N: NetworkService + ?Sized>(
+        &self,
+        network: &NetworkInterface<'_, N>,
+        target_peer: Option<&shell_network::PeerId>,
+    ) {
+        let amendments = match self.stark_frontier_amendments_for_rebroadcast() {
+            Ok(amendments) => amendments,
+            Err(error) => {
+                warn!(%error, "failed to recover canonical STARK proofs for rebroadcast");
+                return;
+            }
+        };
+        for amendment in amendments {
+            let payload = match amendment.to_json() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(%error, "failed to serialize recovered STARK proof for rebroadcast");
+                    return;
+                }
+            };
+            let message = NetworkMessage::ProofAmendment {
+                block_hash: amendment.block_hash,
+                block_number: amendment.block_number,
+                payload,
+            };
+            let result = if let Some(peer) = target_peer {
+                network.send_to_peer(peer, message).await
+            } else {
+                network.broadcast(message).await
+            };
+            if let Err(error) = result {
+                warn!(%error, "failed to rebroadcast recovered STARK proof; retaining artifacts");
+                return;
+            }
+            self.metrics.stark_amendments_broadcast.inc();
+            info!(
+                block = amendment.block_number,
+                peer = target_peer
+                    .map(|peer| peer.0.as_str())
+                    .unwrap_or("broadcast"),
+                "rebroadcast recovered canonical STARK proof"
+            );
+        }
     }
 
     pub(crate) fn enqueue_stark_frontier_backlog(

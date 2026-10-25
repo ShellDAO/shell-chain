@@ -89,3 +89,23 @@ owner absent until the later proof has been generated and its databases reopened
 It then checks source-ordered settlements, exact rewards and all-node reopen
 without recomputing the completed range. This does not change owner selection or
 add an offline takeover policy.
+
+### Persisted proof delivery after reconnection
+
+A CPU result can be durable before any peer receives its announcement. Recovery
+into the local settlement queue alone does not deliver that result to an
+independent validator. On peer connection, send recovered canonical L1 frontier
+proofs directly to that peer; reuse the existing periodic transaction retry for
+bounded proof rebroadcast as well. Read only the current frontier, reuse the two
+pending settlement slots, and revalidate the complete ordered sequence, prover
+authentication and canonical source binding before sending. Later stored ranges
+remain behind a missing predecessor and become eligible after canonical progress.
+Storage and transport errors preserve the original artifacts. Canonical
+settlement removes the queued range and ends retries; neither recovery nor
+rebroadcast starts a CPU job or increments the generated-proof counter.
+
+The manual parallel acceptance mode uses pre-synchronized isolated dev workers
+to make two short CPU calls overlap without pausing either call. It then rejoins
+the native network, checks that settlement uses those exact proof bytes with
+ordered rewards, and reopens the databases. This is a bounded concurrency and
+delivery check; it does not qualify online recruitment, takeover or throughput.

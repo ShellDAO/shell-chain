@@ -33,7 +33,8 @@ const keys = [];
 const lateJoin = process.env.SHELL_COHORT_LATE_JOIN === '1';
 const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
-assert.ok(!delayedPredecessor || !reconfigure, 'Run delayed predecessor and membership scenarios separately');
+const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
+assert.ok(!(delayedPredecessor && parallelWorkers) && (!(delayedPredecessor || parallelWorkers) || !reconfigure), 'Run parallel, delayed predecessor and membership scenarios separately');
 const nodeCount = lateJoin ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
@@ -123,10 +124,10 @@ for (const sig of [
     'SIGINT', 'SIGTERM'
 ])
     process.once(sig, () => stopAll().then(save).then(() => process.exit(1)));
-async function start(i, boot) {
+async function start(i, boot, role = i === 0 ? 'validator' : 'prover') {
     result.nodesStopped = false;
     const args = [
-        '--password-file', password, 'run', '--keystore', join(out, `key${i}.json`), '--config', join(out, `node${i}.toml`), '--datadir', join(out, `db${i}`), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', `127.0.0.1:${metrics[i]}`, '--p2p', '--p2p-addr', `127.0.0.1:${p2p[i]}`, '--node-role', i === 0 ? 'validator' : 'prover', '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--block-time', '1000', '--max-idle-interval', '0', '--log-level', 'info'
+        '--password-file', password, 'run', '--keystore', join(out, `key${i}.json`), '--config', join(out, `node${i}.toml`), '--datadir', join(out, `db${i}`), '--network', 'dev', '--chain-id', '1337', '--db', 'rocksdb', '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', `127.0.0.1:${metrics[i]}`, '--p2p', '--p2p-addr', `127.0.0.1:${p2p[i]}`, '--node-role', role, '--enable-stark-aggregation', '--consensus-engine', 'wpoa', '--block-time', '1000', '--max-idle-interval', '0', '--log-level', 'info'
     ];
     if (boot)
         args.push('--bootnode', boot);
@@ -160,11 +161,10 @@ function count(text) {
     return Number(m[1]);
 }
 async function checkDelayedPredecessor(boot, validators) {
-    result.adaptation = 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
+    result.adaptation = parallelWorkers ? 'Explicit scheduled ownership and overlapping native CPU proof calls, 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
     const provider = createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[0]}` });
     const recipient = '0x' + 'ab'.repeat(32);
-    // Accumulate two genuine windows before either prover starts. The first
-    // owner is deliberately absent while the second completes its own work.
+    // Accumulate two genuine windows before either CPU proof worker starts.
     for (let offset = 0; offset < 1024; offset += 16) {
         const hashes = [];
         for (let nonce = offset; nonce < offset + 16; nonce++) {
@@ -217,55 +217,119 @@ async function checkDelayedPredecessor(boot, validators) {
         fromBlock + '\nworkers=' + JSON.stringify([keys[2].address]) + '\n';
     for (const i of [1, 2]) await writeFile(join(out, `node${i}.toml`), config);
     const record = i => rpc(0, 'shell_getRegisteredProver', [keys[i].address]);
-    await start(2, boot);
-    await until(async () => count(await metricText(2)) === 1, 90);
-    const laterGenerated = count(await metricText(2));
-    await until(async () => /G5: proof amendment artifacts stored/.test(await readFile(join(out, 'node0.log'), 'utf8')));
-    assert.equal((await record(1)).proofs_submitted, 0);
-    assert.equal((await record(2)).proofs_submitted, 0);
-    const stored = await readFile(join(out, 'node2.log'), 'utf8');
-    const range = stored.match(/range ending at block #(\d+) \((\d+) source hashes\)/);
-    assert.ok(range, 'later proof persisted before predecessor');
-    const laterRange = { end: Number(range[1]), start: Number(range[1]) - Number(range[2]) + 1 };
-    assert.equal(laterRange.start, fromBlock);
-    assert.equal(laterRange.end, expectedRanges[1].end);
-    const laterBlock = await rpc(0, 'eth_getBlockByNumber', ['0x' + laterRange.end.toString(16), false]);
-    const originalProof = await rpc(2, 'shell_getProofAmendment', [laterBlock.hash]);
-    assert.equal(originalProof.proof_entries, expectedRanges[1].entries);
-    const originalProofHash = createHash('sha256').update(Buffer.from(originalProof.proof.slice(2), 'hex')).digest('hex');
-    const peerProof = await rpc(0, 'shell_getProofAmendment', [laterBlock.hash]);
-    assert.equal(peerProof.proof, originalProof.proof, 'independent validator retained the actual later proof');
-    result.completionOrder = { fromBlock, laterRange, laterGeneratedBeforePredecessor: laterGenerated, settlementsBeforePredecessor: 0 };
-    result.completionOrder.originalLaterProofSha256 = originalProofHash;
-    await stopAll();
-    await start(0);
-    await start(2, boot);
-    await until(async () => BigInt(await rpc(2, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 1024n);
-    // Poll after multiple admission ticks so a regenerated proof cannot hide
-    // behind an immediate zero-valued metric after process startup.
-    await pause(2500);
-    assert.equal(count(await metricText(2)), 0, 'persisted later proof survives cold reopen without recomputation');
-    for (const i of [0, 2]) {
-        const saved = await rpc(i, 'shell_getProofAmendment', [laterBlock.hash]);
-        assert.ok(saved?.proof, 'waiting proof survives both physical database reopens');
-        assert.equal(createHash('sha256').update(Buffer.from(saved.proof.slice(2), 'hex')).digest('hex'), originalProofHash);
-    }
-    assert.equal((await record(2)).proofs_submitted, 0, 'later proof cannot settle across the gap');
-    await start(1, boot);
-    await until(async () => (await record(1)).proofs_submitted === 1 && (await record(2)).proofs_submitted === 1, 90);
-    assert.equal(count(await metricText(0)), 0, 'validator recovers stored proofs without CPU proving');
-    const generated = await Promise.all([1, 2].map(async i => count(await metricText(i))));
-    assert.deepEqual(generated, [1, 0], 'only the missing predecessor is computed after reopen');
-    const ranges = [];
-    for (const i of [1, 2]) {
-        const log = await readFile(join(out, `node${i}.log`), 'utf8');
-        for (const m of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
-            ranges.push({ worker: i, end: Number(m[1]), start: Number(m[1]) - Number(m[2]) + 1 });
+    let laterGenerated, originalProofHash, generated, ranges;
+    if (parallelWorkers) {
+        // Synchronize both databases using the normal validator role, which does
+        // no CPU proof work. Restart both normal prover processes together so
+        // their independent assigned ranges are available at startup.
+        await Promise.all([1, 2].map(i => start(i, boot, 'validator')));
+        for (const i of [1, 2]) {
+            await until(async () => BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 1024n);
+            assert.equal(count(await metricText(i)), 0);
         }
+        await stopAll();
+        // Pre-synchronized dev nodes can compute without peers. Keep the
+        // authority stopped during computation so changing empty tips and
+        // independent sync handshakes cannot stagger these short proof calls.
+        // No proof call is paused, delayed or replaced.
+        await Promise.all([1, 2].map(i => start(i)));
+        await until(async () => (await Promise.all([1, 2].map(async i => count(await metricText(i))))).every(n => n === 1), 90);
+        await until(async () => (await Promise.all([1, 2].map(async i => /ProverService: proof amendment stored/.test(await readFile(join(out, `node${i}.log`), 'utf8'))))).every(Boolean));
+        generated = await Promise.all([1, 2].map(async i => count(await metricText(i))));
+        assert.deepEqual(generated, [1, 1], 'each worker generates exactly its own proof');
+        const intervals = [];
+        ranges = [];
+        for (const i of [1, 2]) {
+            const log = await readFile(join(out, `node${i}.log`), 'utf8');
+            const starts = log.split('\n').filter(line => line.includes('STARK CPU proof started'));
+            const ends = log.split('\n').filter(line => line.includes('STARK CPU proof finished'));
+            assert.equal(starts.length, 1);
+            assert.equal(ends.length, 1);
+            assert.match(ends[0], /success=true/);
+            const begin = Date.parse(starts[0].split(/\s+/)[0]);
+            const end = Date.parse(ends[0].split(/\s+/)[0]);
+            assert.ok(Number.isFinite(begin) && end > begin, 'actual CPU call has timestamped endpoints');
+            intervals.push({ worker: i, begin, end, startLog: starts[0], endLog: ends[0] });
+            const stored = [...log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)];
+            assert.equal(stored.length, 1);
+            const range = { worker: i, end: Number(stored[0][1]), start: Number(stored[0][1]) - Number(stored[0][2]) + 1 };
+            assert.equal(range.start, expectedRanges[i - 1].start);
+            assert.equal(range.end, expectedRanges[i - 1].end);
+            ranges.push(range);
+        }
+        const overlapMs = Math.min(...intervals.map(x => x.end)) - Math.max(...intervals.map(x => x.begin));
+        const proofSha256 = [];
+        for (const i of [1, 2]) {
+            assert.equal(BigInt(await rpc(i, 'net_peerCount')), 0n, 'computation uses the pre-synchronized isolated dev topology');
+            const block = await rpc(i, 'eth_getBlockByNumber', ['0x' + expectedRanges[i - 1].end.toString(16), false]);
+            const saved = await rpc(i, 'shell_getProofAmendment', [block.hash]);
+            assert.equal(saved.proof_entries, expectedRanges[i - 1].entries);
+            proofSha256.push(createHash('sha256').update(Buffer.from(saved.proof.slice(2), 'hex')).digest('hex'));
+        }
+        result.parallelCpu = { intervals, overlapMs, generated, ranges, proofSha256, topology: 'Pre-synchronized isolated dev proof computation, then native network rejoin for settlement' };
+        await save();
+        assert.ok(overlapMs > 0, 'independent native CPU proof calls must overlap; successful settlement alone is insufficient');
+        laterGenerated = generated[1];
+        await stopAll();
+        await start(0);
+        await Promise.all([1, 2].map(i => start(i, boot)));
+        await until(async () => (await record(1)).proofs_submitted === 1 && (await record(2)).proofs_submitted === 1, 90);
+        assert.equal(count(await metricText(0)), 0, 'validator never generates a proof');
+        result.parallelCpu.generatedAfterRejoin = await Promise.all([1, 2].map(async i => count(await metricText(i))));
+        assert.deepEqual(result.parallelCpu.generatedAfterRejoin, [0, 0], 'network rejoin settles the persisted proofs without regeneration');
+        result.completionOrder = { fromBlock, laterRange: ranges[1], parallelCpu: true };
+    } else {
+        await start(2, boot);
+        await until(async () => count(await metricText(2)) === 1, 90);
+        laterGenerated = count(await metricText(2));
+        await until(async () => /G5: proof amendment artifacts stored/.test(await readFile(join(out, 'node0.log'), 'utf8')));
+        assert.equal((await record(1)).proofs_submitted, 0);
+        assert.equal((await record(2)).proofs_submitted, 0);
+        const stored = await readFile(join(out, 'node2.log'), 'utf8');
+        const range = stored.match(/range ending at block #(\d+) \((\d+) source hashes\)/);
+        assert.ok(range, 'later proof persisted before predecessor');
+        const laterRange = { end: Number(range[1]), start: Number(range[1]) - Number(range[2]) + 1 };
+        assert.equal(laterRange.start, fromBlock);
+        assert.equal(laterRange.end, expectedRanges[1].end);
+        const laterBlock = await rpc(0, 'eth_getBlockByNumber', ['0x' + laterRange.end.toString(16), false]);
+        const originalProof = await rpc(2, 'shell_getProofAmendment', [laterBlock.hash]);
+        assert.equal(originalProof.proof_entries, expectedRanges[1].entries);
+        originalProofHash = createHash('sha256').update(Buffer.from(originalProof.proof.slice(2), 'hex')).digest('hex');
+        const peerProof = await rpc(0, 'shell_getProofAmendment', [laterBlock.hash]);
+        assert.equal(peerProof.proof, originalProof.proof, 'independent validator retained the actual later proof');
+        result.completionOrder = { fromBlock, laterRange, laterGeneratedBeforePredecessor: laterGenerated, settlementsBeforePredecessor: 0 };
+        result.completionOrder.originalLaterProofSha256 = originalProofHash;
+        await stopAll();
+        await start(0);
+        await start(2, boot);
+        await until(async () => BigInt(await rpc(2, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 1024n);
+        // Poll after multiple admission ticks so a regenerated proof cannot hide
+        // behind an immediate zero-valued metric after process startup.
+        await pause(2500);
+        assert.equal(count(await metricText(2)), 0, 'persisted later proof survives cold reopen without recomputation');
+        for (const i of [0, 2]) {
+            const saved = await rpc(i, 'shell_getProofAmendment', [laterBlock.hash]);
+            assert.ok(saved?.proof, 'waiting proof survives both physical database reopens');
+            assert.equal(createHash('sha256').update(Buffer.from(saved.proof.slice(2), 'hex')).digest('hex'), originalProofHash);
+        }
+        assert.equal((await record(2)).proofs_submitted, 0, 'later proof cannot settle across the gap');
+        await start(1, boot);
+        await until(async () => (await record(1)).proofs_submitted === 1 && (await record(2)).proofs_submitted === 1, 90);
+        assert.equal(count(await metricText(0)), 0, 'validator recovers stored proofs without CPU proving');
+        generated = await Promise.all([1, 2].map(async i => count(await metricText(i))));
+        assert.deepEqual(generated, [1, 0], 'only the missing predecessor is computed after reopen');
+        ranges = [];
+        for (const i of [1, 2]) {
+            const log = await readFile(join(out, `node${i}.log`), 'utf8');
+            for (const m of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
+                ranges.push({ worker: i, end: Number(m[1]), start: Number(m[1]) - Number(m[2]) + 1 });
+            }
+        }
+        assert.equal(ranges.length, 1);
+        assert.equal(ranges[0].start, 0);
+        assert.equal(ranges[0].end + 1, laterRange.start);
     }
-    assert.equal(ranges.length, 1);
-    assert.equal(ranges[0].start, 0);
-    assert.equal(ranges[0].end + 1, laterRange.start);
+    const laterRange = { start: fromBlock, end: expectedRanges[1].end };
     const rewardPayloads = [];
     const lastHeight = Number(BigInt(await rpc(0, 'eth_blockNumber')));
     for (let height = laterRange.end + 1; height <= lastHeight; height++) {
@@ -285,7 +349,11 @@ async function checkDelayedPredecessor(boot, validators) {
         assert.equal(amendment.start_block, expectedRanges[batch].start);
         assert.equal(amendment.end_block, expectedRanges[batch].end);
         assert.equal(amendment.proof.n_sigs, expectedRanges[batch].entries);
-        if (batch === 1) {
+        if (parallelWorkers) {
+            const proofHex = '0x' + Buffer.from(amendment.proof.proof_bytes).toString('hex');
+            assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), result.parallelCpu.proofSha256[batch], 'settlement uses the actual overlapping CPU proof bytes');
+        }
+        if (batch === 1 && !parallelWorkers) {
             const proofHex = '0x' + Buffer.from(amendment.proof.proof_bytes).toString('hex');
             assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), originalProofHash, 'settlement uses the original later proof bytes');
         }
@@ -329,7 +397,7 @@ async function checkDelayedPredecessor(boot, validators) {
     await pause(1500);
     for (const i of [1, 2]) assert.equal(count(await metricText(i)), 0, 'settled ranges are not regenerated after all nodes reopen');
     result.workers = [1, 2].map(i => ({ i, generated: i === 1 ? generated[0] : laterGenerated, generationLogs: [], record: result.completionOrder.records[i - 1] }));
-    result.status = 'PASS: later proof completed first, persisted across cold reopen, both original ranges settled once, 1024 genuine transfers and all native reopens';
+    result.status = parallelWorkers ? 'PASS: overlapping native CPU proof calls, disjoint canonical ranges, exact rewards, 1024 genuine transfers and all native reopens' : 'PASS: later proof completed first, persisted across cold reopen, both original ranges settled once, 1024 genuine transfers and all native reopens';
 }
 try {
     result.binaryVersion = cli('version', [
@@ -397,7 +465,7 @@ try {
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
         await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n');
-    if (delayedPredecessor) {
+    if (delayedPredecessor || parallelWorkers) {
         await checkDelayedPredecessor(boot, validators);
     } else {
         await start(1, boot);

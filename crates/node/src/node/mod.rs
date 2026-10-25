@@ -21271,6 +21271,12 @@ mod tests {
         );
         assert!(node.pending_stark_settlements.lock().is_empty());
         assert!(
+            node.stark_frontier_amendments_for_rebroadcast()
+                .unwrap()
+                .is_empty(),
+            "a missing predecessor keeps the later proof out of frontier gossip"
+        );
+        assert!(
             !node
                 .proof_backlog
                 .lock()
@@ -21303,6 +21309,16 @@ mod tests {
 
         node.config.node_role = crate::NodeRole::Validator;
         node.store_stark_artifacts(&amendments[0], None).unwrap();
+        let replay = node.stark_frontier_amendments_for_rebroadcast().unwrap();
+        assert_eq!(
+            replay, amendments,
+            "rejoin advertises the original authenticated proof bytes"
+        );
+        let mut tampered_pending = amendments[0].clone();
+        tampered_pending.prover_signature = Bytes::new();
+        node.pending_stark_settlements.lock()[0] = tampered_pending;
+        assert!(node.stark_frontier_amendments_for_rebroadcast().is_err());
+        node.pending_stark_settlements.lock()[0] = amendments[0].clone();
         node.enqueue_stark_frontier_backlog(64).unwrap();
         assert_eq!(
             node.pending_stark_settlements.lock().as_slice(),
@@ -21364,6 +21380,12 @@ mod tests {
             node.pending_stark_settlements.lock().is_empty(),
             "settled proofs must not be queued twice"
         );
+        assert!(
+            node.stark_frontier_amendments_for_rebroadcast()
+                .unwrap()
+                .is_empty(),
+            "canonical settlement ends proof retries"
+        );
     }
 
     #[test]
@@ -21387,6 +21409,10 @@ mod tests {
         target_key.extend_from_slice(end.as_bytes());
         *db.fail_get_key.lock() = Some(target_key);
         let error = node.enqueue_stark_frontier_backlog(8).unwrap_err();
+        assert!(matches!(error, NodeError::Storage(_)));
+        let error = node
+            .stark_frontier_amendments_for_rebroadcast()
+            .unwrap_err();
         assert!(matches!(error, NodeError::Storage(_)));
         *db.fail_get_key.lock() = None;
         assert_eq!(
