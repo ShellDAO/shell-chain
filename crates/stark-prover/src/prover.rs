@@ -279,6 +279,12 @@ pub fn verify_sig_batch(sig_proof: &SigBatchProof) -> Result<(), String> {
         );
     }
     let inner = sig_proof.inner_proof()?;
+    // Winterfell constructs the AIR from this untrusted trace description.
+    // Reject an incompatible layout before SigBatchAir's constructor asserts.
+    if inner.trace_info().main_trace_width() != TRACE_WIDTH || inner.trace_info().is_multi_segment()
+    {
+        return Err("signature batch proof has an unsupported trace layout".into());
+    }
     let (batch_root_lo, batch_root_hi) = bytes_to_root(&sig_proof.batch_root_bytes);
     let pub_inputs = SigBatchPublicInputs {
         batch_root_lo,
@@ -343,6 +349,16 @@ mod tests {
         let proof = prove_sig_batch(&entries).expect("prove failed");
         assert_eq!(proof.n_sigs, 10);
         verify_sig_batch(&proof).expect("verify failed");
+    }
+
+    #[test]
+    fn tampered_trace_width_returns_error() {
+        let mut proof = prove_sig_batch(&[make_entry(1)]).unwrap();
+        // Winterfell serializes the main trace width in the first byte.
+        proof.proof_bytes[0] ^= 1;
+        assert!(verify_sig_batch(&proof)
+            .unwrap_err()
+            .contains("unsupported trace layout"));
     }
 
     #[test]

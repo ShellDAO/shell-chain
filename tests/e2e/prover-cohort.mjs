@@ -32,6 +32,8 @@ const ports = [], p2p = [], metrics = [];
 const keys = [];
 const lateJoin = process.env.SHELL_COHORT_LATE_JOIN === '1';
 const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
+const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
+assert.ok(!delayedPredecessor || !reconfigure, 'Run delayed predecessor and membership scenarios separately');
 const nodeCount = lateJoin ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
@@ -157,6 +159,178 @@ function count(text) {
     assert.ok(m, 'generated metric present');
     return Number(m[1]);
 }
+async function checkDelayedPredecessor(boot, validators) {
+    result.adaptation = 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
+    const provider = createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[0]}` });
+    const recipient = '0x' + 'ab'.repeat(32);
+    // Accumulate two genuine windows before either prover starts. The first
+    // owner is deliberately absent while the second completes its own work.
+    for (let offset = 0; offset < 1024; offset += 16) {
+        const hashes = [];
+        for (let nonce = offset; nonce < offset + 16; nonce++) {
+            const tx = await sender.buildSignedTransaction({
+                tx: buildTransaction({ chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000 }),
+                includePublicKey: true
+            });
+            hashes.push(await paced(() => provider.sendTransaction(tx)));
+        }
+        for (const hash of hashes) {
+            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+            assert.equal(receipt.status, '0x1');
+            result.receipts.push(receipt);
+        }
+        result.accepted = result.receipts.length;
+        await save();
+    }
+    // Determine complete-block windows before any worker runs. Each submitted
+    // transfer and each registry governance request contributes one signature.
+    // System reward transactions do not contribute a user signature.
+    const signedHashes = new Set([
+        ...result.receipts.map(receipt => receipt.transactionHash),
+        result.registration1.hash, result.registration2.hash
+    ]);
+    assert.equal(signedHashes.size, 1026);
+    const expectedRanges = [];
+    let rangeStart = 0, entries = 0, nonEmptySources = 0, observed = 0;
+    const sourceHead = Number(BigInt(result.receipts.at(-1).blockNumber));
+    for (let height = 0; height <= sourceHead; height++) {
+        const block = await rpc(0, 'eth_getBlockByNumber', ['0x' + height.toString(16), true]);
+        const count = block.transactions.filter(tx => signedHashes.has(tx.hash)).length;
+        observed += count;
+        entries += count;
+        if (count) nonEmptySources++;
+        if (entries >= 512) {
+            expectedRanges.push({ start: rangeStart, end: height, entries, nonEmptySources });
+            rangeStart = height + 1;
+            entries = 0;
+            nonEmptySources = 0;
+        }
+    }
+    assert.equal(observed, 1026, 'all submitted signed inputs are canonical');
+    assert.equal(expectedRanges.length, 2);
+    const fromBlock = expectedRanges[1].start;
+    result.expectedCompletionRanges = expectedRanges;
+    result.completionTailEntries = entries;
+    assert.ok(entries < 512, 'only a sub-threshold tail may remain unproved');
+    const config = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' +
+        JSON.stringify([keys[1].address]) + '\n[[prover.worker_cohort_schedule]]\nfrom_block=' +
+        fromBlock + '\nworkers=' + JSON.stringify([keys[2].address]) + '\n';
+    for (const i of [1, 2]) await writeFile(join(out, `node${i}.toml`), config);
+    const record = i => rpc(0, 'shell_getRegisteredProver', [keys[i].address]);
+    await start(2, boot);
+    await until(async () => count(await metricText(2)) === 1, 90);
+    const laterGenerated = count(await metricText(2));
+    await until(async () => /G5: proof amendment artifacts stored/.test(await readFile(join(out, 'node0.log'), 'utf8')));
+    assert.equal((await record(1)).proofs_submitted, 0);
+    assert.equal((await record(2)).proofs_submitted, 0);
+    const stored = await readFile(join(out, 'node2.log'), 'utf8');
+    const range = stored.match(/range ending at block #(\d+) \((\d+) source hashes\)/);
+    assert.ok(range, 'later proof persisted before predecessor');
+    const laterRange = { end: Number(range[1]), start: Number(range[1]) - Number(range[2]) + 1 };
+    assert.equal(laterRange.start, fromBlock);
+    assert.equal(laterRange.end, expectedRanges[1].end);
+    const laterBlock = await rpc(0, 'eth_getBlockByNumber', ['0x' + laterRange.end.toString(16), false]);
+    const originalProof = await rpc(2, 'shell_getProofAmendment', [laterBlock.hash]);
+    assert.equal(originalProof.proof_entries, expectedRanges[1].entries);
+    const originalProofHash = createHash('sha256').update(Buffer.from(originalProof.proof.slice(2), 'hex')).digest('hex');
+    const peerProof = await rpc(0, 'shell_getProofAmendment', [laterBlock.hash]);
+    assert.equal(peerProof.proof, originalProof.proof, 'independent validator retained the actual later proof');
+    result.completionOrder = { fromBlock, laterRange, laterGeneratedBeforePredecessor: laterGenerated, settlementsBeforePredecessor: 0 };
+    result.completionOrder.originalLaterProofSha256 = originalProofHash;
+    await stopAll();
+    await start(0);
+    await start(2, boot);
+    await until(async () => BigInt(await rpc(2, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 1024n);
+    // Poll after multiple admission ticks so a regenerated proof cannot hide
+    // behind an immediate zero-valued metric after process startup.
+    await pause(2500);
+    assert.equal(count(await metricText(2)), 0, 'persisted later proof survives cold reopen without recomputation');
+    for (const i of [0, 2]) {
+        const saved = await rpc(i, 'shell_getProofAmendment', [laterBlock.hash]);
+        assert.ok(saved?.proof, 'waiting proof survives both physical database reopens');
+        assert.equal(createHash('sha256').update(Buffer.from(saved.proof.slice(2), 'hex')).digest('hex'), originalProofHash);
+    }
+    assert.equal((await record(2)).proofs_submitted, 0, 'later proof cannot settle across the gap');
+    await start(1, boot);
+    await until(async () => (await record(1)).proofs_submitted === 1 && (await record(2)).proofs_submitted === 1, 90);
+    assert.equal(count(await metricText(0)), 0, 'validator recovers stored proofs without CPU proving');
+    const generated = await Promise.all([1, 2].map(async i => count(await metricText(i))));
+    assert.deepEqual(generated, [1, 0], 'only the missing predecessor is computed after reopen');
+    const ranges = [];
+    for (const i of [1, 2]) {
+        const log = await readFile(join(out, `node${i}.log`), 'utf8');
+        for (const m of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
+            ranges.push({ worker: i, end: Number(m[1]), start: Number(m[1]) - Number(m[2]) + 1 });
+        }
+    }
+    assert.equal(ranges.length, 1);
+    assert.equal(ranges[0].start, 0);
+    assert.equal(ranges[0].end + 1, laterRange.start);
+    const rewardPayloads = [];
+    const lastHeight = Number(BigInt(await rpc(0, 'eth_blockNumber')));
+    for (let height = laterRange.end + 1; height <= lastHeight; height++) {
+        const block = await rpc(0, 'eth_getBlockByNumber', ['0x' + height.toString(16), true]);
+        for (const tx of block.transactions) {
+            if (tx.type === '0x81') rewardPayloads.push(tx);
+        }
+    }
+    assert.equal(rewardPayloads.length, 2, 'both original proofs settle exactly once');
+    const canonical = await rpc(0, 'eth_getBlockByNumber', ['0x' + lastHeight.toString(16), false]);
+    const rewards = [];
+    for (let batch = 0; batch < 2; batch++) {
+        const tx = rewardPayloads[batch];
+        const amendment = tx.decodedInput;
+        assert.ok(amendment, 'settlement exposes its actual proof payload');
+        assert.equal(amendment.prover.toLowerCase(), keys[batch + 1].address.toLowerCase());
+        assert.equal(amendment.start_block, expectedRanges[batch].start);
+        assert.equal(amendment.end_block, expectedRanges[batch].end);
+        assert.equal(amendment.proof.n_sigs, expectedRanges[batch].entries);
+        if (batch === 1) {
+            const proofHex = '0x' + Buffer.from(amendment.proof.proof_bytes).toString('hex');
+            assert.equal(createHash('sha256').update(Buffer.from(proofHex.slice(2), 'hex')).digest('hex'), originalProofHash, 'settlement uses the original later proof bytes');
+        }
+        const expected = 50_000_000_000_000_000_000n * BigInt(expectedRanges[batch].nonEmptySources);
+        assert.equal(BigInt(tx.value), expected);
+        assert.equal(BigInt(await rpc(0, 'eth_getBalance', [keys[batch + 1].address, 'latest'])), expected);
+        assert.equal((await rpc(0, 'eth_getTransactionReceipt', [tx.hash])).status, '0x1');
+        rewards.push(expected.toString());
+    }
+    result.completionOrder.predecessorRange = ranges[0];
+    result.completionOrder.generatedAfterReopen = generated;
+    result.completionOrder.records = await Promise.all([1, 2].map(record));
+    result.completionOrder.rewardTransactions = rewardPayloads;
+    result.completionOrder.rewards = rewards;
+    result.recipientBalance = '1024';
+    const last = result.receipts.at(-1);
+    for (const i of [0, 1, 2]) {
+        await until(async () => (await rpc(i, 'eth_getTransactionReceipt', [last.transactionHash]))?.status === '0x1' &&
+            BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])) === 1024n);
+        assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1024n);
+        assert.deepEqual(await rpc(i, 'shell_getValidators'), validators);
+        await until(async () => {
+            const records = await Promise.all([1, 2].map(worker => rpc(i, 'shell_getRegisteredProver', [keys[worker].address])));
+            const finalized = await rpc(i, 'eth_getBlockByNumber', ['finalized', false]);
+            return records.every(item => item.proofs_submitted === 1) && BigInt(finalized.number) >= BigInt(lastHeight);
+        });
+        assert.equal((await rpc(i, 'eth_getBlockByNumber', [canonical.number, false])).hash, canonical.hash);
+    }
+    await stopAll();
+    await start(0);
+    await start(1, boot);
+    await start(2, boot);
+    for (const i of [0, 1, 2]) {
+        assert.equal(BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])), 1024n);
+        assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1024n);
+        for (const worker of [1, 2]) {
+            assert.equal((await rpc(i, 'shell_getRegisteredProver', [keys[worker].address])).proofs_submitted, 1);
+            assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[worker].address, 'latest'])), BigInt(rewards[worker - 1]));
+        }
+    }
+    await pause(1500);
+    for (const i of [1, 2]) assert.equal(count(await metricText(i)), 0, 'settled ranges are not regenerated after all nodes reopen');
+    result.workers = [1, 2].map(i => ({ i, generated: i === 1 ? generated[0] : laterGenerated, generationLogs: [], record: result.completionOrder.records[i - 1] }));
+    result.status = 'PASS: later proof completed first, persisted across cold reopen, both original ranges settled once, 1024 genuine transfers and all native reopens';
+}
 try {
     result.binaryVersion = cli('version', [
         '--version'
@@ -223,261 +397,265 @@ try {
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
         await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n');
-    await start(1, boot);
-    await start(2, boot);
-    for (let i = 1; i < 3; i++) {
-        await until(async () => Number(BigInt(await rpc(i, 'net_peerCount'))) > 0 && !!(await rpc(i, 'shell_getRegisteredProver', [
-            keys[2].address
-        ])));
-        assert.equal(count(await metricText(i)), 0);
-    }
-    result.connectedBeforeWindow = await Promise.all([
-        0, 1, 2
-    ].map(i => rpc(i, 'shell_getNodeInfo')));
-    await save();
-    const provider = createShellProvider({
-        rpcHttpUrl: `http://127.0.0.1:${ports[0]}`
-    });
-    const recipient = '0x' + 'ab'.repeat(32);
-    const signed = [];
-    for (let nonce = 0; nonce < 512; nonce++)
-        signed.push(await sender.buildSignedTransaction({
-            tx: buildTransaction({
-                chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000
-            }), includePublicKey: true
-        }));
-    for (let offset = 0; offset < 512; offset += 16) {
-        const hashes = [];
-        for (const tx of signed.slice(offset, offset + 16))
-            hashes.push(await paced(() => provider.sendTransaction(tx)));
-        for (const h of hashes) {
-            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [
-                h
-            ]));
-            assert.equal(receipt.status, '0x1');
-            result.receipts.push(receipt);
+    if (delayedPredecessor) {
+        await checkDelayedPredecessor(boot, validators);
+    } else {
+        await start(1, boot);
+        await start(2, boot);
+        for (let i = 1; i < 3; i++) {
+            await until(async () => Number(BigInt(await rpc(i, 'net_peerCount'))) > 0 && !!(await rpc(i, 'shell_getRegisteredProver', [
+                keys[2].address
+            ])));
+            assert.equal(count(await metricText(i)), 0);
         }
-        result.accepted = result.receipts.length;
+        result.connectedBeforeWindow = await Promise.all([
+            0, 1, 2
+        ].map(i => rpc(i, 'shell_getNodeInfo')));
         await save();
-        console.log('accepted', result.accepted);
-    }
-    assert.equal(BigInt(await rpc(0, 'eth_getBalance', [
-        recipient, 'latest'
-    ])), 512n);
-    result.recipientBalance = '512';
-    assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
-    await until(async () => count(await metricText(1)) + count(await metricText(2)) >= 1, 90);
-    await pause(5000);
-    result.workers = [];
-    for (let i = 1; i < 3; i++) {
-        const text = await metricText(i);
-        await writeFile(join(out, `metrics${i}.txt`), text);
-        const log = await readFile(join(out, `node${i}.log`), 'utf8');
-        const relevant = log.split('\n').filter(s => /ProverService: (proving|proof amendment stored|proof generation)|proof task panicked/.test(s));
-        result.workers.push({
-            i, address: keys[i].address, generated: count(text), generationLogs: relevant, record: await rpc(0, 'shell_getRegisteredProver', [
-                keys[i].address
-            ])
+        const provider = createShellProvider({
+            rpcHttpUrl: `http://127.0.0.1:${ports[0]}`
         });
-    }
-    result.sourceBlocks = [
-        ...new Set(result.receipts.map(x => x.blockHash))
-    ];
-    result.finalized = await rpc(0, 'eth_getBlockByNumber', [
-        'finalized', false
-    ]);
-    const total = result.workers.reduce((n, w) => n + w.generated, 0);
-    assert.equal(total, 1, 'the one qualifying canonical window must have one generated proof across the cohort');
-    const last = result.receipts.at(-1);
-    await until(async () => {
-        const f = await rpc(0, 'eth_getBlockByNumber', [
-            'finalized', false
-        ]);
-        return BigInt(f.number) >= BigInt(last.blockNumber);
-    });
-    await until(async () => {
-        const counts = await Promise.all([
-            1, 2
-        ].map(i => rpc(0, 'shell_getRegisteredProver', [
-            keys[i].address
-        ])));
-        return counts.reduce((n, x) => n + x.proofs_submitted, 0) === 1;
-    });
-    for (let i = 1; i < 3; i++)
-        await until(async () => {
-            const f = await rpc(i, 'eth_getTransactionReceipt', [
-                last.transactionHash
-            ]);
-            return f?.status === '0x1' && BigInt(await rpc(i, 'eth_getBalance', [
-                recipient, 'latest'
-            ])) === 512n;
-        });
-    await stopAll();
-    await save();
-    // Reopening the same database with a different membership must fail before
-    // listeners or proof work start; restoring the original config must recover.
-    const cfg = join(out, 'node1.toml');
-    const original = await readFile(cfg, 'utf8');
-    await writeFile(cfg, '[prover]\nworker_cohort=' + JSON.stringify([
-        keys[1].address
-    ]) + '\n');
-    const wrong = spawnSync(binary, result.commands.find(c => c.label === 'start1').args, {
-        encoding: 'utf8', timeout: 30000
-    });
-    await writeFile(join(out, 'changed-cohort.log'), wrong.stdout + wrong.stderr);
-    assert.notEqual(wrong.status, 0);
-    assert.match(wrong.stdout + wrong.stderr, /persisted assignment/);
-    result.changedCohortRejected = {
-        status: wrong.status
-    };
-    await writeFile(cfg, original);
-    await start(0);
-    await start(1, boot);
-    await start(2, boot);
-    for (let i = 0; i < 3; i++) {
-        assert.equal(BigInt(await rpc(i, 'eth_getBalance', [
+        const recipient = '0x' + 'ab'.repeat(32);
+        const signed = [];
+        for (let nonce = 0; nonce < 512; nonce++)
+            signed.push(await sender.buildSignedTransaction({
+                tx: buildTransaction({
+                    chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000
+                }), includePublicKey: true
+            }));
+        for (let offset = 0; offset < 512; offset += 16) {
+            const hashes = [];
+            for (const tx of signed.slice(offset, offset + 16))
+                hashes.push(await paced(() => provider.sendTransaction(tx)));
+            for (const h of hashes) {
+                const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [
+                    h
+                ]));
+                assert.equal(receipt.status, '0x1');
+                result.receipts.push(receipt);
+            }
+            result.accepted = result.receipts.length;
+            await save();
+            console.log('accepted', result.accepted);
+        }
+        assert.equal(BigInt(await rpc(0, 'eth_getBalance', [
             recipient, 'latest'
         ])), 512n);
-        assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [
-            sender.getAddress(), 'latest'
-        ])), 512n);
-        assert.equal((await rpc(i, 'eth_getTransactionReceipt', [
-            last.transactionHash
-        ])).status, '0x1');
-    }
-    await pause(1500);
-    for (let i = 1; i < 3; i++)
-        assert.equal(count(await metricText(i)), 0, 'persisted proofs must not be recomputed after all native nodes restart');
-    if (reconfigure) {
-        if (lateJoin) {
-            const hash = await rpc(0, 'shell_proposeRegisterProver', [keys[3].public_key, 1]);
-            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
-            assert.equal(receipt.status, '0x1');
-            const record = await rpc(0, 'shell_getRegisteredProver', [keys[3].address]);
-            assert.ok(record);
-            assert.equal(record.proofs_submitted, 0);
-            assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
-            result.registration3 = { hash, receipt, record };
-        }
-        // Choose different old/new owners for the crossing range, so selecting
-        // membership by its end height would actually fail this native check.
-        const firstEnd = Number(result.workers.flatMap(w => w.generationLogs).join('\n').match(/range ending at block #(\d+)/)[1]);
-        const crossingStart = firstEnd + 1;
-        const firstSource = await rpc(0, 'eth_getBlockByNumber', ['0x' + crossingStart.toString(16), false]);
-        assert.ok(firstSource?.hash);
-        const sorted = keys.slice(1, 3).map(k => k.address.toLowerCase()).sort();
-        const oldOwner = sorted[Number(BigInt('0x' + firstSource.hash.slice(2, 18)) % 2n)];
-        const crossingWorker = keys.findIndex(k => k.address.toLowerCase() === oldOwner);
-        const target = lateJoin ? 3 : 3 - crossingWorker;
-        const heads = await Promise.all([0, 1, 2].map(i => rpc(i, 'eth_blockNumber')));
-        const fromBlock = Math.max(...heads.map(h => Number(BigInt(h)))) + 2;
-        await stopAll();
-        const base = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n';
-        const scheduled = height => base + '[[prover.worker_cohort_schedule]]\nfrom_block=' + height + '\nworkers=' + JSON.stringify([keys[target].address]) + '\n';
-        const failStart = async (name, config, pattern) => {
-            await writeFile(cfg, config);
-            const failed = spawnSync(binary, result.commands.find(c => c.label === 'start1').args, { encoding: 'utf8', timeout: 30000 });
-            await writeFile(join(out, name + '.log'), failed.stdout + failed.stderr);
-            assert.equal(failed.status, 1, name);
-            assert.match(failed.stdout + failed.stderr, pattern);
-            result[name] = { status: failed.status };
-        };
-        await failStart('backdated-schedule', scheduled(1), /persisted canonical head/);
-        for (const i of workers)
-            await writeFile(join(out, `node${i}.toml`), scheduled(fromBlock));
-        await start(0);
-        await start(1, boot);
-        await start(2, boot);
-        if (lateJoin) {
-            await start(3, boot);
-            await until(async () => {
-                const record = await rpc(3, 'shell_getRegisteredProver', [keys[3].address]);
-                return Number(BigInt(await rpc(3, 'net_peerCount'))) > 0 && !!record &&
-                    BigInt(await rpc(3, 'eth_getBalance', [recipient, 'latest'])) === 512n;
-            }, 90);
-            assert.equal(BigInt(await rpc(3, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 512n);
-            assert.equal(count(await metricText(3)), 0, 'fresh epoch-only worker must not prove historical ranges');
-            result.lateJoin = { beforeNewWindow: await rpc(3, 'shell_getNodeInfo'), historicalBalance: '512', historicalNonce: '512', historicalGenerated: 0 };
-            await save();
-        }
-        const settlementCount = async () => {
-            const records = await Promise.all(workers.map(i => rpc(0, 'shell_getRegisteredProver', [keys[i].address])));
-            return records.reduce((n, x) => n + x.proofs_submitted, 0);
-        };
-        const submitWindow = async (firstNonce) => {
-            for (let offset = firstNonce; offset < firstNonce + 512; offset += 16) {
-                const hashes = [];
-                for (let nonce = offset; nonce < offset + 16; nonce++) {
-                    const tx = await sender.buildSignedTransaction({ tx: buildTransaction({ chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000 }), includePublicKey: true });
-                    hashes.push(await paced(() => provider.sendTransaction(tx)));
-                }
-                for (const hash of hashes) {
-                    const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
-                    assert.equal(receipt.status, '0x1');
-                    result.receipts.push(receipt);
-                }
-            }
-        };
-        // The first post-restart range may start BEFORE the new epoch and cross
-        // its activation. It must finish whole under the original membership.
-        await submitWindow(512);
-        await until(async () => await settlementCount() === 2, 90);
-        const before = await Promise.all(workers.map(async (i) => count(await metricText(i))));
-        assert.equal(before.reduce((n, x) => n + x, 0), 1, 'crossing range generated exactly once');
-        await submitWindow(1024);
-        await until(async () => await settlementCount() === 3, 90);
-        await pause(1500);
-        const after = await Promise.all(workers.map(async (i) => count(await metricText(i))));
-        for (const i of workers)
-            assert.equal(after[i - 1] - before[i - 1], i === target ? 1 : 0, 'only the future member generates the later range');
-        const ranges = [];
-        for (const i of workers) {
-            const log = await readFile(join(out, `node${i}.log`), 'utf8');
-            for (const match of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
-                ranges.push({ worker: i, end: Number(match[1]), start: Number(match[1]) - Number(match[2]) + 1 });
-            }
-        }
-        ranges.sort((a, b) => a.start - b.start);
-        assert.equal(ranges.length, 2);
-        assert.equal(ranges[0].start, crossingStart);
-        assert.equal(ranges[0].worker, crossingWorker, 'crossing range stays with its old-epoch owner');
-        assert.notEqual(crossingWorker, target);
-        assert.ok(ranges[0].start < fromBlock && ranges[0].end >= fromBlock, 'actual range crosses activation without splitting');
-        assert.ok(ranges[1].start >= fromBlock);
-        assert.equal(ranges[1].worker, target);
-        assert.equal(ranges[0].end + 1, ranges[1].start, 'no skipped or overlapping sources');
-        result.schedule = { fromBlock, target, crossingWorker, crossingStart, firstSourceHash: firstSource.hash, before, after, ranges };
-        assert.equal(BigInt(await rpc(0, 'eth_getBalance', [recipient, 'latest'])), 1536n);
+        result.recipientBalance = '512';
         assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
+        await until(async () => count(await metricText(1)) + count(await metricText(2)) >= 1, 90);
+        await pause(5000);
+        result.workers = [];
+        for (let i = 1; i < 3; i++) {
+            const text = await metricText(i);
+            await writeFile(join(out, `metrics${i}.txt`), text);
+            const log = await readFile(join(out, `node${i}.log`), 'utf8');
+            const relevant = log.split('\n').filter(s => /ProverService: (proving|proof amendment stored|proof generation)|proof task panicked/.test(s));
+            result.workers.push({
+                i, address: keys[i].address, generated: count(text), generationLogs: relevant, record: await rpc(0, 'shell_getRegisteredProver', [
+                    keys[i].address
+                ])
+            });
+        }
+        result.sourceBlocks = [
+            ...new Set(result.receipts.map(x => x.blockHash))
+        ];
+        result.finalized = await rpc(0, 'eth_getBlockByNumber', [
+            'finalized', false
+        ]);
+        const total = result.workers.reduce((n, w) => n + w.generated, 0);
+        assert.equal(total, 1, 'the one qualifying canonical window must have one generated proof across the cohort');
+        const last = result.receipts.at(-1);
+        await until(async () => {
+            const f = await rpc(0, 'eth_getBlockByNumber', [
+                'finalized', false
+            ]);
+            return BigInt(f.number) >= BigInt(last.blockNumber);
+        });
+        await until(async () => {
+            const counts = await Promise.all([
+                1, 2
+            ].map(i => rpc(0, 'shell_getRegisteredProver', [
+                keys[i].address
+            ])));
+            return counts.reduce((n, x) => n + x.proofs_submitted, 0) === 1;
+        });
+        for (let i = 1; i < 3; i++)
+            await until(async () => {
+                const f = await rpc(i, 'eth_getTransactionReceipt', [
+                    last.transactionHash
+                ]);
+                return f?.status === '0x1' && BigInt(await rpc(i, 'eth_getBalance', [
+                    recipient, 'latest'
+                ])) === 512n;
+            });
         await stopAll();
-        await failStart('static-downgrade', base, /persisted assignment/);
-        await failStart('rewritten-epoch', scheduled(fromBlock).replace(JSON.stringify([keys[target].address]), JSON.stringify([keys[crossingWorker].address])), /persisted assignment/);
-        await writeFile(cfg, scheduled(fromBlock));
+        await save();
+        // Reopening the same database with a different membership must fail before
+        // listeners or proof work start; restoring the original config must recover.
+        const cfg = join(out, 'node1.toml');
+        const original = await readFile(cfg, 'utf8');
+        await writeFile(cfg, '[prover]\nworker_cohort=' + JSON.stringify([
+            keys[1].address
+        ]) + '\n');
+        const wrong = spawnSync(binary, result.commands.find(c => c.label === 'start1').args, {
+            encoding: 'utf8', timeout: 30000
+        });
+        await writeFile(join(out, 'changed-cohort.log'), wrong.stdout + wrong.stderr);
+        assert.notEqual(wrong.status, 0);
+        assert.match(wrong.stdout + wrong.stderr, /persisted assignment/);
+        result.changedCohortRejected = {
+            status: wrong.status
+        };
+        await writeFile(cfg, original);
         await start(0);
         await start(1, boot);
         await start(2, boot);
-        if (lateJoin) await start(3, boot);
-        const finalReceipt = result.receipts.at(-1);
-        for (let i = 0; i < nodeCount; i++) {
-            await until(async () => BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])) === 1536n);
-            assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1536n);
-            assert.equal((await rpc(i, 'eth_getTransactionReceipt', [finalReceipt.transactionHash])).status, '0x1');
+        for (let i = 0; i < 3; i++) {
+            assert.equal(BigInt(await rpc(i, 'eth_getBalance', [
+                recipient, 'latest'
+            ])), 512n);
+            assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [
+                sender.getAddress(), 'latest'
+            ])), 512n);
+            assert.equal((await rpc(i, 'eth_getTransactionReceipt', [
+                last.transactionHash
+            ])).status, '0x1');
         }
         await pause(1500);
-        for (const i of workers)
-            assert.equal(count(await metricText(i)), 0, 'scheduled reopen does not recompute');
-        assert.equal(await settlementCount(), 3, 'settled prover records persist after reopen');
-        if (lateJoin) {
-            assert.equal((await rpc(3, 'shell_getRegisteredProver', [keys[3].address])).proofs_submitted, 1);
-            result.lateJoin.reopenPassed = true;
+        for (let i = 1; i < 3; i++)
+            assert.equal(count(await metricText(i)), 0, 'persisted proofs must not be recomputed after all native nodes restart');
+        if (reconfigure) {
+            if (lateJoin) {
+                const hash = await rpc(0, 'shell_proposeRegisterProver', [keys[3].public_key, 1]);
+                const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+                assert.equal(receipt.status, '0x1');
+                const record = await rpc(0, 'shell_getRegisteredProver', [keys[3].address]);
+                assert.ok(record);
+                assert.equal(record.proofs_submitted, 0);
+                assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
+                result.registration3 = { hash, receipt, record };
+            }
+            // Choose different old/new owners for the crossing range, so selecting
+            // membership by its end height would actually fail this native check.
+            const firstEnd = Number(result.workers.flatMap(w => w.generationLogs).join('\n').match(/range ending at block #(\d+)/)[1]);
+            const crossingStart = firstEnd + 1;
+            const firstSource = await rpc(0, 'eth_getBlockByNumber', ['0x' + crossingStart.toString(16), false]);
+            assert.ok(firstSource?.hash);
+            const sorted = keys.slice(1, 3).map(k => k.address.toLowerCase()).sort();
+            const oldOwner = sorted[Number(BigInt('0x' + firstSource.hash.slice(2, 18)) % 2n)];
+            const crossingWorker = keys.findIndex(k => k.address.toLowerCase() === oldOwner);
+            const target = lateJoin ? 3 : 3 - crossingWorker;
+            const heads = await Promise.all([0, 1, 2].map(i => rpc(i, 'eth_blockNumber')));
+            const fromBlock = Math.max(...heads.map(h => Number(BigInt(h)))) + 2;
+            await stopAll();
+            const base = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n';
+            const scheduled = height => base + '[[prover.worker_cohort_schedule]]\nfrom_block=' + height + '\nworkers=' + JSON.stringify([keys[target].address]) + '\n';
+            const failStart = async (name, config, pattern) => {
+                await writeFile(cfg, config);
+                const failed = spawnSync(binary, result.commands.find(c => c.label === 'start1').args, { encoding: 'utf8', timeout: 30000 });
+                await writeFile(join(out, name + '.log'), failed.stdout + failed.stderr);
+                assert.equal(failed.status, 1, name);
+                assert.match(failed.stdout + failed.stderr, pattern);
+                result[name] = { status: failed.status };
+            };
+            await failStart('backdated-schedule', scheduled(1), /persisted canonical head/);
+            for (const i of workers)
+                await writeFile(join(out, `node${i}.toml`), scheduled(fromBlock));
+            await start(0);
+            await start(1, boot);
+            await start(2, boot);
+            if (lateJoin) {
+                await start(3, boot);
+                await until(async () => {
+                    const record = await rpc(3, 'shell_getRegisteredProver', [keys[3].address]);
+                    return Number(BigInt(await rpc(3, 'net_peerCount'))) > 0 && !!record &&
+                        BigInt(await rpc(3, 'eth_getBalance', [recipient, 'latest'])) === 512n;
+                }, 90);
+                assert.equal(BigInt(await rpc(3, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 512n);
+                assert.equal(count(await metricText(3)), 0, 'fresh epoch-only worker must not prove historical ranges');
+                result.lateJoin = { beforeNewWindow: await rpc(3, 'shell_getNodeInfo'), historicalBalance: '512', historicalNonce: '512', historicalGenerated: 0 };
+                await save();
+            }
+            const settlementCount = async () => {
+                const records = await Promise.all(workers.map(i => rpc(0, 'shell_getRegisteredProver', [keys[i].address])));
+                return records.reduce((n, x) => n + x.proofs_submitted, 0);
+            };
+            const submitWindow = async (firstNonce) => {
+                for (let offset = firstNonce; offset < firstNonce + 512; offset += 16) {
+                    const hashes = [];
+                    for (let nonce = offset; nonce < offset + 16; nonce++) {
+                        const tx = await sender.buildSignedTransaction({ tx: buildTransaction({ chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000 }), includePublicKey: true });
+                        hashes.push(await paced(() => provider.sendTransaction(tx)));
+                    }
+                    for (const hash of hashes) {
+                        const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+                        assert.equal(receipt.status, '0x1');
+                        result.receipts.push(receipt);
+                    }
+                }
+            };
+            // The first post-restart range may start BEFORE the new epoch and cross
+            // its activation. It must finish whole under the original membership.
+            await submitWindow(512);
+            await until(async () => await settlementCount() === 2, 90);
+            const before = await Promise.all(workers.map(async (i) => count(await metricText(i))));
+            assert.equal(before.reduce((n, x) => n + x, 0), 1, 'crossing range generated exactly once');
+            await submitWindow(1024);
+            await until(async () => await settlementCount() === 3, 90);
+            await pause(1500);
+            const after = await Promise.all(workers.map(async (i) => count(await metricText(i))));
+            for (const i of workers)
+                assert.equal(after[i - 1] - before[i - 1], i === target ? 1 : 0, 'only the future member generates the later range');
+            const ranges = [];
+            for (const i of workers) {
+                const log = await readFile(join(out, `node${i}.log`), 'utf8');
+                for (const match of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
+                    ranges.push({ worker: i, end: Number(match[1]), start: Number(match[1]) - Number(match[2]) + 1 });
+                }
+            }
+            ranges.sort((a, b) => a.start - b.start);
+            assert.equal(ranges.length, 2);
+            assert.equal(ranges[0].start, crossingStart);
+            assert.equal(ranges[0].worker, crossingWorker, 'crossing range stays with its old-epoch owner');
+            assert.notEqual(crossingWorker, target);
+            assert.ok(ranges[0].start < fromBlock && ranges[0].end >= fromBlock, 'actual range crosses activation without splitting');
+            assert.ok(ranges[1].start >= fromBlock);
+            assert.equal(ranges[1].worker, target);
+            assert.equal(ranges[0].end + 1, ranges[1].start, 'no skipped or overlapping sources');
+            result.schedule = { fromBlock, target, crossingWorker, crossingStart, firstSourceHash: firstSource.hash, before, after, ranges };
+            assert.equal(BigInt(await rpc(0, 'eth_getBalance', [recipient, 'latest'])), 1536n);
+            assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
+            await stopAll();
+            await failStart('static-downgrade', base, /persisted assignment/);
+            await failStart('rewritten-epoch', scheduled(fromBlock).replace(JSON.stringify([keys[target].address]), JSON.stringify([keys[crossingWorker].address])), /persisted assignment/);
+            await writeFile(cfg, scheduled(fromBlock));
+            await start(0);
+            await start(1, boot);
+            await start(2, boot);
+            if (lateJoin) await start(3, boot);
+            const finalReceipt = result.receipts.at(-1);
+            for (let i = 0; i < nodeCount; i++) {
+                await until(async () => BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])) === 1536n);
+                assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1536n);
+                assert.equal((await rpc(i, 'eth_getTransactionReceipt', [finalReceipt.transactionHash])).status, '0x1');
+            }
+            await pause(1500);
+            for (const i of workers)
+                assert.equal(count(await metricText(i)), 0, 'scheduled reopen does not recompute');
+            assert.equal(await settlementCount(), 3, 'settled prover records persist after reopen');
+            if (lateJoin) {
+                assert.equal((await rpc(3, 'shell_getRegisteredProver', [keys[3].address])).proofs_submitted, 1);
+                result.lateJoin.reopenPassed = true;
+            }
+            result.schedule.reopenPassed = true;
+            result.accepted = result.receipts.length;
+            result.recipientBalance = '1536';
+            result.adaptation = 'Explicit coordinated future memberships, local registry activation0, 1536 genuine transfers. Automatic recruitment and offline takeover remain unqualified.';
         }
-        result.schedule.reopenPassed = true;
-        result.accepted = result.receipts.length;
-        result.recipientBalance = '1536';
-        result.adaptation = 'Explicit coordinated future memberships, local registry activation0, 1536 genuine transfers. Automatic recruitment and offline takeover remain unqualified.';
+        result.reopenPassed = true;
+        result.status = reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
     }
-    result.reopenPassed = true;
-    result.status = reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
     await save();
     console.log(JSON.stringify({
         runtime: root, workers: result.workers.map(w => ({

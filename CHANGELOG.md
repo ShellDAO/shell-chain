@@ -15,6 +15,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Retain valid L1 proofs completed ahead of their frontier until the preceding
+  range arrives, including across recovery. Later completion does not trigger
+  proof regeneration; settlement and block import still require canonical order.
+- Advance committed STARK settlement markers before scanning for recoverable
+  work, so freshly settled proofs are not queued for settlement again.
+- Remove queued source tasks fully covered by a canonical peer settlement,
+  preventing a stale partial prefix from blocking a later worker's range.
+  Active CPU jobs, partial overlaps and unrelated layers remain reserved.
+- Reject incompatible signature-proof trace layouts before constructing the
+  verifier AIR, returning an error for a tampered width instead of panicking.
 - Retrieve a missing next-height block directly from the sender of its verified
   quorum certificate, without waiting for a periodic gossip probe. Duplicate or
   invalid certificates do not amplify requests, and older empty probe responses

@@ -648,6 +648,12 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
                     .map(move |source| (amendment.layer, source))
             }));
         for amendment in amendments {
+            // A peer may settle a range before the last source task is queued
+            // locally. Retaining its earlier queued inputs would leave a gap
+            // below the proving threshold and block every later range.
+            self.proof_backlog
+                .lock()
+                .remove_proved_tasks(amendment.layer, &amendment.covered_hashes());
             for source in amendment.covered_hashes() {
                 let _ = self.settled_source_index.put(amendment.layer, &source);
             }
@@ -1990,6 +1996,7 @@ mod tests {
     #[derive(Debug, Default)]
     pub(super) struct FailingBatchDb {
         inner: MemoryDb,
+        fail_get_key: parking_lot::Mutex<Option<Vec<u8>>>,
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
         fail_next_flush: AtomicBool,
@@ -2002,6 +2009,7 @@ mod tests {
         pub(super) fn new() -> Self {
             Self {
                 inner: MemoryDb::new(),
+                fail_get_key: parking_lot::Mutex::new(None),
                 fail_next_get: AtomicBool::new(false),
                 fail_next_put: AtomicBool::new(false),
                 fail_next_flush: AtomicBool::new(false),
@@ -2034,6 +2042,9 @@ mod tests {
 
     impl KvStore for FailingBatchDb {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_get_key.lock().as_deref() == Some(key) {
+                return Err(StorageError::Database("injected keyed get failure".into()));
+            }
             if self.fail_next_get.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected get failure".into()));
             }
@@ -21178,6 +21189,217 @@ mod tests {
 
         assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 0);
         assert!(node.proof_backlog.lock().is_empty());
+    }
+
+    #[test]
+    fn stark_frontier_recovery_retains_later_real_proof_until_predecessor_completes() {
+        let (mut node, proposer) = setup_stark_node();
+        let (sender, address, public_key) = make_stark_account(&node);
+        fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let signers = [DilithiumSigner::generate(), DilithiumSigner::generate()];
+        let mut amendments = Vec::new();
+        for (batch, signer) in signers.iter().enumerate() {
+            let mut sources = if batch == 0 { vec![genesis] } else { vec![] };
+            let mut entries = Vec::new();
+            let mut original_size = 0;
+            for block_index in 0..16 {
+                for offset in 0..32 {
+                    let nonce = (batch * 512 + block_index * 32 + offset) as u64;
+                    let tx = make_embedded_tx(&sender, address, public_key.clone(), nonce, 1);
+                    node.tx_pool
+                        .insert(
+                            tx,
+                            &mut *node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                }
+                let block = node.produce_block(&proposer, 32).unwrap();
+                assert_eq!(block.transactions.len(), 32);
+                original_size += node
+                    .witness_store
+                    .bundle_size(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+                sources.push(block.hash());
+            }
+            assert_eq!(entries.len(), 512);
+            let proof = shell_stark_prover::prove_sig_batch(&entries).unwrap();
+            shell_stark_prover::verify_sig_batch(&proof).unwrap();
+            let mut amendment = ProofAmendment {
+                version: shell_stark_prover::PROOF_AMENDMENT_VERSION,
+                block_hash: *sources.last().unwrap(),
+                block_number: ((batch + 1) * 16) as u64,
+                start_block: Some(if batch == 0 { 0 } else { 17 }),
+                proof,
+                prover: Address::ZERO,
+                prover_signature: Bytes::new(),
+                layer: 1,
+                source_hashes: sources,
+                original_size: Some(original_size),
+                compressed_size: None,
+                settlement_tx_hash: None,
+            };
+            amendment.sign_prover_authentication(signer).unwrap();
+            node.validate_prover_admission(&amendment).unwrap();
+            node.validate_stark_proof_source_binding(&amendment)
+                .unwrap();
+            assert!(amendment.has_valid_embedded_compression());
+            amendments.push(amendment);
+        }
+        while node.proof_backlog.lock().pop().is_some() {}
+        let later = &amendments[1];
+        let payload = later.to_json().unwrap();
+        // Model a completed CPU job persisted before its event-loop handoff,
+        // followed by recovery while the earlier worker is still proving.
+        node.store_stark_artifacts(later, None).unwrap();
+        assert!(node.validate_stark_amendment_ordering(later).is_err());
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert_eq!(
+            node.amendment_store
+                .get_amendment(&later.block_hash)
+                .unwrap(),
+            Some(payload)
+        );
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        assert!(
+            !node
+                .proof_backlog
+                .lock()
+                .contains_source(1, &later.block_hash),
+            "completed later work must not be recomputed"
+        );
+
+        assert!(
+            node.validate_stark_settlement_sequence(std::slice::from_ref(later))
+                .is_err(),
+            "future storage must not relax block inclusion ordering"
+        );
+        let mut orphan = later.clone();
+        orphan.source_hashes[0] = ShellHash::from([0xA5; 32]);
+        orphan.sign_prover_authentication(&signers[1]).unwrap();
+        assert!(node.validate_stark_amendment_for_storage(&orphan).is_err());
+        let mut tampered = later.clone();
+        tampered.proof.proof_bytes[0] ^= 1;
+        tampered.sign_prover_authentication(&signers[1]).unwrap();
+        node.store_stark_artifacts(&tampered, None).unwrap();
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert!(
+            node.amendment_store
+                .get_amendment(&later.block_hash)
+                .unwrap()
+                .is_none(),
+            "waiting proofs still require genuine cryptographic verification"
+        );
+        node.store_stark_artifacts(later, None).unwrap();
+
+        node.config.node_role = crate::NodeRole::Validator;
+        node.store_stark_artifacts(&amendments[0], None).unwrap();
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            amendments.as_slice()
+        );
+        assert!(
+            !node.proof_backlog.lock().is_empty(),
+            "fixture retains queued inputs until canonical settlement"
+        );
+        let balances: Vec<_> = amendments
+            .iter()
+            .map(|a| node.world_state.read().get_balance(&a.prover).unwrap())
+            .collect();
+        let block = node.produce_block(&proposer, 0).unwrap();
+        assert_eq!(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            2
+        );
+        assert_eq!(node.world_state.read().get_nonce(&address).unwrap(), 1024);
+        for (amendment, before) in amendments.iter().zip(balances) {
+            let reward = node.stark_reward_value(block.number(), amendment).unwrap();
+            assert_eq!(
+                node.world_state
+                    .read()
+                    .get_balance(&amendment.prover)
+                    .unwrap(),
+                before + reward
+            );
+            assert!(amendment
+                .covered_hashes()
+                .iter()
+                .all(|hash| node.settled_stark_sources.lock().contains(&(1, *hash))));
+        }
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        {
+            let backlog = node.proof_backlog.lock();
+            for amendment in &amendments {
+                for source in amendment.covered_hashes() {
+                    assert!(
+                        !backlog.contains_source(1, &source),
+                        "settled peer work must not leave a blocking queued prefix"
+                    );
+                }
+            }
+            if let Some(task) = backlog.peek() {
+                assert_eq!(
+                    task.block_number,
+                    block.number(),
+                    "the newly produced empty source remains unproved"
+                );
+            }
+        }
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert!(
+            node.pending_stark_settlements.lock().is_empty(),
+            "settled proofs must not be queued twice"
+        );
+    }
+
+    #[test]
+    fn stark_frontier_validator_preserves_pointer_on_target_read_failure() {
+        let (node, signer, db) = setup_failing_batch_node();
+        store_genesis(&node);
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let end = produce_witnessed_blocks(&node, &signer, 1)[0];
+        let amendment = dummy_ordered_amendment(1, vec![genesis, end], 1);
+        node.store_stark_artifacts(&amendment, None).unwrap();
+        let pointer = node
+            .amendment_store
+            .get_amendment(&genesis)
+            .unwrap()
+            .unwrap();
+        let mut target_key = b"pa/".to_vec();
+        target_key.extend_from_slice(end.as_bytes());
+        *db.fail_get_key.lock() = Some(target_key);
+        let error = node.enqueue_stark_frontier_backlog(8).unwrap_err();
+        assert!(matches!(error, NodeError::Storage(_)));
+        *db.fail_get_key.lock() = None;
+        assert_eq!(
+            node.amendment_store.get_amendment(&genesis).unwrap(),
+            Some(pointer)
+        );
+        assert!(node.amendment_store.get_amendment(&end).unwrap().is_some());
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        node.enqueue_stark_frontier_backlog(8).unwrap();
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            std::slice::from_ref(&amendment)
+        );
     }
 
     #[test]

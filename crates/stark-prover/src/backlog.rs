@@ -5,7 +5,7 @@
 //! the prover can drain it, enabling the system to shed non-critical work or
 //! activate additional prover capacity.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use shell_primitives::ShellHash;
 
@@ -302,6 +302,30 @@ impl ProofBacklog {
     pub fn contains_source(&self, layer: u32, source_hash: &ShellHash) -> bool {
         let key = (layer, *source_hash);
         self.source_index.contains_key(&key) || self.in_flight_sources.contains_key(&key)
+    }
+
+    /// Remove queued tasks fully covered by a canonical settlement at this layer.
+    /// Partial overlaps, other layers and in-flight CPU work remain reserved.
+    pub fn remove_proved_tasks(&mut self, layer: u32, sources: &[ShellHash]) -> usize {
+        let covered: HashSet<_> = sources.iter().copied().collect();
+        let mut retained = VecDeque::with_capacity(self.pending.len());
+        let mut removed = 0;
+        for task in std::mem::take(&mut self.pending) {
+            let fully_covered = if task.source_hashes.is_empty() {
+                covered.contains(&ShellHash::from(task.block_hash))
+            } else {
+                task.source_hashes.iter().all(|hash| covered.contains(hash))
+            };
+            if task.layer == layer && fully_covered {
+                self.index_remove(&task);
+                self.total_completed += 1;
+                removed += 1;
+            } else {
+                retained.push_back(task);
+            }
+        }
+        self.pending = retained;
+        removed
     }
 
     /// Pop a proof range and reserve all of its sources until handoff finishes.
@@ -809,6 +833,59 @@ mod tests {
 
     fn make_task(n: u64) -> ProofTask {
         ProofTask::new([n as u8; 32], n, vec![])
+    }
+
+    #[test]
+    fn canonical_settlement_removes_only_fully_covered_queued_tasks() {
+        let hash = |n| ShellHash::from([n; 32]);
+        let mut backlog = ProofBacklog::new();
+        backlog.push(make_task(1));
+        let active = backlog.pop_contiguous_for_proving(1, 0).unwrap();
+        backlog.push(make_task(2));
+        backlog.push(ProofTask::with_sources(
+            [4; 32],
+            4,
+            vec![],
+            1,
+            vec![hash(3), hash(4)],
+            None,
+        ));
+        let mut other_layer = make_task(2);
+        other_layer.layer = 2;
+        backlog.push(other_layer);
+        backlog.push(make_task(5));
+
+        assert_eq!(
+            backlog.remove_proved_tasks(1, &[hash(1), hash(2), hash(3)]),
+            1
+        );
+        assert_eq!(backlog.len(), 3);
+        assert!(
+            backlog.contains_source(1, &hash(1)),
+            "active work remains reserved"
+        );
+        assert!(!backlog.contains_source(1, &hash(2)));
+        assert!(
+            backlog.contains_source(2, &hash(2)),
+            "other layers are independent"
+        );
+        assert!(
+            backlog.contains_source(1, &hash(3)),
+            "partial ranges retain uncovered work"
+        );
+        assert!(backlog.contains_source(1, &hash(4)));
+        assert!(backlog.contains_source(1, &hash(5)));
+        assert_eq!(backlog.first_uncovered_block_for_layer(1, 1, 5), Some(2));
+        assert_index_consistency(&backlog);
+        assert_eq!(
+            backlog.remove_proved_tasks(1, &[hash(1), hash(2), hash(3)]),
+            0
+        );
+        backlog.complete_in_flight(1, active.block_number, &active.source_hashes);
+        assert!(!backlog.contains_source(1, &hash(1)));
+        assert_eq!(backlog.remove_proved_tasks(1, &[hash(3), hash(4)]), 1);
+        assert_eq!(backlog.len(), 2);
+        assert_index_consistency(&backlog);
     }
 
     fn make_entry(n: u8) -> SigBatchEntry {

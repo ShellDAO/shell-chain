@@ -859,37 +859,35 @@ impl<S: KvStore + 'static> Node<S> {
                         warn!("local STARK proof is not eligible for submission: {e}");
                         continue;
                     }
-                    if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
-                        warn!(
-                            block = amendment.block_number,
-                            layer = amendment.layer,
-                            "local STARK proof ordering check failed; discarding stored amendment: {e}"
-                        );
-                        // Delete all stored artifacts for this proof range so the source
-                        // blocks are re-seeded as fresh tasks once the frontier catches up.
-                        // Without this deletion, the next seed pass re-loads the failing
-                        // amendment, creates new backlog tasks for the same tip range, the
-                        // prover regenerates the same out-of-order proof, and the rejection
-                        // counter spins indefinitely.
-                        for source_hash in amendment.covered_hashes() {
-                            if let Err(del_err) =
-                                self.amendment_store.delete_amendment(&source_hash)
-                            {
-                                warn!(
-                                    block = amendment.block_number,
-                                    %source_hash,
-                                    "failed to delete out-of-order amendment artifact: {del_err}"
-                                );
+                    let ready = match self.validate_stark_amendment_for_storage(&amendment) {
+                        Ok(ready) => ready,
+                        Err(e) => {
+                            if matches!(e, NodeError::Storage(_)) {
+                                warn!(%e, "retaining local STARK proof after storage read failure");
+                                continue;
                             }
+                            warn!(
+                                block = amendment.block_number,
+                                layer = amendment.layer,
+                                "local STARK proof range is invalid; discarding stored amendment: {e}"
+                            );
+                            if let Err(error) = self.delete_stored_stark_amendment_artifacts(
+                                &amendment, amendment.block_hash,
+                            ) {
+                                warn!(%error, "failed to delete invalid local amendment artifacts");
+                            }
+                            continue;
                         }
-                        continue;
+                    };
+                    if ready {
+                        self.pending_stark_settlements.lock().push(amendment.clone());
                     }
-                    self.pending_stark_settlements.lock().push(amendment.clone());
                     info!(
                         block = amendment.block_number,
                         layer = amendment.layer,
                         can_produce_blocks,
-                        "local STARK proof queued for bounded settlement"
+                        ready,
+                        "local STARK proof retained for ordered settlement"
                     );
                     match amendment.to_json() {
                         Ok(payload) => {
@@ -1939,14 +1937,17 @@ impl<S: KvStore + 'static> Node<S> {
                                           amendment.compressed_size =
                                               Some(amendment.size_bytes() as u64);
                                       }
-                                     if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
+                                     let ready = match self.validate_stark_amendment_for_storage(&amendment) {
+                                         Ok(ready) => ready,
+                                         Err(e) => {
                                          warn!(
                                              block = block_number,
                                              layer = amendment.layer,
                                              "STARK proof rejected by ordered compression frontier: {e}"
                                          );
-                                         continue;
-                                     }
+                                             continue;
+                                         }
+                                     };
                                      if let Err(e) = self.validate_stark_proof_source_binding(&amendment) {
                                          warn!(
                                              block = block_number,
@@ -1969,7 +1970,9 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     }
-                                    self.pending_stark_settlements.lock().push(amendment);
+                                    if ready {
+                                        self.pending_stark_settlements.lock().push(amendment);
+                                    }
                                 }
                                 // G5: Acknowledge that a peer has stored a proof amendment.
                                 NetworkMessage::ProofAck { block_hash, holder } => {
@@ -2927,12 +2930,80 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(count)
     }
 
+    fn validate_stored_stark_amendment(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<bool, NodeError> {
+        self.validate_prover_admission(amendment)?;
+        let ready = self.validate_stark_amendment_for_storage(amendment)?;
+        self.validate_stark_proof_source_binding(amendment)?;
+        Ok(ready)
+    }
+
+    /// Validators recover completed work without creating CPU proving tasks.
+    /// Read only the canonical frontier and admit at most the bounded pending
+    /// window; a missing predecessor cannot cause a scan of the entire chain.
+    fn recover_stark_frontier_amendments(&self) -> Result<usize, NodeError> {
+        let mut recovered = 0;
+        while self.pending_stark_settlements.lock().len() < MAX_PENDING_STARK_SETTLEMENTS {
+            let overlay = self
+                .pending_stark_settlements
+                .lock()
+                .iter()
+                .flat_map(|a| {
+                    a.covered_hashes()
+                        .into_iter()
+                        .map(move |hash| (hash, a.layer))
+                })
+                .collect();
+            let number = self.first_canonical_block_below_layer(1, &overlay)?;
+            let Some(hash) = self.chain_store.get_block_hash_by_number(number)? else {
+                break;
+            };
+            let Some(bytes) = self.amendment_store.get_amendment(&hash)? else {
+                break;
+            };
+            let amendment = match self.load_stored_stark_amendment(hash, number, &bytes) {
+                Ok(amendment) => amendment,
+                Err(error) => {
+                    if matches!(error, NodeError::Storage(_)) {
+                        return Err(error);
+                    }
+                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                    warn!(%error, %hash, "discarding malformed frontier proof artifact");
+                    self.amendment_store.delete_amendment(&hash)?;
+                    break;
+                }
+            };
+            match self.validate_stored_stark_amendment(&amendment) {
+                Ok(true) => {
+                    recovered += amendment.covered_hashes().len();
+                    self.pending_stark_settlements.lock().push(amendment);
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    if matches!(error, NodeError::Storage(_)) {
+                        return Err(error);
+                    }
+                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                    warn!(%error, %hash, "discarding invalid frontier proof artifact");
+                    self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
+                    break;
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
     pub(crate) fn enqueue_stark_frontier_backlog(
         &self,
         max_blocks: usize,
     ) -> Result<usize, NodeError> {
-        if max_blocks == 0 || !self.config.node_role.runs_prover() {
+        if max_blocks == 0 {
             return Ok(0);
+        }
+        if !self.config.node_role.runs_prover() {
+            return self.recover_stark_frontier_amendments();
         }
         if self.pending_stark_settlements.lock().len() >= MAX_PENDING_STARK_SETTLEMENTS {
             return Ok(0);
@@ -3045,75 +3116,73 @@ impl<S: KvStore + 'static> Node<S> {
                     match self.load_stored_stark_amendment(hash, number, &bytes) {
                         Ok(amendment) => {
                             let covered_hashes = amendment.covered_hashes();
-                            let recovered_is_valid = self
-                                .validate_prover_admission(&amendment)
-                                .and_then(|()| self.validate_stark_amendment_ordering(&amendment))
-                                .and_then(|()| {
-                                    if amendment.has_valid_embedded_compression() {
-                                        Ok(())
-                                    } else {
-                                        Err(NodeError::Startup(
-                                            "stored STARK amendment fails compression policy"
-                                                .into(),
-                                        ))
+                            let recovered_is_valid =
+                                self.validate_stored_stark_amendment(&amendment);
+                            match recovered_is_valid {
+                                Err(error) => {
+                                    if matches!(error, NodeError::Storage(_)) {
+                                        return Err(error);
                                     }
-                                })
-                                .and_then(|()| {
-                                    self.validate_stark_proof_source_binding(&amendment)
-                                });
-                            if let Err(error) = recovered_is_valid {
-                                self.metrics.stark_recovery_artifacts_rejected.inc();
-                                warn!(
-                                    block = amendment.block_number,
-                                    layer = amendment.layer,
-                                    %error,
-                                    "discarding invalid stored STARK amendment during recovery"
-                                );
-                                rejected_stored_payloads.insert(payload_hash);
-                                self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
-                                // Continue with this canonical source so a fresh proof
-                                // task replaces the invalid persisted artifact.
-                            } else {
-                                let covered_count = covered_hashes.len().max(1);
-                                let start = amendment.range_start_block().unwrap_or(0);
-                                if self.pending_stark_settlements.lock().len()
-                                    >= MAX_PENDING_STARK_SETTLEMENTS
-                                {
-                                    debug!(
+                                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                                    warn!(
+                                        block = amendment.block_number,
+                                        layer = amendment.layer,
+                                        %error,
+                                        "discarding invalid stored STARK amendment during recovery"
+                                    );
+                                    rejected_stored_payloads.insert(payload_hash);
+                                    self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
+                                    // Continue with this canonical source so a fresh proof
+                                    // task replaces the invalid persisted artifact.
+                                }
+                                Ok(ready) => {
+                                    let covered_count = covered_hashes.len().max(1);
+                                    let start = amendment.range_start_block().unwrap_or(0);
+                                    if self.pending_stark_settlements.lock().len()
+                                        >= MAX_PENDING_STARK_SETTLEMENTS
+                                    {
+                                        debug!(
+                                            block = amendment.block_number,
+                                            start_block = start,
+                                            "STARK seeding paused at settlement admission limit"
+                                        );
+                                        break;
+                                    }
+                                    info!(
                                         block = amendment.block_number,
                                         start_block = start,
-                                        "STARK seeding paused at settlement admission limit"
+                                        sources = covered_count,
+                                        n_sigs = amendment.proof.n_sigs,
+                                        ready,
+                                        "STARK seeding: retaining verified amendment; skipping covered range"
                                     );
-                                    break;
+                                    // Remove any source blocks already queued in `tasks` that
+                                    // are covered by this amendment. Without this, the source
+                                    // blocks inserted before we reach the end block create a
+                                    // gap in the contiguous backlog run, causing
+                                    // `pop_contiguous_with_min_entries` to return None.
+                                    let covered_set: std::collections::HashSet<_> =
+                                        covered_hashes.into_iter().collect();
+                                    tasks.retain(|t: &ProofTask| {
+                                        !t.source_hashes.iter().any(|s| covered_set.contains(s))
+                                    });
+                                    // Recompute seeded_entries from the retained tasks.
+                                    seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
+                                    // Recompute queued: retained regular tasks + all pending covered blocks.
+                                    pending_covered_sum =
+                                        pending_covered_sum.saturating_add(covered_count);
+                                    queued = tasks.len().saturating_add(pending_covered_sum);
+                                    if ready {
+                                        self.pending_stark_settlements.lock().push(amendment);
+                                    }
+                                    continue;
                                 }
-                                info!(
-                                    block = amendment.block_number,
-                                    start_block = start,
-                                    sources = covered_count,
-                                    n_sigs = amendment.proof.n_sigs,
-                                    "STARK seeding: existing amendment passes ordering; skipping covered range"
-                                );
-                                // Remove any source blocks already queued in `tasks` that
-                                // are covered by this amendment. Without this, the source
-                                // blocks inserted before we reach the end block create a
-                                // gap in the contiguous backlog run, causing
-                                // `pop_contiguous_with_min_entries` to return None.
-                                let covered_set: std::collections::HashSet<_> =
-                                    covered_hashes.into_iter().collect();
-                                tasks.retain(|t: &ProofTask| {
-                                    !t.source_hashes.iter().any(|s| covered_set.contains(s))
-                                });
-                                // Recompute seeded_entries from the retained tasks.
-                                seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
-                                // Recompute queued: retained regular tasks + all pending covered blocks.
-                                pending_covered_sum =
-                                    pending_covered_sum.saturating_add(covered_count);
-                                queued = tasks.len().saturating_add(pending_covered_sum);
-                                self.pending_stark_settlements.lock().push(amendment);
-                                continue;
                             }
                         }
                         Err(error) => {
+                            if matches!(error, NodeError::Storage(_)) {
+                                return Err(error);
+                            }
                             self.metrics.stark_settlements_rejected.inc();
                             warn!(
                                 %hash,

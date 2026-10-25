@@ -578,6 +578,10 @@ impl<S: KvStore + 'static> Node<S> {
                 original_size, "G4: proof task queued in backlog (async proving)"
             );
         }
+        // Recovery must observe the settlements just committed above. Otherwise
+        // it can enqueue their stored proofs again before the cache is advanced.
+        prover.record_accepted_settlements(settled_stark_proofs.len());
+        prover.record_settled_sources(&settled_stark_proofs);
         let queued = self.enqueue_stark_frontier_backlog(64)?;
         if queued > 0 {
             debug!(
@@ -585,8 +589,6 @@ impl<S: KvStore + 'static> Node<S> {
                 "queued additional historical STARK frontier proof tasks after block production"
             );
         }
-        prover.record_accepted_settlements(settled_stark_proofs.len());
-        prover.record_settled_sources(&settled_stark_proofs);
         self.feed_l2_scheduler_from_settlements(&settled_stark_proofs, block.number());
         block_store.schedule_settled_witness_deletes(
             &settled_stark_proofs,

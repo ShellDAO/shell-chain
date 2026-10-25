@@ -65,3 +65,27 @@ schedule, observes the historical balance and nonce without generating old proof
 and proves a later range assigned only to its future membership. All four
 databases reopen with balances, nonces, receipts and settlement counters intact.
 This is explicit operator scheduling, not automatic recruitment.
+
+## Completion order and recovery
+
+Independent workers can complete later canonical ranges first. Storage admission
+therefore verifies range structure, canonical sources, non-overlap, authentication,
+compression and cryptographic source binding without requiring the L1 frontier
+to have reached that range yet. The completed proof remains in the existing
+amendment store; it is not placed in the settlement queue until its predecessor
+is pending or settled. Recovery retains that proof instead of deleting and
+regenerating it. Block inclusion, import and replay keep strict frontier ordering.
+Committed settlement markers must advance before scanning recovery artifacts,
+otherwise the just-settled proofs can be queued again.
+Canonical settlement also removes fully covered queued tasks. A peer's proof
+can arrive before the last local source task, leaving an otherwise permanent
+sub-threshold prefix if those earlier tasks remain queued. Partial overlaps,
+other layers and in-flight CPU jobs are preserved, and all queue indexes are
+updated together. Ordinary validators recover only stored frontier proofs,
+without creating proving tasks; storage read errors preserve artifacts for retry.
+
+`SHELL_COHORT_DELAY_PREDECESSOR=1` exercises the same native entry with the earlier
+owner absent until the later proof has been generated and its databases reopened.
+It then checks source-ordered settlements, exact rewards and all-node reopen
+without recomputing the completed range. This does not change owner selection or
+add an offline takeover policy.

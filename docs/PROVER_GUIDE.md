@@ -346,7 +346,12 @@ hash of each minimum-size L1 range, and runs CPU proving only on that owner.
 Other workers retain bounded reservations while observing the resulting proof.
 Range boundaries do not depend on how many later blocks a worker has received.
 Proof authentication, canonical settlement ordering, and rewards retain their
-normal validation rules. Cached proofs prevent recomputation after reopening.
+normal validation rules. A valid later L1 proof may finish before its predecessor;
+it is stored and broadcast while waiting, but cannot settle across the gap.
+Ordinary validators recover stored proofs at the canonical frontier without
+starting CPU proving tasks.
+Cached proofs prevent recomputation after reopening, including while waiting
+for an earlier worker to finish.
 
 The cohort is persisted in each local prover database. Reordered lists are
 accepted; duplicate addresses, a missing local signer, and a different list on
@@ -417,6 +422,15 @@ membership. It registers that identity after the initial proof, requires live
 historical synchronization without old-work generation, checks future ownership,
 and reopens all four native nodes with receipts and prover records intact.
 This option includes the coordinated-membership checks above.
+
+For completion in reverse order, use `SHELL_COHORT_DELAY_PREDECESSOR=1` with the
+same command, separately from the other two options. It accumulates 1,024 signed
+transfers, starts only the later range's scheduled owner, and checks that its
+proof is stored without settling across the gap. It reopens those databases
+before starting the earlier owner, then requires both original proofs to settle
+once in source order, with their exact rewards. All three databases reopen again
+with the balances, nonces, finalized hashes and prover counters intact. This
+controls worker startup order; it does not transfer an absent owner's work.
 
 The entry retains private keys and databases for inspection and stops its own
 processes. It does not qualify automatic recruitment, failover or production scale.
