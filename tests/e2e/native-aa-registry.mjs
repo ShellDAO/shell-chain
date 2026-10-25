@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
-import { createServer } from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 
 assert.ok(
@@ -68,19 +67,8 @@ const miner = await decryptKeystore(
   JSON.parse(await readFile(keyPath, "utf8")),
   password,
 );
-async function unusedPort() {
-  const listener = createServer();
-  await new Promise((done, fail) => {
-    listener.once("error", fail);
-    listener.listen(0, "127.0.0.1", done);
-  });
-  const port = listener.address().port;
-  await new Promise((done) => listener.close(done));
-  return port;
-}
-const ports = [await unusedPort(), await unusedPort()];
-assert.notEqual(ports[0], ports[1]);
-const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
+// Each native process binds port zero and reports the socket it actually owns.
+const ports = [], metricsPorts = [];
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
@@ -88,9 +76,7 @@ const pruneFollower = prunedEpochScenario || blockSignersScenario;
 const epochScenario = process.argv.includes("--epoch-restart") || prunedEpochScenario;
 let expectedConsensusWeight = 1;
 let expectedMembers = [miner.getAddress()];
-const providers = ports.map((port) =>
-  createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${port}` }),
-);
+const providers = [];
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
 let queue = Promise.resolve();
 function paced(request) {
@@ -107,6 +93,8 @@ const result = {
   startedAt: new Date().toISOString(),
   scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
+  listeners: [],
+  stops: [],
   versions: {
     node: process.version,
     sdk: JSON.parse(
@@ -150,6 +138,7 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  result.stops.push({ label: nodeLogLabels[i], pid: child.pid, code: child.exitCode, signal: child.signalCode });
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -168,9 +157,9 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--password-file",
     passwordPath,
     "--rpc-addr",
-    `127.0.0.1:${ports[i]}`,
+    "127.0.0.1:0",
     "--metrics-addr",
-    syncStatusScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
+    "127.0.0.1:0",
     "--block-time",
     "2000",
     "--max-idle-interval",
@@ -205,11 +194,26 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   child.once("error", (error) => {
     spawnError = error;
   });
-  if (!waitForRpc) return;
+  ports[i] = undefined;
+  metricsPorts[i] = undefined;
+  providers[i] = undefined;
   for (let k = 0; k < 160; k++) {
     if (spawnError) throw spawnError;
     assert.equal(child.exitCode, null, "node exited");
     assert.equal(child.signalCode, null, "node signaled");
+    if (!providers[i]) {
+      const log = (await readFile(join(out, label + "-node.log"), "utf8"))
+        .replace(/\u001b\[[0-9;]*m/g, "");
+      const http = log.match(/RPC listeners started http_addr=127\.0\.0\.1:(\d+)/);
+      const metrics = log.match(/metrics server listening addr=127\.0\.0\.1:(\d+)/);
+      if (!http || !metrics) { await pause(250); continue; }
+      ports[i] = Number(http[1]); metricsPorts[i] = Number(metrics[1]);
+      assert.ok(ports[i] > 0 && metricsPorts[i] > 0);
+      assert.notEqual(ports[i], metricsPorts[i]);
+      providers[i] = createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[i]}` });
+      result.listeners.push({ label, pid: child.pid, rpc: ports[i], metrics: metricsPorts[i] });
+      if (!waitForRpc) return;
+    }
     try {
       await rpc(i, "eth_blockNumber");
       return;
@@ -622,8 +626,6 @@ async function runScenario() {
     const extraDirs = [join(out, "observer"), join(out, "control")];
     const extraKeys = [join(out, "observer-key.json"), join(out, "control-key.json")];
     for (let index = 0; index < 2; index++) {
-      ports.push(await unusedPort());
-      providers.push(createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[index + 2]}` }));
       await mkdir(extraDirs[index]);
       await writeFile(join(extraDirs[index], "genesis.json"), JSON.stringify(genesis));
       const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", extraKeys[index]], { encoding: "utf8" });

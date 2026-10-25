@@ -27,6 +27,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Report actual bound RPC and metrics listener addresses, including port-zero
+  launches. Native registry acceptance discovers those live sockets on every
+  start and reopen instead of releasing speculative ports before node startup.
 - Preserve an already recovered or canonically settled local CPU proof during
   channel handoff, keeping its stored artifacts and settlement metadata without
   queueing a duplicate or rejecting the proof as overlapping with itself.

@@ -673,6 +673,10 @@ impl<S: KvStore + 'static> Node<S> {
             None
         };
 
+        if let Some(handle) = rpc_handle.as_ref() {
+            info!(http_addr = %handle.http_addr, ws_addr = ?handle.ws_addr, "RPC listeners started");
+        }
+
         // Register own authority pubkey for seal verification.
         if let Some(addr) = self.config.proposer_address {
             self.register_authority_pubkey(addr, signer.public_key().to_vec());
