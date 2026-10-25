@@ -4196,21 +4196,77 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         Self { store }
     }
 
-    /// Bind this local prover database to one explicitly configured worker cohort.
-    /// The value is local scheduling metadata, never part of consensus state.
-    /// Refuse a different cohort on reopen rather than silently reassign work.
+    /// Bind local scheduling metadata, preserving immutable historical epochs.
+    /// Changes are explicit future additions, never consensus state mutations.
     pub fn bind_worker_cohort(&self, workers: &[Address]) -> Result<(), StorageError> {
+        self.bind_worker_cohort_schedule(&[(0, workers.to_vec())], 0)
+    }
+
+    /// Append future memberships without changing already assigned windows.
+    /// The caller supplies the persisted canonical head, not wall-clock time.
+    pub fn bind_worker_cohort_schedule(
+        &self,
+        epochs: &[(u64, Vec<Address>)],
+        observed_height: u64,
+    ) -> Result<(), StorageError> {
         const KEY: &[u8] = b"prover-worker-cohort/v1";
-        let bytes = serde_json::to_vec(workers)
+        const SCHEDULE: &[u8] = b"prover-worker-cohort/v2";
+        const SCHEDULED: &[u8] = b"scheduled:v2";
+        if epochs.is_empty()
+            || epochs[0].0 != 0
+            || epochs.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(StorageError::InvalidInput(
+                "invalid worker cohort epochs".into(),
+            ));
+        }
+        let initial = serde_json::to_vec(&epochs[0].1)
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
-        if let Some(previous) = self.store.get(KEY)? {
-            if previous != bytes {
-                return Err(StorageError::InvalidInput(
-                    "prover worker cohort differs from the persisted assignment; restore the existing configuration".into(),
-                ));
+        let previous = self.store.get(KEY)?;
+        let persisted_schedule = self.store.get(SCHEDULE)?;
+        let mismatch = || {
+            StorageError::InvalidInput(
+            "prover worker cohort differs from the persisted assignment; restore the existing configuration".into(),
+        )
+        };
+        let previous_epochs: Option<Vec<(u64, Vec<Address>)>> = match persisted_schedule {
+            Some(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            ),
+            None => None,
+        };
+        if let Some(old) = &previous_epochs {
+            if previous.as_deref() != Some(SCHEDULED) || !epochs.starts_with(old) {
+                return Err(mismatch());
             }
-        } else if !workers.is_empty() {
-            self.store.put(KEY, &bytes)?;
+        } else if let Some(bytes) = &previous {
+            if *bytes != initial {
+                return Err(mismatch());
+            }
+        }
+        let previous_len = previous_epochs.as_ref().map_or(1, Vec::len);
+        if previous.is_some()
+            && epochs
+                .iter()
+                .skip(previous_len)
+                .any(|(from, _)| *from <= observed_height)
+        {
+            return Err(StorageError::InvalidInput(
+                "worker cohort additions must start after the persisted canonical head".into(),
+            ));
+        }
+        if epochs.len() > 1 {
+            let bytes = serde_json::to_vec(epochs)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            let mut batch = WriteBatch::new();
+            // Older static-only nodes reject this marker rather than silently
+            // ignoring a schedule when reopening the same database.
+            batch.put(KEY.to_vec(), SCHEDULED.to_vec());
+            batch.put(SCHEDULE.to_vec(), bytes);
+            self.store.write_batch(batch)?;
+        } else if previous.is_none() && !epochs[0].1.is_empty() {
+            self.store.put(KEY, &initial)?;
         }
         Ok(())
     }

@@ -121,7 +121,7 @@ jobs:
               TMPDIR="$runtime" node tests/e2e/native-aa-registry.mjs --fork-sync-same-height &&
             SHELL_NODE_BIN="$GITHUB_WORKSPACE/target/debug/shell-node" \
               SHELL_SDK_ENTRY="$consumer/node_modules/shell-sdk/dist/index.js" \
-              TMPDIR="$runtime" node tests/e2e/prover-cohort.mjs
+              SHELL_COHORT_RECONFIGURE=1 TMPDIR="$runtime" node tests/e2e/prover-cohort.mjs
           }; then
             for report in "$runtime"/*/runtime.json "$runtime"/*/runtime-result.json; do
               test ! -f "$report" || cat "$report"

@@ -1,6 +1,6 @@
 # Fixed L1 prover worker cohorts
 
-Status: initial static mode; unreleased.
+Status: explicit cohorts and coordinated future epochs; unreleased.
 
 The whitepaper describes disjoint proof work across Prover nodes. Independent
 local queues currently let two healthy registered workers compute the same L1
@@ -8,7 +8,8 @@ window. Importing one winning proof does not recover the duplicated CPU work.
 
 An explicit `prover.worker_cohort` provides a bounded initial operating mode.
 Every worker uses the same distinct address list, sorted by address bytes.
-The owner index is the first source hash's first eight bytes interpreted as an
+Future membership is selected by the range's first source height, leaving ranges
+which cross an activation whole. The owner index is the first source hash's first eight bytes interpreted as an
 unsigned big-endian integer, modulo the number of members. An L1 range ends at
 the first canonical block meeting the existing entry minimum. A worker with an
 additional queued successor must therefore reserve the same range as a worker
@@ -28,11 +29,21 @@ shutdown. Shutdown drains active jobs and releases deferred reservations so
 normal canonical seeding can recover them on restart. Deferred entries do not
 silently transfer to a different owner when that member is offline.
 
-This is a fixed, explicitly configured cohort of at most 64 healthy members.
-Automatic membership, coordinated reconfiguration, and failure takeover are not
-implemented by this initial mode. No exactly-once computation claim is made for
-partitions or crashes. Those operational variants remain unqualified; this mode does not replace
-normal proof or settlement rules with weaker requirements.
+The initial cohort and at most 63 strictly increasing future epochs form an
+explicit operator schedule. Persist the full schedule atomically as local
+metadata. Only append epochs beyond the database's current canonical head;
+never remove or rewrite an announced epoch. When migrating a static cohort,
+replace its old metadata with a marker that makes static-only binaries fail
+rather than silently ignore scheduled assignments on database reopen.
+
+An operator must stop and synchronize all workers, install the same schedule,
+and restart before the future activation. New identities still require normal
+registration. Retiring workers retain their historical assignments. Fresh
+joining nodes use the full historical schedule; reordering addresses within
+an epoch is harmless. This does not negotiate conflicting operator schedules,
+automatically discover members, or take over offline work. No exactly-once
+computation claim is made for partitions or crashes. Proof and settlement rules
+are unchanged.
 
 The portable native acceptance is `tests/e2e/prover-cohort.mjs`. It uses genuine
 ML-DSA signed transfers, two registered standalone provers, one validator, actual
@@ -41,3 +52,8 @@ receipts and state, rejection of a changed persisted cohort, and all-node reopen
 without recomputation. Queue-level tests independently verify real STARK proofs
 and prover authentication for disjoint assignments, bounded offline reservations,
 canonical replacement, and storage-error preservation.
+
+With `SHELL_COHORT_RECONFIGURE=1`, the same native entry adds two windows after
+appending a future membership. It checks a whole range crossing the activation,
+a subsequent proof from the new owner, rejection of backdating/history edits/
+static downgrade, and physical RocksDB reopens with no recomputation.

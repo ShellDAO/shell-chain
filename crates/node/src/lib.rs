@@ -16,7 +16,7 @@ pub mod pruning;
 pub mod reorg;
 
 pub use builder::NodeBuilder;
-pub use config::{ConsensusEngineConfig, MetricsConfig, NodeConfig, NodeRole};
+pub use config::{ConsensusEngineConfig, MetricsConfig, NodeConfig, NodeRole, ProverWorkerEpoch};
 pub mod validator_store;
 pub use error::NodeError;
 pub use historical_sync::{PeerCapabilityTracker, SyncStatus};

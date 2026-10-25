@@ -8,8 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - Optional fixed L1 prover worker cohorts partition canonical proof ranges across
   distinct workers and retain membership across database reopen. This initial
-  mode requires an explicitly configured healthy cohort; dynamic membership and
-  automatic failover remain separate work.
+  mode accepts coordinated, append-only future membership epochs selected by
+  the first source height of each range. Historical assignment and scheduled
+  database downgrade protection survive reopen; automatic recruitment and
+  offline takeover remain separate work.
 
 ### Fixed
 

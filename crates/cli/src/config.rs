@@ -76,6 +76,7 @@ pub struct ProverSection {
     pub max_concurrent_proofs: Option<std::num::NonZeroUsize>,
     pub proving_priority: Option<shell_node::ProvingPriority>,
     pub worker_cohort: Vec<shell_primitives::Address>,
+    pub worker_cohort_schedule: Vec<shell_node::ProverWorkerEpoch>,
 }
 
 #[derive(Debug, Default, Deserialize)]

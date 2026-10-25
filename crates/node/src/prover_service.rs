@@ -48,33 +48,68 @@ const MAX_DEFERRED_COHORT_RANGES: usize = 64;
 /// Membership is independent of peer arrival timing and does not change proof
 /// validity, rewards, validator membership, or consensus state.
 pub(crate) struct WorkerCohort<S: KvStore> {
-    workers: Vec<Address>,
+    epochs: Vec<(u64, Vec<Address>)>,
     local: Address,
     chain: ChainStore<S>,
     deferred: VecDeque<ProofTask>,
 }
 
 impl<S: KvStore> WorkerCohort<S> {
+    #[cfg(test)]
     pub(crate) fn open(
         store: Arc<S>,
-        mut workers: Vec<Address>,
+        workers: Vec<Address>,
         local: Address,
     ) -> Result<Option<Self>, StorageError> {
-        workers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        if workers.len() > MAX_WORKER_COHORT
-            || workers.windows(2).any(|pair| pair[0] == pair[1])
-            || (!workers.is_empty() && !workers.contains(&local))
+        Self::open_scheduled(store, workers, Vec::new(), local)
+    }
+
+    pub(crate) fn open_scheduled(
+        store: Arc<S>,
+        workers: Vec<Address>,
+        schedule: Vec<crate::config::ProverWorkerEpoch>,
+        local: Address,
+    ) -> Result<Option<Self>, StorageError> {
+        let mut epochs = vec![(0, workers)];
+        epochs.extend(
+            schedule
+                .into_iter()
+                .map(|epoch| (epoch.from_block, epoch.workers)),
+        );
+        let enabled = !epochs[0].1.is_empty();
+        if epochs.len() > MAX_WORKER_COHORT
+            || (!enabled && epochs.len() != 1)
+            || epochs.windows(2).any(|pair| pair[0].0 >= pair[1].0)
         {
             return Err(StorageError::InvalidInput(
-                "worker_cohort must contain the local prover and at most 64 distinct addresses"
-                    .into(),
+                "worker_cohort_schedule requires an initial cohort and at most 63 strictly increasing future epochs".into(),
             ));
         }
-        ProofAmendmentStore::new(Arc::clone(&store)).bind_worker_cohort(&workers)?;
-        Ok((!workers.is_empty()).then(|| Self {
-            workers,
+        for (_, workers) in &mut epochs {
+            workers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            if workers.len() > MAX_WORKER_COHORT
+                || (enabled && workers.is_empty())
+                || workers.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err(StorageError::InvalidInput(
+                    "each worker cohort must contain 1 to 64 distinct addresses".into(),
+                ));
+            }
+        }
+        if enabled && !epochs.iter().any(|(_, workers)| workers.contains(&local)) {
+            return Err(StorageError::InvalidInput(
+                "worker cohort schedule must contain the local prover".into(),
+            ));
+        }
+        let chain = ChainStore::new(Arc::clone(&store));
+        let height = chain
+            .get_head_block()?
+            .map_or(0, |block| block.header.number);
+        ProofAmendmentStore::new(store).bind_worker_cohort_schedule(&epochs, height)?;
+        Ok(enabled.then(|| Self {
+            epochs,
             local,
-            chain: ChainStore::new(store),
+            chain,
             deferred: VecDeque::new(),
         }))
     }
@@ -85,8 +120,20 @@ impl<S: KvStore> WorkerCohort<S> {
             .first()
             .copied()
             .unwrap_or_else(|| ShellHash::from(task.block_hash));
+        let start = task
+            .block_number
+            .saturating_sub(task.source_hashes.len().saturating_sub(1) as u64);
+        // A range crossing a membership boundary retains its first-source epoch.
+        // Splitting it at an arbitrary activation could create invalid small proofs.
+        let workers = &self
+            .epochs
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= start)
+            .expect("initial epoch at zero")
+            .1;
         let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
-        self.workers[(prefix % self.workers.len() as u64) as usize]
+        workers[(prefix % workers.len() as u64) as usize]
     }
 
     fn reap(
@@ -989,6 +1036,161 @@ mod tests {
         )
         .is_err());
         assert!(WorkerCohort::open(fresh, vec![addresses[1]], addresses[0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_cohort_schedule_preserves_crossing_ranges_and_moves_later_work() {
+        use crate::config::ProverWorkerEpoch;
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let addresses = signers
+            .each_ref()
+            .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()));
+        let epoch = ProverWorkerEpoch {
+            from_block: 10,
+            workers: vec![addresses[1]],
+        };
+        let entries = vec![
+            shell_stark_prover::SigBatchEntry {
+                msg_hash: [7; 32],
+                pk_hash: [9; 32]
+            };
+            MIN_L1_STARK_TXS
+        ];
+        let sources: Vec<ShellHash> = (9..=14).map(|n| ShellHash::from([n; 32])).collect();
+        let tasks = [
+            ProofTask::with_sources(
+                *sources[2].0,
+                11,
+                entries.clone(),
+                1,
+                sources[..3].to_vec(),
+                None,
+            ),
+            ProofTask::with_sources(*sources[5].0, 14, entries, 1, sources[3..].to_vec(), None),
+        ];
+        for i in 0..2 {
+            let store = Arc::new(MemoryDb::new());
+            let chain = ChainStore::new(store.clone());
+            let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+            for task in &tasks {
+                chain
+                    .set_canonical(task.block_number, &ShellHash::from(task.block_hash))
+                    .unwrap();
+                backlog.lock().push(task.clone());
+            }
+            let cohort = WorkerCohort::open_scheduled(
+                store.clone(),
+                vec![addresses[0]],
+                vec![epoch.clone()],
+                addresses[i],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                cohort.owner(&tasks[0]),
+                addresses[0],
+                "crossing window belongs to its first-source epoch"
+            );
+            assert_eq!(
+                cohort.owner(&tasks[1]),
+                addresses[1],
+                "new member owns the later window"
+            );
+            let (tx, mut rx) = mpsc::channel(2);
+            let handle = ProverService::new(
+                backlog,
+                ProofAmendmentStore::new(store.clone()),
+                ProverConfig::default(),
+                addresses[i],
+            )
+            .with_worker_cohort(Some(cohort))
+            .with_signer(signers[i].clone())
+            .with_amendment_sender(tx)
+            .start();
+            let proof = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.block_number, [11, 14][i]);
+            assert_eq!(proof.prover, addresses[i]);
+            shell_stark_prover::verify_sig_batch(&proof.proof).unwrap();
+            proof.verify_prover_authentication().unwrap();
+            handle.shutdown().await;
+            let reopened = WorkerCohort::open_scheduled(
+                store.clone(),
+                vec![addresses[0]],
+                vec![epoch.clone()],
+                addresses[i],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(reopened.owner(&tasks[0]), addresses[0]);
+            assert_eq!(reopened.owner(&tasks[1]), addresses[1]);
+            assert!(
+                WorkerCohort::open(store.clone(), vec![addresses[0]], addresses[0]).is_err(),
+                "scheduled database rejects static downgrade"
+            );
+            let amendments = ProofAmendmentStore::new(store.clone());
+            let old = vec![(0, vec![addresses[0]]), (10, vec![addresses[1]])];
+            let mut appended = old.clone();
+            appended.push((20, addresses.to_vec()));
+            assert!(
+                amendments
+                    .bind_worker_cohort_schedule(&appended, 20)
+                    .is_err(),
+                "backdated append rejected"
+            );
+            amendments.bind_worker_cohort_schedule(&old, 20).unwrap();
+            amendments
+                .bind_worker_cohort_schedule(&appended, 19)
+                .unwrap();
+            assert!(
+                amendments.bind_worker_cohort_schedule(&old, 20).is_err(),
+                "cannot remove an announced future epoch"
+            );
+            appended[1].1 = vec![addresses[0]];
+            assert!(
+                amendments
+                    .bind_worker_cohort_schedule(&appended, 0)
+                    .is_err(),
+                "cannot rewrite history"
+            );
+            assert_eq!(
+                store.get(b"prover-worker-cohort/v1").unwrap().unwrap(),
+                b"scheduled:v2",
+                "static-only binaries must fail their old equality check"
+            );
+        }
+        let store = Arc::new(MemoryDb::new());
+        for schedule in [
+            vec![ProverWorkerEpoch {
+                from_block: 0,
+                workers: vec![addresses[1]],
+            }],
+            vec![ProverWorkerEpoch {
+                from_block: 1,
+                workers: vec![],
+            }],
+            vec![ProverWorkerEpoch {
+                from_block: 1,
+                workers: vec![addresses[1], addresses[1]],
+            }],
+        ] {
+            assert!(WorkerCohort::open_scheduled(
+                store.clone(),
+                vec![addresses[0]],
+                schedule,
+                addresses[0]
+            )
+            .is_err());
+        }
+        assert!(
+            store.get(b"prover-worker-cohort/v1").unwrap().is_none(),
+            "invalid input must not bind the database"
+        );
     }
 
     #[test]

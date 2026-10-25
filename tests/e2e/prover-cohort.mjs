@@ -30,6 +30,8 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 const nodes = [];
 const ports = [], p2p = [], metrics = [];
 const keys = [];
+const reconfigure = process.env.SHELL_COHORT_RECONFIGURE === '1';
+const logPhases = [0, 0, 0];
 async function port() {
     const s = createServer();
     await new Promise((r, j) => {
@@ -123,6 +125,9 @@ async function start(i, boot) {
     ];
     if (boot)
         args.push('--bootnode', boot);
+    if (logPhases[i]++) {
+        await writeFile(join(out, `node${i}.before-reopen-${logPhases[i]}.log`), await readFile(join(out, `node${i}.log`)));
+    }
     const fd = openSync(join(out, `node${i}.log`), 'w');
     const n = spawn(binary, args, {
         stdio: [
@@ -340,8 +345,108 @@ try {
     await pause(1500);
     for (let i = 1; i < 3; i++)
         assert.equal(count(await metricText(i)), 0, 'persisted proofs must not be recomputed after all native nodes restart');
+    if (reconfigure) {
+        // Choose different old/new owners for the crossing range, so selecting
+        // membership by its end height would actually fail this native check.
+        const firstEnd = Number(result.workers.flatMap(w => w.generationLogs).join('\n').match(/range ending at block #(\d+)/)[1]);
+        const crossingStart = firstEnd + 1;
+        const firstSource = await rpc(0, 'eth_getBlockByNumber', ['0x' + crossingStart.toString(16), false]);
+        assert.ok(firstSource?.hash);
+        const sorted = keys.slice(1).map(k => k.address.toLowerCase()).sort();
+        const oldOwner = sorted[Number(BigInt('0x' + firstSource.hash.slice(2, 18)) % 2n)];
+        const crossingWorker = keys.findIndex(k => k.address.toLowerCase() === oldOwner);
+        const target = 3 - crossingWorker;
+        const heads = await Promise.all([0, 1, 2].map(i => rpc(i, 'eth_blockNumber')));
+        const fromBlock = Math.max(...heads.map(h => Number(BigInt(h)))) + 2;
+        await stopAll();
+        const base = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1).map(k => k.address)) + '\n';
+        const scheduled = height => base + '[[prover.worker_cohort_schedule]]\nfrom_block=' + height + '\nworkers=' + JSON.stringify([keys[target].address]) + '\n';
+        const failStart = async (name, config, pattern) => {
+            await writeFile(cfg, config);
+            const failed = spawnSync(binary, result.commands.find(c => c.label === 'start1').args, { encoding: 'utf8', timeout: 30000 });
+            await writeFile(join(out, name + '.log'), failed.stdout + failed.stderr);
+            assert.equal(failed.status, 1, name);
+            assert.match(failed.stdout + failed.stderr, pattern);
+            result[name] = { status: failed.status };
+        };
+        await failStart('backdated-schedule', scheduled(1), /persisted canonical head/);
+        for (let i = 1; i < 3; i++)
+            await writeFile(join(out, `node${i}.toml`), scheduled(fromBlock));
+        await start(0);
+        await start(1, boot);
+        await start(2, boot);
+        const settlementCount = async () => {
+            const records = await Promise.all([1, 2].map(i => rpc(0, 'shell_getRegisteredProver', [keys[i].address])));
+            return records.reduce((n, x) => n + x.proofs_submitted, 0);
+        };
+        const submitWindow = async (firstNonce) => {
+            for (let offset = firstNonce; offset < firstNonce + 512; offset += 16) {
+                const hashes = [];
+                for (let nonce = offset; nonce < offset + 16; nonce++) {
+                    const tx = await sender.buildSignedTransaction({ tx: buildTransaction({ chainId: 1337, nonce, to: recipient, value: 1n, gasLimit: 21000 }), includePublicKey: true });
+                    hashes.push(await paced(() => provider.sendTransaction(tx)));
+                }
+                for (const hash of hashes) {
+                    const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+                    assert.equal(receipt.status, '0x1');
+                    result.receipts.push(receipt);
+                }
+            }
+        };
+        // The first post-restart range may start BEFORE the new epoch and cross
+        // its activation. It must finish whole under the original membership.
+        await submitWindow(512);
+        await until(async () => await settlementCount() === 2, 90);
+        const before = await Promise.all([1, 2].map(async (i) => count(await metricText(i))));
+        assert.equal(before[0] + before[1], 1, 'crossing range generated exactly once');
+        await submitWindow(1024);
+        await until(async () => await settlementCount() === 3, 90);
+        await pause(1500);
+        const after = await Promise.all([1, 2].map(async (i) => count(await metricText(i))));
+        assert.equal(after[target - 1] - before[target - 1], 1, 'new member generates the later range');
+        assert.equal(after[2 - target] - before[2 - target], 0, 'retired member does not duplicate the later range');
+        const ranges = [];
+        for (let i = 1; i < 3; i++) {
+            const log = await readFile(join(out, `node${i}.log`), 'utf8');
+            for (const match of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
+                ranges.push({ worker: i, end: Number(match[1]), start: Number(match[1]) - Number(match[2]) + 1 });
+            }
+        }
+        ranges.sort((a, b) => a.start - b.start);
+        assert.equal(ranges.length, 2);
+        assert.equal(ranges[0].start, crossingStart);
+        assert.equal(ranges[0].worker, crossingWorker, 'crossing range stays with its old-epoch owner');
+        assert.notEqual(crossingWorker, target);
+        assert.ok(ranges[0].start < fromBlock && ranges[0].end >= fromBlock, 'actual range crosses activation without splitting');
+        assert.ok(ranges[1].start >= fromBlock);
+        assert.equal(ranges[1].worker, target);
+        assert.equal(ranges[0].end + 1, ranges[1].start, 'no skipped or overlapping sources');
+        result.schedule = { fromBlock, target, before, after, ranges };
+        assert.equal(BigInt(await rpc(0, 'eth_getBalance', [recipient, 'latest'])), 1536n);
+        assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
+        await stopAll();
+        await failStart('static-downgrade', base, /persisted assignment/);
+        await failStart('rewritten-epoch', scheduled(fromBlock).replace(JSON.stringify([keys[target].address]), JSON.stringify([keys[3 - target].address])), /persisted assignment/);
+        await writeFile(cfg, scheduled(fromBlock));
+        await start(0);
+        await start(1, boot);
+        await start(2, boot);
+        const finalReceipt = result.receipts.at(-1);
+        for (let i = 0; i < 3; i++) {
+            await until(async () => BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])) === 1536n);
+            assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1536n);
+            assert.equal((await rpc(i, 'eth_getTransactionReceipt', [finalReceipt.transactionHash])).status, '0x1');
+        }
+        await pause(1500);
+        for (let i = 1; i < 3; i++)
+            assert.equal(count(await metricText(i)), 0, 'scheduled reopen does not recompute');
+        result.schedule.reopenPassed = true;
+        result.accepted = result.receipts.length;
+        result.recipientBalance = '1536';
+        result.adaptation = 'Explicit coordinated future memberships, local registry activation0, 1536 genuine transfers. Automatic recruitment and offline takeover remain unqualified.';
+    }
     result.reopenPassed = true;
-    result.status = 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
+    result.status = reconfigure ? 'PASS: scheduled membership, crossing and later ranges, 1536 genuine transfers, persistent schedule and native reopens' : 'PASS: one actual proof, unchanged validators, genuine receipts/state and all three native RocksDB reopens';
     await save();
     console.log(JSON.stringify({
         runtime: root, workers: result.workers.map(w => ({

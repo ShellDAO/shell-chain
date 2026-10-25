@@ -353,13 +353,46 @@ accepted; duplicate addresses, a missing local signer, and a different list on
 reopen are rejected. Restore the original configuration after an accidental
 change. Do not delete chain data to bypass a membership error.
 
-This initial mode supports a fixed, healthy cohort of at most 64 workers.
-It does not automatically recruit registered provers, transfer an offline
-worker's assignments, or define a membership-change protocol. Do not change
-membership during a run or assume this provides exactly-once computation across
-partitions or crashes. Omitting the setting on a fresh database retains legacy
-independent scheduling. This feature is unreleased; older binaries may ignore
-the setting and generate duplicate work.
+The initial cohort supports at most 64 workers. To coordinate a later change,
+stop every participating worker, ensure they have synchronized, and append the
+same future epoch to every worker's full configuration before restarting:
+
+```toml
+[[prover.worker_cohort_schedule]]
+from_block = 1000000
+workers = [
+  "0x2222222222222222222222222222222222222222222222222222222222222222",
+]
+```
+
+Replace the sample height with one beyond **all** workers' persisted canonical
+heads, leaving time to restart and synchronize before it is reached. The example
+retires the first worker for new ranges; it remains responsible for older ranges.
+Register each incoming identity using the normal registry rules before its first
+assignment. A local key must occur in at least one configured epoch. Keep retired
+workers online until their old assignments settle.
+
+Ownership is selected by the **first source block** of a range. A range that
+starts before `from_block` and ends after it stays with the old membership;
+the first range starting at or after that height uses the new membership.
+No small, invalid proof range is created by splitting at the boundary.
+
+There may be at most 63 future epochs, with strictly increasing heights. Once
+persisted, every epoch is immutable, including announced future entries. You may
+append an epoch only beyond the local canonical head. Removing, rewriting or
+backdating an epoch fails before listeners or proving start. Restoring the full
+original schedule recovers from an accidental edit. Scheduled databases reject
+static-only configuration and older static-only binaries on reopen; use a build
+supporting this schedule on every worker. A fresh joining database needs the full
+historical schedule to reconstruct the same ownership.
+
+This is an explicitly coordinated operational plan. It does not automatically
+recruit registered provers or transfer an offline worker's assignments. All
+workers must use the same schedule; there is no network negotiation of different
+operator configurations. Do not assume exactly-once computation across partitions
+or crashes. Omitting both settings on a fresh database retains independent
+scheduling. This feature is unreleased; older public binaries may ignore these
+settings and generate duplicate work.
 
 Build a node with RocksDB and libp2p, then run the isolated acceptance with Node.js
 and a compatible Shell SDK build (transaction wire format v2):
@@ -374,7 +407,11 @@ The entry creates fresh keys and an isolated three-node chain, registers two
 provers, submits 512 genuine one-wei transfers, and requires exactly one generated
 proof across the workers. It checks the finalized receipts and balances, rejects
 a changed persisted cohort, and reopens all three RocksDB nodes without proof
-recomputation. It retains private keys and databases for inspection and stops
+recomputation. To also test a coordinated membership change, use the same command
+with `SHELL_COHORT_RECONFIGURE=1`. That mode sends 1,536 transfers, requires an
+unsplit range crossing the activation and a later proof from the new member,
+rejects a backdated append, history rewrite and static downgrade, and reopens
+all databases with the schedule intact. It retains private keys and databases for inspection and stops
 its own processes. It does not qualify automatic failover or production scale.
 
 ---

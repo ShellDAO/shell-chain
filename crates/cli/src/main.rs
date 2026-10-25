@@ -842,6 +842,7 @@ async fn main() {
                     .proving_priority
                     .unwrap_or(shell_node::ProvingPriority::Sequential),
                 prover_worker_cohort: file_config.prover.worker_cohort,
+                prover_worker_cohort_schedule: file_config.prover.worker_cohort_schedule,
                 max_idle_interval,
                 mempool_max_size,
                 mempool_max_bytes,

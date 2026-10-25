@@ -12,6 +12,14 @@ use shell_rpc::RpcConfig;
 
 use crate::pruning::PruningConfig;
 
+/// A coordinated future L1 worker membership, selected by range start height.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProverWorkerEpoch {
+    pub from_block: u64,
+    pub workers: Vec<Address>,
+}
+
 /// H2: The operational role of a node in the wPoA+STARK network.
 ///
 /// - `Validator`: Standard block-producing authority. Participates in PoA
@@ -247,6 +255,8 @@ pub struct NodeConfig {
     /// Explicit, identical cohort of independently keyed L1 prover workers.
     /// Empty retains independent legacy scheduling.
     pub prover_worker_cohort: Vec<shell_primitives::Address>,
+    /// Append-only, coordinated future changes to the initial worker cohort.
+    pub prover_worker_cohort_schedule: Vec<ProverWorkerEpoch>,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -312,6 +322,7 @@ impl NodeConfig {
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,
             prover_worker_cohort: Vec::new(),
+            prover_worker_cohort_schedule: Vec::new(),
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }

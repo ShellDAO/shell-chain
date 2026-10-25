@@ -85,6 +85,7 @@ pub struct RunArgs {
     pub prover_max_concurrent_proofs: usize,
     pub prover_priority: shell_node::ProvingPriority,
     pub prover_worker_cohort: Vec<shell_primitives::Address>,
+    pub prover_worker_cohort_schedule: Vec<shell_node::ProverWorkerEpoch>,
     /// L2 STARK aggregation mode: disabled, scaffold, or active.
     pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
@@ -985,6 +986,7 @@ async fn run_with_store<S: KvStore + 'static>(
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         prover_priority: args.prover_priority,
         prover_worker_cohort: args.prover_worker_cohort,
+        prover_worker_cohort_schedule: args.prover_worker_cohort_schedule,
         l2_stark_mode: args
             .l2_stark_mode
             .parse::<L2StarkMode>()
@@ -1211,6 +1213,7 @@ mod tests {
             prover_max_concurrent_proofs: 1,
             prover_priority: shell_node::ProvingPriority::Sequential,
             prover_worker_cohort: Vec::new(),
+            prover_worker_cohort_schedule: Vec::new(),
             l2_stark_mode: "disabled".into(),
             network: "dev".into(),
             consensus_engine: None,
