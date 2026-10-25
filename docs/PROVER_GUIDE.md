@@ -411,8 +411,15 @@ recomputation. To also test a coordinated membership change, use the same comman
 with `SHELL_COHORT_RECONFIGURE=1`. That mode sends 1,536 transfers, requires an
 unsplit range crossing the activation and a later proof from the new member,
 rejects a backdated append, history rewrite and static downgrade, and reopens
-all databases with the schedule intact. It retains private keys and databases for inspection and stops
-its own processes. It does not qualify automatic failover or production scale.
+all databases with the schedule intact. Use `SHELL_COHORT_LATE_JOIN=1` to also
+exercise a freshly initialized third prover that occurs only in the future
+membership. It registers that identity after the initial proof, requires live
+historical synchronization without old-work generation, checks future ownership,
+and reopens all four native nodes with receipts and prover records intact.
+This option includes the coordinated-membership checks above.
+
+The entry retains private keys and databases for inspection and stops its own
+processes. It does not qualify automatic recruitment, failover or production scale.
 
 ---
 

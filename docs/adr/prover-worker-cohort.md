@@ -57,3 +57,11 @@ With `SHELL_COHORT_RECONFIGURE=1`, the same native entry adds two windows after
 appending a future membership. It checks a whole range crossing the activation,
 a subsequent proof from the new owner, rejection of backdating/history edits/
 static downgrade, and physical RocksDB reopens with no recomputation.
+
+`SHELL_COHORT_LATE_JOIN=1` additionally checks a freshly joining epoch-only identity.
+The first two workers settle an initial window before the new key is registered.
+The fresh fourth native process then synchronizes that history using the full
+schedule, observes the historical balance and nonce without generating old proofs,
+and proves a later range assigned only to its future membership. All four
+databases reopen with balances, nonces, receipts and settlement counters intact.
+This is explicit operator scheduling, not automatic recruitment.

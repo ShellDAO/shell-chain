@@ -30,8 +30,11 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 const nodes = [];
 const ports = [], p2p = [], metrics = [];
 const keys = [];
-const reconfigure = process.env.SHELL_COHORT_RECONFIGURE === '1';
-const logPhases = [0, 0, 0];
+const lateJoin = process.env.SHELL_COHORT_LATE_JOIN === '1';
+const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
+const nodeCount = lateJoin ? 4 : 3;
+const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
+const logPhases = Array(nodeCount).fill(0);
 async function port() {
     const s = createServer();
     await new Promise((r, j) => {
@@ -158,7 +161,7 @@ try {
     result.binaryVersion = cli('version', [
         '--version'
     ]).trim();
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < nodeCount; i++) {
         ports[i] = await port();
         p2p[i] = await port();
         metrics[i] = await port();
@@ -172,7 +175,7 @@ try {
         rpc: ports, p2p, metrics
     };
     result.addresses = keys.map(k => k.address);
-    assert.equal(new Set(result.addresses).size, 3);
+    assert.equal(new Set(result.addresses).size, nodeCount);
     const genesis = {
         prover_registry_height: 0, chain_id: 1337, chain_name: 'multiple-provers', network_type: 'Dev', timestamp: Math.floor(Date.now() / 1000), gas_limit: 30000000, extra_data: 'multiple-provers', consensus: {
             engine: 'wpoa', authorities: [
@@ -191,7 +194,7 @@ try {
         }, boot_nodes: []
     };
     await writeFile(join(out, 'genesis.json'), JSON.stringify(genesis));
-    for (let i = 0; i < 3; i++)
+    for (let i = 0; i < nodeCount; i++)
         cli(`init${i}`, [
             '--datadir', join(out, `db${i}`), 'init', '--genesis', join(out, 'genesis.json'), '--chain-id', '1337', '--network', 'dev'
         ]);
@@ -219,7 +222,7 @@ try {
     const boot = log.match(/\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[A-Za-z0-9]+/g)?.at(-1);
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
-        await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1).map(k => k.address)) + '\n');
+        await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n');
     await start(1, boot);
     await start(2, boot);
     for (let i = 1; i < 3; i++) {
@@ -346,20 +349,30 @@ try {
     for (let i = 1; i < 3; i++)
         assert.equal(count(await metricText(i)), 0, 'persisted proofs must not be recomputed after all native nodes restart');
     if (reconfigure) {
+        if (lateJoin) {
+            const hash = await rpc(0, 'shell_proposeRegisterProver', [keys[3].public_key, 1]);
+            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+            assert.equal(receipt.status, '0x1');
+            const record = await rpc(0, 'shell_getRegisteredProver', [keys[3].address]);
+            assert.ok(record);
+            assert.equal(record.proofs_submitted, 0);
+            assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
+            result.registration3 = { hash, receipt, record };
+        }
         // Choose different old/new owners for the crossing range, so selecting
         // membership by its end height would actually fail this native check.
         const firstEnd = Number(result.workers.flatMap(w => w.generationLogs).join('\n').match(/range ending at block #(\d+)/)[1]);
         const crossingStart = firstEnd + 1;
         const firstSource = await rpc(0, 'eth_getBlockByNumber', ['0x' + crossingStart.toString(16), false]);
         assert.ok(firstSource?.hash);
-        const sorted = keys.slice(1).map(k => k.address.toLowerCase()).sort();
+        const sorted = keys.slice(1, 3).map(k => k.address.toLowerCase()).sort();
         const oldOwner = sorted[Number(BigInt('0x' + firstSource.hash.slice(2, 18)) % 2n)];
         const crossingWorker = keys.findIndex(k => k.address.toLowerCase() === oldOwner);
-        const target = 3 - crossingWorker;
+        const target = lateJoin ? 3 : 3 - crossingWorker;
         const heads = await Promise.all([0, 1, 2].map(i => rpc(i, 'eth_blockNumber')));
         const fromBlock = Math.max(...heads.map(h => Number(BigInt(h)))) + 2;
         await stopAll();
-        const base = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1).map(k => k.address)) + '\n';
+        const base = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n';
         const scheduled = height => base + '[[prover.worker_cohort_schedule]]\nfrom_block=' + height + '\nworkers=' + JSON.stringify([keys[target].address]) + '\n';
         const failStart = async (name, config, pattern) => {
             await writeFile(cfg, config);
@@ -370,13 +383,25 @@ try {
             result[name] = { status: failed.status };
         };
         await failStart('backdated-schedule', scheduled(1), /persisted canonical head/);
-        for (let i = 1; i < 3; i++)
+        for (const i of workers)
             await writeFile(join(out, `node${i}.toml`), scheduled(fromBlock));
         await start(0);
         await start(1, boot);
         await start(2, boot);
+        if (lateJoin) {
+            await start(3, boot);
+            await until(async () => {
+                const record = await rpc(3, 'shell_getRegisteredProver', [keys[3].address]);
+                return Number(BigInt(await rpc(3, 'net_peerCount'))) > 0 && !!record &&
+                    BigInt(await rpc(3, 'eth_getBalance', [recipient, 'latest'])) === 512n;
+            }, 90);
+            assert.equal(BigInt(await rpc(3, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 512n);
+            assert.equal(count(await metricText(3)), 0, 'fresh epoch-only worker must not prove historical ranges');
+            result.lateJoin = { beforeNewWindow: await rpc(3, 'shell_getNodeInfo'), historicalBalance: '512', historicalNonce: '512', historicalGenerated: 0 };
+            await save();
+        }
         const settlementCount = async () => {
-            const records = await Promise.all([1, 2].map(i => rpc(0, 'shell_getRegisteredProver', [keys[i].address])));
+            const records = await Promise.all(workers.map(i => rpc(0, 'shell_getRegisteredProver', [keys[i].address])));
             return records.reduce((n, x) => n + x.proofs_submitted, 0);
         };
         const submitWindow = async (firstNonce) => {
@@ -397,16 +422,16 @@ try {
         // its activation. It must finish whole under the original membership.
         await submitWindow(512);
         await until(async () => await settlementCount() === 2, 90);
-        const before = await Promise.all([1, 2].map(async (i) => count(await metricText(i))));
-        assert.equal(before[0] + before[1], 1, 'crossing range generated exactly once');
+        const before = await Promise.all(workers.map(async (i) => count(await metricText(i))));
+        assert.equal(before.reduce((n, x) => n + x, 0), 1, 'crossing range generated exactly once');
         await submitWindow(1024);
         await until(async () => await settlementCount() === 3, 90);
         await pause(1500);
-        const after = await Promise.all([1, 2].map(async (i) => count(await metricText(i))));
-        assert.equal(after[target - 1] - before[target - 1], 1, 'new member generates the later range');
-        assert.equal(after[2 - target] - before[2 - target], 0, 'retired member does not duplicate the later range');
+        const after = await Promise.all(workers.map(async (i) => count(await metricText(i))));
+        for (const i of workers)
+            assert.equal(after[i - 1] - before[i - 1], i === target ? 1 : 0, 'only the future member generates the later range');
         const ranges = [];
-        for (let i = 1; i < 3; i++) {
+        for (const i of workers) {
             const log = await readFile(join(out, `node${i}.log`), 'utf8');
             for (const match of log.matchAll(/range ending at block #(\d+) \((\d+) source hashes\)/g)) {
                 ranges.push({ worker: i, end: Number(match[1]), start: Number(match[1]) - Number(match[2]) + 1 });
@@ -421,25 +446,31 @@ try {
         assert.ok(ranges[1].start >= fromBlock);
         assert.equal(ranges[1].worker, target);
         assert.equal(ranges[0].end + 1, ranges[1].start, 'no skipped or overlapping sources');
-        result.schedule = { fromBlock, target, before, after, ranges };
+        result.schedule = { fromBlock, target, crossingWorker, crossingStart, firstSourceHash: firstSource.hash, before, after, ranges };
         assert.equal(BigInt(await rpc(0, 'eth_getBalance', [recipient, 'latest'])), 1536n);
         assert.deepEqual(await rpc(0, 'shell_getValidators'), validators);
         await stopAll();
         await failStart('static-downgrade', base, /persisted assignment/);
-        await failStart('rewritten-epoch', scheduled(fromBlock).replace(JSON.stringify([keys[target].address]), JSON.stringify([keys[3 - target].address])), /persisted assignment/);
+        await failStart('rewritten-epoch', scheduled(fromBlock).replace(JSON.stringify([keys[target].address]), JSON.stringify([keys[crossingWorker].address])), /persisted assignment/);
         await writeFile(cfg, scheduled(fromBlock));
         await start(0);
         await start(1, boot);
         await start(2, boot);
+        if (lateJoin) await start(3, boot);
         const finalReceipt = result.receipts.at(-1);
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < nodeCount; i++) {
             await until(async () => BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])) === 1536n);
             assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 1536n);
             assert.equal((await rpc(i, 'eth_getTransactionReceipt', [finalReceipt.transactionHash])).status, '0x1');
         }
         await pause(1500);
-        for (let i = 1; i < 3; i++)
+        for (const i of workers)
             assert.equal(count(await metricText(i)), 0, 'scheduled reopen does not recompute');
+        assert.equal(await settlementCount(), 3, 'settled prover records persist after reopen');
+        if (lateJoin) {
+            assert.equal((await rpc(3, 'shell_getRegisteredProver', [keys[3].address])).proofs_submitted, 1);
+            result.lateJoin.reopenPassed = true;
+        }
         result.schedule.reopenPassed = true;
         result.accepted = result.receipts.length;
         result.recipientBalance = '1536';
