@@ -18,6 +18,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Preserve an already recovered or canonically settled local CPU proof during
+  channel handoff, keeping its stored artifacts and settlement metadata without
+  queueing a duplicate or rejecting the proof as overlapping with itself.
 - Keep the node event loop responsive while a slow post-quantum view-change
   signature is computed. Track one signing job, discard results after their
   height, view, finality or authority context changes, and drain it on shutdown.

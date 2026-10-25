@@ -2003,6 +2003,13 @@ mod tests {
         fail_next_batch: AtomicBool,
         fail_proof_batch: AtomicBool,
         fail_head_batch: AtomicBool,
+        proof_batch_barrier: parking_lot::Mutex<Option<ProofBatchBarrier>>,
+    }
+
+    #[derive(Debug)]
+    struct ProofBatchBarrier {
+        persisted: tokio::sync::oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
     }
 
     impl FailingBatchDb {
@@ -2016,6 +2023,7 @@ mod tests {
                 fail_next_batch: AtomicBool::new(false),
                 fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
+                proof_batch_barrier: parking_lot::Mutex::new(None),
             }
         }
 
@@ -2092,7 +2100,22 @@ mod tests {
                     "injected canonical batch failure".into(),
                 ));
             }
-            self.inner.write_batch(batch)
+            let proof_batch = batch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, WriteBatchOp::Put { key, .. } if key.starts_with(b"pa/")));
+            self.inner.write_batch(batch)?;
+            if proof_batch {
+                let barrier = self.proof_batch_barrier.lock().take();
+                if let Some(barrier) = barrier {
+                    let _ = barrier.persisted.send(());
+                    barrier
+                        .resume
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("proof storage barrier must be released");
+                }
+            }
+            Ok(())
         }
 
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
@@ -20953,7 +20976,9 @@ mod tests {
 
     /// Create and fund a test account with a Dilithium key.
     /// Returns (signer, address, pubkey).
-    fn make_stark_account(node: &Node<MemoryDb>) -> (DilithiumSigner, Address, Vec<u8>) {
+    fn make_stark_account<S: KvStore + 'static>(
+        node: &Node<S>,
+    ) -> (DilithiumSigner, Address, Vec<u8>) {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let address = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
@@ -21386,6 +21411,198 @@ mod tests {
                 .is_empty(),
             "canonical settlement ends proof retries"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovered_proof_local_handoff_preserves_original_artifacts() {
+        assert_recovered_proof_handoff(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settled_proof_local_handoff_preserves_canonical_artifacts() {
+        assert_recovered_proof_handoff(true).await;
+    }
+
+    async fn assert_recovered_proof_handoff(settle_before_handoff: bool) {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, proposer, db) = setup_failing_batch_node();
+        node.config.enable_stark_aggregation = true;
+        node.config.node_role = crate::NodeRole::Prover;
+        node.config.block_time_ms = 60_000;
+        node.config.metrics.enabled = false;
+        node.config.rpc_enabled = false;
+        let (sender, address, public_key) = make_stark_account(&node);
+        fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        for block_index in 0..16 {
+            for offset in 0..32 {
+                let nonce = (block_index * 32 + offset) as u64;
+                let tx = make_embedded_tx(&sender, address, public_key.clone(), nonce, 1);
+                node.tx_pool
+                    .insert(
+                        tx,
+                        &mut *node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                node.produce_block(&proposer, 32)
+                    .unwrap()
+                    .transactions
+                    .len(),
+                32
+            );
+        }
+        let end = node.chain_store.get_head_hash().unwrap().unwrap();
+        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *db.proof_batch_barrier.lock() = Some(ProofBatchBarrier {
+            persisted: persisted_tx,
+            resume: resume_rx,
+        });
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let proposer = Arc::new(proposer);
+        let task = tokio::spawn({
+            let node = Arc::clone(&node);
+            let signer = Arc::clone(&proposer) as Arc<dyn Signer>;
+            async move { node.run(signer, &mut network).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), persisted_rx)
+            .await
+            .expect("genuine CPU proof must be persisted")
+            .unwrap();
+        let mut original = node.amendment_store.get_amendment(&end).unwrap().unwrap();
+        let amendment = ProofAmendment::from_json(&original).unwrap();
+        assert_eq!(amendment.proof.n_sigs, 512);
+        let mut original_artifacts = db.scan_prefix(b"pa/").unwrap();
+        node.validate_prover_admission(&amendment).unwrap();
+        node.validate_stark_proof_source_binding(&amendment)
+            .unwrap();
+        let recovered = node.stark_frontier_amendments_for_rebroadcast().unwrap();
+        assert_eq!(recovered, vec![amendment.clone()]);
+        assert!(
+            node.validate_stark_amendment_for_storage(&amendment)
+                .is_err(),
+            "shared ordering validation must still reject overlapping ranges"
+        );
+        assert!(
+            node.validate_stark_settlement_sequence(&[amendment.clone(), amendment.clone()])
+                .is_err(),
+            "block inclusion must reject duplicate source settlement"
+        );
+        let mut unauthenticated = amendment.clone();
+        unauthenticated.prover_signature = Bytes::new();
+        assert!(node.validate_prover_admission(&unauthenticated).is_err());
+        assert_eq!(node.pending_stark_settlements.lock().len(), 1);
+        assert!(node.prover_ready.load(Ordering::Acquire));
+        assert_eq!(node.metrics.stark_proofs_generated.get(), 0);
+        let rejected_before_handoff = node.metrics.stark_settlements_rejected.get();
+        let balance = node
+            .world_state
+            .read()
+            .get_balance(&amendment.prover)
+            .unwrap();
+        let settled_block = if settle_before_handoff {
+            let block = node.produce_block(proposer.as_ref(), 0).unwrap();
+            original = node.amendment_store.get_amendment(&end).unwrap().unwrap();
+            let settlement = block
+                .system_transactions
+                .iter()
+                .find(|tx| tx.kind == SystemTxKind::StarkReward)
+                .unwrap();
+            assert_eq!(
+                ProofAmendment::from_json(&original)
+                    .unwrap()
+                    .settlement_tx_hash,
+                Some(settlement.hash())
+            );
+            original_artifacts = db.scan_prefix(b"pa/").unwrap();
+            Some(block)
+        } else {
+            None
+        };
+        // Release the actual service into the normal guarded receive branch.
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.metrics.stark_proofs_generated.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+            // A peer roundtrip is a barrier after the synchronous receive handler.
+            let mut peer = bus.join(&NetworkConfig::default());
+            peer.broadcast(shell_network::NetworkMessage::Ping)
+                .await
+                .unwrap();
+            loop {
+                match peer.next_event().await {
+                    Some(shell_network::NetworkEvent::MessageReceived {
+                        message: shell_network::NetworkMessage::Pong,
+                        ..
+                    }) => break,
+                    Some(_) => {}
+                    None => panic!("peer channel closed before the handoff barrier"),
+                }
+            }
+        })
+        .await
+        .expect("local handoff must finish through the live event loop");
+        node.shutdown();
+        task.await.unwrap().unwrap();
+        assert_eq!(node.metrics.stark_proofs_generated.get(), 1);
+        assert!(
+            node.amendment_store.get_amendment(&end).unwrap() == Some(original),
+            "recovery before local handoff must preserve the original CPU proof"
+        );
+        assert_eq!(
+            node.metrics.stark_settlements_rejected.get(),
+            rejected_before_handoff
+        );
+        if settle_before_handoff {
+            assert!(node.pending_stark_settlements.lock().is_empty());
+        } else {
+            assert_eq!(
+                node.pending_stark_settlements.lock().as_slice(),
+                std::slice::from_ref(&amendment)
+            );
+        }
+        assert!(
+            db.scan_prefix(b"pa/").unwrap() == original_artifacts,
+            "every original proof and source-pointer byte must survive handoff"
+        );
+        assert_eq!(node.world_state.read().get_nonce(&address).unwrap(), 512);
+        let block =
+            settled_block.unwrap_or_else(|| node.produce_block(proposer.as_ref(), 0).unwrap());
+        let reward = node.stark_reward_value(block.number(), &amendment).unwrap();
+        assert_eq!(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            1
+        );
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_balance(&amendment.prover)
+                .unwrap(),
+            balance + reward
+        );
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        assert!(amendment
+            .covered_hashes()
+            .iter()
+            .all(|hash| node.settled_stark_sources.lock().contains(&(1, *hash))));
+        let next = node.produce_block(proposer.as_ref(), 0).unwrap();
+        assert!(!next
+            .system_transactions
+            .iter()
+            .any(|tx| tx.kind == SystemTxKind::StarkReward));
     }
 
     #[test]

@@ -888,6 +888,19 @@ impl<S: KvStore + 'static> Node<S> {
                         warn!("local STARK proof is not eligible for submission: {e}");
                         continue;
                     }
+                    // Recovery may queue or settle a durable CPU result before
+                    // this channel handoff. Preserve the existing proof and its
+                    // canonical settlement metadata instead of rejecting an overlap.
+                    if self.pending_stark_settlements.lock().contains(&amendment)
+                        || matches!(self.is_settled_stark_response(&amendment), Ok(true))
+                    {
+                        debug!(
+                            block = amendment.block_number,
+                            layer = amendment.layer,
+                            "local STARK proof already recovered or settled"
+                        );
+                        continue;
+                    }
                     let ready = match self.validate_stark_amendment_for_storage(&amendment) {
                         Ok(ready) => ready,
                         Err(e) => {

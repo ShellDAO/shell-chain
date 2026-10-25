@@ -109,3 +109,23 @@ to make two short CPU calls overlap without pausing either call. It then rejoins
 the native network, checks that settlement uses those exact proof bytes with
 ordered rewards, and reopens the databases. This is a bounded concurrency and
 delivery check; it does not qualify online recruitment, takeover or throughput.
+
+### Recovery before local result handoff
+
+A CPU worker persists its signed proof before handing it to the node event loop.
+Frontier recovery can queue that exact proof while the result is still in flight.
+After authenticating the local result and releasing its backlog reservation, the
+receive branch recognizes an identical pending amendment or a range already
+settled on the canonical chain. It leaves the stored artifacts, canonical
+settlement metadata and any existing queue entry intact. Generated work is
+counted once at handoff. Unsettled amendments still undergo the usual ordering
+check; block inclusion never accepts
+duplicate source ranges. This changes local result delivery only.
+
+The focused regression pauses storage completion after a genuine 512-entry proof
+is committed, recovers one pending settlement, then resumes the actual service
+and guarded event-loop receive. A second timing settles the recovered proof
+before resuming local handoff. Both check stored proof bytes, source pointers,
+one settlement and its exact reward; the second also preserves the canonical
+settlement transaction link. The deterministic in-process scheduling check
+does not qualify native disk-crash recovery or wider network scheduling.
