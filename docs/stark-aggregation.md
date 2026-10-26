@@ -28,6 +28,24 @@ public-key governance request, quorum and finalized-state checks. A proof's
 counter increments only during successful settlement, using execution-local
 registry state on producers, importers and historical replay.
 
+## L2 mode and input indexing
+
+`--l2-stark-mode disabled` is the default selection. L1 proving and settlement remain
+available, while L2 input indexing, scheduling and job creation stay disabled.
+An unreleased correction also prevents producers and importers from adding L2
+input rows when an L1 proof settles. Disabling L2 preserves existing L2 metadata.
+When enabled again, the canonical settlement rebuild restores missing inputs
+and removes orphaned ones without recomputing or changing the settled L1 proof.
+
+`scaffold` and `active` retain L2 input indexing. Scaffold does not execute
+recursive proving; selecting Active does not supply a missing recursive backend.
+The focused mode regression uses genuine 512-transfer L1 proofs and independent
+block import, including physical database reopen with the `rocksdb` feature:
+
+```bash
+cargo test --locked -p shell-node --features rocksdb l2_mode_controls_canonical_input_index -- --nocapture
+```
+
 ## Architecture
 
 ```

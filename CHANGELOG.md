@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Honor disabled L2 mode when recording settled L1 proofs: producers and
+  importers retain ordinary L1 settlement data without creating L2 input rows.
+  Existing L2 metadata is preserved while disabled; enabling L2 restores
+  missing canonical inputs through the existing rebuild path.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

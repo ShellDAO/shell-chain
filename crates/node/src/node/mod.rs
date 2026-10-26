@@ -598,7 +598,7 @@ struct ProverOrchestratorBoundary<'a, S: KvStore + 'static> {
     settled_stark_frontiers: &'a parking_lot::Mutex<HashMap<u32, u64>>,
     chain_store: &'a Arc<ChainStore<S>>,
     settled_source_index: &'a SettledSourceIndex<S>,
-    l2_input_index: &'a L2InputIndex<S>,
+    l2_input_index: Option<&'a L2InputIndex<S>>,
     metrics: &'a Arc<Metrics>,
 }
 
@@ -652,8 +652,8 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
                 let _ = self.settled_source_index.put(amendment.layer, &source);
             }
             // Record the final source of each L1 amendment as a canonical L2 input.
-            if amendment.layer == 1 {
-                let _ = self.l2_input_index.put(&amendment.block_hash);
+            if let (1, Some(index)) = (amendment.layer, self.l2_input_index) {
+                let _ = index.put(&amendment.block_hash);
             }
         }
         let touched_layers = amendments
@@ -1094,7 +1094,11 @@ impl<S: KvStore + 'static> Node<S> {
             settled_stark_frontiers: &self.settled_stark_frontiers,
             chain_store: &self.chain_store,
             settled_source_index: &self.settled_source_index,
-            l2_input_index: &self.l2_input_index,
+            l2_input_index: self
+                .config
+                .l2_stark_mode
+                .is_enabled()
+                .then_some(&self.l2_input_index),
             metrics: &self.metrics,
         }
     }
@@ -5003,6 +5007,261 @@ mod tests {
             "producer should settle the valid L1 amendment and skip invalid L2 proof bytes"
         );
         assert_eq!(settlements[0].layer, 1);
+    }
+
+    #[test]
+    fn l2_mode_controls_canonical_input_index() {
+        use crate::config::L2StarkMode;
+        for mode in [
+            L2StarkMode::Disabled,
+            L2StarkMode::Scaffold,
+            L2StarkMode::Active,
+        ] {
+            let (mut node, proposer) = setup_stark_node();
+            node.config.l2_stark_mode = mode;
+            assert_l2_mode_canonical_input_index(node, proposer);
+        }
+    }
+
+    fn assert_l2_mode_canonical_input_index<S: KvStore + 'static>(
+        node: Node<S>,
+        proposer: DilithiumSigner,
+    ) -> (Address, ShellHash) {
+        let mode = node.config.l2_stark_mode;
+        use crate::config::L2StarkMode;
+        let (sender, address, public_key) = make_stark_account(&node);
+        fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let genesis_rows = node.store.scan_prefix(b"").unwrap();
+        let genesis_root = current_state_root(&node);
+        let mut blocks = Vec::new();
+        let mut sources = vec![node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap()];
+        let mut entries = Vec::new();
+        let mut original_size = 0;
+        for height in 1..=16u64 {
+            for offset in 0..32u64 {
+                let tx = make_embedded_tx(
+                    &sender,
+                    address,
+                    public_key.clone(),
+                    (height - 1) * 32 + offset,
+                    1,
+                );
+                node.tx_pool
+                    .insert(
+                        tx,
+                        &mut *node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+            }
+            let block = node.produce_block(&proposer, 32).unwrap();
+            assert_eq!(block.transactions.len(), 32);
+            original_size += node
+                .witness_store
+                .bundle_size(&block.hash())
+                .unwrap()
+                .unwrap();
+            entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+            sources.push(block.hash());
+            blocks.push(block);
+        }
+        assert_eq!(entries.len(), 512);
+        let proof = shell_stark_prover::prove_sig_batch(&entries).unwrap();
+        shell_stark_prover::verify_sig_batch(&proof).unwrap();
+        let proof_signer = DilithiumSigner::generate();
+        let mut amendment = ProofAmendment {
+            version: shell_stark_prover::PROOF_AMENDMENT_VERSION,
+            block_hash: *sources.last().unwrap(),
+            block_number: 16,
+            start_block: Some(0),
+            proof,
+            prover: Address::ZERO,
+            prover_signature: Bytes::new(),
+            layer: 1,
+            source_hashes: sources,
+            original_size: Some(original_size),
+            compressed_size: None,
+            settlement_tx_hash: None,
+        };
+        amendment.sign_prover_authentication(&proof_signer).unwrap();
+        node.validate_prover_admission(&amendment).unwrap();
+        node.validate_stark_proof_source_binding(&amendment)
+            .unwrap();
+        let mut tampered = amendment.clone();
+        *tampered.proof.proof_bytes.last_mut().unwrap() ^= 1;
+        tampered.sign_prover_authentication(&proof_signer).unwrap();
+        let before_rejection = node.store.scan_prefix(b"").unwrap();
+        assert!(node.validate_stark_proof_source_binding(&tampered).is_err());
+        assert_eq!(node.store.scan_prefix(b"").unwrap(), before_rejection);
+        node.pending_stark_settlements
+            .lock()
+            .push(amendment.clone());
+        let block = node.produce_block(&proposer, 32).unwrap();
+        assert_eq!(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            1
+        );
+        assert_eq!(node.world_state.read().get_nonce(&address).unwrap(), 512);
+        let inputs = node.store.scan_prefix(b"l2i/").unwrap();
+        eprintln!(
+            "mode={mode} accepted_l1=1 nonce=512 l2_input_rows={}",
+            inputs.len()
+        );
+        if mode == L2StarkMode::Disabled {
+            assert!(
+                inputs.is_empty(),
+                "Disabled must not persist L2 input index rows after genuine L1 settlement"
+            );
+            assert!(node.store.scan_prefix(b"l2j/").unwrap().is_empty());
+        } else {
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(
+                node.l2_input_index.all_hashes().unwrap(),
+                vec![amendment.block_hash]
+            );
+        }
+
+        // Replay the same sealed blocks into an independent execution state.
+        let authority = node.config.proposer_address.unwrap();
+        let mut imported = setup_node_with_authority(authority);
+        imported.config.l2_stark_mode = mode;
+        for (key, value) in genesis_rows {
+            imported.store.put(&key, &value).unwrap();
+        }
+        *imported.world_state.write() =
+            WorldState::at_root(imported.store.clone(), &genesis_root).unwrap();
+        imported.register_authority_pubkey(authority, proposer.public_key().to_vec());
+        blocks.push(block.clone());
+        for sealed in &blocks {
+            imported
+                .import_block(sealed.clone(), &MultiVerifier)
+                .unwrap();
+        }
+        assert_eq!(current_state_root(&imported), block.header.state_root);
+        assert_eq!(current_state_root(&node), block.header.state_root);
+        assert_eq!(
+            imported.world_state.read().get_nonce(&address).unwrap(),
+            512
+        );
+        assert_eq!(
+            imported
+                .world_state
+                .read()
+                .get_balance(&amendment.prover)
+                .unwrap(),
+            node.world_state
+                .read()
+                .get_balance(&amendment.prover)
+                .unwrap()
+        );
+        assert_eq!(imported.store.scan_prefix(b"l2i/").unwrap(), inputs);
+        assert_eq!(
+            imported
+                .amendment_store
+                .get_amendment(&amendment.block_hash)
+                .unwrap(),
+            node.amendment_store
+                .get_amendment(&amendment.block_hash)
+                .unwrap()
+        );
+
+        let original_proof = imported
+            .amendment_store
+            .get_amendment(&amendment.block_hash)
+            .unwrap();
+        let old_input = ShellHash::from([0xFA; 32]);
+        imported.l2_input_index.put(&old_input).unwrap();
+        let before_rebuild = imported.store.scan_prefix(b"l2i/").unwrap();
+        imported.rebuild_settled_stark_sources_from_chain().unwrap();
+        if mode == L2StarkMode::Disabled {
+            assert_eq!(
+                imported.store.scan_prefix(b"l2i/").unwrap(),
+                before_rebuild,
+                "disabled rebuild preserves existing L2 metadata"
+            );
+            imported.config.l2_stark_mode = L2StarkMode::Scaffold;
+            imported.rebuild_settled_stark_sources_from_chain().unwrap();
+        }
+        assert_eq!(
+            imported.l2_input_index.all_hashes().unwrap(),
+            vec![amendment.block_hash],
+            "enabled rebuild restores only canonical L1 inputs"
+        );
+        assert_eq!(
+            imported
+                .amendment_store
+                .get_amendment(&amendment.block_hash)
+                .unwrap(),
+            original_proof
+        );
+        assert_eq!(current_state_root(&imported), block.header.state_root);
+        (address, amendment.block_hash)
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn l2_mode_controls_canonical_input_index_on_disk() {
+        use crate::config::L2StarkMode;
+        for mode in [
+            L2StarkMode::Disabled,
+            L2StarkMode::Scaffold,
+            L2StarkMode::Active,
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "shell-l2-mode-{}-{}-{mode}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("db");
+            let stores = shell_storage::RocksDbStore::open_all(&path, None).unwrap();
+            let db = Arc::new(stores.state.clone());
+            let proposer = DilithiumSigner::generate();
+            let authority =
+                Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+            let mut node = setup_node_with_store(authority, db.clone());
+            node.config.l2_stark_mode = mode;
+            node.config.enable_stark_aggregation = true;
+            node.config.node_role = crate::NodeRole::ValidatorProver;
+            let (sender, source) = assert_l2_mode_canonical_input_index(node, proposer);
+            db.flush().unwrap();
+            let expected = db.scan_prefix(b"").unwrap();
+            drop(db);
+            drop(stores);
+            let reopened = shell_storage::RocksDbStore::open_all(&path, None).unwrap();
+            let db = Arc::new(reopened.state.clone());
+            assert_eq!(db.scan_prefix(b"").unwrap(), expected);
+            let chain = ChainStore::new(db.clone());
+            let head = chain.get_head_block().unwrap().unwrap();
+            let state = WorldState::at_root(db.clone(), &head.header.state_root).unwrap();
+            assert_eq!(state.get_nonce(&sender).unwrap(), 512);
+            assert_eq!(
+                db.scan_prefix(b"l2i/").unwrap().len(),
+                usize::from(mode.is_enabled())
+            );
+            let proof = ProofAmendmentStore::new(db)
+                .get_amendment(&source)
+                .unwrap()
+                .unwrap();
+            assert_eq!(ProofAmendment::from_json(&proof).unwrap().proof.n_sigs, 512);
+            eprintln!(
+                "physical reopen mode={mode} retained512 proof/nonce/index; fixture={}",
+                directory.display()
+            );
+        }
     }
 
     #[test]
@@ -20942,7 +21201,9 @@ mod tests {
 
     /// Create and fund a test account with a Dilithium key.
     /// Returns (signer, address, pubkey).
-    fn make_stark_account(node: &Node<MemoryDb>) -> (DilithiumSigner, Address, Vec<u8>) {
+    fn make_stark_account<S: KvStore + 'static>(
+        node: &Node<S>,
+    ) -> (DilithiumSigner, Address, Vec<u8>) {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let address = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
