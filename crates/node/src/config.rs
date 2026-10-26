@@ -259,6 +259,8 @@ pub struct NodeConfig {
     pub prover_worker_cohort_schedule: Vec<ProverWorkerEpoch>,
     /// Derive worker membership from canonical registered prover identities.
     pub prover_worker_cohort_from_registry: bool,
+    /// Finalized-block interval between optional backup workers; zero disables.
+    pub prover_worker_fallback_after_blocks: u64,
     /// Operational mode for L2 recursive STARK aggregation.
     /// Defaults to [`L2StarkMode::Disabled`] for testnet safety; set to
     /// [`L2StarkMode::Scaffold`] to activate observability without proving.
@@ -326,6 +328,7 @@ impl NodeConfig {
             prover_worker_cohort: Vec::new(),
             prover_worker_cohort_schedule: Vec::new(),
             prover_worker_cohort_from_registry: false,
+            prover_worker_fallback_after_blocks: 0,
             l2_stark_mode: L2StarkMode::Disabled,
             node_role: NodeRole::default(),
         }

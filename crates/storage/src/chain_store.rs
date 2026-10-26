@@ -4295,7 +4295,20 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         epochs: &[(u64, Vec<Address>)],
         observed_height: u64,
     ) -> Result<(), StorageError> {
+        self.bind_worker_cohort_schedule_with_fallback(epochs, observed_height, 0)
+    }
+
+    /// Bind an optional immutable finalized-height backup interval atomically
+    /// with the cohort schedule. Older scheduling writers reject the marker.
+    pub fn bind_worker_cohort_schedule_with_fallback(
+        &self,
+        epochs: &[(u64, Vec<Address>)],
+        observed_height: u64,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
         const KEY: &[u8] = b"prover-worker-cohort/v1";
+        const FALLBACK: &[u8] = b"prover-worker-cohort/fallback/v1";
+        const RECOVERY: &[u8] = b"scheduled-fallback:v4";
         const SCHEDULE: &[u8] = b"prover-worker-cohort/v2";
         const SCHEDULED: &[u8] = b"scheduled:v2";
         if epochs.is_empty()
@@ -4309,12 +4322,30 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         let initial = serde_json::to_vec(&epochs[0].1)
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
         let previous = self.store.get(KEY)?;
+        let persisted_fallback = self.store.get(FALLBACK)?;
         let persisted_schedule = self.store.get(SCHEDULE)?;
         let mismatch = || {
             StorageError::InvalidInput(
             "prover worker cohort differs from the persisted assignment; restore the existing configuration".into(),
         )
         };
+        let recovering = previous.as_deref() == Some(RECOVERY);
+        if recovering {
+            if fallback_after_blocks == 0
+                || persisted_fallback.as_deref()
+                    != Some(fallback_after_blocks.to_be_bytes().as_slice())
+                || persisted_schedule.is_none()
+            {
+                return Err(mismatch());
+            }
+        } else if persisted_fallback.is_some() {
+            return Err(mismatch());
+        }
+        if fallback_after_blocks > 0 && epochs[0].1.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "worker fallback requires an explicit cohort".into(),
+            ));
+        }
         let previous_epochs: Option<Vec<(u64, Vec<Address>)>> = match persisted_schedule {
             Some(bytes) => Some(
                 serde_json::from_slice(&bytes)
@@ -4323,7 +4354,7 @@ impl<S: KvStore> ProofAmendmentStore<S> {
             None => None,
         };
         if let Some(old) = &previous_epochs {
-            if previous.as_deref() != Some(SCHEDULED) || !epochs.starts_with(old) {
+            if (!recovering && previous.as_deref() != Some(SCHEDULED)) || !epochs.starts_with(old) {
                 return Err(mismatch());
             }
         } else if let Some(bytes) = &previous {
@@ -4342,14 +4373,28 @@ impl<S: KvStore> ProofAmendmentStore<S> {
                 "worker cohort additions must start after the persisted canonical head".into(),
             ));
         }
-        if epochs.len() > 1 {
+        if epochs.len() > 1 || fallback_after_blocks > 0 {
             let bytes = serde_json::to_vec(epochs)
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
             let mut batch = WriteBatch::new();
             // Older static-only nodes reject this marker rather than silently
             // ignoring a schedule when reopening the same database.
-            batch.put(KEY.to_vec(), SCHEDULED.to_vec());
+            batch.put(
+                KEY.to_vec(),
+                if fallback_after_blocks > 0 {
+                    RECOVERY
+                } else {
+                    SCHEDULED
+                }
+                .to_vec(),
+            );
             batch.put(SCHEDULE.to_vec(), bytes);
+            if fallback_after_blocks > 0 {
+                batch.put(
+                    FALLBACK.to_vec(),
+                    fallback_after_blocks.to_be_bytes().to_vec(),
+                );
+            }
             self.store.write_batch(batch)?;
         } else if previous.is_none() && !epochs[0].1.is_empty() {
             self.store.put(KEY, &initial)?;
@@ -4900,6 +4945,27 @@ mod tests {
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
         scanned_entries: AtomicUsize,
+    }
+
+    #[test]
+    fn worker_fallback_policy_batch_failure_preserves_schedule() {
+        let store = Arc::new(FailingBatchStore::new());
+        let amendments = ProofAmendmentStore::new(store.clone());
+        let epochs = vec![(0, vec![Address::from([1; 32]), Address::from([2; 32])])];
+        amendments.bind_worker_cohort_schedule(&epochs, 0).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        store.fail_next_batch();
+        assert!(amendments
+            .bind_worker_cohort_schedule_with_fallback(&epochs, 0, 3)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        amendments
+            .bind_worker_cohort_schedule_with_fallback(&epochs, 0, 3)
+            .unwrap();
+        assert_eq!(
+            store.get(b"prover-worker-cohort/v1").unwrap().unwrap(),
+            b"scheduled-fallback:v4"
+        );
     }
 
     impl FailingBatchStore {

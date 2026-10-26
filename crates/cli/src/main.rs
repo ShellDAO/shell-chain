@@ -844,6 +844,9 @@ async fn main() {
                 prover_worker_cohort: file_config.prover.worker_cohort,
                 prover_worker_cohort_schedule: file_config.prover.worker_cohort_schedule,
                 prover_worker_cohort_from_registry: file_config.prover.worker_cohort_from_registry,
+                prover_worker_fallback_after_blocks: file_config
+                    .prover
+                    .worker_fallback_after_blocks,
                 max_idle_interval,
                 mempool_max_size,
                 mempool_max_bytes,

@@ -858,6 +858,7 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<Option<usize>, NodeError> {
         if !self.config.prover_worker_cohort.is_empty()
             || !self.config.prover_worker_cohort_schedule.is_empty()
+            || self.config.prover_worker_fallback_after_blocks > 0
         {
             return Err(NodeError::Startup(
                 "registry-derived membership conflicts with explicit cohorts".into(),

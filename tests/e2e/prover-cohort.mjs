@@ -36,9 +36,10 @@ const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
 const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
 const connectedWorkers = process.env.SHELL_COHORT_CONNECTED === '1';
+const fallbackWorkers = process.env.SHELL_COHORT_FALLBACK === '1';
 const rebuildWorkers = process.env.SHELL_COHORT_REBUILD === '1';
 const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1' || rebuildWorkers;
-assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
+assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers, fallbackWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers || fallbackWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
 const nodeCount = lateJoin || registryWorkers ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
@@ -166,6 +167,97 @@ function count(text) {
     assert.ok(m, 'generated metric present');
     return Number(m[1]);
 }
+async function checkFallback(boot, validators) {
+    const interval = 32;
+    const members = keys.slice(1, 3).map(k => k.address).sort();
+    const genesis = await rpc(0, 'eth_getBlockByNumber', ['0x0', false]);
+    const primaryAddress = members[Number(BigInt(genesis.hash.slice(0, 18)) % 2n)];
+    const primary = keys.findIndex(k => k.address === primaryAddress);
+    const backup = primary === 1 ? 2 : 1;
+    const config = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(members) + '\nworker_fallback_after_blocks=' + interval + '\n';
+    for (const i of [1, 2]) await writeFile(join(out, `node${i}.toml`), config);
+    const before = BigInt(await rpc(0, 'eth_getBalance', [keys[backup].address, 'latest']));
+    const provider = createShellProvider({rpcHttpUrl: `http://127.0.0.1:${ports[0]}`});
+    const recipient = '0x' + 'ab'.repeat(32);
+    for (let offset = 0; offset < 512; offset += 16) {
+        const hashes = [];
+        for (let nonce = offset; nonce < offset + 16; nonce++) {
+            const tx = await sender.buildSignedTransaction({tx: buildTransaction({chainId:1337, nonce, to:recipient, value:1n, gasLimit:21000}), includePublicKey:true});
+            hashes.push(await paced(() => provider.sendTransaction(tx)));
+        }
+        for (const hash of hashes) {
+            const receipt = await until(() => rpc(0, 'eth_getTransactionReceipt', [hash]));
+            assert.equal(receipt.status, '0x1'); result.receipts.push(receipt);
+        }
+        result.accepted = result.receipts.length; await save();
+    }
+    const signed = new Set([...result.receipts.map(r => r.transactionHash), result.registration1.hash, result.registration2.hash]);
+    const tip = Number(BigInt(result.receipts.at(-1).blockNumber));
+    let entries = 0, nonEmpty = 0, end;
+    for (let height = 0; height <= tip; height++) {
+        const block = await rpc(0, 'eth_getBlockByNumber', ['0x' + height.toString(16), false]);
+        const n = block.transactions.filter(hash => signed.has(hash)).length;
+        entries += n; if (n) nonEmpty++;
+        if (entries >= 512) { end = height; break; }
+    }
+    assert.ok(end !== undefined);
+    const deadline = end + interval;
+    await start(backup, boot);
+    await until(async () => BigInt(await rpc(backup, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 512n && (await readFile(join(out, `node${backup}.log`), 'utf8')).includes('deferring L1 proof range to cohort owner'));
+    const observed = Number(BigInt((await rpc(backup, 'eth_getBlockByNumber', ['finalized', false])).number));
+    assert.ok(observed < deadline, 'backup must observe the ready range before its finalized-height deadline');
+    assert.equal(count(await metricText(backup)), 0);
+    assert.equal(nodes[primary], undefined, 'primary remains absent during fallback');
+    result.fallback = {primary, backup, interval, end, entries, observedBeforeDeadline:observed, deadline}; await save();
+    await until(async () => (await rpc(0, 'shell_getRegisteredProver', [keys[backup].address])).proofs_submitted === 1, 120);
+    assert.equal(count(await metricText(backup)), 1);
+    assert.equal((await rpc(0, 'shell_getRegisteredProver', [keys[primary].address])).proofs_submitted, 0);
+    const block = await rpc(0, 'eth_getBlockByNumber', ['0x' + end.toString(16), false]);
+    const proof = await rpc(0, 'shell_getProofAmendment', [block.hash]);
+    assert.equal(proof.proof_entries, entries);
+    const proofSha256 = createHash('sha256').update(Buffer.from(proof.proof.slice(2), 'hex')).digest('hex');
+    const expectedReward = BigInt(nonEmpty) * 50n * 10n ** 18n;
+    const balance = BigInt(await rpc(0, 'eth_getBalance', [keys[backup].address, 'latest']));
+    assert.equal(balance - before, expectedReward);
+    await start(primary, boot);
+    await until(async () => !!(await rpc(primary, 'shell_getProofAmendment', [block.hash])) && BigInt(await rpc(primary, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])) === 512n);
+    await pause(1500);
+    assert.equal(count(await metricText(primary)), 0, 'late primary must retain the canonical winning proof');
+    result.workers = await Promise.all([1,2].map(async i => ({i, generated:count(await metricText(i)), generationLogs:[]})));
+    result.fallback.proofSha256 = proofSha256; result.fallback.reward = expectedReward.toString();
+    const anchor = await rpc(0, 'eth_getBlockByNumber', ['finalized', false]);
+    for (const i of [0,1,2]) {
+        await until(async () => (await rpc(i, 'eth_getBlockByNumber', [anchor.number, false]))?.hash === anchor.hash);
+        const same = await rpc(i, 'eth_getBlockByNumber', [anchor.number, false]);
+        assert.equal(same.stateRoot, anchor.stateRoot); assert.deepEqual(await rpc(i, 'shell_getValidators'), validators);
+        assert.equal(BigInt(await rpc(i, 'eth_getBalance', [recipient, 'latest'])), 512n);
+    }
+    await stopAll();
+    for (const changed of [0, interval + 1]) {
+        await writeFile(join(out, `node${backup}.toml`), config.replace('worker_fallback_after_blocks=' + interval, 'worker_fallback_after_blocks=' + changed));
+        const args = ['--password-file', password, 'run', '--keystore', join(out, `key${backup}.json`), '--config', join(out, `node${backup}.toml`), '--datadir', join(out, `db${backup}`), '--network','dev','--chain-id','1337','--db','rocksdb','--rpc-addr','127.0.0.1:0','--metrics-addr','127.0.0.1:0','--node-role','prover','--enable-stark-aggregation','--consensus-engine','wpoa'];
+        const rejected = spawnSync(binary, args, {encoding:'utf8',timeout:20000});
+        assert.notEqual(rejected.status, 0); assert.match(rejected.stdout + rejected.stderr, /persisted assignment/);
+        result.commands.push({label:'reject-fallback-' + changed, args, status:rejected.status});
+    }
+    await writeFile(join(out, `node${backup}.toml`), config);
+    await start(0); const log = await readFile(join(out, 'node0.log'), 'utf8');
+    const reopenedBoot = log.match(/\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[A-Za-z0-9]+/g)?.at(-1);
+    await start(backup, reopenedBoot); await start(primary, reopenedBoot);
+    await pause(1500);
+    for (const i of [0,1,2]) {
+        assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [sender.getAddress(), 'latest'])), 512n);
+        assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[backup].address, 'latest'])), balance);
+        const stored = await rpc(i, 'shell_getProofAmendment', [block.hash]);
+        assert.equal(createHash('sha256').update(Buffer.from(stored.proof.slice(2), 'hex')).digest('hex'), proofSha256);
+        assert.equal((await rpc(i, 'shell_getRegisteredProver', [keys[backup].address])).proofs_submitted, 1);
+        if (i) assert.equal(count(await metricText(i)), 0);
+    }
+    result.reopenPassed = true; result.recipientBalance = '512';
+    result.adaptation = 'Opt-in finalized-height fallback in an explicit cohort, absent primary, genuine512transfers and one actual authenticated backup proof/reward. Primary eligibility is never revoked; slow primary/partition overlap and registry-derived fallback remain unqualified.';
+    result.status = 'PASS: absent primary recovered by registered backup after finalized-height boundary; original proof and reward survive late-primary sync and all three physical reopens';
+}
+
 async function checkDelayedPredecessor(boot, validators) {
     result.adaptation = connectedWorkers ? 'Explicit scheduled ownership, connected native workers and an authority kept running during proof computation; 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : parallelWorkers ? 'Explicit scheduled ownership and overlapping native CPU proof calls, 1024 genuine transfers. No automatic recruitment, takeover or throughput claim.' : 'Explicit scheduled ownership and delayed predecessor startup, 1024 genuine transfers. No automatic recruitment or takeover.';
     const provider = createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[0]}` });
@@ -513,7 +605,9 @@ try {
     assert.ok(boot, 'actual advertised bootstrap address');
     for (let i = 1; i < 3; i++)
         await writeFile(join(out, `node${i}.toml`), '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\n' + (registryWorkers ? 'worker_cohort_from_registry=true\n' : 'worker_cohort=' + JSON.stringify(keys.slice(1, 3).map(k => k.address)) + '\n'));
-    if (delayedPredecessor || parallelWorkers || connectedWorkers) {
+    if (fallbackWorkers) {
+        await checkFallback(boot, validators);
+    } else if (delayedPredecessor || parallelWorkers || connectedWorkers) {
         await checkDelayedPredecessor(boot, validators);
     } else {
         await start(1, boot);

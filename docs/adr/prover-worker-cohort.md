@@ -27,7 +27,8 @@ These deferred reservations are bounded at 64 ranges. A stored proof or canonica
 change releases them; storage errors retain the reservation until orderly
 shutdown. Shutdown drains active jobs and releases deferred reservations so
 normal canonical seeding can recover them on restart. Deferred entries do not
-silently transfer to a different owner when that member is offline.
+silently transfer to a different owner when that member is offline unless the
+separate finalized-height fallback option below is configured.
 
 The initial cohort and at most 63 strictly increasing future epochs form an
 explicit operator schedule. Persist the full schedule atomically as local
@@ -254,3 +255,49 @@ persistent discovery and original proof history, without repeating replay or
 proof generation. Snapshot certification is earned by replay, never copied from
 the imported certificate. This manual mode uses the same compatible binary/SDK
 inputs and isolated accounts as the registry membership acceptance.
+
+## Optional backup eligibility for explicit cohorts
+
+Set `worker_fallback_after_blocks` to a positive integer under `[prover]` to
+allow registered backups in an explicit static or scheduled cohort. Zero is the
+default and retains existing primary-only scheduling. This option cannot be
+combined with registry-derived membership. Use the same interval and complete
+schedule on all coordinating workers, including a returning primary.
+
+The primary's historical epoch and hash-based assignment remain unchanged.
+Order backups cyclically after the primary in that epoch's sorted member list.
+The rank-r backup becomes eligible when the finalized height reaches the range's
+last source height plus r times the configured interval. A later epoch's new
+member cannot take historical work from an epoch it did not join. Eligibility
+uses canonical finalized height, not local uptime, wall-clock time or a timer
+reset by restart. A stopped chain does not advance this deadline. Overflowed
+rank intervals never make a backup eligible early.
+
+The option never revokes a primary or cancels an active CPU job. It expands the
+eligible set as work ages, allowing a healthy primary to progress even if later
+backups are absent. It is an operational recovery budget, not proof of peer
+failure or an exclusive lease. A slow primary or partition can therefore cause
+overlapping computation after the interval. Choose an interval consistent with
+the network's proof latency; no exactly-once computation claim is made under
+those conditions. Existing proof verification, canonical settlement ordering,
+registered signing identity and single canonical reward checks still apply.
+
+Persist the immutable interval and append-only epoch schedule in one local
+batch. Older scheduling writers reject the new marker, and reopen rejects
+changing or disabling a bound interval. Explicitly opting an existing cohort
+into this mode requires stopping and coordinating its workers first. Discovery,
+chain state roots, wire messages, signing domains and activation heights are
+unchanged. Storage errors retain deferred reservations and stop admission.
+Eligible deferred work releases its reservation for ordinary witness reseeding;
+entry-cleared task placeholders are never passed directly to the CPU prover.
+
+Run the existing native entry with `SHELL_COHORT_FALLBACK=1` and the same
+compatible binary/SDK inputs. It uses a 32-block interval on an isolated dev
+chain, keeps the primary stopped while 512 genuine transfers form a ready
+window, and checks no backup generation before its finalized-height boundary.
+The backup must then generate an actual authenticated proof and receive the
+exact source-block reward. A returning primary and all three physical database
+reopens must retain original proof bytes, counters and account state without
+recomputation. Reopen with a changed or disabled interval must fail. This
+bounded scenario does not qualify registry-derived fallback, partitions, slow
+primary overlap or production latency.

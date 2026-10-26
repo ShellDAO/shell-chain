@@ -53,6 +53,7 @@ pub(crate) struct WorkerCohort<S: KvStore> {
     chain: ChainStore<S>,
     deferred: VecDeque<ProofTask>,
     registry_mode: bool,
+    fallback_after_blocks: u64,
 }
 
 impl<S: KvStore + 'static> WorkerCohort<S> {
@@ -65,11 +66,22 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         Self::open_scheduled(store, workers, Vec::new(), local)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_scheduled(
         store: Arc<S>,
         workers: Vec<Address>,
         schedule: Vec<crate::config::ProverWorkerEpoch>,
         local: Address,
+    ) -> Result<Option<Self>, StorageError> {
+        Self::open_scheduled_with_fallback(store, workers, schedule, local, 0)
+    }
+
+    pub(crate) fn open_scheduled_with_fallback(
+        store: Arc<S>,
+        workers: Vec<Address>,
+        schedule: Vec<crate::config::ProverWorkerEpoch>,
+        local: Address,
+        fallback_after_blocks: u64,
     ) -> Result<Option<Self>, StorageError> {
         if store.get(b"prover-worker-cohort/v1")?.as_deref() == Some(b"registry:v3") {
             return Err(StorageError::InvalidInput("registry-derived worker cohort cannot be disabled or replaced by a static schedule".into()));
@@ -109,13 +121,18 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         let height = chain
             .get_head_block()?
             .map_or(0, |block| block.header.number);
-        ProofAmendmentStore::new(store).bind_worker_cohort_schedule(&epochs, height)?;
+        ProofAmendmentStore::new(store).bind_worker_cohort_schedule_with_fallback(
+            &epochs,
+            height,
+            fallback_after_blocks,
+        )?;
         Ok(enabled.then(|| Self {
             epochs,
             local,
             chain,
             deferred: VecDeque::new(),
             registry_mode: false,
+            fallback_after_blocks,
         }))
     }
 
@@ -158,6 +175,7 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
             chain,
             deferred: VecDeque::new(),
             registry_mode: true,
+            fallback_after_blocks: 0,
         })
     }
 
@@ -221,26 +239,53 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         Ok(Some(members[(prefix % members.len() as u64) as usize].0))
     }
 
+    fn members_for_task(&self, task: &ProofTask) -> &[Address] {
+        let start = task
+            .block_number
+            .saturating_sub(task.source_hashes.len().saturating_sub(1) as u64);
+        &self
+            .epochs
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= start)
+            .expect("initial epoch at zero")
+            .1
+    }
+
     fn owner(&self, task: &ProofTask) -> Address {
         let source = task
             .source_hashes
             .first()
             .copied()
             .unwrap_or_else(|| ShellHash::from(task.block_hash));
-        let start = task
-            .block_number
-            .saturating_sub(task.source_hashes.len().saturating_sub(1) as u64);
-        // A range crossing a membership boundary retains its first-source epoch.
-        // Splitting it at an arbitrary activation could create invalid small proofs.
-        let workers = &self
-            .epochs
-            .iter()
-            .rev()
-            .find(|(from, _)| *from <= start)
-            .expect("initial epoch at zero")
-            .1;
+        let workers = self.members_for_task(task);
         let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
         workers[(prefix % workers.len() as u64) as usize]
+    }
+
+    fn fallback_eligible(&self, task: &ProofTask) -> Result<bool, StorageError> {
+        if self.fallback_after_blocks == 0 || self.registry_mode {
+            return Ok(false);
+        }
+        let workers = self.members_for_task(task);
+        let Some(local) = workers.iter().position(|worker| *worker == self.local) else {
+            return Ok(false);
+        };
+        let primary = workers
+            .iter()
+            .position(|worker| *worker == self.owner(task))
+            .expect("owner belongs to the selected epoch");
+        let rank = (local + workers.len() - primary) % workers.len();
+        if rank == 0 {
+            return Ok(false);
+        }
+        let Some(wait) = self.fallback_after_blocks.checked_mul(rank as u64) else {
+            return Ok(false);
+        };
+        let finalized = self.chain.get_finalized_number()?.unwrap_or(0);
+        Ok(finalized
+            .checked_sub(task.block_number)
+            .is_some_and(|age| age >= wait))
     }
 
     fn reap(
@@ -254,7 +299,8 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
             let done = amendments.has_amendment(&ShellHash::from(task.block_hash))?
                 || self.chain.get_block_hash_by_number(task.block_number)?
                     != Some(ShellHash::from(task.block_hash))
-                || (self.registry_mode && self.assigned_owner(task)? == Some(self.local));
+                || (self.registry_mode && self.assigned_owner(task)? == Some(self.local))
+                || self.fallback_eligible(task)?;
             let task = self.deferred.pop_front().expect("observed deferred range");
             if done {
                 backlog.lock().complete_in_flight(
@@ -646,14 +692,27 @@ impl<S: KvStore + Send + Sync + 'static> ProverService<S> {
                                 break;
                             }
                         };
-                        if owner != cohort.local {
+                        let fallback = if owner != cohort.local {
+                            match cohort.fallback_eligible(&task) {
+                                Ok(eligible) => eligible,
+                                Err(error) => {
+                                    error!(%error, "cannot inspect finalized worker fallback; preserving reservation");
+                                    cohort.deferred.push_back(task);
+                                    admission_failed = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if owner != cohort.local && !fallback {
                             info!(%owner, block = task.block_number, "deferring L1 proof range to cohort owner");
                             let mut task = task;
                             task.entries.clear();
                             cohort.deferred.push_back(task);
                             continue;
                         }
-                        info!(%owner, block = task.block_number, "admitting L1 proof range for cohort owner");
+                        info!(%owner, prover = %cohort.local, fallback, block = task.block_number, "admitting L1 proof range for cohort worker");
                     }
                 }
                 reserved.push(task);
@@ -1691,6 +1750,249 @@ mod tests {
             backlog.lock().covered_block_count_for_layer(1),
             1,
             "shutdown releases only deferred reservations"
+        );
+    }
+
+    #[test]
+    fn worker_fallback_uses_finalized_age_and_persists_policy() {
+        let store = Arc::new(MemoryDb::new());
+        let members = vec![
+            Address::from([1; 32]),
+            Address::from([2; 32]),
+            Address::from([3; 32]),
+        ];
+        let task = ProofTask::new([0; 32], 10, vec![]);
+        let chain = ChainStore::new(store.clone());
+        let first = WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            members.clone(),
+            vec![],
+            members[1],
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        let second = WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            members.clone(),
+            vec![],
+            members[2],
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        for (height, a, b) in [
+            (9, false, false),
+            (10, false, false),
+            (12, false, false),
+            (13, true, false),
+            (15, true, false),
+            (16, true, true),
+            (100, true, true),
+        ] {
+            chain.set_finalized_number(height).unwrap();
+            assert_eq!(
+                first.fallback_eligible(&task).unwrap(),
+                a,
+                "height {height}"
+            );
+            assert_eq!(
+                second.fallback_eligible(&task).unwrap(),
+                b,
+                "height {height}"
+            );
+            assert_eq!(
+                first.owner(&task),
+                members[0],
+                "fallback never revokes the primary"
+            );
+        }
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(WorkerCohort::open(store.clone(), members.clone(), members[1]).is_err());
+        assert!(WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            members.clone(),
+            vec![],
+            members[1],
+            4
+        )
+        .is_err());
+        assert!(
+            ProofAmendmentStore::new(store.clone())
+                .bind_worker_cohort_schedule(&[(0, members.clone())], 0)
+                .is_err(),
+            "older writer rejects recovery marker"
+        );
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        let mut reordered = members.clone();
+        reordered.reverse();
+        let reopened = WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            reordered,
+            vec![],
+            members[1],
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reopened.fallback_eligible(&task).unwrap());
+        let overflow_store = Arc::new(MemoryDb::new());
+        let overflow = WorkerCohort::open_scheduled_with_fallback(
+            overflow_store.clone(),
+            members.clone(),
+            vec![],
+            members[2],
+            u64::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        ChainStore::new(overflow_store)
+            .set_finalized_number(u64::MAX)
+            .unwrap();
+        assert!(
+            !overflow.fallback_eligible(&task).unwrap(),
+            "rank multiplication cannot wrap"
+        );
+        let future = Arc::new(MemoryDb::new());
+        let cohort = WorkerCohort::open_scheduled_with_fallback(
+            future.clone(),
+            members[..2].to_vec(),
+            vec![crate::config::ProverWorkerEpoch {
+                from_block: 20,
+                workers: members.clone(),
+            }],
+            members[2],
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        ChainStore::new(future).set_finalized_number(100).unwrap();
+        assert!(
+            !cohort.fallback_eligible(&task).unwrap(),
+            "future members cannot take historical ranges"
+        );
+        assert!(WorkerCohort::open_scheduled_with_fallback(
+            Arc::new(MemoryDb::new()),
+            vec![],
+            vec![],
+            members[0],
+            3
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_fallback_proves_after_boundary_and_reopen_keeps_original_artifact() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let mut members: Vec<_> = signers
+            .iter()
+            .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()))
+            .collect();
+        members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let backup = members[1];
+        let signer = signers
+            .into_iter()
+            .find(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()) == backup)
+            .unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(store.clone());
+        let hash = ShellHash::from([0; 32]);
+        chain.set_canonical(10, &hash).unwrap();
+        chain.set_finalized_number(12).unwrap();
+        let task = ProofTask::new(
+            *hash.as_bytes(),
+            10,
+            vec![
+                shell_stark_prover::SigBatchEntry {
+                    msg_hash: [7; 32],
+                    pk_hash: [9; 32]
+                };
+                MIN_L1_STARK_TXS
+            ],
+        );
+        let backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+        backlog.lock().push(task.clone());
+        let cohort = WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            members.clone(),
+            vec![],
+            backup,
+            3,
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let handle = ProverService::new(
+            backlog.clone(),
+            ProofAmendmentStore::new(store.clone()),
+            ProverConfig::default(),
+            backup,
+        )
+        .with_worker_cohort(cohort)
+        .with_signer(signer.clone())
+        .with_amendment_sender(tx)
+        .start();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !backlog.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .is_err());
+        chain.set_finalized_number(13).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backlog.lock().first_uncovered_block_for_layer(1, 10, 10) != Some(10) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The native acceptance exercises the node's actual witness reseeding.
+        backlog.lock().push(task.clone());
+        let amendment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(amendment.prover, backup);
+        assert_eq!(amendment.block_hash, hash);
+        shell_stark_prover::verify_sig_batch(&amendment.proof).unwrap();
+        amendment.verify_prover_authentication().unwrap();
+        handle.shutdown().await;
+        let original = ProofAmendmentStore::new(store.clone())
+            .get_amendment(&hash)
+            .unwrap()
+            .unwrap();
+        let reopened_backlog = Arc::new(Mutex::new(ProofBacklog::new()));
+        reopened_backlog.lock().push(task);
+        let cohort =
+            WorkerCohort::open_scheduled_with_fallback(store.clone(), members, vec![], backup, 3)
+                .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let reopened = ProverService::new(
+            reopened_backlog,
+            ProofAmendmentStore::new(store.clone()),
+            ProverConfig::default(),
+            backup,
+        )
+        .with_worker_cohort(cohort)
+        .with_signer(signer)
+        .with_amendment_sender(tx)
+        .start();
+        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err());
+        reopened.shutdown().await;
+        assert_eq!(
+            ProofAmendmentStore::new(store)
+                .get_amendment(&hash)
+                .unwrap()
+                .unwrap(),
+            original
         );
     }
 

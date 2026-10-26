@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add opt-in finalized-height backup eligibility for explicit L1 worker cohorts.
+  Registered backups can drain an absent primary's ready range after a persisted
+  interval; the primary remains eligible. Normal proof authentication and one
+  canonical reward remain unchanged. Slow primaries and partitions can overlap
+  computation; registry-derived fallback is not enabled by this option.
 - Rebuild missing prover discovery metadata before an opted-in worker starts
   networking. Replay retained canonical bodies and witnesses privately from
   trusted genesis, verify actual execution and state roots, then publish only

@@ -543,8 +543,9 @@ impl<S: KvStore + 'static> Node<S> {
             if self.config.prover_worker_cohort_from_registry {
                 if !self.config.prover_worker_cohort.is_empty()
                     || !self.config.prover_worker_cohort_schedule.is_empty()
+                    || self.config.prover_worker_fallback_after_blocks > 0
                 {
-                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts".into()));
+                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts or fallback".into()));
                 }
                 crate::prover_service::WorkerCohort::open_registry(
                     Arc::clone(&self.store),
@@ -552,11 +553,12 @@ impl<S: KvStore + 'static> Node<S> {
                 )
                 .map(Some)
             } else {
-                crate::prover_service::WorkerCohort::open_scheduled(
+                crate::prover_service::WorkerCohort::open_scheduled_with_fallback(
                     Arc::clone(&self.store),
                     self.config.prover_worker_cohort.clone(),
                     self.config.prover_worker_cohort_schedule.clone(),
                     self.config.proposer_address.unwrap_or(local_signer_address),
+                    self.config.prover_worker_fallback_after_blocks,
                 )
             }
             .map_err(|error| NodeError::Startup(format!("invalid prover worker cohort: {error}")))?

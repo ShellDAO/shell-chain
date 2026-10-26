@@ -88,6 +88,7 @@ pub struct RunArgs {
     pub prover_worker_cohort_schedule: Vec<shell_node::ProverWorkerEpoch>,
     /// Derive worker membership from canonical registered prover identities.
     pub prover_worker_cohort_from_registry: bool,
+    pub prover_worker_fallback_after_blocks: u64,
     /// L2 STARK aggregation mode: disabled, scaffold, or active.
     pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
@@ -589,6 +590,9 @@ async fn run_with_store<S: KvStore + 'static>(
     store: Arc<S>,
     args: RunArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if args.prover_worker_cohort_from_registry && args.prover_worker_fallback_after_blocks > 0 {
+        return Err("worker fallback currently requires an explicit cohort".into());
+    }
     // Load or generate the signer.
     let signer: Arc<dyn Signer> = match args.keystore {
         Some(path) => {
@@ -990,6 +994,7 @@ async fn run_with_store<S: KvStore + 'static>(
         prover_worker_cohort: args.prover_worker_cohort,
         prover_worker_cohort_schedule: args.prover_worker_cohort_schedule,
         prover_worker_cohort_from_registry: args.prover_worker_cohort_from_registry,
+        prover_worker_fallback_after_blocks: args.prover_worker_fallback_after_blocks,
         l2_stark_mode: args
             .l2_stark_mode
             .parse::<L2StarkMode>()
@@ -1227,6 +1232,7 @@ mod tests {
             prover_worker_cohort: Vec::new(),
             prover_worker_cohort_schedule: Vec::new(),
             prover_worker_cohort_from_registry: false,
+            prover_worker_fallback_after_blocks: 0,
             l2_stark_mode: "disabled".into(),
             network: "dev".into(),
             consensus_engine: None,
