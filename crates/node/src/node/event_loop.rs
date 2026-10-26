@@ -2707,6 +2707,12 @@ impl<S: KvStore + 'static> Node<S> {
         // Track L1 final source hashes for l2i/ reconcile (one per L1 amendment).
         let mut canonical_l1_finals: std::collections::HashSet<ShellHash> =
             std::collections::HashSet::new();
+        // Reconstruct off to the side; a failed durable job write must not
+        // publish a partially recovered scheduler to the running node.
+        let mut recovered_scheduler = self.config.l2_stark_mode.is_enabled().then(|| {
+            AggregationScheduler::new(self.aggregation_scheduler.lock().config().clone(), 0)
+        });
+        let mut last_l2_trigger = 0;
         for number in 0..=head {
             let Some(block) = self.chain_store.get_block_by_number(number)? else {
                 continue;
@@ -2738,7 +2744,24 @@ impl<S: KvStore + 'static> Node<S> {
                 // Collect L1 final source hashes for l2i/ reconcile.
                 if amendment.layer == 1 {
                     canonical_l1_finals.insert(amendment.block_hash);
+                    if let Some(scheduler) = recovered_scheduler.as_mut() {
+                        scheduler
+                            .on_settled_l1_amendment(Self::l2_input_from_amendment(&amendment))
+                            .map_err(|gap| {
+                                NodeError::Startup(format!(
+                                    "canonical L2 input gap: expected {}, received {}",
+                                    gap.expected_start, gap.received_start
+                                ))
+                            })?;
+                    }
                 }
+            }
+            if let Some(trigger) = recovered_scheduler
+                .as_mut()
+                .and_then(|s| s.on_block(number))
+            {
+                self.create_l2_job_from_trigger(trigger, number)?;
+                last_l2_trigger = number;
             }
         }
         let finalized_number = self.finality.read().last_finalized_number();
@@ -2838,19 +2861,13 @@ impl<S: KvStore + 'static> Node<S> {
                 warn!("rebuild_settled: reset {l2j_reset} L2 jobs to PendingInputs after reorg");
             }
 
-            // ── Step 2d: update L2 observability metrics ─────────────────────────
-            {
-                let pending_inputs = all_l2_jobs
-                    .iter()
-                    .filter(|j| matches!(j.status, L2JobStatus::PendingInputs))
-                    .count() as i64;
-                let ready_jobs = all_l2_jobs
-                    .iter()
-                    .filter(|j| matches!(j.status, L2JobStatus::Ready))
-                    .count() as i64;
-                self.metrics.stark_l2_pending_inputs.set(pending_inputs);
-                self.metrics.stark_l2_ready_jobs.set(ready_jobs);
-            }
+            // Query after orphan jobs have changed status, not from the stale
+            // pre-reconciliation snapshot.
+            self.metrics.stark_l2_ready_jobs.set(
+                self.l2_job_store
+                    .jobs_with_status(L2JobStatus::Ready)?
+                    .len() as i64,
+            );
         }
 
         // ── Step 3: update the in-memory settled set ──────────────────────────
@@ -2878,6 +2895,16 @@ impl<S: KvStore + 'static> Node<S> {
 
         if removed > 0 {
             info!("rebuild_settled: removed {removed} stale `ss/` index entries after reorg");
+        }
+        if let Some(scheduler) = recovered_scheduler {
+            self.metrics
+                .stark_l2_pending_inputs
+                .set(scheduler.pending_proof_count() as i64);
+            self.metrics
+                .stark_l2_last_trigger_block
+                .set(last_l2_trigger as i64);
+            self.metrics.stark_l2_blocked_gap_start.set(0);
+            *self.aggregation_scheduler.lock() = scheduler;
         }
         Ok(count)
     }

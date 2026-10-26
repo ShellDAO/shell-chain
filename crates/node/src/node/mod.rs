@@ -5264,6 +5264,178 @@ mod tests {
         }
     }
 
+    fn prepare_scaffold_recovered_window<S: KvStore + 'static>(
+        node: &mut Node<S>,
+        proposer: &DilithiumSigner,
+    ) -> ShellHash {
+        node.config.l2_stark_mode = crate::config::L2StarkMode::Scaffold;
+        let policy = AggregationConfig {
+            epoch_length: 0,
+            min_l1_proofs_for_l2: 2,
+            trigger_block_interval: 0,
+            max_source_range: 0,
+        };
+        *node.aggregation_scheduler.lock() = AggregationScheduler::new(policy.clone(), 0);
+        store_genesis(node);
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let first = node.produce_block(proposer, 0).unwrap();
+        let amendment = dummy_ordered_amendment(1, vec![genesis, first.hash()], 1);
+        let first_root = amendment.proof.batch_root_bytes;
+        node.pending_stark_settlements.lock().push(amendment);
+        let first_settlement = node.produce_block(proposer, 100).unwrap();
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 1);
+        // A fresh scheduler models the volatile state of a reopened node.
+        *node.aggregation_scheduler.lock() = AggregationScheduler::new(policy.clone(), 0);
+        node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 1);
+        assert_eq!(node.metrics.stark_l2_pending_inputs.get(), 1);
+        assert!(node.l2_job_store.all_jobs().unwrap().is_empty());
+
+        let second = node.produce_block(proposer, 0).unwrap();
+        let amendment = dummy_ordered_amendment(1, vec![first_settlement.hash(), second.hash()], 3);
+        node.pending_stark_settlements.lock().push(amendment);
+        let settlement = node.produce_block(proposer, 100).unwrap();
+        let jobs = node.l2_job_store.all_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.status, L2JobStatus::Ready);
+        assert_eq!((job.start_block, job.end_block), (0, 3));
+        assert_eq!(job.created_at_block, settlement.number());
+        assert_eq!(job.l1_source_hashes, vec![first.hash(), second.hash()]);
+        let second_amendment = ProofAmendment::from_json(
+            &node
+                .amendment_store
+                .get_amendment(&second.hash())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            job.l1_batch_roots,
+            vec![first_root, second_amendment.proof.batch_root_bytes]
+        );
+        assert_eq!(node.metrics.stark_proofs_generated.get(), 0);
+        let rows = node.store.scan_prefix(b"l2j/").unwrap();
+        let root = current_state_root(node);
+        let artifacts = node.store.scan_prefix(b"pa/").unwrap();
+        *node.aggregation_scheduler.lock() = AggregationScheduler::new(policy, 0);
+        node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(node.store.scan_prefix(b"l2j/").unwrap(), rows);
+        assert_eq!(node.store.scan_prefix(b"pa/").unwrap(), artifacts);
+        assert_eq!(current_state_root(node), root);
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 0);
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 1);
+        job.id
+    }
+
+    #[test]
+    fn scaffold_scheduler_rebuild_recovers_pending_and_durable_windows() {
+        let (mut node, proposer) = setup_node();
+        let id = prepare_scaffold_recovered_window(&mut node, &proposer);
+        // Restrict the canonical scan to the first settlement. The orphaned
+        // second input must stop counting as a ready job immediately.
+        let ancestor = node
+            .chain_store
+            .get_block_hash_by_number(2)
+            .unwrap()
+            .unwrap();
+        node.chain_store.set_head(&ancestor).unwrap();
+        node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(
+            node.l2_job_store.get(&id).unwrap().unwrap().status,
+            L2JobStatus::PendingInputs
+        );
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 0);
+        assert_eq!(node.metrics.stark_l2_pending_inputs.get(), 1);
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 1);
+    }
+
+    #[test]
+    fn scaffold_scheduler_rebuild_normal_tick_retries_persistence_failure() {
+        let (mut node, proposer, db) = setup_failing_batch_node();
+        let id = prepare_scaffold_recovered_window(&mut node, &proposer);
+        let job = node.l2_job_store.get(&id).unwrap().unwrap();
+        let amendments: Vec<_> = job
+            .l1_source_hashes
+            .iter()
+            .map(|hash| {
+                ProofAmendment::from_json(
+                    &node.amendment_store.get_amendment(hash).unwrap().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        node.l2_job_store.delete(&id).unwrap();
+        let config = node.aggregation_scheduler.lock().config().clone();
+        *node.aggregation_scheduler.lock() = AggregationScheduler::new(config, 0);
+        node.metrics.stark_l2_ready_jobs.set(0);
+        let root = current_state_root(&node);
+        let artifacts = db.scan_prefix(b"pa/").unwrap();
+        db.fail_next_put();
+        node.feed_l2_scheduler_from_settlements(&amendments, 4);
+        assert!(node.l2_job_store.get(&id).unwrap().is_none());
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 2);
+        assert_eq!(node.metrics.stark_l2_pending_inputs.get(), 2);
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 0);
+        node.feed_l2_scheduler_from_settlements(&[], 5);
+        let ready = node.l2_job_store.get(&id).unwrap().unwrap();
+        assert_eq!(ready.status, L2JobStatus::Ready);
+        assert_eq!(ready.l1_source_hashes, job.l1_source_hashes);
+        assert_eq!(node.aggregation_scheduler.lock().pending_proof_count(), 0);
+        assert_eq!(node.metrics.stark_l2_pending_inputs.get(), 0);
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 1);
+        assert_eq!(current_state_root(&node), root);
+        assert_eq!(db.scan_prefix(b"pa/").unwrap(), artifacts);
+    }
+
+    #[test]
+    fn scaffold_scheduler_rebuild_repairs_ready_roots_and_rejects_inflight_mismatch() {
+        let (mut node, proposer) = setup_node();
+        let id = prepare_scaffold_recovered_window(&mut node, &proposer);
+        let original = node.l2_job_store.get(&id).unwrap().unwrap();
+        let mut damaged = original.clone();
+        damaged.l1_batch_roots[0][31] ^= 1;
+        node.l2_job_store.put(&damaged).unwrap();
+        node.rebuild_settled_stark_sources_from_chain().unwrap();
+        let repaired = node.l2_job_store.get(&id).unwrap().unwrap();
+        assert_eq!(repaired.l1_batch_roots, original.l1_batch_roots);
+        assert_eq!(repaired.created_at_block, original.created_at_block);
+        assert_eq!(repaired.status, L2JobStatus::Ready);
+        damaged.status = L2JobStatus::ProofStored;
+        node.l2_job_store.put(&damaged).unwrap();
+        let before = node.store.scan_prefix(b"l2j/").unwrap();
+        let root = current_state_root(&node);
+        let error = node.rebuild_settled_stark_sources_from_chain().unwrap_err();
+        assert!(error.to_string().contains("canonical L1 inputs"));
+        assert_eq!(node.store.scan_prefix(b"l2j/").unwrap(), before);
+        assert_eq!(current_state_root(&node), root);
+    }
+
+    #[test]
+    fn scaffold_scheduler_rebuild_propagates_job_persistence_failure() {
+        let (mut node, proposer, db) = setup_failing_batch_node();
+        let id = prepare_scaffold_recovered_window(&mut node, &proposer);
+        node.l2_job_store.delete(&id).unwrap();
+        let root = current_state_root(&node);
+        let artifacts = db.scan_prefix(b"pa/").unwrap();
+        db.fail_next_put();
+        let error = node.rebuild_settled_stark_sources_from_chain().unwrap_err();
+        assert!(error.to_string().contains("injected put failure"));
+        assert!(node.l2_job_store.get(&id).unwrap().is_none());
+        assert_eq!(current_state_root(&node), root);
+        assert_eq!(db.scan_prefix(b"pa/").unwrap(), artifacts);
+        node.rebuild_settled_stark_sources_from_chain().unwrap();
+        assert_eq!(
+            node.l2_job_store.get(&id).unwrap().unwrap().status,
+            L2JobStatus::Ready
+        );
+        assert_eq!(node.metrics.stark_l2_ready_jobs.get(), 1);
+    }
+
     #[test]
     fn disabled_l2_mode_does_not_feed_scheduler_or_create_jobs() {
         let (node, _signer) = setup_node();

@@ -40,8 +40,8 @@ pub struct SettledL1Input {
     pub start_block: u64,
     /// Last canonical block covered by this L1 proof (inclusive).
     pub end_block: u64,
-    /// The L1 `batch_root` field element (as u128) produced by the STARK proof.
-    pub batch_root: u128,
+    /// Complete authenticated L1 accumulator root, preserved for durable jobs.
+    pub batch_root_bytes: [u8; 32],
     /// The canonical amendment hash — the key used in the `l2i/` input index.
     pub source_hash: [u8; 32],
 }
@@ -137,7 +137,7 @@ pub struct L1Gap {
 ///
 /// [`on_settled_l1_amendment`]: AggregationScheduler::on_settled_l1_amendment
 /// [`on_block`]: AggregationScheduler::on_block
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AggregationScheduler {
     config: AggregationConfig,
     /// The expected `start_block` of the next incoming L1 proof.
@@ -163,6 +163,11 @@ impl AggregationScheduler {
             last_trigger_block: genesis_block,
             gap: None,
         }
+    }
+
+    /// Scheduling policy retained when reconstructing canonical pending inputs.
+    pub fn config(&self) -> &AggregationConfig {
+        &self.config
     }
 
     // ── Input ingestion ───────────────────────────────────────────────────
@@ -326,7 +331,10 @@ impl AggregationScheduler {
 
     fn emit_trigger(&mut self, block_number: u64, reason: TriggerReason) -> AggregationTrigger {
         let inputs = std::mem::take(&mut self.pending_inputs);
-        let l1_roots: Vec<u128> = inputs.iter().map(|i| i.batch_root).collect();
+        let l1_roots: Vec<u128> = inputs
+            .iter()
+            .map(|i| u128::from_le_bytes(i.batch_root_bytes[..16].try_into().unwrap()))
+            .collect();
         let window_start = inputs
             .first()
             .map(|i| i.start_block)
@@ -373,7 +381,11 @@ mod tests {
         SettledL1Input {
             start_block: start,
             end_block: end,
-            batch_root: root,
+            batch_root_bytes: {
+                let mut bytes = [0; 32];
+                bytes[..16].copy_from_slice(&root.to_le_bytes());
+                bytes
+            },
             source_hash: [0u8; 32],
         }
     }
@@ -582,11 +594,36 @@ mod tests {
     }
 
     #[test]
+    fn trigger_inputs_preserve_both_root_limbs() {
+        let mut sched = default_scheduler();
+        let mut expected = Vec::new();
+        for block in 0..8 {
+            let mut input = make_input(block, block, block as u128);
+            input.batch_root_bytes[16..].fill(0xA0 + block as u8);
+            expected.push(input.batch_root_bytes);
+            sched.on_settled_l1_amendment(input).unwrap();
+        }
+        let trigger = sched.on_block(10).unwrap();
+        assert_eq!(
+            trigger
+                .inputs
+                .iter()
+                .map(|i| i.batch_root_bytes)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn trigger_inputs_carry_batch_roots() {
         let mut sched = default_scheduler();
         feed_inputs(&mut sched, 0, 8, 1000);
         let trigger = sched.on_block(10).unwrap();
-        let roots: Vec<u128> = trigger.inputs.iter().map(|i| i.batch_root).collect();
+        let roots: Vec<u128> = trigger
+            .inputs
+            .iter()
+            .map(|i| u128::from_le_bytes(i.batch_root_bytes[..16].try_into().unwrap()))
+            .collect();
         assert_eq!(roots, (1000..1008u128).collect::<Vec<_>>());
     }
 

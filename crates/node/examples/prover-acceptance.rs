@@ -45,6 +45,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?,
             )?;
         }
+        #[cfg(feature = "rocksdb")]
+        Some("l2-state") => {
+            let stores = shell_storage::RocksDbStore::open_all(&args[2], None)?;
+            let store = std::sync::Arc::new(stores.state);
+            let jobs = shell_storage::L2JobStore::new(store.clone()).all_jobs()?;
+            let inputs = shell_storage::L2InputIndex::new(store.clone()).all_hashes()?;
+            let chain = shell_storage::ChainStore::new(store);
+            let head = chain.get_head_block()?.map(|b| b.number()).unwrap_or(0);
+            let mut canonical_l1_inputs = Vec::new();
+            for height in 0..=head {
+                if let Some(block) = chain.get_block_by_number(height)? {
+                    for tx in &block.system_transactions {
+                        if tx.kind != shell_core::SystemTxKind::StarkReward {
+                            continue;
+                        }
+                        let Some(payload) = tx.proof_payload.as_ref() else {
+                            continue;
+                        };
+                        let amendment = ProofAmendment::from_json(payload.as_ref())?;
+                        if amendment.layer != 1 {
+                            continue;
+                        }
+                        amendment.verify_prover_authentication()?;
+                        verify_sig_batch(&amendment.proof)?;
+                        canonical_l1_inputs.push(serde_json::json!({
+                            "hash": amendment.block_hash, "start": amendment.range_start_block(),
+                            "end": amendment.block_number, "root": amendment.proof.batch_root_bytes,
+                            "settlement_block": height
+                        }));
+                    }
+                }
+            }
+            std::fs::write(
+                &args[3],
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "jobs": jobs, "inputs": inputs, "canonical_l1_inputs": canonical_l1_inputs
+                }))?,
+            )?;
+        }
         Some("verify") => {
             let bytes = std::fs::read(&args[2])?;
             let amendment = ProofAmendment::from_json(&bytes)?;
@@ -66,7 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert!(altered.verify_prover_authentication().is_err());
             println!("STARK proof, prover authentication, and tamper rejection verified");
         }
-        _ => return Err("usage: prover-acceptance inputs|verify FILE".into()),
+        _ => {
+            return Err(
+                "usage: prover-acceptance inputs|verify FILE, or l2-state DB OUTPUT (rocksdb)"
+                    .into(),
+            )
+        }
     }
     Ok(())
 }

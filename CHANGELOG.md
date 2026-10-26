@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Recover Scaffold scheduler windows from canonical L1 settlements across restart,
+  retaining complete proof roots in durable job metadata. Retry failed job writes
+  without dropping their inputs, and refresh metrics after orphan reconciliation.
 - Honor disabled L2 mode when recording settled L1 proofs: producers and
   importers retain ordinary L1 settlement data without creating L2 input rows.
   Existing L2 metadata is preserved while disabled; enabling L2 restores

@@ -46,6 +46,40 @@ block import, including physical database reopen with the `rocksdb` feature:
 cargo test --locked -p shell-node --features rocksdb l2_mode_controls_canonical_input_index -- --nocapture
 ```
 
+### Canonical input recovery
+
+An unreleased correction reconstructs the L2 scheduler from retained canonical
+L1 settlements before networking starts. Pending inputs survive a normal
+process restart or later selection of Scaffold mode, and historical trigger
+heights recreate missing durable windows with stable IDs. Job metadata retains
+both limbs of each L1 root. Ready or waiting descriptors can be repaired from
+the canonical inputs; a mismatched in-flight or stored recursive result fails
+startup instead of silently changing its inputs.
+
+A failed durable-job write keeps the ordinary scheduler's input window available
+for retry on the next block. Recovery propagates storage failure before
+publishing its reconstructed scheduler. Reconciliation refreshes pending-input
+and ready-job metrics after removing orphaned input eligibility. The source
+regressions cover pending/ready recovery, repeat reconstruction, metadata repair,
+orphaned inputs and failed writes:
+
+```bash
+cargo test --locked -p shell-node scaffold_scheduler_rebuild -- --nocapture
+```
+
+For a stopped local test node, the existing prover acceptance helper can export
+its auxiliary input/job records for comparison across process reopens:
+
+```bash
+cargo run --locked -p shell-node --features rocksdb --example prover-acceptance -- l2-state node-data/db l2-state.json
+```
+
+The native qualification resumes two genuine settled L1 ranges from an existing
+development checkpoint and checks the same proof bytes, state, job sources and
+full roots across process reopens. This covers retained settlement history and
+Scaffold metadata; recursive proving and history unavailable after pruning
+remain outside that qualification.
+
 ## Architecture
 
 ```
