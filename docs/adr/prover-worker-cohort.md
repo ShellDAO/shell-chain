@@ -209,7 +209,10 @@ covers calls whose registration calldata was constructed by a contract.
 
 Replay uses a private canonical view and its own volatile settlement progress,
 so already-settled live proofs cannot make their historical inclusion look like
-a duplicate. Private execution and history overlays are each bounded at 64 MiB.
+a duplicate. Hide base canonical-height mappings and add only verified replay
+mappings to this private view. Preparation does not allocate a height vector or
+one tombstone per captured block before checking the retained inputs. Private
+execution and history overlays are each bounded at 64 MiB.
 Only after the entire
 captured history validates and the target head still matches, atomically publish
 the address hints and coverage certificate. Do not publish replayed state,

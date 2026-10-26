@@ -3535,6 +3535,17 @@ impl<S: KvStore> ChainStore<S> {
         )
     }
 
+    /// Rebuild canonical mappings privately as verified history is replayed.
+    /// Hiding the base namespace avoids staging a tombstone per captured height.
+    pub fn prover_discovery_replay_overlay(&self) -> Result<OverlayStore<S>, StorageError> {
+        let overlay = self.native_replay_overlay()?;
+        // Checkpoint restoration still verifies the trusted canonical genesis.
+        if let Some(genesis) = self.get_block_hash_by_number(0)? {
+            overlay.put(&Self::number_key(0), genesis.as_bytes())?;
+        }
+        Ok(overlay.with_hidden_base_prefixes(&[prefix::HASH_BY_NUMBER]))
+    }
+
     /// Reopen the isolated legacy witness replay state without sampling live
     /// mutable metadata again.
     pub fn reopen_native_replay(&self) -> Result<OverlayStore<S>, StorageError> {

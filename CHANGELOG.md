@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Avoid allocating stale-height tombstones for the entire captured head before
+  prover discovery replay. Build the private canonical view as history validates,
+  so high or sparse heads do not consume the replay budget before input checks.
+
 ### Added
 
 - Rebuild missing prover discovery metadata before an opted-in worker starts

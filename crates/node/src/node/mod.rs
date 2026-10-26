@@ -4289,7 +4289,7 @@ mod tests {
 
     #[test]
     fn prover_discovery_rebuild_replays_real_registration_without_live_state_writes() {
-        for failure in 0..11 {
+        for failure in 0..13 {
             let signer = DilithiumSigner::generate();
             let authority =
                 Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -4377,10 +4377,22 @@ mod tests {
                     }
                     node.chain_store.set_canonical(1, &alias).unwrap();
                 }
+                11 | 12 => {
+                    let mut sparse_head = block.clone();
+                    sparse_head.header.number = if failure == 11 { 1_000_000 } else { u64::MAX };
+                    node.chain_store.put_block(&sparse_head).unwrap();
+                    node.chain_store.set_head(&sparse_head.hash()).unwrap();
+                }
                 _ => {}
             }
             let before = store.scan_prefix(b"").unwrap();
             let result = node.rebuild_prover_discovery(&supplied);
+            if failure >= 11 {
+                assert!(
+                    result.as_ref().unwrap_err().to_string().contains("canonical body #2 unavailable"),
+                    "sparse history must reach the first missing input without allocating the full head: {result:?}"
+                );
+            }
             if failure == 0 {
                 assert_eq!(result.unwrap(), Some(1));
                 assert_eq!(node.rebuild_prover_discovery(&config).unwrap(), None);

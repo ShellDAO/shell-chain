@@ -901,7 +901,7 @@ impl<S: KvStore + 'static> Node<S> {
             .registered_prover_members(genesis.hash())?;
         let overlay = Arc::new(
             chain
-                .native_replay_overlay()?
+                .prover_discovery_replay_overlay()?
                 .with_write_limit(64 * 1024 * 1024)?,
         );
         let replay_chain = ChainStore::new(overlay.clone());
@@ -925,7 +925,7 @@ impl<S: KvStore + 'static> Node<S> {
         // is rewound; retained source bodies/witnesses still come from `chain`.
         replay_chain.commit_canonical_rewind(
             &[],
-            &(1..=head.number()).collect::<Vec<_>>(),
+            &[],
             &genesis.hash(),
             0,
             shell_primitives::U256::ZERO,

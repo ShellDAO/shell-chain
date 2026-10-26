@@ -57,6 +57,15 @@ impl<S: KvStore> OverlayStore<S> {
         })
     }
 
+    /// Hide base keys in selected namespaces without copying or deleting them.
+    /// Staged keys remain visible. Like a frozen snapshot, this private view
+    /// cannot be committed back to the base store.
+    pub fn with_hidden_base_prefixes(mut self, prefixes: &[&[u8]]) -> Self {
+        self.frozen_prefixes
+            .extend(prefixes.iter().map(|prefix| prefix.to_vec()));
+        self
+    }
+
     /// Limit private staged data, including an allowance for each map entry.
     /// A rejected write or batch leaves the overlay unchanged.
     pub fn with_write_limit(mut self, max_bytes: usize) -> Result<Self, StorageError> {
@@ -674,6 +683,33 @@ mod tests {
         );
         assert!(!checkpoint.contains_key(b"state/account-a".as_slice()));
     }
+    #[test]
+    fn hidden_base_namespace_uses_only_private_mappings() {
+        let base = Arc::new(MemoryDb::new());
+        base.put(b"n/old", b"canonical").unwrap();
+        base.put(b"header", b"retained").unwrap();
+        let overlay = OverlayStore::new(base.clone())
+            .with_hidden_base_prefixes(&[b"n/"])
+            .with_write_limit(128)
+            .unwrap();
+        base.put(b"n/later", b"future").unwrap();
+        assert_eq!(overlay.get(b"n/old").unwrap(), None);
+        assert!(overlay.scan_prefix(b"n/").unwrap().is_empty());
+        overlay.put(b"n/zero", b"genesis").unwrap();
+        let expected = vec![(b"n/zero".to_vec(), b"genesis".to_vec())];
+        assert_eq!(overlay.scan_prefix(b"n/").unwrap(), expected);
+        assert_eq!(
+            overlay.scan_prefix(b"").unwrap(),
+            vec![
+                (b"header".to_vec(), b"retained".to_vec()),
+                (b"n/zero".to_vec(), b"genesis".to_vec())
+            ]
+        );
+        assert!(overlay.commit().is_err());
+        assert_eq!(base.get(b"n/zero").unwrap(), None);
+        assert_eq!(base.get(b"n/old").unwrap(), Some(b"canonical".to_vec()));
+    }
+
     #[test]
     fn frozen_snapshot_hides_later_base_writes_and_cannot_commit() {
         let base = Arc::new(MemoryDb::new());
