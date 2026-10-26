@@ -858,21 +858,13 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<Option<usize>, NodeError> {
         if !self.config.prover_worker_cohort.is_empty()
             || !self.config.prover_worker_cohort_schedule.is_empty()
-            || self.config.prover_worker_fallback_after_blocks > 0
         {
             return Err(NodeError::Startup(
                 "registry-derived membership conflicts with explicit cohorts".into(),
             ));
         }
-        if self
-            .store
-            .get(b"prover-worker-cohort/v1")?
-            .is_some_and(|mode| mode != b"registry:v3")
-        {
-            return Err(NodeError::Startup(
-                "registry-derived membership conflicts with persisted static assignments".into(),
-            ));
-        }
+        ProofAmendmentStore::new(self.store.clone())
+            .validate_registry_worker_policy(self.config.prover_worker_fallback_after_blocks)?;
         let chain = self.chain_store.as_ref();
         let cfg = chain.get_chain_config()?.ok_or(NodeError::NoGenesis)?;
         if cfg.prover_registry_height.is_none() {

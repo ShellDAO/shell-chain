@@ -12,11 +12,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Extend optional finalized-height backups to canonical registry-derived cohorts,
+  without worker address lists. Persist the registry mode and immutable interval
+  atomically; matching full-history discovery reconstruction preserves that mode.
+  Historical registration boundaries still exclude later identities from old work.
 - Add opt-in finalized-height backup eligibility for explicit L1 worker cohorts.
   Registered backups can drain an absent primary's ready range after a persisted
   interval; the primary remains eligible. Normal proof authentication and one
   canonical reward remain unchanged. Slow primaries and partitions can overlap
-  computation; registry-derived fallback is not enabled by this option.
+  computation; historical membership still bounds which backups are eligible.
 - Rebuild missing prover discovery metadata before an opted-in worker starts
   networking. Replay retained canonical bodies and witnesses privately from
   trusted genesis, verify actual execution and state roots, then publish only

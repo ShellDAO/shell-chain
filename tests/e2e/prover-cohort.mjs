@@ -36,11 +36,12 @@ const reconfigure = lateJoin || process.env.SHELL_COHORT_RECONFIGURE === '1';
 const delayedPredecessor = process.env.SHELL_COHORT_DELAY_PREDECESSOR === '1';
 const parallelWorkers = process.env.SHELL_COHORT_PARALLEL === '1';
 const connectedWorkers = process.env.SHELL_COHORT_CONNECTED === '1';
-const fallbackWorkers = process.env.SHELL_COHORT_FALLBACK === '1';
+const registryFallback = process.env.SHELL_COHORT_REGISTRY_FALLBACK === '1';
+const fallbackWorkers = process.env.SHELL_COHORT_FALLBACK === '1' || registryFallback;
 const rebuildWorkers = process.env.SHELL_COHORT_REBUILD === '1';
-const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1' || rebuildWorkers;
-assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers, fallbackWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers || fallbackWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
-const nodeCount = lateJoin || registryWorkers ? 4 : 3;
+const registryWorkers = process.env.SHELL_COHORT_REGISTRY === '1' || rebuildWorkers || registryFallback;
+assert.ok([delayedPredecessor, parallelWorkers, connectedWorkers, registryWorkers && !registryFallback, fallbackWorkers].filter(Boolean).length <= 1 && (!(delayedPredecessor || parallelWorkers || connectedWorkers || registryWorkers || fallbackWorkers) || !reconfigure), 'Run connected, parallel, delayed predecessor and registry or scheduled membership scenarios separately');
+const nodeCount = lateJoin || (registryWorkers && !registryFallback) ? 4 : 3;
 const workers = Array.from({ length: nodeCount - 1 }, (_, i) => i + 1);
 const logPhases = Array(nodeCount).fill(0);
 async function port() {
@@ -174,7 +175,7 @@ async function checkFallback(boot, validators) {
     const primaryAddress = members[Number(BigInt(genesis.hash.slice(0, 18)) % 2n)];
     const primary = keys.findIndex(k => k.address === primaryAddress);
     const backup = primary === 1 ? 2 : 1;
-    const config = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\nworker_cohort=' + JSON.stringify(members) + '\nworker_fallback_after_blocks=' + interval + '\n';
+    const config = '[network]\nenable_mdns=false\n[prover]\nproving_priority="sequential"\n' + (registryFallback ? 'worker_cohort_from_registry=true' : 'worker_cohort=' + JSON.stringify(members)) + '\nworker_fallback_after_blocks=' + interval + '\n';
     for (const i of [1, 2]) await writeFile(join(out, `node${i}.toml`), config);
     const before = BigInt(await rpc(0, 'eth_getBalance', [keys[backup].address, 'latest']));
     const provider = createShellProvider({rpcHttpUrl: `http://127.0.0.1:${ports[0]}`});
@@ -208,7 +209,7 @@ async function checkFallback(boot, validators) {
     assert.ok(observed < deadline, 'backup must observe the ready range before its finalized-height deadline');
     assert.equal(count(await metricText(backup)), 0);
     assert.equal(nodes[primary], undefined, 'primary remains absent during fallback');
-    result.fallback = {primary, backup, interval, end, entries, observedBeforeDeadline:observed, deadline}; await save();
+    result.fallback = {registryDerived:registryFallback, primary, backup, interval, end, entries, observedBeforeDeadline:observed, deadline}; await save();
     await until(async () => (await rpc(0, 'shell_getRegisteredProver', [keys[backup].address])).proofs_submitted === 1, 120);
     assert.equal(count(await metricText(backup)), 1);
     assert.equal((await rpc(0, 'shell_getRegisteredProver', [keys[primary].address])).proofs_submitted, 0);
@@ -254,7 +255,7 @@ async function checkFallback(boot, validators) {
         if (i) assert.equal(count(await metricText(i)), 0);
     }
     result.reopenPassed = true; result.recipientBalance = '512';
-    result.adaptation = 'Opt-in finalized-height fallback in an explicit cohort, absent primary, genuine512transfers and one actual authenticated backup proof/reward. Primary eligibility is never revoked; slow primary/partition overlap and registry-derived fallback remain unqualified.';
+    result.adaptation = (registryFallback ? 'Opt-in canonical registry-derived membership and finalized-height fallback, no worker address/epoch list. ' : 'Opt-in explicit cohort finalized-height fallback. ') + 'Absent primary, genuine512transfers and one actual authenticated backup proof/reward. Primary eligibility is never revoked; slow primary/partition overlap and later registrant takeover of historical work remain unqualified.';
     result.status = 'PASS: absent primary recovered by registered backup after finalized-height boundary; original proof and reward survive late-primary sync and all three physical reopens';
 }
 

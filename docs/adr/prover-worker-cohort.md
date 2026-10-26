@@ -179,8 +179,10 @@ The registry's current append-only, immutable registration-height semantics are
 required for this historical derivation. A future deregistration or replacement
 protocol must revisit this rule before use. The operational cohort supports at
 most 64 registered members; a larger set is rejected rather than truncated.
-An assigned member going offline still retains its historical ranges. This
-mode adds recruitment, not a timeout, lease or takeover mechanism.
+An assigned member remains its historical range's primary. Without the optional
+finalized-height backup interval below, offline work retains that sole owner.
+With the interval enabled, backups come from the same finalized historical
+registration set; later registrations do not retroactively acquire old work.
 
 Address preimages live in an auxiliary local candidate index. Candidates from
 rolled-back or orphaned execution are harmless: every discovery reads actual
@@ -256,19 +258,24 @@ proof generation. Snapshot certification is earned by replay, never copied from
 the imported certificate. This manual mode uses the same compatible binary/SDK
 inputs and isolated accounts as the registry membership acceptance.
 
-## Optional backup eligibility for explicit cohorts
+## Optional finalized-height backup eligibility
 
 Set `worker_fallback_after_blocks` to a positive integer under `[prover]` to
-allow registered backups in an explicit static or scheduled cohort. Zero is the
-default and retains existing primary-only scheduling. This option cannot be
-combined with registry-derived membership. Use the same interval and complete
-schedule on all coordinating workers, including a returning primary.
+allow registered backups in an explicit static/scheduled cohort or in canonical
+registry-derived membership. Zero is the default and retains existing primary-only
+scheduling. Use the same interval and membership mode on coordinating workers,
+including a returning primary. Explicit cohorts also require the same complete
+schedule. Registry mode uses `worker_cohort_from_registry = true` with the interval;
+do not add a worker address list or schedule.
 
 The primary's historical epoch and hash-based assignment remain unchanged.
 Order backups cyclically after the primary in that epoch's sorted member list.
 The rank-r backup becomes eligible when the finalized height reaches the range's
 last source height plus r times the configured interval. A later epoch's new
-member cannot take historical work from an epoch it did not join. Eligibility
+member cannot take historical work from an epoch it did not join. Registry mode
+uses the same finalized registration-height cutoff as primary assignment. A
+range whose historical registration set contains one prover has no backup;
+registering another prover later does not rewrite that set. Eligibility
 uses canonical finalized height, not local uptime, wall-clock time or a timer
 reset by restart. A stopped chain does not advance this deadline. Overflowed
 rank intervals never make a backup eligible early.
@@ -282,8 +289,12 @@ the network's proof latency; no exactly-once computation claim is made under
 those conditions. Existing proof verification, canonical settlement ordering,
 registered signing identity and single canonical reward checks still apply.
 
-Persist the immutable interval and append-only epoch schedule in one local
-batch. Older scheduling writers reject the new marker, and reopen rejects
+Persist the immutable interval with the selected membership mode in one local
+batch (and the append-only epoch schedule for explicit cohorts). Registry mode
+uses a v5 marker rejected by older registry-only scheduling writers. Existing
+v3 registry databases may explicitly opt in; matching v5 databases can rebuild
+missing discovery privately without changing the bound interval. Incompatible
+or missing policy metadata rejects before discovery certification. Reopen rejects
 changing or disabling a bound interval. Explicitly opting an existing cohort
 into this mode requires stopping and coordinating its workers first. Discovery,
 chain state roots, wire messages, signing domains and activation heights are
@@ -299,5 +310,8 @@ The backup must then generate an actual authenticated proof and receive the
 exact source-block reward. A returning primary and all three physical database
 reopens must retain original proof bytes, counters and account state without
 recomputation. Reopen with a changed or disabled interval must fail. This
-bounded scenario does not qualify registry-derived fallback, partitions, slow
-primary overlap or production latency.
+bounded scenario does not qualify partitions, slow primary overlap or production
+latency. `SHELL_COHORT_REGISTRY_FALLBACK=1` runs the same behavior with canonical
+registry membership and no configured worker addresses or epochs. Both modes
+retain the same actual proof, exact reward, returning-primary and physical reopen
+checks; registry mode also preserves historical registration cutoffs.

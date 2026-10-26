@@ -83,7 +83,10 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         local: Address,
         fallback_after_blocks: u64,
     ) -> Result<Option<Self>, StorageError> {
-        if store.get(b"prover-worker-cohort/v1")?.as_deref() == Some(b"registry:v3") {
+        if matches!(
+            store.get(b"prover-worker-cohort/v1")?.as_deref(),
+            Some(b"registry:v3" | b"registry-fallback:v5")
+        ) {
             return Err(StorageError::InvalidInput("registry-derived worker cohort cannot be disabled or replaced by a static schedule".into()));
         }
         let mut epochs = vec![(0, workers)];
@@ -136,7 +139,18 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn open_registry(store: Arc<S>, local: Address) -> Result<Self, StorageError> {
+        Self::open_registry_with_fallback(store, local, 0)
+    }
+
+    pub(crate) fn open_registry_with_fallback(
+        store: Arc<S>,
+        local: Address,
+        fallback_after_blocks: u64,
+    ) -> Result<Self, StorageError> {
+        ProofAmendmentStore::new(Arc::clone(&store))
+            .validate_registry_worker_policy(fallback_after_blocks)?;
         let chain = ChainStore::new(Arc::clone(&store));
         if chain
             .get_chain_config()?
@@ -159,23 +173,14 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
             0,
         )?
         .registered_prover_members(genesis)?;
-        let key = b"prover-worker-cohort/v1";
-        match store.get(key)? {
-            Some(bytes) if bytes != b"registry:v3" => {
-                return Err(StorageError::InvalidInput(
-                    "registry-derived cohort conflicts with persisted static assignments".into(),
-                ))
-            }
-            Some(_) => {}
-            None => store.put(key, b"registry:v3")?,
-        }
+        ProofAmendmentStore::new(store).bind_registry_worker_policy(fallback_after_blocks)?;
         Ok(Self {
             epochs: Vec::new(),
             local,
             chain,
             deferred: VecDeque::new(),
             registry_mode: true,
-            fallback_after_blocks: 0,
+            fallback_after_blocks,
         })
     }
 
@@ -183,9 +188,23 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         if !self.registry_mode {
             return Ok(Some(self.owner(task)));
         }
+        let members = self.registry_members(task)?;
+        if members.is_empty() {
+            return Ok(None);
+        }
+        let source = task
+            .source_hashes
+            .first()
+            .copied()
+            .unwrap_or_else(|| ShellHash::from(task.block_hash));
+        let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
+        Ok(Some(members[(prefix % members.len() as u64) as usize]))
+    }
+
+    fn registry_members(&self, task: &ProofTask) -> Result<Vec<Address>, StorageError> {
         let finalized = self.chain.get_finalized_number()?.unwrap_or(0);
         if task.block_number > finalized {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let genesis = self
             .chain
@@ -207,13 +226,13 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
         )?
         .registered_prover_members(genesis)?;
         let Some(first) = current.iter().map(|(_, height)| *height).min() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         // A source range predating the first prover uses that first canonical
         // registration, so old backlog cannot remain permanently unassigned.
         let reference = task.block_number.max(first);
         if reference > finalized {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         // The current registry is append-only and its registration height is
         // immutable. Filter finalized records by the range's reference height;
@@ -223,20 +242,14 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
             .filter(|(_, height)| *height <= reference)
             .collect();
         if members.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         if members.len() > MAX_WORKER_COHORT {
             return Err(StorageError::InvalidInput(
                 "registry-derived cohort exceeds 64 workers".into(),
             ));
         }
-        let source = task
-            .source_hashes
-            .first()
-            .copied()
-            .unwrap_or_else(|| ShellHash::from(task.block_hash));
-        let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
-        Ok(Some(members[(prefix % members.len() as u64) as usize].0))
+        Ok(members.into_iter().map(|(address, _)| address).collect())
     }
 
     fn members_for_task(&self, task: &ProofTask) -> &[Address] {
@@ -264,17 +277,29 @@ impl<S: KvStore + 'static> WorkerCohort<S> {
     }
 
     fn fallback_eligible(&self, task: &ProofTask) -> Result<bool, StorageError> {
-        if self.fallback_after_blocks == 0 || self.registry_mode {
+        if self.fallback_after_blocks == 0 {
             return Ok(false);
         }
-        let workers = self.members_for_task(task);
+        let registered;
+        let workers = if self.registry_mode {
+            registered = self.registry_members(task)?;
+            registered.as_slice()
+        } else {
+            self.members_for_task(task)
+        };
+        if workers.is_empty() {
+            return Ok(false);
+        }
         let Some(local) = workers.iter().position(|worker| *worker == self.local) else {
             return Ok(false);
         };
-        let primary = workers
-            .iter()
-            .position(|worker| *worker == self.owner(task))
-            .expect("owner belongs to the selected epoch");
+        let source = task
+            .source_hashes
+            .first()
+            .copied()
+            .unwrap_or_else(|| ShellHash::from(task.block_hash));
+        let prefix = u64::from_be_bytes(source.as_bytes()[..8].try_into().expect("hash prefix"));
+        let primary = (prefix % workers.len() as u64) as usize;
         let rank = (local + workers.len() - primary) % workers.len();
         if rank == 0 {
             return Ok(false);
@@ -1238,6 +1263,99 @@ mod tests {
                 WorkerCohort::open(stores[i].clone(), addresses.to_vec(), addresses[i]).is_err()
             );
         }
+    }
+
+    #[test]
+    fn registry_fallback_observes_finality_historical_membership_and_reopen_policy() {
+        let signers = [
+            Arc::new(DilithiumSigner::generate()),
+            Arc::new(DilithiumSigner::generate()),
+        ];
+        let addresses = signers
+            .each_ref()
+            .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()));
+        let store = Arc::new(MemoryDb::new());
+        let blocks = registry_cohort_fixture(store.clone(), &signers);
+        let chain = ChainStore::new(store.clone());
+        let task = ProofTask::new(*blocks[2].hash().as_bytes(), 2, vec![]);
+        let cohort =
+            WorkerCohort::open_registry_with_fallback(store.clone(), addresses[0], 3).unwrap();
+        assert_eq!(cohort.assigned_owner(&task).unwrap(), Some(addresses[1]));
+        let mut parent = blocks[2].clone();
+        for height in 3..=5 {
+            let mut block = parent.clone();
+            block.header.parent_hash = parent.hash();
+            block.header.number = height;
+            block.header.timestamp += 1;
+            chain.commit_canonical_block(&block, None).unwrap();
+            chain.set_finalized_number(height).unwrap();
+            assert_eq!(cohort.fallback_eligible(&task).unwrap(), height >= 5);
+            parent = block;
+        }
+        let later = Arc::new(DilithiumSigner::generate());
+        let later_address = Address::from_public_key(later.public_key(), later.sig_type().as_u8());
+        let mut state =
+            shell_storage::WorldState::at_root(store.clone(), &parent.header.state_root).unwrap();
+        state
+            .set_registered_prover(
+                &later_address,
+                &shell_storage::RegisteredProver {
+                    public_key: later.public_key().to_vec(),
+                    algorithm: later.sig_type().as_u8(),
+                    registered_at: 6,
+                    proofs_submitted: 0,
+                    last_proof_block: 0,
+                },
+            )
+            .unwrap();
+        let mut tip = parent.clone();
+        tip.header.number = 6;
+        tip.header.parent_hash = parent.hash();
+        tip.header.timestamp += 1;
+        tip.header.state_root = state.state_root().unwrap();
+        chain.commit_canonical_block(&tip, None).unwrap();
+        chain.set_finalized_number(6).unwrap();
+        let later_cohort =
+            WorkerCohort::open_registry_with_fallback(store.clone(), later_address, 3).unwrap();
+        assert!(
+            !later_cohort.fallback_eligible(&task).unwrap(),
+            "later registration is not historical backup membership"
+        );
+        assert!(cohort.fallback_eligible(&task).unwrap());
+        assert_eq!(cohort.assigned_owner(&task).unwrap(), Some(addresses[1]));
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(WorkerCohort::open_registry(store.clone(), addresses[0]).is_err());
+        assert!(WorkerCohort::open_registry_with_fallback(store.clone(), addresses[0], 4).is_err());
+        assert!(WorkerCohort::open_scheduled_with_fallback(
+            store.clone(),
+            addresses.to_vec(),
+            vec![],
+            addresses[0],
+            3
+        )
+        .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        let reopened =
+            WorkerCohort::open_registry_with_fallback(store.clone(), addresses[0], 3).unwrap();
+        assert!(reopened.fallback_eligible(&task).unwrap());
+        chain
+            .commit_canonical_rewind(
+                &[],
+                &[3, 4, 5, 6],
+                &blocks[2].hash(),
+                0,
+                shell_primitives::U256::ZERO,
+                2,
+            )
+            .unwrap();
+        assert!(
+            !cohort.fallback_eligible(&task).unwrap(),
+            "rewind must use actual finalized root/height"
+        );
+        assert!(
+            !later_cohort.fallback_eligible(&task).unwrap(),
+            "orphaned hint is never membership"
+        );
     }
 
     #[test]

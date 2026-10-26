@@ -4282,6 +4282,54 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         Self { store }
     }
 
+    /// Check the local registry scheduling mode without publishing metadata.
+    /// Discovery reconstruction uses this before certifying a missing index.
+    pub fn validate_registry_worker_policy(
+        &self,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
+        let mode = self.store.get(b"prover-worker-cohort/v1")?;
+        let interval = self.store.get(b"prover-worker-cohort/fallback/v1")?;
+        let valid = match mode.as_deref() {
+            None | Some(b"registry:v3") => interval.is_none(),
+            Some(b"registry-fallback:v5") => {
+                fallback_after_blocks > 0
+                    && interval.as_deref() == Some(fallback_after_blocks.to_be_bytes().as_slice())
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(StorageError::InvalidInput("registry worker policy differs from the persisted assignment; restore the existing configuration".into()));
+        }
+        Ok(())
+    }
+
+    /// Bind registry membership and its immutable optional backup interval in
+    /// one batch. Older registry-only writers reject the v5 mode marker.
+    pub fn bind_registry_worker_policy(
+        &self,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
+        self.validate_registry_worker_policy(fallback_after_blocks)?;
+        let mode = if fallback_after_blocks == 0 {
+            b"registry:v3".as_slice()
+        } else {
+            b"registry-fallback:v5".as_slice()
+        };
+        if self.store.get(b"prover-worker-cohort/v1")?.as_deref() == Some(mode) {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(b"prover-worker-cohort/v1".to_vec(), mode.to_vec());
+        if fallback_after_blocks > 0 {
+            batch.put(
+                b"prover-worker-cohort/fallback/v1".to_vec(),
+                fallback_after_blocks.to_be_bytes().to_vec(),
+            );
+        }
+        self.store.write_batch(batch)
+    }
+
     /// Bind local scheduling metadata, preserving immutable historical epochs.
     /// Changes are explicit future additions, never consensus state mutations.
     pub fn bind_worker_cohort(&self, workers: &[Address]) -> Result<(), StorageError> {
@@ -4945,6 +4993,31 @@ mod tests {
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
         scanned_entries: AtomicUsize,
+    }
+
+    #[test]
+    fn registry_fallback_policy_is_atomic_and_rejects_downgrade_or_corruption() {
+        let store = Arc::new(FailingBatchStore::new());
+        let amendments = ProofAmendmentStore::new(store.clone());
+        amendments.bind_registry_worker_policy(0).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        store.fail_next_batch();
+        assert!(amendments.bind_registry_worker_policy(3).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        amendments.bind_registry_worker_policy(3).unwrap();
+        assert_eq!(
+            store.get(b"prover-worker-cohort/v1").unwrap().unwrap(),
+            b"registry-fallback:v5"
+        );
+        let bound = store.scan_prefix(b"").unwrap();
+        assert!(amendments.bind_registry_worker_policy(0).is_err());
+        assert!(amendments.bind_registry_worker_policy(4).is_err());
+        assert!(amendments
+            .bind_worker_cohort_schedule_with_fallback(&[(0, vec![Address::from([1; 32])])], 0, 3)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), bound);
+        store.delete(b"prover-worker-cohort/fallback/v1").unwrap();
+        assert!(amendments.validate_registry_worker_policy(3).is_err());
     }
 
     #[test]

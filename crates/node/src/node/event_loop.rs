@@ -543,13 +543,13 @@ impl<S: KvStore + 'static> Node<S> {
             if self.config.prover_worker_cohort_from_registry {
                 if !self.config.prover_worker_cohort.is_empty()
                     || !self.config.prover_worker_cohort_schedule.is_empty()
-                    || self.config.prover_worker_fallback_after_blocks > 0
                 {
-                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts or fallback".into()));
+                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts".into()));
                 }
-                crate::prover_service::WorkerCohort::open_registry(
+                crate::prover_service::WorkerCohort::open_registry_with_fallback(
                     Arc::clone(&self.store),
                     self.config.proposer_address.unwrap_or(local_signer_address),
+                    self.config.prover_worker_fallback_after_blocks,
                 )
                 .map(Some)
             } else {

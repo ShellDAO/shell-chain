@@ -4289,7 +4289,7 @@ mod tests {
 
     #[test]
     fn prover_discovery_rebuild_replays_real_registration_without_live_state_writes() {
-        for failure in 0..13 {
+        for failure in 0..16 {
             let signer = DilithiumSigner::generate();
             let authority =
                 Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -4383,17 +4383,32 @@ mod tests {
                     node.chain_store.put_block(&sparse_head).unwrap();
                     node.chain_store.set_head(&sparse_head.hash()).unwrap();
                 }
+                13 => {
+                    node.config.prover_worker_fallback_after_blocks = 3;
+                    ProofAmendmentStore::new(store.clone())
+                        .bind_registry_worker_policy(3)
+                        .unwrap();
+                }
+                14 => ProofAmendmentStore::new(store.clone())
+                    .bind_registry_worker_policy(3)
+                    .unwrap(),
+                15 => {
+                    node.config.prover_worker_fallback_after_blocks = 3;
+                    ProofAmendmentStore::new(store.clone())
+                        .bind_registry_worker_policy(4)
+                        .unwrap();
+                }
                 _ => {}
             }
             let before = store.scan_prefix(b"").unwrap();
             let result = node.rebuild_prover_discovery(&supplied);
-            if failure >= 11 {
+            if failure == 11 || failure == 12 {
                 assert!(
                     result.as_ref().unwrap_err().to_string().contains("canonical body #2 unavailable"),
                     "sparse history must reach the first missing input without allocating the full head: {result:?}"
                 );
             }
-            if failure == 0 {
+            if failure == 0 || failure == 13 {
                 assert_eq!(result.unwrap(), Some(1));
                 assert_eq!(node.rebuild_prover_discovery(&config).unwrap(), None);
                 assert_eq!(
@@ -4404,8 +4419,12 @@ mod tests {
                     vec![(address, 1)]
                 );
                 assert!(
-                    crate::prover_service::WorkerCohort::open_registry(store.clone(), address)
-                        .is_ok()
+                    crate::prover_service::WorkerCohort::open_registry_with_fallback(
+                        store.clone(),
+                        address,
+                        node.config.prover_worker_fallback_after_blocks
+                    )
+                    .is_ok()
                 );
                 // The cohort marker is an intentional later startup write.
                 let filtered = |rows: Vec<(Vec<u8>, Vec<u8>)>| {

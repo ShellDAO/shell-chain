@@ -590,9 +590,6 @@ async fn run_with_store<S: KvStore + 'static>(
     store: Arc<S>,
     args: RunArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.prover_worker_cohort_from_registry && args.prover_worker_fallback_after_blocks > 0 {
-        return Err("worker fallback currently requires an explicit cohort".into());
-    }
     // Load or generate the signer.
     let signer: Arc<dyn Signer> = match args.keystore {
         Some(path) => {
