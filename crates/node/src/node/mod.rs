@@ -648,6 +648,12 @@ impl<'a, S: KvStore + 'static> ProverOrchestratorBoundary<'a, S> {
                     .map(move |source| (amendment.layer, source))
             }));
         for amendment in amendments {
+            // A peer may settle a range before the last source task is queued
+            // locally. Retaining its earlier queued inputs would leave a gap
+            // below the proving threshold and block every later range.
+            self.proof_backlog
+                .lock()
+                .remove_proved_tasks(amendment.layer, &amendment.covered_hashes());
             for source in amendment.covered_hashes() {
                 let _ = self.settled_source_index.put(amendment.layer, &source);
             }
@@ -1990,24 +1996,34 @@ mod tests {
     #[derive(Debug, Default)]
     pub(super) struct FailingBatchDb {
         inner: MemoryDb,
+        fail_get_key: parking_lot::Mutex<Option<Vec<u8>>>,
         fail_next_get: AtomicBool,
         fail_next_put: AtomicBool,
         fail_next_flush: AtomicBool,
         fail_next_batch: AtomicBool,
         fail_proof_batch: AtomicBool,
         fail_head_batch: AtomicBool,
+        proof_batch_barrier: parking_lot::Mutex<Option<ProofBatchBarrier>>,
+    }
+
+    #[derive(Debug)]
+    struct ProofBatchBarrier {
+        persisted: tokio::sync::oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
     }
 
     impl FailingBatchDb {
         pub(super) fn new() -> Self {
             Self {
                 inner: MemoryDb::new(),
+                fail_get_key: parking_lot::Mutex::new(None),
                 fail_next_get: AtomicBool::new(false),
                 fail_next_put: AtomicBool::new(false),
                 fail_next_flush: AtomicBool::new(false),
                 fail_next_batch: AtomicBool::new(false),
                 fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
+                proof_batch_barrier: parking_lot::Mutex::new(None),
             }
         }
 
@@ -2034,6 +2050,9 @@ mod tests {
 
     impl KvStore for FailingBatchDb {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.fail_get_key.lock().as_deref() == Some(key) {
+                return Err(StorageError::Database("injected keyed get failure".into()));
+            }
             if self.fail_next_get.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected get failure".into()));
             }
@@ -2081,11 +2100,34 @@ mod tests {
                     "injected canonical batch failure".into(),
                 ));
             }
-            self.inner.write_batch(batch)
+            let proof_batch = batch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, WriteBatchOp::Put { key, .. } if key.starts_with(b"pa/")));
+            self.inner.write_batch(batch)?;
+            if proof_batch {
+                let barrier = self.proof_batch_barrier.lock().take();
+                if let Some(barrier) = barrier {
+                    let _ = barrier.persisted.send(());
+                    barrier
+                        .resume
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("proof storage barrier must be released");
+                }
+            }
+            Ok(())
         }
 
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.inner.scan_prefix(prefix)
+        }
+
+        fn snapshot_prefixes(
+            &self,
+            prefixes: &[&[u8]],
+            max_bytes: usize,
+        ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+            self.inner.snapshot_prefixes(prefixes, max_bytes)
         }
     }
 
@@ -4243,6 +4285,179 @@ mod tests {
             U256::from(50_000_000_000_000_000_000u128)
         );
         assert!(node.stark_reward_value(20_047, &invalid).is_err());
+    }
+
+    #[test]
+    fn prover_discovery_rebuild_replays_real_registration_without_live_state_writes() {
+        for failure in 0..16 {
+            let signer = DilithiumSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let prover = DilithiumSigner::generate();
+            let address = Address::from_public_key(prover.public_key(), prover.sig_type().as_u8());
+            let config: shell_genesis::GenesisConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "chain_name":"discovery-rebuild", "network_type":"Dev",
+                "timestamp":0, "gas_limit":30000000, "extra_data":"discovery-rebuild",
+                "prover_registry_height":0, "boot_nodes":[],
+                "alloc":{(authority.to_string()):{"balance":"1000000000000000000000000"}},
+                "consensus":{"engine":"poa","authorities":[authority],"block_time_secs":1,"max_future_secs":60}
+            })).unwrap();
+            let store = Arc::new(FailingBatchDb::new());
+            let genesis = shell_genesis::initialize_genesis(&config, store.clone()).unwrap();
+            let (mut node, _) =
+                crate::builder::NodeBuilder::new(NodeConfig::dev(authority), store.clone())
+                    .build()
+                    .unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let mut tx = signed_tx_with_gas_limit(100_000).tx;
+            tx.max_fee_per_gas = shell_core::INITIAL_BASE_FEE;
+            tx.to = Some(shell_pqvm::registry_address());
+            tx.data = Bytes::from(shell_pqvm::encode_register_prover_calldata(
+                prover.public_key(),
+                prover.sig_type().as_u8(),
+            ));
+            let transaction = submit_signed_tx(&node, &signer, authority, tx);
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert_eq!(
+                node.chain_store
+                    .get_receipts(&block.hash())
+                    .unwrap()
+                    .unwrap()[0]
+                    .status,
+                1
+            );
+            assert!(node
+                .world_state
+                .read()
+                .get_registered_prover(&address)
+                .unwrap()
+                .is_some());
+            assert!(node.chain_store.has_witness_bundle(&block.hash()).unwrap());
+            for (key, _) in store.scan_prefix(b"prover-discovery/").unwrap() {
+                store.delete(&key).unwrap();
+            }
+            assert!(
+                crate::prover_service::WorkerCohort::open_registry(store.clone(), address).is_err(),
+                "old database baseline must reject an uncertified member list"
+            );
+            let root = current_state_root(&node);
+            let mut supplied = config.clone();
+            match failure {
+                1 => node.chain_store.delete_body(&block.hash()).unwrap(),
+                2 => supplied.timestamp += 1,
+                3 => store.fail_next_batch(),
+                4 => {
+                    for (key, _) in store.scan_prefix(b"w/").unwrap() {
+                        store.delete(&key).unwrap();
+                    }
+                }
+                5 => {
+                    let mut tampered = block.clone();
+                    tampered.transactions.clear();
+                    node.chain_store.put_block(&tampered).unwrap();
+                }
+                6 => store.fail_next_get(),
+                7 => {
+                    for (key, _) in store.scan_prefix(b"amc/").unwrap() {
+                        store.delete(&key).unwrap();
+                    }
+                }
+                8 => store
+                    .put(b"prover-worker-cohort/v1", authority.as_bytes())
+                    .unwrap(),
+                9 => node.config.prover_worker_cohort = vec![authority],
+                10 => {
+                    let alias = ShellHash::from([0xE4; 32]);
+                    for prefix in [b"b/".as_slice(), b"w/", b"h/"] {
+                        let original = [prefix, block.hash().as_bytes()].concat();
+                        let copy = [prefix, alias.as_bytes()].concat();
+                        if let Some(value) = store.get(&original).unwrap() {
+                            store.put(&copy, &value).unwrap();
+                        }
+                    }
+                    node.chain_store.set_canonical(1, &alias).unwrap();
+                }
+                11 | 12 => {
+                    let mut sparse_head = block.clone();
+                    sparse_head.header.number = if failure == 11 { 1_000_000 } else { u64::MAX };
+                    node.chain_store.put_block(&sparse_head).unwrap();
+                    node.chain_store.set_head(&sparse_head.hash()).unwrap();
+                }
+                13 => {
+                    node.config.prover_worker_fallback_after_blocks = 3;
+                    ProofAmendmentStore::new(store.clone())
+                        .bind_registry_worker_policy(3)
+                        .unwrap();
+                }
+                14 => ProofAmendmentStore::new(store.clone())
+                    .bind_registry_worker_policy(3)
+                    .unwrap(),
+                15 => {
+                    node.config.prover_worker_fallback_after_blocks = 3;
+                    ProofAmendmentStore::new(store.clone())
+                        .bind_registry_worker_policy(4)
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            let result = node.rebuild_prover_discovery(&supplied);
+            if failure == 11 || failure == 12 {
+                assert!(
+                    result.as_ref().unwrap_err().to_string().contains("canonical body #2 unavailable"),
+                    "sparse history must reach the first missing input without allocating the full head: {result:?}"
+                );
+            }
+            if failure == 0 || failure == 13 {
+                assert_eq!(result.unwrap(), Some(1));
+                assert_eq!(node.rebuild_prover_discovery(&config).unwrap(), None);
+                assert_eq!(
+                    node.world_state
+                        .read()
+                        .registered_prover_members(genesis.hash())
+                        .unwrap(),
+                    vec![(address, 1)]
+                );
+                assert!(
+                    crate::prover_service::WorkerCohort::open_registry_with_fallback(
+                        store.clone(),
+                        address,
+                        node.config.prover_worker_fallback_after_blocks
+                    )
+                    .is_ok()
+                );
+                // The cohort marker is an intentional later startup write.
+                let filtered = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+                    rows.into_iter()
+                        .filter(|(key, _)| {
+                            !key.starts_with(b"prover-discovery/")
+                                && !key.starts_with(b"prover-worker-cohort/")
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(filtered(store.scan_prefix(b"").unwrap()), filtered(before));
+                assert_eq!(
+                    node.chain_store
+                        .get_tx_location(&transaction)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    block.hash()
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "failure case {failure}; certificate={:?}",
+                    store.get(b"prover-discovery/head/v1").unwrap()
+                );
+                assert_eq!(
+                    store.scan_prefix(b"").unwrap(),
+                    before,
+                    "failed replay/publication must not write canonical/native metadata"
+                );
+            }
+            assert_eq!(current_state_root(&node), root);
+        }
     }
 
     #[test]
@@ -20942,7 +21157,9 @@ mod tests {
 
     /// Create and fund a test account with a Dilithium key.
     /// Returns (signer, address, pubkey).
-    fn make_stark_account(node: &Node<MemoryDb>) -> (DilithiumSigner, Address, Vec<u8>) {
+    fn make_stark_account<S: KvStore + 'static>(
+        node: &Node<S>,
+    ) -> (DilithiumSigner, Address, Vec<u8>) {
         let signer = DilithiumSigner::generate();
         let pubkey = signer.public_key().to_vec();
         let address = Address::from_public_key(&pubkey, signer.sig_type().as_u8());
@@ -21178,6 +21395,435 @@ mod tests {
 
         assert_eq!(node.enqueue_stark_frontier_backlog(8).unwrap(), 0);
         assert!(node.proof_backlog.lock().is_empty());
+    }
+
+    #[test]
+    fn stark_frontier_recovery_retains_later_real_proof_until_predecessor_completes() {
+        let (mut node, proposer) = setup_stark_node();
+        let (sender, address, public_key) = make_stark_account(&node);
+        fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let signers = [DilithiumSigner::generate(), DilithiumSigner::generate()];
+        let mut amendments = Vec::new();
+        for (batch, signer) in signers.iter().enumerate() {
+            let mut sources = if batch == 0 { vec![genesis] } else { vec![] };
+            let mut entries = Vec::new();
+            let mut original_size = 0;
+            for block_index in 0..16 {
+                for offset in 0..32 {
+                    let nonce = (batch * 512 + block_index * 32 + offset) as u64;
+                    let tx = make_embedded_tx(&sender, address, public_key.clone(), nonce, 1);
+                    node.tx_pool
+                        .insert(
+                            tx,
+                            &mut *node.world_state.write(),
+                            node.chain_store.as_ref(),
+                            &MultiVerifier,
+                        )
+                        .unwrap();
+                }
+                let block = node.produce_block(&proposer, 32).unwrap();
+                assert_eq!(block.transactions.len(), 32);
+                original_size += node
+                    .witness_store
+                    .bundle_size(&block.hash())
+                    .unwrap()
+                    .unwrap();
+                entries.extend(stark_sources::block_to_sig_batch_entries(&block));
+                sources.push(block.hash());
+            }
+            assert_eq!(entries.len(), 512);
+            let proof = shell_stark_prover::prove_sig_batch(&entries).unwrap();
+            shell_stark_prover::verify_sig_batch(&proof).unwrap();
+            let mut amendment = ProofAmendment {
+                version: shell_stark_prover::PROOF_AMENDMENT_VERSION,
+                block_hash: *sources.last().unwrap(),
+                block_number: ((batch + 1) * 16) as u64,
+                start_block: Some(if batch == 0 { 0 } else { 17 }),
+                proof,
+                prover: Address::ZERO,
+                prover_signature: Bytes::new(),
+                layer: 1,
+                source_hashes: sources,
+                original_size: Some(original_size),
+                compressed_size: None,
+                settlement_tx_hash: None,
+            };
+            amendment.sign_prover_authentication(signer).unwrap();
+            node.validate_prover_admission(&amendment).unwrap();
+            node.validate_stark_proof_source_binding(&amendment)
+                .unwrap();
+            assert!(amendment.has_valid_embedded_compression());
+            amendments.push(amendment);
+        }
+        while node.proof_backlog.lock().pop().is_some() {}
+        let later = &amendments[1];
+        let payload = later.to_json().unwrap();
+        // Model a completed CPU job persisted before its event-loop handoff,
+        // followed by recovery while the earlier worker is still proving.
+        node.store_stark_artifacts(later, None).unwrap();
+        assert!(node.validate_stark_amendment_ordering(later).is_err());
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert_eq!(
+            node.amendment_store
+                .get_amendment(&later.block_hash)
+                .unwrap(),
+            Some(payload)
+        );
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        assert!(
+            node.stark_frontier_amendments_for_rebroadcast()
+                .unwrap()
+                .is_empty(),
+            "a missing predecessor keeps the later proof out of frontier gossip"
+        );
+        assert!(
+            !node
+                .proof_backlog
+                .lock()
+                .contains_source(1, &later.block_hash),
+            "completed later work must not be recomputed"
+        );
+
+        assert!(
+            node.validate_stark_settlement_sequence(std::slice::from_ref(later))
+                .is_err(),
+            "future storage must not relax block inclusion ordering"
+        );
+        let mut orphan = later.clone();
+        orphan.source_hashes[0] = ShellHash::from([0xA5; 32]);
+        orphan.sign_prover_authentication(&signers[1]).unwrap();
+        assert!(node.validate_stark_amendment_for_storage(&orphan).is_err());
+        let mut tampered = later.clone();
+        tampered.proof.proof_bytes[0] ^= 1;
+        tampered.sign_prover_authentication(&signers[1]).unwrap();
+        node.store_stark_artifacts(&tampered, None).unwrap();
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert!(
+            node.amendment_store
+                .get_amendment(&later.block_hash)
+                .unwrap()
+                .is_none(),
+            "waiting proofs still require genuine cryptographic verification"
+        );
+        node.store_stark_artifacts(later, None).unwrap();
+
+        node.config.node_role = crate::NodeRole::Validator;
+        node.store_stark_artifacts(&amendments[0], None).unwrap();
+        let replay = node.stark_frontier_amendments_for_rebroadcast().unwrap();
+        assert_eq!(
+            replay, amendments,
+            "rejoin advertises the original authenticated proof bytes"
+        );
+        let mut tampered_pending = amendments[0].clone();
+        tampered_pending.prover_signature = Bytes::new();
+        node.pending_stark_settlements.lock()[0] = tampered_pending;
+        assert!(node.stark_frontier_amendments_for_rebroadcast().is_err());
+        node.pending_stark_settlements.lock()[0] = amendments[0].clone();
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            amendments.as_slice()
+        );
+        assert!(
+            !node.proof_backlog.lock().is_empty(),
+            "fixture retains queued inputs until canonical settlement"
+        );
+        let balances: Vec<_> = amendments
+            .iter()
+            .map(|a| node.world_state.read().get_balance(&a.prover).unwrap())
+            .collect();
+        let block = node.produce_block(&proposer, 0).unwrap();
+        assert_eq!(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            2
+        );
+        assert_eq!(node.world_state.read().get_nonce(&address).unwrap(), 1024);
+        for (amendment, before) in amendments.iter().zip(balances) {
+            let reward = node.stark_reward_value(block.number(), amendment).unwrap();
+            assert_eq!(
+                node.world_state
+                    .read()
+                    .get_balance(&amendment.prover)
+                    .unwrap(),
+                before + reward
+            );
+            assert!(amendment
+                .covered_hashes()
+                .iter()
+                .all(|hash| node.settled_stark_sources.lock().contains(&(1, *hash))));
+        }
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        {
+            let backlog = node.proof_backlog.lock();
+            for amendment in &amendments {
+                for source in amendment.covered_hashes() {
+                    assert!(
+                        !backlog.contains_source(1, &source),
+                        "settled peer work must not leave a blocking queued prefix"
+                    );
+                }
+            }
+            if let Some(task) = backlog.peek() {
+                assert_eq!(
+                    task.block_number,
+                    block.number(),
+                    "the newly produced empty source remains unproved"
+                );
+            }
+        }
+        node.enqueue_stark_frontier_backlog(64).unwrap();
+        assert!(
+            node.pending_stark_settlements.lock().is_empty(),
+            "settled proofs must not be queued twice"
+        );
+        assert!(
+            node.stark_frontier_amendments_for_rebroadcast()
+                .unwrap()
+                .is_empty(),
+            "canonical settlement ends proof retries"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovered_proof_local_handoff_preserves_original_artifacts() {
+        assert_recovered_proof_handoff(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settled_proof_local_handoff_preserves_canonical_artifacts() {
+        assert_recovered_proof_handoff(true).await;
+    }
+
+    async fn assert_recovered_proof_handoff(settle_before_handoff: bool) {
+        use shell_network::{NetworkBus, NetworkConfig};
+        use std::time::Duration;
+
+        let (mut node, proposer, db) = setup_failing_batch_node();
+        node.config.enable_stark_aggregation = true;
+        node.config.node_role = crate::NodeRole::Prover;
+        node.config.block_time_ms = 60_000;
+        node.config.metrics.enabled = false;
+        node.config.rpc_enabled = false;
+        let (sender, address, public_key) = make_stark_account(&node);
+        fund_account(&node, &address, U256::from(1_000_000_000_000_000_000u64));
+        store_consistent_genesis(&node);
+        for block_index in 0..16 {
+            for offset in 0..32 {
+                let nonce = (block_index * 32 + offset) as u64;
+                let tx = make_embedded_tx(&sender, address, public_key.clone(), nonce, 1);
+                node.tx_pool
+                    .insert(
+                        tx,
+                        &mut *node.world_state.write(),
+                        node.chain_store.as_ref(),
+                        &MultiVerifier,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                node.produce_block(&proposer, 32)
+                    .unwrap()
+                    .transactions
+                    .len(),
+                32
+            );
+        }
+        let end = node.chain_store.get_head_hash().unwrap().unwrap();
+        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *db.proof_batch_barrier.lock() = Some(ProofBatchBarrier {
+            persisted: persisted_tx,
+            resume: resume_rx,
+        });
+        let bus = NetworkBus::new(64);
+        let mut network = bus.join(&NetworkConfig::default());
+        let node = Arc::new(node);
+        let proposer = Arc::new(proposer);
+        let task = tokio::spawn({
+            let node = Arc::clone(&node);
+            let signer = Arc::clone(&proposer) as Arc<dyn Signer>;
+            async move { node.run(signer, &mut network).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), persisted_rx)
+            .await
+            .expect("genuine CPU proof must be persisted")
+            .unwrap();
+        let mut original = node.amendment_store.get_amendment(&end).unwrap().unwrap();
+        let amendment = ProofAmendment::from_json(&original).unwrap();
+        assert_eq!(amendment.proof.n_sigs, 512);
+        let mut original_artifacts = db.scan_prefix(b"pa/").unwrap();
+        node.validate_prover_admission(&amendment).unwrap();
+        node.validate_stark_proof_source_binding(&amendment)
+            .unwrap();
+        let recovered = node.stark_frontier_amendments_for_rebroadcast().unwrap();
+        assert_eq!(recovered, vec![amendment.clone()]);
+        assert!(
+            node.validate_stark_amendment_for_storage(&amendment)
+                .is_err(),
+            "shared ordering validation must still reject overlapping ranges"
+        );
+        assert!(
+            node.validate_stark_settlement_sequence(&[amendment.clone(), amendment.clone()])
+                .is_err(),
+            "block inclusion must reject duplicate source settlement"
+        );
+        let mut unauthenticated = amendment.clone();
+        unauthenticated.prover_signature = Bytes::new();
+        assert!(node.validate_prover_admission(&unauthenticated).is_err());
+        assert_eq!(node.pending_stark_settlements.lock().len(), 1);
+        assert!(node.prover_ready.load(Ordering::Acquire));
+        assert_eq!(node.metrics.stark_proofs_generated.get(), 0);
+        let rejected_before_handoff = node.metrics.stark_settlements_rejected.get();
+        let balance = node
+            .world_state
+            .read()
+            .get_balance(&amendment.prover)
+            .unwrap();
+        let settled_block = if settle_before_handoff {
+            let block = node.produce_block(proposer.as_ref(), 0).unwrap();
+            original = node.amendment_store.get_amendment(&end).unwrap().unwrap();
+            let settlement = block
+                .system_transactions
+                .iter()
+                .find(|tx| tx.kind == SystemTxKind::StarkReward)
+                .unwrap();
+            assert_eq!(
+                ProofAmendment::from_json(&original)
+                    .unwrap()
+                    .settlement_tx_hash,
+                Some(settlement.hash())
+            );
+            original_artifacts = db.scan_prefix(b"pa/").unwrap();
+            Some(block)
+        } else {
+            None
+        };
+        // Release the actual service into the normal guarded receive branch.
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.metrics.stark_proofs_generated.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+            // A peer roundtrip is a barrier after the synchronous receive handler.
+            let mut peer = bus.join(&NetworkConfig::default());
+            peer.broadcast(shell_network::NetworkMessage::Ping)
+                .await
+                .unwrap();
+            loop {
+                match peer.next_event().await {
+                    Some(shell_network::NetworkEvent::MessageReceived {
+                        message: shell_network::NetworkMessage::Pong,
+                        ..
+                    }) => break,
+                    Some(_) => {}
+                    None => panic!("peer channel closed before the handoff barrier"),
+                }
+            }
+        })
+        .await
+        .expect("local handoff must finish through the live event loop");
+        node.shutdown();
+        task.await.unwrap().unwrap();
+        assert_eq!(node.metrics.stark_proofs_generated.get(), 1);
+        assert!(
+            node.amendment_store.get_amendment(&end).unwrap() == Some(original),
+            "recovery before local handoff must preserve the original CPU proof"
+        );
+        assert_eq!(
+            node.metrics.stark_settlements_rejected.get(),
+            rejected_before_handoff
+        );
+        if settle_before_handoff {
+            assert!(node.pending_stark_settlements.lock().is_empty());
+        } else {
+            assert_eq!(
+                node.pending_stark_settlements.lock().as_slice(),
+                std::slice::from_ref(&amendment)
+            );
+        }
+        assert!(
+            db.scan_prefix(b"pa/").unwrap() == original_artifacts,
+            "every original proof and source-pointer byte must survive handoff"
+        );
+        assert_eq!(node.world_state.read().get_nonce(&address).unwrap(), 512);
+        let block =
+            settled_block.unwrap_or_else(|| node.produce_block(proposer.as_ref(), 0).unwrap());
+        let reward = node.stark_reward_value(block.number(), &amendment).unwrap();
+        assert_eq!(
+            block
+                .system_transactions
+                .iter()
+                .filter(|tx| tx.kind == SystemTxKind::StarkReward)
+                .count(),
+            1
+        );
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_balance(&amendment.prover)
+                .unwrap(),
+            balance + reward
+        );
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        assert!(amendment
+            .covered_hashes()
+            .iter()
+            .all(|hash| node.settled_stark_sources.lock().contains(&(1, *hash))));
+        let next = node.produce_block(proposer.as_ref(), 0).unwrap();
+        assert!(!next
+            .system_transactions
+            .iter()
+            .any(|tx| tx.kind == SystemTxKind::StarkReward));
+    }
+
+    #[test]
+    fn stark_frontier_validator_preserves_pointer_on_target_read_failure() {
+        let (node, signer, db) = setup_failing_batch_node();
+        store_genesis(&node);
+        let genesis = node
+            .chain_store
+            .get_block_hash_by_number(0)
+            .unwrap()
+            .unwrap();
+        let end = produce_witnessed_blocks(&node, &signer, 1)[0];
+        let amendment = dummy_ordered_amendment(1, vec![genesis, end], 1);
+        node.store_stark_artifacts(&amendment, None).unwrap();
+        let pointer = node
+            .amendment_store
+            .get_amendment(&genesis)
+            .unwrap()
+            .unwrap();
+        let mut target_key = b"pa/".to_vec();
+        target_key.extend_from_slice(end.as_bytes());
+        *db.fail_get_key.lock() = Some(target_key);
+        let error = node.enqueue_stark_frontier_backlog(8).unwrap_err();
+        assert!(matches!(error, NodeError::Storage(_)));
+        let error = node
+            .stark_frontier_amendments_for_rebroadcast()
+            .unwrap_err();
+        assert!(matches!(error, NodeError::Storage(_)));
+        *db.fail_get_key.lock() = None;
+        assert_eq!(
+            node.amendment_store.get_amendment(&genesis).unwrap(),
+            Some(pointer)
+        );
+        assert!(node.amendment_store.get_amendment(&end).unwrap().is_some());
+        assert!(node.pending_stark_settlements.lock().is_empty());
+        node.enqueue_stark_frontier_backlog(8).unwrap();
+        assert_eq!(
+            node.pending_stark_settlements.lock().as_slice(),
+            std::slice::from_ref(&amendment)
+        );
     }
 
     #[test]
@@ -22478,6 +23124,159 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn early_certificate_requests_missing_block_without_waiting_for_gossip_probe() {
+            use shell_network::{
+                NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+            };
+            use std::time::Duration;
+
+            let (producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let mut follower = setup_node_with_authority(authority);
+            follower.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                store_consistent_genesis(node);
+            }
+            let block = producer.produce_block(&signer, 10).unwrap();
+            let block_hash = block.hash();
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block_hash.as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            follower.config.proposer_address = None;
+            follower.config.rpc_enabled = false;
+            follower.config.metrics.enabled = false;
+            let follower = Arc::new(follower);
+            let bus = NetworkBus::new(64);
+            let mut network = bus.join(&NetworkConfig::default());
+            let mut sender = bus.join(&NetworkConfig::default());
+            let handle = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(Arc::new(signer), &mut network).await }
+            });
+            let receive_request = async |sender: &mut shell_network::ChannelNetwork| loop {
+                if let Some(NetworkEvent::MessageReceived {
+                    message:
+                        NetworkMessage::BlockRequest {
+                            start_number,
+                            count,
+                            nonce,
+                        },
+                    ..
+                }) = sender.next_event().await
+                {
+                    break (start_number, count, nonce);
+                }
+            };
+            // Observe but do not answer the startup gossip probe. Verified
+            // evidence must recover even while that earlier request is pending.
+            let (_, _, startup_nonce) =
+                tokio::time::timeout(Duration::from_secs(2), receive_request(&mut sender))
+                    .await
+                    .expect("startup head probe");
+            // Untrusted evidence must neither trigger I/O nor advance the chain.
+            for (number, bytes) in [(1, vec![0]), (2, certificate.clone())] {
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: number,
+                        certificate: bytes,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let untrusted =
+                tokio::time::timeout(Duration::from_millis(100), receive_request(&mut sender))
+                    .await;
+            assert!(
+                untrusted.is_err(),
+                "invalid/out-of-window evidence must not fetch blocks"
+            );
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: 1,
+                    certificate: certificate.clone(),
+                })
+                .await
+                .unwrap();
+            // The announcement itself is deliberately absent. Recover its sealed
+            // block through the existing request/response validation path instead.
+            let request =
+                tokio::time::timeout(Duration::from_secs(1), receive_request(&mut sender)).await;
+            if let Ok((start_number, count, nonce)) = request {
+                assert_eq!((start_number, count), (1, 1));
+                assert_eq!(follower.head_number(), 0);
+                assert_eq!(follower.finality.read().last_finalized_number(), 0);
+                // A duplicate certificate must not amplify requests while the
+                // existing bounded request is still awaiting its response.
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: 1,
+                        certificate: certificate.clone(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(tokio::time::timeout(
+                    Duration::from_millis(100),
+                    receive_request(&mut sender)
+                )
+                .await
+                .is_err());
+                // A delayed empty response to the older gossip probe must not
+                // cancel retrieval triggered by newly received quorum evidence.
+                sender
+                    .broadcast(NetworkMessage::BlockResponse {
+                        blocks: vec![],
+                        commit_certificates: vec![],
+                        nonce: startup_nonce,
+                    })
+                    .await
+                    .unwrap();
+                sender
+                    .broadcast(NetworkMessage::BlockResponse {
+                        blocks: vec![block],
+                        commit_certificates: vec![],
+                        nonce,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let finalized = tokio::time::timeout(Duration::from_secs(2), async {
+                while follower.finality.read().last_finalized_number() != 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            follower.shutdown();
+            handle.await.unwrap().unwrap();
+            request.expect("valid next-height evidence must request its missing block before the periodic gossip probe");
+            finalized
+                .expect("the normally imported block must finalize using retained quorum evidence");
+            assert_eq!(
+                follower.chain_store.get_head_hash().unwrap(),
+                Some(block_hash)
+            );
+            assert_eq!(
+                follower.chain_store.get_finalized_number().unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                follower
+                    .chain_store
+                    .get_commit_certificate(&block_hash)
+                    .unwrap(),
+                Some(certificate)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn event_loop_finalizes_certificate_received_before_block() {
             use shell_network::{NetworkBus, NetworkConfig, NetworkMessage, NetworkService};
             use std::time::Duration;
@@ -22570,8 +23369,50 @@ mod tests {
             );
         }
 
+        #[test]
+        fn view_change_signing_completion_rejects_obsolete_protocol_context() {
+            let (mut node, signer) = setup_wpoa_node();
+            store_consistent_genesis(&node);
+            let context = || {
+                ViewChangeMessage::new(
+                    node.config.chain_id,
+                    node.head_number() + 1,
+                    node.consensus.read().current_view(),
+                    *node.finality.read().last_finalized_hash(),
+                    node.config.proposer_address.unwrap(),
+                    Vec::new(),
+                )
+            };
+            let before = context();
+            assert!(node.view_change_signing_context_is_current(&before));
+            node.produce_block(&signer, 0).unwrap();
+            assert!(
+                !node.view_change_signing_context_is_current(&before),
+                "a completed signature for the previous next height cannot be broadcast"
+            );
+            let current = context();
+            assert!(node.view_change_signing_context_is_current(&current));
+            let mut obsolete = current.clone();
+            obsolete.view += 1;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.highest_qc_hash = ShellHash::from([0xA5; 32]);
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.chain_id += 1;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            obsolete = current.clone();
+            obsolete.validator = Address::ZERO;
+            assert!(!node.view_change_signing_context_is_current(&obsolete));
+            node.config.proposer_address = None;
+            assert!(
+                !node.view_change_signing_context_is_current(&current),
+                "an identity that is no longer the local authority cannot publish a pending result"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-        async fn slow_view_change_signing_keeps_network_executor_available() {
+        async fn slow_view_change_signing_keeps_node_event_loop_responsive() {
             use shell_network::{
                 NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
             };
@@ -22638,6 +23479,7 @@ mod tests {
             };
             let bus = NetworkBus::new(64);
             let mut network = bus.join(&NetworkConfig::default());
+            let target = network.local_peer_id().clone();
             let task = tokio::spawn({
                 let node = Arc::clone(&node);
                 async move { node.run(Arc::new(signer), &mut network).await }
@@ -22645,15 +23487,32 @@ mod tests {
             let receiver = tokio::spawn(async move {
                 signing_started.await.unwrap();
                 let mut peer = bus.join(&NetworkConfig::default());
-                // The same executor must continue driving peer I/O while signing is busy.
-                let _ = progress.send(());
+                peer.send_to_peer(&target, NetworkMessage::Ping)
+                    .await
+                    .unwrap();
+                let mut progress = Some(progress);
+                let mut signed = None;
+                let mut pong = false;
                 loop {
-                    if let Some(NetworkEvent::MessageReceived {
-                        message: NetworkMessage::WPoaViewChange(message),
-                        ..
-                    }) = peer.next_event().await
-                    {
-                        break message;
+                    match peer.next_event().await {
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::Pong,
+                            ..
+                        }) => {
+                            pong = true;
+                            if let Some(progress) = progress.take() {
+                                let _ = progress.send(());
+                            }
+                        }
+                        Some(NetworkEvent::MessageReceived {
+                            message: NetworkMessage::WPoaViewChange(message),
+                            ..
+                        }) => signed = Some(message),
+                        _ => {}
+                    }
+                    match (pong, signed.take()) {
+                        (true, Some(message)) => break message,
+                        (_, message) => signed = message,
                     }
                 }
             });
@@ -22672,7 +23531,7 @@ mod tests {
                 .unwrap());
             assert!(
                 network_progressed.load(Ordering::SeqCst),
-                "slow timeout signing must not monopolize the async executor"
+                "slow timeout signing must not stop the node from consuming inbound peer messages"
             );
         }
 

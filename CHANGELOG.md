@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Avoid allocating stale-height tombstones for the entire captured head before
+  prover discovery replay. Build the private canonical view as history validates,
+  so high or sparse heads do not consume the replay budget before input checks.
+
+### Added
+
+- Extend optional finalized-height backups to canonical registry-derived cohorts,
+  without worker address lists. Persist the registry mode and immutable interval
+  atomically; matching full-history discovery reconstruction preserves that mode.
+  Historical registration boundaries still exclude later identities from old work.
+- Add opt-in finalized-height backup eligibility for explicit L1 worker cohorts.
+  Registered backups can drain an absent primary's ready range after a persisted
+  interval; the primary remains eligible. Normal proof authentication and one
+  canonical reward remain unchanged. Slow primaries and partitions can overlap
+  computation; historical membership still bounds which backups are eligible.
+- Rebuild missing prover discovery metadata before an opted-in worker starts
+  networking. Replay retained canonical bodies and witnesses privately from
+  trusted genesis, verify actual execution and state roots, then publish only
+  discovery hints and coverage atomically. Live state and proof history stay
+  intact; unavailable history or failed replay does not certify a partial set.
+- Add optional registry-derived L1 worker membership. Compatible fresh nodes
+  discover canonically registered provers without coordinated address lists or
+  epoch edits, retain historical ownership, and persist the selected mode across
+  restart. Missing local registration capture can be rebuilt from complete
+  canonical history; unavailable history fails closed. Offline takeover remains
+  separate work.
+- Add a connected native prover-cohort acceptance mode that keeps the authority
+  running through worker sync, overlapping CPU proofs and ordered settlement,
+  then checks exact rewards and all-node database reopen.
+- Record L1 CPU proof start, completion and duration inside each proof worker,
+  allowing a native concurrency check to distinguish overlapping computation
+  from queued work or ordered result delivery.
+- Optional fixed L1 prover worker cohorts partition canonical proof ranges across
+  distinct workers and retain membership across database reopen. This initial
+  mode accepts coordinated, append-only future membership epochs selected by
+  the first source height of each range. Historical assignment and scheduled
+  database downgrade protection survive reopen; offline takeover remains
+  separate work.
+
+### Fixed
+
+- Report actual bound RPC and metrics listener addresses, including port-zero
+  launches. Native registry acceptance discovers those live sockets on every
+  start and reopen instead of releasing speculative ports before node startup.
+- Preserve an already recovered or canonically settled local CPU proof during
+  channel handoff, keeping its stored artifacts and settlement metadata without
+  queueing a duplicate or rejecting the proof as overlapping with itself.
+- Keep the node event loop responsive while a slow post-quantum view-change
+  signature is computed. Track one signing job, discard results after their
+  height, view, finality or authority context changes, and drain it on shutdown.
+- Re-advertise persisted L1 frontier proofs when peers reconnect and on the
+  existing retry timer, so offline-completed work reaches validators and settles
+  without recomputation. Retries revalidate canonical order and authentication.
+- Retain valid L1 proofs completed ahead of their frontier until the preceding
+  range arrives, including across recovery. Later completion does not trigger
+  proof regeneration; settlement and block import still require canonical order.
+- Advance committed STARK settlement markers before scanning for recoverable
+  work, so freshly settled proofs are not queued for settlement again.
+- Remove queued source tasks fully covered by a canonical peer settlement,
+  preventing a stale partial prefix from blocking a later worker's range.
+  Active CPU jobs, partial overlaps and unrelated layers remain reserved.
+- Reject incompatible signature-proof trace layouts before constructing the
+  verifier AIR, returning an error for a tampered width instead of panicking.
+- Retrieve a missing next-height block directly from the sender of its verified
+  quorum certificate, without waiting for a periodic gossip probe. Duplicate or
+  invalid certificates do not amplify requests, and older empty probe responses
+  cannot cancel retrieval. Normal import and finality validation remain required.
+- Stop a qualifying L1 range at its first complete block even when additional
+  successors are locally queued, keeping worker range boundaries consistent.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

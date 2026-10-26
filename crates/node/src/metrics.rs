@@ -578,7 +578,9 @@ pub async fn serve_metrics(metrics: Arc<Metrics>, addr: SocketAddr) {
             return;
         }
     };
-    tracing::info!(%addr, "metrics server listening");
+    if let Ok(bound_addr) = listener.local_addr() {
+        tracing::info!(addr = %bound_addr, "metrics server listening");
+    }
 
     // Cancelling the server also cancels its established HTTP connections.
     let mut connections = tokio::task::JoinSet::new();

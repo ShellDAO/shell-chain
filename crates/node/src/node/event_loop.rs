@@ -39,12 +39,20 @@ impl EarlyCommitCertificate {
         number: u64,
         hash: ShellHash,
         certificate: Vec<u8>,
-    ) {
+    ) -> bool {
         if node.head_number().checked_add(1) == Some(number)
             && node.verify_commit_certificate(number, hash, &certificate)
         {
+            let newly_retained =
+                self.pending
+                    .as_ref()
+                    .is_none_or(|(pending_number, pending_hash, _)| {
+                        *pending_number != number || *pending_hash != hash
+                    });
             self.pending = Some((number, hash, certificate));
+            return newly_retained;
         }
+        false
     }
 
     fn finalize_imported<S: KvStore + 'static>(&mut self, node: &Node<S>) -> bool {
@@ -290,6 +298,8 @@ fn decode_challenge_response_amendment(
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
+    view_change_signing:
+        tokio::task::JoinSet<Result<shell_crypto::PQSignature, shell_crypto::CryptoError>>,
 }
 
 impl NodeTaskLifecycle {
@@ -297,6 +307,7 @@ impl NodeTaskLifecycle {
         Self {
             tasks: tokio::task::JoinSet::new(),
             prover_service: None,
+            view_change_signing: tokio::task::JoinSet::new(),
         }
     }
 
@@ -316,6 +327,14 @@ impl NodeTaskLifecycle {
             prover_service.shutdown().await;
         }
 
+        // A running CPU signer cannot be aborted. Drain the one tracked job
+        // before releasing node resources; shutdown never broadcasts its result.
+        while let Some(result) = self.view_change_signing.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "view-change signing task exited unexpectedly during shutdown");
+            }
+        }
+
         self.tasks.abort_all();
         while let Some(result) = self.tasks.join_next().await {
             if let Err(err) = result {
@@ -328,6 +347,23 @@ impl NodeTaskLifecycle {
 }
 
 impl<S: KvStore + 'static> Node<S> {
+    /// Signing may outlive a height, view, finality or authority transition.
+    /// Never apply or broadcast a result under a different protocol context.
+    pub(super) fn view_change_signing_context_is_current(
+        &self,
+        message: &ViewChangeMessage,
+    ) -> bool {
+        let current_view = self.consensus.read().current_view();
+        let finalized_hash = *self.finality.read().last_finalized_hash();
+        message.chain_id == self.config.chain_id
+            && self.config.proposer_address == Some(message.validator)
+            && self.local_validator_weight().is_some()
+            && ChainStateMachine::next_block_number(self.head_number()).ok()
+                == Some(message.block_number)
+            && current_view == message.view
+            && finalized_hash == message.highest_qc_hash
+    }
+
     fn update_challenge_lifecycle<T>(
         &self,
         update: impl FnOnce(&mut ChallengeLifecycle) -> T,
@@ -503,6 +539,32 @@ impl<S: KvStore + 'static> Node<S> {
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let worker_cohort = if self.config.node_role.runs_prover() {
+            if self.config.prover_worker_cohort_from_registry {
+                if !self.config.prover_worker_cohort.is_empty()
+                    || !self.config.prover_worker_cohort_schedule.is_empty()
+                {
+                    return Err(NodeError::Startup("registry-derived worker membership cannot be combined with explicit cohorts".into()));
+                }
+                crate::prover_service::WorkerCohort::open_registry_with_fallback(
+                    Arc::clone(&self.store),
+                    self.config.proposer_address.unwrap_or(local_signer_address),
+                    self.config.prover_worker_fallback_after_blocks,
+                )
+                .map(Some)
+            } else {
+                crate::prover_service::WorkerCohort::open_scheduled_with_fallback(
+                    Arc::clone(&self.store),
+                    self.config.prover_worker_cohort.clone(),
+                    self.config.prover_worker_cohort_schedule.clone(),
+                    self.config.proposer_address.unwrap_or(local_signer_address),
+                    self.config.prover_worker_fallback_after_blocks,
+                )
+            }
+            .map_err(|error| NodeError::Startup(format!("invalid prover worker cohort: {error}")))?
+        } else {
+            None
+        };
         let mut task_lifecycle = NodeTaskLifecycle::new();
 
         // Spawn the Prometheus metrics HTTP server if enabled.
@@ -613,6 +675,10 @@ impl<S: KvStore + 'static> Node<S> {
             None
         };
 
+        if let Some(handle) = rpc_handle.as_ref() {
+            info!(http_addr = %handle.http_addr, ws_addr = ?handle.ws_addr, "RPC listeners started");
+        }
+
         // Register own authority pubkey for seal verification.
         if let Some(addr) = self.config.proposer_address {
             self.register_authority_pubkey(addr, signer.public_key().to_vec());
@@ -647,6 +713,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut sync_requested = false;
         let mut sync_request: Option<BlockRequestState> = None;
         let mut early_commit_certificate = EarlyCommitCertificate::default();
+        let mut pending_view_change: Option<ViewChangeMessage> = None;
         let mut body_request: Option<BodyRequestState> = None;
         let mut deferred_body_gap: Option<u64> = None;
         let startup_peers = network.peer_count().await;
@@ -701,6 +768,7 @@ impl<S: KvStore + 'static> Node<S> {
             .with_signer(Arc::clone(&signer))
             .with_amendment_sender(prover_amendment_tx)
             .with_readiness(prover_readiness_rx)
+            .with_worker_cohort(worker_cohort)
             .with_l2_mode(self.config.l2_stark_mode);
             let handle = service.start();
             task_lifecycle.attach_prover_service(handle);
@@ -839,37 +907,48 @@ impl<S: KvStore + 'static> Node<S> {
                         warn!("local STARK proof is not eligible for submission: {e}");
                         continue;
                     }
-                    if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
-                        warn!(
+                    // Recovery may queue or settle a durable CPU result before
+                    // this channel handoff. Preserve the existing proof and its
+                    // canonical settlement metadata instead of rejecting an overlap.
+                    if self.pending_stark_settlements.lock().contains(&amendment)
+                        || matches!(self.is_settled_stark_response(&amendment), Ok(true))
+                    {
+                        debug!(
                             block = amendment.block_number,
                             layer = amendment.layer,
-                            "local STARK proof ordering check failed; discarding stored amendment: {e}"
+                            "local STARK proof already recovered or settled"
                         );
-                        // Delete all stored artifacts for this proof range so the source
-                        // blocks are re-seeded as fresh tasks once the frontier catches up.
-                        // Without this deletion, the next seed pass re-loads the failing
-                        // amendment, creates new backlog tasks for the same tip range, the
-                        // prover regenerates the same out-of-order proof, and the rejection
-                        // counter spins indefinitely.
-                        for source_hash in amendment.covered_hashes() {
-                            if let Err(del_err) =
-                                self.amendment_store.delete_amendment(&source_hash)
-                            {
-                                warn!(
-                                    block = amendment.block_number,
-                                    %source_hash,
-                                    "failed to delete out-of-order amendment artifact: {del_err}"
-                                );
-                            }
-                        }
                         continue;
                     }
-                    self.pending_stark_settlements.lock().push(amendment.clone());
+                    let ready = match self.validate_stark_amendment_for_storage(&amendment) {
+                        Ok(ready) => ready,
+                        Err(e) => {
+                            if matches!(e, NodeError::Storage(_)) {
+                                warn!(%e, "retaining local STARK proof after storage read failure");
+                                continue;
+                            }
+                            warn!(
+                                block = amendment.block_number,
+                                layer = amendment.layer,
+                                "local STARK proof range is invalid; discarding stored amendment: {e}"
+                            );
+                            if let Err(error) = self.delete_stored_stark_amendment_artifacts(
+                                &amendment, amendment.block_hash,
+                            ) {
+                                warn!(%error, "failed to delete invalid local amendment artifacts");
+                            }
+                            continue;
+                        }
+                    };
+                    if ready {
+                        self.pending_stark_settlements.lock().push(amendment.clone());
+                    }
                     info!(
                         block = amendment.block_number,
                         layer = amendment.layer,
                         can_produce_blocks,
-                        "local STARK proof queued for bounded settlement"
+                        ready,
+                        "local STARK proof retained for ordered settlement"
                     );
                     match amendment.to_json() {
                         Ok(payload) => {
@@ -1175,7 +1254,10 @@ impl<S: KvStore + 'static> Node<S> {
 
                     // W.5: If the proposer fails to produce within the timeout,
                     // broadcast a signed view-change vote for the current height.
-                    if self.consensus.read().engine_type() == EngineType::WPoA && can_produce_blocks {
+                    if self.consensus.read().engine_type() == EngineType::WPoA
+                        && can_produce_blocks
+                        && pending_view_change.is_none()
+                    {
                         let now_ms = Self::wall_clock_millis();
                         let timed_out = self
                             .consensus
@@ -1210,45 +1292,52 @@ impl<S: KvStore + 'static> Node<S> {
                                 view,
                                 &highest_qc_hash,
                             );
-                            // SLH-DSA signing can exceed a block tick. Let Tokio drive
-                            // peer I/O on a replacement worker while this computation runs.
-                            match tokio::task::block_in_place(|| signer.sign(&signing_message)) {
-                                Ok(signature) => {
-                                    let msg = ViewChangeMessage::new(
-                                        chain_id,
-                                        block_number,
-                                        view,
-                                        highest_qc_hash,
-                                        validator,
-                                        signature.data,
-                                    );
-                                    let total_weight: u64 = self
-                                        .consensus
-                                        .read()
-                                        .validator_weights()
-                                        .values()
-                                        .copied()
-                                        .sum();
-                                    let quorum = self
-                                        .consensus
-                                        .write()
-                                        .handle_view_change_message(msg.clone(), total_weight);
-                                    warn!(
-                                        view,
-                                        block_number,
-                                        timeout_ms = VIEW_CHANGE_TIMEOUT_MS,
-                                        quorum,
-                                        "W.5: proposer timeout — broadcasting view change"
-                                    );
-                                    let _ = network
-                                        .broadcast(NetworkMessage::WPoaViewChange(Box::new(msg)))
-                                        .await;
-                                }
-                                Err(error) => {
-                                    warn!(%error, view, block_number, "W.5: failed to sign view change");
-                                }
-                            }
+                            let message = ViewChangeMessage::new(
+                                chain_id,
+                                block_number,
+                                view,
+                                highest_qc_hash,
+                                validator,
+                                Vec::new(),
+                            );
+                            let signing_key = Arc::clone(&signer);
+                            task_lifecycle.view_change_signing.spawn_blocking(move || {
+                                signing_key.sign(&signing_message)
+                            });
+                            pending_view_change = Some(message);
                         }
+                    }
+                }
+
+                Some(result) = task_lifecycle.view_change_signing.join_next(),
+                    if pending_view_change.is_some() => {
+                    let mut message = pending_view_change.take().expect("tracked signing context");
+                    if !self.view_change_signing_context_is_current(&message) {
+                        debug!(
+                            block = message.block_number,
+                            view = message.view,
+                            "discarding stale view-change signing result"
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(Ok(signature)) => {
+                            message.signature = signature.data;
+                            let total_weight = self.consensus.read().validator_weights()
+                                .values().copied().sum();
+                            let quorum = self.consensus.write()
+                                .handle_view_change_message(message.clone(), total_weight);
+                            warn!(
+                                view = message.view,
+                                block_number = message.block_number,
+                                timeout_ms = VIEW_CHANGE_TIMEOUT_MS,
+                                quorum,
+                                "W.5: proposer timeout — broadcasting view change"
+                            );
+                            let _ = network.broadcast(NetworkMessage::WPoaViewChange(Box::new(message))).await;
+                        }
+                        Ok(Err(error)) => warn!(%error, "W.5: failed to sign view change"),
+                        Err(error) => warn!(%error, "W.5: view-change signing task failed"),
                     }
                 }
 
@@ -1919,14 +2008,17 @@ impl<S: KvStore + 'static> Node<S> {
                                           amendment.compressed_size =
                                               Some(amendment.size_bytes() as u64);
                                       }
-                                     if let Err(e) = self.validate_stark_amendment_ordering(&amendment) {
+                                     let ready = match self.validate_stark_amendment_for_storage(&amendment) {
+                                         Ok(ready) => ready,
+                                         Err(e) => {
                                          warn!(
                                              block = block_number,
                                              layer = amendment.layer,
                                              "STARK proof rejected by ordered compression frontier: {e}"
                                          );
-                                         continue;
-                                     }
+                                             continue;
+                                         }
+                                     };
                                      if let Err(e) = self.validate_stark_proof_source_binding(&amendment) {
                                          warn!(
                                              block = block_number,
@@ -1949,7 +2041,9 @@ impl<S: KvStore + 'static> Node<S> {
                                             continue;
                                         }
                                     }
-                                    self.pending_stark_settlements.lock().push(amendment);
+                                    if ready {
+                                        self.pending_stark_settlements.lock().push(amendment);
+                                    }
                                 }
                                 // G5: Acknowledge that a peer has stored a proof amendment.
                                 NetworkMessage::ProofAck { block_hash, holder } => {
@@ -2326,10 +2420,35 @@ impl<S: KvStore + 'static> Node<S> {
                                         if fin > *fn_w {
                                             *fn_w = fin;
                                         }
-                                    } else {
-                                        early_commit_certificate.retain(
-                                            &self, block_number, block_hash, certificate,
-                                        );
+                                    } else if early_commit_certificate.retain(
+                                        &self, block_number, block_hash, certificate,
+                                    ) {
+                                        // The block announcement may have been lost. A verified
+                                        // next-height certificate identifies a useful source;
+                                        // bypass a pending gossip probe with a bounded unicast.
+                                        // Duplicate certificates do not issue more requests.
+                                        // Start a new request so an older empty gossip response
+                                        // cannot exhaust this certificate-triggered retrieval.
+                                        sync_request = None;
+                                        if self.request_blocks_from(
+                                            &network,
+                                            Some(&peer),
+                                            block_number,
+                                            &mut sync_requested,
+                                            &mut sync_request,
+                                            "early-commit-certificate",
+                                        ).await {
+                                            production_readiness.note_sync_requested(
+                                                self.head_number(),
+                                                std::time::Instant::now(),
+                                                catch_up_timeout,
+                                                "early-commit-certificate",
+                                            );
+                                            sync_retry_attempts_without_progress = 0;
+                                            sync_retry_timer.reset_after(Duration::from_secs(
+                                                SYNC_RETRY_BASE_INTERVAL_SECS,
+                                            ));
+                                        }
                                     }
                                 }
                                 // W.5: Receive a signed wPoA view-change vote from a peer validator.
@@ -2429,6 +2548,10 @@ impl<S: KvStore + 'static> Node<S> {
                                 "peer-connected",
                             )
                             .await;
+                            self.rebroadcast_stark_frontier_amendments(
+                                &network,
+                                Some(&peer),
+                            ).await;
                         }
                         Some(NetworkEvent::PeerDisconnected(peer)) => {
                             info!(%peer, "peer disconnected");
@@ -2519,6 +2642,9 @@ impl<S: KvStore + 'static> Node<S> {
                 }
 
                 _ = tx_rebroadcast_timer.tick() => {
+                    if network.peer_count().await > 0 {
+                        self.rebroadcast_stark_frontier_amendments(&network, None).await;
+                    }
                     if network.peer_count().await > 0 && !self.tx_pool.is_empty() {
                         self.rebroadcast_pending_transactions(
                             &network,
@@ -2882,12 +3008,150 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(count)
     }
 
+    fn validate_stored_stark_amendment(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<bool, NodeError> {
+        self.validate_prover_admission(amendment)?;
+        let ready = self.validate_stark_amendment_for_storage(amendment)?;
+        self.validate_stark_proof_source_binding(amendment)?;
+        Ok(ready)
+    }
+
+    /// Validators recover completed work without creating CPU proving tasks.
+    /// Read only the canonical frontier and admit at most the bounded pending
+    /// window; a missing predecessor cannot cause a scan of the entire chain.
+    fn recover_stark_frontier_amendments(&self) -> Result<usize, NodeError> {
+        let mut recovered = 0;
+        while self.pending_stark_settlements.lock().len() < MAX_PENDING_STARK_SETTLEMENTS {
+            let overlay = self
+                .pending_stark_settlements
+                .lock()
+                .iter()
+                .flat_map(|a| {
+                    a.covered_hashes()
+                        .into_iter()
+                        .map(move |hash| (hash, a.layer))
+                })
+                .collect();
+            let number = self.first_canonical_block_below_layer(1, &overlay)?;
+            let Some(hash) = self.chain_store.get_block_hash_by_number(number)? else {
+                break;
+            };
+            let Some(bytes) = self.amendment_store.get_amendment(&hash)? else {
+                break;
+            };
+            let amendment = match self.load_stored_stark_amendment(hash, number, &bytes) {
+                Ok(amendment) => amendment,
+                Err(error) => {
+                    if matches!(error, NodeError::Storage(_)) {
+                        return Err(error);
+                    }
+                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                    warn!(%error, %hash, "discarding malformed frontier proof artifact");
+                    self.amendment_store.delete_amendment(&hash)?;
+                    break;
+                }
+            };
+            match self.validate_stored_stark_amendment(&amendment) {
+                Ok(true) => {
+                    recovered += amendment.covered_hashes().len();
+                    self.pending_stark_settlements.lock().push(amendment);
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    if matches!(error, NodeError::Storage(_)) {
+                        return Err(error);
+                    }
+                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                    warn!(%error, %hash, "discarding invalid frontier proof artifact");
+                    self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
+                    break;
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Retry only the bounded, canonical L1 settlement frontier. Recovery must
+    /// not turn a disconnected completed proof into new CPU work or scan ahead
+    /// of a missing predecessor merely to advertise later ranges.
+    pub(super) fn stark_frontier_amendments_for_rebroadcast(
+        &self,
+    ) -> Result<Vec<ProofAmendment>, NodeError> {
+        self.recover_stark_frontier_amendments()?;
+        let amendments: Vec<_> = self
+            .pending_stark_settlements
+            .lock()
+            .iter()
+            .filter(|amendment| amendment.layer == 1)
+            .take(MAX_PENDING_STARK_SETTLEMENTS)
+            .cloned()
+            .collect();
+        // Validate a fresh sequence against canonical state, without counting
+        // each pending amendment as an overlap with itself.
+        self.validate_stark_settlement_sequence(&amendments)?;
+        for amendment in &amendments {
+            self.validate_prover_admission(amendment)?;
+            self.validate_stark_proof_source_binding(amendment)?;
+        }
+        Ok(amendments)
+    }
+
+    async fn rebroadcast_stark_frontier_amendments<N: NetworkService + ?Sized>(
+        &self,
+        network: &NetworkInterface<'_, N>,
+        target_peer: Option<&shell_network::PeerId>,
+    ) {
+        let amendments = match self.stark_frontier_amendments_for_rebroadcast() {
+            Ok(amendments) => amendments,
+            Err(error) => {
+                warn!(%error, "failed to recover canonical STARK proofs for rebroadcast");
+                return;
+            }
+        };
+        for amendment in amendments {
+            let payload = match amendment.to_json() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(%error, "failed to serialize recovered STARK proof for rebroadcast");
+                    return;
+                }
+            };
+            let message = NetworkMessage::ProofAmendment {
+                block_hash: amendment.block_hash,
+                block_number: amendment.block_number,
+                payload,
+            };
+            let result = if let Some(peer) = target_peer {
+                network.send_to_peer(peer, message).await
+            } else {
+                network.broadcast(message).await
+            };
+            if let Err(error) = result {
+                warn!(%error, "failed to rebroadcast recovered STARK proof; retaining artifacts");
+                return;
+            }
+            self.metrics.stark_amendments_broadcast.inc();
+            info!(
+                block = amendment.block_number,
+                peer = target_peer
+                    .map(|peer| peer.0.as_str())
+                    .unwrap_or("broadcast"),
+                "rebroadcast recovered canonical STARK proof"
+            );
+        }
+    }
+
     pub(crate) fn enqueue_stark_frontier_backlog(
         &self,
         max_blocks: usize,
     ) -> Result<usize, NodeError> {
-        if max_blocks == 0 || !self.config.node_role.runs_prover() {
+        if max_blocks == 0 {
             return Ok(0);
+        }
+        if !self.config.node_role.runs_prover() {
+            return self.recover_stark_frontier_amendments();
         }
         if self.pending_stark_settlements.lock().len() >= MAX_PENDING_STARK_SETTLEMENTS {
             return Ok(0);
@@ -3000,75 +3264,73 @@ impl<S: KvStore + 'static> Node<S> {
                     match self.load_stored_stark_amendment(hash, number, &bytes) {
                         Ok(amendment) => {
                             let covered_hashes = amendment.covered_hashes();
-                            let recovered_is_valid = self
-                                .validate_prover_admission(&amendment)
-                                .and_then(|()| self.validate_stark_amendment_ordering(&amendment))
-                                .and_then(|()| {
-                                    if amendment.has_valid_embedded_compression() {
-                                        Ok(())
-                                    } else {
-                                        Err(NodeError::Startup(
-                                            "stored STARK amendment fails compression policy"
-                                                .into(),
-                                        ))
+                            let recovered_is_valid =
+                                self.validate_stored_stark_amendment(&amendment);
+                            match recovered_is_valid {
+                                Err(error) => {
+                                    if matches!(error, NodeError::Storage(_)) {
+                                        return Err(error);
                                     }
-                                })
-                                .and_then(|()| {
-                                    self.validate_stark_proof_source_binding(&amendment)
-                                });
-                            if let Err(error) = recovered_is_valid {
-                                self.metrics.stark_recovery_artifacts_rejected.inc();
-                                warn!(
-                                    block = amendment.block_number,
-                                    layer = amendment.layer,
-                                    %error,
-                                    "discarding invalid stored STARK amendment during recovery"
-                                );
-                                rejected_stored_payloads.insert(payload_hash);
-                                self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
-                                // Continue with this canonical source so a fresh proof
-                                // task replaces the invalid persisted artifact.
-                            } else {
-                                let covered_count = covered_hashes.len().max(1);
-                                let start = amendment.range_start_block().unwrap_or(0);
-                                if self.pending_stark_settlements.lock().len()
-                                    >= MAX_PENDING_STARK_SETTLEMENTS
-                                {
-                                    debug!(
+                                    self.metrics.stark_recovery_artifacts_rejected.inc();
+                                    warn!(
+                                        block = amendment.block_number,
+                                        layer = amendment.layer,
+                                        %error,
+                                        "discarding invalid stored STARK amendment during recovery"
+                                    );
+                                    rejected_stored_payloads.insert(payload_hash);
+                                    self.delete_stored_stark_amendment_artifacts(&amendment, hash)?;
+                                    // Continue with this canonical source so a fresh proof
+                                    // task replaces the invalid persisted artifact.
+                                }
+                                Ok(ready) => {
+                                    let covered_count = covered_hashes.len().max(1);
+                                    let start = amendment.range_start_block().unwrap_or(0);
+                                    if self.pending_stark_settlements.lock().len()
+                                        >= MAX_PENDING_STARK_SETTLEMENTS
+                                    {
+                                        debug!(
+                                            block = amendment.block_number,
+                                            start_block = start,
+                                            "STARK seeding paused at settlement admission limit"
+                                        );
+                                        break;
+                                    }
+                                    info!(
                                         block = amendment.block_number,
                                         start_block = start,
-                                        "STARK seeding paused at settlement admission limit"
+                                        sources = covered_count,
+                                        n_sigs = amendment.proof.n_sigs,
+                                        ready,
+                                        "STARK seeding: retaining verified amendment; skipping covered range"
                                     );
-                                    break;
+                                    // Remove any source blocks already queued in `tasks` that
+                                    // are covered by this amendment. Without this, the source
+                                    // blocks inserted before we reach the end block create a
+                                    // gap in the contiguous backlog run, causing
+                                    // `pop_contiguous_with_min_entries` to return None.
+                                    let covered_set: std::collections::HashSet<_> =
+                                        covered_hashes.into_iter().collect();
+                                    tasks.retain(|t: &ProofTask| {
+                                        !t.source_hashes.iter().any(|s| covered_set.contains(s))
+                                    });
+                                    // Recompute seeded_entries from the retained tasks.
+                                    seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
+                                    // Recompute queued: retained regular tasks + all pending covered blocks.
+                                    pending_covered_sum =
+                                        pending_covered_sum.saturating_add(covered_count);
+                                    queued = tasks.len().saturating_add(pending_covered_sum);
+                                    if ready {
+                                        self.pending_stark_settlements.lock().push(amendment);
+                                    }
+                                    continue;
                                 }
-                                info!(
-                                    block = amendment.block_number,
-                                    start_block = start,
-                                    sources = covered_count,
-                                    n_sigs = amendment.proof.n_sigs,
-                                    "STARK seeding: existing amendment passes ordering; skipping covered range"
-                                );
-                                // Remove any source blocks already queued in `tasks` that
-                                // are covered by this amendment. Without this, the source
-                                // blocks inserted before we reach the end block create a
-                                // gap in the contiguous backlog run, causing
-                                // `pop_contiguous_with_min_entries` to return None.
-                                let covered_set: std::collections::HashSet<_> =
-                                    covered_hashes.into_iter().collect();
-                                tasks.retain(|t: &ProofTask| {
-                                    !t.source_hashes.iter().any(|s| covered_set.contains(s))
-                                });
-                                // Recompute seeded_entries from the retained tasks.
-                                seeded_entries = tasks.iter().map(|t| t.entries.len()).sum();
-                                // Recompute queued: retained regular tasks + all pending covered blocks.
-                                pending_covered_sum =
-                                    pending_covered_sum.saturating_add(covered_count);
-                                queued = tasks.len().saturating_add(pending_covered_sum);
-                                self.pending_stark_settlements.lock().push(amendment);
-                                continue;
                             }
                         }
                         Err(error) => {
+                            if matches!(error, NodeError::Storage(_)) {
+                                return Err(error);
+                            }
                             self.metrics.stark_settlements_rejected.inc();
                             warn!(
                                 %hash,

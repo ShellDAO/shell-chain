@@ -838,6 +838,9 @@ impl<S: KvStore> ChainStore<S> {
             batch.delete(Self::number_key(*number));
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        if let Some(previous) = self.get_head_hash()? {
+            self.append_prover_discovery_progress(&mut batch, previous, *new_head)?;
+        }
         batch.put(
             prefix::TOTAL_TX_COUNT.to_vec(),
             total_tx_count.to_be_bytes().to_vec(),
@@ -918,6 +921,9 @@ impl<S: KvStore> ChainStore<S> {
             batch.delete(Self::number_key(*number));
         }
         batch.put(prefix::HEAD_BLOCK.to_vec(), new_head.as_bytes().to_vec());
+        if let Some(previous) = self.get_head_hash()? {
+            self.append_prover_discovery_progress(&mut batch, previous, *new_head)?;
+        }
         self.append_reorg_totals(&mut batch, old_chain, new_chain, new_head)?;
 
         Ok(batch)
@@ -1536,6 +1542,46 @@ impl<S: KvStore> ChainStore<S> {
         Ok(())
     }
 
+    /// An older writer or an incomplete snapshot must not silently certify a
+    /// partial candidate index as the complete registered set.
+    pub fn validate_prover_discovery_coverage(&self) -> Result<(), StorageError> {
+        let snapshot = self.store.snapshot_prefixes(
+            &[
+                prefix::HEAD_BLOCK,
+                crate::prover_registry::PROVER_DISCOVERY_HEAD,
+            ],
+            1024,
+        )?;
+        let covered = snapshot.get(crate::prover_registry::PROVER_DISCOVERY_HEAD);
+        let head = snapshot.get(prefix::HEAD_BLOCK);
+        if covered.is_none_or(|bytes| bytes.len() != 32) || covered != head {
+            return Err(StorageError::State(
+                "prover discovery index does not cover the canonical head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn append_prover_discovery_progress(
+        &self,
+        batch: &mut WriteBatch,
+        expected: ShellHash,
+        next: ShellHash,
+    ) -> Result<(), StorageError> {
+        if self
+            .store
+            .get(crate::prover_registry::PROVER_DISCOVERY_HEAD)?
+            .as_deref()
+            == Some(expected.as_bytes())
+        {
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec(),
+                next.as_bytes().to_vec(),
+            );
+        }
+        Ok(())
+    }
+
     /// Build the batch containing all canonical block artifacts.
     fn canonical_block_batch(
         &self,
@@ -1561,6 +1607,7 @@ impl<S: KvStore> ChainStore<S> {
             block_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::HEAD_BLOCK.to_vec(), block_hash.as_bytes().to_vec());
+        self.append_prover_discovery_progress(&mut batch, block.header.parent_hash, block_hash)?;
 
         Ok(batch)
     }
@@ -1654,6 +1701,17 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         config: &ChainConfig,
     ) -> Result<(), StorageError> {
+        self.commit_genesis_block_with_prover_discovery(block, config, false)
+    }
+
+    /// New compatible genesis creation can atomically certify a complete, empty
+    /// local candidate index. Custom registry storage must leave it unavailable.
+    pub fn commit_genesis_block_with_prover_discovery(
+        &self,
+        block: &Block,
+        config: &ChainConfig,
+        complete_prover_discovery: bool,
+    ) -> Result<(), StorageError> {
         config.validate_algorithm_governance()?;
 
         if self
@@ -1679,6 +1737,16 @@ impl<S: KvStore> ChainStore<S> {
             genesis_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::CHAIN_CONFIG.to_vec(), config_bytes);
+        if complete_prover_discovery {
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec(),
+                genesis_hash.as_bytes().to_vec(),
+            );
+            batch.put(
+                crate::prover_registry::PROVER_DISCOVERY_GENESIS.to_vec(),
+                genesis_hash.as_bytes().to_vec(),
+            );
+        }
 
         self.store.write_batch(batch)
     }
@@ -3243,6 +3311,11 @@ impl<S: KvStore> ChainStore<S> {
         let mut batch_bytes = 0usize;
         let mut pending_publication = crate::WriteBatch::new();
         while let Some(entry) = snap_reader.next_entry()? {
+            // Candidate coverage is a local writer-history certificate, never
+            // state-root-authenticated snapshot data.
+            if entry.key.starts_with(b"prover-discovery/") {
+                continue;
+            }
             if matches!(
                 entry.key.as_slice(),
                 prefix::HEAD_BLOCK
@@ -3374,6 +3447,8 @@ impl<S: KvStore> ChainStore<S> {
         // failed streaming import must retain a mutually consistent old view.
         // Missing snapshot keys delete stale destination progress in the same
         // batch rather than mixing the imported chain with old counters.
+        pending_publication.delete(crate::prover_registry::PROVER_DISCOVERY_GENESIS.to_vec());
+        pending_publication.delete(crate::prover_registry::PROVER_DISCOVERY_HEAD.to_vec());
         self.store.write_batch(pending_publication)?;
 
         Ok(metadata)
@@ -3458,6 +3533,17 @@ impl<S: KvStore> ChainStore<S> {
             ],
             MAX_NATIVE_REPLAY_SNAPSHOT_BYTES,
         )
+    }
+
+    /// Rebuild canonical mappings privately as verified history is replayed.
+    /// Hiding the base namespace avoids staging a tombstone per captured height.
+    pub fn prover_discovery_replay_overlay(&self) -> Result<OverlayStore<S>, StorageError> {
+        let overlay = self.native_replay_overlay()?;
+        // Checkpoint restoration still verifies the trusted canonical genesis.
+        if let Some(genesis) = self.get_block_hash_by_number(0)? {
+            overlay.put(&Self::number_key(0), genesis.as_bytes())?;
+        }
+        Ok(overlay.with_hidden_base_prefixes(&[prefix::HASH_BY_NUMBER]))
     }
 
     /// Reopen the isolated legacy witness replay state without sampling live
@@ -4196,6 +4282,174 @@ impl<S: KvStore> ProofAmendmentStore<S> {
         Self { store }
     }
 
+    /// Check the local registry scheduling mode without publishing metadata.
+    /// Discovery reconstruction uses this before certifying a missing index.
+    pub fn validate_registry_worker_policy(
+        &self,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
+        let mode = self.store.get(b"prover-worker-cohort/v1")?;
+        let interval = self.store.get(b"prover-worker-cohort/fallback/v1")?;
+        let valid = match mode.as_deref() {
+            None | Some(b"registry:v3") => interval.is_none(),
+            Some(b"registry-fallback:v5") => {
+                fallback_after_blocks > 0
+                    && interval.as_deref() == Some(fallback_after_blocks.to_be_bytes().as_slice())
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(StorageError::InvalidInput("registry worker policy differs from the persisted assignment; restore the existing configuration".into()));
+        }
+        Ok(())
+    }
+
+    /// Bind registry membership and its immutable optional backup interval in
+    /// one batch. Older registry-only writers reject the v5 mode marker.
+    pub fn bind_registry_worker_policy(
+        &self,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
+        self.validate_registry_worker_policy(fallback_after_blocks)?;
+        let mode = if fallback_after_blocks == 0 {
+            b"registry:v3".as_slice()
+        } else {
+            b"registry-fallback:v5".as_slice()
+        };
+        if self.store.get(b"prover-worker-cohort/v1")?.as_deref() == Some(mode) {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(b"prover-worker-cohort/v1".to_vec(), mode.to_vec());
+        if fallback_after_blocks > 0 {
+            batch.put(
+                b"prover-worker-cohort/fallback/v1".to_vec(),
+                fallback_after_blocks.to_be_bytes().to_vec(),
+            );
+        }
+        self.store.write_batch(batch)
+    }
+
+    /// Bind local scheduling metadata, preserving immutable historical epochs.
+    /// Changes are explicit future additions, never consensus state mutations.
+    pub fn bind_worker_cohort(&self, workers: &[Address]) -> Result<(), StorageError> {
+        self.bind_worker_cohort_schedule(&[(0, workers.to_vec())], 0)
+    }
+
+    /// Append future memberships without changing already assigned windows.
+    /// The caller supplies the persisted canonical head, not wall-clock time.
+    pub fn bind_worker_cohort_schedule(
+        &self,
+        epochs: &[(u64, Vec<Address>)],
+        observed_height: u64,
+    ) -> Result<(), StorageError> {
+        self.bind_worker_cohort_schedule_with_fallback(epochs, observed_height, 0)
+    }
+
+    /// Bind an optional immutable finalized-height backup interval atomically
+    /// with the cohort schedule. Older scheduling writers reject the marker.
+    pub fn bind_worker_cohort_schedule_with_fallback(
+        &self,
+        epochs: &[(u64, Vec<Address>)],
+        observed_height: u64,
+        fallback_after_blocks: u64,
+    ) -> Result<(), StorageError> {
+        const KEY: &[u8] = b"prover-worker-cohort/v1";
+        const FALLBACK: &[u8] = b"prover-worker-cohort/fallback/v1";
+        const RECOVERY: &[u8] = b"scheduled-fallback:v4";
+        const SCHEDULE: &[u8] = b"prover-worker-cohort/v2";
+        const SCHEDULED: &[u8] = b"scheduled:v2";
+        if epochs.is_empty()
+            || epochs[0].0 != 0
+            || epochs.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(StorageError::InvalidInput(
+                "invalid worker cohort epochs".into(),
+            ));
+        }
+        let initial = serde_json::to_vec(&epochs[0].1)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        let previous = self.store.get(KEY)?;
+        let persisted_fallback = self.store.get(FALLBACK)?;
+        let persisted_schedule = self.store.get(SCHEDULE)?;
+        let mismatch = || {
+            StorageError::InvalidInput(
+            "prover worker cohort differs from the persisted assignment; restore the existing configuration".into(),
+        )
+        };
+        let recovering = previous.as_deref() == Some(RECOVERY);
+        if recovering {
+            if fallback_after_blocks == 0
+                || persisted_fallback.as_deref()
+                    != Some(fallback_after_blocks.to_be_bytes().as_slice())
+                || persisted_schedule.is_none()
+            {
+                return Err(mismatch());
+            }
+        } else if persisted_fallback.is_some() {
+            return Err(mismatch());
+        }
+        if fallback_after_blocks > 0 && epochs[0].1.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "worker fallback requires an explicit cohort".into(),
+            ));
+        }
+        let previous_epochs: Option<Vec<(u64, Vec<Address>)>> = match persisted_schedule {
+            Some(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            ),
+            None => None,
+        };
+        if let Some(old) = &previous_epochs {
+            if (!recovering && previous.as_deref() != Some(SCHEDULED)) || !epochs.starts_with(old) {
+                return Err(mismatch());
+            }
+        } else if let Some(bytes) = &previous {
+            if *bytes != initial {
+                return Err(mismatch());
+            }
+        }
+        let previous_len = previous_epochs.as_ref().map_or(1, Vec::len);
+        if previous.is_some()
+            && epochs
+                .iter()
+                .skip(previous_len)
+                .any(|(from, _)| *from <= observed_height)
+        {
+            return Err(StorageError::InvalidInput(
+                "worker cohort additions must start after the persisted canonical head".into(),
+            ));
+        }
+        if epochs.len() > 1 || fallback_after_blocks > 0 {
+            let bytes = serde_json::to_vec(epochs)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            let mut batch = WriteBatch::new();
+            // Older static-only nodes reject this marker rather than silently
+            // ignoring a schedule when reopening the same database.
+            batch.put(
+                KEY.to_vec(),
+                if fallback_after_blocks > 0 {
+                    RECOVERY
+                } else {
+                    SCHEDULED
+                }
+                .to_vec(),
+            );
+            batch.put(SCHEDULE.to_vec(), bytes);
+            if fallback_after_blocks > 0 {
+                batch.put(
+                    FALLBACK.to_vec(),
+                    fallback_after_blocks.to_be_bytes().to_vec(),
+                );
+            }
+            self.store.write_batch(batch)?;
+        } else if previous.is_none() && !epochs[0].1.is_empty() {
+            self.store.put(KEY, &initial)?;
+        }
+        Ok(())
+    }
+
     fn key(block_hash: &ShellHash) -> Vec<u8> {
         let mut k = PA_PREFIX.to_vec();
         k.extend_from_slice(block_hash.as_bytes());
@@ -4739,6 +4993,52 @@ mod tests {
         fail_put_after: AtomicUsize,
         put_calls: AtomicUsize,
         scanned_entries: AtomicUsize,
+    }
+
+    #[test]
+    fn registry_fallback_policy_is_atomic_and_rejects_downgrade_or_corruption() {
+        let store = Arc::new(FailingBatchStore::new());
+        let amendments = ProofAmendmentStore::new(store.clone());
+        amendments.bind_registry_worker_policy(0).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        store.fail_next_batch();
+        assert!(amendments.bind_registry_worker_policy(3).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        amendments.bind_registry_worker_policy(3).unwrap();
+        assert_eq!(
+            store.get(b"prover-worker-cohort/v1").unwrap().unwrap(),
+            b"registry-fallback:v5"
+        );
+        let bound = store.scan_prefix(b"").unwrap();
+        assert!(amendments.bind_registry_worker_policy(0).is_err());
+        assert!(amendments.bind_registry_worker_policy(4).is_err());
+        assert!(amendments
+            .bind_worker_cohort_schedule_with_fallback(&[(0, vec![Address::from([1; 32])])], 0, 3)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), bound);
+        store.delete(b"prover-worker-cohort/fallback/v1").unwrap();
+        assert!(amendments.validate_registry_worker_policy(3).is_err());
+    }
+
+    #[test]
+    fn worker_fallback_policy_batch_failure_preserves_schedule() {
+        let store = Arc::new(FailingBatchStore::new());
+        let amendments = ProofAmendmentStore::new(store.clone());
+        let epochs = vec![(0, vec![Address::from([1; 32]), Address::from([2; 32])])];
+        amendments.bind_worker_cohort_schedule(&epochs, 0).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        store.fail_next_batch();
+        assert!(amendments
+            .bind_worker_cohort_schedule_with_fallback(&epochs, 0, 3)
+            .is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        amendments
+            .bind_worker_cohort_schedule_with_fallback(&epochs, 0, 3)
+            .unwrap();
+        assert_eq!(
+            store.get(b"prover-worker-cohort/v1").unwrap().unwrap(),
+            b"scheduled-fallback:v4"
+        );
     }
 
     impl FailingBatchStore {
@@ -8017,6 +8317,15 @@ mod tests {
         cs.set_finalized_number(9).unwrap();
         store
             .put(
+                crate::prover_registry::PROVER_DISCOVERY_GENESIS,
+                &[0xAA; 32],
+            )
+            .unwrap();
+        store
+            .put(crate::prover_registry::PROVER_DISCOVERY_HEAD, &[0xAA; 32])
+            .unwrap();
+        store
+            .put(
                 prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED,
                 &9u64.to_be_bytes(),
             )
@@ -8064,6 +8373,21 @@ mod tests {
                 )
                 .unwrap();
             writer.write_entry(b"snapshot-key", b"value").unwrap();
+            writer
+                .write_entry(
+                    crate::prover_registry::PROVER_DISCOVERY_GENESIS,
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(
+                    crate::prover_registry::PROVER_DISCOVERY_HEAD,
+                    block_hash.as_bytes(),
+                )
+                .unwrap();
+            writer
+                .write_entry(b"prover-discovery/candidates/v1/forged", b"value")
+                .unwrap();
             writer.finalize().unwrap();
         }
 
@@ -8071,6 +8395,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(cs.get_head_hash().unwrap(), Some(block_hash));
+        assert!(store
+            .get(crate::prover_registry::PROVER_DISCOVERY_GENESIS)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(crate::prover_registry::PROVER_DISCOVERY_HEAD)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(b"prover-discovery/candidates/v1/forged")
+            .unwrap()
+            .is_none());
         assert_eq!(cs.get_finalized_number().unwrap(), None);
         assert!(store
             .get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)

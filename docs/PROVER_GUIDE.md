@@ -324,6 +324,136 @@ computed first; proof publication still waits for their predecessors.
 Priority scheduling is an unreleased implementation change. Older binaries may
 parse the setting without changing the actual proving order.
 
+
+### worker_cohort (unreleased)
+
+For a fixed group of L1 workers, put the same list of their distinct prover
+addresses in each worker's configuration. Every worker must use its own key,
+be registered under the network's existing prover-registry rules, and follow
+the same canonical chain. For example, after replacing both values with the
+actual 32-byte addresses of two registered workers:
+
+```toml
+[prover]
+worker_cohort = [
+  "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "0x2222222222222222222222222222222222222222222222222222222222222222",
+]
+```
+
+The node sorts the addresses, chooses one owner from the first canonical source
+hash of each minimum-size L1 range, and runs CPU proving only on that owner.
+Other workers retain bounded reservations while observing the resulting proof.
+Range boundaries do not depend on how many later blocks a worker has received.
+Proof authentication, canonical settlement ordering, and rewards retain their
+normal validation rules. A valid later L1 proof may finish before its predecessor;
+it is stored and broadcast while waiting, but cannot settle across the gap.
+Ordinary validators recover stored proofs at the canonical frontier without
+starting CPU proving tasks.
+Cached proofs prevent recomputation after reopening, including while waiting
+for an earlier worker to finish.
+
+The cohort is persisted in each local prover database. Reordered lists are
+accepted; duplicate addresses, a missing local signer, and a different list on
+reopen are rejected. Restore the original configuration after an accidental
+change. Do not delete chain data to bypass a membership error.
+
+The initial cohort supports at most 64 workers. To coordinate a later change,
+stop every participating worker, ensure they have synchronized, and append the
+same future epoch to every worker's full configuration before restarting:
+
+```toml
+[[prover.worker_cohort_schedule]]
+from_block = 1000000
+workers = [
+  "0x2222222222222222222222222222222222222222222222222222222222222222",
+]
+```
+
+Replace the sample height with one beyond **all** workers' persisted canonical
+heads, leaving time to restart and synchronize before it is reached. The example
+retires the first worker for new ranges; it remains responsible for older ranges.
+Register each incoming identity using the normal registry rules before its first
+assignment. A local key must occur in at least one configured epoch. Keep retired
+workers online until their old assignments settle.
+
+Ownership is selected by the **first source block** of a range. A range that
+starts before `from_block` and ends after it stays with the old membership;
+the first range starting at or after that height uses the new membership.
+No small, invalid proof range is created by splitting at the boundary.
+
+There may be at most 63 future epochs, with strictly increasing heights. Once
+persisted, every epoch is immutable, including announced future entries. You may
+append an epoch only beyond the local canonical head. Removing, rewriting or
+backdating an epoch fails before listeners or proving start. Restoring the full
+original schedule recovers from an accidental edit. Scheduled databases reject
+static-only configuration and older static-only binaries on reopen; use a build
+supporting this schedule on every worker. A fresh joining database needs the full
+historical schedule to reconstruct the same ownership.
+
+This is an explicitly coordinated operational plan. It does not automatically
+recruit registered provers or transfer an offline worker's assignments. All
+workers must use the same schedule; there is no network negotiation of different
+operator configurations. Do not assume exactly-once computation across partitions
+or crashes. Omitting both settings on a fresh database retains independent
+scheduling. This feature is unreleased; older public binaries may ignore these
+settings and generate duplicate work.
+
+Build a node with RocksDB and libp2p, then run the isolated acceptance with Node.js
+and a compatible Shell SDK build (transaction wire format v2):
+
+```sh
+SHELL_NODE_BIN=./target/debug/shell-node \
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+node tests/e2e/prover-cohort.mjs
+```
+
+The entry creates fresh keys and an isolated three-node chain, registers two
+provers, submits 512 genuine one-wei transfers, and requires exactly one generated
+proof across the workers. It checks the finalized receipts and balances, rejects
+a changed persisted cohort, and reopens all three RocksDB nodes without proof
+recomputation. To also test a coordinated membership change, use the same command
+with `SHELL_COHORT_RECONFIGURE=1`. That mode sends 1,536 transfers, requires an
+unsplit range crossing the activation and a later proof from the new member,
+rejects a backdated append, history rewrite and static downgrade, and reopens
+all databases with the schedule intact. Use `SHELL_COHORT_LATE_JOIN=1` to also
+exercise a freshly initialized third prover that occurs only in the future
+membership. It registers that identity after the initial proof, requires live
+historical synchronization without old-work generation, checks future ownership,
+and reopens all four native nodes with receipts and prover records intact.
+This option includes the coordinated-membership checks above.
+
+For completion in reverse order, use `SHELL_COHORT_DELAY_PREDECESSOR=1` with the
+same command, separately from the other two options. It accumulates 1,024 signed
+transfers, starts only the later range's scheduled owner, and checks that its
+proof is stored without settling across the gap. It reopens those databases
+before starting the earlier owner, then requires both original proofs to settle
+once in source order, with their exact rewards. All three databases reopen again
+with the balances, nonces, finalized hashes and prover counters intact. This
+controls worker startup order; it does not transfer an absent owner's work.
+
+For a bounded concurrency check, use `SHELL_COHORT_PARALLEL=1` separately from
+all other options. It accumulates 1,024 genuine transfers and synchronizes the
+workers as validators before restarting both as isolated dev provers while the
+authority is stopped. It then reconnects the native nodes and requires settlement
+from those persisted proofs without regeneration. It requires overlapping
+start/finish intervals recorded inside the two actual CPU proof calls, distinct
+input-derived ranges, exactly one generated proof per worker, ordered settlement
+with exact rewards, and consistent state after reopening all three databases.
+The validator must generate no proof. An overlap failure leaves concurrency
+unqualified even when settlement succeeds. This local workload does not measure
+throughput, speedup or CPU core utilization.
+
+Persisted L1 frontier proofs are re-advertised directly to newly connected
+peers and on the existing periodic retry. Recovery admits at most the two pending
+settlement slots, rechecks canonical order, prover authentication and source
+binding, and retains artifacts on storage or transport errors. A later proof
+waits for its predecessor; settled proofs stop retrying. This does not move work
+from an absent owner.
+
+The entry retains private keys and databases for inspection and stops its own
+processes. It does not qualify automatic recruitment, failover or production scale.
+
 ---
 
 ## ProofAmendment Lifecycle

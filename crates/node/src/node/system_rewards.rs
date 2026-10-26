@@ -629,6 +629,25 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         amendment: &ProofAmendment,
     ) -> Result<(), NodeError> {
+        self.validate_stark_amendment_with_pending(amendment, false)
+            .map(|_| ())
+    }
+
+    /// A valid later L1 range may be stored while an earlier worker finishes.
+    /// `false` means retain the proof, but do not include it in a settlement yet.
+    /// Authentication and cryptographic source binding are separate checks.
+    pub(crate) fn validate_stark_amendment_for_storage(
+        &self,
+        amendment: &ProofAmendment,
+    ) -> Result<bool, NodeError> {
+        self.validate_stark_amendment_with_pending(amendment, true)
+    }
+
+    fn validate_stark_amendment_with_pending(
+        &self,
+        amendment: &ProofAmendment,
+        allow_future_l1: bool,
+    ) -> Result<bool, NodeError> {
         // Include pending (queued-but-unsettled) settlements in the overlay so that
         // consecutive amendments pass the frontier ordering check even when the
         // preceding range hasn't yet been mined into a canonical block.
@@ -641,7 +660,7 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         }
-        self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay)
+        self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay, allow_future_l1)
             .inspect_err(|_| self.metrics.stark_settlements_rejected.inc())
     }
 
@@ -651,7 +670,7 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<(), NodeError> {
         let mut overlay = HashMap::new();
         for amendment in amendments {
-            self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay)
+            self.validate_stark_amendment_ordering_with_overlay(amendment, &overlay, false)
                 .inspect_err(|_| self.metrics.stark_settlements_rejected.inc())?;
             for source in amendment.covered_hashes() {
                 overlay.insert(source, amendment.layer);
@@ -950,7 +969,8 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         amendment: &ProofAmendment,
         overlay_layers: &HashMap<ShellHash, u32>,
-    ) -> Result<(), NodeError> {
+        allow_future_l1: bool,
+    ) -> Result<bool, NodeError> {
         let (start_block, covered) = self.validate_stark_amendment_range(amendment)?;
         for (offset, source_hash) in covered.iter().enumerate() {
             let number = start_block.saturating_add(offset as u64);
@@ -978,6 +998,9 @@ impl<S: KvStore + 'static> Node<S> {
 
         let expected_start =
             self.first_canonical_block_below_layer(amendment.layer, overlay_layers)?;
+        if allow_future_l1 && amendment.layer == 1 && start_block > expected_start {
+            return Ok(false);
+        }
         if start_block != expected_start {
             return Err(NodeError::Startup(format!(
                 "STARK L{} amendment must start at frontier #{expected_start}, got #{start_block}",
@@ -985,7 +1008,7 @@ impl<S: KvStore + 'static> Node<S> {
             )));
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn first_canonical_block_below_layer(
