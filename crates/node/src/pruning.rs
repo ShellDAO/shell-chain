@@ -35,7 +35,7 @@ pub const MIN_AMENDMENT_DEPTH: u64 = 128;
 /// | Profile (WP name)       | body_retention | witness_retention | keep_recent | proof_replacement_grace          |
 /// |-------------------------|----------------|-------------------|-------------|----------------------------------|
 /// | Archive                 | 0 (forever)    | 0 (forever)       | 0 (forever) | u64::MAX (never delete)          |
-/// | Full                    | 0 (forever)    | 128               | 0 (forever) | MIN_AMENDMENT_DEPTH (128)        |
+/// | Full                    | 0 (forever)    | 256               | 0 (forever) | MIN_AMENDMENT_DEPTH (128)        |
 /// | Pruned / Rolling / Light| 4 096          | 64                | 4 096       | MIN_AMENDMENT_DEPTH (128)        |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -158,7 +158,7 @@ pub struct PruningConfig {
     pub keep_recent: u64,
     /// Number of recent blocks whose witness bundles are retained.
     /// `0` means archive mode — no witness bundles are ever pruned.
-    /// Default: 128 (matches `DEFAULT_WITNESS_RETENTION`).
+    /// Default for the Full profile: 256 (matches `DEFAULT_WITNESS_RETENTION`).
     pub witness_retention: u64,
     /// Number of recent blocks whose full bodies are retained.
     /// `0` means archive mode — no bodies are ever pruned.

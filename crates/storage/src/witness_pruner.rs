@@ -7,7 +7,7 @@
 //! chain; only the raw witness data (PQ signatures) is pruned.
 //!
 //! Setting `retention_count = 0` enables **archive mode** — no bundles are
-//! ever pruned.  The default (`128`) is suitable for full nodes that do not
+//! ever pruned.  The current default (`256`) is suitable for full nodes that do not
 //! need to serve historical witness data.
 
 use tracing::debug;

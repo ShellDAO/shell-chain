@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep witnesses covered by a late STARK settlement until its finalized
+  proof-replacement grace expires, including the age-based pruning path.
+- Correct the documented Full/Light retention presets and replace unsupported
+  pruning TOML examples with CLI options and effective-profile queries.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

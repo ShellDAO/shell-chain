@@ -127,23 +127,32 @@ When the node receives a valid `ProofAmendment`:
    Block-level STARK settlement in header `extraData` is deprecated and rejected.
    Normal STARK-settled blocks keep `extraData=0x`.
 2. The proof artifact must satisfy `compressed_size * 2 < original_size`.
-3. After `proof_replacement_grace` blocks (default: **0**), eligible witness
-   data is deleted.
+3. The named Full and Light presets use `proof_replacement_grace = 128`.
+   Deletion waits until the settlement height plus this delay is finalized.
+   Archive uses `u64::MAX` and never schedules witness replacement.
 
-```toml
-# node config (TOML)
-[pruning]
-proof_replacement_grace = 0   # delete immediately; set > 0 for forensic window
-```
+These are the node v0.27.13 operator-profile defaults. The Full age-based
+witness window is 256 blocks; enabling STARK aggregation does not change it
+to zero. Proof replacement is a separate deletion path: an accepted proof can
+replace covered witnesses after its grace period even when their age-based
+retention window has not expired. Use Archive to retain all witnesses.
 
-When `enable_stark_aggregation = true`, the node automatically initialises
-`witness_retention = 0` — no manual config needed.
+A programmatically constructed `PruningConfig` can use zero grace, but that
+is not the CLI profile default. The CLI does not load a `[pruning]` TOML
+section or expose a proof-grace override; configure its supported profile
+and retention options as shown below.
 
 The compression threshold is a protocol invariant for pruning and rewards:
 non-compressing proofs may be retained for verification or diagnostics, but
 they cannot replace witness data or claim STARK rewards. L1 artifacts may cover
 contiguous canonical block ranges; L2+ artifacts compress prior-layer STARK
 artifacts rather than raw witnesses.
+
+The age-based pruning path also respects a covered source's pending
+post-settlement grace deadline. This compatibility fix is unreleased: a late
+proof must not allow an already-old witness bundle to bypass that deadline.
+The profile defaults above are already present in v0.27.13; the correction
+changes pruning eligibility, without changing the configured windows.
 
 ### Ordered compression frontiers
 
@@ -213,19 +222,23 @@ the snapshot does not contain one and rejects cursors ahead of the snapshot head
 
 ## Configuration Reference
 
-```toml
-[pruning]
-# How many finalized blocks to retain witness bundles for before deletion.
-# Ignored when proof_replacement_grace is non-zero.
-witness_retention = 128        # default; overridden to 0 when STARK is on
+```bash
+# Named Full preset: body=0, witness=256, keep_recent=0, proof grace=128.
+shell-node run --storage-profile full
 
-# Grace window: keep witness bundle for N blocks after proof arrival.
-# 0 = delete immediately on proof receipt (default, recommended for STARK nodes).
-proof_replacement_grace = 0
+# Override the age-based witness window; proof replacement still applies.
+shell-node run --storage-profile full --witness-retention 2048
 
-# Experimental: enable trie node ref-counting and eviction. Default false.
-state_pruning_experimental = false
+# Retain all raw witnesses, including those covered by accepted proofs.
+shell-node run --storage-profile archive
 ```
+
+Alternatively, set `[storage] profile = "full"` in a TOML file and load it
+with `--config node.toml`. An explicit `--storage-profile` takes precedence.
+Query `shell_getStorageProfile` to inspect the resulting values; `0` means
+unlimited retention for body/witness/state windows, while Archive's proof
+grace is `u64::MAX`. A witness-retention override does not disable the
+independent proof-replacement path.
 
 ---
 
@@ -240,17 +253,20 @@ shell_storage_cf_size_bytes{cf="proof"}    # pa/ prefix — grows slowly (~15 KB
 shell_storage_cf_size_bytes{cf="state"}    # trie nodes (0 unless L3 enabled)
 ```
 
-A healthy STARK node should show `witness` converging to near-zero.
+Witness use depends on the active profile, pending proof coverage, retention
+window, and grace period. Archive intentionally keeps raw witness data.
 
 ### Startup banner
 
-On every start the node logs a three-line pruning summary:
+With Full and STARK aggregation enabled, the startup summary includes:
 
+```text
+profile=full  state=archive  bodies=archive  witnesses=keep-256
+STARK: enabled  (grace=128 blocks before witness deletion)
 ```
-[PRUNING] state  : experimental=false  retained_roots=128
-[PRUNING] bodies : witness_retention=0  proof_replacement_grace=0
-[PRUNING] stark  : aggregation=true  — witnesses replaced by proof on receipt
-```
+
+Here `state=archive` and `bodies=archive` describe unlimited retention for
+those data types; the overall storage profile remains Full.
 
 ---
 
@@ -366,8 +382,8 @@ Default: **`full`**
 | Profile | `body_retention` | `witness_retention` | `proof_replacement_grace` | `keep_recent` | Typical use |
 |---|---|---|---|---|---|
 | `archive` | 0 (forever) | 0 (forever) | u64::MAX (never delete) | 0 (forever) | Complete cryptographic audit trail; PQ signatures kept even after STARK proof |
-| `full` (**default**) | 0 (forever) | 128 | 0 (replace immediately) | 0 (forever) | Full node: TX history queryable forever; STARK proof replaces PQ signatures |
-| `light` | 4096 (~2.3 h) | 64 | 0 | 4096 | Light / embedded node; rolling window plus epoch recovery state |
+| `full` (**default**) | 0 (forever) | 256 | 128 | 0 (forever) | Full node: TX history queryable forever; STARK proof replaces PQ signatures |
+| `light` | 4096 (~2.3 h) | 64 | 128 | 4096 | Light / embedded node; rolling window plus epoch recovery state |
 
 ### Data volume estimates
 
@@ -384,16 +400,18 @@ Base: 50 tx/block, 2 s/block → 43,200 blocks/day.
 `--body-retention` and `--witness-retention` override profile defaults:
 
 ```
-# full profile but keep the last 2048 blocks of witnesses too
+# Override age-based retention; accepted-proof replacement still applies
 shell-node run --storage-profile full --witness-retention 2048
 ```
 
-Explicit flags take priority over the profile for body and witness retention.
+These node v0.27.13 defaults match the running public binary. Explicit flags
+take priority over the profile for body and age-based witness retention;
+they do not change the proof-replacement grace period.
 `--storage-profile` also sets `proof_replacement_grace` (how long to wait before
 replacing PQ witness data with a STARK proof) and — when `--pruning` is omitted —
-the `keep_recent` (state-root) default for the profile. To fully override all
-profile values, use `--body-retention`, `--witness-retention`, and `--pruning`
-explicitly.
+the `keep_recent` (state-root) default for the profile. To override the body, age-based witness, and state-root windows, use
+`--body-retention`, `--witness-retention`, and `--pruning` explicitly.
+These flags leave the preset proof grace unchanged.
 
 ### Auto-sync on profile upgrade
 

@@ -1785,7 +1785,17 @@ impl<S: KvStore + 'static> Node<S> {
                 // the settled-set size: stale fork entries and gaps must fail closed.
                 match wpruner.prune_before_settled(
                     finalized_number,
-                    |hash| self.settled_stark_sources.lock().contains(&(1, *hash)),
+                    |hash| {
+                        if !self.settled_stark_sources.lock().contains(&(1, *hash)) {
+                            return false;
+                        }
+                        // A late proof must not let the age-based path bypass
+                        // the grace period measured from canonical settlement.
+                        self.pending_grace_deletes
+                            .lock()
+                            .get(hash)
+                            .is_none_or(|delete_at| finalized_number >= *delete_at)
+                    },
                     &self.chain_store,
                     &self.witness_store,
                 ) {
@@ -19193,6 +19203,56 @@ mod tests {
 
         assert_eq!(node.body_pruner.read().pruned_below(), 2);
         assert_eq!(node.witness_pruner.read().pruned_below(), 0);
+    }
+
+    #[test]
+    fn age_based_witness_pruning_honors_late_settlement_grace() {
+        for grace in [0, 2, 128] {
+            let (node, signer) = setup_node_with_retention(0, 2);
+            store_genesis(&node);
+            let genesis = node
+                .chain_store
+                .get_block_hash_by_number(0)
+                .unwrap()
+                .unwrap();
+            let hashes = produce_witnessed_blocks(&node, &signer, grace + 8);
+            let head = grace + 8;
+            let root = current_state_root(&node);
+            let sources = vec![genesis, hashes[0], hashes[1]];
+            node.settled_stark_sources
+                .lock()
+                .extend(sources.iter().map(|hash| (1, *hash)));
+            let amendment = dummy_ordered_amendment(1, sources, 2);
+            node.block_store()
+                .schedule_settled_witness_deletes(&[amendment], 4, grace);
+
+            if grace > 0 {
+                // Source 1 is already older than the two-block retention
+                // window, but its settlement has not reached the deadline.
+                let finalized = 4 + grace - 1;
+                node.chain_store.set_finalized_number(finalized).unwrap();
+                node.record_canonical_state_root(head, root);
+                assert!(node.chain_store.has_witness_bundle(&hashes[0]).unwrap());
+                assert!(node.chain_store.has_witness_bundle(&hashes[1]).unwrap());
+                assert_eq!(node.witness_pruner.read().pruned_below(), 0);
+                assert_eq!(
+                    node.pending_grace_deletes.lock().get(&hashes[0]),
+                    Some(&(4 + grace))
+                );
+            }
+
+            node.chain_store.set_finalized_number(4 + grace).unwrap();
+            node.record_canonical_state_root(head, root);
+            assert!(!node.chain_store.has_witness_bundle(&hashes[0]).unwrap());
+            assert!(!node.chain_store.has_witness_bundle(&hashes[1]).unwrap());
+            assert!(node
+                .chain_store
+                .get_block_by_hash(&hashes[0])
+                .unwrap()
+                .is_some());
+            node.block_store().prune_grace_witnesses(4 + grace);
+            assert!(!node.pending_grace_deletes.lock().contains_key(&hashes[0]));
+        }
     }
 
     #[test]
