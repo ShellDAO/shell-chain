@@ -297,6 +297,20 @@ impl<S: KvStore + 'static> Node<S> {
             );
             return Ok(());
         }
+        if let Some(height) = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|config| config.equivocation_replay_height)
+        {
+            let head = self
+                .chain_store
+                .get_head_block()?
+                .map_or(0, |block| block.number());
+            if head >= height {
+                // A node must not depend on an echo of the evidence it discovered.
+                self.persist_authority_slash(&equivocation.offender, Some(&equivocation))?;
+            }
+        }
         warn!(
             offender = %equivocation.offender,
             block_number = equivocation.header_a.number,
@@ -2779,5 +2793,91 @@ mod tests {
                 ..
             } if rejected == block_hash
         ));
+    }
+}
+
+#[cfg(test)]
+mod local_equivocation_tests {
+    use super::*;
+    use shell_consensus::{PoaConfig, WPoaConfig};
+    use shell_crypto::MlDsaSigner;
+
+    #[test]
+    fn local_equivocation_authentication_activation_and_received_replay_share_penalties() {
+        for activation in [None, Some(0), Some(2)] {
+            let signer = MlDsaSigner::generate();
+            let authority =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let db = Arc::new(crate::node::tests::FailingBatchDb::new());
+            let mut config = NodeConfig::dev(authority);
+            config.consensus = crate::config::ConsensusEngineConfig::WPoa(
+                WPoaConfig::with_weights(PoaConfig::new(vec![authority], 1), vec![100]),
+            );
+            let (node, _) = crate::NodeBuilder::new(config, db.clone()).build().unwrap();
+            node.chain_store
+                .put_pubkey(&authority, signer.public_key())
+                .unwrap();
+            let chain_config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"equivocation_replay_height":activation})).unwrap();
+            node.chain_store.put_chain_config(&chain_config).unwrap();
+            let mut a = Block {
+                header: BlockHeader {
+                    number: 1,
+                    proposer: authority,
+                    ..Default::default()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            a.proposer_seal = Some(signer.sign(a.hash().as_bytes()).unwrap());
+            let mut b = a.clone();
+            b.header.state_root = ShellHash::from([0x33; 32]);
+            b.proposer_seal = Some(signer.sign(b.hash().as_bytes()).unwrap());
+            node.chain_store.put_block(&a).unwrap();
+            node.chain_store.set_head(&a.hash()).unwrap();
+            let mut invalid = b.clone();
+            invalid.proposer_seal = Some(signer.sign(b"wrong header").unwrap());
+            node.queue_signed_equivocation_if_valid(&a, &invalid)
+                .unwrap();
+            assert!(node.equivocation_queue.lock().is_empty());
+            assert_eq!(node.consensus.read().validator_weights()[&authority], 100);
+            if activation == Some(0) {
+                db.fail_next_batch();
+                assert!(node.queue_signed_equivocation_if_valid(&a, &b).is_err());
+                assert!(node.equivocation_queue.lock().is_empty());
+                assert_eq!(node.consensus.read().validator_weights()[&authority], 100);
+            }
+            node.queue_signed_equivocation_if_valid(&a, &b).unwrap();
+            let expected = if activation == Some(0) { 90 } else { 100 };
+            assert_eq!(
+                node.consensus.read().validator_weights()[&authority],
+                expected
+            );
+            let proof = node.equivocation_queue.lock()[0].clone();
+            assert!(proof.verify_signed(signer.public_key(), &MultiVerifier));
+            node.queue_signed_equivocation_if_valid(&b, &a).unwrap();
+            assert_eq!(
+                node.consensus.read().validator_weights()[&authority],
+                expected
+            );
+            if activation == Some(2) {
+                let mut head = a.clone();
+                head.header.number = 2;
+                node.chain_store.put_block(&head).unwrap();
+                node.chain_store.set_head(&head.hash()).unwrap();
+                node.queue_signed_equivocation_if_valid(&a, &b).unwrap();
+                assert_eq!(node.consensus.read().validator_weights()[&authority], 90);
+            }
+            node.persist_authority_slash(&authority, Some(&proof))
+                .unwrap();
+            assert_eq!(node.consensus.read().validator_weights()[&authority], 90);
+            let recovered = ChallengeLifecycle::load(db.as_ref()).unwrap();
+            let mut consensus = shell_consensus::WPoaEngine::new(
+                WPoaConfig::with_weights(PoaConfig::new(vec![authority], 1), vec![100]),
+                Arc::new(MultiVerifier),
+            );
+            consensus.restore_penalty_state(recovered.penalties.as_ref().unwrap());
+            assert_eq!(consensus.validator_weights()[&authority], 90);
+        }
     }
 }

@@ -2,7 +2,7 @@
 
 ## Decision
 
-The authenticated evidence receive path owns replay suppression. Use the
+Authenticated local detection and received evidence share replay suppression. Use the
 unordered pair of recomputed header hashes plus the offender identity, rather
 than a message hash, signatures, or a permanent per-validator ban on further
 penalties. This catches order reversal and different valid signature encodings
@@ -33,6 +33,13 @@ refuses missing or conflicting chain configuration. This deliberately prevents
 an older writer from dropping the policy on its next save. Scheduling this
 upgrade consequently requires upgraded binaries even before the boundary.
 Complete KV snapshot export/import includes both the envelope and markers.
+
+After activation, local import commits the penalty before queuing its verified
+proof, so a detecting node cannot depend on an echo of its own broadcast.
+The event loop drains activated evidence independently of canonical NewBlock
+success: range sync and side-fork validation can authenticate an offense without
+adopting the candidate as canonical. Legacy local detection and broadcast timing
+remain unchanged before activation or without a configured schedule.
 Do not copy only the penalty record or erase evidence keys to downgrade.
 
 ## Validation and limits
@@ -43,5 +50,7 @@ conflicts and snapshot trust mismatch. The portable TCP/Noise acceptance uses
 real ML-DSA signatures and independently observes effective weights from two
 nodes, including RocksDB reopen and CLI snapshot restore. Its malformed-signature
 control must leave weights unchanged. An optional older-binary check confirms
-refusal without losing recoverable protected penalties. This change is
+refusal without losing recoverable protected penalties. A separate real full-block fork case observes local and receiving-peer weight
+agreement and restart persistence, without requiring competing-branch adoption.
+This change is
 unreleased and does not select an activation height for an existing network.

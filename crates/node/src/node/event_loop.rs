@@ -342,7 +342,7 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(result)
     }
 
-    fn persist_authority_slash(
+    pub(super) fn persist_authority_slash(
         &self,
         offender: &Address,
         proof: Option<&shell_consensus::EquivocationProof>,
@@ -509,11 +509,11 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut recovered = ChallengeLifecycle::load(self.store.as_ref())?;
         let previous = recovered.clone();
-        recovered.configure_equivocation_replay(
-            self.chain_store
-                .get_chain_config()?
-                .and_then(|config| config.equivocation_replay_height),
-        )?;
+        let equivocation_replay_height = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|config| config.equivocation_replay_height);
+        recovered.configure_equivocation_replay(equivocation_replay_height)?;
         if recovered != previous {
             recovered.persist(self.store.as_ref())?;
         }
@@ -848,6 +848,17 @@ impl<S: KvStore + 'static> Node<S> {
             self.metrics
                 .stark_pending_settlements
                 .set(self.pending_stark_settlements.lock().len() as i64);
+
+            // Activated nodes must relay sync/side-fork evidence without waiting
+            // for canonical NewBlock gossip. Unconfigured nodes keep the legacy path.
+            if equivocation_replay_height.is_some_and(|height| self.head_number() >= height) {
+                let equivocations = std::mem::take(&mut *self.equivocation_queue.lock());
+                for proof in equivocations {
+                    let _ = network
+                        .broadcast(NetworkMessage::EquivocationEvidence(Box::new(proof)))
+                        .await;
+                }
+            }
 
             tokio::select! {
                 Some(amendment) = prover_amendment_rx.recv(),

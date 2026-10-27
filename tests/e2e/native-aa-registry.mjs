@@ -33,11 +33,12 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const localEquivocationScenario = process.argv.includes("--equivocation-local");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
 const forkSyncScenario = process.argv.includes("--fork-sync") || weightedForkScenario;
-const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
+const twoAuthorities = quorumRecoveryScenario || forkSyncScenario || localEquivocationScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
@@ -55,7 +56,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario) ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario && !localEquivocationScenario) ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: localEquivocationScenario ? "local-equivocation" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -124,7 +125,9 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    sameHeightForkScenario
+    localEquivocationScenario
+      ? "One ML-DSA authority signs two isolated forks sequentially; a non-authority observer authenticates local and forwarded evidence."
+      : sameHeightForkScenario
       ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
       : twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
@@ -150,6 +153,11 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (localEquivocationScenario) {
+    const process = result.nativeProcesses.find((entry) => entry.pid === child.pid);
+    Object.assign(process, { exitCode: child.exitCode, signal: child.signalCode });
+    assert.equal(child.exitCode, 0, `native node ${i} exits cleanly`);
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -195,12 +203,17 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   ];
   if (pruneFollower && i === 1)
     args.push("--pruning", "1", "--body-retention", "1");
+  if (localEquivocationScenario) args.push("--enable-stark-aggregation", "false");
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
   nodeLogLabels[i] = label;
+  if (localEquivocationScenario) {
+    result.nativeProcesses ??= [];
+    result.nativeProcesses.push({ label, pid: child.pid, argv: [binary, ...args] });
+  }
   let spawnError;
   child.once("error", (error) => {
     spawnError = error;
@@ -461,6 +474,7 @@ async function runScenario() {
     alloc: {},
     boot_nodes: [],
     registered_key_algorithm_height: 0,
+    ...(localEquivocationScenario ? { equivocation_replay_height: 0 } : {}),
     aa_account_manager_height: 0,
     aa_validator_registry_height: 3,
     native_validator_events_height: 16,
@@ -471,11 +485,11 @@ async function runScenario() {
       authorities: authorities.map((signer) => signer.getAddress()),
       authority_pubkeys: authorities.map((signer) =>
         "0x" + Buffer.from(signer.getPublicKey()).toString("hex")),
-      weights: authorities.map((_, index) => weightedForkScenario && index === 1 ? 3 : 1),
+      weights: authorities.map((_, index) => localEquivocationScenario ? (index === 0 ? 200 : 100) : weightedForkScenario && index === 1 ? 3 : 1),
       stakes: [],
       block_time_secs: 2,
       max_future_secs: 300,
-      epoch_length: epochScenario ? 5 : 0,
+      epoch_length: localEquivocationScenario ? 1000 : epochScenario ? 5 : 0,
     },
   };
   for (const signer of signers)
@@ -490,6 +504,107 @@ async function runScenario() {
       join(dir, "genesis.json"),
       JSON.stringify(genesis, null, 2),
     );
+  if (localEquivocationScenario) {
+    result.adaptations.push("Local equivocation: fresh ML-DSA forks with weights [200,100], quorum201, only offender online, explicit replay activation0, epoch1000. No AA/governance prefix or STARK proofs. Canonical fork adoption is not an acceptance requirement.");
+    const observerDir = join(out, "equivocation-observer");
+    const observerKey = join(out, "equivocation-observer-key.json");
+    await mkdir(observerDir);
+    await writeFile(join(observerDir, "genesis.json"), JSON.stringify(genesis));
+    const observerKeyResult = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", observerKey], { encoding: "utf8" });
+    assert.equal(observerKeyResult.status, 0, observerKeyResult.stderr);
+    result.keyGeneration = { validator:generated.status, offline:keyResult.status, observer:observerKeyResult.status };
+    ports.push(await unusedPort());
+    providers.push(createShellProvider({ rpcHttpUrl: `http://127.0.0.1:${ports[2]}` }));
+    const peerAddress = async (label) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const value = (await readFile(join(out, label + "-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+        if (value) return value;
+        await pause(100);
+      }
+      throw Error("missing local evidence peer address");
+    };
+    const send = async (index, value, nonce) => {
+      const tx = buildTransaction({ chainId:1337, nonce, to:outsider.getAddress(), value:BigInt(value), gasLimit:100000 });
+      const signed = await miner.buildSignedTransaction({ tx, includePublicKey:true });
+      const hash = await paced(() => providers[index].sendTransaction(signed));
+      for (let attempt = 0; attempt < 250; attempt++) {
+        const receipt = await rpc(index,"eth_getTransactionReceipt",[hash]);
+        if (receipt) {
+          assert.equal(receipt.status,"0x1");
+          result.transactions.push({ label:`local evidence branch ${index}`, value, nonce, hash, receipt });
+          await save(); return;
+        }
+        await pause(100);
+      }
+      throw Error("local evidence transfer receipt timeout");
+    };
+    const balance = async (index) => BigInt(await rpc(index,"eth_getBalance",[outsider.getAddress(),"latest"]))-BigInt(genesis.alloc[outsider.getAddress()].balance);
+    const observe = async (index, number, delta) => {
+      for (let attempt = 0; attempt < 150; attempt++) {
+        const head = await rpc(index,"eth_getBlockByNumber",["latest",false]);
+        if (Number(BigInt(head.number)) === number && await balance(index) === BigInt(delta)) {
+          assert.equal((await rpc(index,"eth_getBlockByNumber",["finalized",false])).number,"0x0","one offender cannot supply quorum201");
+          const signers = await rpc(index,"shell_getBlockSigners",["latest"]);
+          assert.ok(signers.signers.some((entry) => entry.address === miner.getAddress() && entry.signatureValid));
+          return { head, delta, signers };
+        }
+        await pause(100);
+      }
+      throw Error("local evidence branch observation timeout");
+    };
+    const weight = async (index) => {
+      const response = await rpc(index,"shell_consensusInfo");
+      result.localWeightObservations ??= [];
+      result.localWeightObservations.push({ index, response });
+      return response.validators.find((entry) => entry.address === miner.getAddress()).weight;
+    };
+    await start(0,dirs[0],keyPath,"local-a");
+    await start(2,observerDir,observerKey,"local-observer",await peerAddress("local-a"));
+    assert.equal(await weight(2),200);
+    await send(0,3,0); const a = await observe(0,1,3); await observe(2,1,3); await stop(0);
+    // The same test signer runs on just one authority process at a time.
+    await start(1,dirs[1],keyPath,"local-b");
+    await send(1,5,0); const b = await observe(1,1,5);
+    assert.notEqual(a.head.hash,b.head.hash); assert.equal(a.head.parentHash,b.head.parentHash);
+    await send(1,7,1); const b2 = await observe(1,2,12); await stop(1);
+    await start(1,dirs[1],keyPath,"local-bridge",await peerAddress("local-observer"));
+    const observerLog = join(out,"local-observer-node.log");
+    let detected = false;
+    for (let attempt = 0; attempt < 300; attempt++) {
+      if ((await readFile(observerLog,"utf8")).includes("signed double-sign detected")) { detected = true; break; }
+      await pause(100);
+    }
+    assert.ok(detected,"native local detector authenticates the conflicting headers");
+    assert.equal((await rpc(2,"eth_getBlockByHash",[b.head.hash,false])).hash,b.head.hash,"observer retains the genuine side fork");
+    assert.equal(await weight(2),180,"local detector commits its own penalty without an echo");
+    let relayed = false;
+    for (let attempt = 0; attempt < 150; attempt++) {
+      if (await weight(1) === 180) { relayed = true; break; }
+      await pause(100);
+    }
+    assert.ok(relayed,"range-sync side-fork evidence reaches the other peer");
+    await pause(6000);
+    const observerWeight = await weight(2), peerWeight = await weight(1);
+    assert.equal(observerWeight,180); assert.equal(peerWeight,180,"forwarded repeats do not compound the penalty");
+    const current = await rpc(2,"eth_getBlockByNumber",["latest",false]);
+    const expectedDelta = new Map([[a.head.hash,3],[b.head.hash,5],[b2.head.hash,12]]).get(current.hash);
+    assert.notEqual(expectedDelta,undefined); assert.equal(await balance(2),BigInt(expectedDelta));
+    result.localEquivocation = { a,b,b2,observerHead:current,observerWeight,peerWeight,detectedCopies:(await readFile(observerLog,"utf8")).split("signed double-sign detected").length-1 };
+    await stop(1); await stop(2);
+    await start(2,observerDir,observerKey,"local-observer-reopen");
+    assert.equal(await weight(2),180,"local penalty survives physical reopen");
+    assert.equal((await rpc(2,"eth_getBlockByNumber",["latest",false])).hash,current.hash);
+    assert.equal(await balance(2),BigInt(expectedDelta));
+    result.localEquivocation.reopenVerified = true;
+    await stop(2);
+    await start(1,dirs[1],keyPath,"local-peer-reopen");
+    assert.equal(await weight(1),180,"receiving peer retains the same penalty after reopen");
+    assert.equal((await rpc(1,"eth_getBlockByNumber",["latest",false])).hash,b2.head.hash);
+    assert.equal(await balance(1),12n);
+    assert.equal((await rpc(1,"eth_getBlockByNumber",["finalized",false])).number,"0x0");
+    result.localEquivocation.peerReopenVerified = true;
+    result.passed = true; return;
+  }
   await start(0, dirs[0], keyPath, "leader");
   let bootnode;
   for (let k = 0; k < 80; k++) {

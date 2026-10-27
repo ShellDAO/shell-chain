@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
   canonical-head activation. Persist each evidence marker atomically with its
   penalty, preserve it across restart and full snapshot restore, and reject
   incompatible older penalty-state writers. Legacy penalties are not rewritten.
+  Activated local detection uses the same durable penalty path and relays sync
+  and side-fork evidence without waiting for canonical block gossip or an echo.
 
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 

@@ -590,7 +590,7 @@ headers from the same authority.
 
 An exact signed conflicting-header pair is one piece of evidence, even when a
 peer resends it or reverses the two headers. With the optional genesis field
-`equivocation_replay_height: H`, the receive path suppresses repeat penalties
+`equivocation_replay_height: H`, the authenticated local-detection and receive paths suppress repeat penalties
 when the **local canonical head** is at least `H`. The claimed evidence height
 cannot activate the rule. Omitting the field retains legacy behavior; fresh
 isolated chains may explicitly use `0`. Existing chains can schedule only a
@@ -602,8 +602,13 @@ the offender plus the sorted pair of header hashes, independent of signatures
 or message order. The penalty and evidence marker commit in one database batch;
 a failed write restores the in-memory penalty and allows a later retry. Markers
 are not evicted. A distinct pair, including a later double-sign, can still incur
-the configured penalty. Evidence observed before a scheduled boundary is
-recorded while retaining legacy charging, preventing another charge when that
+the configured penalty. Local block import applies the same atomic penalty
+before queuing its authenticated evidence, without requiring a network echo.
+After activation, the event loop also relays proofs discovered during range sync
+or side-fork import even if no canonical block is adopted. Before activation,
+local detection retains its legacy broadcast-only behavior. Received evidence
+observed before a scheduled boundary is recorded while retaining legacy
+charging, preventing another charge when that
 same pair is forwarded after activation. This does not undo earlier penalties.
 
 Restart and complete state snapshot export/import preserve the markers and
@@ -635,6 +640,22 @@ binary refuses the protected database and that the upgraded node can still
 recover it. These header-evidence checks do not exercise block-body execution,
 Byzantine availability or public release installation. See
 [the persistence decision](adr/equivocation-replay.md).
+
+A separate full-block local-detection case reuses the native Registry acceptance
+entry and requires a compatible SDK (`0.14.0-rc.3` tested) plus the built node:
+
+```bash
+NODE_BIN=target/debug/shell-node \
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs --equivocation-local
+```
+
+This creates fresh ML-DSA keys and three signed transfers on isolated forks.
+Only one process uses the authority signer at a time. The observer verifies and
+stores the conflicting block, applies its own penalty, relays evidence to the
+other peer, and retains the penalty across physical reopen of both nodes. It checks weight
+`200 -> 180` with an offline weight-100 authority and initial quorum 201. It does not
+require canonical adoption of the competing branch or claim Byzantine agreement.
 
 ### Offline
 
