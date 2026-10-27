@@ -482,9 +482,9 @@ Shell-Chain supports three operational roles, set via `node.node_role` or `--nod
 |------|-----------------|---------------|----------|
 | `validator` *(default)* | ✅ | ❌ | Standard block-producing authority node |
 | `validator-prover` | ✅ | ✅ (idle slots) | Validator that also contributes proof work |
-| `prover` | ❌ | ✅ (full time) | Standalone prover — no keys needed |
+| `prover` | ❌ | ✅ (full time) | Standalone prover with a separate proof-signing identity |
 
-A `prover` node syncs the chain, generates `ProofAmendment` proofs, and propagates them via P2P without producing blocks. See [PROVER_GUIDE.md](PROVER_GUIDE.md) for details.
+A `prover` node syncs the chain, generates `ProofAmendment` proofs, and propagates them via P2P without producing blocks. It needs a proof-signing key, but no validator identity. Set `node.keystore` or `--keystore` to select the intended prover key; omitting it uses the node's development identity instead. Keep `node_role = "prover"` so loading the key does not enable block production. See [PROVER_GUIDE.md](PROVER_GUIDE.md) for details.
 
 ### Validator vs RPC configuration differences
 
