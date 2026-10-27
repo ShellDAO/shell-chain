@@ -1737,20 +1737,22 @@ Replays a transaction and returns an execution trace.
 **Returns:**
 ```json
 {
-  "frame": {
-    "type": "CALL",
-    "from": "0x...",
-    "to": "0x...",
-    "gas": 21000,
-    "gasUsed": 21000,
-    "input": "0x",
-    "output": "0x",
-    "value": "0xde0b6b3a7640000",
-    "error": null
-  },
+  "type": "CALL",
+  "from": "0x<64 hex>",
+  "to": "0x<64 hex>",
+  "gas": 21000,
+  "gasUsed": 21000,
+  "input": "0x",
+  "output": "0x",
+  "value": "0xde0b6b3a7640000",
+  "structLogs": [],
   "failed": false
 }
 ```
+
+The call-frame fields and `failed` are returned at the top level, both with
+default options and with `tracer: "callTracer"`. Failed executions set
+`failed` to `true` and include an `error` message.
 
 ```bash
 curl -s http://localhost:8545 \
