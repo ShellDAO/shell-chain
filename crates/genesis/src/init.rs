@@ -138,6 +138,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
             &block,
             &ChainConfig {
                 log_address_activation_height: config.log_address_activation_height,
+                equivocation_replay_height: config.equivocation_replay_height,
                 algorithm_voting_window: config.algorithm_voting_window()?,
                 algorithm_proposal_identity_height: config.algorithm_proposal_identity_height,
                 algorithm_deprecation_height: config.algorithm_deprecation_height,
@@ -436,6 +437,7 @@ mod tests {
         GenesisConfig {
             governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,

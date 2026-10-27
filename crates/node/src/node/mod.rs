@@ -2011,7 +2011,7 @@ mod tests {
             }
         }
 
-        fn fail_next_batch(&self) {
+        pub(super) fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
         }
 
@@ -3760,6 +3760,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: activation,
+                        equivocation_replay_height: None,
                         algorithm_voting_window: None,
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,
@@ -5635,6 +5636,7 @@ mod tests {
                             fee_accounting_activation_height: fee_activation,
                             bloom_activation_height: bloom_activation,
                             log_address_activation_height: activation,
+                            equivocation_replay_height: None,
                             algorithm_voting_window: None,
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
@@ -5800,6 +5802,7 @@ mod tests {
                             chain_id: 1337,
                             genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                             log_address_activation_height: None,
+                            equivocation_replay_height: None,
                             algorithm_voting_window: None,
                             algorithm_proposal_identity_height: None,
                             algorithm_deprecation_height: None,
@@ -5914,6 +5917,7 @@ mod tests {
                         chain_id: 1337,
                         genesis_hash: participant.chain_store.get_head_hash().unwrap().unwrap(),
                         log_address_activation_height: None,
+                        equivocation_replay_height: None,
                         algorithm_voting_window: None,
                         algorithm_proposal_identity_height: None,
                         algorithm_deprecation_height: None,

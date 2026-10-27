@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Add default-off `equivocation_replay_height` to prevent repeated or reordered
+  signed equivocation evidence from compounding weight penalties after its
+  canonical-head activation. Persist each evidence marker atomically with its
+  penalty, preserve it across restart and full snapshot restore, and reject
+  incompatible older penalty-state writers. Legacy penalties are not rewritten.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

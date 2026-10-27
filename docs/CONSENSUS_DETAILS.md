@@ -586,6 +586,56 @@ SlashEvidence::Equivocation { h1: BlockHeader, h2: BlockHeader }
 `EquivocationProof` can be broadcast by any node that observes two conflicting
 headers from the same authority.
 
+#### Persistent replay protection (unreleased)
+
+An exact signed conflicting-header pair is one piece of evidence, even when a
+peer resends it or reverses the two headers. With the optional genesis field
+`equivocation_replay_height: H`, the receive path suppresses repeat penalties
+when the **local canonical head** is at least `H`. The claimed evidence height
+cannot activate the rule. Omitting the field retains legacy behavior; fresh
+isolated chains may explicitly use `0`. Existing chains can schedule only a
+future height through the normal chain configuration validation. A stored
+schedule cannot be changed or removed.
+
+Both PQ signatures are checked before considering replay identity. Identity is
+the offender plus the sorted pair of header hashes, independent of signatures
+or message order. The penalty and evidence marker commit in one database batch;
+a failed write restores the in-memory penalty and allows a later retry. Markers
+are not evicted. A distinct pair, including a later double-sign, can still incur
+the configured penalty. Evidence observed before a scheduled boundary is
+recorded while retaining legacy charging, preventing another charge when that
+same pair is forwarded after activation. This does not undo earlier penalties.
+
+Restart and complete state snapshot export/import preserve the markers and
+penalties together. A configured node writes a versioned penalty envelope;
+older binaries reject that envelope rather than silently discarding replay
+protection. Use an upgraded binary to reopen it. This is a local evidence
+admission rule, not a replacement for the protocol's block-validity, finality,
+authority-removal or evidence-distribution requirements. No public network
+activation is implied.
+
+The real transport acceptance requires Node.js 20 or later and a Rust toolchain:
+
+```bash
+cargo build -p shell-cli --features libp2p --locked
+cargo build -p shell-network --features libp2p --example equivocation_peer --locked
+node scripts/test-equivocation-replay.mjs \
+  --node-bin target/debug/shell-node \
+  --peer-bin target/debug/examples/equivocation_peer \
+  --output ./equivocation-acceptance
+```
+
+The output directory must not exist. The script generates fresh ML-DSA keys,
+uses isolated loopback ports and full RocksDB nodes, checks invalid signatures,
+repeated/reversed evidence, separate offenses, physical restarts and snapshot
+restore, and exits nonzero on failure. Two independent observers receive the
+same signatures. A legacy configuration remains a separate control. Add
+`--old-node-bin /path/to/older/shell-node` to verify that a compatible older
+binary refuses the protected database and that the upgraded node can still
+recover it. These header-evidence checks do not exercise block-body execution,
+Byzantine availability or public release installation. See
+[the persistence decision](adr/equivocation-replay.md).
+
 ### Offline
 
 Detected by `detect_offline(addr, last_proposed, current_block, config)` —

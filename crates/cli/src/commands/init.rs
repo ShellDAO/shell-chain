@@ -102,6 +102,7 @@ pub fn init(
             GenesisConfig {
                 governance_fallback_keys: Default::default(),
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window_activation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,

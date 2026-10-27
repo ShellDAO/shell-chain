@@ -366,6 +366,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             let genesis = initialize_genesis(genesis_config, Arc::new(MemoryDb::new()))?;
             let trusted = shell_storage::ChainConfig {
                 log_address_activation_height: genesis_config.log_address_activation_height,
+                equivocation_replay_height: genesis_config.equivocation_replay_height,
                 algorithm_voting_window: genesis_config.algorithm_voting_window()?,
                 algorithm_proposal_identity_height: genesis_config
                     .algorithm_proposal_identity_height,
@@ -451,6 +452,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             .as_ref()
             .and_then(|config| config.log_address_activation_height)
             != genesis_config.log_address_activation_height
+        || stored
+            .as_ref()
+            .and_then(|config| config.equivocation_replay_height)
+            != genesis_config.equivocation_replay_height
         || stored
             .as_ref()
             .and_then(|config| config.algorithm_voting_window)
@@ -544,6 +549,7 @@ async fn initialize_chain<S: KvStore + 'static>(
         let desired = shell_storage::ChainConfig {
             fee_accounting_activation_height: genesis_config.fee_accounting_activation_height,
             log_address_activation_height: genesis_config.log_address_activation_height,
+            equivocation_replay_height: genesis_config.equivocation_replay_height,
             algorithm_voting_window: genesis_config.algorithm_voting_window()?,
             algorithm_proposal_identity_height: genesis_config.algorithm_proposal_identity_height,
             algorithm_deprecation_height: genesis_config.algorithm_deprecation_height,
@@ -781,6 +787,7 @@ async fn run_with_store<S: KvStore + 'static>(
         let config = GenesisConfig {
             governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -1362,6 +1369,7 @@ mod tests {
         GenesisConfig {
             governance_fallback_keys: Default::default(),
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window_activation_height: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -1682,6 +1690,7 @@ mod tests {
         let chain = ChainStore::new(Arc::clone(&store));
         let existing = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -2967,6 +2976,7 @@ mod tests {
                 &genesis,
                 &ChainConfig {
                     log_address_activation_height: None,
+                    equivocation_replay_height: None,
                     algorithm_voting_window: None,
                     algorithm_proposal_identity_height: None,
                     algorithm_deprecation_height: None,

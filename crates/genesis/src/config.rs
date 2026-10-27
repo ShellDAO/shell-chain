@@ -162,6 +162,9 @@ pub struct GenesisConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// Canonical head height enabling persistent equivocation replay protection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivocation_replay_height: Option<u64>,
     /// Optional seven-day voting-window upgrade; absent preserves legacy proposals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_voting_window_activation_height: Option<u64>,

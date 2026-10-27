@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use shell_storage::{KvStore, StorageError};
+use shell_storage::{KvStore, StorageError, WriteBatch};
 
 const STORAGE_KEY: &[u8] = b"node/challenge-lifecycle/v1";
 
@@ -9,6 +9,15 @@ const STORAGE_KEY: &[u8] = b"node/challenge-lifecycle/v1";
 struct Snapshot {
     records: Vec<ChallengeRecord>,
     penalties: Option<shell_consensus::PenaltyState>,
+}
+
+// The envelope deliberately lacks the legacy `records` field: old writers
+// must refuse recovery instead of discarding the replay policy on their next save.
+#[derive(Serialize, Deserialize)]
+struct ReplaySnapshot {
+    version: u8,
+    equivocation_replay_height: u64,
+    state: Snapshot,
 }
 
 use shell_primitives::{Address, ShellHash};
@@ -36,6 +45,7 @@ pub struct ChallengeRecord {
 pub struct ChallengeLifecycle {
     challenges: HashMap<ShellHash, ChallengeRecord>,
     pub penalties: Option<shell_consensus::PenaltyState>,
+    equivocation_replay_height: Option<u64>,
 }
 
 impl ChallengeLifecycle {
@@ -43,8 +53,25 @@ impl ChallengeLifecycle {
         let Some(bytes) = store.get(STORAGE_KEY)? else {
             return Ok(Self::new());
         };
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| StorageError::Database(format!("invalid challenge snapshot: {e}")))?;
+        let (snapshot, equivocation_replay_height) = if value.get("version").is_some() {
+            let protected: ReplaySnapshot = serde_json::from_value(value)
+                .map_err(|e| StorageError::Database(format!("invalid replay snapshot: {e}")))?;
+            if protected.version != 2 {
+                return Err(StorageError::Database(
+                    "unsupported replay snapshot version".into(),
+                ));
+            }
+            (protected.state, Some(protected.equivocation_replay_height))
+        } else {
+            (
+                serde_json::from_value::<Snapshot>(value).map_err(|e| {
+                    StorageError::Database(format!("invalid challenge snapshot: {e}"))
+                })?,
+                None,
+            )
+        };
         if let Some(penalties) = &snapshot.penalties {
             let slashed: std::collections::HashSet<_> = penalties.slashed.iter().collect();
             let reductions: std::collections::HashSet<_> = penalties
@@ -78,24 +105,89 @@ impl ChallengeLifecycle {
         Ok(Self {
             challenges,
             penalties: snapshot.penalties,
+            equivocation_replay_height,
         })
     }
 
-    pub fn persist(&self, store: &impl KvStore) -> Result<(), StorageError> {
+    fn encode(&self) -> Result<Vec<u8>, StorageError> {
         let mut records: Vec<_> = self.challenges.values().cloned().collect();
         records.sort_by(|a, b| a.challenge_id.as_bytes().cmp(b.challenge_id.as_bytes()));
-        let bytes = serde_json::to_vec(&Snapshot {
+        let state = Snapshot {
             records,
             penalties: self.penalties.clone(),
-        })
-        .map_err(|e| StorageError::Database(format!("encode challenge snapshot: {e}")))?;
-        store.put(STORAGE_KEY, &bytes)
+        };
+        match self.equivocation_replay_height {
+            Some(height) => serde_json::to_vec(&ReplaySnapshot {
+                version: 2,
+                equivocation_replay_height: height,
+                state,
+            }),
+            None => serde_json::to_vec(&state),
+        }
+        .map_err(|e| StorageError::Database(format!("encode challenge snapshot: {e}")))
+    }
+
+    pub fn persist(&self, store: &impl KvStore) -> Result<(), StorageError> {
+        store.put(STORAGE_KEY, &self.encode()?)
+    }
+
+    pub fn configure_equivocation_replay(
+        &mut self,
+        height: Option<u64>,
+    ) -> Result<(), StorageError> {
+        if self.equivocation_replay_height.is_some() && self.equivocation_replay_height != height {
+            return Err(StorageError::State(
+                "equivocation replay policy conflicts with persisted penalties".into(),
+            ));
+        }
+        self.equivocation_replay_height = height;
+        Ok(())
+    }
+
+    fn equivocation_key(proof: &shell_consensus::EquivocationProof) -> Vec<u8> {
+        let (a, b) = if proof.hash_a.as_bytes() < proof.hash_b.as_bytes() {
+            (proof.hash_a, proof.hash_b)
+        } else {
+            (proof.hash_b, proof.hash_a)
+        };
+        [
+            b"node/equivocation/v1/".as_slice(),
+            proof.offender.as_ref(),
+            a.as_bytes(),
+            b.as_bytes(),
+        ]
+        .concat()
+    }
+
+    pub fn has_equivocation(
+        store: &impl KvStore,
+        proof: &shell_consensus::EquivocationProof,
+    ) -> Result<bool, StorageError> {
+        match store.get(&Self::equivocation_key(proof))? {
+            None => Ok(false),
+            Some(value) if value == b"1" => Ok(true),
+            Some(_) => Err(StorageError::Database(
+                "invalid equivocation replay record".into(),
+            )),
+        }
+    }
+
+    pub fn persist_equivocation(
+        &self,
+        store: &impl KvStore,
+        proof: &shell_consensus::EquivocationProof,
+    ) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(STORAGE_KEY.to_vec(), self.encode()?);
+        batch.put(Self::equivocation_key(proof), b"1".to_vec());
+        store.write_batch(batch)
     }
 
     pub fn new() -> Self {
         Self {
             challenges: HashMap::new(),
             penalties: None,
+            equivocation_replay_height: None,
         }
     }
 
@@ -181,6 +273,34 @@ mod tests {
             opened_at_block,
             status: ChallengeStatus::Open,
         }
+    }
+
+    #[test]
+    fn replay_policy_migrates_legacy_state_and_refuses_downgrade() {
+        let db = shell_storage::MemoryDb::new();
+        let mut state = ChallengeLifecycle::new();
+        state.open_challenge(open_record(1, 0));
+        state.persist(&db).unwrap();
+        let legacy = db.get(STORAGE_KEY).unwrap().unwrap();
+        assert!(serde_json::from_slice::<Snapshot>(&legacy).is_ok());
+        state.configure_equivocation_replay(Some(5)).unwrap();
+        state.persist(&db).unwrap();
+        let protected = db.get(STORAGE_KEY).unwrap().unwrap();
+        assert!(serde_json::from_slice::<Snapshot>(&protected).is_err());
+        let mut recovered = ChallengeLifecycle::load(&db).unwrap();
+        assert_eq!(state, recovered);
+        for conflicting in [None, Some(6)] {
+            assert!(recovered
+                .configure_equivocation_replay(conflicting)
+                .is_err());
+            assert_eq!(state, recovered);
+        }
+        recovered.configure_equivocation_replay(Some(5)).unwrap();
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&protected).unwrap();
+        corrupt["version"] = 3.into();
+        db.put(STORAGE_KEY, &serde_json::to_vec(&corrupt).unwrap())
+            .unwrap();
+        assert!(ChallengeLifecycle::load(&db).is_err());
     }
 
     #[test]

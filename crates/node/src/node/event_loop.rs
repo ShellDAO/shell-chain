@@ -342,14 +342,36 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(result)
     }
 
-    fn persist_authority_slash(&self, offender: &Address) -> Result<(), NodeError> {
+    fn persist_authority_slash(
+        &self,
+        offender: &Address,
+        proof: Option<&shell_consensus::EquivocationProof>,
+    ) -> Result<(), NodeError> {
         let mut current = self.challenge_lifecycle.lock();
+        let mut next = current.clone();
+        let activation = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|config| config.equivocation_replay_height);
+        next.configure_equivocation_replay(activation)?;
+        if let (Some(height), Some(proof)) = (activation, proof) {
+            let head = self
+                .chain_store
+                .get_head_block()?
+                .map_or(0, |block| block.number());
+            if head >= height && ChallengeLifecycle::has_equivocation(self.store.as_ref(), proof)? {
+                return Ok(());
+            }
+        }
         let mut consensus = self.consensus.write();
         let before = consensus.penalty_state();
         consensus.slash_authority(offender);
-        let mut next = current.clone();
         next.penalties = Some(consensus.penalty_state());
-        if let Err(error) = next.persist(self.store.as_ref()) {
+        let persisted = match proof.filter(|_| activation.is_some()) {
+            Some(proof) => next.persist_equivocation(self.store.as_ref(), proof),
+            None => next.persist(self.store.as_ref()),
+        };
+        if let Err(error) = persisted {
             consensus.restore_penalty_state(&before);
             return Err(error.into());
         }
@@ -485,7 +507,16 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let recovered = ChallengeLifecycle::load(self.store.as_ref())?;
+        let mut recovered = ChallengeLifecycle::load(self.store.as_ref())?;
+        let previous = recovered.clone();
+        recovered.configure_equivocation_replay(
+            self.chain_store
+                .get_chain_config()?
+                .and_then(|config| config.equivocation_replay_height),
+        )?;
+        if recovered != previous {
+            recovered.persist(self.store.as_ref())?;
+        }
         if let Some(penalties) = &recovered.penalties {
             self.consensus.write().restore_penalty_state(penalties);
         }
@@ -1990,9 +2021,9 @@ impl<S: KvStore + 'static> Node<S> {
                                     warn!(
                                         offender = %equivocation.offender,
                                         block_number = equivocation.header_a.number,
-                                        "I1: signed equivocation evidence verified, applying slash"
+                                        "I1: signed equivocation evidence verified, checking penalty"
                                     );
-                                    if let Err(error) = self.persist_authority_slash(&equivocation.offender) {
+                                    if let Err(error) = self.persist_authority_slash(&equivocation.offender, Some(&equivocation)) {
                                         warn!(%error, "failed to persist equivocation penalty");
                                     }
                                 }
@@ -3467,6 +3498,122 @@ mod challenge_tests {
     }
 
     #[test]
+    fn equivocation_replay_uses_canonical_head_and_atomic_persistent_identity() {
+        use shell_consensus::EquivocationProof;
+        // The transport regression supplies genuine signatures. This test isolates
+        // persistence failures and activation, after authentication has succeeded.
+        for activation in [None, Some(0), Some(2)] {
+            let db = Arc::new(crate::node::tests::FailingBatchDb::new());
+            let (node, block) = node_with_store(db.clone());
+            node.chain_store.set_head(&block.hash()).unwrap();
+            let config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                "equivocation_replay_height":activation,
+            }))
+            .unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            let mut other = block.header.clone();
+            other.state_root = ShellHash::from([0x77; 32]);
+            let proof = EquivocationProof {
+                offender: block.header.proposer,
+                hash_a: block.hash(),
+                hash_b: other.hash(),
+                header_a: Box::new(block.header.clone()),
+                header_b: Box::new(other),
+                seal_a: None,
+                seal_b: None,
+            };
+            let mut reversed = proof.clone();
+            std::mem::swap(&mut reversed.hash_a, &mut reversed.hash_b);
+            std::mem::swap(&mut reversed.header_a, &mut reversed.header_b);
+            if activation.is_some() {
+                db.fail_next_batch();
+                assert!(node
+                    .persist_authority_slash(&proof.offender, Some(&proof))
+                    .is_err());
+                assert_eq!(
+                    node.consensus.read().validator_weights()[&proof.offender],
+                    100
+                );
+                assert!(!ChallengeLifecycle::has_equivocation(db.as_ref(), &proof).unwrap());
+                assert!(ChallengeLifecycle::load(db.as_ref())
+                    .unwrap()
+                    .penalties
+                    .is_none());
+            }
+            node.persist_authority_slash(&proof.offender, Some(&proof))
+                .unwrap();
+            assert_eq!(
+                node.consensus.read().validator_weights()[&proof.offender],
+                90
+            );
+            node.persist_authority_slash(&proof.offender, Some(&reversed))
+                .unwrap();
+            let expected = if activation == Some(0) { 90 } else { 81 };
+            assert_eq!(
+                node.consensus.read().validator_weights()[&proof.offender],
+                expected
+            );
+            if activation == Some(2) {
+                // Evidence height is still 1. Only the canonical head activates the rule.
+                let mut head = block.clone();
+                head.header.number = 2;
+                node.chain_store.put_block(&head).unwrap();
+                node.chain_store.set_head(&head.hash()).unwrap();
+                node.persist_authority_slash(&proof.offender, Some(&proof))
+                    .unwrap();
+                assert_eq!(
+                    node.consensus.read().validator_weights()[&proof.offender],
+                    81
+                );
+                head.header.number = 3;
+                node.chain_store.put_block(&head).unwrap();
+                node.chain_store.set_head(&head.hash()).unwrap();
+                node.persist_authority_slash(&proof.offender, Some(&reversed))
+                    .unwrap();
+                assert_eq!(
+                    node.consensus.read().validator_weights()[&proof.offender],
+                    81
+                );
+            }
+            drop(node);
+            let (reopened, _) = node_with_store(db.clone());
+            assert_eq!(
+                reopened.consensus.read().validator_weights()[&proof.offender],
+                expected
+            );
+            if activation == Some(0) {
+                reopened
+                    .persist_authority_slash(&proof.offender, Some(&reversed))
+                    .unwrap();
+                assert_eq!(
+                    reopened.consensus.read().validator_weights()[&proof.offender],
+                    90
+                );
+                let mut distinct = proof.clone();
+                distinct.header_a.number = 2;
+                distinct.header_b.number = 2;
+                distinct.hash_a = distinct.header_a.hash();
+                distinct.hash_b = distinct.header_b.hash();
+                reopened
+                    .persist_authority_slash(&distinct.offender, Some(&distinct))
+                    .unwrap();
+                assert_eq!(
+                    reopened.consensus.read().validator_weights()[&proof.offender],
+                    81
+                );
+                reopened
+                    .persist_authority_slash(&distinct.offender, Some(&distinct))
+                    .unwrap();
+                assert_eq!(
+                    reopened.consensus.read().validator_weights()[&proof.offender],
+                    81
+                );
+            }
+        }
+    }
+
+    #[test]
     fn later_authority_slash_does_not_restore_stale_challenge_penalties() {
         let db = Arc::new(crate::node::tests::FailingBatchDb::new());
         let (node, block) = node_with_store(db.clone());
@@ -3474,13 +3621,13 @@ mod challenge_tests {
         node.slash_timed_out_challenges(CHALLENGE_TIMEOUT_BLOCKS);
         db.fail_next_put();
         assert!(node
-            .persist_authority_slash(&block.header.proposer)
+            .persist_authority_slash(&block.header.proposer, None)
             .is_err());
         assert_eq!(
             node.consensus.read().validator_weights()[&block.header.proposer],
             90
         );
-        node.persist_authority_slash(&block.header.proposer)
+        node.persist_authority_slash(&block.header.proposer, None)
             .unwrap();
         assert_eq!(
             node.consensus.read().validator_weights()[&block.header.proposer],

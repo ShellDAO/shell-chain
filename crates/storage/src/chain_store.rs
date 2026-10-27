@@ -63,6 +63,9 @@ pub struct ChainConfig {
     /// First block restoring known full-width log emitters; omitted for legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_address_activation_height: Option<u64>,
+    /// Canonical head height enabling persistent equivocation replay protection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivocation_replay_height: Option<u64>,
     /// Optional seven-day voting-window upgrade; absent preserves legacy proposals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_voting_window: Option<AlgorithmVotingWindow>,
@@ -2127,6 +2130,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.log_address_activation_height,
             ),
             (
+                "equivocation replay",
+                stored.equivocation_replay_height,
+                desired.equivocation_replay_height,
+            ),
+            (
                 "algorithm timelock",
                 stored.algorithm_timelock_activation_height,
                 desired.algorithm_timelock_activation_height,
@@ -2614,6 +2622,9 @@ impl<S: KvStore> ChainStore<S> {
             log_address_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.log_address_activation_height),
+            equivocation_replay_height: self
+                .get_chain_config()?
+                .and_then(|config| config.equivocation_replay_height),
             bloom_activation_height: self
                 .get_chain_config()?
                 .and_then(|config| config.bloom_activation_height),
@@ -2653,6 +2664,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_fee_activation = trusted.fee_accounting_activation_height;
         let trusted_bloom_activation = trusted.bloom_activation_height;
         let trusted_log_address_activation = trusted.log_address_activation_height;
+        let trusted_equivocation_replay = trusted.equivocation_replay_height;
         let trusted_algorithm_voting_window = trusted.algorithm_voting_window;
         let trusted_algorithm_proposal_identity = trusted.algorithm_proposal_identity_height;
         let trusted_algorithm_deprecation = trusted.algorithm_deprecation_height;
@@ -2820,6 +2832,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.fee_accounting_activation_height != trusted_fee_activation
                     || config.bloom_activation_height != trusted_bloom_activation
                     || config.log_address_activation_height != trusted_log_address_activation
+                    || config.equivocation_replay_height != trusted_equivocation_replay
                     || config.algorithm_voting_window != trusted_algorithm_voting_window
                     || config.algorithm_proposal_identity_height
                         != trusted_algorithm_proposal_identity
@@ -2945,6 +2958,16 @@ impl<S: KvStore> ChainStore<S> {
         {
             return Err(StorageError::State(
                 "snapshot is missing the trusted log address activation".into(),
+            ));
+        }
+
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.equivocation_replay_height)
+            != trusted_equivocation_replay
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted equivocation replay activation".into(),
             ));
         }
 
@@ -3338,6 +3361,7 @@ impl<S: KvStore> ChainStore<S> {
         // chain identity with the head so a fresh destination remains bootable.
         let config = ChainConfig {
             log_address_activation_height: trusted_log_address_activation,
+            equivocation_replay_height: trusted_equivocation_replay,
             algorithm_voting_window: trusted_algorithm_voting_window,
             algorithm_proposal_identity_height: trusted_algorithm_proposal_identity,
             algorithm_deprecation_height: trusted_algorithm_deprecation,
@@ -5273,6 +5297,7 @@ mod tests {
 
         let config = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -5326,6 +5351,7 @@ mod tests {
         let restarted = ChainStore::new(store);
         let changed = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -5365,6 +5391,7 @@ mod tests {
                 chain_id: 1337,
                 genesis_hash: ShellHash::ZERO,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5394,6 +5421,7 @@ mod tests {
             let before = store.scan_prefix(b"").unwrap();
             let untrusted = ChainConfig {
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5455,6 +5483,7 @@ mod tests {
                 genesis_hash: ShellHash::ZERO,
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5484,6 +5513,7 @@ mod tests {
             let untrusted = ChainConfig {
                 fee_accounting_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5535,6 +5565,47 @@ mod tests {
     }
 
     #[test]
+    fn equivocation_replay_schedule_is_immutable_and_snapshot_bound() {
+        for height in [None, Some(5)] {
+            let store = Arc::new(MemoryDb::new());
+            let chain = ChainStore::new(store.clone());
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                "equivocation_replay_height":height,
+            }))
+            .unwrap();
+            chain.put_chain_config(&trusted).unwrap();
+            let mut scheduled = trusted.clone();
+            scheduled.equivocation_replay_height = Some(6);
+            if height.is_some() {
+                assert!(chain.schedule_protocol_activations(&scheduled).is_err());
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            writer
+                .write_entry(
+                    prefix::CHAIN_CONFIG,
+                    &serde_json::to_vec(&scheduled).unwrap(),
+                )
+                .unwrap();
+            writer.finalize().unwrap();
+            assert!(chain
+                .import_snapshot_with_config(std::io::Cursor::new(bytes), &trusted)
+                .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn log_address_activation_snapshot_mismatch_is_rejected_before_writes() {
         for trusted_height in [None, Some(5)] {
             let store = Arc::new(MemoryDb::new());
@@ -5545,6 +5616,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: trusted_height,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5574,6 +5646,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: Some(6),
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5634,6 +5707,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5663,6 +5737,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -5762,6 +5837,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: trusted_height.map(|activation_height| {
                     AlgorithmVotingWindow {
                         activation_height,
@@ -5796,6 +5872,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: snapshot_interval.map(|block_time_secs| {
                     AlgorithmVotingWindow {
                         activation_height: 5,
@@ -5867,6 +5944,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_proposal_identity_height: None,
@@ -5896,6 +5974,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_proposal_identity_height: None,
@@ -5962,6 +6041,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -5994,6 +6074,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6063,6 +6144,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6095,6 +6177,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6164,6 +6247,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6196,6 +6280,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6310,6 +6395,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6342,6 +6428,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6411,6 +6498,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6443,6 +6531,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6512,6 +6601,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6544,6 +6634,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6613,6 +6704,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6645,6 +6737,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6714,6 +6807,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -6746,6 +6840,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -7128,6 +7223,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -7160,6 +7256,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: Some(AlgorithmVotingWindow {
                     activation_height: 0,
                     block_time_secs: 2,
@@ -7229,6 +7326,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -7258,6 +7356,7 @@ mod tests {
                 fee_accounting_activation_height: None,
                 bloom_activation_height: None,
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -7596,6 +7695,7 @@ mod tests {
         let mismatched_configs = [
             ChainConfig {
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -7625,6 +7725,7 @@ mod tests {
             },
             ChainConfig {
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -7696,6 +7797,7 @@ mod tests {
         let cs = ChainStore::new(store);
         let config = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -7832,6 +7934,7 @@ mod tests {
             cs.get_chain_config().unwrap(),
             Some(ChainConfig {
                 log_address_activation_height: None,
+                equivocation_replay_height: None,
                 algorithm_voting_window: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_deprecation_height: None,
@@ -8771,6 +8874,7 @@ mod tests {
         let head_hash = head.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -9393,6 +9497,7 @@ mod tests {
 
             cs.put_chain_config(&ChainConfig {
                 log_address_activation_height: log_activation,
+                equivocation_replay_height: None,
                 algorithm_voting_window: quorum_activation.map(|height| AlgorithmVotingWindow {
                     activation_height: height + 1,
                     block_time_secs: 2,
@@ -9662,6 +9767,7 @@ mod tests {
         put_canonical(&cs, &b0);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -9736,6 +9842,7 @@ mod tests {
         put_canonical(&cs, &genesis);
         cs.put_chain_config(&ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -11082,6 +11189,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
@@ -11128,6 +11236,7 @@ mod tests {
         let genesis_hash = block.hash();
         let config = ChainConfig {
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,

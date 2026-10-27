@@ -2652,6 +2652,7 @@ mod tests {
             chain_id: 1337,
             genesis_hash: ShellHash::ZERO,
             log_address_activation_height: None,
+            equivocation_replay_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,
             algorithm_deprecation_height: None,
