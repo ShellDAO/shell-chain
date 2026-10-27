@@ -52,6 +52,11 @@ impl<S: KvStore + 'static> LegacyEvmApiServer for RpcHandler<S> {
         let dev = self.dev_control.as_ref().ok_or_else(|| {
             feature_not_enabled("legacy evm dev namespace not enabled on this node")
         })?;
-        dev.revert(&snapshot_id).map_err(internal_err)
+        let reverted = dev.revert(&snapshot_id).map_err(internal_err)?;
+        if reverted {
+            let finalized = self.finality.read().last_finalized_number();
+            *self.finalized_number.write() = finalized;
+        }
+        Ok(reverted)
     }
 }

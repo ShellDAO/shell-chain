@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh the shared RPC finality view after a successful development
+  `evm_revert`, so `safe` and `finalized` queries follow the restored snapshot
+  instead of referring to blocks removed by the rewind.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

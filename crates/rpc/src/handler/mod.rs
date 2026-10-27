@@ -1419,6 +1419,7 @@ mod tests {
     struct MockDevControl {
         mined: AtomicU64,
         increased: AtomicU64,
+        revert_finality: Option<Arc<parking_lot::RwLock<FinalityState>>>,
     }
 
     #[derive(Default)]
@@ -1548,7 +1549,13 @@ mod tests {
         }
 
         fn revert(&self, snapshot_id: &str) -> Result<bool, String> {
-            Ok(snapshot_id == "0x1")
+            if snapshot_id != "0x1" {
+                return Ok(false);
+            }
+            if let Some(finality) = &self.revert_finality {
+                *finality.write() = FinalityState::new();
+            }
+            Ok(true)
         }
     }
 
@@ -1759,6 +1766,61 @@ mod tests {
         assert!(!LegacyEvmApiServer::revert(&handler, "0x2".into())
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn evm_revert_updates_shared_finality_tags() {
+        let handler = setup();
+        let dev = Arc::new(MockDevControl {
+            revert_finality: Some(handler.finality.clone()),
+            ..Default::default()
+        });
+        let handler = handler.with_dev_control(dev);
+        let reader = handler.clone();
+        let genesis = make_genesis_block();
+        let genesis_hash = genesis.hash();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                number: 1,
+                ..make_genesis_block().header
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let hash = block.hash();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler.chain_store.set_canonical(0, &genesis_hash).unwrap();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        *handler.finality.write() = FinalityState::with_finalized(1, hash);
+        *handler.finalized_number.write() = 1;
+
+        assert!(!LegacyEvmApiServer::revert(&handler, "0x2".into())
+            .await
+            .unwrap());
+        assert_eq!(reader.parse_block_number("finalized").unwrap(), Some(1));
+        assert!(LegacyEvmApiServer::revert(&handler, "0x1".into())
+            .await
+            .unwrap());
+        for tag in ["safe", "finalized"] {
+            let block = EthApiServer::get_block_by_number(&reader, tag.into(), false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(block.number, "0x0");
+            let block = ShellApiServer::shell_get_block_by_number(
+                &reader,
+                tag.into(),
+                Some("summary".into()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(block.number, "0x0");
+        }
     }
 
     #[tokio::test]

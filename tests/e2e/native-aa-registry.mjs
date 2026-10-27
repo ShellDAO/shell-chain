@@ -42,6 +42,7 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const devSnapshotScenario = process.argv.includes("--dev-snapshot-revert");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: devSnapshotScenario ? "dev-snapshot-revert" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -124,12 +125,16 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    sameHeightForkScenario
+    devSnapshotScenario
+      ? "One isolated loopback dev/wPoA/RocksDB authority with temporary accounts, nested execution snapshots and a process reopen."
+      : sameHeightForkScenario
       ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
       : twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
       : `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
-    "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
+    devSnapshotScenario
+      ? "Development snapshot IDs belong to the current process; restored execution state is checked after a database reopen."
+      : "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
 if (pruneFollower)
@@ -184,7 +189,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--db",
     "rocksdb",
     "--rpc-api",
-    "eth,net,web3,shell,debug,trace",
+    devSnapshotScenario ? "eth,net,web3,shell,evm" : "eth,net,web3,shell,debug,trace",
     "--storage-profile",
     pruneFollower && i === 1 ? "light" : "full",
     "--p2p",
@@ -491,6 +496,84 @@ async function runScenario() {
       JSON.stringify(genesis, null, 2),
     );
   await start(0, dirs[0], keyPath, "leader");
+  if (devSnapshotScenario) {
+    const recipient = "0x" + "56".repeat(32);
+    const blockState = (block) => block && ({
+      number: block.number, hash: block.hash, stateRoot: block.stateRoot,
+    });
+    const executionState = async () => ({
+      head: blockState(await rpc(0, "eth_getBlockByNumber", ["latest", false])),
+      safe: blockState(await rpc(0, "eth_getBlockByNumber", ["safe", false])),
+      finalized: blockState(await rpc(0, "eth_getBlockByNumber", ["finalized", false])),
+      nonce: await rpc(0, "eth_getTransactionCount", [miner.getAddress(), "latest"]),
+      pendingNonce: await rpc(0, "eth_getTransactionCount", [miner.getAddress(), "pending"]),
+      senderBalance: await rpc(0, "eth_getBalance", [miner.getAddress(), "latest"]),
+      balance: await rpc(0, "eth_getBalance", [recipient, "latest"]),
+    });
+    const transfer = async (value) => {
+      const signed = await miner.buildSignedTransaction({
+        tx: buildTransaction({ chainId: 1337, nonce: await nonce(miner), to: recipient,
+          value: BigInt(value), gasLimit: 21000 }),
+        includePublicKey: true,
+      });
+      const hash = await paced(() => providers[0].sendTransaction(signed));
+      const entry = { hash, value };
+      result.transactions.push(entry);
+      await save();
+      for (let k = 0; k < 120; k++) {
+        entry.receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        const finalized = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+        if (entry.receipt && finalized
+          && BigInt(finalized.number) >= BigInt(entry.receipt.blockNumber)) break;
+        await pause(250);
+      }
+      assert.equal(entry.receipt?.status, "0x1");
+      const finalized = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+      assert.ok(finalized && BigInt(finalized.number) >= BigInt(entry.receipt.blockNumber));
+      await save();
+      return entry;
+    };
+    await transfer(1);
+    const before = await executionState();
+    const initial = await rpc(0, "evm_snapshot");
+    const first = await transfer(11);
+    const newer = await rpc(0, "evm_snapshot");
+    const second = await transfer(13);
+    assert.equal(BigInt((await executionState()).balance), 25n);
+    assert.equal(await rpc(0, "evm_revert", [initial]), true);
+    const reverted = await executionState();
+    result.devSnapshot = { before, reverted };
+    await save();
+    assert.deepEqual(reverted, before);
+    for (const tag of ["safe", "finalized"]) {
+      const block = await rpc(0, "shell_getBlockByNumber", [tag, "hashes"]);
+      assert.equal(block?.hash, before.finalized.hash);
+      assert.equal(await rpc(0, "eth_getBalance", [recipient, tag]), before.balance);
+    }
+    for (const entry of [first, second])
+      assert.equal(await rpc(0, "eth_getTransactionReceipt", [entry.hash]), null);
+    assert.equal(await rpc(0, "evm_revert", [initial]), false);
+    assert.equal(await rpc(0, "evm_revert", [newer]), false);
+    const continued = await transfer(31);
+    const after = await executionState();
+    assert.equal(BigInt(after.balance), 32n);
+    assert.equal(BigInt(after.nonce), BigInt(before.nonce) + 1n);
+    const producer = nodes[0];
+    await stop(0);
+    assert.equal(producer.exitCode, 0, "producer stopped gracefully");
+    await start(0, dirs[0], keyPath, "dev-snapshot-reopen");
+    assert.deepEqual(await executionState(), after);
+    assert.deepEqual(await rpc(0, "eth_getTransactionReceipt", [continued.hash]), continued.receipt);
+    for (const entry of [first, second])
+      assert.equal(await rpc(0, "eth_getTransactionReceipt", [entry.hash]), null);
+    result.devSnapshot.after = after;
+    result.devSnapshot.reopenVerified = true;
+    const reopened = nodes[0];
+    await stop(0);
+    assert.equal(reopened.exitCode, 0, "reopened node stopped gracefully");
+    result.passed = true;
+    return;
+  }
   let bootnode;
   for (let k = 0; k < 80; k++) {
     bootnode = (await readFile(join(out, "leader-node.log"), "utf8")).match(

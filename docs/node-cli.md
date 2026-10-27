@@ -21,6 +21,7 @@
    - [version](#211-version)
 3. [Environment Variables](#3-environment-variables)
 4. [Exit Codes](#4-exit-codes)
+5. [Development Snapshot Check](#5-development-snapshot-check)
 
 ---
 
@@ -376,6 +377,28 @@ Prints the binary version and build metadata.
 | `143` | Terminated (SIGTERM) |
 
 ---
+
+## 5. Development Snapshot Check
+
+Unreleased source refreshes the shared RPC finality view after `evm_revert`.
+The published v0.27.13 binary can return `null` for `safe` and `finalized`
+immediately after a successful rewind. Use a binary containing the fix for
+this check, with Node.js 24+ and a compatible built `shell-sdk`
+(`0.14.0-rc.3` verified):
+
+```bash
+cargo build --locked -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --dev-snapshot-revert
+```
+
+The check creates temporary keys, isolated RocksDB data and loopback listeners.
+It submits four genuine transfers, takes nested snapshots at a nonzero
+finalized height, verifies the restored balances and `safe`/`finalized` tags,
+checks that consumed snapshot IDs and reverted receipts stay unavailable,
+then spends from the restored nonce and reopens the database. Development
+snapshot IDs are local to the current node process.
 
 ## See Also
 

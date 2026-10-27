@@ -394,6 +394,8 @@ revert(snapshot_id: String) → bool
 
 Revert to a previously captured snapshot. A successful revert consumes
 the selected snapshot and any snapshots created after it.
+Unreleased: a successful rewind also refreshes the `safe` and `finalized` RPC tags.
+Development snapshot IDs are local to the current node process.
 
 
 ## shell_  namespace
