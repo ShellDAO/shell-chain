@@ -2,14 +2,28 @@ use super::*;
 
 const MAX_FEE_HISTORY_REWARD_PERCENTILES: usize = 100;
 
-fn rpc_logs_from_core(logs: Vec<shell_core::Log>) -> Vec<RpcLog> {
+pub(super) fn rpc_logs_from_core(
+    logs: Vec<shell_core::Log>,
+    block_hash: ShellHash,
+    block_number: u64,
+    transaction_hash: ShellHash,
+    transaction_index: u64,
+    first_log_index: u64,
+) -> Vec<RpcLogWithMeta> {
     logs.into_iter()
-        .map(|log| {
+        .enumerate()
+        .map(|(index, log)| {
             let data = hex_bytes(log.data.as_ref());
-            RpcLog {
+            RpcLogWithMeta {
                 address: log.address,
                 topics: log.topics,
                 data,
+                block_number: hex_u64(block_number),
+                block_hash,
+                transaction_hash,
+                transaction_index: hex_u64(transaction_index),
+                log_index: hex_u64(first_log_index + index as u64),
+                removed: false,
             }
         })
         .collect()
@@ -266,6 +280,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         } else {
                             BlockTxDetail::Hashes
                         },
+                        false,
                     );
                     rpc
                 }))
@@ -286,6 +301,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         } else {
                             BlockTxDetail::Hashes
                         },
+                        false,
                     );
                     rpc
                 }))
@@ -303,6 +319,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         } else {
                             BlockTxDetail::Hashes
                         },
+                        false,
                     );
                     rpc
                 }))
@@ -428,6 +445,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 } else {
                     BlockTxDetail::Hashes
                 },
+                false,
             );
             rpc
         }))
@@ -502,6 +520,11 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .map_err(internal_err)?;
             if let (Some(block), Some(receipts)) = (block, receipts) {
                 if let Some(receipt) = receipts.get(tx_index as usize).cloned() {
+                    let first_log_index = receipts
+                        .iter()
+                        .take(tx_index as usize)
+                        .map(|receipt| receipt.logs.len() as u64)
+                        .sum();
                     // F-067: populate from/to/effective_gas_price from the transaction.
                     let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
                         if let Some(tx) = block.transactions.get(tx_index as usize) {
@@ -556,7 +579,14 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                         effective_gas_price: hex_u64(eff_gas_price),
                         contract_address: receipt.contract_address,
-                        logs: rpc_logs_from_core(receipt.logs),
+                        logs: rpc_logs_from_core(
+                            receipt.logs,
+                            block_hash,
+                            receipt.block_number,
+                            receipt.tx_hash,
+                            tx_index as u64,
+                            first_log_index,
+                        ),
                         logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
                         tx_type: format!("{:#x}", tx_type_val),
                         shell_type,
@@ -617,7 +647,9 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             .collect();
 
         let mut rpc_receipts = Vec::with_capacity(receipts.len());
+        let mut first_log_index = 0;
         for (i, receipt) in receipts.into_iter().enumerate() {
+            let log_count = receipt.logs.len() as u64;
             let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
                 if let Some(tx) = block_obj.transactions.get(i) {
                     let price = shell_core::effective_gas_price(
@@ -667,12 +699,20 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                 effective_gas_price: hex_u64(eff_gas_price),
                 contract_address: receipt.contract_address,
-                logs: rpc_logs_from_core(receipt.logs),
+                logs: rpc_logs_from_core(
+                    receipt.logs,
+                    block_hash,
+                    receipt.block_number,
+                    receipt.tx_hash,
+                    i as u64,
+                    first_log_index,
+                ),
                 logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
                 tx_type: format!("{:#x}", tx_type_val),
                 shell_type,
                 reward_kind,
             });
+            first_log_index += log_count;
         }
 
         Ok(rpc_receipts)

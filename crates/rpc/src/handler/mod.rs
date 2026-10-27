@@ -1022,6 +1022,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         block: &Block,
         rpc: &mut RpcBlock,
         detail: BlockTxDetail,
+        rewards_first: bool,
     ) {
         let block_hash = block.hash();
         let Ok(system_txs) = self.chain_store.get_system_transactions(&block_hash) else {
@@ -1030,42 +1031,38 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         if system_txs.is_empty() {
             return;
         }
-
         let Ok(mut existing) =
             serde_json::from_value::<Vec<serde_json::Value>>(rpc.transactions.clone())
         else {
             return;
         };
-        let ordered_system_txs = ordered_system_txs(&system_txs);
-        match detail {
-            BlockTxDetail::Full => {
-                let mut merged: Vec<serde_json::Value> = ordered_system_txs
-                    .into_iter()
-                    .filter_map(|tx| {
-                        serde_json::to_value(system_tx_to_rpc(tx, Some(block_hash))).ok()
-                    })
-                    .collect();
-                merged.extend(existing);
-                existing = merged;
-            }
-            BlockTxDetail::Summary => {
-                let mut merged: Vec<serde_json::Value> = ordered_system_txs
-                    .into_iter()
-                    .filter_map(|tx| {
-                        serde_json::to_value(system_tx_to_rpc_summary(tx, Some(block_hash))).ok()
-                    })
-                    .collect();
-                merged.extend(existing);
-                existing = merged;
-            }
-            BlockTxDetail::Hashes => {
-                let mut merged: Vec<serde_json::Value> = ordered_system_txs
-                    .into_iter()
-                    .map(|tx| serde_json::json!(tx.hash()))
-                    .collect();
-                merged.extend(existing);
-                existing = merged;
-            }
+        // Shell summaries prioritize rewards for display; ETH block arrays must
+        // keep the execution positions exposed by transaction/receipt indices.
+        let mut ordered = ordered_system_txs(&system_txs);
+        if !rewards_first {
+            ordered.sort_by_key(|tx| tx.tx_index);
+        }
+        let mut rewards = match detail {
+            BlockTxDetail::Full => ordered
+                .into_iter()
+                .filter_map(|tx| serde_json::to_value(system_tx_to_rpc(tx, Some(block_hash))).ok())
+                .collect::<Vec<_>>(),
+            BlockTxDetail::Summary => ordered
+                .into_iter()
+                .filter_map(|tx| {
+                    serde_json::to_value(system_tx_to_rpc_summary(tx, Some(block_hash))).ok()
+                })
+                .collect(),
+            BlockTxDetail::Hashes => ordered
+                .into_iter()
+                .map(|tx| serde_json::json!(tx.hash()))
+                .collect(),
+        };
+        if rewards_first {
+            rewards.extend(existing);
+            existing = rewards;
+        } else {
+            existing.extend(rewards);
         }
         rpc.transactions = serde_json::Value::Array(existing);
     }
@@ -6259,6 +6256,152 @@ mod tests {
     #[tokio::test]
     async fn bloom_activation_mixed_height_filter_polling() {
         assert_bloom_activation_query(true).await;
+    }
+
+    #[tokio::test]
+    async fn receipt_log_metadata_is_block_global_and_shared_across_apis() {
+        let handler = setup();
+        let (template_hash, _) = store_block_with_tx(&handler, 0, true);
+        let template = handler
+            .chain_store
+            .get_block_by_hash(&template_hash)
+            .unwrap()
+            .unwrap()
+            .transactions[0]
+            .clone();
+        let log = shell_core::Log {
+            address: test_address(b"receipt-log-emitter"),
+            topics: vec![ShellHash::from([0x42; 32])],
+            data: Bytes::from(vec![7]),
+        };
+        let hash = store_block_with_logs(
+            &handler,
+            1,
+            vec![
+                vec![log.clone(), log.clone()],
+                vec![],
+                vec![log.clone()],
+                vec![log.clone(), log],
+            ],
+        );
+        let mut block = handler
+            .chain_store
+            .get_block_by_hash(&hash)
+            .unwrap()
+            .unwrap();
+        block.transactions = (0..4)
+            .map(|index| {
+                let mut tx = template.clone();
+                tx.tx.nonce = index + 10;
+                tx
+            })
+            .collect();
+        handler.chain_store.put_block(&block).unwrap();
+        let mut receipts = handler.chain_store.get_receipts(&hash).unwrap().unwrap();
+        for (index, receipt) in receipts.iter_mut().enumerate() {
+            receipt.tx_hash = block.transactions[index].hash();
+        }
+        let reward = SystemTransaction::block_gas_reward(
+            42,
+            1,
+            4,
+            block.header.proposer,
+            U256::from(10u64),
+            block.header.parent_hash,
+        );
+        handler
+            .chain_store
+            .put_system_transactions(&hash, 1, std::slice::from_ref(&reward))
+            .unwrap();
+        receipts.push(shell_core::TransactionReceipt {
+            tx_hash: reward.hash(),
+            block_number: 1,
+            tx_index: 4,
+            status: 1,
+            gas_used: 0,
+            cumulative_gas_used: 0,
+            contract_address: None,
+            logs_bloom: Bytes::default(),
+            logs: vec![],
+        });
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        let stored_before = serde_json::to_value(&receipts).unwrap();
+        let expected_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .chain(std::iter::once(reward.hash()))
+            .collect::<Vec<_>>();
+        for rpc_block in [
+            EthApiServer::get_block_by_hash(&handler, hash, false)
+                .await
+                .unwrap()
+                .unwrap(),
+            EthApiServer::get_block_by_number(&handler, "0x1".into(), false)
+                .await
+                .unwrap()
+                .unwrap(),
+        ] {
+            assert_eq!(
+                rpc_block.transactions,
+                serde_json::to_value(&expected_hashes).unwrap()
+            );
+        }
+        let full = EthApiServer::get_block_by_hash(&handler, hash, true)
+            .await
+            .unwrap()
+            .unwrap();
+        for (index, tx) in full.transactions.as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                tx["hash"],
+                serde_json::to_value(expected_hashes[index]).unwrap()
+            );
+            assert_eq!(tx["transactionIndex"], format!("0x{index:x}"));
+        }
+        let block_receipts = EthApiServer::get_block_receipts(&handler, "0x1".into())
+            .await
+            .unwrap();
+        let expected_indices = [vec![0, 1], vec![], vec![2], vec![3, 4]];
+        for (index, expected) in expected_indices.iter().enumerate() {
+            let tx_hash = block.transactions[index].hash();
+            let receipt = EthApiServer::get_transaction_receipt(&handler, tx_hash)
+                .await
+                .unwrap()
+                .unwrap();
+            let summary = ShellApiServer::get_transaction_summary(
+                &handler,
+                tx_hash,
+                Some(RpcTransactionSummaryOptions {
+                    include_receipt: Some(true),
+                }),
+            )
+            .await
+            .unwrap();
+            let json = serde_json::to_value(&receipt).unwrap();
+            assert_eq!(serde_json::to_value(&block_receipts[index]).unwrap(), json);
+            assert_eq!(
+                serde_json::to_value(summary.receipt.unwrap()).unwrap(),
+                json
+            );
+            assert_eq!(json["logs"].as_array().unwrap().len(), expected.len());
+            for (entry, log_index) in json["logs"].as_array().unwrap().iter().zip(expected) {
+                assert_eq!(
+                    entry["transactionHash"],
+                    serde_json::to_value(tx_hash).unwrap()
+                );
+                assert_eq!(entry["blockHash"], serde_json::to_value(hash).unwrap());
+                assert_eq!(entry["blockNumber"], "0x1");
+                assert_eq!(entry["transactionIndex"], format!("0x{index:x}"));
+                assert_eq!(entry["logIndex"], format!("0x{log_index:x}"));
+                assert_eq!(entry["removed"], false);
+                assert_eq!(entry["data"], "0x07");
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(handler.chain_store.get_receipts(&hash).unwrap().unwrap())
+                .unwrap(),
+            stored_before
+        );
     }
 
     /// Helper: store a block with receipts that contain logs and return the block hash.

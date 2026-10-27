@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Include block and transaction identity, block-global log indices and removal
+  flags in receipt logs returned by the Ethereum receipt methods and Shell
+  transaction summaries. Context is reconstructed from retained block receipts;
+  stored receipt encoding does not change. Ethereum block transaction arrays now
+  retain execution order so their positions match receipt indices; Shell block
+  summaries retain their reward-first display.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

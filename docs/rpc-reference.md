@@ -481,6 +481,8 @@ get_transaction_summary(hash: ShellHash, options: Option<crate::types::RpcTransa
 ```
 
 Returns a compact transaction view with optional receipt.
+Unreleased: an included receipt has the same contextual log objects as
+`eth_getTransactionReceipt` and `eth_getBlockReceipts`.
 
 ### shell_getValidatorSnapshot
 ```

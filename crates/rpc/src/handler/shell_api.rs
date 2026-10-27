@@ -39,7 +39,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     ) -> RpcBlock {
         let mut rpc = block_to_rpc_with_detail(block, detail);
         self.fill_stark_metadata(&block.hash(), &mut rpc);
-        self.attach_system_txs(block, &mut rpc, detail);
+        self.attach_system_txs(block, &mut rpc, detail, true);
         if let Some(limit) = tx_limit {
             if let serde_json::Value::Array(ref mut txs) = rpc.transactions {
                 txs.truncate(limit);
@@ -237,9 +237,20 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         block_hash: ShellHash,
         tx_index: u32,
     ) -> Result<Option<RpcReceipt>, shell_storage::StorageError> {
-        let Some(receipt) = self.chain_store.get_receipt_by_tx_hash(hash)? else {
+        let Some(receipts) = self.chain_store.get_receipts(&block_hash)? else {
             return Ok(None);
         };
+        let Some(receipt) = receipts.get(tx_index as usize).cloned() else {
+            return Ok(None);
+        };
+        if receipt.tx_hash != *hash {
+            return Ok(None);
+        }
+        let first_log_index = receipts
+            .iter()
+            .take(tx_index as usize)
+            .map(|receipt| receipt.logs.len() as u64)
+            .sum();
         let (from, to, effective_gas_price, tx_type, shell_type, reward_kind) =
             if let Some(tx) = block.transactions.get(tx_index as usize) {
                 let shell_type = if tx.is_aa_bundle() {
@@ -287,15 +298,14 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
             effective_gas_price: hex_u64(effective_gas_price),
             contract_address: receipt.contract_address,
-            logs: receipt
-                .logs
-                .into_iter()
-                .map(|log| RpcLog {
-                    address: log.address,
-                    topics: log.topics,
-                    data: hex_bytes(log.data.as_ref()),
-                })
-                .collect(),
+            logs: super::eth::rpc_logs_from_core(
+                receipt.logs,
+                block_hash,
+                receipt.block_number,
+                receipt.tx_hash,
+                tx_index as u64,
+                first_log_index,
+            ),
             logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
             tx_type: format!("{:#x}", tx_type),
             shell_type,
@@ -384,7 +394,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             } else {
                 self.fill_stark_metadata(&b.hash(), &mut rpc);
             }
-            self.attach_system_txs(b, &mut rpc, detail);
+            self.attach_system_txs(b, &mut rpc, detail, true);
             rpc
         }))
     }
@@ -407,7 +417,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             } else {
                 self.fill_stark_metadata(&hash, &mut rpc);
             }
-            self.attach_system_txs(b, &mut rpc, detail);
+            self.attach_system_txs(b, &mut rpc, detail, true);
             rpc
         }))
     }

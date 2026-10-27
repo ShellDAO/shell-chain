@@ -629,6 +629,32 @@ Returns the receipt of a mined transaction.
 
 **Returns:** `Object|null` — Receipt object (includes `status`, `gasUsed`, `logs`, `blockNumber`, `shellType`, `rewardKind`, etc.) or `null` if not yet mined.
 
+Unreleased source includes `transactionHash`, `transactionIndex`, `blockHash`,
+`blockNumber`, block-global `logIndex` and `removed: false` on each receipt log,
+in addition to `address`, `topics` and `data`. The same context is returned by
+`eth_getBlockReceipts` and `shell_getTransactionSummary` with `includeReceipt`.
+Published v0.27.13 receipt logs contain only the three payload fields. Stored
+receipt data needs no migration; the node derives context from the containing
+block and preceding receipts. Unreleased Ethereum block transaction arrays also
+retain execution order, so array positions match transaction indices. Shell
+block summaries retain their reward-first display.
+
+From a source checkout containing this fix, with Node.js 24+ and a compatible
+built `shell-sdk` (`0.14.0-rc.3` verified), run:
+
+```bash
+cargo build --locked -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --receipt-logs
+```
+
+This isolated check creates temporary accounts and a small genesis log emitter,
+executes three genuine signed calls, checks all three receipt entrances against
+canonical block positions and actual log queries, then reopens RocksDB. Genesis
+code allocation is a test fixture; this check does not claim contract deployment
+or production activation.
+
 ---
 
 ### eth_sendRawTransaction

@@ -328,7 +328,7 @@ pub struct RpcReceipt {
     pub cumulative_gas_used: String,
     pub effective_gas_price: String,
     pub contract_address: Option<Address>,
-    pub logs: Vec<RpcLog>,
+    pub logs: Vec<RpcLogWithMeta>,
     pub logs_bloom: String,
     #[serde(rename = "type")]
     pub tx_type: String,
@@ -338,7 +338,7 @@ pub struct RpcReceipt {
     pub reward_kind: Option<String>,
 }
 
-/// Hex-encoded log response.
+/// Payload-only log representation. Mined receipt/query logs use `RpcLogWithMeta`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcLog {

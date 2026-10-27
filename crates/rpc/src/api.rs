@@ -423,6 +423,8 @@ pub trait ShellApi {
     ) -> Result<crate::types::RpcAddressTransactionsV2Page, jsonrpsee::types::ErrorObjectOwned>;
 
     /// Returns a compact transaction view with optional receipt.
+    /// Unreleased: an included receipt has the same contextual log objects as
+    /// `eth_getTransactionReceipt` and `eth_getBlockReceipts`.
     #[method(name = "getTransactionSummary")]
     async fn get_transaction_summary(
         &self,
