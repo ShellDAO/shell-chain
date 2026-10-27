@@ -491,6 +491,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
         *self.challenge_lifecycle.lock() = recovered;
         self.recover_unfinalized_head()?;
+        self.restore_dev_clock()?;
         // Normal restarts may not rewind any blocks. Restore policy from the
         // recovered canonical state before exposing RPC or admitting transactions.
         let registry = load_algorithm_registry(&self.world_state.read()).map_err(|error| {
@@ -1042,7 +1043,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 continue;
                             }
                         };
-                        let now_secs = Self::wall_clock_secs();
+                        let now_secs = self.block_clock_secs();
                         if !Self::block_time_elapsed(
                             head.header.timestamp,
                             now_secs,
@@ -3244,7 +3245,7 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or(0)
     }
 
-    fn wall_clock_secs() -> u64 {
+    pub(super) fn wall_clock_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

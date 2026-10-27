@@ -42,6 +42,7 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const devTimeScenario = process.argv.includes("--dev-time-controls");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: devTimeScenario ? "dev-time-controls" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -124,12 +125,16 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    sameHeightForkScenario
+    devTimeScenario
+      ? "One isolated loopback dev/wPoA/RocksDB authority with temporary keys and a future virtual clock."
+      : sameHeightForkScenario
       ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
       : twoAuthorities
       ? "Two isolated full RocksDB authority nodes, loopback libp2p, SLH-DSA-SHA2-256f and ML-DSA keys."
       : `Two isolated CLI/RocksDB nodes, loopback libp2p, one ${sphincsSignersScenario ? "SLH-DSA-SHA2-256f" : "ML-DSA"} authority and one non-authority follower; normal block production and finality.`,
-    "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
+    devTimeScenario
+      ? "Manual mining is distinct from consensus finality; normal transaction finality and continued spending after database reopen are checked."
+      : "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
 if (pruneFollower)
@@ -184,7 +189,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--db",
     "rocksdb",
     "--rpc-api",
-    "eth,net,web3,shell,debug,trace",
+    devTimeScenario ? "eth,net,web3,shell,evm" : "eth,net,web3,shell,debug,trace",
     "--storage-profile",
     pruneFollower && i === 1 ? "light" : "full",
     "--p2p",
@@ -491,6 +496,86 @@ async function runScenario() {
       JSON.stringify(genesis, null, 2),
     );
   await start(0, dirs[0], keyPath, "leader");
+  if (devTimeScenario) {
+    const recipient = "0x" + "57".repeat(32);
+    const blockView = (b) => ({ number: b.number, hash: b.hash,
+      parentHash: b.parentHash, timestamp: b.timestamp, stateRoot: b.stateRoot });
+    const snapshot = async () => ({
+      head: blockView(await rpc(0, "eth_getBlockByNumber", ["latest", false])),
+      finalized: blockView(await rpc(0, "eth_getBlockByNumber", ["finalized", false])),
+      nonce: await rpc(0, "eth_getTransactionCount", [miner.getAddress(), "latest"]),
+      balance: await rpc(0, "eth_getBalance", [recipient, "latest"]),
+    });
+    const transfer = async (value) => {
+      const signed = await miner.buildSignedTransaction({
+        tx: buildTransaction({ chainId: 1337, nonce: await nonce(miner),
+          to: recipient, value: BigInt(value), gasLimit: 21000 }), includePublicKey: true,
+      });
+      const entry = { value, hash: await paced(() => providers[0].sendTransaction(signed)) };
+      result.transactions.push(entry);
+      await save();
+      for (let k = 0; k < 100; k++) {
+        entry.receipt = await rpc(0, "eth_getTransactionReceipt", [entry.hash]);
+        const fin = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+        if (entry.receipt && fin && BigInt(fin.number) >= BigInt(entry.receipt.blockNumber)) break;
+        await pause(200);
+      }
+      assert.equal(entry.receipt?.status, "0x1");
+      const fin = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+      assert.ok(fin && BigInt(fin.number) >= BigInt(entry.receipt.blockNumber));
+      await save();
+      return entry;
+    };
+    await transfer(1);
+    const before = await snapshot();
+    for (const params of [[257], ["1"]]) {
+      await assert.rejects(() => rpc(0, "evm_mine", params), (e) => e.code === -32602);
+      assert.deepEqual(await snapshot(), before);
+    }
+    const timestamp = Math.floor(Date.now() / 1000) + 7200;
+    await rpc(0, "evm_setNextBlockTimestamp", [timestamp]);
+    await rpc(0, "evm_mine");
+    const first = blockView(await rpc(0, "eth_getBlockByNumber", ["latest", false]));
+    assert.equal(BigInt(first.number), BigInt(before.head.number) + 1n);
+    assert.equal(first.parentHash, before.head.hash);
+    assert.equal(BigInt(first.timestamp), BigInt(timestamp));
+    await rpc(0, "evm_increaseTime", [120]);
+    await rpc(0, "evm_mine", [2]);
+    const second = blockView(await rpc(0, "eth_getBlockByNumber", ["latest", false]));
+    assert.equal(BigInt(second.number), BigInt(first.number) + 2n);
+    assert.ok(BigInt(second.timestamp) >= BigInt(first.timestamp) + 120n);
+    await rpc(0, "evm_mine", [256]);
+    const mined = blockView(await rpc(0, "eth_getBlockByNumber", ["latest", false]));
+    assert.equal(BigInt(mined.number), BigInt(second.number) + 256n);
+    let previous = before.head;
+    for (let n = BigInt(previous.number) + 1n; n <= BigInt(mined.number); n++) {
+      const block = blockView(await rpc(0, "eth_getBlockByNumber", ["0x" + n.toString(16), false]));
+      assert.equal(block.parentHash, previous.hash);
+      assert.ok(BigInt(block.timestamp) > BigInt(previous.timestamp));
+      previous = block;
+    }
+    const continued = await transfer(41);
+    const after = await snapshot();
+    assert.equal(BigInt(after.balance), 42n);
+    assert.equal(BigInt(after.nonce), BigInt(before.nonce) + 1n);
+    const producer = nodes[0];
+    await stop(0);
+    assert.equal(producer.exitCode, 0);
+    await start(0, dirs[0], keyPath, "dev-time-reopen");
+    assert.deepEqual(await snapshot(), after);
+    assert.deepEqual(await rpc(0, "eth_getTransactionReceipt", [continued.hash]), continued.receipt);
+    await transfer(43);
+    const reopened = await snapshot();
+    assert.equal(BigInt(reopened.balance), 85n);
+    assert.equal(BigInt(reopened.nonce), BigInt(after.nonce) + 1n);
+    assert.ok(BigInt(reopened.head.timestamp) > BigInt(after.head.timestamp));
+    result.devTime = { before, first, second, mined, after, reopened };
+    const child = nodes[0];
+    await stop(0);
+    assert.equal(child.exitCode, 0);
+    result.passed = true;
+    return;
+  }
   let bootnode;
   for (let k = 0; k < 80; k++) {
     bootnode = (await readFile(join(out, "leader-node.log"), "utf8")).match(

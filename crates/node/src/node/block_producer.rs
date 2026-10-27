@@ -567,6 +567,7 @@ impl<S: KvStore + 'static> Node<S> {
             return Err(err.into());
         }
         algorithm_registry_rollback.commit();
+        self.note_dev_block_timestamp(block.header.timestamp);
         let committed_world_state =
             WorldState::at_root(self.store.clone(), &block.header.state_root)?;
         block_store.replace_world_state(committed_world_state);

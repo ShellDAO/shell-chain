@@ -21,6 +21,7 @@
    - [version](#211-version)
 3. [Environment Variables](#3-environment-variables)
 4. [Exit Codes](#4-exit-codes)
+5. [Development Time Check](#5-development-time-check)
 
 ---
 
@@ -376,6 +377,31 @@ Prints the binary version and build metadata.
 | `143` | Terminated (SIGTERM) |
 
 ---
+
+## 5. Development Time Check
+
+Unreleased source keeps the explicitly enabled `evm` development clock in sync
+with local block-production cadence. Published v0.27.13 can leave normal
+transactions waiting for wall time after mining a block with a future timestamp.
+The default RPC namespaces and network timestamp validation are unchanged.
+
+Use a binary containing this fix, Node.js 24+ and a compatible built `shell-sdk`
+(`0.14.0-rc.3` verified):
+
+```bash
+cargo build --locked -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --dev-time-controls
+```
+
+The check creates temporary accounts, RocksDB data and loopback listeners. It
+sets a future timestamp, advances virtual time, tests the 256-block mining cap
+and invalid requests, then requires genuine transfers to reach normal consensus
+finality before and after a database reopen. Manual mining alone is not treated
+as consensus finality. Development snapshots restore their clock offset; restart
+recovery derives it from the recovered canonical head. Snapshot IDs remain local
+to the node process.
 
 ## See Also
 

@@ -357,10 +357,12 @@ struct DevSnapshot {
     finalized_number: u64,
     pending_txs: Vec<SignedTransaction>,
     next_block_timestamp: Option<u64>,
+    clock_offset_secs: u64,
 }
 
 struct DevState {
     next_block_timestamp: Option<u64>,
+    clock_offset_secs: u64,
     next_snapshot_id: u64,
     snapshots: BTreeMap<u64, DevSnapshot>,
 }
@@ -1028,6 +1030,7 @@ impl<S: KvStore + 'static> Node<S> {
             runtime_signer: RwLock::new(None),
             dev_state: RwLock::new(DevState {
                 next_block_timestamp: None,
+                clock_offset_secs: 0,
                 next_snapshot_id: 1,
                 snapshots: BTreeMap::new(),
             }),
@@ -1544,17 +1547,45 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn current_block_timestamp(&self, parent_timestamp: u64) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let wall_time = Self::wall_clock_secs();
+        let dev_clock = self.config.rpc.has_api_namespace("evm");
         let mut dev = self.dev_state.write();
         let ts = if let Some(next) = dev.next_block_timestamp.take() {
             next
         } else {
-            now
+            wall_time.saturating_add(if dev_clock { dev.clock_offset_secs } else { 0 })
         };
         ts.max(parent_timestamp.saturating_add(1))
+    }
+
+    fn note_dev_block_timestamp(&self, timestamp: u64) {
+        if self.config.rpc.has_api_namespace("evm") {
+            self.dev_state.write().clock_offset_secs =
+                timestamp.saturating_sub(Self::wall_clock_secs());
+        }
+    }
+
+    fn block_clock_secs(&self) -> u64 {
+        let now = Self::wall_clock_secs();
+        if self.config.rpc.has_api_namespace("evm") {
+            now.saturating_add(self.dev_state.read().clock_offset_secs)
+        } else {
+            now
+        }
+    }
+
+    fn restore_dev_clock(&self) -> Result<(), NodeError> {
+        if self.config.rpc.has_api_namespace("evm") {
+            let head = self
+                .chain_store
+                .get_head_block()?
+                .ok_or(NodeError::NoGenesis)?;
+            self.dev_state.write().clock_offset_secs = head
+                .header
+                .timestamp
+                .saturating_sub(Self::wall_clock_secs());
+        }
+        Ok(())
     }
 
     fn snapshot_inner(&self) -> Result<String, NodeError> {
@@ -1584,6 +1615,7 @@ impl<S: KvStore + 'static> Node<S> {
             .checked_add(1)
             .ok_or_else(|| NodeError::Startup("dev snapshot ID space exhausted".into()))?;
         let next_block_timestamp = dev.next_block_timestamp;
+        let clock_offset_secs = dev.clock_offset_secs;
         dev.snapshots.insert(
             id,
             DevSnapshot {
@@ -1595,6 +1627,7 @@ impl<S: KvStore + 'static> Node<S> {
                 finalized_number,
                 pending_txs,
                 next_block_timestamp,
+                clock_offset_secs,
             },
         );
         Ok(format!("0x{id:x}"))
@@ -1671,6 +1704,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut dev = self.dev_state.write();
         dev.next_block_timestamp = snapshot.next_block_timestamp;
+        dev.clock_offset_secs = snapshot.clock_offset_secs;
         dev.snapshots.retain(|id, _| *id < snapshot_id);
 
         Ok(true)
@@ -6476,6 +6510,52 @@ mod tests {
         assert_eq!(
             restarted.metrics.last_finalized_number.get(),
             finalized.number() as i64
+        );
+    }
+
+    #[test]
+    fn dev_rpc_future_clock_survives_next_blocks_and_snapshot_revert() {
+        let (mut node, signer) = setup_node();
+        node.config.rpc.api_namespaces.push("evm".into());
+        store_genesis(&node);
+        *node.runtime_signer.write() = Some(Arc::new(signer));
+        let snapshot = node.snapshot().unwrap();
+        let future = Node::<MemoryDb>::wall_clock_secs() + 7_200;
+
+        node.set_next_block_timestamp(future).unwrap();
+        node.mine_blocks(2).unwrap();
+        let head = node.chain_store.get_head_block().unwrap().unwrap();
+        assert_eq!(head.header.timestamp, future + 1);
+        assert!(node.block_clock_secs() >= head.header.timestamp);
+
+        node.dev_state.write().clock_offset_secs = 0;
+        node.restore_dev_clock().unwrap();
+        assert!(node.block_clock_secs() >= head.header.timestamp);
+        assert!(node.revert(&snapshot).unwrap());
+        assert!(node.block_clock_secs() <= Node::<MemoryDb>::wall_clock_secs() + 1);
+    }
+
+    #[test]
+    fn dev_rpc_clock_does_not_change_normal_node_time() {
+        let (node, _) = setup_node();
+        assert!(!node.config.rpc.has_api_namespace("evm"));
+        node.dev_state.write().clock_offset_secs = 7_200;
+        assert!(node.block_clock_secs() <= Node::<MemoryDb>::wall_clock_secs() + 1);
+    }
+
+    #[test]
+    fn dev_rpc_failed_commit_does_not_advance_clock() {
+        let (mut node, signer, db) = setup_failing_batch_node();
+        node.config.rpc.api_namespaces.push("evm".into());
+        store_genesis(&node);
+        node.set_next_block_timestamp(Node::<MemoryDb>::wall_clock_secs() + 7_200)
+            .unwrap();
+        db.fail_next_batch();
+        assert!(node.produce_block(&signer, 0).is_err());
+        assert_eq!(node.dev_state.read().clock_offset_secs, 0);
+        assert_eq!(
+            node.chain_store.get_head_block().unwrap().unwrap().number(),
+            0
         );
     }
 

@@ -321,6 +321,8 @@ pub trait LegacyEvmApi {
     ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
     /// Increase the virtual clock used for future blocks.
+    /// Unreleased: the explicitly enabled development clock also drives normal
+    /// local block-production cadence, snapshots and restart recovery.
     #[method(name = "increaseTime")]
     async fn increase_time(
         &self,

@@ -378,6 +378,8 @@ increase_time(seconds: u64, ) → serde_json::Value
 ```
 
 Increase the virtual clock used for future blocks.
+Unreleased: the explicitly enabled development clock also drives normal
+local block-production cadence, snapshots and restart recovery.
 
 ### evm_snapshot
 ```

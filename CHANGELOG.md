@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep development block timestamps and production cadence on the same virtual
+  clock after `evm_setNextBlockTimestamp` or `evm_increaseTime`, so future
+  timestamps do not stall subsequent transactions. Restore the development
+  clock with snapshots and from the canonical chain head on restart.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
