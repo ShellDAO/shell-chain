@@ -335,13 +335,8 @@ impl Libp2pNetwork {
         let mut swarm = build_swarm_with_identity(config, keypair)?;
 
         // Listen on configured address.
-        let listen_addr: Multiaddr = format!(
-            "/ip4/{}/tcp/{}",
-            config.listen_addr.ip(),
-            config.listen_addr.port()
-        )
-        .parse()
-        .map_err(|e: libp2p::multiaddr::Error| NetworkError::Transport(e.to_string()))?;
+        let listen_addr = Multiaddr::from(config.listen_addr.ip())
+            .with(libp2p::multiaddr::Protocol::Tcp(config.listen_addr.port()));
 
         swarm
             .listen_on(listen_addr)
@@ -2376,8 +2371,13 @@ mod tests {
 
     #[tokio::test]
     async fn local_node_info_tracks_bound_listener_and_shutdown() {
+        check_bound_listener("127.0.0.1:0", "/ip4/127.0.0.1/tcp/").await;
+        check_bound_listener("[::1]:0", "/ip6/::1/tcp/").await;
+    }
+
+    async fn check_bound_listener(address: &str, expected_prefix: &str) {
         let config = NetworkConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            listen_addr: address.parse().unwrap(),
             enable_mdns: false,
             enable_kademlia: false,
             ..Default::default()
@@ -2394,7 +2394,7 @@ mod tests {
         let bound = info.read().unwrap().clone();
         assert!(!bound.peer_id.is_empty());
         assert_eq!(bound.protocols, vec!["gossipsub"]);
-        assert!(bound.listen_addresses[0].starts_with("/ip4/127.0.0.1/tcp/"));
+        assert!(bound.listen_addresses[0].starts_with(expected_prefix));
         let port: u16 = bound.listen_addresses[0]
             .rsplit('/')
             .next()
@@ -2402,7 +2402,7 @@ mod tests {
             .parse()
             .unwrap();
         assert!(port > 0);
-        let connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        let connection = tokio::net::TcpStream::connect((config.listen_addr.ip(), port))
             .await
             .unwrap();
         drop(connection);

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve the IP address family when opening a P2P TCP listener. IPv6
+  addresses such as `[::1]:30303` no longer fail with an IPv4 parsing error.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

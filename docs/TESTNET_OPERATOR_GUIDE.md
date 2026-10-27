@@ -906,10 +906,30 @@ curl -s http://localhost:8545 \
 
 ### Peers not connecting
 
+- IPv6 P2P listeners are supported by the unreleased source fix. The public
+  v0.27.13 binary rejects an IPv6 `--p2p-addr` with an IPv4 parsing
+  error. With the fix, use bracketed socket addresses such as
+  `--p2p-addr '[::1]:30303'` and an `/ip6/::1/tcp/30303/p2p/<PEER_ID>`
+  bootstrap address for a local IPv6 peer. Other machines need a reachable
+  IPv6 host instead of `::1`.
 - Ensure port 30303/tcp is open and reachable.
 - Verify `--p2p` flag is enabled.
 - Check `--bootnode` multiaddr is correct (format: `/dns4/<host>/tcp/30303/p2p/<PEER_ID>` or `/ip4/<ip>/tcp/30303/p2p/<PEER_ID>`).
 - In cloud environments, disable mDNS (`enable_mdns = false`) and use explicit bootnodes.
+
+The following manual regression requires a node built with `libp2p` and
+`rocksdb`, a compatible Shell SDK build, Node.js 20+ and IPv6 loopback support.
+It creates its own encrypted test accounts and isolated node data, submits
+two signed transfers through IPv6 peers, checks offline catch-up and reopens
+both nodes to verify state, receipts and peer identities. RPC stays on IPv4
+loopback; this does not test public routing, NAT traversal or scoped link-local
+IPv6 addresses.
+
+```bash
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --p2p-ipv6
+```
 
 ### RPC not responding
 

@@ -42,6 +42,7 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const ipv6Scenario = process.argv.includes("--p2p-ipv6");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: ipv6Scenario ? "p2p-ipv6" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +151,11 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (ipv6Scenario) {
+    const entry = result.nativeOpens.findLast((entry) => entry.pid === child.pid);
+    entry.exitCode = child.exitCode;
+    entry.signal = child.signalCode;
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -189,7 +195,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     pruneFollower && i === 1 ? "light" : "full",
     "--p2p",
     "--p2p-addr",
-    "127.0.0.1:0",
+    ipv6Scenario ? "[::1]:0" : "127.0.0.1:0",
     "--log-level",
     "info",
   ];
@@ -200,6 +206,9 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
+  if (ipv6Scenario) {
+    (result.nativeOpens ??= []).push({ pid: child.pid, label, args });
+  }
   nodeLogLabels[i] = label;
   let spawnError;
   child.once("error", (error) => {
@@ -494,12 +503,84 @@ async function runScenario() {
   let bootnode;
   for (let k = 0; k < 80; k++) {
     bootnode = (await readFile(join(out, "leader-node.log"), "utf8")).match(
-      /Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/,
+      /Listening on (\/(?:ip4\/127\.0\.0\.1|ip6\/::1)\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/,
     )?.[1];
     if (bootnode) break;
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (ipv6Scenario) {
+    assert.ok(bootnode.startsWith("/ip6/::1/tcp/"));
+    await start(1, dirs[1], followerKey, "follower", bootnode);
+    await peerReady();
+    const identities = await Promise.all([0, 1].map(async (i) => {
+      const info = await rpc(i, "shell_getNodeInfo");
+      const stats = await rpc(i, "shell_getNetworkStats");
+      assert.ok(stats.listeningAddress.startsWith("/ip6/::1/tcp/"));
+      assert.ok(info.peer_id);
+      return info.peer_id;
+    }));
+    const initialBalance = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+    const initialMinerBalance = BigInt(await rpc(0, "eth_getBalance", [miner.getAddress(), "latest"]));
+    async function transfer(i, value) {
+      const signed = await outsider.buildSignedTransaction({
+        tx: buildTransaction({
+          chainId: 1337, nonce: await nonce(outsider), to: miner.getAddress(),
+          value, data: "0x", gasLimit: 100000,
+        }),
+        includePublicKey: true,
+      });
+      const hash = await providers[i].sendTransaction(signed);
+      let receipt;
+      for (let attempt = 0; attempt < 120; attempt++) {
+        receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        if (receipt) break;
+        await pause(250);
+      }
+      assert.equal(receipt?.status, "0x1");
+      assert.equal(Number(BigInt(receipt.blockNumber)), ++height);
+      result.transactions.push({ hash, receipt, value: value.toString() });
+      await save();
+      return hash;
+    }
+    // A transaction submitted only to the non-authority must cross the IPv6 peer link.
+    const first = await transfer(1, 17n);
+    result.initialSynchronization = await compare(first);
+    await stop(1);
+    const second = await transfer(0, 19n);
+    await start(1, dirs[1], followerKey, "follower-catchup", bootnode);
+    await peerReady();
+    result.catchupAfterRestart = await compare(second);
+    for (const entry of result.transactions)
+      assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+    const fees = result.transactions.reduce((sum, entry) =>
+      sum + BigInt(entry.receipt.gasUsed) * BigInt(entry.receipt.effectiveGasPrice), 0n);
+    assert.equal(initialBalance - BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])), 36n + fees);
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [miner.getAddress(), "latest"])) - initialMinerBalance, 36n + fees);
+    assert.equal(await nonce(outsider), 2);
+    await stop(1);
+    await stop(0);
+    await start(0, dirs[0], keyPath, "leader-reopen");
+    for (let k = 0; k < 80; k++) {
+      bootnode = (await readFile(join(out, "leader-reopen-node.log"), "utf8"))
+        .match(/Listening on (\/ip6\/::1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+      if (bootnode) break;
+      await pause(250);
+    }
+    assert.ok(bootnode);
+    await start(1, dirs[1], followerKey, "follower-reopen", bootnode);
+    await peerReady();
+    assert.deepEqual(await compare(second), result.catchupAfterRestart);
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await rpc(i, "shell_getNodeInfo")).peer_id, identities[i]);
+      for (const entry of result.transactions)
+        assert.deepEqual(await rpc(i, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+    }
+    result.persistentIpv6Identity = true;
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
   if (syncStatusScenario) {
     // Create the backlog through the existing real signed transaction path.
     for (let block = 1; block <= 21; block++)
@@ -1439,8 +1520,13 @@ try {
 } finally {
   for (let index = nodes.length - 1; index >= 0; index--) await stop(index);
   result.nodesStopped = nodes.every((x) => !x);
+  if (ipv6Scenario) {
+    result.processExitsVerified = result.nativeOpens?.every((entry) => entry.exitCode === 0);
+    if (!result.processExitsVerified) result.passed = false;
+  }
   result.endedAt = new Date().toISOString();
   await save();
   for (const signer of signers) signer.dispose();
   console.log(`Acceptance report: ${join(out, "runtime.json")}`);
+  if (ipv6Scenario) assert.equal(result.processExitsVerified, true, "IPv6 nodes must stop gracefully");
 }
