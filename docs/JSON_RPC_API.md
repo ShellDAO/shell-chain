@@ -678,7 +678,10 @@ curl -s http://localhost:8545 \
 
 ### eth_estimateGas
 
-Estimates gas for a transaction. Returns `gas_used × 1.2` with a minimum of 21,000.
+Estimates the gas limit for a transaction. Returns `floor(gas_spent × 1.2)`
+with a minimum of 21,000, where `gas_spent` is execution gas **before refunds**.
+A receipt's `gasUsed` can be lower after a storage refund. That refund applies
+only after execution and cannot supply gas while the transaction is running.
 
 **Parameters:**
 | # | Type | Required | Description |
@@ -687,14 +690,24 @@ Estimates gas for a transaction. Returns `gas_used × 1.2` with a minimum of 21,
 
 **Returns:** `String` — Hex-encoded gas estimate.
 
+Set `SENDER_ADDRESS` to a funded account whose balance covers `value`, and
+`RECIPIENT_ADDRESS` to an account without contract code. Both must use canonical
+32-byte Shell addresses (`0x` followed by 64 hex characters). Omitting `from`
+uses the zero address, which normally cannot fund this value transfer.
+
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"to":"0xRECIPIENT_ADDRESS","value":"0xde0b6b3a7640000"}],"id":1}'
+  --data-binary @- <<JSON
+{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"from":"${SENDER_ADDRESS}","to":"${RECIPIENT_ADDRESS}","value":"0xde0b6b3a7640000"}],"id":1}
+JSON
 ```
 
+This ordinary transfer spends 21,000 gas before refunds, so the estimate with
+the 20% buffer is 25,200 (`0x6270`). This example was verified with v0.27.13.
+
 ```json
-{"jsonrpc":"2.0","id":1,"result":"0x5208"}
+{"jsonrpc":"2.0","id":1,"result":"0x6270"}
 ```
 
 ---
