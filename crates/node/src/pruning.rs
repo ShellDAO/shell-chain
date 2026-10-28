@@ -1,9 +1,10 @@
 //! State-root pruning: track recent state roots and mark old ones for eviction.
 //!
 //! The tracker records `(block_number, state_root)` pairs after each block is
-//! finalised. When the history exceeds [`PruningConfig::keep_recent`], rolling
-//! storage profiles prune trie snapshots that fall outside the retention window
-//! while preserving nodes still reachable from retained state roots.
+//! finalised. A nonzero [`PruningConfig::keep_recent`] bounds state retention in
+//! Full and rolling profiles independently of block-body retention. Pruning uses
+//! durable finality and its cursor, including when the tracker is cold after a
+//! restart, while preserving nodes reachable from retained state roots.
 
 use std::collections::{HashSet, VecDeque};
 use std::str::FromStr;
@@ -365,7 +366,7 @@ pub fn prune_state_trie<S: KvStore + 'static>(
     keep_below_block: u64,
     profile: StorageProfile,
 ) -> Result<StateTriePruneResult, StorageError> {
-    if keep_below_block == 0 || !matches!(profile, StorageProfile::Light) {
+    if keep_below_block == 0 || matches!(profile, StorageProfile::Archive) {
         return Ok(StateTriePruneResult::default());
     }
 
@@ -736,18 +737,20 @@ mod tests {
     }
 
     #[test]
-    fn pruned_profile_triggers_trie_deletion() {
-        let (store, roots, addresses) = populate_state_chain();
+    fn full_and_light_profiles_reclaim_unretained_tries() {
+        for profile in [StorageProfile::Full, StorageProfile::Light] {
+            let (store, roots, addresses) = populate_state_chain();
 
-        let result = prune_state_trie(Arc::clone(&store), 2, StorageProfile::Light).unwrap();
+            let result = prune_state_trie(Arc::clone(&store), 2, profile).unwrap();
 
-        assert!(result.deleted_nodes > 0);
-        assert!(result.pruned_roots > 0);
-        assert!(root_balance(&store, roots[0], addresses[0]).is_err());
-        assert_eq!(
-            root_balance(&store, roots[2], addresses[2]).unwrap(),
-            U256::from(3u64)
-        );
+            assert!(result.deleted_nodes > 0);
+            assert!(result.pruned_roots > 0);
+            assert!(root_balance(&store, roots[0], addresses[0]).is_err());
+            assert_eq!(
+                root_balance(&store, roots[2], addresses[2]).unwrap(),
+                U256::from(3u64)
+            );
+        }
     }
 
     #[test]

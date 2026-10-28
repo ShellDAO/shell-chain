@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Honor an explicit nonzero state retention window in Full storage mode while
+  preserving all block bodies. Resume finalized state-trie pruning after restart
+  without waiting for the in-memory root tracker to fill again; retain the
+  finalized epoch recovery boundary. Default Full and Archive retention are unchanged.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

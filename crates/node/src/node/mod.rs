@@ -1708,7 +1708,6 @@ impl<S: KvStore + 'static> Node<S> {
     fn record_canonical_state_root(&self, block_number: u64, state_root: ShellHash) {
         let profile = StorageProfile::from_pruning_config(&self.config.pruning);
         let keep_recent = self.config.pruning.keep_recent;
-        let mut prune_keep_below = None;
         let finalized_number = match self.chain_store.get_finalized_number() {
             Ok(stored) => stored.unwrap_or(0),
             Err(e) => {
@@ -1747,16 +1746,20 @@ impl<S: KvStore + 'static> Node<S> {
                     root = %evicted.state_root,
                     "state root eligible for pruning"
                 );
-                if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
-                    prune_keep_below = state_trie_prune_boundary(
-                        finalized_number,
-                        keep_recent,
-                        self.consensus.read().poa_config().epoch_length,
-                    );
-                }
             }
         }
 
+        // Retention follows durable finality, including after a restart when
+        // the process-local tracker has not yet accumulated an eviction window.
+        let prune_keep_below = if keep_recent > 0 && !matches!(profile, StorageProfile::Archive) {
+            state_trie_prune_boundary(
+                finalized_number,
+                keep_recent,
+                self.consensus.read().poa_config().epoch_length,
+            )
+        } else {
+            None
+        };
         if let Some(keep_below_block) = prune_keep_below {
             match prune_state_trie(Arc::clone(&self.store), keep_below_block, profile) {
                 Ok(result) => {
@@ -1816,21 +1819,21 @@ impl<S: KvStore + 'static> Node<S> {
             // A delayed STARK settlement can hold the witness cursor behind the
             // configured retention window, so never let mapping cleanup overtake
             // any dependent pruner.
-            let state_trie_boundary = if matches!(profile, StorageProfile::Light) && keep_recent > 0
-            {
-                match state_trie_pruned_below(self.store.as_ref()) {
-                    Ok(boundary) => Some(boundary),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "state pruner: failed to read state-trie pruning cursor"
-                        );
-                        Some(0)
+            let state_trie_boundary =
+                if !matches!(profile, StorageProfile::Archive) && keep_recent > 0 {
+                    match state_trie_pruned_below(self.store.as_ref()) {
+                        Ok(boundary) => Some(boundary),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "state pruner: failed to read state-trie pruning cursor"
+                            );
+                            Some(0)
+                        }
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             let canonical_prune_boundary = canonical_mapping_prune_boundary(
                 finalized_number,
                 self.body_pruner.read().pruned_below(),
@@ -18779,49 +18782,54 @@ mod tests {
         assert_eq!(state_trie_prune_boundary(18, 1, 10), Some(10));
         assert_eq!(state_trie_prune_boundary(20, 1, 10), Some(20));
         assert_eq!(state_trie_prune_boundary(18, 30, 10), None);
-        let (node, _) = setup_node_with_pruning(1);
-        node.consensus.write().poa_config_mut().epoch_length = 5;
-        let authority = node.config.proposer_address.unwrap();
-        let mut roots = Vec::new();
-        let mut parent = ShellHash::ZERO;
-        for number in 0..=10 {
-            let root = {
-                let mut state = node.world_state.write();
-                state.set_validators(&[authority]).unwrap();
-                state.set_validator_weight(&authority, number + 1).unwrap();
-                state.state_root().unwrap()
-            };
-            let block = Block {
-                header: BlockHeader {
-                    number,
-                    parent_hash: parent,
-                    state_root: root,
-                    ..BlockHeader::default()
-                },
-                transactions: Vec::new(),
-                system_transactions: Vec::new(),
-                proposer_seal: None,
-            };
-            parent = block.hash();
-            node.chain_store.put_block(&block).unwrap();
-            node.chain_store.set_canonical(number, &parent).unwrap();
-            node.chain_store.set_head(&parent).unwrap();
-            node.chain_store
-                .set_finalized_number(number.min(7))
-                .unwrap();
-            roots.push(root);
-            node.record_canonical_state_root(number, root);
+        for profile in [StorageProfile::Full, StorageProfile::Light] {
+            let (body, witness, _, _) = profile.pruning_defaults();
+            let (mut node, _) = setup_node_with_retention(body, witness);
+            node.config.pruning = profile.to_pruning_config(None, None, Some(1));
+            *node.state_root_tracker.write() = StateRootTracker::new(node.config.pruning.clone());
+            node.consensus.write().poa_config_mut().epoch_length = 5;
+            let authority = node.config.proposer_address.unwrap();
+            let mut roots = Vec::new();
+            let mut parent = ShellHash::ZERO;
+            for number in 0..=10 {
+                let root = {
+                    let mut state = node.world_state.write();
+                    state.set_validators(&[authority]).unwrap();
+                    state.set_validator_weight(&authority, number + 1).unwrap();
+                    state.state_root().unwrap()
+                };
+                let block = Block {
+                    header: BlockHeader {
+                        number,
+                        parent_hash: parent,
+                        state_root: root,
+                        ..BlockHeader::default()
+                    },
+                    transactions: Vec::new(),
+                    system_transactions: Vec::new(),
+                    proposer_seal: None,
+                };
+                parent = block.hash();
+                node.chain_store.put_block(&block).unwrap();
+                node.chain_store.set_canonical(number, &parent).unwrap();
+                node.chain_store.set_head(&parent).unwrap();
+                node.chain_store
+                    .set_finalized_number(number.min(7))
+                    .unwrap();
+                roots.push(root);
+                node.record_canonical_state_root(number, root);
+            }
+            // Head10 must not release boundary5 while a reorg to finalized7 is legal.
+            let mut boundary = WorldState::at_root(node.store.clone(), &roots[5]).unwrap();
+            boundary.validate().unwrap();
+            assert_eq!(boundary.get_validator_weight(&authority).unwrap(), 6);
+            assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 5);
+            node.chain_store.set_finalized_number(10).unwrap();
+            node.record_canonical_state_root(10, roots[10]);
+            assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 10);
+            let mut current = WorldState::at_root(node.store.clone(), &roots[10]).unwrap();
+            current.validate().unwrap();
         }
-        // Head10 must not release boundary5 while a reorg to finalized7 is legal.
-        let mut boundary = WorldState::at_root(node.store.clone(), &roots[5]).unwrap();
-        boundary.validate().unwrap();
-        assert_eq!(boundary.get_validator_weight(&authority).unwrap(), 6);
-        assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 5);
-        node.chain_store.set_finalized_number(10).unwrap();
-        node.record_canonical_state_root(10, roots[10]);
-        assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 10);
-        let mut current = WorldState::at_root(node.store.clone(), &roots[10]).unwrap();
-        current.validate().unwrap();
     }
 
     #[test]
@@ -18858,6 +18866,77 @@ mod tests {
         let pruner = node.state_pruner.read();
         assert_eq!(pruner.active_root_count(), 1);
         assert_eq!(pruner.genesis_root(), Some(&genesis_root));
+    }
+
+    #[test]
+    fn explicit_full_state_retention_and_cold_tracker_reclaim_old_tries() {
+        for (profile, keep_recent) in [
+            (StorageProfile::Full, 0),
+            (StorageProfile::Full, 2),
+            (StorageProfile::Light, 2),
+        ] {
+            let (body, witness, _, _) = profile.pruning_defaults();
+            let (mut node, _) = setup_node_with_retention(body, witness);
+            node.config.pruning = profile.to_pruning_config(None, None, Some(keep_recent));
+            node.consensus.write().poa_config_mut().epoch_length = 0;
+            let account = node.config.proposer_address.unwrap();
+            let mut roots = Vec::new();
+            let mut hashes = Vec::new();
+            let mut parent_hash = ShellHash::ZERO;
+            for number in 0u64..=6 {
+                let root = {
+                    let mut state = node.world_state.write();
+                    state.set_balance(&account, U256::from(number + 1)).unwrap();
+                    state.state_root().unwrap()
+                };
+                let block = Block {
+                    header: BlockHeader {
+                        number,
+                        parent_hash,
+                        state_root: root,
+                        ..BlockHeader::default()
+                    },
+                    transactions: Vec::new(),
+                    system_transactions: Vec::new(),
+                    proposer_seal: None,
+                };
+                parent_hash = block.hash();
+                node.chain_store.put_block(&block).unwrap();
+                node.chain_store
+                    .set_canonical(number, &parent_hash)
+                    .unwrap();
+                node.chain_store.set_head(&parent_hash).unwrap();
+                roots.push(root);
+                hashes.push(parent_hash);
+            }
+            // A restarted process has no eviction history for the retained DB.
+            *node.state_root_tracker.write() = StateRootTracker::new(node.config.pruning.clone());
+            node.chain_store.set_finalized_number(5).unwrap();
+            node.record_canonical_state_root(6, roots[6]);
+            if keep_recent == 0 {
+                let old = WorldState::at_root(node.store.clone(), &roots[0]).unwrap();
+                assert_eq!(old.get_balance(&account).unwrap(), U256::from(1));
+                assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 0);
+            } else {
+                assert!(
+                    node.store.get(roots[0].as_bytes()).unwrap().is_none(),
+                    "{profile:?} explicit retention must reclaim old physical nodes after restart"
+                );
+                assert_eq!(state_trie_pruned_below(node.store.as_ref()).unwrap(), 4);
+            }
+            for (number, balance) in [(4, 5), (6, 7)] {
+                let mut retained = WorldState::at_root(node.store.clone(), &roots[number]).unwrap();
+                retained.validate().unwrap();
+                assert_eq!(retained.get_balance(&account).unwrap(), U256::from(balance));
+            }
+            // State retention must not turn Full into body-pruned storage.
+            assert!(node.chain_store.has_body(&hashes[0]).unwrap());
+            assert!(node
+                .chain_store
+                .get_header_by_hash(&hashes[0])
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]

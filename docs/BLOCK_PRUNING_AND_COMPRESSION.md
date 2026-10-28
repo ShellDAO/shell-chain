@@ -191,10 +191,14 @@ finalized height.
 ### L3 — State trie pruning
 
 Rolling/light profiles prune state snapshots automatically when `keep_recent`
-is nonzero. `state_pruning_experimental` is a legacy compatibility field and
+is nonzero. In unreleased source, Full also honors an explicit nonzero
+`--pruning` / `keep_recent` override independently of block-body retention:
+all Full block bodies remain available. Default Full (`keep_recent = 0`) and
+Archive retain all state snapshots. Published v0.27.13 reports a Full override
+but does not reclaim its old trie nodes. `state_pruning_experimental` is a legacy compatibility field and
 does not gate this pruning.
 
-During a pruning pass, `prune_state_trie()` walks canonical state roots below the light-profile retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
+During a pruning pass, `prune_state_trie()` walks canonical state roots below the finalized state retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
 
 For a nonzero consensus epoch length, pruning also retains the last finalized
 epoch boundary and newer state. This can exceed `keep_recent`, but preserves
@@ -202,6 +206,10 @@ active-authority recovery on restart and after allowed reorgs. The next finalize
 boundary makes the preceding window eligible for pruning. Boundary headers are
 sufficient for recovery; their block bodies are not required. See
 [epoch authority recovery](adr/epoch-authority-recovery.md).
+
+Pruning eligibility follows finalized height and the durable cursor rather than
+in-memory tracker eviction, so a restarted node resumes on its next canonical
+state update without first filling another `keep_recent` window.
 
 Logical snapshots preserve the durable state-trie pruning cursor and publish it
 atomically with imported chain progress. Import clears a stale local cursor when
