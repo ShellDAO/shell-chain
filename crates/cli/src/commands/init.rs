@@ -28,7 +28,7 @@ const DEV_AUTHORITY_INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000_000_000_00
 pub fn init(
     datadir: PathBuf,
     genesis_path: Option<PathBuf>,
-    chain_id: u64,
+    chain_id: Option<u64>,
     network: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network_type: NetworkType = network.parse()?;
@@ -126,7 +126,7 @@ pub fn init(
                 algorithm_timelock_activation_height: None,
                 bloom_activation_height: None,
                 fee_accounting_activation_height: None,
-                chain_id,
+                chain_id: chain_id.unwrap_or(1337),
                 chain_name: format!("shell-chain-{}", network_type.as_str()),
                 network_type,
                 timestamp: SystemTime::now()
@@ -148,6 +148,8 @@ pub fn init(
             }
         }
     };
+
+    super::validate_genesis_chain_id(chain_id, genesis_config.chain_id)?;
 
     // Use MemoryDb to compute genesis state (actual storage on `run`).
     let store = Arc::new(MemoryDb::new());
@@ -185,7 +187,7 @@ mod tests {
     #[test]
     fn default_genesis_persists_the_authority_used_on_startup() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+        init(dir.path().to_path_buf(), None, Some(1337), "dev".into()).unwrap();
 
         let key_path = dir.path().join(DEV_AUTHORITY_KEY_FILE);
         assert!(
@@ -218,7 +220,7 @@ mod tests {
         let signer = load_or_create_dev_signer(&key_path).unwrap();
         let original = std::fs::read(&key_path).unwrap();
 
-        init(dir.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+        init(dir.path().to_path_buf(), None, Some(1337), "dev".into()).unwrap();
 
         let genesis = GenesisConfig::from_file(&dir.path().join("genesis.json")).unwrap();
         let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -237,7 +239,7 @@ mod tests {
         std::fs::write(&key_path, b"invalid key").unwrap();
         std::fs::write(&genesis_path, b"existing genesis").unwrap();
 
-        assert!(init(dir.path().to_path_buf(), None, 1337, "dev".into()).is_err());
+        assert!(init(dir.path().to_path_buf(), None, Some(1337), "dev".into()).is_err());
 
         assert_eq!(std::fs::read(key_path).unwrap(), b"invalid key");
         assert_eq!(std::fs::read(genesis_path).unwrap(), b"existing genesis");
@@ -246,14 +248,14 @@ mod tests {
     #[test]
     fn supplied_genesis_does_not_generate_a_dev_key() {
         let source = tempfile::tempdir().unwrap();
-        init(source.path().to_path_buf(), None, 1337, "dev".into()).unwrap();
+        init(source.path().to_path_buf(), None, Some(1337), "dev".into()).unwrap();
         let genesis_path = source.path().join("genesis.json");
         let destination = tempfile::tempdir().unwrap();
 
         init(
             destination.path().to_path_buf(),
             Some(genesis_path.clone()),
-            1337,
+            Some(1337),
             "dev".into(),
         )
         .unwrap();
@@ -266,11 +268,46 @@ mod tests {
     }
 
     #[test]
+    fn supplied_genesis_enforces_requested_chain_without_rewriting_identity() {
+        let source = tempfile::tempdir().unwrap();
+        init(source.path().to_path_buf(), None, Some(11), "dev".into()).unwrap();
+        let genesis_path = source.path().join("genesis.json");
+        let original = std::fs::read(&genesis_path).unwrap();
+        for requested in [Some(10), Some(1337), Some(11), None] {
+            let destination = tempfile::tempdir().unwrap();
+            let result = init(
+                destination.path().to_path_buf(),
+                Some(genesis_path.clone()),
+                requested,
+                "dev".into(),
+            );
+            if matches!(requested, Some(10 | 1337)) {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match genesis chain ID 11"));
+                assert!(!destination.path().join("genesis.json").exists());
+            } else {
+                result.unwrap();
+                let written =
+                    GenesisConfig::from_file(&destination.path().join("genesis.json")).unwrap();
+                assert_eq!(written.chain_id, 11);
+                assert_eq!(
+                    std::fs::read(destination.path().join("genesis.json")).unwrap(),
+                    original
+                );
+            }
+            assert!(!destination.path().join(DEV_AUTHORITY_KEY_FILE).exists());
+            assert_eq!(std::fs::read(&genesis_path).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn rejects_unknown_network_before_creating_datadir() {
         let parent = tempfile::tempdir().unwrap();
         let datadir = parent.path().join("chain-data");
 
-        let error = init(datadir.clone(), None, 1337, "mianet".into()).unwrap_err();
+        let error = init(datadir.clone(), None, Some(1337), "mianet".into()).unwrap_err();
 
         assert!(error.to_string().contains("unsupported network profile"));
         assert!(!datadir.exists());

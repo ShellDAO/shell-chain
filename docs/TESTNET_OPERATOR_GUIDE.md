@@ -504,7 +504,7 @@ A `prover` node syncs the chain, generates `ProofAmendment` proofs, and propagat
 | `--rpc-addr <ADDR>` | `127.0.0.1:8545` | RPC listen address |
 | `--block-time <MS>` | profile default | Block interval (ms): `dev` defaults to 30000, `testnet`/`mainnet` to 2000 |
 | `--keystore <PATH>` | — | Keystore file path |
-| `--chain-id <ID>` | `1337` | Chain ID; use `10` for public testnet |
+| `--chain-id <ID>` | supplied genesis ID; otherwise `1337` | Chain ID selection; unreleased source rejects conflicts with a supplied genesis. |
 | `--db <BACKEND>` | profile default | `memory` for `--network dev`; `rocksdb` for `testnet`/`mainnet` |
 | `--ws` | disabled | Enable WebSocket RPC |
 | `--ws-port <PORT>` | `8546` | WebSocket port |
@@ -619,6 +619,15 @@ shell-node --datadir shell-data init --genesis genesis.json --chain-id 1337 --ne
 ```
 
 This creates the data directory structure and writes the genesis block.
+
+In unreleased source, an explicit `--chain-id` on `init` or `run`, or
+`[node].chain_id` in a run configuration, must match the supplied `genesis.json`.
+If no ID is selected, the node adopts the file's chain ID; `1337` is the default
+only when creating a new genesis. A conflicting selection is rejected rather
+than changing the genesis identity. Published v0.27.13 silently ignores a
+conflicting selection with an existing genesis, so check the running version
+before relying on this guard.
+
 
 ---
 

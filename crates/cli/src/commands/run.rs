@@ -37,7 +37,7 @@ pub struct RunArgs {
     pub network: String,
     pub block_time: u64,
     pub keystore: Option<PathBuf>,
-    pub chain_id: u64,
+    pub chain_id: Option<u64>,
     pub db: String,
     pub ws: bool,
     pub ws_port: u16,
@@ -314,6 +314,18 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let args = RunArgs { datadir, ..args };
+    // Reject an explicit identity conflict before opening RocksDB or loading keys.
+    if args.chain_id.is_some() {
+        let genesis_file = args.datadir.join("genesis.json");
+        match std::fs::symlink_metadata(&genesis_file) {
+            Ok(_) => {
+                let genesis = GenesisConfig::from_file(&genesis_file)?;
+                super::validate_genesis_chain_id(args.chain_id, genesis.chain_id)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
 
     match args.db.as_str() {
         "memory" => {
@@ -805,7 +817,7 @@ async fn run_with_store<S: KvStore + 'static>(
             algorithm_timelock_activation_height: None,
             bloom_activation_height: None,
             fee_accounting_activation_height: None,
-            chain_id: args.chain_id,
+            chain_id: args.chain_id.unwrap_or(1337),
             chain_name: format!("shell-chain-{}", args.network),
             network_type,
             timestamp: SystemTime::now()
@@ -842,11 +854,12 @@ async fn run_with_store<S: KvStore + 'static>(
         config
     };
 
+    super::validate_genesis_chain_id(args.chain_id, genesis_config.chain_id)?;
     initialize_chain(
         Arc::clone(&store),
         &genesis_config,
         &args.datadir,
-        args.chain_id,
+        genesis_config.chain_id,
         args.checkpoint_url.as_deref(),
     )
     .await?;
@@ -1168,15 +1181,13 @@ mod tests {
     use shell_storage::{ChainConfig, MemoryDb, DEFAULT_BODY_RETENTION, DEFAULT_WITNESS_RETENTION};
     use std::collections::HashMap;
 
-    /// Verify that `--parallel-pqvm --parallel-pqvm-workers 4` produces the correct config.
-    #[test]
-    fn parallel_pqvm_args_produce_correct_config() {
-        let args = RunArgs {
+    fn test_run_args() -> RunArgs {
+        RunArgs {
             datadir: std::path::PathBuf::from("shell-data"),
             rpc_addr: "127.0.0.1:8545".into(),
             block_time: 2000,
             keystore: None,
-            chain_id: 1337,
+            chain_id: Some(1337),
             db: "memory".into(),
             ws: false,
             ws_port: 8546,
@@ -1217,7 +1228,39 @@ mod tests {
                 password_stdin: false,
                 allow_env_password: false,
             },
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_id_conflict_rejects_before_database_and_keystore_access() {
+        let source = tempfile::tempdir().unwrap();
+        crate::commands::init(source.path().to_path_buf(), None, Some(11), "dev".into()).unwrap();
+        for db in ["memory", "rocksdb"] {
+            let destination = tempfile::tempdir().unwrap();
+            let original = std::fs::read(source.path().join("genesis.json")).unwrap();
+            std::fs::write(destination.path().join("genesis.json"), &original).unwrap();
+            let mut args = test_run_args();
+            args.datadir = destination.path().to_path_buf();
+            args.chain_id = Some(10);
+            args.db = db.into();
+            args.keystore = Some(destination.path().join("missing-key.json"));
+            let error = run(args).await.unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("requested chain ID 10 does not match genesis chain ID 11"));
+            assert!(!destination.path().join("db").exists());
+            assert!(!destination.path().join(DEV_AUTHORITY_KEY_FILE).exists());
+            assert_eq!(
+                std::fs::read(destination.path().join("genesis.json")).unwrap(),
+                original
+            );
+        }
+    }
+
+    /// Verify that `--parallel-pqvm --parallel-pqvm-workers 4` produces the correct config.
+    #[test]
+    fn parallel_pqvm_args_produce_correct_config() {
+        let args = test_run_args();
 
         let expected = ParallelPqvmConfig {
             enabled: args.parallel_pqvm,

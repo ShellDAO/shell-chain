@@ -100,9 +100,9 @@ enum Commands {
         #[arg(long)]
         keystore: Option<PathBuf>,
 
-        /// Chain ID.
-        #[arg(long, default_value = "1337")]
-        chain_id: u64,
+        /// Require this chain ID to match a supplied genesis (defaults to 1337 for new genesis).
+        #[arg(long)]
+        chain_id: Option<u64>,
 
         /// Storage backend: "memory" or "rocksdb".
         /// Defaults to "rocksdb" for testnet/mainnet (persistent) and "memory" for dev (ephemeral).
@@ -273,9 +273,9 @@ enum Commands {
         #[arg(long)]
         genesis: Option<PathBuf>,
 
-        /// Chain ID.
-        #[arg(long, default_value = "1337")]
-        chain_id: u64,
+        /// Require this chain ID to match a supplied genesis (defaults to 1337 for new genesis).
+        #[arg(long)]
+        chain_id: Option<u64>,
 
         /// Network profile: "dev", "testnet", or "mainnet".
         #[arg(long, default_value = "dev")]
@@ -724,8 +724,7 @@ async fn main() {
                 file_config.consensus.enable_stark_aggregation,
             );
 
-            let effective_chain_id =
-                config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
+            let effective_chain_id = chain_id.or(file_config.node.chain_id);
 
             let effective_storage_profile = config_or_cli(
                 run_matches,
@@ -996,6 +995,22 @@ mod tests {
     }
 
     #[test]
+    fn chain_id_preserves_explicit_default_and_omission() {
+        for command in ["init", "run"] {
+            for (flags, expected) in [(vec![], None), (vec!["--chain-id", "1337"], Some(1337))] {
+                let mut argv = vec!["shell-node", command];
+                argv.extend(flags);
+                let cli = Cli::try_parse_from(argv).unwrap();
+                let id = match cli.command {
+                    Commands::Init { chain_id, .. } | Commands::Run { chain_id, .. } => chain_id,
+                    _ => unreachable!(),
+                };
+                assert_eq!(id, expected);
+            }
+        }
+    }
+
+    #[test]
     fn explicit_run_defaults_override_file_config() {
         check_config_precedence(
             "storage_profile",
@@ -1015,7 +1030,6 @@ mod tests {
             "dev".to_string(),
             "testnet".to_string(),
         );
-        check_config_precedence("chain_id", "--chain-id", 1337u64, 42u64);
         check_config_precedence(
             "node_role",
             "--node-role",

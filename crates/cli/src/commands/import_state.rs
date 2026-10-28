@@ -147,7 +147,7 @@ mod tests {
         datadir: &std::path::Path,
         activation: Option<u64>,
     ) -> (shell_genesis::GenesisConfig, ShellHash, PathBuf) {
-        crate::commands::init(datadir.to_path_buf(), None, 1337, "dev".into()).unwrap();
+        crate::commands::init(datadir.to_path_buf(), None, Some(1337), "dev".into()).unwrap();
         let mut genesis =
             shell_genesis::GenesisConfig::from_file(&datadir.join("genesis.json")).unwrap();
         genesis.fee_accounting_activation_height = activation;

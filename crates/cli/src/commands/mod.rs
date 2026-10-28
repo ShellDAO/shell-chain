@@ -28,3 +28,18 @@ pub use key::{key_generate, key_inspect, key_migrate};
 pub use removedb::removedb;
 pub use run::run;
 pub use version::version;
+
+/// A supplied genesis defines the network identity; an explicit selection must agree.
+pub(crate) fn validate_genesis_chain_id(
+    requested: Option<u64>,
+    genesis_chain_id: u64,
+) -> Result<(), String> {
+    if let Some(requested) = requested {
+        if requested != genesis_chain_id {
+            return Err(format!(
+                "requested chain ID {requested} does not match genesis chain ID {genesis_chain_id}"
+            ));
+        }
+    }
+    Ok(())
+}

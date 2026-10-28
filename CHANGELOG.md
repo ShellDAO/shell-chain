@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject explicit CLI or TOML chain IDs that conflict with a supplied genesis
+  during initialization or startup, before opening the database or loading keys.
+  Omitted IDs adopt the supplied genesis; fresh default genesis remains chain 1337.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
