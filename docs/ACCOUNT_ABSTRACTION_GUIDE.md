@@ -578,6 +578,27 @@ network; it does not establish public-testnet activation or other policy, rollba
 algorithm or storage-profile combinations. Run this mode separately from the
 other scenarios.
 
+Run the failed-batch case independently, without repeating the accepted
+single-call case:
+
+```sh
+NODE_BIN=/path/to/shell-node \
+  SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --contract-paymaster-failure
+```
+
+This mode gives the sender 11 wei. Its first inner call transfers 7 wei, stores
+31 and emits a log; the second deliberately reverts. Actual execution frames
+and opcode traces must establish that the first call succeeded before the
+second failed. The failed receipt, block log query and canonical state must
+contain no provisional log, storage write or value transfer. The sender retains
+11 wei, consumes one outer nonce, and the contract paymaster still pays the
+ordinary outer fee without consuming its own nonce. The script checks read-only
+tracing and the failed receipt, account state and sponsorship metadata after a
+physical restart. It uses fresh temporary data and the same version/profile
+scope as the successful contract-paymaster mode above; it does not test native
+AccountManager metadata or runtime algorithm-policy changes inside a failed batch.
+
 ## Historical block signers after pruning
 
 From the current source checkout, use Node.js 24, the public
