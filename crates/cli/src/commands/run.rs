@@ -281,13 +281,25 @@ fn repair_head_state_if_needed<S: KvStore + 'static>(
 
 fn validate_transaction_protocol<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
+    checkpoint_requested: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(config) = chain_store.get_chain_config()? else {
         return Ok(());
     };
-    let genesis = chain_store
-        .get_header_by_hash(&config.genesis_hash)?
-        .ok_or_else(|| "chain configuration references a missing genesis header".to_string())?;
+    let genesis = match chain_store.get_header_by_hash(&config.genesis_hash)? {
+        Some(genesis) => genesis,
+        None if checkpoint_requested
+            && chain_store.get_head_hash()?.is_none()
+            && chain_store.get_finalized_number()?.is_none()
+            && chain_store.get_block_hash_by_number(0)?.is_none() =>
+        {
+            // A failed checkpoint leaves its trust anchor but no chain. The
+            // import path must match it against local genesis before retrying;
+            // validate the imported protocol again before starting the node.
+            return Ok(());
+        }
+        None => return Err("chain configuration references a missing genesis header".into()),
+    };
     if !genesis
         .extra_data
         .as_ref()
@@ -640,7 +652,7 @@ async fn run_with_store<S: KvStore + 'static>(
 
     // Check if chain is already initialized (persistent storage resume).
     let chain_store = ChainStore::new(store.clone());
-    validate_transaction_protocol(&chain_store)?;
+    validate_transaction_protocol(&chain_store, args.checkpoint_url.is_some())?;
     let mut resumed = match chain_store.get_head_block()? {
         Some(head) => {
             info!(
@@ -850,6 +862,7 @@ async fn run_with_store<S: KvStore + 'static>(
         args.checkpoint_url.as_deref(),
     )
     .await?;
+    validate_transaction_protocol(&chain_store, false)?;
 
     // Extract authorities and epoch_length from genesis.
     let authorities = genesis_config.consensus.authorities().to_vec();
@@ -1570,16 +1583,96 @@ mod tests {
         assert!(result.is_err(), "invalid checkpoint must fail startup");
         let chain = ChainStore::new(Arc::clone(&store));
         assert!(chain.get_head_hash().unwrap().is_none());
+        validate_transaction_protocol(&chain, true).unwrap();
         let (url, expected_head) = checkpoint_fixture(dir.path(), &config);
         initialize_chain(store, &config, dir.path(), config.chain_id, Some(&url))
             .await
             .unwrap();
         assert_eq!(chain.get_head_hash().unwrap(), Some(expected_head));
+        validate_transaction_protocol(&chain, false).unwrap();
         assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
             .unwrap()
             .file_name()
             .to_string_lossy()
             .starts_with("checkpoint_snapshot-")));
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    #[tokio::test]
+    async fn checkpoint_retry_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_genesis(Address::from([7u8; 20]));
+        let invalid = dir.path().join("invalid-snapshot.jsonl");
+        std::fs::write(&invalid, "not a snapshot").unwrap();
+        let db_path = dir.path().join("db");
+        {
+            let stores = shell_storage::RocksDbStore::open_all(&db_path, None).unwrap();
+            let store = Arc::new(stores.state);
+            assert!(initialize_chain(
+                store.clone(),
+                &config,
+                dir.path(),
+                config.chain_id,
+                Some(&format!("file://{}", invalid.display())),
+            )
+            .await
+            .is_err());
+            store.flush().unwrap();
+        }
+        let stores = shell_storage::RocksDbStore::open_all(&db_path, None).unwrap();
+        let store = Arc::new(stores.state);
+        let chain = ChainStore::new(store.clone());
+        assert!(chain.get_head_hash().unwrap().is_none());
+        let before = store.scan_prefix(b"").unwrap();
+        validate_transaction_protocol(&chain, true).unwrap();
+        assert!(validate_transaction_protocol(&chain, false).is_err());
+        let mut changed = config.clone();
+        changed.timestamp += 1;
+        let error = initialize_chain(
+            store.clone(),
+            &changed,
+            dir.path(),
+            config.chain_id,
+            Some("invalid-checkpoint-url"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("stored chain config"));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        let (url, expected_head) = checkpoint_fixture(dir.path(), &config);
+        initialize_chain(store, &config, dir.path(), config.chain_id, Some(&url))
+            .await
+            .unwrap();
+        validate_transaction_protocol(&chain, false).unwrap();
+        assert_eq!(chain.get_head_hash().unwrap(), Some(expected_head));
+    }
+
+    #[test]
+    fn transaction_protocol_rejects_missing_genesis_on_initialized_chain() {
+        let config = test_genesis(Address::from([7u8; 20]));
+        let trusted_store = Arc::new(MemoryDb::new());
+        let genesis = initialize_genesis(&config, trusted_store.clone()).unwrap();
+        let trusted = ChainStore::new(trusted_store)
+            .get_chain_config()
+            .unwrap()
+            .unwrap();
+        for marker in ["head", "finalized", "canonical-genesis"] {
+            let store = Arc::new(MemoryDb::new());
+            let chain = ChainStore::new(store.clone());
+            chain.put_chain_config(&trusted).unwrap();
+            match marker {
+                "head" => chain.set_head(&genesis.hash()).unwrap(),
+                "finalized" => chain.set_finalized_number(0).unwrap(),
+                _ => chain.set_canonical(0, &genesis.hash()).unwrap(),
+            }
+            let before = store.scan_prefix(b"").unwrap();
+            for checkpoint_requested in [false, true] {
+                let error =
+                    validate_transaction_protocol(&chain, checkpoint_requested).unwrap_err();
+                assert!(error.to_string().contains("missing genesis header"));
+            }
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
     }
 
     #[tokio::test]
@@ -1808,7 +1901,7 @@ mod tests {
         let authority = Address::from([7u8; 20]);
         initialize_genesis(&test_genesis(authority), Arc::clone(&store)).unwrap();
 
-        validate_transaction_protocol(&ChainStore::new(store)).unwrap();
+        validate_transaction_protocol(&ChainStore::new(store), false).unwrap();
     }
 
     #[tokio::test]
@@ -2997,7 +3090,9 @@ mod tests {
             )
             .unwrap();
 
-        let error = validate_transaction_protocol(&chain_store).unwrap_err();
+        let error = validate_transaction_protocol(&chain_store, false).unwrap_err();
+        assert!(error.to_string().contains("requires a fresh genesis"));
+        let error = validate_transaction_protocol(&chain_store, true).unwrap_err();
         assert!(error.to_string().contains("requires a fresh genesis"));
     }
 

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Allow checkpoint sync to retry the same database after a failed download or
+  snapshot validation. Preserve the trusted genesis configuration and continue
+  rejecting missing genesis headers on initialized chains and legacy protocols.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
