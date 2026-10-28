@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Validate snapshot ancestry and the authenticated state trie in isolated storage
+  before restoring destination records. Invalid snapshots leave existing data
+  unchanged and cannot borrow missing trie nodes from an earlier import.
+  Persistent imports use temporary disk space for validation, with bounded batches.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

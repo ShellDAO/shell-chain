@@ -14,6 +14,30 @@ use crate::{KvStore, OverlayStore, StorageError, WriteBatch};
 const SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES: usize = 10_000;
 const SNAPSHOT_IMPORT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+// Keep both private validation and destination replay bounded by the same limits.
+fn write_snapshot_entry<S: KvStore>(
+    store: &S,
+    batch: &mut WriteBatch,
+    batch_bytes: &mut usize,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<(), StorageError> {
+    let entry_bytes = key.len().saturating_add(value.len());
+    if !batch.is_empty()
+        && batch_bytes.saturating_add(entry_bytes) > SNAPSHOT_IMPORT_BATCH_MAX_BYTES
+    {
+        store.write_batch(std::mem::take(batch))?;
+        *batch_bytes = 0;
+    }
+    batch.put(key, value);
+    *batch_bytes = batch_bytes.saturating_add(entry_bytes);
+    if batch.len() >= SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES {
+        store.write_batch(std::mem::take(batch))?;
+        *batch_bytes = 0;
+    }
+    Ok(())
+}
+
 /// Seven nominal days, converted to a fixed block count when a proposal opens.
 pub const ALGORITHM_VOTING_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -3238,6 +3262,19 @@ impl<S: KvStore> ChainStore<S> {
         }
         snap_reader.rewind()?;
 
+        // Validate against an isolated store, never against leftover destination
+        // records. Persistent builds stage on disk to avoid buffering a complete
+        // snapshot in memory. Declaration order closes the DB before cleanup.
+        #[cfg(feature = "rocksdb")]
+        let validation_dir = tempfile::tempdir().map_err(|e| {
+            StorageError::Database(format!("create snapshot validation directory: {e}"))
+        })?;
+        #[cfg(feature = "rocksdb")]
+        let validation_store =
+            Arc::new(crate::RocksDbStore::open_all(validation_dir.path(), None)?.state);
+        #[cfg(not(feature = "rocksdb"))]
+        let validation_store = Arc::new(crate::MemoryDb::new());
+
         // Import all entries
         let mut batch = crate::WriteBatch::new();
         let mut batch_bytes = 0usize;
@@ -3258,52 +3295,45 @@ impl<S: KvStore> ChainStore<S> {
                 pending_publication.put(entry.key, entry.value);
                 continue;
             }
-            let entry_bytes = entry.key.len().saturating_add(entry.value.len());
-            // Bound retained payload even when individual snapshot values are large.
-            if !batch.is_empty()
-                && batch_bytes.saturating_add(entry_bytes) > SNAPSHOT_IMPORT_BATCH_MAX_BYTES
-            {
-                self.store.write_batch(batch)?;
-                batch = crate::WriteBatch::new();
-                batch_bytes = 0;
-            }
-            batch.put(entry.key, entry.value);
-            batch_bytes = batch_bytes.saturating_add(entry_bytes);
-
-            if batch.len() >= SNAPSHOT_IMPORT_BATCH_MAX_ENTRIES {
-                self.store.write_batch(batch)?;
-                batch = crate::WriteBatch::new();
-                batch_bytes = 0;
-            }
+            write_snapshot_entry(
+                validation_store.as_ref(),
+                &mut batch,
+                &mut batch_bytes,
+                entry.key,
+                entry.value,
+            )?;
         }
 
         // Flush remaining
         if !batch.is_empty() {
-            self.store.write_batch(batch)?;
+            validation_store.write_batch(batch)?;
         }
 
-        self.validate_snapshot_canonical_ancestry(
+        ChainStore::new(Arc::clone(&validation_store)).validate_snapshot_canonical_ancestry(
             head_hash,
             metadata.block_number,
             expected_genesis_hash,
         )?;
 
         if metadata.state_root != ShellHash::ZERO {
-            if self.store.get(metadata.state_root.as_bytes())?.is_none() {
+            if validation_store
+                .get(metadata.state_root.as_bytes())?
+                .is_none()
+            {
                 return Err(StorageError::State(
                     "snapshot head state root is unavailable or corrupt: root node is missing"
                         .into(),
                 ));
             }
-            let mut world_state = crate::WorldState::at_root(
-                Arc::clone(&self.store),
-                &metadata.state_root,
-            )
-            .map_err(|e| {
-                StorageError::State(format!("snapshot head state root could not be opened: {e}"))
-            })?;
-            crate::WorldState::<S>::validate_snapshot_nodes(
-                self.store.as_ref(),
+            let mut world_state =
+                crate::WorldState::at_root(Arc::clone(&validation_store), &metadata.state_root)
+                    .map_err(|e| {
+                        StorageError::State(format!(
+                            "snapshot head state root could not be opened: {e}"
+                        ))
+                    })?;
+            crate::WorldState::validate_snapshot_nodes(
+                validation_store.as_ref(),
                 metadata.state_root,
             )
             .map_err(|e| {
@@ -3316,6 +3346,23 @@ impl<S: KvStore> ChainStore<S> {
                     "snapshot head state root is unavailable or corrupt: {e}"
                 ))
             })?;
+        }
+
+        // Replay only the immutable validated data, not the input file again.
+        // Progress remains unpublished until the bounded data batches succeed.
+        let mut batch = WriteBatch::new();
+        let mut batch_bytes = 0;
+        validation_store.visit_all(&mut |key, value| {
+            write_snapshot_entry(
+                self.store.as_ref(),
+                &mut batch,
+                &mut batch_bytes,
+                key.to_vec(),
+                value.to_vec(),
+            )
+        })?;
+        if !batch.is_empty() {
+            self.store.write_batch(batch)?;
         }
 
         for key in [
@@ -8507,6 +8554,7 @@ mod tests {
             writer.finalize().unwrap();
         }
 
+        let before = store.scan_prefix(b"").unwrap();
         let error = cs
             .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
             .unwrap_err();
@@ -8515,6 +8563,7 @@ mod tests {
             .to_string()
             .contains("snapshot head state root is unavailable or corrupt"));
         assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
     }
 
     #[test]
@@ -8575,18 +8624,30 @@ mod tests {
             writer.finalize().unwrap();
         }
 
-        let target = Arc::new(MemoryDb::new());
-        let cs = ChainStore::new(Arc::clone(&target));
-        let old_head = ShellHash::from([0xAA; 32]);
-        cs.set_head(&old_head).unwrap();
+        for preexisting_node in [false, true] {
+            let target = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&target));
+            let old_head = ShellHash::from([0xAA; 32]);
+            cs.set_head(&old_head).unwrap();
 
-        let error = cs
-            .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
-            .unwrap_err();
+            if preexisting_node {
+                target
+                    .put(
+                        missing_node.as_bytes(),
+                        &source.get(missing_node.as_bytes()).unwrap().unwrap(),
+                    )
+                    .unwrap();
+            }
+            let before = target.scan_prefix(b"").unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(&buf), 1337, &ShellHash::ZERO)
+                .unwrap_err();
 
-        assert!(error.to_string().contains("state trie node"));
-        assert!(error.to_string().contains("is missing"));
-        assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
+            assert!(error.to_string().contains("state trie node"));
+            assert!(error.to_string().contains("is missing"));
+            assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
+            assert_eq!(target.scan_prefix(b"").unwrap(), before);
+        }
     }
 
     #[test]
@@ -8632,6 +8693,7 @@ mod tests {
             writer.finalize().unwrap();
         }
 
+        let before = store.scan_prefix(b"").unwrap();
         let error = cs
             .import_snapshot(std::io::Cursor::new(buf), 1337, &ShellHash::ZERO)
             .unwrap_err();
@@ -8640,6 +8702,7 @@ mod tests {
             .to_string()
             .contains("snapshot head state root is unavailable or corrupt"));
         assert_eq!(cs.get_head_hash().unwrap(), Some(old_head));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
     }
 
     #[test]
@@ -8843,6 +8906,7 @@ mod tests {
             writer.finalize().unwrap();
         }
 
+        let before = store.scan_prefix(b"").unwrap();
         let error = cs
             .import_snapshot(std::io::Cursor::new(buf), 1337, &genesis_hash)
             .unwrap_err();
@@ -8851,6 +8915,7 @@ mod tests {
             .to_string()
             .contains("snapshot canonical ancestry is incomplete"));
         assert_eq!(cs.get_head_hash().unwrap(), None);
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
     }
 
     #[test]
