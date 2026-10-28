@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Renew polling filters only after a successful poll or log retrieval. Failed
+  queries no longer extend the five-minute idle lifetime; expired or uninstalled
+  filters cannot be revived by an in-flight retrieval.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

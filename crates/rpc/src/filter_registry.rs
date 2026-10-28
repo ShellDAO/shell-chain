@@ -52,7 +52,7 @@ pub struct FilterEntry {
     pub last_poll_hash: Option<ShellHash>,
     /// First block whose changes can be reported by this filter.
     pub changes_from_block: Option<u64>,
-    /// Last access time for TTL-based expiry.
+    /// Last successful poll or retrieval time for TTL-based expiry.
     pub last_access: Instant,
 }
 
@@ -153,7 +153,7 @@ impl FilterRegistry {
 
     /// Get the filter kind and last poll block for a given filter ID.
     /// Returns `None` if the filter does not exist.
-    /// Updates the last access timestamp.
+    /// Reading poll state does not renew the filter's lifetime.
     pub fn get_filter_info(&self, id: &str) -> Option<(bool, u64)> {
         self.get_filter_cursor(id)
             .map(|(is_log, cursor)| (is_log, cursor.block_number))
@@ -161,7 +161,7 @@ impl FilterRegistry {
 
     /// Get the filter kind and exact canonical cursor.
     /// Returns `None` if the filter does not exist.
-    /// Updates the last access timestamp.
+    /// Reading poll state does not renew the filter's lifetime.
     pub fn get_filter_cursor(&self, id: &str) -> Option<(bool, FilterCursor)> {
         self.get_filter_poll_state(id)
             .map(|(is_log, cursor, _)| (is_log, cursor))
@@ -169,15 +169,14 @@ impl FilterRegistry {
 
     /// Get the filter kind, canonical cursor, and first reportable block.
     /// Returns `None` if the filter does not exist.
-    /// Updates the last access timestamp.
+    /// Renewal is committed only after a successful poll.
     pub fn get_filter_poll_state(&self, id: &str) -> Option<(bool, FilterCursor, Option<u64>)> {
         if !is_valid_filter_id(id) {
             return None;
         }
         let mut filters = self.filters.write();
         remove_expired_filter(&mut filters, id, self.ttl_secs);
-        let entry = filters.get_mut(id)?;
-        entry.last_access = Instant::now();
+        let entry = filters.get(id)?;
         let is_log = matches!(entry.kind, FilterKind::Log(_));
         Some((
             is_log,
@@ -252,18 +251,36 @@ impl FilterRegistry {
 
     /// Check if a filter exists and whether it is a log filter.
     /// Returns the stored `RawLogFilter` for log filters (cloned).
+    /// Reading criteria does not renew the filter's lifetime.
     pub fn get_log_filter(&self, id: &str) -> Option<RawLogFilter> {
         if !is_valid_filter_id(id) {
             return None;
         }
         let mut filters = self.filters.write();
         remove_expired_filter(&mut filters, id, self.ttl_secs);
-        let entry = filters.get_mut(id)?;
-        entry.last_access = Instant::now();
+        let entry = filters.get(id)?;
         match &entry.kind {
             FilterKind::Log(raw) => Some(raw.clone()),
             _ => None,
         }
+    }
+
+    /// Renew a log filter after a successful retrieval.
+    /// An expired, uninstalled, or non-log filter cannot be renewed.
+    pub fn refresh_log_filter(&self, id: &str) -> bool {
+        if !is_valid_filter_id(id) {
+            return false;
+        }
+        let mut filters = self.filters.write();
+        remove_expired_filter(&mut filters, id, self.ttl_secs);
+        let Some(entry) = filters.get_mut(id) else {
+            return false;
+        };
+        if !matches!(&entry.kind, FilterKind::Log(_)) {
+            return false;
+        }
+        entry.last_access = Instant::now();
+        true
     }
 
     /// Remove a filter. Returns `true` if an unexpired filter existed.
@@ -609,6 +626,49 @@ mod tests {
 
         assert!(reg.get_filter_info(&id).is_none());
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn reading_filter_metadata_does_not_renew_lifetime() {
+        let reg = FilterRegistry::new();
+        let raw: RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
+        let id = reg.new_filter(FilterKind::Log(raw), 7).unwrap();
+        let previous = Instant::now() - Duration::from_secs(150);
+        reg.filters.write().get_mut(&id).unwrap().last_access = previous;
+
+        assert!(reg.get_filter_info(&id).is_some());
+        assert!(reg.get_filter_cursor(&id).is_some());
+        assert!(reg.get_filter_poll_state(&id).is_some());
+        assert!(reg.get_log_filter(&id).is_some());
+        assert_eq!(reg.filters.read().get(&id).unwrap().last_access, previous);
+
+        assert!(reg.refresh_log_filter(&id));
+        assert!(reg.filters.read().get(&id).unwrap().last_access > previous);
+    }
+
+    #[test]
+    fn log_retrieval_cannot_renew_expired_uninstalled_or_block_filter() {
+        let reg = FilterRegistry::with_ttl(1);
+        let raw: RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
+        let id = reg.new_filter(FilterKind::Log(raw), 7).unwrap();
+        reg.filters.write().get_mut(&id).unwrap().last_access =
+            Instant::now() - Duration::from_secs(2);
+        assert!(!reg.refresh_log_filter(&id));
+        assert!(!reg.uninstall(&id));
+
+        let raw: RawLogFilter = serde_json::from_str(r#"{}"#).unwrap();
+        let removed = reg.new_filter(FilterKind::Log(raw), 7).unwrap();
+        assert!(reg.uninstall(&removed));
+        assert!(!reg.refresh_log_filter(&removed));
+
+        let block = reg.new_filter(FilterKind::Block, 7).unwrap();
+        let previous = reg.filters.read().get(&block).unwrap().last_access;
+        assert!(!reg.refresh_log_filter(&block));
+        assert_eq!(
+            reg.filters.read().get(&block).unwrap().last_access,
+            previous
+        );
+        assert!(!reg.refresh_log_filter("invalid"));
     }
 
     #[test]

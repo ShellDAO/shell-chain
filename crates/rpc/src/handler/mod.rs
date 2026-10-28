@@ -9413,6 +9413,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filter_http_only_successful_requests_renew_idle_lifetime() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use jsonrpsee::server::ServerBuilder;
+        use std::time::Duration;
+
+        let mut handler = setup();
+        handler.filter_registry = Arc::new(FilterRegistry::with_ttl(4));
+        store_block_with_logs(&handler, 0, vec![]);
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{}", server.local_addr().unwrap()))
+            .unwrap();
+        let handle = server.start(EthApiServer::into_rpc(handler.clone()));
+        let mut ids = Vec::new();
+        for criteria in [
+            serde_json::json!({}),
+            serde_json::json!({"fromBlock":"0x0", "toBlock":"0xffffffffffffffff"}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        ] {
+            ids.push(
+                client
+                    .request::<String, _>("eth_newFilter", rpc_params![criteria])
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let failure = client
+            .request::<serde_json::Value, _>("eth_getFilterLogs", rpc_params![&ids[1]])
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("cap the range"));
+        for (id, method) in [
+            (&ids[2], "eth_getFilterLogs"),
+            (&ids[3], "eth_getFilterChanges"),
+        ] {
+            assert_eq!(
+                client
+                    .request::<serde_json::Value, _>(method, rpc_params![id])
+                    .await
+                    .unwrap(),
+                serde_json::json!([])
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        for id in &ids[..2] {
+            let failure = client
+                .request::<serde_json::Value, _>("eth_getFilterChanges", rpc_params![id])
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("filter not found"));
+            assert!(!client
+                .request::<bool, _>("eth_uninstallFilter", rpc_params![id])
+                .await
+                .unwrap());
+        }
+        for id in &ids[2..] {
+            assert_eq!(
+                client
+                    .request::<serde_json::Value, _>("eth_getFilterChanges", rpc_params![id])
+                    .await
+                    .unwrap(),
+                serde_json::json!([])
+            );
+            assert!(client
+                .request::<bool, _>("eth_uninstallFilter", rpc_params![id])
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn filter_http_failed_block_poll_does_not_renew_idle_lifetime() {
+        use jsonrpsee::core::client::ClientT;
+        use jsonrpsee::http_client::HttpClientBuilder;
+        use jsonrpsee::rpc_params;
+        use jsonrpsee::server::ServerBuilder;
+        use std::time::Duration;
+
+        let mut handler = setup();
+        handler.filter_registry = Arc::new(FilterRegistry::with_ttl(4));
+        store_block_with_logs(&handler, 0, vec![]);
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{}", server.local_addr().unwrap()))
+            .unwrap();
+        let handle = server.start(EthApiServer::into_rpc(handler.clone()));
+        let id: String = client
+            .request("eth_newBlockFilter", rpc_params![])
+            .await
+            .unwrap();
+        // A missing intermediate canonical header makes the poll fail after
+        // looking up the filter, without delivering or committing a cursor.
+        store_block_with_logs(&handler, 2, vec![]);
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let failure = client
+            .request::<serde_json::Value, _>("eth_getFilterChanges", rpc_params![&id])
+            .await
+            .unwrap_err();
+        // Internal chain-store errors are sanitized at the public RPC boundary.
+        assert!(
+            matches!(failure, jsonrpsee::core::client::Error::Call(error) if error.code() == -32603)
+        );
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(!client
+            .request::<bool, _>("eth_uninstallFilter", rpc_params![id])
+            .await
+            .unwrap());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
     async fn get_filter_logs_returns_all_matching_logs() {
         let handler = setup();
         let addr = Address::from([0xDD; 20]);

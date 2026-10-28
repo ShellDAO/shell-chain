@@ -1245,7 +1245,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             .get_log_filter(&id)
             .ok_or_else(|| not_found("filter not found"))?;
         let logs = self.get_logs(raw).await?;
-        if self.filter_registry.get_log_filter(&id).is_none() {
+        if !self.filter_registry.refresh_log_filter(&id) {
             return Err(not_found("filter not found"));
         }
         Ok(logs)
