@@ -551,6 +551,33 @@ keys remain in its private temporary directory. It does not test multiple-author
 quorum or prove public package availability. See the
 [execution decision](adr/aa-validator-registry.md) for the atomicity boundary.
 
+## Signed contract-paymaster acceptance
+
+Use a compatible SDK and native executable with RocksDB and `libp2p` support:
+
+```sh
+NODE_BIN=/path/to/shell-node \
+  SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --contract-paymaster
+```
+
+This mode was checked with the public node v0.27.13 and SDK v0.14.0-rc.3. It
+creates its own producer key, unfunded sender, ports and temporary full-storage
+database. Fee accounting is active only in that temporary genesis. A real EVM
+paymaster policy accepts context `0xab` and rejects `0xac`. A genuinely signed
+bundle with the wrong context must leave the chain, pool and accounts unchanged;
+the accepted bundle must write storage while charging the contract paymaster,
+leaving the sender's balance at zero. The script verifies actual receipts,
+finality, sponsorship metadata and the same database after a physical restart.
+It stops its children, exits unsuccessfully on failed assertions, and prints the
+report directory. Private test data remain there for inspection.
+
+The genesis bytecode fixtures test execution, rather than contract deployment.
+This checks one ML-DSA sender, one policy and one inner call on a local development
+network; it does not establish public-testnet activation or other policy, rollback,
+algorithm or storage-profile combinations. Run this mode separately from the
+other scenarios.
+
 ## Historical block signers after pruning
 
 From the current source checkout, use Node.js 24, the public

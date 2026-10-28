@@ -23,6 +23,7 @@ const {
   MlDsa65Adapter,
   buildTransaction,
   buildBatchTransaction,
+  buildContractPaymasterTransaction,
   buildInnerCall,
   accountManagerAddress,
   validatorRegistryAddress,
@@ -42,6 +43,10 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const contractPaymasterScenario = process.argv.includes("--contract-paymaster");
+if (contractPaymasterScenario)
+  assert.ok(process.argv.slice(2).every((arg) => arg === "--contract-paymaster"),
+    "Run --contract-paymaster separately from other scenarios");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -150,6 +155,11 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (contractPaymasterScenario) {
+    const command = result.nativeCommands?.find((entry) => entry.pid === child.pid);
+    if (command) Object.assign(command, { endedAt: new Date().toISOString(), exitCode: child.exitCode, signal: child.signalCode });
+    await save();
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -197,6 +207,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     args.push("--pruning", "1", "--body-retention", "1");
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
+  const startedAt = new Date().toISOString();
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
@@ -205,6 +216,10 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   child.once("error", (error) => {
     spawnError = error;
   });
+  if (contractPaymasterScenario) {
+    (result.nativeCommands ??= []).push({ args: [binary, ...args], pid: child.pid, startedAt });
+    await save();
+  }
   if (!waitForRpc) return;
   for (let k = 0; k < 160; k++) {
     if (spawnError) throw spawnError;
@@ -427,7 +442,124 @@ async function confirmed(
   await save();
   return entry;
 }
+async function runContractPaymasterScenario() {
+  assert.equal(typeof buildContractPaymasterTransaction, "function");
+  result.scenario = "signed-contract-paymaster";
+  result.adaptations = [
+    "One isolated full RocksDB ML-DSA producer; fresh unfunded sender and funded contract paymaster.",
+    "Fee accounting activates at this temporary genesis only; no live network activation.",
+    "Genesis EVM policy/storage fixtures test execution, not contract deployment or native-address activation.",
+  ];
+  const data = join(out, "contract-paymaster");
+  await mkdir(data);
+  const paymaster = "0x" + "00".repeat(12) + "91".repeat(20);
+  const target = "0x" + "00".repeat(12) + "92".repeat(20);
+  const sender = outsider.getAddress();
+  const word = (n) => "0x" + BigInt(n).toString(16).padStart(64, "0");
+  // ABI argument 4 holds the context offset. Approve only a first byte of 0xab.
+  const policyCode = "0x6064356004016020013560001a60ab1460005260206000f3";
+  const genesis = {
+    chain_id: 1337,
+    chain_name: "contract-paymaster-acceptance",
+    network_type: "Dev",
+    timestamp: Math.floor(Date.now() / 1000) - 120,
+    gas_limit: 30000000,
+    extra_data: "contract-paymaster-acceptance",
+    fee_accounting_activation_height: 0,
+    alloc: {
+      [paymaster]: { balance: "0x3635c9adc5dea00000", nonce: 0, code: policyCode, storage: {} },
+      [target]: { balance: "0x0", nonce: 0, code: "0x60003560005500", storage: {} },
+    },
+    boot_nodes: [],
+    consensus: {
+      engine: "wpoa", authorities: [miner.getAddress()],
+      authority_pubkeys: ["0x" + Buffer.from(miner.getPublicKey()).toString("hex")],
+      weights: [1], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 0,
+    },
+  };
+  await writeFile(join(data, "genesis.json"), JSON.stringify(genesis, null, 2));
+  const snapshot = async () => ({
+    head: await rpc(0, "eth_getBlockByNumber", ["latest", false]),
+    senderBalance: await rpc(0, "eth_getBalance", [sender, "latest"]),
+    payerBalance: await rpc(0, "eth_getBalance", [paymaster, "latest"]),
+    senderNonce: await rpc(0, "eth_getTransactionCount", [sender, "latest"]),
+    payerNonce: await rpc(0, "eth_getTransactionCount", [paymaster, "latest"]),
+    slot: await rpc(0, "eth_getStorageAt", [target, "0x0", "latest"]),
+    policySlot: await rpc(0, "eth_getStorageAt", [paymaster, "0x0", "latest"]),
+    pending: await rpc(0, "shell_pendingCount"),
+  });
+  const signed = async (context) => {
+    const { tx, aa_bundle } = buildContractPaymasterTransaction({
+      chainId: 1337, nonce: 0,
+      innerCalls: [{ to: target, value: "0x0", data: word(23), gas_limit: "0xc350" }],
+      gasLimit: 300000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0,
+      paymaster, paymasterContext: [context],
+    });
+    assert.equal(aa_bundle.paymaster_signature, null);
+    return outsider.buildSignedTransaction({ tx, aaBundle: aa_bundle, includePublicKey: true });
+  };
+  await start(0, data, keyPath, "contract-paymaster");
+  const before = await snapshot();
+  assert.equal(before.senderBalance, "0x0");
+  const { toRlp } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+  result.paymasterSimulation = await rpc(0, "shell_estimatePaymasterGas", [{
+    paymaster, sender,
+    inner_calls_data: toRlp([[target, "0x", word(23), "0xc350"]]),
+    gas_limit: "0x493e0", max_fee_per_gas: "0xe8d4a51000", paymaster_context: "0xab",
+  }]);
+  assert.equal(result.paymasterSimulation.simulation_status, "simulated");
+  assert.equal(result.paymasterSimulation.within_cap, true);
+  assert.deepEqual(await snapshot(), before);
+  const rejected = await signed(0xac);
+  await assert.rejects(() => paced(() => providers[0].sendTransaction(rejected)),
+    /contract paymaster rejected transaction/);
+  assert.deepEqual(await snapshot(), before);
+  result.wrongContextRejectedWithoutWrites = true;
+  const hash = await paced(async () => providers[0].sendTransaction(await signed(0xab)));
+  let receipt;
+  for (let attempt = 0; attempt < 120; attempt++) {
+    receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+    if (receipt) break;
+    await pause(250);
+  }
+  assert.equal(receipt?.status, "0x1");
+  const after = await snapshot();
+  const fee = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
+  assert.ok(fee > 0n);
+  assert.equal(BigInt(before.payerBalance) - BigInt(after.payerBalance), fee);
+  assert.equal(after.senderBalance, "0x0");
+  assert.equal(after.senderNonce, "0x1");
+  assert.equal(after.payerNonce, before.payerNonce);
+  assert.equal(after.slot, word(23));
+  assert.equal(after.policySlot, word(0));
+  const sponsorship = await rpc(0, "shell_isSponsored", [hash]);
+  assert.equal(sponsorship.found, true);
+  assert.equal(sponsorship.location, "chain");
+  assert.equal(sponsorship.is_aa_bundle, true);
+  assert.equal(sponsorship.sponsored, true);
+  assert.equal(sponsorship.sender, sender);
+  assert.equal(sponsorship.paymaster, paymaster);
+  assert.equal(sponsorship.inner_call_count, 1);
+  assert.ok(BigInt((await rpc(0, "shell_getFinalityInfo")).lastFinalizedBlock) >= BigInt(receipt.blockNumber));
+  result.transactions.push({ label: "contract-sponsored storage call", hash, receipt });
+  result.contractSponsorship = { before, after, sponsorship, fee: fee.toString() };
+  const child = nodes[0];
+  await stop(0);
+  assert.equal(child.exitCode, 0);
+  await start(0, data, keyPath, "contract-paymaster-restart");
+  assert.deepEqual(await snapshot(), after);
+  assert.deepEqual(await rpc(0, "eth_getTransactionReceipt", [hash]), receipt);
+  assert.deepEqual(await rpc(0, "shell_isSponsored", [hash]), sponsorship);
+  const reopened = nodes[0];
+  await stop(0);
+  assert.equal(reopened.exitCode, 0);
+  result.restartPreservedContractSponsorship = true;
+  result.nativeExitCodes = [child.exitCode, reopened.exitCode];
+  result.passed = true;
+}
+
 async function runScenario() {
+  if (contractPaymasterScenario) return runContractPaymasterScenario();
   const dirs = [join(out, "leader"), join(out, "follower")];
   for (const dir of dirs) await mkdir(dir);
   const followerKey = join(out, "follower-key.json");
