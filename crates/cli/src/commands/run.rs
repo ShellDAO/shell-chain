@@ -66,6 +66,8 @@ pub struct RunArgs {
     pub mempool_max_bytes: Option<usize>,
     /// Minimum gas-price bump required to replace a pending transaction, in percent (default: 10).
     pub mempool_price_bump: Option<u64>,
+    /// Successful admissions per sender per second (default: 64; 0 disables).
+    pub mempool_sender_rate: Option<usize>,
     /// Account LRU cache size for the world-state trie, in MiB (default: 64).
     pub state_cache_size_mb: Option<usize>,
     /// Enable the parallel-PQVM conflict-graph scheduler.
@@ -908,6 +910,7 @@ async fn run_with_store<S: KvStore + 'static>(
             max_pool_size: args.mempool_max_size.unwrap_or(4096),
             max_pool_bytes: args.mempool_max_bytes.unwrap_or(DEFAULT_MAX_POOL_BYTES),
             replacement_fee_bump_pct: args.mempool_price_bump.unwrap_or(10),
+            max_sender_rate_per_second: args.mempool_sender_rate.unwrap_or(64),
             ..MempoolConfig::default()
         },
         rpc: RpcConfig {
@@ -1199,6 +1202,7 @@ mod tests {
             mempool_max_size: None,
             mempool_max_bytes: None,
             mempool_price_bump: None,
+            mempool_sender_rate: None,
             state_cache_size_mb: None,
             parallel_pqvm: true,
             parallel_pqvm_workers: Some(4),

@@ -91,6 +91,26 @@ so bad unauthenticated requests do not consume the authenticated bucket. Valid
 Bearer tokens get independent buckets; no-token public requests share a public
 bucket. When the limit is exceeded, the server returns an HTTP 429 response.
 
+Development source builds containing the sender-admission rate change also apply
+`--mempool-sender-rate` to authenticated transactions entering the shared mempool
+through RPC or P2P. The default allows 64 successful admissions, including fee
+replacements, per sender in each one-second window starting at its first
+admission. Refused transactions do not consume the allowance. A rate refusal is
+an application-level JSON-RPC error; the HTTP bucket above is independent.
+
+```bash
+# Unreleased development source builds only; absent from the 0.27.13 native release.
+shell-node run --mempool-sender-rate 64
+```
+
+Use `0` to disable this local policy. The pending-transaction queue cap remains a
+separate bound. Mining, eviction and clearing a queue retain its current-window
+allowance; restarting the node resets these short-lived counters. Tracking is
+bounded by the configured maximum pool size in recent distinct senders. A full
+tracker refuses new senders until a window expires. Block import and historical
+replay continue to follow consensus validity rules independently of this local
+admission setting. Public binary availability requires a subsequent release.
+
 ## WebSocket Support
 
 Enable the WebSocket server with `--ws`:

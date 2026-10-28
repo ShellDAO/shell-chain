@@ -198,6 +198,10 @@ enum Commands {
         #[arg(long)]
         mempool_price_bump: Option<u64>,
 
+        /// Successful admissions per sender per second (default: 64; 0 disables).
+        #[arg(long)]
+        mempool_sender_rate: Option<usize>,
+
         /// Account LRU cache size for the world-state trie in MiB.
         #[arg(long)]
         state_cache_size_mb: Option<usize>,
@@ -664,6 +668,7 @@ async fn main() {
             mempool_max_size,
             mempool_max_bytes,
             mempool_price_bump,
+            mempool_sender_rate,
             state_cache_size_mb,
             parallel_pqvm,
             parallel_pqvm_workers,
@@ -845,6 +850,7 @@ async fn main() {
                 mempool_max_size,
                 mempool_max_bytes,
                 mempool_price_bump,
+                mempool_sender_rate,
                 state_cache_size_mb,
                 parallel_pqvm: effective_parallel_pqvm,
                 parallel_pqvm_workers: effective_parallel_pqvm_workers,

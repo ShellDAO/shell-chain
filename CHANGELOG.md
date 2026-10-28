@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Apply a configurable local per-sender mempool admission rate to RPC and P2P
+  transactions, including successful fee replacements. The default is 64
+  admissions per one-second window; `--mempool-sender-rate 0` disables it.
+  Invalid or refused transactions do not consume another sender's allowance,
+  and rate refusals preserve the current queue and balance reservations.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -14,6 +14,16 @@ pub enum MempoolError {
     #[error("sender {sender} has too many pending transactions ({count})")]
     SenderQueueFull { sender: Address, count: usize },
 
+    #[error("sender {sender} admission rate exceeds {limit} per second; retry after {retry_after_ms} ms")]
+    SenderRateLimited {
+        sender: Address,
+        limit: usize,
+        retry_after_ms: u64,
+    },
+
+    #[error("sender admission-rate tracker is full ({capacity} senders); retry after one second")]
+    SenderRateCapacity { capacity: usize },
+
     #[error("duplicate transaction {hash}")]
     Duplicate { hash: ShellHash },
 
@@ -66,6 +76,8 @@ impl MempoolError {
             Self::PoolFull { .. } => "pool_full",
             Self::PoolBytesFull { .. } => "pool_bytes_full",
             Self::SenderQueueFull { .. } => "sender_queue_full",
+            Self::SenderRateLimited { .. } => "sender_rate_limited",
+            Self::SenderRateCapacity { .. } => "sender_rate_capacity",
             Self::Duplicate { .. } => "duplicate",
             Self::ChainIdMismatch { .. } => "chain_id_mismatch",
             Self::GasPriceTooLow { .. } => "gas_price_too_low",

@@ -17753,6 +17753,10 @@ mod tests {
         ] {
             let registry_active = activation.is_some_and(|height| height <= 17);
             let (mut node, proposer) = setup_node();
+            // This proof-storage fixture synthesizes 512 transactions without
+            // waiting for real block intervals; admission timing is independent.
+            node.config.mempool.max_sender_rate_per_second = 0;
+            node.tx_pool = Arc::new(TxPool::new(node.config.mempool.clone()));
             node.config.rpc_enabled = false;
             node.config.metrics.enabled = false;
             let (sender, address, pubkey) = make_stark_account(&node);

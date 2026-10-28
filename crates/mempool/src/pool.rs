@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tracing::warn;
@@ -83,6 +84,14 @@ struct PoolInner {
     /// Aggregate balance reserved by retained transactions for each sender or
     /// paymaster. This keeps admission checks independent of total pool size.
     reserved_by_account: HashMap<Address, ReservationTotal>,
+    /// Recent successful admissions, retained even after mining or eviction.
+    sender_admissions: HashMap<Address, SenderAdmissionWindow>,
+    last_sender_admission_gc: Instant,
+}
+
+struct SenderAdmissionWindow {
+    started: Instant,
+    accepted: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -156,6 +165,8 @@ impl TxPool {
                 total_bytes: 0,
                 accepted_total: 0,
                 reserved_by_account: HashMap::new(),
+                sender_admissions: HashMap::new(),
+                last_sender_admission_gc: Instant::now(),
             }),
         }
     }
@@ -341,6 +352,17 @@ impl TxPool {
                 "mempool arrival sequence exhausted".into(),
             ));
         };
+
+        // Authentication, nonce, fee, capacity and reservation checks above must
+        // all succeed before charging a sender. No fallible pool operation
+        // follows this charge, so a refused replacement cannot evict its owner.
+        Self::charge_sender_admission(
+            &mut inner,
+            sender,
+            self.config.max_sender_rate_per_second,
+            self.config.max_pool_size.max(1),
+            Instant::now(),
+        )?;
 
         for evicted_hash in &evicted_hashes {
             Self::remove_entry(&mut inner, evicted_hash);
@@ -749,6 +771,55 @@ impl TxPool {
     }
 
     // --- Private helpers ---
+
+    fn charge_sender_admission(
+        inner: &mut PoolInner,
+        sender: Address,
+        limit: usize,
+        capacity: usize,
+        now: Instant,
+    ) -> Result<(), MempoolError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let window = Duration::from_secs(1);
+        if now.saturating_duration_since(inner.last_sender_admission_gc) >= window {
+            inner
+                .sender_admissions
+                .retain(|_, entry| now.saturating_duration_since(entry.started) < window);
+            inner.last_sender_admission_gc = now;
+        }
+        if let Some(entry) = inner.sender_admissions.get_mut(&sender) {
+            let elapsed = now.saturating_duration_since(entry.started);
+            if elapsed >= window {
+                *entry = SenderAdmissionWindow {
+                    started: now,
+                    accepted: 1,
+                };
+                return Ok(());
+            }
+            if entry.accepted >= limit {
+                return Err(MempoolError::SenderRateLimited {
+                    sender,
+                    limit,
+                    retry_after_ms: (window - elapsed).as_nanos().div_ceil(1_000_000) as u64,
+                });
+            }
+            entry.accepted += 1;
+            return Ok(());
+        }
+        if inner.sender_admissions.len() >= capacity {
+            return Err(MempoolError::SenderRateCapacity { capacity });
+        }
+        inner.sender_admissions.insert(
+            sender,
+            SenderAdmissionWindow {
+                started: now,
+                accepted: 1,
+            },
+        );
+        Ok(())
+    }
 
     /// Lightweight validation performed before acquiring the pool lock.
     fn validate_stateless<S: KvStore + 'static, V: Verifier>(
@@ -1253,6 +1324,7 @@ mod tests {
             max_pool_size: 10,
             max_pool_bytes: 1024 * 1024,
             max_per_sender: 4,
+            max_sender_rate_per_second: 0, // Other fixtures isolate nonce/fee/capacity rules.
             chain_id: 42,
             min_gas_price: 1,
             replacement_fee_bump_pct: 10,
@@ -1560,6 +1632,96 @@ mod tests {
 
     fn indexed_reservation(pool: &TxPool, account: &Address) -> Option<ReservationTotal> {
         pool.inner.read().reserved_by_account.get(account).copied()
+    }
+
+    #[test]
+    fn sender_admission_rate_preserves_authentication_replacements_and_reservations() {
+        let pool = TxPool::new(MempoolConfig {
+            max_sender_rate_per_second: 2,
+            ..make_config()
+        });
+        let (mut ws, cs) = setup_validation_ctx();
+        let verifier = DilithiumVerifier;
+        let signer = DilithiumSigner::generate();
+        let pk = signer.public_key().to_vec();
+        let sender = test_address(&pk);
+        ws.set_balance(&sender, U256::from(1_000_000_000_000u64))
+            .unwrap();
+        let first = make_signed_tx_with_signer(&signer, &pk, 0, 2);
+        let first_hash = pool.insert(first.clone(), &mut ws, &cs, &verifier).unwrap();
+
+        let mut invalid = make_signed_tx_with_signer(&signer, &pk, 1, 2);
+        invalid.signature.data[0] ^= 1;
+        assert!(pool.insert(invalid, &mut ws, &cs, &verifier).is_err());
+        let underpriced = make_signed_value_tx_with_signer(&signer, &pk, 0, 2, U256::from(1u64));
+        assert!(pool.insert(underpriced, &mut ws, &cs, &verifier).is_err());
+        assert_eq!(pool.inner.read().sender_admissions[&sender].accepted, 1);
+
+        let replacement = make_signed_tx_with_signer(&signer, &pk, 0, 10);
+        let replacement_hash = pool.insert(replacement, &mut ws, &cs, &verifier).unwrap();
+        assert!(!pool.contains(&first_hash));
+        let before_root = ws.state_root().unwrap();
+        let before_bytes = pool.size_bytes();
+        let reservation = indexed_reservation(&pool, &sender).unwrap();
+        let next = make_signed_tx_with_signer(&signer, &pk, 1, 2);
+        assert!(matches!(
+            pool.insert(next, &mut ws, &cs, &verifier),
+            Err(MempoolError::SenderRateLimited { limit: 2, .. })
+        ));
+        assert!(pool.contains(&replacement_hash));
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.size_bytes(), before_bytes);
+        assert_eq!(ws.state_root().unwrap(), before_root);
+        let after = indexed_reservation(&pool, &sender).unwrap();
+        assert_eq!(
+            (after.low, after.overflow_units),
+            (reservation.low, reservation.overflow_units)
+        );
+
+        let (other, _) = make_signed_tx(0, 2);
+        assert!(insert_rich(&pool, other, &verifier, &mut ws, &cs).is_ok());
+        assert!(pool.remove(&replacement_hash));
+        assert!(matches!(
+            pool.insert(first.clone(), &mut ws, &cs, &verifier),
+            Err(MempoolError::SenderRateLimited { .. })
+        ));
+        pool.inner
+            .write()
+            .sender_admissions
+            .get_mut(&sender)
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(1);
+        assert!(pool.insert(first, &mut ws, &cs, &verifier).is_ok());
+        assert_eq!(pool.inner.read().sender_admissions[&sender].accepted, 1);
+    }
+
+    #[test]
+    fn sender_admission_rate_window_boundary_and_bounded_tracking() {
+        let pool = TxPool::new(make_config());
+        let mut inner = pool.inner.write();
+        let now = Instant::now();
+        let a = test_address(b"rate-a");
+        let b = test_address(b"rate-b");
+        let c = test_address(b"rate-c");
+        TxPool::charge_sender_admission(&mut inner, a, 1, 2, now).unwrap();
+        TxPool::charge_sender_admission(&mut inner, b, 1, 2, now).unwrap();
+        assert!(matches!(
+            TxPool::charge_sender_admission(&mut inner, c, 1, 2, now),
+            Err(MempoolError::SenderRateCapacity { capacity: 2 })
+        ));
+        assert!(matches!(
+            TxPool::charge_sender_admission(&mut inner, a, 1, 2, now + Duration::from_millis(999)),
+            Err(MempoolError::SenderRateLimited {
+                retry_after_ms: 1,
+                ..
+            })
+        ));
+        assert_eq!(inner.sender_admissions.len(), 2);
+        TxPool::charge_sender_admission(&mut inner, c, 1, 2, now + Duration::from_secs(1)).unwrap();
+        assert_eq!(inner.sender_admissions.len(), 1);
+        // Disabling the local policy neither charges nor allocates a window.
+        TxPool::charge_sender_admission(&mut inner, a, 0, 1, now).unwrap();
+        assert_eq!(inner.sender_admissions.len(), 1);
     }
 
     #[test]

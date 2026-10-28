@@ -10,6 +10,9 @@ pub struct MempoolConfig {
     pub max_pool_bytes: usize,
     /// Maximum number of pending transactions per sender address.
     pub max_per_sender: usize,
+    /// Successful admissions per sender in a one-second window, including RBF.
+    /// Zero disables this local admission policy.
+    pub max_sender_rate_per_second: usize,
     /// Expected chain ID — reject transactions targeting other chains.
     pub chain_id: u64,
     /// Minimum gas price (max_fee_per_gas) to accept into the pool.
@@ -26,6 +29,7 @@ impl Default for MempoolConfig {
             max_pool_size: 4096,
             max_pool_bytes: DEFAULT_MAX_POOL_BYTES,
             max_per_sender: 64,
+            max_sender_rate_per_second: 64,
             chain_id: 1,
             min_gas_price: 0,
             replacement_fee_bump_pct: 10,
@@ -49,6 +53,11 @@ mod tests {
             MempoolConfig::default().max_pool_bytes,
             DEFAULT_MAX_POOL_BYTES
         );
+    }
+
+    #[test]
+    fn default_sender_rate_is_enabled() {
+        assert_eq!(MempoolConfig::default().max_sender_rate_per_second, 64);
     }
 
     #[test]
@@ -81,6 +90,7 @@ mod tests {
             max_pool_size: 100,
             max_pool_bytes: 1_000_000,
             max_per_sender: 5,
+            max_sender_rate_per_second: 64,
             chain_id: 42,
             min_gas_price: 1_000_000_000,
             replacement_fee_bump_pct: 25,
