@@ -1702,20 +1702,30 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
 
 ### shell_setBalance *(dev/testnet only)*
 
-Directly sets the balance of an address. **Only available when `api_modules` includes `dev`.** Returns `-32601` on production nodes.
+Directly sets the balance of an address. Requires development RPC control,
+which is enabled by including `evm` alongside `shell` in the RPC namespaces.
+For a local node, configure:
+
+```toml
+[rpc]
+api_modules = ["eth", "net", "web3", "shell", "evm"]
+```
 
 **Parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `address` | string | Target `0x...` address |
-| `balance` | string | New balance in wei as decimal string |
+| `address` | string | Target `0x<64 hex>` address |
+| `balance` | string | New balance in wei as a canonical hexadecimal quantity (`0x` prefix, no leading zero padding; zero is `0x0`) |
 
-**Response:** `true` on success.
+**Response:** `true` on success. Returns `DEV_MODE_REQUIRED (-32002)` when
+development control is disabled, or `-32602` for an invalid balance quantity.
+
+The following example sets the balance to 1 SHELL (10^18 wei):
 
 ```bash
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"shell_setBalance","params":["0xabc...","1000000000000000000"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"shell_setBalance","params":["0x<64 hex>","0xde0b6b3a7640000"],"id":1}'
 ```
 
 ---
