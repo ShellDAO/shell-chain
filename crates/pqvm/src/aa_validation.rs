@@ -1169,6 +1169,7 @@ fn simulate_paymaster_with_address_context<S: KvStore + 'static>(
         input.call_data,
         input.max_gas_cost,
         input.context,
+        native_context.is_some(),
     );
 
     let wrapper_address = paymaster_validation_wrapper_address(paymaster);
@@ -1367,7 +1368,7 @@ fn decode_abi_bool(bytes: &[u8]) -> Option<bool> {
 /// Layout:
 /// ```text
 /// [0..4]   selector
-/// [4..36]  sender (address, left-padded to 32 bytes)
+/// [4..36]  sender (full native word after activation, padded low160 before)
 /// [36..68] offset of callData (= 0x80 = 128)
 /// [68..100] maxGasCost (uint256)
 /// [100..132] offset of context (= 0x80 + 32 + padded(callData.len))
@@ -1379,6 +1380,7 @@ fn encode_validate_paymaster_op_calldata(
     call_data: &[u8],
     max_gas_cost: U256,
     context: &[u8],
+    native: bool,
 ) -> Vec<u8> {
     let call_data_offset: usize = 128; // 4 static args × 32 bytes
     let call_data_len_padded = padded_len(call_data.len());
@@ -1403,10 +1405,14 @@ fn encode_validate_paymaster_op_calldata(
             .unwrap_or_else(|| unreachable!("keccak256 is 32 bytes")),
     );
 
-    // sender: address left-padded to 32 bytes
-    let sender_evm = sender.to_alloy();
-    out.extend_from_slice(&[0u8; 12]);
-    out.extend_from_slice(sender_evm.as_slice());
+    // PQABI preserves the complete sender only under the native address profile.
+    // Historical admission and replay retain the zero-padded 20-byte ABI value.
+    if native {
+        out.extend_from_slice(sender.as_bytes());
+    } else {
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(sender.to_alloy().as_slice());
+    }
 
     // callData offset
     out.extend_from_slice(&abi_word(call_data_offset as u64));
@@ -2421,14 +2427,87 @@ mod tests {
     }
 
     #[test]
+    fn compiled_paymaster_sender_identity_follows_native_activation() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/native-paymaster-identity.json"
+        ))
+        .unwrap();
+        let sender = Address::from([0x34; 32]);
+        let mut alias = *sender.as_bytes();
+        alias[..12].fill(0x56);
+        let alias = Address::from(alias);
+        let paymaster = Address::from([0x12; 32]);
+        let limit = U256::from(300_000_000_000_000_000_u64);
+        for activation in [None, Some(2)] {
+            let (mut ws, cs) = setup_stores();
+            let profile = if activation.is_some() { "pqvm" } else { "evm" };
+            let code = fixture["artifacts"][profile]["deployedBytecode"]
+                .as_str()
+                .unwrap();
+            install_paymaster(&mut ws, &cs, paymaster, hex::decode(&code[2..]).unwrap());
+            ws.set_storage(
+                &paymaster,
+                &ShellHash::ZERO,
+                &ShellHash::from(*sender.as_bytes()),
+            )
+            .unwrap();
+            cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337, "genesis_hash":ShellHash::ZERO,
+                    "native_address_context_height":activation
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let before = ws.state_root().unwrap();
+            // An earlier header after active-height reads must select the old ABI again.
+            for number in [1, 2, 3, 1] {
+                let native = activation.is_some_and(|height| number >= height);
+                let header = BlockHeader {
+                    number,
+                    gas_limit: PAYMASTER_VALIDATE_GAS_CAP,
+                    ..BlockHeader::default()
+                };
+                for (identity, max_gas_cost, context, accepted) in [
+                    (sender, limit, &[0xab][..], activation.is_none() || native),
+                    (alias, limit, &[0xab][..], activation.is_none()),
+                    (sender, limit + U256::from(1), &[0xab][..], false),
+                    (sender, limit, &[0xac][..], false),
+                    (sender, limit, &[][..], false),
+                ] {
+                    let input = PaymasterValidationInput {
+                        chain_id: 1337,
+                        sender: &identity,
+                        paymaster: &paymaster,
+                        call_data: &[0xc0],
+                        max_gas_cost,
+                        context,
+                    };
+                    assert_eq!(
+                        simulate_paymaster_validation(&ws, &cs, &input, Some(&header)).is_ok(),
+                        accepted,
+                        "profile={profile} number={number} identity={identity} cost={max_gas_cost}"
+                    );
+                    assert_eq!(ws.state_root().unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn paymaster_validation_calldata_encodes_uint256_max_gas_cost() {
         let sender = Address::from([0x22; 20]);
         let call_data = [0xAA, 0xBB, 0xCC];
         let context = [0xDD, 0xEE];
         let max_gas_cost = U256::from(u64::MAX) + U256::from(42u64);
 
-        let calldata =
-            encode_validate_paymaster_op_calldata(&sender, &call_data, max_gas_cost, &context);
+        let calldata = encode_validate_paymaster_op_calldata(
+            &sender,
+            &call_data,
+            max_gas_cost,
+            &context,
+            false,
+        );
         let selector = keccak256(VALIDATE_PAYMASTER_OP_SIGNATURE);
 
         assert_eq!(&calldata[0..4], &selector.as_bytes()[..4]);

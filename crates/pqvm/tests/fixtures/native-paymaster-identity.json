@@ -1,0 +1,121 @@
+{
+  "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\ncontract IdentityPaymaster {\n address public allowed;\n function validatePaymasterOp(address sender, bytes calldata callData, uint256 maxGasCost, bytes calldata context) external view returns (bool) {\n  return sender == allowed && maxGasCost <= 300000000000000000 && context.length == 1 && context[0] == 0xab && callData.length > 0;\n }\n}",
+  "compiler": "0.8.37+commit.f401782d.Emscripten.clang",
+  "sdk": "shell-sdk@0.14.0-rc.3",
+  "evmVersion": "cancun",
+  "nativeAddressContextHeight": 0,
+  "artifacts": {
+    "pqvm": {
+      "contractName": "IdentityPaymaster",
+      "sourcePath": "IdentityPaymaster.sol",
+      "solcVersion": "0.8.37+commit.f401782d.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [],
+          "name": "allowed",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "callData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxGasCost",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "context",
+              "type": "bytes"
+            }
+          ],
+          "name": "validatePaymasterOp",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x60808060405234601557610198908161001a8239f35b5f80fdfe6080806040526004361015610012575f80fd5b5f3560e01c90816319e1fca41461011b575063d135224f14610032575f80fd5b346101175760803660031901126101175760243567ffffffffffffffff811161011757610063903690600401610134565b905060643567ffffffffffffffff811161011757610085903690600401610134565b90915f54600435149182610102575b826100f7575b826100c0575b5060209250816100b6575b506040519015158152f35b905015155f6100ab565b909150156100e357602091356001600160f81b03191660ab60f81b14905f6100a0565b634e487b7160e01b5f52603260045260245ffd5b60018114925061009a565b670429d069189e000060443511159250610094565b5f80fd5b34610117575f366003190112610117576020905f548152f35b9181601f840112156101175782359167ffffffffffffffff831161011757602083818601950101116101175756fea264697066735822122073f96c814aaff6148ec8f378fd673ec4e47bbc8c0b3d38701a86fb24a380918e64736f6c63430008250033",
+      "deployedBytecode": "0x6080806040526004361015610012575f80fd5b5f3560e01c90816319e1fca41461011b575063d135224f14610032575f80fd5b346101175760803660031901126101175760243567ffffffffffffffff811161011757610063903690600401610134565b905060643567ffffffffffffffff811161011757610085903690600401610134565b90915f54600435149182610102575b826100f7575b826100c0575b5060209250816100b6575b506040519015158152f35b905015155f6100ab565b909150156100e357602091356001600160f81b03191660ab60f81b14905f6100a0565b634e487b7160e01b5f52603260045260245ffd5b60018114925061009a565b670429d069189e000060443511159250610094565b5f80fd5b34610117575f366003190112610117576020905f548152f35b9181601f840112156101175782359167ffffffffffffffff831161011757602083818601950101116101175756fea264697066735822122073f96c814aaff6148ec8f378fd673ec4e47bbc8c0b3d38701a86fb24a380918e64736f6c63430008250033"
+    },
+    "evm": {
+      "contractName": "IdentityPaymaster",
+      "sourcePath": "IdentityPaymaster.sol",
+      "solcVersion": "0.8.37+commit.f401782d.Emscripten.clang",
+      "abi": [
+        {
+          "inputs": [],
+          "name": "allowed",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "callData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxGasCost",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "context",
+              "type": "bytes"
+            }
+          ],
+          "name": "validatePaymasterOp",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "bytecode": "0x6080604052348015600e575f5ffd5b5061022a8061001c5f395ff3fe608060405234801561000f575f5ffd5b5060043610610034575f3560e01c806319e1fca414610038578063d135224f14610067575b5f5ffd5b5f5461004a906001600160a01b031681565b6040516001600160a01b0390911681526020015b60405180910390f35b61007a61007536600461014a565b61008a565b604051901515815260200161005e565b5f80546001600160a01b0388811691161480156100af5750670429d069189e00008411155b80156100bb5750600182145b80156100ef575082825f8181106100d4576100d46101e0565b9050013560f81c60f81b6001600160f81b03191660ab60f81b145b80156100fa57508415155b979650505050505050565b5f5f83601f840112610115575f5ffd5b50813567ffffffffffffffff81111561012c575f5ffd5b602083019150836020828501011115610143575f5ffd5b9250929050565b5f5f5f5f5f5f6080878903121561015f575f5ffd5b86356001600160a01b0381168114610175575f5ffd5b9550602087013567ffffffffffffffff811115610190575f5ffd5b61019c89828a01610105565b90965094505060408701359250606087013567ffffffffffffffff8111156101c2575f5ffd5b6101ce89828a01610105565b979a9699509497509295939492505050565b634e487b7160e01b5f52603260045260245ffdfea2646970667358221220bf0d80721586a508ec5e82a052a414335eb9b4838a8176b87636bab4c405ee3464736f6c63430008250033",
+      "deployedBytecode": "0x608060405234801561000f575f5ffd5b5060043610610034575f3560e01c806319e1fca414610038578063d135224f14610067575b5f5ffd5b5f5461004a906001600160a01b031681565b6040516001600160a01b0390911681526020015b60405180910390f35b61007a61007536600461014a565b61008a565b604051901515815260200161005e565b5f80546001600160a01b0388811691161480156100af5750670429d069189e00008411155b80156100bb5750600182145b80156100ef575082825f8181106100d4576100d46101e0565b9050013560f81c60f81b6001600160f81b03191660ab60f81b145b80156100fa57508415155b979650505050505050565b5f5f83601f840112610115575f5ffd5b50813567ffffffffffffffff81111561012c575f5ffd5b602083019150836020828501011115610143575f5ffd5b9250929050565b5f5f5f5f5f5f6080878903121561015f575f5ffd5b86356001600160a01b0381168114610175575f5ffd5b9550602087013567ffffffffffffffff811115610190575f5ffd5b61019c89828a01610105565b90965094505060408701359250606087013567ffffffffffffffff8111156101c2575f5ffd5b6101ce89828a01610105565b979a9699509497509295939492505050565b634e487b7160e01b5f52603260045260245ffdfea2646970667358221220bf0d80721586a508ec5e82a052a414335eb9b4838a8176b87636bab4c405ee3464736f6c63430008250033"
+    }
+  }
+}

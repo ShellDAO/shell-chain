@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve the complete sender in contract-paymaster validation calldata when
+  the existing native address profile is active. Estimation, admission and block
+  validation use the same encoding; pre-activation and unconfigured chains keep
+  their historical ABI. Add compiled Solidity policy coverage for identity,
+  sponsorship cost, context and activation boundaries.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

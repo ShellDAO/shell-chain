@@ -599,6 +599,53 @@ physical restart. It uses fresh temporary data and the same version/profile
 scope as the successful contract-paymaster mode above; it does not test native
 AccountManager metadata or runtime algorithm-policy changes inside a failed batch.
 
+
+### Compiled policies and the native sender ABI
+
+The native address profile must pass the complete 32-byte sender to
+`validatePaymasterOp(address,bytes,uint256,bytes)`. Before
+`native_address_context_height`, or when it is absent, the existing ABI retains
+its zero-padded low-20-byte sender. At and after activation, a PQABI policy
+compiled with `target: "pqvm"` receives the full word with the same function
+selector and dynamic-argument layout. Match the policy's compiler target to the
+network's configured profile; this correction does not activate a network.
+
+The public v0.27.13 binary truncates this argument even under the native
+profile. A compiled policy comparing the sender with a stored full identity can
+accept a direct call but reject paymaster estimation and admission. Build the
+source correction before running its separate acceptance mode with Node.js 24
+and `shell-sdk@0.14.0-rc.3`:
+
+```sh
+cargo build --locked -p shell-cli --features libp2p --bin shell-node
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --compiled-paymaster
+```
+
+The Solidity source, compiler version and both compiler targets are retained in
+`crates/pqvm/tests/fixtures/native-paymaster-identity.json`. The policy checks a
+stored sender, the maximum gas cost and context `0xab`. The mode uses the
+compiled PQABI runtime with native address and fee accounting active only in
+its temporary genesis. It rejects a sender sharing only the low 20 bytes,
+excess cost and incorrect context without state changes, then submits a genuine
+signed sponsored storage call. A separate observer must import the same block,
+receipt, full identities and payer fee. Both databases reopen; historical
+tracing must preserve current state. Keys, ports and data are generated locally,
+and all child processes stop on exit. Preinstalled runtime acceptance does not
+establish native contract creation, deployment or public-testnet activation.
+
+Run the compatibility boundary regression separately when changing validation:
+
+```sh
+cargo test -p shell-pqvm compiled_paymaster_sender_identity_follows_native_activation
+```
+
+It checks omitted, pre-activation, boundary and later heights, followed by an
+earlier header again. Legacy Solidity policies keep their existing address
+mapping, while activated PQABI policies reject a different full identity even
+when its low 20 bytes match.
+
 ## Historical block signers after pruning
 
 From the current source checkout, use Node.js 24, the public
@@ -674,7 +721,9 @@ A rejecting/reverting policy, static-state write or exhausted budget returns
 `-32000`; malformed inputs or zero outer gas limit return `-32602`.
 
 Execution uses the current state and admission's next-candidate block context.
-The existing paymaster ABI and activation policies are unchanged, including its
-retained `address` argument mapping. No simulation writes are committed.
+The selector, dynamic arguments and activation schedule are unchanged. The
+sender `address` follows the configured profile described above: historical
+low-20-byte mapping before native activation, full PQABI word afterward in the
+source correction. No simulation writes are committed.
 Acceptance does not verify signatures, sender nonce, funding or full bundle
 validity, and cannot guarantee sponsorship at a later inclusion state or height.

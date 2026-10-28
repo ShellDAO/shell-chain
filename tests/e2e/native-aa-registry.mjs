@@ -43,10 +43,11 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const compiledPaymasterScenario = process.argv.includes("--compiled-paymaster");
 const contractPaymasterFailureScenario = process.argv.includes("--contract-paymaster-failure");
-const contractPaymasterScenario = process.argv.includes("--contract-paymaster") || contractPaymasterFailureScenario;
+const contractPaymasterScenario = process.argv.includes("--contract-paymaster") || contractPaymasterFailureScenario || compiledPaymasterScenario;
 if (contractPaymasterScenario)
-  assert.ok(process.argv.slice(2).every((arg) => arg === (contractPaymasterFailureScenario ? "--contract-paymaster-failure" : "--contract-paymaster")),
+  assert.ok(process.argv.slice(2).every((arg) => arg === (compiledPaymasterScenario ? "--compiled-paymaster" : contractPaymasterFailureScenario ? "--contract-paymaster-failure" : "--contract-paymaster")),
     "Run each contract-paymaster scenario separately");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -446,21 +447,26 @@ async function confirmed(
 async function runContractPaymasterScenario() {
   assert.equal(typeof buildContractPaymasterTransaction, "function");
   const failure = contractPaymasterFailureScenario;
-  result.scenario = failure ? "signed-contract-paymaster-failure" : "signed-contract-paymaster";
+  const compiled = compiledPaymasterScenario;
+  result.scenario = compiled ? "compiled-native-paymaster" : failure ? "signed-contract-paymaster-failure" : "signed-contract-paymaster";
   result.adaptations = [
-    `One isolated full RocksDB ML-DSA producer; fresh ${failure ? "11-wei" : "unfunded"} sender and funded contract paymaster.`,
+    `${compiled ? "Independent producer and observer" : "One producer"} on isolated full RocksDB with ML-DSA; fresh ${failure ? "11-wei" : "unfunded"} sender and funded contract paymaster.`,
     "Fee accounting activates at this temporary genesis only; no live network activation.",
-    "Genesis EVM policy/storage fixtures test execution, not contract deployment or native-address activation.",
+    compiled
+      ? "Compiled PQABI policy and native address context activate at this isolated genesis only; no deployment or live activation."
+      : "Genesis EVM policy/storage fixtures test execution, not contract deployment or native-address activation.",
   ];
   const data = join(out, "contract-paymaster");
   await mkdir(data);
-  const paymaster = "0x" + "00".repeat(12) + "91".repeat(20);
-  const target = "0x" + "00".repeat(12) + "92".repeat(20);
+  const paymaster = "0x" + (compiled ? "a1" : "00").repeat(12) + "91".repeat(20);
+  const target = "0x" + (compiled ? "a2" : "00").repeat(12) + "92".repeat(20);
   const revert = "0x" + "00".repeat(12) + "93".repeat(20);
   const sender = outsider.getAddress();
   const word = (n) => "0x" + BigInt(n).toString(16).padStart(64, "0");
   // ABI argument 4 holds the context offset. Approve only a first byte of 0xab.
-  const policyCode = "0x6064356004016020013560001a60ab1460005260206000f3";
+  const fixture = compiled ? JSON.parse(await readFile(new URL(
+    "../../crates/pqvm/tests/fixtures/native-paymaster-identity.json", import.meta.url), "utf8")) : null;
+  const policyCode = fixture?.artifacts.pqvm.deployedBytecode ?? "0x6064356004016020013560001a60ab1460005260206000f3";
   const genesis = {
     chain_id: 1337,
     chain_name: "contract-paymaster-acceptance",
@@ -469,8 +475,9 @@ async function runContractPaymasterScenario() {
     gas_limit: 30000000,
     extra_data: "contract-paymaster-acceptance",
     fee_accounting_activation_height: 0,
+    ...(compiled ? { native_address_context_height: 0 } : {}),
     alloc: {
-      [paymaster]: { balance: "0x3635c9adc5dea00000", nonce: 0, code: policyCode, storage: {} },
+      [paymaster]: { balance: "0x3635c9adc5dea00000", nonce: 0, code: policyCode, storage: compiled ? { [word(0)]: sender } : {} },
       [target]: { balance: "0x0", nonce: 0, code: "0x60003560005500", storage: {} },
     },
     boot_nodes: [],
@@ -486,48 +493,90 @@ async function runContractPaymasterScenario() {
     genesis.alloc[revert] = { balance: "0x0", nonce: 0, code: "0x60006000fd", storage: {} };
   }
   await writeFile(join(data, "genesis.json"), JSON.stringify(genesis, null, 2));
-  const snapshot = async () => ({
-    head: await rpc(0, "eth_getBlockByNumber", ["latest", false]),
-    senderBalance: await rpc(0, "eth_getBalance", [sender, "latest"]),
-    payerBalance: await rpc(0, "eth_getBalance", [paymaster, "latest"]),
-    senderNonce: await rpc(0, "eth_getTransactionCount", [sender, "latest"]),
-    payerNonce: await rpc(0, "eth_getTransactionCount", [paymaster, "latest"]),
-    slot: await rpc(0, "eth_getStorageAt", [target, "0x0", "latest"]),
-    policySlot: await rpc(0, "eth_getStorageAt", [paymaster, "0x0", "latest"]),
-    pending: await rpc(0, "shell_pendingCount"),
+  const snapshot = async (i = 0) => ({
+    head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+    senderBalance: await rpc(i, "eth_getBalance", [sender, "latest"]),
+    payerBalance: await rpc(i, "eth_getBalance", [paymaster, "latest"]),
+    senderNonce: await rpc(i, "eth_getTransactionCount", [sender, "latest"]),
+    payerNonce: await rpc(i, "eth_getTransactionCount", [paymaster, "latest"]),
+    slot: await rpc(i, "eth_getStorageAt", [target, "0x0", "latest"]),
+    policySlot: await rpc(i, "eth_getStorageAt", [paymaster, "0x0", "latest"]),
+    pending: await rpc(i, "shell_pendingCount"),
     ...(failure ? {
-      targetBalance: await rpc(0, "eth_getBalance", [target, "latest"]),
-      registeredKey: await rpc(0, "shell_getPqPubkey", [sender]),
+      targetBalance: await rpc(i, "eth_getBalance", [target, "latest"]),
+      registeredKey: await rpc(i, "shell_getPqPubkey", [sender]),
     } : {}),
   });
   const innerCalls = failure
     ? [{ to: target, value: "0x7", data: word(31), gas_limit: "0xc350" },
       { to: revert, value: "0x0", data: "0x", gas_limit: "0xc350" }]
     : [{ to: target, value: "0x0", data: word(23), gas_limit: "0xc350" }];
-  const signed = async (context) => {
+  const signed = async (context, maxFeePerGas = 1000000000000, actor = outsider) => {
     const { tx, aa_bundle } = buildContractPaymasterTransaction({
       chainId: 1337, nonce: 0,
       innerCalls,
-      gasLimit: 300000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0,
+      gasLimit: 300000, maxFeePerGas, maxPriorityFeePerGas: 0,
       paymaster, paymasterContext: [context],
     });
     assert.equal(aa_bundle.paymaster_signature, null);
-    return outsider.buildSignedTransaction({ tx, aaBundle: aa_bundle, includePublicKey: true });
+    return actor.buildSignedTransaction({ tx, aaBundle: aa_bundle, includePublicKey: true });
   };
   await start(0, data, keyPath, "contract-paymaster");
+  let follower;
+  if (compiled) {
+    const directory = join(out, "compiled-follower"), key = join(out, "compiled-follower-key.json");
+    await mkdir(directory);
+    await writeFile(join(directory, "genesis.json"), JSON.stringify(genesis, null, 2));
+    const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", key], { encoding: "utf8" });
+    assert.equal(generated.status, 0, generated.stderr);
+    const bootnode = (await readFile(join(out, "contract-paymaster-node.log"), "utf8")).match(
+      /Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    assert.ok(bootnode, "producer complete multiaddr");
+    await start(1, directory, key, "compiled-follower", bootnode);
+    await peerReady();
+    follower = { directory, key, child: nodes[1] };
+  }
   const before = await snapshot();
   assert.equal(before.senderBalance, failure ? "0xb" : "0x0");
   if (!failure) {
     const { toRlp } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
-    result.paymasterSimulation = await rpc(0, "shell_estimatePaymasterGas", [{
+    const simulationInput = {
       paymaster, sender,
       inner_calls_data: toRlp([[target, "0x", word(23), "0xc350"]]),
       gas_limit: "0x493e0", max_fee_per_gas: "0xe8d4a51000", paymaster_context: "0xab",
-    }]);
+    };
+    result.paymasterSimulation = await rpc(0, "shell_estimatePaymasterGas", [simulationInput]);
+    if (compiled) {
+      result.compiledPolicy = { compiler: fixture.compiler, sdk: fixture.sdk };
+      const alias = "0x" + (sender.slice(2, 26) === "56".repeat(12) ? "57" : "56").repeat(12) + sender.slice(26);
+      result.compiledRejections = [];
+      for (const change of [
+        { sender: alias }, { max_fee_per_gas: "0xe8d4a51001" }, { paymaster_context: "0xac" },
+      ]) {
+        const input = { ...simulationInput, ...change };
+        await assert.rejects(() => rpc(0, "shell_estimatePaymasterGas", [input]), (error) => {
+          result.compiledRejections.push({ method: "shell_estimatePaymasterGas", input, error: error.message });
+          return /contract paymaster rejected transaction/.test(error.message);
+        });
+        assert.deepEqual(await snapshot(), before);
+        await save();
+      }
+      for (const denied of [await signed(0xab, 1000000000001), await signed(0xab, 1000000000000, miner)]) {
+        await assert.rejects(() => paced(() => providers[0].sendTransaction(denied)), (error) => {
+          result.compiledRejections.push({ method: "shell_sendTransaction", input: denied, error: error.message });
+          return /contract paymaster rejected transaction/.test(error.message);
+        });
+        assert.deepEqual(await snapshot(), before);
+        await save();
+      }
+      result.identityAndCostRejectedWithoutWrites = true;
+    }
     assert.equal(result.paymasterSimulation.simulation_status, "simulated");
     assert.equal(result.paymasterSimulation.within_cap, true);
     assert.deepEqual(await snapshot(), before);
     const rejected = await signed(0xac);
+    result.rejectedContextBundle = rejected;
+    await save();
     await assert.rejects(() => paced(() => providers[0].sendTransaction(rejected)),
       /contract paymaster rejected transaction/);
     assert.deepEqual(await snapshot(), before);
@@ -552,7 +601,7 @@ async function runContractPaymasterScenario() {
   assert.equal(after.senderNonce, "0x1");
   assert.equal(after.payerNonce, before.payerNonce);
   assert.equal(after.slot, failure ? word(0) : word(23));
-  assert.equal(after.policySlot, word(0));
+  assert.equal(after.policySlot, compiled ? sender : word(0));
   const sponsorship = await rpc(0, "shell_isSponsored", [hash]);
   assert.equal(sponsorship.found, true);
   assert.equal(sponsorship.location, "chain");
@@ -587,6 +636,27 @@ async function runContractPaymasterScenario() {
   assert.ok(BigInt((await rpc(0, "shell_getFinalityInfo")).lastFinalizedBlock) >= BigInt(receipt.blockNumber));
   result.transactions.push({ label: failure ? "contract-sponsored reverted batch" : "contract-sponsored storage call", hash, receipt });
   result.contractSponsorship = { before, after, sponsorship, fee: fee.toString() };
+  if (compiled) {
+    for (let attempt = 0; attempt < 120; attempt++) {
+      if (await rpc(1, "eth_getTransactionReceipt", [hash])) break;
+      await pause(250);
+    }
+    assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [hash]), receipt);
+    assert.deepEqual(await snapshot(1), after, "independent block import agrees on root, fee and full identities");
+    result.compiledTrace = await rpc(1, "debug_traceTransaction", [hash, { tracer: "callTracer" }]);
+    assert.equal(result.compiledTrace.failed, false);
+    assert.deepEqual(await snapshot(1), after, "historical replay is read-only");
+    await stop(1);
+    assert.equal(follower.child.exitCode, 0);
+    await start(1, follower.directory, follower.key, "compiled-follower-restart");
+    assert.deepEqual(await snapshot(1), after);
+    assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [hash]), receipt);
+    assert.deepEqual(await rpc(1, "debug_traceTransaction", [hash, { tracer: "callTracer" }]), result.compiledTrace);
+    result.independentImportAndReopen = true;
+    const reopenedFollower = nodes[1];
+    await stop(1);
+    assert.equal(reopenedFollower.exitCode, 0);
+  }
   const child = nodes[0];
   await stop(0);
   assert.equal(child.exitCode, 0);
@@ -605,7 +675,7 @@ async function runContractPaymasterScenario() {
   await stop(0);
   assert.equal(reopened.exitCode, 0);
   result.restartPreservedContractSponsorship = true;
-  result.nativeExitCodes = [child.exitCode, reopened.exitCode];
+  result.nativeExitCodes = result.nativeCommands.map((command) => command.exitCode);
   result.passed = true;
 }
 
