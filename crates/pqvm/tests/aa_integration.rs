@@ -44,11 +44,6 @@ fn account_manager_tx(nonce: u64, calldata: Vec<u8>) -> Transaction {
     }
 }
 
-fn default_pq_validator_runtime() -> Vec<u8> {
-    hex::decode(include_str!("../../../contracts/DefaultPQValidator.bin-runtime").trim())
-        .expect("default validator runtime hex should decode")
-}
-
 fn validator_returns_false() -> Vec<u8> {
     vec![0x60, 0x00, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3]
 }
@@ -68,16 +63,39 @@ fn set_validation_code_allows_custom_validator_and_clear_restores_builtin_rules(
 
     fund_account(&mut evm, &owner_addr, U256::from(10_000_000_000u64));
 
-    let (_validator_addr, validator_hash) = deploy_runtime_contract(
+    // Execute the real constructor so its immutable owner hash is bound in code.
+    let mut init = hex::decode(include_str!("../../../contracts/DefaultPQValidator.bin").trim())
+        .expect("default validator creation bytecode");
+    init.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+    init.extend_from_slice(&U256::from(owner.public_key().len()).to_be_bytes::<32>());
+    init.extend_from_slice(owner.public_key());
+    init.extend(std::iter::repeat_n(
+        0,
+        (32 - owner.public_key().len() % 32) % 32,
+    ));
+    let mut creation = transfer_tx(0, receiver, 0);
+    creation.to = None;
+    creation.gas_limit = 5_000_000;
+    creation.data = ShellBytes::from(init);
+    let deployed = apply_tx(
         &mut evm,
         &chain_store,
         &verifier,
-        &owner,
-        owner_addr,
-        0,
+        &sign_tx(owner_addr, &owner, creation, true),
         1,
-        &default_pq_validator_runtime(),
+        0,
+        0,
     );
+    assert_eq!(deployed.receipt.status, 1);
+    let contract = deployed.receipt.contract_address.unwrap();
+    let validator_hash = evm
+        .state_db()
+        .world_state()
+        .get_account(&contract)
+        .unwrap()
+        .unwrap()
+        .code_hash
+        .unwrap();
 
     let set_signed = sign_tx(
         owner_addr,
@@ -103,6 +121,50 @@ fn set_validation_code_allows_custom_validator_and_clear_restores_builtin_rules(
     assert_eq!(
         evm.state_db().world_state().get_balance(&receiver).unwrap(),
         U256::from(111u64)
+    );
+
+    let attacker = DilithiumSigner::generate();
+    let foreign = sign_tx(owner_addr, &attacker, transfer_tx(3, receiver, 999), true);
+    let before = evm.state_db_mut().world_state_mut().state_root().unwrap();
+    assert!(
+        validate_tx(
+            &foreign,
+            evm.state_db_mut().world_state_mut(),
+            &chain_store,
+            &verifier,
+            CHAIN_ID
+        )
+        .is_err(),
+        "reference validator must bind its configured owner key"
+    );
+    assert_eq!(
+        evm.state_db_mut().world_state_mut().state_root().unwrap(),
+        before
+    );
+
+    let mut tampered = sign_tx(owner_addr, &owner, transfer_tx(3, receiver, 999), true);
+    tampered.signature.data[0] ^= 1;
+    assert!(validate_tx(
+        &tampered,
+        evm.state_db_mut().world_state_mut(),
+        &chain_store,
+        &verifier,
+        CHAIN_ID
+    )
+    .is_err());
+    let mut changed = sign_tx(owner_addr, &owner, transfer_tx(3, receiver, 1), true);
+    changed.tx.value = U256::from(999);
+    assert!(validate_tx(
+        &changed,
+        evm.state_db_mut().world_state_mut(),
+        &chain_store,
+        &verifier,
+        CHAIN_ID
+    )
+    .is_err());
+    assert_eq!(
+        evm.state_db_mut().world_state_mut().state_root().unwrap(),
+        before
     );
 
     let clear_signed = sign_tx(

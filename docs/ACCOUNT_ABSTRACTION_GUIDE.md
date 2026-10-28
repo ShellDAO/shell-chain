@@ -203,6 +203,67 @@ This call path is implemented in:
 
 ---
 
+
+### Installing the owner-bound reference validator
+
+Custom validators must establish which key is authorized as well as verifying
+that a signature is mathematically valid. Older `DefaultPQValidator` bytecode
+verified any supplied ML-DSA key and did not bind it to an owner. Installing that
+old reference runtime therefore permits another valid key to authorize the
+account. Updating source does not replace bytecode already installed on a chain.
+
+The corrected reference constructor takes the authorized **public key bytes**.
+It stores their BLAKE3 hash as an immutable and checks that binding before
+signature verification. No private key is supplied to the contract. Deploy the
+corrected source with `shell-sdk/contracts` and the compatible compiler, then
+install the hash of the **actual deployed runtime** through an owner-signed
+AccountManager transaction:
+
+```ts
+const deployed = await deployContract({
+  provider, signer, chainId, artifact,
+  constructorArgs: ["0x" + Buffer.from(signer.getPublicKey()).toString("hex")],
+  gasLimit: 2_000_000, includePublicKey: true, wait: true,
+});
+```
+
+Here `artifact` is compiled from the corrected
+`contracts/DefaultPQValidator.sol`. Query `eth_getCode` at
+`deployed.contractAddress` and compute its Keccak-256 hash for
+`encodeSetValidationCodeCalldata`. Sign that AccountManager call with the
+currently authorized key. The checked `.bin` is constructor bytecode;
+`.bin-runtime` is an uninitialized compiler template, so its hash must not be
+used in place of the deployed code hash.
+
+This is an explicitly bound custom policy. `rotateKey` preserves custom policy
+and does not rewrite the immutable. To change this policy's key, deploy a new
+bound instance and explicitly install its code hash with the current policy's
+authorization. Clearing validation restores the account's native registered-root
+rules. Other custom validators retain their own authorization semantics.
+
+Run the independent acceptance from a checkout containing the correction with
+the public node v0.27.13, `shell-sdk@0.14.0-rc.3` and its optional Solidity compiler
+installed. Node.js 25.3.0 and solc 0.8.37 were used for this public-package run;
+the checked artifacts use the pinned solc 0.8.35 toolchain.
+
+```sh
+NODE_BIN=/path/to/shell-node \
+  SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --reference-validator
+```
+
+This mode deploys the actual constructor with a fresh ML-DSA owner's public key,
+installs its runtime, verifies owner writes, rejects a different valid key,
+tampered signatures/payloads and stale nonces, then clears and reinstalls the
+policy. A separate full RocksDB observer imports the same receipts and state;
+historical tracing is read-only, and both databases reopen with the same
+binding. The script retains an encrypted temporary owner keystore and node data,
+records child commands/exits, and stops all children. Its isolated development
+chain does not activate a live network or prove native CREATE/CREATE2 under the
+separately gated full-address profile. The old reference runtime remains unsafe;
+only the corrected, constructor-bound deployment is covered here.
+
+
 ## 5. Key rotation and validator upgrades
 
 The long-term AA model includes a protocol-managed account controller for:

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bind `DefaultPQValidator` to an explicitly supplied owner public key before
+  checking signatures. Older reference runtime accepted valid signatures from
+  unrelated keys. The new constructor embeds the owner key hash in deployed
+  code; existing deployed bytecode requires an explicitly authorized replacement.
+  Generic custom-validator and native key-rotation rules are unchanged.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

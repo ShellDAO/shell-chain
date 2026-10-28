@@ -382,6 +382,12 @@ Allows accounts to:
 2. **Set a custom validation contract** — enables account abstraction patterns
    where transaction validation is handled by on-chain code.
 
+The reference `DefaultPQValidator` must be deployed with the authorized public
+key in its constructor before installing its actual deployed runtime hash.
+Older unbound reference bytecode accepts other valid signing keys. See the
+[owner-bound installation flow](ACCOUNT_ABSTRACTION_GUIDE.md#installing-the-owner-bound-reference-validator)
+for deployment, signing, compatibility and the independent native acceptance.
+
 ### Interface
 
 ```solidity

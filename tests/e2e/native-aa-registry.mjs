@@ -33,6 +33,8 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const referenceValidatorScenario = process.argv.includes("--reference-validator");
+if (referenceValidatorScenario) assert.deepEqual(process.argv.slice(2), ["--reference-validator"]);
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -150,6 +152,11 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (referenceValidatorScenario) {
+    const command = result.nativeCommands.find((entry) => entry.pid === child.pid);
+    Object.assign(command, { endedAt: new Date().toISOString(), exitCode: child.exitCode, signal: child.signalCode });
+    await save();
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -201,6 +208,10 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   closeSync(fd);
   nodes[i] = child;
   nodeLogLabels[i] = label;
+  if (referenceValidatorScenario) {
+    (result.nativeCommands ??= []).push({ args: [binary, ...args], pid: child.pid, startedAt: new Date().toISOString() });
+    await save();
+  }
   let spawnError;
   child.once("error", (error) => {
     spawnError = error;
@@ -427,7 +438,134 @@ async function confirmed(
   await save();
   return entry;
 }
+
+async function runReferenceValidatorScenario() {
+  result.scenario = "owner-bound-reference-validator";
+  result.adaptations = [
+    "Actual Solidity constructor deployment, owner-signed AccountManager calls, fresh ML-DSA accounts and isolated full RocksDB producer/observer.",
+    "Public native node and SDK can run the corrected contract; no new native address profile or live network activation.",
+  ];
+  const sdkUrl = pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY));
+  const { compileSolidity } = await import(new URL("./contracts-compiler.js", sdkUrl));
+  const { buildDeployTransaction } = await import(new URL("./contracts.js", sdkUrl));
+  const sdk = await import(sdkUrl);
+  const { keccak256 } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+  const source = await readFile(new URL("../../contracts/DefaultPQValidator.sol", import.meta.url), "utf8");
+  const artifact = await compileSolidity({ sources: [{ path: "DefaultPQValidator.sol", content: source }], contractName: "DefaultPQValidator" });
+  result.referenceArtifact = artifact;
+  const ownerKey = join(out, "reference-owner-key.json");
+  const ownerGenerated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", ownerKey], { encoding: "utf8" });
+  assert.equal(ownerGenerated.status, 0, ownerGenerated.stderr);
+  const ownerSigner = await decryptKeystore(JSON.parse(await readFile(ownerKey, "utf8")), password);
+  signers.push(ownerSigner);
+  result.ownerKeystore = ownerKey;
+  const dirs = [join(out, "reference-leader"), join(out, "reference-observer")];
+  const target = "0x" + "00".repeat(12) + "b4".repeat(20), owner = ownerSigner.getAddress();
+  const foreign = new ShellSigner("MlDsa65", MlDsa65Adapter.generate(), owner);
+  signers.push(foreign);
+  result.owner = owner;
+  result.foreignPublicKey = "0x" + Buffer.from(foreign.getPublicKey()).toString("hex");
+  const word = (n) => "0x" + BigInt(n).toString(16).padStart(64, "0");
+  const genesis = {
+    chain_id: 1337, chain_name: "reference-validator-acceptance", network_type: "Dev",
+    timestamp: Math.floor(Date.now() / 1000) - 120, gas_limit: 30000000,
+    extra_data: "reference-validator-acceptance", fee_accounting_activation_height: 0,
+    alloc: {
+      [owner]: { balance: "0x3635c9adc5dea00000", nonce: 0, code: null, storage: {} },
+      [target]: { balance: "0x0", nonce: 0, code: "0x60003560005500", storage: {} },
+    }, boot_nodes: [],
+    consensus: { engine: "wpoa", authorities: [miner.getAddress()], authority_pubkeys: ["0x" + Buffer.from(miner.getPublicKey()).toString("hex")], weights: [1], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 0 },
+  };
+  for (const dir of dirs) { await mkdir(dir); await writeFile(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2)); }
+  const followerKey = join(out, "reference-observer-key.json");
+  const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", followerKey], { encoding: "utf8" });
+  assert.equal(generated.status, 0, generated.stderr);
+  await start(0, dirs[0], keyPath, "reference-leader");
+  let bootnode;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    bootnode = (await readFile(join(out, "reference-leader-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    if (bootnode) break;
+    await pause(100);
+  }
+  assert.ok(bootnode);
+  await start(1, dirs[1], followerKey, "reference-observer", bootnode);
+  await peerReady();
+  const snapshot = async (i = 0) => ({
+    head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+    balance: await rpc(i, "eth_getBalance", [owner, "latest"]),
+    nonce: await rpc(i, "eth_getTransactionCount", [owner, "latest"]),
+    pubkey: await rpc(i, "shell_getPqPubkey", [owner]),
+    slot: await rpc(i, "eth_getStorageAt", [target, "0x0", "latest"]),
+    pending: await rpc(i, "shell_pendingCount"),
+  });
+  const sign = async (actor, nonce, to, data) => actor.buildSignedTransaction({
+    tx: buildTransaction({ chainId: 1337, nonce, to, value: 0n, data, gasLimit: 800000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 }), includePublicKey: true,
+  });
+  const confirm = async (label, packet) => {
+    const row = { label, packet };
+    result.transactions.push(row); await save();
+    row.hash = await paced(() => providers[0].sendTransaction(packet));
+    for (let attempt = 0; attempt < 120; attempt++) { row.receipt = await rpc(0, "eth_getTransactionReceipt", [row.hash]); if (row.receipt) break; await pause(250); }
+    assert.equal(row.receipt?.status, "0x1", label);
+    for (let attempt = 0; attempt < 120; attempt++) { if (await rpc(1, "eth_getTransactionReceipt", [row.hash])) break; await pause(250); }
+    assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [row.hash]), row.receipt);
+    assert.deepEqual(await snapshot(1), await snapshot(), "independent import agrees on canonical root and account state");
+    await save(); return row;
+  };
+  const deny = async (label, packet, pattern = /validation contract rejected|SignatureInvalid|signature.*invalid|signature verification|nonce.*(?:mismatch|too low)/i) => {
+    const before = await snapshot(), row = { label, packet };
+    (result.rejections ??= []).push(row); await save();
+    await assert.rejects(() => paced(() => providers[0].sendTransaction(packet)), (error) => { row.error = error.message; return pattern.test(error.message); });
+    assert.deepEqual(await snapshot(), before, label + " leaves state and metadata unchanged");
+    await save();
+  };
+  const deploy = buildDeployTransaction({ artifact, chainId: 1337, nonce: 0, constructorArgs: ["0x" + Buffer.from(ownerSigner.getPublicKey()).toString("hex")], gasLimit: 2000000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 });
+  const deployed = await confirm("deploy constructor with explicit owner key", await ownerSigner.buildSignedTransaction({ tx: deploy, includePublicKey: true }));
+  const contract = deployed.receipt.contractAddress;
+  assert.match(contract, /^0x[0-9a-f]{64}$/);
+  const runtime = await rpc(0, "eth_getCode", [contract, "latest"]), hash = keccak256(runtime);
+  result.deployedReference = { contract, runtime, hash };
+  await confirm("install actual bound runtime", await sign(ownerSigner, 1, accountManagerAddress, sdk.encodeSetValidationCodeCalldata(hash)));
+  await confirm("genuine owner after install", await sign(ownerSigner, 2, target, word(51)));
+  assert.equal((await snapshot()).slot, word(51));
+  await deny("foreign genuine key cannot write owner state", await sign(foreign, 3, target, word(99)));
+  await deny("foreign key cannot clear validation policy", await sign(foreign, 3, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+  const tampered = await sign(ownerSigner, 3, target, word(99));
+  tampered.signature.data[0] ^= 1;
+  await deny("tampered owner signature", tampered);
+  const changed = await sign(ownerSigner, 3, target, word(99));
+  changed.tx.data = word(100);
+  await deny("changed signed payload", changed);
+  await deny("custom validation retains protocol nonce", await sign(ownerSigner, 2, target, word(52)));
+  await confirm("authorized owner clears custom validator", await sign(ownerSigner, 3, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+  await deny("foreign key after clear", await sign(foreign, 4, target, word(99)), /pubkey.*conflict|pubkey hash mismatch|public key.*mismatch|signature.*invalid/i);
+  await confirm("built-in owner after clear", await sign(ownerSigner, 4, target, word(52)));
+  await confirm("reinstall same bound validator", await sign(ownerSigner, 5, accountManagerAddress, sdk.encodeSetValidationCodeCalldata(hash)));
+  const beforeHistory = await snapshot();
+  result.historicalTraces = [];
+  for (const row of result.transactions) {
+    const trace = await rpc(1, "debug_traceTransaction", [row.hash, { tracer: "callTracer" }]);
+    assert.equal(trace.failed, false);
+    result.historicalTraces.push(trace);
+  }
+  assert.deepEqual(await snapshot(1), beforeHistory, "historical validation/execution cannot mutate tip");
+  await stop(0); await stop(1);
+  await start(0, dirs[0], keyPath, "reference-leader-restart");
+  await start(1, dirs[1], followerKey, "reference-observer-restart");
+  assert.deepEqual(await snapshot(), beforeHistory); assert.deepEqual(await snapshot(1), beforeHistory);
+  for (const [i, row] of result.transactions.entries()) {
+    for (const node of [0, 1]) assert.deepEqual(await rpc(node, "eth_getTransactionReceipt", [row.hash]), row.receipt);
+    assert.deepEqual(await rpc(1, "debug_traceTransaction", [row.hash, { tracer: "callTracer" }]), result.historicalTraces[i]);
+  }
+  await deny("foreign key still rejected after physical reopen", await sign(foreign, 6, target, word(99)));
+  await stop(0); await stop(1);
+  assert.ok(result.nativeCommands.every((command) => command.exitCode === 0));
+  result.independentImportAndRestart = true;
+  result.passed = true;
+}
+
 async function runScenario() {
+  if (referenceValidatorScenario) return runReferenceValidatorScenario();
   const dirs = [join(out, "leader"), join(out, "follower")];
   for (const dir of dirs) await mkdir(dir);
   const followerKey = join(out, "follower-key.json");

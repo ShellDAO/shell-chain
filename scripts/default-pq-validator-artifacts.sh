@@ -4,6 +4,7 @@ set -euo pipefail
 readonly CONTRACT="contracts/DefaultPQValidator.sol"
 readonly ABI="contracts/DefaultPQValidator.abi.json"
 readonly RUNTIME="contracts/DefaultPQValidator.bin-runtime"
+readonly CREATION="contracts/DefaultPQValidator.bin"
 readonly TOOL_DIR="tools/default-pq-validator-artifacts"
 
 mode="${1:---check}"
@@ -52,9 +53,11 @@ fi
 if [[ "$mode" == "--check" ]]; then
   require_regular_file "$ABI"
   require_regular_file "$RUNTIME"
+  require_regular_file "$CREATION"
 else
   require_safe_output "$ABI"
   require_safe_output "$RUNTIME"
+  require_safe_output "$CREATION"
 fi
 
 tmp_dir="$(mktemp -d)"
@@ -65,7 +68,7 @@ jq -Rs '{
   sources: {"DefaultPQValidator.sol": {content: .}},
   settings: {
     optimizer: {enabled: true, runs: 200},
-    outputSelection: {"*": {"*": ["abi", "evm.deployedBytecode.object"]}}
+    outputSelection: {"*": {"*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object"]}}
   }
 }' "$CONTRACT" > "$tmp_dir/input.json"
 
@@ -90,9 +93,13 @@ jq '.contracts["DefaultPQValidator.sol"].DefaultPQValidator.abi' \
 jq -r '.contracts["DefaultPQValidator.sol"].DefaultPQValidator.evm.deployedBytecode.object' \
   "$tmp_dir/output.json" | tr -d '\n' > "$tmp_dir/runtime"
 
+jq -r '.contracts["DefaultPQValidator.sol"].DefaultPQValidator.evm.bytecode.object' \
+  "$tmp_dir/output.json" | tr -d '\n' > "$tmp_dir/creation"
+
 if [[ "$mode" == "--write" ]]; then
   cp "$tmp_dir/abi.json" "$ABI"
   cp "$tmp_dir/runtime" "$RUNTIME"
+  cp "$tmp_dir/creation" "$CREATION"
   exit 0
 fi
 
@@ -103,6 +110,10 @@ if ! diff -u "$ABI" "$tmp_dir/abi.json"; then
 fi
 if ! diff -u "$RUNTIME" "$tmp_dir/runtime"; then
   echo "$RUNTIME is stale; run scripts/default-pq-validator-artifacts.sh --write" >&2
+  status=1
+fi
+if ! diff -u "$CREATION" "$tmp_dir/creation"; then
+  echo "$CREATION is stale; run scripts/default-pq-validator-artifacts.sh --write" >&2
   status=1
 fi
 exit "$status"
