@@ -28,11 +28,14 @@ const {
   validatorRegistryAddress,
   encodeSetGuardiansCalldata,
   encodeSubmitRecoveryCalldata,
+  encodeClearValidationCodeCalldata,
 } = await import(pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)).href);
 const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const aaWarmLegacy = process.argv.includes("--aa-access-warmth-legacy-address");
+const aaWarmScenario = aaWarmLegacy || process.argv.includes("--aa-access-warmth");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -81,7 +84,12 @@ async function unusedPort() {
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
-const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+const outsider = aaWarmScenario ? await (async () => {
+  const path = join(out, "owner.json");
+  const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", path], { encoding: "utf8" });
+  assert.equal(generated.status, 0, generated.stderr);
+  return decryptKeystore(JSON.parse(await readFile(path, "utf8")), password);
+})() : new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
 const pruneFollower = prunedEpochScenario || blockSignersScenario;
@@ -105,7 +113,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: aaWarmScenario ? (aaWarmLegacy ? "aa-access-warmth-legacy-address" : "aa-access-warmth") : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +158,10 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (aaWarmScenario) {
+    (result.exits ??= []).push({ label: nodeLogLabels[i], pid: child.pid, code: child.exitCode, signal: child.signalCode });
+    assert.equal(child.exitCode, 0);
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -368,6 +380,7 @@ async function confirmed(
   status = "0x1",
   sync = true,
   direct = false,
+  accessList,
 ) {
   const currentNonce = await nonce(signer);
   const balanceBefore = BigInt(
@@ -391,6 +404,7 @@ async function confirmed(
         gasLimit: 3000000,
       })
     : batch.tx;
+  if (accessList) batch.tx.access_list = accessList;
   const signed = await signer.buildSignedTransaction({
     tx,
     ...(batch ? { aaBundle: batch.aa_bundle } : {}),
@@ -422,6 +436,7 @@ async function confirmed(
     { tracer: "callTracer" },
   ]);
   const entry = { label, hash, receipt, trace };
+  if (aaWarmScenario) entry.feeCaps = { maxFee: tx.max_fee_per_gas, tip: tx.max_priority_fee_per_gas };
   result.transactions.push(entry);
   if (sync) entry.synchronization = await compare(hash);
   await save();
@@ -478,6 +493,29 @@ async function runScenario() {
       epoch_length: epochScenario ? 5 : 0,
     },
   };
+  const warmTarget = "0x" + "35".repeat(32);
+  const warmOther = "0x" + "36".repeat(12) + "35".repeat(20);
+  const legacyAddress = byte => "0x" + "00".repeat(12) + byte.repeat(20);
+  const warmReverter = aaWarmLegacy ? legacyAddress("37") : "0x" + "37".repeat(32);
+  const warmForeign = aaWarmLegacy ? legacyAddress("38") : "0x" + "38".repeat(32);
+  const warmNested = "0x" + "39".repeat(32);
+  const warmBalance = "0x" + "3a".repeat(32);
+  const word = value => "0x" + BigInt(value).toString(16).padStart(64, "0");
+  if (aaWarmScenario) {
+    genesis.aa_access_warmth_height = 3;
+    if (!aaWarmLegacy) genesis.native_address_context_height = 0;
+    const runtime = "0x3615600a575f355f55005b600054506000545f5260205ff3";
+    const code = (runtime, value = 7) => ({ balance: "0x0", nonce: 1, code: runtime, storage: { [word(0)]: word(value) } });
+    const operand = address => aaWarmLegacy ? "73" + address.slice(-40) : "7f" + address.slice(2);
+    const call = address => "5f5f5f5f5f" + operand(address) + "620186a0f150";
+    genesis.alloc[warmTarget] = code(runtime);
+    genesis.alloc[warmOther] = code(runtime, 9);
+    genesis.alloc[warmForeign] = code(runtime);
+    genesis.alloc[warmReverter] = code("0x" + call(warmForeign) + "5f5ffd");
+    genesis.alloc[warmNested] = code("0x" + call(warmReverter) + "00");
+    genesis.alloc[warmBalance] = code("0x" + operand(warmForeign) + "315000");
+    result.adaptations.push("Raw opcode fixtures isolate execution from CREATE deployment. Access warmth activates only at local block3. Legacy mode uses canonical20-byte nested CALL operands; direct AA targets retain full native identities, including same-low20 targets. SSTORE original-value/refund policy and batch estimation are separate assertions.");
+  }
   for (const signer of signers)
     genesis.alloc[signer.getAddress()] = {
       balance: "0x3635c9adc5dea00000",
@@ -608,6 +646,56 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (aaWarmScenario) {
+    const read = (address, cap = 100000) => buildInnerCall(address, "0x", cap);
+    const costs = (entry, op = "SLOAD") => entry.trace.structLogs.filter(step => step.op === op).map(step => step.gasCost);
+    const cold = [2100, 100], warm = [100, 100];
+    const slot = (index, tag = "latest") => rpc(index, "eth_getStorageAt", [warmTarget, "0x0", tag]);
+    async function batch(label, calls, expected, status = "0x1", accessList) {
+      const entry = await confirmed(label, outsider, calls, status, true, false, accessList);
+      assert.deepEqual(costs(entry), expected, label + " opcode gas follows transaction-wide access sets");
+      return entry;
+    }
+    await batch("before activation1", [read(warmTarget), read(warmTarget), read(warmOther)], [...cold, ...cold, ...cold]);
+    await batch("before activation2", [read(warmTarget), read(warmTarget)], [...cold, ...cold]);
+    const boundary = await batch("activation boundary3 and distinct native identity", [read(warmTarget), read(warmTarget), read(warmOther)], [...cold, ...warm, ...cold]);
+    assert.equal(boundary.trace.calls[0].output, word(7));
+    assert.equal(boundary.trace.calls[1].output, word(7));
+    assert.equal(boundary.trace.calls[2].output, word(9));
+    const nativeBoundary = await batch("warm capped read survives native system call", [read(warmTarget), buildInnerCall(accountManagerAddress, encodeClearValidationCodeCalldata(), 100000), read(warmTarget, 22000)], [...cold, ...warm]);
+    assert.equal(nativeBoundary.trace.calls[1].output, word(1));
+    assert.equal(nativeBoundary.trace.calls[1].error, undefined);
+    const failed = await confirmed("new outer capped read is cold and fails", outsider, [read(warmTarget, 22000)], "0x0");
+    assert(failed.trace.calls[0].error, "cold read really exhausts its inner budget");
+    await batch("reverted new nested access stays cold", [read(warmNested, 400000), read(warmForeign)], [...cold, ...cold]);
+    await batch("earlier outer access remains warm through nested revert", [read(warmForeign), read(warmNested, 400000), read(warmForeign)], [...cold, ...warm, ...warm]);
+    const balance = await confirmed("read-only foreign account stays warm", outsider, [read(warmBalance), read(warmBalance)]);
+    assert.deepEqual(costs(balance, "BALANCE"), [2600, 100]);
+    const list = [{ address: warmTarget, storage_keys: [word(0)] }];
+    await batch("outer access list prewarms without per-inner charges", [read(warmTarget), read(warmTarget)], [...warm, ...warm], "0x1", [...list, ...list]);
+    await batch("failed write rolls back and no warm state persists", [buildInnerCall(warmTarget, word(9), 100000), read(warmReverter, 200000)], [...cold], "0x0");
+    for (const index of [0, 1]) assert.equal(await slot(index), word(7));
+    await batch("successful later write changes historical read context", [buildInnerCall(warmTarget, word(11), 100000)], []);
+    const observe = async index => ({ head: await rpc(index, "eth_getBlockByNumber", ["latest", false]), nonce: await rpc(index, "eth_getTransactionCount", [outsider.getAddress(), "latest"]), balance: await rpc(index, "eth_getBalance", [outsider.getAddress(), "latest"]), miner: await rpc(index, "eth_getBalance", [miner.getAddress(), "latest"]), slot: await slot(index) });
+    const expected = await observe(0);assert.equal(expected.slot, word(11));assert.equal(BigInt(expected.nonce), 11n);assert.deepEqual(await observe(1), expected);
+    async function history(index) {
+      for (const tag of ["0x0", "0x1", "0x2", "0x3", "0xa"]) assert.equal(await slot(index, tag), word(7));
+      for (const entry of result.transactions) {
+        const block = await rpc(index, "eth_getBlockByHash", [entry.receipt.blockHash, false]);
+        const maxFee = BigInt(entry.feeCaps.maxFee), offered = BigInt(block.baseFeePerGas) + BigInt(entry.feeCaps.tip);
+        assert.equal(BigInt(entry.receipt.effectiveGasPrice), maxFee < offered ? maxFee : offered, "receipt price matches signed bounds and canonical header");
+        assert.deepEqual(await rpc(index, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+        assert.deepEqual(await rpc(index, "debug_traceTransaction", [entry.hash, { tracer: "callTracer" }]), entry.trace);
+      }
+      assert.deepEqual(await observe(index), expected, "historical replay cannot alter current state");
+    }
+    for (const index of [0, 1]) await history(index);
+    await stop(1);await stop(0);
+    await start(0, dirs[0], keyPath, "warm-reopened-producer");await start(1, dirs[1], followerKey, "warm-reopened-follower");
+    for (const index of [0, 1]) await history(index);
+    result.accessWarmth = { activation: 3, expected, reopened: true, publicFailure: "repeated inner SLOAD charged2100 instead of100" };
+    result.passed = true;return;
+  }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

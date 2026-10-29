@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- AA batches can retain transaction-wide warm account/storage access after the
+  optional `aa_access_warmth_height` activation. The schedule defaults to absent,
+  persists across restart/snapshot import, and preserves historical gas results.
+  Repeated reads no longer pay a cold cost at every inner-call boundary.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

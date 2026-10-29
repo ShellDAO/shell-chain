@@ -630,3 +630,45 @@ The existing paymaster ABI and activation policies are unchanged, including its
 retained `address` argument mapping. No simulation writes are committed.
 Acceptance does not verify signatures, sender nonce, funding or full bundle
 validity, and cannot guarantee sponsorship at a later inclusion state or height.
+
+
+## Warm account and storage access in AA batches
+
+The retained Cancun rules keep accessed accounts and storage slots warm for one
+outer transaction. An `SLOAD` of a new slot costs 2100 gas, and a later read of that
+same contract/slot in the batch costs 100 gas. Another contract's slot remains
+cold. Nested reverts discard only accesses first made in the reverted scope.
+Each new outer transaction starts with its own access sets.
+
+Published node v0.27.13 restarts those sets at each AA inner call. A repeated read
+can pay the cold cost again or exhaust an inner cap that should suffice after an
+earlier read. The correction is in unreleased source behind
+`aa_access_warmth_height`. Omitting the field preserves legacy behavior. An existing
+chain may add only a future first height above its head; an established height
+cannot be moved or removed. Restarts and trusted snapshot imports enforce the
+schedule. No deployed-network activation is scheduled by this change.
+
+An outer access list seeds the same sets; its intrinsic charge applies once to
+the outer transaction, including duplicate entries. Dynamically warmed entries add
+no access-list intrinsic charge. Full native identities remain separate even when
+their low 20 bytes match. Gas estimation retains its documented limitations.
+
+With Node.js 24+, a compatible built SDK (`0.14.0-rc.3` tested), and this source:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-access-warmth
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-access-warmth-legacy-address
+```
+
+The entry creates temporary funded keys and two isolated RocksDB nodes. Genuine
+batches check activation at local block 3, opcode costs, capped-call success and
+failure, distinct identities, native system calls, nested rollback, outer access
+lists, receipt fee debits/nonce, independent import and history/restart. Raw opcode
+fixtures in genesis isolate execution from contract creation. The second mode
+retains legacy nested CALL operands while checking full-width direct AA targets.
+Source validation does not establish public binary availability or live activation.

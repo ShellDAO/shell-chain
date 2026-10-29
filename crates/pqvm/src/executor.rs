@@ -126,6 +126,59 @@ where
     type IT = EthInterpreter;
 }
 
+// Access sets belong to the signed outer transaction. Reuse revm's prewarm
+// mechanism without adding synthetic access-list intrinsic charges per call.
+struct AaAccessWarmthHandler<EVM, ERROR> {
+    warm: revm::primitives::AddressMap<revm::primitives::HashSet<U256>>,
+    reconciled_fees: bool,
+    marker: std::marker::PhantomData<(EVM, ERROR)>,
+}
+
+impl<EVM, ERROR> Handler for AaAccessWarmthHandler<EVM, ERROR>
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type Evm = EVM;
+    type Error = ERROR;
+    type HaltReason = HaltReason;
+
+    fn load_accounts(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
+        revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
+            .load_accounts(evm)?;
+        evm.ctx().journal_mut().warm_access_list(self.warm.clone());
+        Ok(())
+    }
+
+    fn reward_beneficiary(
+        &self,
+        evm: &mut Self::Evm,
+        result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        if self.reconciled_fees {
+            Ok(())
+        } else {
+            revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
+                .reward_beneficiary(evm, result)
+        }
+    }
+}
+
+impl<EVM, ERROR> InspectorHandler for AaAccessWarmthHandler<EVM, ERROR>
+where
+    EVM: InspectorEvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type IT = EthInterpreter;
+}
+
 fn next_sender_nonce(nonce: u64) -> Result<u64, ExecutorError> {
     nonce.checked_add(1).ok_or(ExecutorError::NonceOverflow)
 }
@@ -930,6 +983,27 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut last_revert_data: Vec<u8> = Vec::new();
         let mut native_effects = SystemContractEffects::default();
 
+        let share_access = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.aa_access_warmth_height)
+            .is_some_and(|height| header.number >= height);
+        let mut native_access =
+            std::collections::BTreeMap::<[u8; 32], std::collections::BTreeSet<U256>>::new();
+        if share_access {
+            for item in tx.access_list.iter().flatten() {
+                native_access
+                    .entry(*item.address.as_bytes())
+                    .or_default()
+                    .extend(
+                        item.storage_keys
+                            .iter()
+                            .map(|key| U256::from_be_bytes(*key.as_bytes())),
+                    );
+            }
+        }
+
         for inner in &bundle.inner_calls {
             if let Some(target) = inner.to.filter(|target| {
                 (native_account_manager && *target == system_contracts::account_manager_address())
@@ -1041,6 +1115,19 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 self.state_db.chain_store(),
                 header.number,
             )?;
+            let mut warm =
+                revm::primitives::AddressMap::<revm::primitives::HashSet<U256>>::default();
+            if share_access {
+                for (bytes, slots) in &native_access {
+                    let native = ShellAddress::from(*bytes);
+                    let key = address_key(native)?;
+                    // Legacy interpreter keys can alias distinct native accounts.
+                    // Supply only rows belonging to this inner call's mapping.
+                    if native_context.is_some() || self.state_db.resolve_address(&key) == native {
+                        warm.entry(key).or_default().extend(slots.iter().copied());
+                    }
+                }
+            }
             let ctx: MainnetContext<&mut ShellStateDb<S>> =
                 Context::new(&mut self.state_db, SpecId::CANCUN)
                     .modify_block_chained(|b| *b = block_env.clone())
@@ -1061,9 +1148,20 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 crate::native_context::install(&mut instructions);
             }
             let mut evm = Evm::new(ctx, instructions, precompiles);
+            let inner_transaction_id = evm.ctx.journaled_state.transaction_id;
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
-                let result = if reconciled_fees {
+                let result = if share_access {
+                    inspected.ctx.set_tx(tx_env);
+                    let mut handler = AaAccessWarmthHandler::<_, EVMError<StateDbError>> {
+                        warm,
+                        reconciled_fees,
+                        marker: std::marker::PhantomData,
+                    };
+                    handler
+                        .inspect_run(&mut inspected)
+                        .map(|result| ResultAndState::new(result, inspected.finalize()))
+                } else if reconciled_fees {
                     inspected.ctx.set_tx(tx_env);
                     let mut handler = SystemRewardHandler::<_, EVMError<StateDbError>, _>(
                         std::marker::PhantomData,
@@ -1076,6 +1174,16 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 };
                 evm = inspected.with_inspector(());
                 result
+            } else if share_access {
+                evm.ctx.set_tx(tx_env);
+                let mut handler = AaAccessWarmthHandler::<_, EVMError<StateDbError>> {
+                    warm,
+                    reconciled_fees,
+                    marker: std::marker::PhantomData,
+                };
+                handler
+                    .run(&mut evm)
+                    .map(|result| ResultAndState::new(result, evm.finalize()))
             } else if reconciled_fees {
                 evm.ctx.set_tx(tx_env);
                 let mut handler =
@@ -1103,6 +1211,30 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
             let exec_result = result_and_state.result;
             let mut state = result_and_state.state;
+            if share_access {
+                // Read before dropping untouched accounts: foreign read-only
+                // accesses warm accounts too. Revm's reverted frame markers are
+                // already restored, so reverted first accesses are excluded.
+                for (key, account) in &state {
+                    if account.is_cold_transaction_id(inner_transaction_id) {
+                        continue;
+                    }
+                    let native = address_registry
+                        .get(key)
+                        .copied()
+                        .unwrap_or_else(|| ShellAddress::from(*key));
+                    let slots = native_access.entry(*native.as_bytes()).or_default();
+                    slots.extend(
+                        account
+                            .storage
+                            .iter()
+                            .filter(|(_, slot)| {
+                                slot.transaction_id == inner_transaction_id && !slot.is_cold
+                            })
+                            .map(|(slot, _)| *slot),
+                    );
+                }
+            }
             if native_context.is_some() {
                 state.retain(|_, account| account.is_touched());
             }
@@ -3139,6 +3271,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                aa_access_warmth_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3366,6 +3499,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                aa_access_warmth_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3451,6 +3585,7 @@ mod tests {
                                 native_registry_view_height: None,
                                 pq_address_bounds_height: None,
                                 native_address_context_height: native_activation,
+                                aa_access_warmth_height: None,
                                 native_validator_events_height: None,
                                 prover_registry_height: None,
                                 algorithm_proposal_staging_height: None,
@@ -4029,6 +4164,7 @@ mod tests {
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
                     native_address_context_height: None,
+                    aa_access_warmth_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
@@ -7575,6 +7711,353 @@ mod tests {
         );
         assert!(result.err().unwrap().to_string().contains("capture limit"));
         assert!(evm.tracer.is_none());
+    }
+
+    fn aa_access_fixture(
+        activation: Option<u64>,
+        native: bool,
+        reconciled: bool,
+    ) -> (ShellPqvm<MemoryDb>, ShellAddress, ShellAddress) {
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(Arc::clone(&store));
+        chain
+            .put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                    "aa_access_warmth_height":activation,
+                    "native_address_context_height":native.then_some(0),
+                    "fee_accounting_activation_height":reconciled.then_some(0)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut vm = ShellPqvm::new(ShellStateDb::new(WorldState::new(store), chain), 1337);
+        let sender = ShellAddress::from([0x42; 32]);
+        let target = ShellAddress::from([0x35; 32]);
+        fund_account(&mut vm, &sender, U256::from(100_000_000u64));
+        aa_access_install(
+            &mut vm,
+            target,
+            &hex::decode("600054506000545f5260205ff3").unwrap(),
+        );
+        (vm, sender, target)
+    }
+
+    fn aa_access_install(vm: &mut ShellPqvm<MemoryDb>, target: ShellAddress, code: &[u8]) {
+        let hash = shell_primitives::keccak256(code);
+        vm.state_db().chain_store().put_code(&hash, code).unwrap();
+        vm.state_db_mut()
+            .world_state_mut()
+            .set_account(
+                &target,
+                &Account {
+                    code_hash: Some(hash),
+                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                },
+            )
+            .unwrap();
+        vm.state_db_mut()
+            .world_state_mut()
+            .set_storage(
+                &target,
+                &ShellHash::ZERO,
+                &ShellHash::from(U256::from(7).to_be_bytes::<32>()),
+            )
+            .unwrap();
+    }
+    fn aa_access_call(target: ShellAddress, gas_limit: u64) -> shell_core::InnerCall {
+        shell_core::InnerCall {
+            to: Some(target),
+            value: U256::ZERO,
+            gas_limit,
+            data: Default::default(),
+        }
+    }
+    fn aa_access_costs(vm: &ShellPqvm<MemoryDb>, op: &str) -> Vec<u64> {
+        vm.tracer
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .filter(|step| step.op == op)
+            .map(|step| step.gas_cost)
+            .collect()
+    }
+
+    #[test]
+    fn aa_access_warmth_activation_identity_outer_lifetime_and_tracing() {
+        for activation in [None, Some(5)] {
+            for number in [4, 5, 6] {
+                for native in [false, true] {
+                    for reconciled in [false, true] {
+                        for traced in [false, true] {
+                            let (mut vm, sender, a) =
+                                aa_access_fixture(activation, native, reconciled);
+                            let mut bytes = [0x35; 32];
+                            bytes[..12].fill(0x36);
+                            let b = ShellAddress::from(bytes);
+                            aa_access_install(
+                                &mut vm,
+                                b,
+                                &hex::decode("600054506000545f5260205ff3").unwrap(),
+                            );
+                            let mut header = sample_header();
+                            header.number = number;
+                            if traced {
+                                vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+                            }
+                            let tx = make_aa_signed(
+                                sender,
+                                0,
+                                700000,
+                                10,
+                                [a, a, b, b, a]
+                                    .into_iter()
+                                    .map(|x| aa_access_call(x, 100000))
+                                    .collect(),
+                                None,
+                            );
+                            let result = vm.execute_aa_bundle(&tx, &header, 0, 0).unwrap();
+                            assert!(result.receipt.succeeded());
+                            let active = activation.is_some_and(|height| number >= height);
+                            if traced {
+                                assert_eq!(
+                                    aa_access_costs(&vm, "SLOAD"),
+                                    if active {
+                                        vec![2100, 100, 100, 100, 2100, 100, 100, 100, 100, 100]
+                                    } else {
+                                        vec![2100, 100, 2100, 100, 2100, 100, 2100, 100, 2100, 100]
+                                    }
+                                );
+                            }
+                            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+                            let next = make_aa_signed(
+                                sender,
+                                1,
+                                300000,
+                                10,
+                                vec![aa_access_call(a, 100000)],
+                                None,
+                            );
+                            assert!(vm
+                                .execute_aa_bundle(&next, &header, 1, result.gas_used)
+                                .unwrap()
+                                .receipt
+                                .succeeded());
+                            assert_eq!(aa_access_costs(&vm, "SLOAD"), vec![2100, 100]);
+                            assert_eq!(get_nonce(&mut vm, &sender), 2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aa_access_warmth_capped_inner_requires_prior_access() {
+        for activation in [None, Some(0)] {
+            for traced in [false, true] {
+                let (mut vm, sender, a) = aa_access_fixture(activation, true, true);
+                if traced {
+                    vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+                }
+                let tx = make_aa_signed(
+                    sender,
+                    0,
+                    300000,
+                    10,
+                    vec![aa_access_call(a, 100000), aa_access_call(a, 22000)],
+                    None,
+                );
+                assert_eq!(
+                    vm.execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                        .unwrap()
+                        .receipt
+                        .succeeded(),
+                    activation.is_some()
+                );
+                let next =
+                    make_aa_signed(sender, 1, 300000, 10, vec![aa_access_call(a, 22000)], None);
+                assert!(!vm
+                    .execute_aa_bundle(&next, &sample_header(), 1, 0)
+                    .unwrap()
+                    .receipt
+                    .succeeded());
+                assert_eq!(get_nonce(&mut vm, &sender), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn aa_access_warmth_foreign_read_only_account_survives_untouched_filter() {
+        let (mut vm, sender, a) = aa_access_fixture(Some(0), true, true);
+        let foreign = ShellAddress::from([0x49; 32]);
+        let code = hex::decode(format!("7f{}315000", hex::encode(foreign.as_bytes()))).unwrap();
+        aa_access_install(&mut vm, a, &code);
+        vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+        let tx = make_aa_signed(
+            sender,
+            0,
+            300000,
+            10,
+            vec![aa_access_call(a, 100000), aa_access_call(a, 100000)],
+            None,
+        );
+        assert!(vm
+            .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+            .unwrap()
+            .receipt
+            .succeeded());
+        assert_eq!(aa_access_costs(&vm, "BALANCE"), vec![2600, 100]);
+        assert!(vm
+            .state_db()
+            .world_state()
+            .get_account(&foreign)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn aa_access_warmth_nested_revert_restores_only_new_accesses() {
+        for prior in [false, true] {
+            let (mut vm, sender, a) = aa_access_fixture(Some(0), true, true);
+            let c = ShellAddress::from([0x37; 32]);
+            let d = ShellAddress::from([0x38; 32]);
+            let call = |target: ShellAddress| {
+                format!("5f5f5f5f5f7f{}620186a0f150", hex::encode(target.as_bytes()))
+            };
+            aa_access_install(
+                &mut vm,
+                d,
+                &hex::decode("600054506000545f5260205ff3").unwrap(),
+            );
+            aa_access_install(
+                &mut vm,
+                c,
+                &hex::decode(format!("{}5f5ffd", call(d))).unwrap(),
+            );
+            aa_access_install(&mut vm, a, &hex::decode(format!("{}00", call(c))).unwrap());
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let mut calls = Vec::new();
+            if prior {
+                calls.push(aa_access_call(d, 100000));
+            }
+            calls.extend([aa_access_call(a, 400000), aa_access_call(d, 100000)]);
+            let tx = make_aa_signed(sender, 0, 800000, 10, calls, None);
+            assert!(vm
+                .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            assert_eq!(
+                aa_access_costs(&vm, "SLOAD"),
+                if prior {
+                    vec![2100, 100, 100, 100, 100, 100]
+                } else {
+                    vec![2100, 100, 2100, 100]
+                }
+            );
+            // A failed outer execution must not warm the following transaction.
+            let fail = make_aa_signed(
+                sender,
+                1,
+                400000,
+                10,
+                vec![aa_access_call(d, 100000), aa_access_call(c, 200000)],
+                None,
+            );
+            assert!(!vm
+                .execute_aa_bundle(&fail, &sample_header(), 1, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let next = make_aa_signed(sender, 2, 300000, 10, vec![aa_access_call(d, 100000)], None);
+            assert!(vm
+                .execute_aa_bundle(&next, &sample_header(), 2, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            assert_eq!(aa_access_costs(&vm, "SLOAD"), vec![2100, 100]);
+        }
+    }
+
+    #[test]
+    fn aa_access_warmth_access_list_native_alias_isolation() {
+        for native in [false, true] {
+            let (mut vm, sender, a) = aa_access_fixture(Some(0), native, true);
+            let mut bytes = [0x35; 32];
+            bytes[..12].fill(0x36);
+            let b = ShellAddress::from(bytes);
+            aa_access_install(
+                &mut vm,
+                b,
+                &hex::decode("600054506000545f5260205ff3").unwrap(),
+            );
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let mut tx = make_aa_signed(
+                sender,
+                0,
+                500000,
+                10,
+                vec![
+                    aa_access_call(a, 100000),
+                    aa_access_call(b, 100000),
+                    aa_access_call(a, 100000),
+                ],
+                None,
+            );
+            tx.tx.access_list = Some(vec![shell_core::AccessListItem {
+                address: b,
+                storage_keys: vec![ShellHash::ZERO],
+            }]);
+            assert!(vm
+                .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            assert_eq!(
+                aa_access_costs(&vm, "SLOAD"),
+                vec![2100, 100, 100, 100, 100, 100],
+                "prewarming B must not warm same-low20 A before its own first access"
+            );
+        }
+    }
+
+    #[test]
+    fn aa_access_warmth_outer_access_list_warms_once_and_charges_duplicates() {
+        let mut first_gas = None;
+        for duplicates in [1, 2] {
+            let (mut vm, sender, a) = aa_access_fixture(Some(0), true, true);
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let mut tx = make_aa_signed(
+                sender,
+                0,
+                300000,
+                10,
+                vec![aa_access_call(a, 100000), aa_access_call(a, 100000)],
+                None,
+            );
+            tx.tx.access_list = Some(vec![
+                shell_core::AccessListItem {
+                    address: a,
+                    storage_keys: vec![ShellHash::ZERO]
+                };
+                duplicates
+            ]);
+            let result = vm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            assert_eq!(aa_access_costs(&vm, "SLOAD"), vec![100, 100, 100, 100]);
+            if let Some(first) = first_gas {
+                assert_eq!(
+                    result.gas_used - first,
+                    2400 + 1900,
+                    "duplicate list entries are charged once at the outer boundary"
+                );
+            } else {
+                first_gas = Some(result.gas_used);
+            }
+        }
     }
 
     #[test]
