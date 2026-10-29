@@ -26,6 +26,8 @@ const {
   createSessionAuth,
   finalizeSessionAuth,
   hashBatchTransaction,
+  hashTransaction,
+  encodeSetValidationCodeCalldata,
   buildSignedTransaction,
   buildTransaction,
   buildBatchTransaction,
@@ -50,6 +52,7 @@ const blockSignersScenario =
 const syncStatusScenario = process.argv.includes("--sync-status");
 const receiptLogsScenario = process.argv.includes("--receipt-logs");
 const blobReceiptsScenario = process.argv.includes("--blob-receipts");
+const multisigScenario = process.argv.includes("--custom-multisig");
 const slhSessionScenario = process.argv.includes("--slh-session-size");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -114,7 +117,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: slhSessionScenario ? "slh-session-wire-size" : blobReceiptsScenario ? "blob-receipt-fees" : receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: multisigScenario ? "custom-multisig" : slhSessionScenario ? "slh-session-wire-size" : blobReceiptsScenario ? "blob-receipt-fees" : receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -170,7 +173,7 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
-  if (blobReceiptsScenario) (result.stops ??= []).push({pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode});
+  if (blobReceiptsScenario || multisigScenario) (result.stops ??= []).push({pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode});
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -517,12 +520,125 @@ async function runScenario() {
     genesis.alloc[blobReverter] = {balance: "0x0", nonce: 0, code: "0x60006000fd", storage: null};
   if (slhSessionScenario)
     genesis.alloc[blobRecipient] = {balance: "0x0", nonce: 0, code: "0x60003560005500", storage: null};
+  let multisig;
+  if (multisigScenario) {
+    const {keccak256} = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+    const solc = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("solc");
+    const cosigner = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+    signers.push(cosigner);
+    const keyA = Buffer.from(outsider.getPublicKey()), keyB = Buffer.from(cosigner.getPublicKey());
+    const source = `pragma solidity ^0.8.24;
+      contract TwoOfTwoValidator {
+        function verify(bytes32 h, bytes memory sig, bytes memory pk) internal view returns (bool) {
+          (bool ok, bytes memory result) = address(1).staticcall(abi.encodePacked(uint32(pk.length),pk,uint32(32),h,sig));
+          return ok && result.length >= 32 && result[31] == bytes1(0x01);
+        }
+        function validateTransaction(bytes32 h,bytes calldata sig,bytes calldata pk) external view returns(bytes1) {
+          if (keccak256(pk) != keccak256(hex"${keyA.toString("hex")}")) return 0x00;
+          if (sig.length != 6618) return 0x00;
+          if (!verify(h,sig[:3309],hex"${keyA.toString("hex")}")) return 0x00;
+          if (!verify(h,sig[3309:],hex"${keyB.toString("hex")}")) return 0x00;
+          return 0x01;
+        }
+      }`;
+    const compiled = JSON.parse(solc.compile(JSON.stringify({language:"Solidity",sources:{"TwoOfTwoValidator.sol":{content:source}},
+      settings:{optimizer:{enabled:true,runs:200},viaIR:true,evmVersion:"cancun",outputSelection:{"*":{"*":["abi","evm.deployedBytecode.object"]}}}})));
+    assert.ok(!compiled.errors?.some(error => error.severity === "error"), JSON.stringify(compiled.errors));
+    const artifact = compiled.contracts["TwoOfTwoValidator.sol"].TwoOfTwoValidator;
+    const runtime = "0x" + artifact.evm.deployedBytecode.object;
+    const validator = "0x" + "00".repeat(12) + "a5".repeat(20);
+    genesis.alloc[validator] = {balance:"0x0",nonce:0,code:runtime,storage:null};
+    genesis.alloc[blobReverter] = {balance:"0x0",nonce:0,code:"0x60006000fd",storage:null};
+    genesis.alloc[blobRecipient] = {balance:"0x0",nonce:0,code:"0x60003560005500",storage:null};
+    genesis.custom_validation_payload_height = 3;
+    multisig = {cosigner,keyA,artifact,validator,codeHash:keccak256(runtime)};
+    result.versions.solc = solc.version();
+    result.adaptations = ["Unreleased custom_validation_payload_height profile, locally scheduled at block 3; no live activation claim.",
+      "Genesis-allocated real Solidity two-owner validator and storage target isolate validation from contract deployment.",
+      "Published V1 validator ABI; two distinct generated ML-DSA keys sign each canonical hash. Native precompile checks, original JSON/RLP entry, independent follower and RocksDB reopen are required."];
+    await writeFile(join(out,"TwoOfTwoValidator.sol"),source);
+  }
   for (const dir of dirs)
     await writeFile(
       join(dir, "genesis.json"),
       JSON.stringify(genesis, null, 2),
     );
   await start(0, dirs[0], keyPath, "leader");
+  if (multisigScenario) {
+    const {toRlp,encodeFunctionData} = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+    const word = value => "0x" + BigInt(value).toString(16).padStart(64,"0");
+    const hex = bytes => "0x" + Buffer.from(bytes).toString("hex");
+    const uint = value => BigInt(value) === 0n ? "0x" : "0x" + BigInt(value).toString(16);
+    const snapshot = async (i=0) => ({head:await rpc(i,"eth_getBlockByNumber",["latest",false]),
+      nonce:await rpc(i,"eth_getTransactionCount",[outsider.getAddress(),"latest"]),
+      balance:await rpc(i,"eth_getBalance",[outsider.getAddress(),"latest"]),
+      slot:await rpc(i,"eth_getStorageAt",[blobRecipient,"0x0","latest"]),
+      pubkey:await rpc(i,"shell_getPqPubkey",[outsider.getAddress()]),
+      authorityNonce:await rpc(i,"eth_getTransactionCount",[miner.getAddress(),"latest"]),
+      authorityBalance:await rpc(i,"eth_getBalance",[miner.getAddress(),"latest"]),pending:await rpc(i,"shell_pendingCount")});
+    const tx = (n,to,data) => buildTransaction({chainId:1337,nonce:n,to,data,value:0n,gasLimit:800000,maxFeePerGas:1000000000000,maxPriorityFeePerGas:0});
+    const sign = async (n,value) => {
+      const request = tx(n,blobRecipient,word(value)), hash = hashTransaction(request,"MlDsa65");
+      const first = await outsider.sign(hash), second = await multisig.cosigner.sign(hash);
+      const combined = Buffer.concat([first,second]);
+      return {hash,first,combined,packet:buildSignedTransaction({from:outsider.getAddress(),tx:request,signature:combined,signatureType:"MlDsa65",senderPubkey:multisig.keyA})};
+    };
+    const encode = signed => {const t=signed.tx;return toRlp([signed.from,[uint(t.chain_id),uint(t.nonce),t.to,uint(t.value),t.data,uint(t.gas_limit),uint(t.max_fee_per_gas),uint(t.max_priority_fee_per_gas),[],uint(t.tx_type),"0x","0x",[]],["0x01",hex(signed.signature.data)],hex(signed.sender_pubkey)]);};
+    const deny = async (label,packet,raw=false,pattern) => {const before=await snapshot();let error;try{await rpc(0,raw?"eth_sendRawTransaction":"shell_sendTransaction",[raw?encode(packet):packet]);}catch(e){error=e.message;}
+      assert.ok(error,label);if(pattern)assert.match(error,pattern,label);assert.deepEqual(await snapshot(),before,label+" changes no state");(result.rejections??=[]).push({label,error});await save();};
+    const accept = async (label,packet,expectedSlot,raw=false,status="0x1") => {const before=await snapshot();
+      const hash=await rpc(0,raw?"eth_sendRawTransaction":"shell_sendTransaction",[raw?encode(packet):packet]);let receipt;
+      for(let k=0;k<120;k++){receipt=await rpc(0,"eth_getTransactionReceipt",[hash]);if(receipt)break;await pause(100);}
+      assert.equal(receipt?.status,status,label);const after=await snapshot();
+      assert.equal(BigInt(after.nonce),BigInt(before.nonce)+1n);assert.equal(after.slot,word(expectedSlot));
+      assert.equal(BigInt(before.balance)-BigInt(after.balance),BigInt(receipt.gasUsed)*BigInt(receipt.effectiveGasPrice));
+      result.transactions.push({label,hash,receipt});await save();return after;};
+    const install=await outsider.buildSignedTransaction({tx:tx(0,accountManagerAddress,encodeSetValidationCodeCalldata(multisig.codeHash)),includePublicKey:true});
+    await accept("owner installs real two-owner policy",install,0);
+    const both=await sign(1,51);
+    const validate = async signature => rpc(0,"eth_call",[{to:multisig.validator,gas:"0x7a120",data:encodeFunctionData({abi:multisig.artifact.abi,functionName:"validateTransaction",args:[hex(both.hash),hex(signature),hex(multisig.keyA)]})},"latest"]);
+    assert.equal(await validate(both.combined),"0x01"+"00".repeat(31));assert.equal(await validate(both.first),word(0));
+    const tampered=Buffer.from(both.combined);tampered[tampered.length-1]^=1;assert.equal(await validate(tampered),word(0));
+    await deny("two valid signatures remain disabled before activation",both.packet,false,/signature too large/);
+    // A separate normal authority transaction reaches head 2; candidate 3 is the boundary.
+    const clock=await miner.buildSignedTransaction({tx:tx(0,miner.getAddress(),"0x"),includePublicKey:true});
+    const clockHash=await rpc(0,"shell_sendTransaction",[clock]);
+    for(let k=0;k<120;k++){if(await rpc(0,"eth_getTransactionReceipt",[clockHash]))break;await pause(100);}
+    assert.equal(await rpc(0,"eth_blockNumber"),"0x2");
+    const single=structuredClone(both.packet);single.signature.data=Array.from(both.first);
+    await deny("single signature cannot satisfy installed two-owner policy",single);
+    const invalid=structuredClone(both.packet);invalid.signature.data=Array.from(tampered);
+    await deny("tampered second owner refused after activation",invalid,true);
+    const ordinary=await miner.buildSignedTransaction({tx:tx(1,miner.getAddress(),"0x"),includePublicKey:true});
+    ordinary.signature.data=Array.from(both.combined);
+    await deny("ordinary account retains algorithm size bounds after activation",ordinary,true,/signature too large/);
+    const oversized=structuredClone(both.packet);oversized.signature.data=Array.from(new Uint8Array(51201));
+    await deny("authorization transport cap rejects 51201 bytes",oversized);
+    await deny("RLP transport cap rejects 51201 bytes",oversized,true);
+    await accept("two owners execute at activation through JSON",both.packet,51);
+    const next=await sign(2,52);await accept("two owners execute after activation through RLP",next.packet,52,true);
+    const flat=await sign(3,53);const flatPacket={...flat.packet,signature:hex(flat.combined),sig_type:1};
+    await accept("two owners execute through flat JSON signature",flatPacket,53);
+    const signBatch = async (n,calls) => {
+      const draft=buildBatchTransaction({chainId:1337,nonce:n,innerCalls:calls,gasLimit:800000,maxFeePerGas:1000000000000,maxPriorityFeePerGas:0});
+      const hash=hashBatchTransaction(draft.tx,draft.aa_bundle,"MlDsa65");
+      const signature=Buffer.concat([await outsider.sign(hash),await multisig.cosigner.sign(hash)]);
+      return buildSignedTransaction({from:outsider.getAddress(),tx:draft.tx,aaBundle:draft.aa_bundle,signature,signatureType:"MlDsa65",senderPubkey:multisig.keyA});
+    };
+    const batch=await signBatch(4,[buildInnerCall(blobRecipient,word(54),100000,0n),buildInnerCall(blobRecipient,word(55),100000,0n)]);
+    const changed=structuredClone(batch);changed.aa_bundle.inner_calls[1].data=word(99);
+    await deny("two-owner authorization binds the complete AA bundle",changed);
+    await accept("two owners execute ordered atomic AA bundle",batch,55);
+    const failing=await signBatch(5,[buildInnerCall(blobRecipient,word(56),100000,0n),buildInnerCall(blobReverter,"0x",100000,0n)]);
+    const expected=await accept("later AA failure rolls back earlier write while charging one nonce and fee",failing,55,false,"0x0");
+    let bootnode;for(let k=0;k<80;k++){bootnode=(await readFile(join(out,"leader-node.log"),"utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[A-Za-z0-9]+)/)?.[1];if(bootnode)break;await pause(100);}
+    assert.ok(bootnode);await start(1,dirs[1],followerKey,"multisig-follower",bootnode);await peerReady();
+    for(let k=0;k<160;k++){if((await snapshot(1)).head.hash===expected.head.hash)break;await pause(100);}
+    assert.deepEqual(await snapshot(1),expected);
+    for(const row of result.transactions)assert.deepEqual(await rpc(1,"eth_getTransactionReceipt",[row.hash]),row.receipt);
+    for(const i of [0,1]){await stop(i);await start(i,dirs[i],i?followerKey:keyPath,"multisig-reopen-"+i);assert.deepEqual(await snapshot(i),expected);await stop(i);}
+    assert.ok(result.stops.every(row=>row.exitCode===0));result.multisig={final:expected,reopenVerified:true,independentImport:true};result.passed=true;return;
+  }
   if (slhSessionScenario) {
     const {toRlp} = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
     const uint = (value) => BigInt(value) === 0n ? "0x" : "0x" + BigInt(value).toString(16);

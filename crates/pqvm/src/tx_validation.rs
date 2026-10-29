@@ -747,6 +747,7 @@ impl From<AaValidationError> for TxValidationError {
                 Self::AddressMismatch { from, derived }
             }
             AaValidationError::SignatureInvalid => Self::SignatureInvalid,
+            AaValidationError::InvalidAuthorizationPayload(msg) => Self::AaValidation(msg),
             AaValidationError::PubkeyConflict => Self::PubkeyConflict,
             AaValidationError::DisallowedAlgorithm(sig_type) => Self::DisallowedAlgorithm(sig_type),
             AaValidationError::Crypto(

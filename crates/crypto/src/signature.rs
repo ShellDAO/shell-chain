@@ -92,7 +92,7 @@ impl<'de> Deserialize<'de> for PQSignature {
             sig_type: raw.sig_type,
             data: raw.data,
         };
-        sig.validate_size().map_err(D::Error::custom)?;
+        sig.validate_payload_size().map_err(D::Error::custom)?;
         Ok(sig)
     }
 }
@@ -159,7 +159,7 @@ impl alloy_rlp::Decodable for PQSignature {
             .unwrap_or_else(|| unreachable!("RLP header payload_length validated by decode"));
         let sig = Self { sig_type, data };
         // F-157: Reject oversized signatures during deserialization.
-        sig.validate_size()
+        sig.validate_payload_size()
             .map_err(|_| alloy_rlp::Error::Custom("signature exceeds size limit"))?;
         Ok(sig)
     }
@@ -171,6 +171,20 @@ impl PQSignature {
             .as_u8()
             .length()
             .saturating_add(self.data.as_slice().length())
+    }
+
+    /// Bound decoded authorization data before account-aware validation. Custom
+    /// validators may carry multiple signatures under the sender's algorithm tag.
+    /// Built-in verification and inactive custom accounts retain `validate_size`.
+    pub fn validate_payload_size(&self) -> Result<(), String> {
+        if self.data.len() > MAX_SIGNATURE_BYTES {
+            return Err(format!(
+                "authorization payload too large: {} bytes (max {})",
+                self.data.len(),
+                MAX_SIGNATURE_BYTES
+            ));
+        }
+        Ok(())
     }
 
     /// Validate that the signature size is within acceptable bounds.
@@ -213,13 +227,13 @@ mod tests {
     // ── F-157: RLP/JSON deserialization size bounds ──────────────
 
     #[test]
-    fn rlp_decode_rejects_oversized_dilithium_signature() {
+    fn rlp_decode_rejects_oversized_authorization_payload() {
         use alloy_rlp::Decodable;
         // Build an oversized signature manually without going through PQSignature::new
         // (which doesn't enforce size at construction).
         let oversized = PQSignature {
             sig_type: SignatureType::Dilithium3,
-            data: vec![0u8; 5000],
+            data: vec![0u8; MAX_SIGNATURE_BYTES + 1],
         };
         let mut encoded = Vec::new();
         oversized.encode(&mut encoded);
@@ -227,8 +241,29 @@ mod tests {
         let result = PQSignature::decode(&mut encoded.as_slice());
         assert!(
             result.is_err(),
-            "RLP decode should reject oversized Dilithium sig"
+            "RLP decode should reject oversized authorization data"
         );
+    }
+
+    #[test]
+    fn compound_payload_decodes_without_relaxing_algorithm_bounds() {
+        use alloy_rlp::Decodable;
+        for sig_type in [SignatureType::Dilithium3, SignatureType::MlDsa65] {
+            for size in [6618, MAX_SIGNATURE_BYTES] {
+                let signature = PQSignature::new(sig_type, vec![0; size]);
+                assert!(signature.validate_size().is_err());
+                let json = serde_json::to_vec(&signature).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<PQSignature>(&json).unwrap(),
+                    signature
+                );
+                let encoded = alloy_rlp::encode(&signature);
+                assert_eq!(
+                    PQSignature::decode(&mut encoded.as_slice()).unwrap(),
+                    signature
+                );
+            }
+        }
     }
 
     #[test]
@@ -266,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn json_decode_rejects_oversized_signature() {
+    fn json_decode_rejects_oversized_authorization_payload() {
         // Manually construct JSON with an oversized data field
-        let oversized_data: Vec<u8> = vec![0u8; 5000];
+        let oversized_data: Vec<u8> = vec![0u8; MAX_SIGNATURE_BYTES + 1];
         let json = format!(
             r#"{{"sig_type":"Dilithium3","data":{}}}"#,
             serde_json::to_string(&oversized_data).unwrap()
@@ -276,7 +311,7 @@ mod tests {
         let result: Result<PQSignature, _> = serde_json::from_str(&json);
         assert!(
             result.is_err(),
-            "JSON decode should reject oversized Dilithium sig"
+            "JSON decode should reject oversized authorization data"
         );
     }
 

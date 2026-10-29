@@ -95,6 +95,9 @@ pub enum AaValidationError {
     #[error("address mismatch: from={from} but pubkey derives {derived}")]
     AddressMismatch { from: Address, derived: Address },
 
+    #[error("invalid authorization payload: {0}")]
+    InvalidAuthorizationPayload(String),
+
     #[error("signature verification failed")]
     SignatureInvalid,
 
@@ -245,6 +248,23 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
     validation_header: Option<&BlockHeader>,
 ) -> Result<AaValidationOutcome, AaValidationError> {
     let account = world_state.get_account(&signed_tx.from)?;
+    let candidate_height = match validation_header {
+        Some(header) => header.number,
+        None => validation_block_number(chain_store.get_head_block()?.map(|block| block.number())),
+    };
+    let compound_payload = account
+        .as_ref()
+        .is_some_and(|account| account.has_custom_validation())
+        && chain_store
+            .get_chain_config()?
+            .and_then(|config| config.custom_validation_payload_height)
+            .is_some_and(|height| candidate_height >= height);
+    let size_result = if compound_payload {
+        signed_tx.signature.validate_payload_size()
+    } else {
+        signed_tx.signature.validate_size()
+    };
+    size_result.map_err(AaValidationError::InvalidAuthorizationPayload)?;
     let registered_pubkey = chain_store.get_pubkey(&signed_tx.from)?;
 
     if let Some(account) = account.as_ref() {
@@ -322,10 +342,6 @@ fn validate_aa_tx_inner<S: KvStore + 'static, V: Verifier>(
         });
     }
 
-    let candidate_height = match validation_header {
-        Some(header) => header.number,
-        None => validation_block_number(chain_store.get_head_block()?.map(|block| block.number())),
-    };
     let matured_direct_account = signed_tx
         .aa_bundle()
         .is_none_or(|bundle| bundle.session_auth.is_none())
@@ -2669,6 +2685,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            custom_validation_payload_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -4206,6 +4223,85 @@ mod tests {
                     ),
                     state_before
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_validation_payload_height_enforces_size_at_candidate_and_import() {
+        use shell_crypto::{MAX_ML_DSA_65_SIG_BYTES, MAX_SIGNATURE_BYTES};
+        for activation in [None, Some(2)] {
+            for number in [1, 2, 3] {
+                for size in [
+                    MAX_ML_DSA_65_SIG_BYTES,
+                    6618,
+                    MAX_SIGNATURE_BYTES,
+                    MAX_SIGNATURE_BYTES + 1,
+                ] {
+                    for custom in [false, true] {
+                        let (mut ws, cs) = setup_stores();
+                        let from = Address::from([0x42; 32]);
+                        cs.put_chain_config(
+                            &serde_json::from_value(serde_json::json!({
+                                "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                                "custom_validation_payload_height":activation
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let code = validator_returns_true();
+                        let hash = keccak256(&code);
+                        cs.put_code(&hash, &code).unwrap();
+                        let mut account = Account::new_user_account(
+                            ShellHash::ZERO,
+                            U256::from(1_000_000_000u64),
+                        );
+                        account.validation_code_hash = custom.then_some(hash);
+                        ws.set_account(&from, &account).unwrap();
+                        let signed = SignedTransaction::new(
+                            from,
+                            base_tx(1337, 0),
+                            PQSignature::new(SignatureType::MlDsa65, vec![0; size]),
+                        );
+                        let expected = custom
+                            && (size <= MAX_ML_DSA_65_SIG_BYTES
+                                || (activation.is_some_and(|height| number >= height)
+                                    && size <= MAX_SIGNATURE_BYTES));
+                        let header = BlockHeader {
+                            number,
+                            gas_limit: 30_000_000,
+                            ..BlockHeader::default()
+                        };
+                        let before = ws.state_root().unwrap();
+                        assert_eq!(
+                            validate_aa_tx_at_block(&signed, &ws, &cs, &MultiVerifier, &header)
+                                .is_ok(),
+                            expected,
+                            "explicit height {activation:?} {number} {size} custom={custom}"
+                        );
+                        set_head_number(&cs, number - 1);
+                        assert_eq!(
+                            validate_aa_tx(&signed, &ws, &cs, &MultiVerifier).is_ok(),
+                            expected,
+                            "candidate height {activation:?} {number} {size} custom={custom}"
+                        );
+                        assert_eq!(
+                            crate::tx_validation::validate_tx_for_import_at_block(
+                                &signed,
+                                &mut ws,
+                                &cs,
+                                &MultiVerifier,
+                                1337,
+                                None,
+                                &header
+                            )
+                            .is_ok(),
+                            expected,
+                            "import height {activation:?} {number} {size} custom={custom}"
+                        );
+                        assert_eq!(ws.state_root().unwrap(), before);
+                    }
+                }
             }
         }
     }

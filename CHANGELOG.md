@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Add the default-disabled `custom_validation_payload_height` schedule for
+  compound signatures in installed account validators. Bound decoding at
+  51,200 bytes and enforce legacy per-algorithm limits before activation and
+  for ordinary accounts. Persist the schedule across startup and snapshots.
+
+
 - Apply the 128 KiB single-transaction cap to canonical native RLP instead of
   expanded JSON, allowing valid SLH-DSA session bundles. Keep aggregate pool
   memory accounting unchanged and bound raw JSON parsing separately at 512 KiB.

@@ -180,6 +180,43 @@ function validateTransaction(
 - **execution model:** isolated validation dry-run against a world-state snapshot
 - **replay guard:** protocol nonce equality is still enforced before execution
 
+### Compound signatures (unreleased)
+
+The unreleased `custom_validation_payload_height` schedule allows an account
+with installed validation code to carry compound authorization data, such as
+two ML-DSA-65 signatures, in the existing `signature.data` field. The algorithm
+tag and canonical signing hash do not change. Both owners sign the same hash;
+the installed contract must bind and verify each owner independently.
+
+Decoded authorization data is bounded at 51,200 bytes. The expanded limit
+applies only to installed custom validators at or after the scheduled block.
+Omitting the schedule or validating an earlier block preserves the algorithm
+limit (4,096 bytes for ML-DSA-65 and Dilithium3). Ordinary accounts retain that
+limit and the built-in cryptographic checks at every height. The existing
+transaction-size and 500,000-gas validation limits still apply.
+
+The schedule follows the existing immutable activation rules: a running chain
+may add a future height, but cannot change or remove it, or rewrite history.
+All validating nodes must upgrade before activation. This feature is not
+available in the published v0.27.13 binary and has no live-network activation.
+
+Run the source acceptance with a CLI built with `libp2p`, a compatible built
+SDK, and `solc` 0.8.24 or later available beside that SDK:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --custom-multisig
+```
+
+It generates independent temporary keys and compiles a real two-owner
+validator. It checks native PQ precompiles, owner-signed installation, refusal
+before activation, single and tampered-signature refusal, JSON acceptance at
+the activation boundary, RLP and flat JSON acceptance afterward, exact execution state and
+fees, ordered AA execution and later-call rollback, independent block import, and
+process restart. Validator and target
+code are allocated in an isolated genesis; this does not test deployment.
+
 ### Compatibility and nonce policy
 
 V2 validators receive enough typed context to enforce application policy, but

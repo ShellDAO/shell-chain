@@ -1515,7 +1515,7 @@ impl<'de> Deserialize<'de> for SignedTransaction {
                     .ok_or_else(|| serde::de::Error::custom("unknown sig_type"))?;
                 let signature = PQSignature::new(sig_type, signature.as_ref().to_vec());
                 signature
-                    .validate_size()
+                    .validate_payload_size()
                     .map_err(serde::de::Error::custom)?;
                 signature
             }
