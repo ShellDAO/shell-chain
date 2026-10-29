@@ -672,3 +672,51 @@ lists, receipt fee debits/nonce, independent import and history/restart. Raw opc
 fixtures in genesis isolate execution from contract creation. The second mode
 retains legacy nested CALL operands while checking full-width direct AA targets.
 Source validation does not establish public binary availability or live activation.
+
+
+## Original storage values and refunds in AA batches
+
+Cancun storage metering retains the slot's original value for one outer transaction.
+For a slot initially 7, writing 9 then restoring 7 in a batch uses a dirty-slot
+write on the second call: 100 gas and a 2800 refund before the outer cap. Clearing
+then restoring the slot first adds 4800, then cancels that credit and adds 2800;
+a signed negative inner refund must contribute to the same outer counter. The
+final refund is limited to one fifth of the outer gas spent and cannot fund later
+execution. A failed outer transaction receives no storage refund. The 2300-gas
+SSTORE protection still applies even to dirty slots.
+
+The independent `aa_storage_metering_height` correction is unreleased source.
+Public v0.27.13 restarts the original value at every inner call. Access-only
+`aa_access_warmth_height` fixes warmth but retains its prior original/refund rules.
+Storage metering also retains the warmth required by Cancun; it can activate
+without a separate access-only schedule. Both schedules default to absent. Existing
+chains may add only future first heights, and established schedules cannot move or
+be removed. Restart and trusted snapshot import preserve these rules. No online
+activation is scheduled here.
+
+Resets write their final value back even when it equals the outer original. Each
+new outer transaction starts from its own persisted original values and fresh
+refund counter. Native identity and delegate ownership remain separate; nested
+reverts restore values and their refund contribution. In the legacy fee mode,
+existing beneficiary pricing and scope are retained, with the refund-adjusted
+inner credit settled after successful outer execution. Receipt fee debits use the
+outer result. Batch gas-estimation limitations remain as documented above.
+
+With the node and SDK prerequisites from the warm-access section:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-storage-metering
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-storage-metering-legacy-address
+```
+
+The entry signs genuine batches on two isolated nodes, activates access-only at
+local block 2 and storage metering at block 3, and checks persisted resets, matched
+refund controls, cancellation, the whole-transaction cap, write stipend, native
+identity, nested and outer rollback, independent import and history/reopen after
+state changes. Raw genesis runtimes isolate execution from contract deployment.
+Source acceptance does not establish a published binary or deployed activation.

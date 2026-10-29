@@ -2670,6 +2670,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

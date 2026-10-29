@@ -128,13 +128,14 @@ where
 
 // Access sets belong to the signed outer transaction. Reuse revm's prewarm
 // mechanism without adding synthetic access-list intrinsic charges per call.
-struct AaAccessWarmthHandler<EVM, ERROR> {
+struct AaAccessWarmthHandler<'a, EVM, ERROR> {
     warm: revm::primitives::AddressMap<revm::primitives::HashSet<U256>>,
     reconciled_fees: bool,
+    meter_refund: Option<&'a std::cell::Cell<i64>>,
     marker: std::marker::PhantomData<(EVM, ERROR)>,
 }
 
-impl<EVM, ERROR> Handler for AaAccessWarmthHandler<EVM, ERROR>
+impl<EVM, ERROR> Handler for AaAccessWarmthHandler<'_, EVM, ERROR>
 where
     EVM: EvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
@@ -153,12 +154,24 @@ where
         Ok(())
     }
 
+    fn refund(&self, evm: &mut Self::Evm, result: &mut FrameResult, authorization_refund: i64) {
+        if let Some(refund) = self.meter_refund {
+            // Preserve a signed frame refund, including cancellation of a prior
+            // inner clear. Apply the Cancun cap once at the outer boundary.
+            refund.set(result.gas().refunded().saturating_add(authorization_refund));
+            result.gas_mut().set_refund(0);
+        } else {
+            revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
+                .refund(evm, result, authorization_refund);
+        }
+    }
+
     fn reward_beneficiary(
         &self,
         evm: &mut Self::Evm,
         result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
-        if self.reconciled_fees {
+        if self.reconciled_fees || self.meter_refund.is_some() {
             Ok(())
         } else {
             revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
@@ -167,7 +180,7 @@ where
     }
 }
 
-impl<EVM, ERROR> InspectorHandler for AaAccessWarmthHandler<EVM, ERROR>
+impl<EVM, ERROR> InspectorHandler for AaAccessWarmthHandler<'_, EVM, ERROR>
 where
     EVM: InspectorEvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
@@ -983,12 +996,20 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut last_revert_data: Vec<u8> = Vec::new();
         let mut native_effects = SystemContractEffects::default();
 
-        let share_access = self
-            .state_db
-            .chain_store()
-            .get_chain_config()?
-            .and_then(|config| config.aa_access_warmth_height)
+        let chain_config = self.state_db.chain_store().get_chain_config()?;
+        let share_storage = chain_config
+            .as_ref()
+            .and_then(|config| config.aa_storage_metering_height)
             .is_some_and(|height| header.number >= height);
+        let share_access = share_storage
+            || chain_config
+                .as_ref()
+                .and_then(|config| config.aa_access_warmth_height)
+                .is_some_and(|height| header.number >= height);
+        let mut native_originals =
+            std::collections::BTreeMap::<[u8; 32], std::collections::BTreeMap<U256, U256>>::new();
+        let mut raw_refund = 0_i64;
+        let mut legacy_inner_spent = 0_u64;
         let mut native_access =
             std::collections::BTreeMap::<[u8; 32], std::collections::BTreeSet<U256>>::new();
         if share_access {
@@ -1128,6 +1149,25 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     }
                 }
             }
+            let mut original_slots = Vec::new();
+            let mut commit_originals = std::collections::BTreeMap::new();
+            if share_storage {
+                for (bytes, slots) in &native_originals {
+                    let native = ShellAddress::from(*bytes);
+                    let key = address_key(native)?;
+                    if native_context.is_some() || self.state_db.resolve_address(&key) == native {
+                        for (slot, original) in slots {
+                            let current = self
+                                .state_db
+                                .world_state()
+                                .get_storage(&native, &ShellHash::from(slot.to_be_bytes::<32>()))?;
+                            let current = U256::from_be_bytes(*current.as_bytes());
+                            original_slots.push((key, *slot, *original, current));
+                            commit_originals.insert((key, *slot), current);
+                        }
+                    }
+                }
+            }
             let ctx: MainnetContext<&mut ShellStateDb<S>> =
                 Context::new(&mut self.state_db, SpecId::CANCUN)
                     .modify_block_chained(|b| *b = block_env.clone())
@@ -1149,6 +1189,24 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             }
             let mut evm = Evm::new(ctx, instructions, precompiles);
             let inner_transaction_id = evm.ctx.journaled_state.transaction_id;
+            for (key, slot, original, current) in original_slots {
+                evm.ctx.journaled_state.load_account(key)?;
+                evm.ctx
+                    .journaled_state
+                    .state
+                    .get_mut(&key)
+                    .ok_or_else(|| ExecutorError::Revm("AA original-slot account missing".into()))?
+                    .storage
+                    .insert(
+                        slot,
+                        revm::state::EvmStorageSlot::new_changed(
+                            original,
+                            current,
+                            inner_transaction_id,
+                        ),
+                    );
+            }
+            let inner_refund = std::cell::Cell::new(0_i64);
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
                 let result = if share_access {
@@ -1156,6 +1214,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     let mut handler = AaAccessWarmthHandler::<_, EVMError<StateDbError>> {
                         warm,
                         reconciled_fees,
+                        meter_refund: share_storage.then_some(&inner_refund),
                         marker: std::marker::PhantomData,
                     };
                     handler
@@ -1179,6 +1238,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 let mut handler = AaAccessWarmthHandler::<_, EVMError<StateDbError>> {
                     warm,
                     reconciled_fees,
+                    meter_refund: share_storage.then_some(&inner_refund),
                     marker: std::marker::PhantomData,
                 };
                 handler
@@ -1223,6 +1283,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                         .get(key)
                         .copied()
                         .unwrap_or_else(|| ShellAddress::from(*key));
+                    if share_storage {
+                        let originals = native_originals.entry(*native.as_bytes()).or_default();
+                        for (slot, value) in &account.storage {
+                            if value.transaction_id == inner_transaction_id && !value.is_cold {
+                                originals.entry(*slot).or_insert(value.original_value);
+                            }
+                        }
+                    }
                     let slots = native_access.entry(*native.as_bytes()).or_default();
                     slots.extend(
                         account
@@ -1244,6 +1312,23 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
 
             match &exec_result {
                 ExecutionResult::Success { logs, .. } => {
+                    if share_storage {
+                        raw_refund = raw_refund.saturating_add(inner_refund.get());
+                        legacy_inner_spent =
+                            legacy_inner_spent.saturating_add(exec_result.gas().spent());
+                        // Gas uses the outer original. Persistent commit compares
+                        // against this inner's entry value, so reset-to-original
+                        // still overwrites a value committed by an earlier call.
+                        for ((key, slot), current) in commit_originals {
+                            if let Some(value) = state
+                                .get_mut(&key)
+                                .and_then(|account| account.storage.get_mut(&slot))
+                            {
+                                value.original_value = current;
+                            }
+                        }
+                    }
+
                     for log in logs {
                         if let Ok(l) = shell_core::Log::new(
                             if native_context.is_some() || full_log_addresses {
@@ -1331,7 +1416,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         }
 
         // ── Settlement ─────────────────────────────────────────
-        let gas_cost = U256::from(total_gas_used).saturating_mul(settlement_price);
+        let unrefunded_gas = total_gas_used;
+        let outer_refund = if share_storage && !atomic_failure {
+            (raw_refund.max(0) as u64).min(total_gas_spent / 5)
+        } else {
+            0
+        };
+        total_gas_used = total_gas_used.saturating_sub(outer_refund);
+        let mut gas_cost = U256::from(total_gas_used).saturating_mul(settlement_price);
 
         // Reserve the AA gas charge after successful execution. An inner call
         // may mutate the payer's balance, but it may not spend the gas reserve.
@@ -1346,6 +1438,13 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 atomic_failure = true;
                 last_revert_data = b"aa: payer spent reserved gas during execution".to_vec();
             }
+        }
+
+        if share_storage && atomic_failure {
+            // An outer revert has no storage refund, including an execution
+            // that fails its final payer reserve check.
+            total_gas_used = unrefunded_gas;
+            gas_cost = U256::from(total_gas_used).saturating_mul(settlement_price);
         }
 
         // revm applies every successful inner call directly to live state. On
@@ -1443,6 +1542,28 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 self.state_db
                     .world_state_mut()
                     .set_account(&sender, &s_acct)?;
+            }
+        }
+
+        if share_storage && !reconciled_fees && !atomic_failure {
+            // Keep legacy beneficiary pricing/scope, but settle its refund-
+            // adjusted inner credit once rather than exposing unearned fees to
+            // later calls of the same transaction.
+            let reward = U256::from(legacy_inner_spent.saturating_sub(outer_refund))
+                .saturating_mul(revm_gas_price);
+            if reward != U256::ZERO {
+                let mut account = self
+                    .state_db
+                    .world_state()
+                    .get_account(&header.proposer)?
+                    .unwrap_or_else(|| Account::new_user_account(ShellHash::ZERO, U256::ZERO));
+                account.balance = account
+                    .balance
+                    .checked_add(reward)
+                    .ok_or_else(|| ExecutorError::Revm("AA beneficiary credit overflow".into()))?;
+                self.state_db
+                    .world_state_mut()
+                    .set_account(&header.proposer, &account)?;
             }
         }
 
@@ -3272,6 +3393,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3500,6 +3622,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3586,6 +3709,7 @@ mod tests {
                                 pq_address_bounds_height: None,
                                 native_address_context_height: native_activation,
                                 aa_access_warmth_height: None,
+                                aa_storage_metering_height: None,
                                 native_validator_events_height: None,
                                 prover_registry_height: None,
                                 algorithm_proposal_staging_height: None,
@@ -4165,6 +4289,7 @@ mod tests {
                     pq_address_bounds_height: None,
                     native_address_context_height: None,
                     aa_access_warmth_height: None,
+                    aa_storage_metering_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
@@ -8056,6 +8181,352 @@ mod tests {
                 );
             } else {
                 first_gas = Some(result.gas_used);
+            }
+        }
+    }
+
+    fn aa_meter_fixture(
+        activation: Option<u64>,
+        warmth: Option<u64>,
+        native: bool,
+        reconciled: bool,
+        original: u64,
+    ) -> (ShellPqvm<MemoryDb>, ShellAddress, ShellAddress) {
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(Arc::clone(&store));
+        chain.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO,"aa_storage_metering_height":activation,"aa_access_warmth_height":warmth,"native_address_context_height":native.then_some(0),"fee_accounting_activation_height":reconciled.then_some(0)})).unwrap()).unwrap();
+        let mut vm = ShellPqvm::new(ShellStateDb::new(WorldState::new(store), chain), 1337);
+        let sender = ShellAddress::from([0x42; 32]);
+        let a = ShellAddress::from([0x35; 32]);
+        fund_account(&mut vm, &sender, U256::from(100_000_000u64));
+        aa_meter_install(&mut vm, a, original, &hex::decode("5f355f5500").unwrap());
+        (vm, sender, a)
+    }
+    fn aa_meter_install(vm: &mut ShellPqvm<MemoryDb>, a: ShellAddress, original: u64, code: &[u8]) {
+        aa_access_install(vm, a, code);
+        vm.state_db_mut()
+            .world_state_mut()
+            .set_storage(
+                &a,
+                &ShellHash::ZERO,
+                &ShellHash::from(U256::from(original).to_be_bytes::<32>()),
+            )
+            .unwrap();
+    }
+    fn aa_meter_call(a: ShellAddress, value: u64, gas_limit: u64) -> shell_core::InnerCall {
+        shell_core::InnerCall {
+            to: Some(a),
+            value: U256::ZERO,
+            gas_limit,
+            data: shell_primitives::Bytes::from(U256::from(value).to_be_bytes::<32>().to_vec()),
+        }
+    }
+    fn aa_meter_word(vm: &ShellPqvm<MemoryDb>, a: ShellAddress) -> u64 {
+        U256::from_be_bytes(
+            *vm.state_db()
+                .world_state()
+                .get_storage(&a, &ShellHash::ZERO)
+                .unwrap()
+                .as_bytes(),
+        )
+        .to::<u64>()
+    }
+
+    #[test]
+    fn aa_storage_metering_activation_persistence_and_fee_modes() {
+        for activation in [None, Some(5)] {
+            for warmth in [None, Some(0)] {
+                for number in [4, 5, 6] {
+                    for native in [false, true] {
+                        for reconciled in [false, true] {
+                            for traced in [false, true] {
+                                let (mut vm, sender, a) =
+                                    aa_meter_fixture(activation, warmth, native, reconciled, 7);
+                                let mut header = sample_header();
+                                header.number = number;
+                                header.base_fee_per_gas = 3;
+                                let before = vm
+                                    .state_db()
+                                    .world_state()
+                                    .get_account(&sender)
+                                    .unwrap()
+                                    .unwrap()
+                                    .balance;
+                                if traced {
+                                    vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+                                }
+                                let mut tx = make_aa_signed(
+                                    sender,
+                                    0,
+                                    400000,
+                                    10,
+                                    vec![aa_meter_call(a, 9, 100000), aa_meter_call(a, 7, 100000)],
+                                    None,
+                                );
+                                tx.tx.max_priority_fee_per_gas = 2;
+                                let result = vm.execute_aa_bundle(&tx, &header, 0, 0).unwrap();
+                                assert!(result.receipt.succeeded());
+                                let active = activation.is_some_and(|height| number >= height);
+                                let second = if active {
+                                    100
+                                } else if warmth.is_some_and(|height| number >= height) {
+                                    2900
+                                } else {
+                                    5000
+                                };
+                                if traced {
+                                    assert_eq!(aa_access_costs(&vm, "SSTORE"), vec![5000, second]);
+                                }
+                                let refund = if active { 2800 } else { 0 };
+                                assert_eq!(result.gas_spent - result.gas_used, refund);
+                                assert_eq!(
+                                    aa_meter_word(&vm, a),
+                                    7,
+                                    "reset to outer original must overwrite the earlier committed9"
+                                );
+                                let after = vm
+                                    .state_db()
+                                    .world_state()
+                                    .get_account(&sender)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(after.nonce, 1);
+                                assert_eq!(
+                                    before - after.balance,
+                                    U256::from(result.gas_used)
+                                        * U256::from(if reconciled { 5 } else { 10 })
+                                );
+                                let beneficiary = vm
+                                    .state_db()
+                                    .world_state()
+                                    .get_account(&header.proposer)
+                                    .unwrap()
+                                    .map(|x| x.balance)
+                                    .unwrap_or(U256::ZERO);
+                                let expected = if reconciled {
+                                    0
+                                } else {
+                                    ((21147 + 5000) + (21147 + second) - refund) * 2
+                                };
+                                assert_eq!(beneficiary, U256::from(expected));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aa_storage_metering_signed_cancellations_and_outer_refund_cap() {
+        let cases = [
+            (7, vec![9, 7], vec![5000, 100], 2800),
+            (7, vec![0, 7], vec![5000, 100], 2800),
+            (7, vec![0, 9], vec![5000, 100], 0),
+            (7, vec![9, 0, 7], vec![5000, 100, 100], 2800),
+            (7, vec![9, 7, 9], vec![5000, 100, 2900], 2800),
+            (0, vec![9, 0], vec![22100, 100], 19900),
+            (0, vec![9, 0, 9], vec![22100, 100, 20000], 19900),
+        ];
+        for (original, values, costs, raw_refund) in cases {
+            let (mut vm, sender, a) = aa_meter_fixture(Some(0), None, true, true, original);
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let tx = make_aa_signed(
+                sender,
+                0,
+                600000,
+                10,
+                values
+                    .iter()
+                    .map(|value| aa_meter_call(a, *value, 100000))
+                    .collect(),
+                None,
+            );
+            let result = vm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            assert_eq!(aa_access_costs(&vm, "SSTORE"), costs);
+            assert_eq!(aa_meter_word(&vm, a), *values.last().unwrap());
+            assert_eq!(
+                result.gas_spent - result.gas_used,
+                raw_refund.min(result.gas_spent / 5)
+            );
+            if original == 0 && values.len() == 2 {
+                assert!(
+                    result.gas_spent / 5 < raw_refund,
+                    "this case must exercise the cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aa_storage_metering_native_identity_and_next_outer_original() {
+        for native in [false, true] {
+            let (mut vm, sender, a) = aa_meter_fixture(Some(0), None, native, true, 7);
+            let mut bytes = [0x35; 32];
+            bytes[..12].fill(0x36);
+            let b = ShellAddress::from(bytes);
+            aa_meter_install(&mut vm, b, 11, &hex::decode("5f355f5500").unwrap());
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let tx = make_aa_signed(
+                sender,
+                0,
+                600000,
+                10,
+                vec![
+                    aa_meter_call(a, 9, 100000),
+                    aa_meter_call(b, 12, 100000),
+                    aa_meter_call(a, 7, 100000),
+                    aa_meter_call(b, 11, 100000),
+                ],
+                None,
+            );
+            let result = vm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            assert_eq!(aa_access_costs(&vm, "SSTORE"), vec![5000, 5000, 100, 100]);
+            assert_eq!(result.gas_spent - result.gas_used, 5600);
+            assert_eq!(aa_meter_word(&vm, a), 7);
+            assert_eq!(aa_meter_word(&vm, b), 11);
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let next = make_aa_signed(
+                sender,
+                1,
+                300000,
+                10,
+                vec![aa_meter_call(a, 9, 100000)],
+                None,
+            );
+            let result = vm.execute_aa_bundle(&next, &sample_header(), 1, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            assert_eq!(aa_access_costs(&vm, "SSTORE"), vec![5000]);
+            assert_eq!(result.gas_spent, result.gas_used);
+            assert_eq!(aa_meter_word(&vm, a), 9);
+        }
+    }
+
+    #[test]
+    fn aa_storage_metering_stipend_and_failed_outer_discard_refunds() {
+        for cap in [23447, 23448] {
+            let (mut vm, sender, a) = aa_meter_fixture(Some(0), None, true, true, 7);
+            let tx = make_aa_signed(
+                sender,
+                0,
+                400000,
+                10,
+                vec![aa_meter_call(a, 0, 100000), aa_meter_call(a, 7, cap)],
+                None,
+            );
+            let result = vm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+            assert_eq!(result.receipt.succeeded(), cap == 23448);
+            assert_eq!(aa_meter_word(&vm, a), 7);
+            assert_eq!(get_nonce(&mut vm, &sender), 1);
+            assert_eq!(
+                result.gas_spent - result.gas_used,
+                if cap == 23448 { 2800 } else { 0 }
+            );
+            vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            let next = make_aa_signed(
+                sender,
+                1,
+                300000,
+                10,
+                vec![aa_meter_call(a, 9, 100000)],
+                None,
+            );
+            let result = vm.execute_aa_bundle(&next, &sample_header(), 1, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            assert_eq!(aa_access_costs(&vm, "SSTORE"), vec![5000]);
+            assert_eq!(result.gas_spent, result.gas_used);
+        }
+    }
+
+    #[test]
+    fn aa_storage_metering_nested_revert_restores_value_and_refund() {
+        let (mut vm, sender, a) = aa_meter_fixture(Some(0), None, true, true, 7);
+        let library = ShellAddress::from([0x37; 32]);
+        aa_meter_install(&mut vm, library, 0, &hex::decode("5f5f555f5ffd").unwrap());
+        let code = hex::decode(format!(
+            "3615600a575f355f55005b5f5f5f5f7f{}620186a0f45000",
+            hex::encode(library.as_bytes())
+        ))
+        .unwrap();
+        aa_meter_install(&mut vm, a, 7, &code);
+        vm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+        let mut nested = aa_access_call(a, 200000);
+        nested.data = Default::default();
+        let tx = make_aa_signed(
+            sender,
+            0,
+            600000,
+            10,
+            vec![
+                aa_meter_call(a, 9, 100000),
+                nested,
+                aa_meter_call(a, 7, 100000),
+            ],
+            None,
+        );
+        let result = vm.execute_aa_bundle(&tx, &sample_header(), 0, 0).unwrap();
+        assert!(result.receipt.succeeded());
+        assert_eq!(aa_access_costs(&vm, "SSTORE"), vec![5000, 100, 100]);
+        assert_eq!(result.gas_spent - result.gas_used, 2800);
+        assert_eq!(aa_meter_word(&vm, a), 7);
+    }
+
+    #[test]
+    fn aa_storage_metering_legacy_self_beneficiary_and_sponsored_payer() {
+        for sponsored in [false, true] {
+            let (mut vm, sender, a) = aa_meter_fixture(Some(0), None, true, false, 7);
+            let payer = ShellAddress::from([0x43; 32]);
+            if sponsored {
+                fund_account(&mut vm, &payer, U256::from(100_000_000u64));
+            }
+            let mut header = sample_header();
+            header.proposer = sender;
+            let before = vm
+                .state_db()
+                .world_state()
+                .get_account(&sender)
+                .unwrap()
+                .unwrap()
+                .balance;
+            let mut tx = make_aa_signed(
+                sender,
+                0,
+                400000,
+                10,
+                vec![aa_meter_call(a, 9, 100000), aa_meter_call(a, 7, 100000)],
+                sponsored.then_some(payer),
+            );
+            tx.tx.max_priority_fee_per_gas = 2;
+            let result = vm.execute_aa_bundle(&tx, &header, 0, 0).unwrap();
+            assert!(result.receipt.succeeded());
+            let credit = U256::from((26147 + 21247 - 2800) * 2u64);
+            let after = vm
+                .state_db()
+                .world_state()
+                .get_account(&sender)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.nonce, 1);
+            assert_eq!(
+                after.balance,
+                if sponsored {
+                    before + credit
+                } else {
+                    before + credit - U256::from(result.gas_used) * U256::from(10)
+                }
+            );
+            if sponsored {
+                assert_eq!(
+                    vm.state_db()
+                        .world_state()
+                        .get_account(&payer)
+                        .unwrap()
+                        .unwrap()
+                        .balance,
+                    U256::from(100_000_000u64) - U256::from(result.gas_used) * U256::from(10)
+                );
             }
         }
     }

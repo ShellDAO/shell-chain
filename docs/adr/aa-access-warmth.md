@@ -28,9 +28,10 @@ outer return. Native system-call intercepts do not clear it.
 Default to absent activation and allow only a future first schedule on existing
 chains. Persist and validate it through genesis, restart and trusted snapshots.
 Historical execution/import selects the original block's height. This schedules no
-online activation. This change covers access sets; transaction-wide original-value
-SSTORE metering and refund aggregation remain separate assertions, and batch gas
-estimation keeps its documented limitations.
+online activation. This activation covers access sets. Original-value SSTORE metering and refund
+aggregation are selected independently by `aa_storage_metering_height` (see
+[outer storage metering](aa-storage-metering.md)); batch gas estimation keeps its
+documented limitations.
 
 Validation uses the public binary's actual signed AA trace against literal opcode
 costs from EIP-2929, then the same stopped database with a future local schedule.

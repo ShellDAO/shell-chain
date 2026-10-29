@@ -34,8 +34,10 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const aaWarmLegacy = process.argv.includes("--aa-access-warmth-legacy-address");
-const aaWarmScenario = aaWarmLegacy || process.argv.includes("--aa-access-warmth");
+const aaMeterLegacy = process.argv.includes("--aa-storage-metering-legacy-address");
+const aaMeterScenario = aaMeterLegacy || process.argv.includes("--aa-storage-metering");
+const aaWarmLegacy = aaMeterLegacy || process.argv.includes("--aa-access-warmth-legacy-address");
+const aaWarmScenario = aaMeterScenario || aaWarmLegacy || process.argv.includes("--aa-access-warmth");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -113,7 +115,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: aaWarmScenario ? (aaWarmLegacy ? "aa-access-warmth-legacy-address" : "aa-access-warmth") : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: aaMeterScenario ? (aaMeterLegacy ? "aa-storage-metering-legacy-address" : "aa-storage-metering") : aaWarmScenario ? (aaWarmLegacy ? "aa-access-warmth-legacy-address" : "aa-access-warmth") : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -516,6 +518,20 @@ async function runScenario() {
     genesis.alloc[warmBalance] = code("0x" + operand(warmForeign) + "315000");
     result.adaptations.push("Raw opcode fixtures isolate execution from CREATE deployment. Access warmth activates only at local block3. Legacy mode uses canonical20-byte nested CALL operands; direct AA targets retain full native identities, including same-low20 targets. SSTORE original-value/refund policy and batch estimation are separate assertions.");
   }
+  const meterLibrary = aaMeterLegacy ? legacyAddress("3c") : "0x" + "3c".repeat(32);
+  const meterZero = "0x" + "3d".repeat(32), meterZeroControl = "0x" + "3e".repeat(32);
+  if (aaMeterScenario) {
+    genesis.aa_access_warmth_height = 2;
+    genesis.aa_storage_metering_height = 3;
+    const operand = address => aaMeterLegacy ? "73" + address.slice(-40) : "7f" + address.slice(2);
+    genesis.alloc[warmTarget].code = "0x3615600a575f355f55005b5f5f5f5f" + operand(meterLibrary) + "620186a0f45000";
+    genesis.alloc[warmOther].storage[word(0)] = word(11);
+    genesis.alloc[meterLibrary] = { balance: "0x0", nonce: 1, code: "0x5f5f555f5ffd", storage: {} };
+    genesis.alloc[warmReverter].code = "0x5f5ffd";
+    for (const address of [meterZero, meterZeroControl])
+      genesis.alloc[address] = { balance: "0x0", nonce: 1, code: genesis.alloc[warmForeign].code, storage: {} };
+    result.adaptations.push("Outer storage originals/refunds activate at local3 after access-only2. Genuine matched receipt controls independently check2800 refunds, signed cancellation, failed-outer discard and whole-transaction1/5cap. No online activation or total PQ signature-price claim.");
+  }
   for (const signer of signers)
     genesis.alloc[signer.getAddress()] = {
       balance: "0x3635c9adc5dea00000",
@@ -646,6 +662,56 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (aaMeterScenario) {
+    const set = (address, value, cap = 100000) => buildInnerCall(address, word(value), cap);
+    const costs = entry => entry.trace.structLogs.filter(step => step.op === "SSTORE").map(step => step.gasCost);
+    const used = entry => BigInt(entry.receipt.gasUsed);
+    const slot = (index, address = warmTarget, tag = "latest") => rpc(index, "eth_getStorageAt", [address, "0x0", tag]);
+    async function batch(label, calls, expected, status = "0x1") {
+      const entry = await confirmed(label, outsider, calls, status);
+      if (expected) assert.deepEqual(costs(entry), expected, label);
+      return entry;
+    }
+    await batch("before activation1", [set(warmTarget,9),set(warmTarget,7)], [5000,5000]);
+    await batch("access-only activation2 retains old originals", [set(warmTarget,9),set(warmTarget,7)], [5000,2900]);
+    const reset = await batch("storage activation3 reset original", [set(warmTarget,9),set(warmTarget,7)], [5000,100]);
+    const nonreset = await batch("matched nonreset control", [set(warmForeign,9),set(warmForeign,8)], [5000,100]);
+    assert.equal(used(nonreset)-used(reset),2800n,"reset refund measured by equal-cost no-refund control");
+    const clearReset = await batch("clear then restore cancels negative inner refund", [set(warmTarget,0),set(warmTarget,7)], [5000,100]);
+    assert.equal(used(clearReset),used(reset)-12n,"one fewer nonzero calldata byte; same2800 total refund");
+    const clearChange = await batch("clear then change removes the entire clear refund", [set(warmTarget,0),set(warmTarget,9)], [5000,100]);
+    assert.equal(used(clearChange)-used(clearReset),2800n);
+    await batch("next outer loads new original9", [set(warmTarget,7)], [5000]);
+    await batch("reverted delegate restores original/current/refund", [set(warmTarget,9),buildInnerCall(warmTarget,"0x",200000),set(warmTarget,7)], [5000,100,100]);
+    const capped = await batch("zero-original reset uses outer refund cap", [set(meterZero,9),set(meterZero,0)], [22100,100]);
+    const capControl = await batch("matched zero-original nonreset control", [set(meterZeroControl,9),set(meterZeroControl,8)], [22100,100]);
+    const gross = used(capControl)-12n, refund = gross/5n;
+    assert(refund<19900n,"the whole-transaction cap must bind");assert.equal(used(capped),gross-refund);
+    await batch("distinct same-low20 original slots", [set(warmTarget,9),set(warmOther,12),set(warmTarget,7),set(warmOther,11)], [5000,5000,100,100]);
+    for (const index of [0,1]) {assert.equal(await slot(index),word(7));assert.equal(await slot(index,warmOther),word(11));}
+    const stipend = await batch("2300 remaining gas rejects a dirty write", [set(warmTarget,0),set(warmTarget,7,23465)], undefined,"0x0");
+    assert(stipend.trace.calls[1].error);
+    const failedClear = await batch("failed outer discards prior4800 refund", [set(warmTarget,0),buildInnerCall(warmReverter,"0x",100000)], [5000],"0x0");
+    const failedControl = await batch("matched failed outer without clear refund", [set(warmTarget,9),buildInnerCall(warmReverter,"0x",100000)], [5000],"0x0");
+    assert.equal(used(failedClear),used(failedControl)-12n,"failed batch has no retained inner refund");
+    await batch("later write changes historical context", [set(warmTarget,11)], [5000]);
+    const observe = async index => ({head:await rpc(index,"eth_getBlockByNumber",["latest",false]),nonce:await rpc(index,"eth_getTransactionCount",[outsider.getAddress(),"latest"]),balance:await rpc(index,"eth_getBalance",[outsider.getAddress(),"latest"]),miner:await rpc(index,"eth_getBalance",[miner.getAddress(),"latest"]),slot:await slot(index),other:await slot(index,warmOther),zero:await slot(index,meterZero),control:await slot(index,meterZeroControl)});
+    const expected=await observe(0);assert.equal(expected.slot,word(11));assert.equal(expected.other,word(11));assert.equal(expected.zero,word(0));assert.equal(expected.control,word(8));assert.equal(BigInt(expected.nonce),15n);assert.deepEqual(await observe(1),expected);
+    async function history(index) {
+      for(const [tag,value] of [["0x0",7],["0x1",7],["0x2",7],["0x3",7],["0x6",9],["0x7",7],["0xe",7]]) assert.equal(await slot(index,warmTarget,tag),word(value));
+      for(const entry of result.transactions) {
+        const block=await rpc(index,"eth_getBlockByHash",[entry.receipt.blockHash,false]);const maxFee=BigInt(entry.feeCaps.maxFee),offer=BigInt(block.baseFeePerGas)+BigInt(entry.feeCaps.tip);
+        assert.equal(BigInt(entry.receipt.effectiveGasPrice),maxFee<offer?maxFee:offer);
+        assert.deepEqual(await rpc(index,"eth_getTransactionReceipt",[entry.hash]),entry.receipt);
+        assert.deepEqual(await rpc(index,"debug_traceTransaction",[entry.hash,{tracer:"callTracer"}]),entry.trace);
+      }
+      assert.deepEqual(await observe(index),expected,"history does not write current original/refund state");
+    }
+    for(const index of [0,1]) await history(index);
+    await stop(1);await stop(0);await start(0,dirs[0],keyPath,"meter-reopened-producer");await start(1,dirs[1],followerKey,"meter-reopened-follower");
+    for(const index of [0,1]) await history(index);
+    result.storageMetering={activation:3,expected,reopened:true,matchedRefund:2800,cappedRefund:refund.toString()};result.passed=true;return;
+  }
   if (aaWarmScenario) {
     const read = (address, cap = 100000) => buildInnerCall(address, "0x", cap);
     const costs = (entry, op = "SLOAD") => entry.trace.structLogs.filter(step => step.op === op).map(step => step.gasCost);

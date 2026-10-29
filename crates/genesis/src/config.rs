@@ -216,6 +216,9 @@ pub struct GenesisConfig {
     /// First block sharing warm account and storage access across calls of one outer AA transaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_access_warmth_height: Option<u64>,
+    /// First block using outer-transaction storage originals and aggregate refunds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_storage_metering_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,

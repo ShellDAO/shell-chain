@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- After optional `aa_storage_metering_height`, AA calls share original storage
+  values and a signed refund counter. Resets persist correctly, clear/recreate
+  refunds cancel, and the Cancun refund cap applies once to the outer batch.
+  The independent schedule defaults to absent and preserves access-only history.
+
 - AA batches can retain transaction-wide warm account/storage access after the
   optional `aa_access_warmth_height` activation. The schedule defaults to absent,
   persists across restart/snapshot import, and preserves historical gas results.

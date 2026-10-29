@@ -117,6 +117,9 @@ pub struct ChainConfig {
     /// First block sharing warm account and storage access across calls of one outer AA transaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aa_access_warmth_height: Option<u64>,
+    /// First block using outer-transaction storage originals and aggregate refunds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_storage_metering_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
@@ -2225,6 +2228,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.aa_access_warmth_height,
             ),
             (
+                "AA storage metering",
+                stored.aa_storage_metering_height,
+                desired.aa_storage_metering_height,
+            ),
+            (
                 "native validator events",
                 stored.native_validator_events_height,
                 desired.native_validator_events_height,
@@ -2610,6 +2618,9 @@ impl<S: KvStore> ChainStore<S> {
             aa_access_warmth_height: self
                 .get_chain_config()?
                 .and_then(|config| config.aa_access_warmth_height),
+            aa_storage_metering_height: self
+                .get_chain_config()?
+                .and_then(|config| config.aa_storage_metering_height),
             native_validator_events_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_validator_events_height),
@@ -2683,6 +2694,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_pq_address_bounds = trusted.pq_address_bounds_height;
         let trusted_native_address_context = trusted.native_address_context_height;
         let trusted_aa_access_warmth = trusted.aa_access_warmth_height;
+        let trusted_aa_storage_metering = trusted.aa_storage_metering_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
         let trusted_prover_registry = trusted.prover_registry_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
@@ -2854,6 +2866,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.pq_address_bounds_height != trusted_pq_address_bounds
                     || config.native_address_context_height != trusted_native_address_context
                     || config.aa_access_warmth_height != trusted_aa_access_warmth
+                    || config.aa_storage_metering_height != trusted_aa_storage_metering
                     || config.native_validator_events_height != trusted_native_validator_events
                     || config.prover_registry_height != trusted_prover_registry
                     || config.algorithm_proposal_staging_height
@@ -3130,6 +3143,15 @@ impl<S: KvStore> ChainStore<S> {
         }
         if snapshot_chain_config
             .as_ref()
+            .and_then(|config| config.aa_storage_metering_height)
+            != trusted_aa_storage_metering
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted AA storage metering activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
             .and_then(|config| config.native_address_context_height)
             != trusted_native_address_context
         {
@@ -3378,6 +3400,7 @@ impl<S: KvStore> ChainStore<S> {
             pq_address_bounds_height: trusted_pq_address_bounds,
             native_address_context_height: trusted_native_address_context,
             aa_access_warmth_height: trusted_aa_access_warmth,
+            aa_storage_metering_height: trusted_aa_storage_metering,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
@@ -5314,6 +5337,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5368,6 +5392,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5408,6 +5433,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5438,6 +5464,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5500,6 +5527,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5530,6 +5558,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5592,6 +5621,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5622,6 +5652,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5683,6 +5714,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5713,6 +5745,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5819,6 +5852,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5854,6 +5888,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5921,6 +5956,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: trusted_height,
@@ -5951,6 +5987,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(6),
@@ -6021,6 +6058,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6054,6 +6092,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6123,6 +6162,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6156,6 +6196,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6225,6 +6266,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6258,6 +6300,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6373,6 +6416,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6406,6 +6450,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6476,6 +6521,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6509,6 +6555,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6579,6 +6626,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6612,6 +6660,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6677,6 +6726,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6710,6 +6760,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6779,6 +6830,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: trusted_height,
@@ -6812,6 +6864,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: Some(6),
@@ -7126,6 +7179,51 @@ mod tests {
     }
 
     #[test]
+    fn aa_storage_metering_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "aa_storage_metering_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.aa_storage_metering_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted AA storage metering activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn native_validator_events_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -7239,6 +7337,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7272,6 +7371,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7347,6 +7447,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7377,6 +7478,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7716,6 +7818,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7746,6 +7849,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7818,6 +7922,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -7955,6 +8060,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: None,
+                aa_storage_metering_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -8895,6 +9001,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9522,6 +9629,7 @@ mod tests {
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
                 aa_access_warmth_height: transient_activation,
+                aa_storage_metering_height: transient_activation,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
@@ -9586,6 +9694,7 @@ mod tests {
                 })
             );
             assert_eq!(loaded_cfg.aa_access_warmth_height, transient_activation);
+            assert_eq!(loaded_cfg.aa_storage_metering_height, transient_activation);
             assert_eq!(loaded_cfg.chain_id, 1337);
             assert_eq!(loaded_cfg.genesis_hash, b0.hash());
             assert_eq!(
@@ -9790,6 +9899,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9865,6 +9975,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11212,6 +11323,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11259,6 +11371,7 @@ mod tests {
             pq_address_bounds_height: None,
             native_address_context_height: None,
             aa_access_warmth_height: None,
+            aa_storage_metering_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
