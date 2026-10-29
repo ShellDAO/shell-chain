@@ -296,6 +296,53 @@ separately gated full-address profile. The old reference runtime remains unsafe;
 only the corrected, constructor-bound deployment is covered here.
 
 
+### Time-locked owner policy
+
+`contracts/TimedPQValidator.sol` adds an immutable chain-timestamp deadline to
+the owner-bound ML-DSA reference policy. Its constructor takes
+`(bytes ownerPubkey, uint256 unlockTime_)` and deploys a real
+`DefaultPQValidator` for the configured public key. Compile both source files
+with the compatible Solidity compiler, deploy `TimedPQValidator`, and install
+the Keccak-256 hash of its actual `eth_getCode` runtime through AccountManager.
+Its runtime contains both the deadline and the deployed verifier address.
+Use both files from the corrected source revision: an older, unbound
+`DefaultPQValidator` would still admit unrelated keys after the time gate opens.
+
+While `block.timestamp < unlockTime`, **every transaction using this policy
+is rejected**, including an owner-signed request to clear or replace it. Once
+the deadline is reached, the configured key must still pass the real ML-DSA
+signature check. The deadline and verifier key are immutable; preserve the
+authorized keystore and check the deadline before installing the policy.
+
+The deadline is an absolute Unix timestamp in seconds evaluated against chain
+time. Admission uses the last canonical block's timestamp, so an idle chain
+needs a later canonical block before the unlocked operation can enter. Waiting
+on a wallet's local clock does not advance chain time. This policy does not
+provide a separate wall-clock guarantee or a recovery bypass before its deadline.
+
+Run the independent example with the same public node/SDK/compiler versions as
+the owner-bound reference acceptance above:
+
+```sh
+NODE_BIN=/path/to/shell-node \
+  SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --timed-validator
+```
+
+The command creates fresh encrypted owner and clock-account keystores. It funds
+the independent account, deploys the actual constructor/verifier, checks the
+stored deadline and verifier code, installs the policy, and verifies rejection
+of owner writes and policy clearing before the deadline. After an independent
+transaction advances the canonical block time past the deadline, the owner can
+write while another genuine key cannot clear the policy; changed signatures
+and signed payloads are also rejected. Both databases reopen while locked to
+check that the deadline still rejects the owner. They reopen again after unlock
+and the owner writes again; receipts, exact fees/nonces, state and
+read-only historical results agree across the observer and final reopens.
+No simulated timestamp or live activation is used. This example uses the
+existing legacy constructor/CREATE path; it does not establish the separately
+gated full-native CREATE address profile.
+
 ## 5. Key rotation and validator upgrades
 
 The long-term AA model includes a protocol-managed account controller for:

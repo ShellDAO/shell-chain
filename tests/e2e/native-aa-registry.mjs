@@ -33,8 +33,9 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const referenceValidatorScenario = process.argv.includes("--reference-validator");
-if (referenceValidatorScenario) assert.deepEqual(process.argv.slice(2), ["--reference-validator"]);
+const timedValidatorScenario = process.argv.includes("--timed-validator");
+const referenceValidatorScenario = process.argv.includes("--reference-validator") || timedValidatorScenario;
+if (referenceValidatorScenario) assert.deepEqual(process.argv.slice(2), [timedValidatorScenario ? "--timed-validator" : "--reference-validator"]);
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -440,7 +441,7 @@ async function confirmed(
 }
 
 async function runReferenceValidatorScenario() {
-  result.scenario = "owner-bound-reference-validator";
+  result.scenario = timedValidatorScenario ? "owner-bound-timed-validator" : "owner-bound-reference-validator";
   result.adaptations = [
     "Actual Solidity constructor deployment, owner-signed AccountManager calls, fresh ML-DSA accounts and isolated full RocksDB producer/observer.",
     "Public native node and SDK can run the corrected contract; no new native address profile or live network activation.",
@@ -449,9 +450,11 @@ async function runReferenceValidatorScenario() {
   const { compileSolidity } = await import(new URL("./contracts-compiler.js", sdkUrl));
   const { buildDeployTransaction } = await import(new URL("./contracts.js", sdkUrl));
   const sdk = await import(sdkUrl);
-  const { keccak256 } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+  const { keccak256, encodeFunctionData } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
   const source = await readFile(new URL("../../contracts/DefaultPQValidator.sol", import.meta.url), "utf8");
-  const artifact = await compileSolidity({ sources: [{ path: "DefaultPQValidator.sol", content: source }], contractName: "DefaultPQValidator" });
+  const sources = [{ path: "DefaultPQValidator.sol", content: source }];
+  if (timedValidatorScenario) sources.push({ path: "TimedPQValidator.sol", content: await readFile(new URL("../../contracts/TimedPQValidator.sol", import.meta.url), "utf8") });
+  const artifact = await compileSolidity({ sources, contractName: timedValidatorScenario ? "TimedPQValidator" : "DefaultPQValidator" });
   result.referenceArtifact = artifact;
   const ownerKey = join(out, "reference-owner-key.json");
   const ownerGenerated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", ownerKey], { encoding: "utf8" });
@@ -501,8 +504,11 @@ async function runReferenceValidatorScenario() {
   const sign = async (actor, nonce, to, data) => actor.buildSignedTransaction({
     tx: buildTransaction({ chainId: 1337, nonce, to, value: 0n, data, gasLimit: 800000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 }), includePublicKey: true,
   });
-  const confirm = async (label, packet) => {
+  const confirm = async (label, packet, actor = ownerSigner) => {
     const before = await snapshot();
+    const address = actor.getAddress();
+    const beforeNonce = address === owner ? before.nonce : await rpc(0, "eth_getTransactionCount", [address, "latest"]);
+    const beforeBalance = address === owner ? before.balance : await rpc(0, "eth_getBalance", [address, "latest"]);
     const row = { label, packet };
     result.transactions.push(row); await save();
     row.hash = await paced(() => providers[0].sendTransaction(packet));
@@ -512,8 +518,11 @@ async function runReferenceValidatorScenario() {
     assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [row.hash]), row.receipt);
     assert.deepEqual(await snapshot(1), await snapshot(), "independent import agrees on canonical root and account state");
     const after = await snapshot();
-    assert.equal(BigInt(after.nonce), BigInt(before.nonce) + 1n);
-    assert.equal(BigInt(before.balance) - BigInt(after.balance), BigInt(row.receipt.gasUsed) * BigInt(row.receipt.effectiveGasPrice));
+    const afterNonce = address === owner ? after.nonce : await rpc(0, "eth_getTransactionCount", [address, "latest"]);
+    const afterBalance = address === owner ? after.balance : await rpc(0, "eth_getBalance", [address, "latest"]);
+    assert.equal(row.receipt.from, address);
+    assert.equal(BigInt(afterNonce), BigInt(beforeNonce) + 1n);
+    assert.equal(BigInt(beforeBalance) - BigInt(afterBalance), BigInt(row.receipt.gasUsed) * BigInt(row.receipt.effectiveGasPrice) + BigInt(packet.tx.value));
     await save(); return row;
   };
   const deny = async (label, packet, pattern = /validation contract rejected|SignatureInvalid|signature.*invalid|signature verification|nonce.*(?:mismatch|too low)/i) => {
@@ -523,6 +532,86 @@ async function runReferenceValidatorScenario() {
     assert.deepEqual(await snapshot(), before, label + " leaves state and metadata unchanged");
     await save();
   };
+  if (timedValidatorScenario) {
+    const clockKey = join(out, "reference-clock-key.json");
+    const clockGenerated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", clockKey], { encoding: "utf8" });
+    assert.equal(clockGenerated.status, 0, clockGenerated.stderr);
+    const clockSigner = await decryptKeystore(JSON.parse(await readFile(clockKey, "utf8")), password);
+    signers.push(clockSigner);
+    result.clockKeystore = clockKey;
+    const funding = buildTransaction({ chainId: 1337, nonce: 0, to: clockSigner.getAddress(), value: 1000000000000000000n, gasLimit: 100000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 });
+    await confirm("fund independent block-clock account", await ownerSigner.buildSignedTransaction({ tx: funding, includePublicKey: true }));
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [clockSigner.getAddress(), "latest"])), 1000000000000000000n);
+    const unlockTime = Math.floor(Date.now() / 1000) + 12;
+    const deployment = buildDeployTransaction({ artifact, chainId: 1337, nonce: 1, constructorArgs: ["0x" + Buffer.from(ownerSigner.getPublicKey()).toString("hex"), BigInt(unlockTime)], gasLimit: 3000000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 });
+    const deployed = await confirm("deploy immutable timed policy and real owner verifier", await ownerSigner.buildSignedTransaction({ tx: deployment, includePublicKey: true }));
+    const contract = deployed.receipt.contractAddress, runtime = await rpc(0, "eth_getCode", [contract, "latest"]);
+    const read = (functionName) => rpc(0, "eth_call", [{ to: contract, data: encodeFunctionData({ abi: artifact.abi, functionName }) }, "latest"]);
+    assert.equal(BigInt(await read("unlockTime")), BigInt(unlockTime));
+    const verifier = await read("verifier");
+    assert.notEqual(await rpc(0, "eth_getCode", [verifier, "latest"]), "0x");
+    result.timedPolicy = { contract, runtime, hash: keccak256(runtime), verifier, unlockTime };
+    await confirm("install actual timed runtime", await sign(ownerSigner, 2, accountManagerAddress, sdk.encodeSetValidationCodeCalldata(result.timedPolicy.hash)));
+    const reopen = async (label) => {
+      await stop(0); await stop(1);
+      await start(0, dirs[0], keyPath, label + "-leader");
+      let address;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        address = (await readFile(join(out, label + "-leader-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+        if (address) break;
+        await pause(100);
+      }
+      assert.ok(address);
+      await start(1, dirs[1], followerKey, label + "-observer", address);
+      await peerReady();
+    };
+    const locked = await snapshot();
+    assert.ok(BigInt(locked.head.timestamp) < BigInt(unlockTime));
+    await deny("owner cannot write before chain timestamp unlocks", await sign(ownerSigner, 3, target, word(56)));
+    await deny("owner cannot clear timed policy before unlock", await sign(ownerSigner, 3, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+    await reopen("timed-locked-reopen");
+    assert.deepEqual(await snapshot(), locked); assert.deepEqual(await snapshot(1), locked);
+    await deny("locked policy survives both physical DB reopens", await sign(ownerSigner, 3, target, word(56)));
+    while (Math.floor(Date.now() / 1000) <= unlockTime) await pause(200);
+    await confirm("independent account advances real canonical timestamp", await sign(clockSigner, 0, target, word(55)), clockSigner);
+    const unlocked = await snapshot();
+    assert.ok(BigInt(unlocked.head.timestamp) >= BigInt(unlockTime));
+    assert.equal(unlocked.nonce, locked.nonce);
+    assert.equal(unlocked.balance, locked.balance);
+    const tampered = await sign(ownerSigner, 3, target, word(56));
+    tampered.signature.data[0] ^= 1;
+    await deny("unlocked policy rejects tampered owner signature", tampered);
+    const altered = await sign(ownerSigner, 3, target, word(56));
+    altered.tx.data = word(99);
+    await deny("unlocked policy rejects changed signed payload", altered);
+    await confirm("owner executes after actual chain timestamp unlock", await sign(ownerSigner, 3, target, word(56)));
+    assert.equal((await snapshot()).slot, word(56));
+    await deny("foreign genuine key cannot clear unlocked policy", await sign(foreign, 4, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+    const beforeRestart = await snapshot();
+    await reopen("timed-policy-reopen");
+    assert.deepEqual(await snapshot(), beforeRestart); assert.deepEqual(await snapshot(1), beforeRestart);
+    await deny("foreign key cannot clear policy after unlocked DB reopen", await sign(foreign, 4, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+    await confirm("owner continues unlocked execution after both DB reopens", await sign(ownerSigner, 4, target, word(57)));
+    assert.equal((await snapshot()).slot, word(57));
+    const beforeHistory = await snapshot();
+    result.historicalTraces = [];
+    for (const row of result.transactions) {
+      const trace = await rpc(1, "debug_traceTransaction", [row.hash, { tracer: "callTracer" }]);
+      assert.equal(trace.failed, false); result.historicalTraces.push(trace);
+    }
+    assert.deepEqual(await snapshot(1), beforeHistory);
+    await reopen("timed-policy-final-reopen");
+    assert.deepEqual(await snapshot(), beforeHistory); assert.deepEqual(await snapshot(1), beforeHistory);
+    for (const [index, row] of result.transactions.entries()) {
+      assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [row.hash]), row.receipt);
+      assert.deepEqual(await rpc(1, "debug_traceTransaction", [row.hash, { tracer: "callTracer" }]), result.historicalTraces[index]);
+    }
+    assert.deepEqual(await snapshot(1), beforeHistory);
+    await stop(0); await stop(1);
+    assert.ok(result.nativeCommands.every((command) => command.exitCode === 0));
+    result.independentImportAndRestart = true; result.passed = true;
+    return;
+  }
   const deploy = buildDeployTransaction({ artifact, chainId: 1337, nonce: 0, constructorArgs: ["0x" + Buffer.from(ownerSigner.getPublicKey()).toString("hex")], gasLimit: 2000000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 });
   const deployed = await confirm("deploy constructor with explicit owner key", await ownerSigner.buildSignedTransaction({ tx: deploy, includePublicKey: true }));
   const contract = deployed.receipt.contractAddress;
