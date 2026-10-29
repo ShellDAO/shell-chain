@@ -678,15 +678,34 @@ curl -s http://localhost:8545 \
 
 ### eth_estimateGas
 
-Estimates the gas limit for a transaction. Returns `floor(gas_spent × 1.2)`
-with a minimum of 21,000, where `gas_spent` is execution gas **before refunds**.
+Estimates the gas limit for a transaction. The initial recommendation is
+`floor(gas_spent × 1.2)` with a minimum of 21,000, where `gas_spent` is execution
+gas **before refunds**.
 A receipt's `gasUsed` can be lower after a storage refund. That refund applies
 only after execution and cannot supply gas while the transaction is running.
+
+Unreleased node source verifies that the recommendation completes execution.
+Contracts that inspect remaining gas can require more than their measured
+consumption plus 20%. If the initial recommendation fails, the estimator refines
+a known passing upper bound using at most 16 probes, and verifies any added
+buffer. Each probe uses fresh private state at one captured root and block
+header; no probe commits writes. Total simulated work is capped at 50 million
+gas, charging failed probes their full limit. If refinement reaches that budget,
+the response retains an already verified passing bound rather than an unchecked
+guess. The result is sufficient in that snapshot, not necessarily minimal.
+
+The optional `gas` sets the upper bound, also limited by the current block gas
+limit and the 50 million RPC cap. Execution must succeed at that bound; otherwise
+the method returns an execution error. Gas-dependent branching need not be
+monotonic, so this method does not promise to find a smaller passing window when
+the upper bound fails. The response is not a fee quote or a guarantee against
+state changes before inclusion. The verified-bound behavior requires unreleased
+source; v0.27.13 can return an insufficient estimate for GAS-dependent contracts.
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Call request: `{from?, to?, data?, value?}` |
+| 1 | `Object` | Yes | Call request: `{from?, to?, data?, value?, gas?, accessList?}` |
 
 **Returns:** `String` — Hex-encoded gas estimate.
 
@@ -709,6 +728,20 @@ the 20% buffer is 25,200 (`0x6270`). This example was verified with v0.27.13.
 ```json
 {"jsonrpc":"2.0","id":1,"result":"0x6270"}
 ```
+
+Run the signed GAS-dependent, refund, value, revert, independent-node import and
+restart regression with a compatible built SDK and a node built with `libp2p`:
+
+```bash
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --gas-estimate
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --gas-estimate-legacy-address
+```
+
+The script creates temporary keys and isolated full RocksDB nodes on loopback
+ports. It checks returned limits through genuine signed transactions, then
+compares receipts and historical traces after live state changes and reopening.
+These development profiles exercise explicit native-address activation and the
+legacy default; they do not assert production activation or npm availability.
 
 ---
 

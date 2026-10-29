@@ -525,13 +525,10 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         Ok((output, gas))
     }
 
-    fn execute_call_with_access_list(
+    fn capture_call_state(
         &self,
-        req: &crate::types::CallRequest,
         block: Option<&str>,
-        collect: bool,
-    ) -> Result<(Vec<u8>, u64, Vec<shell_core::AccessListItem>), ErrorObjectOwned> {
-        let store = self.chain_store.store().clone();
+    ) -> Result<(ShellHash, Option<BlockHeader>), ErrorObjectOwned> {
         let requested_number = self.parse_block_number(block.unwrap_or("latest"))?;
 
         // Historical calls use the selected canonical header and its committed root.
@@ -554,6 +551,88 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             (ws.state_root().map_err(internal_err)?, head_header)
         };
 
+        Ok((state_root, head_header))
+    }
+
+    fn estimate_call_gas(&self, req: &crate::types::CallRequest) -> Result<u64, ErrorObjectOwned> {
+        let (root, header) = self.capture_call_state(None)?;
+        let upper = req
+            .gas
+            .as_deref()
+            .map(parse_hex_u64)
+            .transpose()?
+            .unwrap_or_else(|| header.as_ref().map_or(30_000_000, |h| h.gas_limit))
+            .min(50_000_000)
+            .min(header.as_ref().map_or(30_000_000, |h| h.gas_limit));
+        // Every probe uses fresh private state at the same root/header. Bound
+        // cumulative work too; a failed probe is charged its entire gas cap.
+        let mut remaining = 50_000_000_u64;
+        let mut probe = |limit| {
+            if limit > remaining {
+                return None;
+            }
+            let mut request = req.clone();
+            request.gas = Some(hex_u64(limit));
+            let result = self
+                .execute_call_on_state(&request, root, header.clone(), false)
+                .map(|(_, spent, _)| spent);
+            let charge = result.as_ref().copied().unwrap_or(limit);
+            remaining = remaining.saturating_sub(charge);
+            Some(result)
+        };
+        let used = probe(upper).expect("initial cap within work budget")?;
+        let suggestion = buffered_gas_estimate(used, 21_000).min(upper);
+        if suggestion == upper {
+            return Ok(upper);
+        }
+        match probe(suggestion) {
+            Some(Ok(_)) => return Ok(suggestion),
+            None => return Ok(upper),
+            Some(Err(_)) => {}
+        }
+        let mut low = suggestion;
+        let mut high = upper; // Every value assigned here passed execution.
+        for _ in 0..16 {
+            if high.saturating_sub(low) <= 1 {
+                break;
+            }
+            let middle = low + (high - low) / 2;
+            match probe(middle) {
+                Some(Ok(_)) => high = middle,
+                Some(Err(_)) => low = middle,
+                None => break,
+            }
+        }
+        // Buffer the passing bound when possible. GAS-dependent branches may
+        // reject a larger limit, so never replace a proven bound with a guess.
+        let buffered = buffered_gas_estimate(high, 21_000).min(upper);
+        if buffered == upper {
+            return Ok(upper);
+        }
+        if buffered != high && matches!(probe(buffered), Some(Ok(_))) {
+            return Ok(buffered);
+        }
+        Ok(high)
+    }
+
+    fn execute_call_with_access_list(
+        &self,
+        req: &crate::types::CallRequest,
+        block: Option<&str>,
+        collect: bool,
+    ) -> Result<(Vec<u8>, u64, Vec<shell_core::AccessListItem>), ErrorObjectOwned> {
+        let (root, header) = self.capture_call_state(block)?;
+        self.execute_call_on_state(req, root, header, collect)
+    }
+
+    fn execute_call_on_state(
+        &self,
+        req: &crate::types::CallRequest,
+        state_root: ShellHash,
+        head_header: Option<BlockHeader>,
+        collect: bool,
+    ) -> Result<(Vec<u8>, u64, Vec<shell_core::AccessListItem>), ErrorObjectOwned> {
+        let store = self.chain_store.store().clone();
         let from = req.from.unwrap_or(Address::ZERO);
         // Cap gas to prevent DoS via unbounded simulated execution.
         const RPC_GAS_CAP: u64 = 50_000_000;
@@ -5904,6 +5983,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eth_estimate_gas_validates_gas_dependent_bounds_without_writes() {
+        // The first program needs GAS >= 100,000 before its storage write.
+        // The second accepts a low window or a high window: buffering a
+        // passing low bound can enter a reverting gap and must be verified.
+        for (code, nonmonotonic) in [
+            ("620186a05a10600e5760015f55005b5f5ffd", false),
+            ("620249f05a10600c57601f565b620186a05a106025576201adb05a116025575b60015f55005b5f5ffd", true),
+        ] {
+            let handler = setup();
+            let address = test_address(b"gas-sensitive-contract");
+            let code = hex::decode(code).unwrap();
+            let hash = shell_primitives::keccak256(&code);
+            handler.chain_store.put_code(&hash, &code).unwrap();
+            {
+                let mut ws = handler.world_state.write();
+                ws.set_code_hash(&address, hash).unwrap();
+                ws.state_root().unwrap();
+            }
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            let mut request = crate::types::CallRequest {
+                from: None,
+                to: Some(address),
+                data: None,
+                value: None,
+                gas: Some(hex_u64(200_000)),
+                access_list: None,
+            };
+            let estimate = EthApiServer::estimate_gas(&handler, request.clone())
+                .await
+                .unwrap();
+            let limit = parse_hex_u64(&estimate).unwrap();
+            assert!(limit <= 200_000);
+            if nonmonotonic {
+                assert!(limit < 140_000, "retain the proven low window: {limit}");
+            }
+            request.gas = Some(estimate);
+            assert_eq!(EthApiServer::call(&handler, request.clone(), None).await.unwrap(), "0x");
+            request.gas = Some(hex_u64(100_000));
+            assert!(EthApiServer::estimate_gas(&handler, request).await.is_err());
+            assert_eq!(handler.chain_store.store().scan_prefix(b"").unwrap(), before);
+            assert_eq!(handler.world_state.write().get_storage(&address, &ShellHash::ZERO).unwrap(), ShellHash::ZERO);
+        }
+    }
+
+    #[tokio::test]
     async fn eth_estimate_gas_simple_transfer() {
         let handler = setup();
         let from = test_address(b"caller-key");
@@ -5926,7 +6050,7 @@ mod tests {
         assert!(result.is_ok(), "estimateGas failed: {:?}", result.err());
         let gas_hex = result.unwrap();
         let gas = u64::from_str_radix(gas_hex.strip_prefix("0x").unwrap(), 16).unwrap();
-        assert!(gas >= 21_000, "estimated gas too low: {gas}");
+        assert_eq!(gas, 25_200, "ordinary transfers keep the 20% buffer");
     }
 
     #[tokio::test]

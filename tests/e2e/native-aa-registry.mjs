@@ -33,6 +33,8 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const gasEstimateScenario = process.argv.includes("--gas-estimate") || process.argv.includes("--gas-estimate-legacy-address");
+const gasEstimateLegacy = process.argv.includes("--gas-estimate-legacy-address");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -81,7 +83,12 @@ async function unusedPort() {
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
-const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+const outsider = gasEstimateScenario ? await (async () => {
+  const path = join(out, "owner.json");
+  const created = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", path], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  return decryptKeystore(JSON.parse(await readFile(path, "utf8")), password);
+})() : new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
 const pruneFollower = prunedEpochScenario || blockSignersScenario;
@@ -105,7 +112,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: gasEstimateScenario ? "gas-dependent-estimate" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +157,13 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (gasEstimateScenario) {
+    const opened = result.opens.findLast((entry) => entry.pid === child.pid);
+    opened.exitCode = child.exitCode;
+    opened.signal = child.signalCode;
+    opened.endedAt = new Date().toISOString();
+    assert.equal(child.exitCode, 0, "clean service exit");
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -200,6 +214,11 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
+  if (gasEstimateScenario) {
+    result.opens ??= [];
+    result.opens.push({ pid: child.pid, argv: args, startedAt: new Date().toISOString() });
+    await save();
+  }
   nodeLogLabels[i] = label;
   let spawnError;
   child.once("error", (error) => {
@@ -485,6 +504,20 @@ async function runScenario() {
       code: null,
       storage: null,
     };
+  if (gasEstimateScenario) {
+    if (!gasEstimateLegacy) genesis.native_address_context_height = 0;
+    for (const [index, code] of [
+      "620186a05a10600e5760015f55005b5f5ffd",
+      "620249f05a10600c57601f565b620186a05a106025576201adb05a116025575b60015f55005b5f5ffd",
+      "5f5f5500", // Refund after clearing a nonzero slot.
+      "60015f555f5ffd", // Write then revert.
+      "5f355f5500", // Change live state after the original receipts.
+    ].entries()) {
+      const address = "0x" + (0x35 + index).toString(16).repeat(32);
+      genesis.alloc[address] = { balance: "0x0", nonce: 1, code: "0x" + code,
+        storage: { ["0x" + word(0)]: "0x" + word(index === 2 ? 1 : 0) } };
+    }
+  }
   for (const dir of dirs)
     await writeFile(
       join(dir, "genesis.json"),
@@ -500,6 +533,106 @@ async function runScenario() {
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (gasEstimateScenario) {
+    await start(1, dirs[1], followerKey, "follower", bootnode);
+    await peerReady();
+    const address = (index) => "0x" + (0x35 + index).toString(16).repeat(32);
+    const stateAt = async (i) => ({
+      head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+      balance: await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"]),
+      miner: await rpc(i, "eth_getBalance", [miner.getAddress(), "latest"]),
+      nonce: await rpc(i, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
+      slots: await Promise.all([0, 1, 2, 3, 4].map((n) => rpc(i, "eth_getStorageAt", [address(n), "0x0", "latest"]))),
+    });
+    const request = (index, extra = {}) => ({ from: outsider.getAddress(), to: address(index), data: "0x", value: "0x0", ...extra });
+    const estimate = async (input) => {
+      const before = await stateAt(0);
+      let value, error;
+      try { value = await rpc(0, "eth_estimateGas", [input]); } catch (e) { error = String(e); }
+      const after = await stateAt(0);
+      assert.deepEqual(after, before, "estimation leaves canonical state and fees unchanged");
+      result.estimates ??= [];
+      result.estimates.push({ input, value, error, before, after });
+      await save();
+      return { value, error };
+    };
+    const send = async (label, input, gas, expected, expectedSlot) => {
+      const before = await stateAt(0);
+      const tx = buildTransaction({ chainId: 1337, nonce: Number(BigInt(before.nonce)), to: input.to,
+        data: input.data, value: BigInt(input.value), gasLimit: Number(BigInt(gas)), maxFeePerGas: 1000000000, maxPriorityFeePerGas: 0 });
+      const signed = await outsider.buildSignedTransaction({ tx, includePublicKey: true });
+      const hash = await paced(() => providers[0].sendTransaction(signed));
+      const entry = { label, input, gas, signed, hash, before };
+      result.transactions.push(entry);
+      await save();
+      for (let n = 0; n < 160; n++) {
+        entry.receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        if (entry.receipt) break;
+        await pause(200);
+      }
+      assert.equal(entry.receipt?.status, expected);
+      height++;
+      assert.equal(BigInt(entry.receipt.blockNumber), BigInt(height));
+      entry.after = await stateAt(0);
+      entry.trace = await rpc(0, "debug_traceTransaction", [hash, { tracer: "callTracer" }]);
+      const fee = BigInt(entry.receipt.gasUsed) * BigInt(entry.receipt.effectiveGasPrice);
+      assert.equal(BigInt(before.balance) - BigInt(entry.after.balance), fee + (expected === "0x1" ? BigInt(input.value) : 0n));
+      assert.equal(BigInt(entry.after.miner) - BigInt(before.miner), fee);
+      assert.equal(BigInt(entry.after.nonce), BigInt(before.nonce) + 1n);
+      assert.equal(await rpc(0, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(expectedSlot));
+      for (let n = 0; n < 160; n++) {
+        const block = await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false]);
+        if (block?.hash === entry.receipt.blockHash) break;
+        await pause(200);
+      }
+      assert.equal((await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false])).hash, entry.receipt.blockHash);
+      assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [hash]), entry.receipt);
+      assert.equal(await rpc(1, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(expectedSlot));
+      await save();
+    };
+    assert.ok((await estimate(request(0, { gas: "0x186a0" }))).error, "explicit insufficient cap rejected");
+    for (const index of [0, 1, 2]) {
+      const input = request(index, { gas: "0x30d40" });
+      const quoted = await estimate(input);
+      assert.ok(quoted.value);
+      assert.ok(BigInt(quoted.value) <= 200000n);
+      await send(`estimated contract ${index}`, input, quoted.value, "0x1", index === 2 ? 0 : 1);
+    }
+    const rejected = request(3, { gas: "0x30d40", value: "0x7" });
+    assert.ok((await estimate(rejected)).error);
+    await send("write and value revert", rejected, "0x30d40", "0x0", 0);
+    for (const value of [3, 11]) {
+      const input = request(4, { data: "0x" + word(value), value: "0x7" });
+      const quoted = await estimate(input);
+      assert.ok(quoted.value);
+      await send(`estimated value and state ${value}`, input, quoted.value, "0x1", value);
+    }
+    const verifyHistory = async () => {
+      for (const i of [0, 1]) {
+        const before = await stateAt(i);
+        for (const entry of result.transactions) {
+          assert.deepEqual(await rpc(i, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+          assert.deepEqual(await rpc(i, "debug_traceTransaction", [entry.hash, { tracer: "callTracer" }]), entry.trace);
+        }
+        const first = result.transactions.find((entry) => entry.label === "estimated value and state 3");
+        assert.equal(await rpc(i, "eth_getStorageAt", [address(4), "0x0", first.receipt.blockNumber]), "0x" + word(3));
+        assert.deepEqual(await stateAt(i), before);
+      }
+    };
+    await verifyHistory();
+    await stop(1);
+    await stop(0);
+    await start(0, dirs[0], keyPath, "gas-leader-reopen");
+    const reopenedLog = await readFile(join(out, "gas-leader-reopen-node.log"), "utf8");
+    const reopenedPeer = reopenedLog.match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    assert.ok(reopenedPeer);
+    await start(1, dirs[1], followerKey, "gas-follower-reopen", reopenedPeer);
+    await peerReady();
+    await verifyHistory();
+    result.gasEstimation = { legacyAddressContext: gasEstimateLegacy, finalHeight: height, historyAfterLiveStateChangeAndReopen: true };
+    result.passed = true;
+    return;
+  }
   if (syncStatusScenario) {
     // Create the backlog through the existing real signed transaction path.
     for (let block = 1; block <= 21; block++)

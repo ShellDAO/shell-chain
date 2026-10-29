@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Return a simulated passing gas limit for contracts that branch on remaining
+  gas. Preserve the usual 20% gross-consumption recommendation when it succeeds;
+  otherwise refine and validate a passing bound on isolated state with bounded
+  total work. Respect caller and block ceilings and leave canonical state intact.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -875,10 +875,7 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         &self,
         tx: crate::types::CallRequest,
     ) -> Result<String, ErrorObjectOwned> {
-        let (_output, gas_used) = self.execute_call(&tx)?;
-        // Add a 20% buffer to the estimated gas, with a minimum of 21000.
-        let estimate = buffered_gas_estimate(gas_used, 21_000);
-        Ok(hex_u64(estimate))
+        Ok(hex_u64(self.estimate_call_gas(&tx)?))
     }
 
     async fn create_access_list(
