@@ -2,6 +2,21 @@ use super::*;
 
 const MAX_FEE_HISTORY_REWARD_PERCENTILES: usize = 100;
 
+pub(super) fn rpc_blob_gas_fields(
+    transaction: Option<&SignedTransaction>,
+    header: &BlockHeader,
+) -> (Option<String>, Option<String>) {
+    match transaction.filter(|tx| tx.tx.tx_type == 3) {
+        Some(tx) => (
+            Some(hex_u64(tx.tx.blob_gas())),
+            Some(hex_u64(shell_core::calc_blob_gas_price(
+                header.excess_blob_gas,
+            ))),
+        ),
+        None => (None, None),
+    }
+}
+
 pub(super) fn rpc_logs_from_core(
     logs: Vec<shell_core::Log>,
     block_hash: ShellHash,
@@ -567,6 +582,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                             (Address::ZERO, None, 0, 2u8, None, None)
                         };
 
+                    let (blob_gas_used, blob_gas_price) = rpc_blob_gas_fields(
+                        block.transactions.get(tx_index as usize),
+                        &block.header,
+                    );
                     return Ok(Some(RpcReceipt {
                         transaction_hash: receipt.tx_hash,
                         block_hash,
@@ -578,6 +597,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                         gas_used: hex_u64(receipt.gas_used),
                         cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                         effective_gas_price: hex_u64(eff_gas_price),
+                        blob_gas_used,
+                        blob_gas_price,
                         contract_address: receipt.contract_address,
                         logs: rpc_logs_from_core(
                             receipt.logs,
@@ -687,6 +708,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                     (Address::ZERO, None, 0, 2u8, None, None)
                 };
 
+            let (blob_gas_used, blob_gas_price) =
+                rpc_blob_gas_fields(block_obj.transactions.get(i), &block_obj.header);
             rpc_receipts.push(RpcReceipt {
                 transaction_hash: receipt.tx_hash,
                 block_hash,
@@ -698,6 +721,8 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 gas_used: hex_u64(receipt.gas_used),
                 cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
                 effective_gas_price: hex_u64(eff_gas_price),
+                blob_gas_used,
+                blob_gas_price,
                 contract_address: receipt.contract_address,
                 logs: rpc_logs_from_core(
                     receipt.logs,

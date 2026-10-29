@@ -43,6 +43,7 @@ const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
 const receiptLogsScenario = process.argv.includes("--receipt-logs");
+const blobReceiptsScenario = process.argv.includes("--blob-receipts");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -106,7 +107,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: blobReceiptsScenario ? "blob-receipt-fees" : receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -137,6 +138,11 @@ const result = {
       : "AA ValidatorRegistry activates locally at block 3, AccountManager at genesis. No production activation, multiple-authority quorum or algorithm migration claim.",
   ],
 };
+if (blobReceiptsScenario) result.adaptations = [
+  "One isolated full RocksDB ML-DSA authority; a separately funded ML-DSA account sends real ordinary and type-3 transactions.",
+  "Synthetic versioned hashes test envelope execution and receipt fees, not KZG proofs, blob sidecar availability or live activation.",
+  "A small genesis-allocated REVERT runtime tests fee reporting after failed execution, not contract deployment.",
+];
 if (pruneFollower)
   result.adaptations.push(
     "Full producer and light follower with one-block state/body retention; this scaled experiment does not establish the default 4096-block retention window.",
@@ -155,6 +161,7 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (blobReceiptsScenario) (result.stops ??= []).push({pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode});
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -495,12 +502,107 @@ async function runScenario() {
   const logRuntime = "0x346000527f" + logTopic.slice(2) + "60206000a100";
   if (receiptLogsScenario)
     genesis.alloc[logEmitter] = {balance: "0x0", nonce: 0, code: logRuntime, storage: null};
+  const blobRecipient = "0x" + "00".repeat(12) + "d7".repeat(20);
+  const blobReverter = "0x" + "00".repeat(12) + "d8".repeat(20);
+  if (blobReceiptsScenario)
+    genesis.alloc[blobReverter] = {balance: "0x0", nonce: 0, code: "0x60006000fd", storage: null};
   for (const dir of dirs)
     await writeFile(
       join(dir, "genesis.json"),
       JSON.stringify(genesis, null, 2),
     );
   await start(0, dirs[0], keyPath, "leader");
+  if (blobReceiptsScenario) {
+    const snapshot = async () => ({
+      head: await rpc(0, "eth_getBlockByNumber", ["latest", false]),
+      balance: await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]),
+      nonce: await rpc(0, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
+      recipient: await rpc(0, "eth_getBalance", [blobRecipient, "latest"]),
+      reverted: await rpc(0, "eth_getBalance", [blobReverter, "latest"]),
+    });
+    // EIP-4844 fee oracle, independent of the node's fee helper and receipt fields.
+    const blobPrice = (excess) => {
+      const denominator = 3338477n;
+      let sum = 0n, term = denominator, index = 1n;
+      while (term > 0n) {
+        sum += term; term = term * BigInt(excess) / (denominator * index++);
+      }
+      return sum / denominator;
+    };
+    const checkReceipt = async (entry) => {
+      const receipt = await rpc(0, "eth_getTransactionReceipt", [entry.hash]);
+      assert.equal(receipt?.status, entry.status);
+      const block = await rpc(0, "eth_getBlockByHash", [receipt.blockHash, false]);
+      const all = await rpc(0, "eth_getBlockReceipts", [receipt.blockHash]);
+      const summary = await rpc(0, "shell_getTransactionSummary", [entry.hash, {includeReceipt: true}]);
+      assert.deepEqual(all.find((item) => item.transactionHash === entry.hash), receipt);
+      assert.deepEqual(summary.receipt, receipt);
+      const cap = BigInt(entry.signed.tx.max_fee_per_gas);
+      const offered = BigInt(block.baseFeePerGas) + BigInt(entry.signed.tx.max_priority_fee_per_gas);
+      const normalPrice = cap < offered ? cap : offered;
+      assert.equal(BigInt(receipt.effectiveGasPrice), normalPrice);
+      let fee = BigInt(receipt.gasUsed) * normalPrice;
+      if (entry.hashes.length) {
+        const gas = 131072n * BigInt(entry.hashes.length), price = blobPrice(block.excessBlobGas);
+        assert.equal(receipt.type, "0x3");
+        assert.equal(BigInt(receipt.blobGasUsed), gas);
+        assert.equal(BigInt(receipt.blobGasPrice), price);
+        fee += gas * price;
+      } else {
+        assert.equal(receipt.type, "0x2");
+        assert.equal(receipt.blobGasUsed, undefined);
+        assert.equal(receipt.blobGasPrice, undefined);
+      }
+      return {receipt, fee};
+    };
+    const initial = await snapshot();
+    const cases = [
+      {value: 3, hashes: [], status: "0x1"},
+      {value: 5, hashes: ["0x01" + "11".repeat(31)], status: "0x1"},
+      {value: 7, hashes: ["0x01" + "22".repeat(31), "0x01" + "33".repeat(31)], status: "0x1"},
+      {value: 11, hashes: ["0x01" + "44".repeat(31)], status: "0x0"},
+    ];
+    let previous = initial;
+    for (const [nonce, entry] of cases.entries()) {
+      const signed = await outsider.buildSignedTransaction({tx: buildTransaction({
+        chainId: 1337, nonce, to: entry.status === "0x0" ? blobReverter : blobRecipient,
+        value: BigInt(entry.value), gasLimit: 100000,
+        maxFeePerGas: 1000000000, maxPriorityFeePerGas: 2,
+        ...(entry.hashes.length ? {txType: 3, maxFeePerBlobGas: 1000000, blobVersionedHashes: entry.hashes} : {}),
+      }), includePublicKey: true});
+      entry.signed = signed;
+    }
+    result.prepared = cases;
+    await save();
+    for (const [nonce, entry] of cases.entries()) {
+      entry.hash = await paced(() => providers[0].sendTransaction(entry.signed));
+      result.transactions.push(entry); await save();
+      for (let k = 0; k < 120; k++) {
+        const receipt = await rpc(0, "eth_getTransactionReceipt", [entry.hash]);
+        const finalized = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+        if (receipt && finalized && BigInt(finalized.number) >= BigInt(receipt.blockNumber)) break;
+        await pause(200);
+      }
+      const checked = await checkReceipt(entry);
+      entry.receipt = checked.receipt; entry.fee = checked.fee.toString();
+      const after = await snapshot();
+      assert.equal(BigInt(previous.balance) - BigInt(after.balance), checked.fee + (entry.status === "0x1" ? BigInt(entry.value) : 0n));
+      assert.equal(BigInt(after.nonce), BigInt(nonce + 1));
+      previous = after; await save();
+    }
+    assert.equal(BigInt(previous.recipient), 15n);
+    assert.equal(BigInt(previous.reverted), 0n);
+    for (const entry of result.transactions) assert.deepEqual((await checkReceipt(entry)).receipt, entry.receipt);
+    assert.deepEqual(await snapshot(), previous);
+    const first = nodes[0]; await stop(0); assert.equal(first.exitCode, 0);
+    await start(0, dirs[0], keyPath, "blob-receipts-reopen");
+    assert.deepEqual(await snapshot(), previous);
+    for (const entry of result.transactions) assert.deepEqual((await checkReceipt(entry)).receipt, entry.receipt);
+    assert.deepEqual(await snapshot(), previous);
+    const reopened = nodes[0]; await stop(0); assert.equal(reopened.exitCode, 0);
+    result.blobReceiptFees = {initial, final: previous, reopenVerified: true};
+    result.passed = true; return;
+  }
   if (receiptLogsScenario) {
     assert.equal(await rpc(0, "eth_getCode", [logEmitter, "latest"]), logRuntime);
     for (const [index, value] of [3, 5, 7].entries()) {

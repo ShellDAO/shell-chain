@@ -286,6 +286,10 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             } else {
                 (Address::ZERO, None, 0, 2u8, None, None)
             };
+        let (blob_gas_used, blob_gas_price) = super::eth::rpc_blob_gas_fields(
+            block.transactions.get(tx_index as usize),
+            &block.header,
+        );
         Ok(Some(RpcReceipt {
             transaction_hash: receipt.tx_hash,
             block_hash,
@@ -297,6 +301,8 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             gas_used: hex_u64(receipt.gas_used),
             cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
             effective_gas_price: hex_u64(effective_gas_price),
+            blob_gas_used,
+            blob_gas_price,
             contract_address: receipt.contract_address,
             logs: super::eth::rpc_logs_from_core(
                 receipt.logs,

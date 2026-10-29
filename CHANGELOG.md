@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Include `blobGasUsed` and `blobGasPrice` in type-3 receipts returned by both
+  Ethereum receipt methods and nested Shell summaries. Reconstruct the charged
+  blob price from the mined block, including failed execution; ordinary and
+  system receipts omit these fields. Fees and stored receipts are unchanged.
+
 - Include block and transaction identity, block-global log indices and removal
   flags in receipt logs returned by the Ethereum receipt methods and Shell
   transaction summaries. Context is reconstructed from retained block receipts;

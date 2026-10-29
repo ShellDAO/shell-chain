@@ -6259,6 +6259,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blob_receipt_gas_fields_use_mined_context_across_apis() {
+        let handler = setup();
+        let (template_hash, _) = store_block_with_tx(&handler, 1, true);
+        let mut block = handler
+            .chain_store
+            .get_block_by_hash(&template_hash)
+            .unwrap()
+            .unwrap();
+        block.header.excess_blob_gas = 3_338_477;
+        block.header.blob_gas_used = 393_216;
+        let template = block.transactions[0].clone();
+        block.transactions = (0..3)
+            .map(|index| {
+                let mut tx = template.clone();
+                tx.tx.nonce = index;
+                if index < 2 {
+                    tx.tx.tx_type = 3;
+                    tx.tx.max_fee_per_blob_gas = Some(1000);
+                    tx.tx.blob_versioned_hashes =
+                        Some(vec![ShellHash::from([1; 32]); 2 - index as usize]);
+                }
+                tx
+            })
+            .collect();
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &hash).unwrap();
+        let reward = SystemTransaction::block_gas_reward(
+            42,
+            1,
+            3,
+            block.header.proposer,
+            U256::from(10u64),
+            block.header.parent_hash,
+        );
+        handler
+            .chain_store
+            .put_system_transactions(&hash, 1, std::slice::from_ref(&reward))
+            .unwrap();
+        let mut receipts = block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, tx)| TransactionReceipt {
+                tx_hash: tx.hash(),
+                block_number: 1,
+                tx_index: index as u32,
+                status: if index == 1 { 0 } else { 1 },
+                gas_used: 21000,
+                cumulative_gas_used: 21000 * (index as u64 + 1),
+                contract_address: None,
+                logs_bloom: Bytes::default(),
+                logs: vec![],
+            })
+            .collect::<Vec<_>>();
+        receipts.push(TransactionReceipt {
+            tx_hash: reward.hash(),
+            block_number: 1,
+            tx_index: 3,
+            status: 1,
+            gas_used: 0,
+            cumulative_gas_used: 63000,
+            contract_address: None,
+            logs_bloom: Bytes::default(),
+            logs: vec![],
+        });
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        let stored_before = serde_json::to_value(&receipts).unwrap();
+        // A later zero-excess head must not supply the historical blob price.
+        store_block_with_tx(&handler, 2, true);
+        let block_receipts = EthApiServer::get_block_receipts(&handler, "0x1".into())
+            .await
+            .unwrap();
+        for (index, core) in receipts.iter().enumerate() {
+            let receipt = EthApiServer::get_transaction_receipt(&handler, core.tx_hash)
+                .await
+                .unwrap()
+                .unwrap();
+            let summary = ShellApiServer::get_transaction_summary(
+                &handler,
+                core.tx_hash,
+                Some(RpcTransactionSummaryOptions {
+                    include_receipt: Some(true),
+                }),
+            )
+            .await
+            .unwrap();
+            let json = serde_json::to_value(receipt).unwrap();
+            assert_eq!(serde_json::to_value(&block_receipts[index]).unwrap(), json);
+            assert_eq!(
+                serde_json::to_value(summary.receipt.unwrap()).unwrap(),
+                json
+            );
+            if index < 2 {
+                assert_eq!(
+                    json["blobGasUsed"],
+                    if index == 0 { "0x40000" } else { "0x20000" }
+                );
+                // EIP-4844 fake_exponential(1, 3338477, 3338477) = 2.
+                assert_eq!(json["blobGasPrice"], "0x2");
+            } else {
+                assert!(json.get("blobGasUsed").is_none());
+                assert!(json.get("blobGasPrice").is_none());
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(handler.chain_store.get_receipts(&hash).unwrap().unwrap())
+                .unwrap(),
+            stored_before
+        );
+    }
+
+    #[tokio::test]
     async fn receipt_log_metadata_is_block_global_and_shared_across_apis() {
         let handler = setup();
         let (template_hash, _) = store_block_with_tx(&handler, 0, true);

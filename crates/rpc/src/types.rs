@@ -327,6 +327,10 @@ pub struct RpcReceipt {
     pub gas_used: String,
     pub cumulative_gas_used: String,
     pub effective_gas_price: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_gas_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_gas_price: Option<String>,
     pub contract_address: Option<Address>,
     pub logs: Vec<RpcLogWithMeta>,
     pub logs_bloom: String,
@@ -917,6 +921,8 @@ mod tests {
             gas_used: "0x5208".into(),
             cumulative_gas_used: "0x5208".into(),
             effective_gas_price: "0x14".into(),
+            blob_gas_used: None,
+            blob_gas_price: None,
             contract_address: None,
             logs: vec![],
             logs_bloom: format!("0x{}", "00".repeat(256)),
@@ -965,6 +971,8 @@ mod tests {
             gas_used: "0x5208".into(),
             cumulative_gas_used: "0x5208".into(),
             effective_gas_price: "0x14".into(),
+            blob_gas_used: None,
+            blob_gas_price: None,
             contract_address: None,
             logs: vec![],
             logs_bloom: format!("0x{}", "00".repeat(256)),

@@ -655,6 +655,31 @@ canonical block positions and actual log queries, then reopens RocksDB. Genesis
 code allocation is a test fixture; this check does not claim contract deployment
 or production activation.
 
+The unreleased receipt-fee update adds `blobGasUsed` and `blobGasPrice` as hex
+quantities to type-3 receipts, including failed execution. The blob price is
+computed from the mined block, rather than the latest head or the transaction's
+fee cap. Total charged gas cost is `gasUsed * effectiveGasPrice + blobGasUsed *
+blobGasPrice`. Ordinary and system receipts omit these two fields. Both block
+receipts and nested Shell summary receipts use the same representation.
+Public v0.27.13 charges blob gas but omits these fields; this source correction
+requires a subsequent merged release. Fee accounting and stored receipts do
+not change. This reports execution-layer costs, not blob sidecar availability
+or KZG publication.
+
+Use the source build and SDK setup above to run:
+
+```bash
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --blob-receipts
+```
+
+This check creates fresh accounts, sends ordinary and one-/two-blob envelopes,
+checks exact full fees and all receipt entrances for successful and reverted
+execution, then reopens the database and checks the original receipts again.
+Synthetic versioned hashes and a genesis-allocated REVERT runtime are explicit
+test inputs, not a data-availability or contract-deployment demonstration.
+
 ---
 
 ### eth_sendRawTransaction
