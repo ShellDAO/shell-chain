@@ -21,7 +21,7 @@ use revm::interpreter::{
 };
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{TxKind, KECCAK_EMPTY};
-use revm::state::EvmState;
+use revm::state::{EvmState, TransientStorage};
 use shell_core::{Account, BlockHeader, TransactionReceipt};
 use shell_primitives::{Address as ShellAddress, ShellHash};
 use shell_storage::{ChainStore, KvStore, OverlayStore, StorageError, WorldState};
@@ -118,6 +118,74 @@ impl<EVM, ERROR> InspectorHandler for SystemRewardHandler<EVM, ERROR, EthFrame<E
 where
     EVM: InspectorEvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type IT = EthInterpreter;
+}
+
+// An inner revm run ends a synthetic transaction. Capture transient state before
+// revm clears it, then seed the next inner run. Ownership never leaves the outer
+// AA execution, and revm still journals nested frame reverts normally.
+trait AaTransientJournal {
+    fn take_aa_transient(&mut self) -> TransientStorage;
+}
+
+impl<DB: revm::context_interface::Database> AaTransientJournal for revm::context::Journal<DB> {
+    fn take_aa_transient(&mut self) -> TransientStorage {
+        std::mem::take(&mut self.inner.transient_storage)
+    }
+}
+
+struct AaTransientHandler<'a, EVM, ERROR> {
+    transient: &'a mut TransientStorage,
+    reconciled_fees: bool,
+    marker: std::marker::PhantomData<(EVM, ERROR)>,
+}
+
+impl<EVM, ERROR> Handler for AaTransientHandler<'_, EVM, ERROR>
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + AaTransientJournal>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type Evm = EVM;
+    type Error = ERROR;
+    type HaltReason = HaltReason;
+
+    fn reward_beneficiary(
+        &self,
+        evm: &mut Self::Evm,
+        result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        if self.reconciled_fees {
+            Ok(())
+        } else {
+            revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
+                .reward_beneficiary(evm, result)
+        }
+    }
+
+    fn execution_result(
+        &mut self,
+        evm: &mut Self::Evm,
+        result: FrameResult,
+        gas: revm::context_interface::result::ResultGas,
+    ) -> Result<ExecutionResult<HaltReason>, Self::Error> {
+        *self.transient = evm.ctx().journal_mut().take_aa_transient();
+        revm::handler::MainnetHandler::<EVM, ERROR, EthFrame<EthInterpreter>>::default()
+            .execution_result(evm, result, gas)
+    }
+}
+
+impl<EVM, ERROR> InspectorHandler for AaTransientHandler<'_, EVM, ERROR>
+where
+    EVM: InspectorEvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + AaTransientJournal>,
         Frame = EthFrame<EthInterpreter>,
         Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
     >,
@@ -930,6 +998,15 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut last_revert_data: Vec<u8> = Vec::new();
         let mut native_effects = SystemContractEffects::default();
 
+        let share_transient = self
+            .state_db
+            .chain_store()
+            .get_chain_config()?
+            .and_then(|config| config.aa_transient_storage_height)
+            .is_some_and(|height| header.number >= height);
+        let mut transient_storage = TransientStorage::default();
+        let mut native_transient = std::collections::BTreeMap::<([u8; 32], U256), U256>::new();
+
         for inner in &bundle.inner_calls {
             if let Some(target) = inner.to.filter(|target| {
                 (native_account_manager && *target == system_contracts::account_manager_address())
@@ -1041,6 +1118,20 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 self.state_db.chain_store(),
                 header.number,
             )?;
+            if share_transient {
+                // Different full-width accounts can share a legacy interpreter
+                // key. Keep their values by native identity, seeding only rows
+                // that resolve to that account in the current inner context.
+                for ((bytes, slot), value) in std::mem::take(&mut native_transient) {
+                    let native = ShellAddress::from(bytes);
+                    let key = address_key(native)?;
+                    if native_context.is_some() || self.state_db.resolve_address(&key) == native {
+                        transient_storage.insert((key, slot), value);
+                    } else {
+                        native_transient.insert((*native.as_bytes(), slot), value);
+                    }
+                }
+            }
             let ctx: MainnetContext<&mut ShellStateDb<S>> =
                 Context::new(&mut self.state_db, SpecId::CANCUN)
                     .modify_block_chained(|b| *b = block_env.clone())
@@ -1061,9 +1152,22 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 crate::native_context::install(&mut instructions);
             }
             let mut evm = Evm::new(ctx, instructions, precompiles);
+            if share_transient {
+                evm.ctx.journaled_state.transient_storage = std::mem::take(&mut transient_storage);
+            }
             let exec_outcome = if let Some(tracer) = self.tracer.as_mut() {
                 let mut inspected = evm.with_inspector(tracer);
-                let result = if reconciled_fees {
+                let result = if share_transient {
+                    inspected.ctx.set_tx(tx_env);
+                    let mut handler = AaTransientHandler::<_, EVMError<StateDbError>> {
+                        transient: &mut transient_storage,
+                        reconciled_fees,
+                        marker: std::marker::PhantomData,
+                    };
+                    handler
+                        .inspect_run(&mut inspected)
+                        .map(|result| ResultAndState::new(result, inspected.finalize()))
+                } else if reconciled_fees {
                     inspected.ctx.set_tx(tx_env);
                     let mut handler = SystemRewardHandler::<_, EVMError<StateDbError>, _>(
                         std::marker::PhantomData,
@@ -1076,6 +1180,16 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 };
                 evm = inspected.with_inspector(());
                 result
+            } else if share_transient {
+                evm.ctx.set_tx(tx_env);
+                let mut handler = AaTransientHandler::<_, EVMError<StateDbError>> {
+                    transient: &mut transient_storage,
+                    reconciled_fees,
+                    marker: std::marker::PhantomData,
+                };
+                handler
+                    .run(&mut evm)
+                    .map(|result| ResultAndState::new(result, evm.finalize()))
             } else if reconciled_fees {
                 evm.ctx.set_tx(tx_env);
                 let mut handler =
@@ -1088,6 +1202,15 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             };
             drop(evm);
             let address_registry = self.state_db.address_registry_snapshot();
+            if share_transient {
+                for ((key, slot), value) in transient_storage.drain() {
+                    let native = address_registry
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_else(|| ShellAddress::from(key));
+                    native_transient.insert((*native.as_bytes(), slot), value);
+                }
+            }
             // The local snapshot is enough for commit; clear live mappings
             // before any revert or error can leave this inner call.
             self.state_db.clear_address_registry();
@@ -3139,6 +3262,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                aa_transient_storage_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3366,6 +3490,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                aa_transient_storage_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3451,6 +3576,7 @@ mod tests {
                                 native_registry_view_height: None,
                                 pq_address_bounds_height: None,
                                 native_address_context_height: native_activation,
+                                aa_transient_storage_height: None,
                                 native_validator_events_height: None,
                                 prover_registry_height: None,
                                 algorithm_proposal_staging_height: None,
@@ -4029,6 +4155,7 @@ mod tests {
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
                     native_address_context_height: None,
+                    aa_transient_storage_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,
@@ -7575,6 +7702,317 @@ mod tests {
         );
         assert!(result.err().unwrap().to_string().contains("capture limit"));
         assert!(evm.tracer.is_none());
+    }
+
+    fn aa_transient_fixture(
+        activation: Option<u64>,
+        reconciled: bool,
+        native: bool,
+    ) -> (ShellPqvm<MemoryDb>, ShellAddress, ShellAddress) {
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(Arc::clone(&store));
+        chain
+            .put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                    "aa_transient_storage_height":activation,
+                    "fee_accounting_activation_height":reconciled.then_some(0),
+                    "native_address_context_height":native.then_some(0),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut evm = ShellPqvm::new(ShellStateDb::new(WorldState::new(store), chain), 1337);
+        let sender = ShellAddress::from([0x42; 32]);
+        let target = ShellAddress::from([0x35; 32]);
+        fund_account(&mut evm, &sender, U256::from(1_000_000_000u64));
+        let code = hex::decode("3615600a575f355f5d005b5f5c806001555f5260205ff3").unwrap();
+        install_aa_transient_code(&mut evm, target, &code);
+        (evm, sender, target)
+    }
+
+    fn install_aa_transient_code(evm: &mut ShellPqvm<MemoryDb>, target: ShellAddress, code: &[u8]) {
+        let hash = shell_primitives::keccak256(code);
+        evm.state_db().chain_store().put_code(&hash, code).unwrap();
+        evm.state_db_mut()
+            .world_state_mut()
+            .set_account(
+                &target,
+                &Account {
+                    code_hash: Some(hash),
+                    ..Account::new_user_account(ShellHash::ZERO, U256::ZERO)
+                },
+            )
+            .unwrap();
+        evm.state_db_mut()
+            .world_state_mut()
+            .set_storage(
+                &target,
+                &ShellHash::from(U256::from(1).to_be_bytes::<32>()),
+                &ShellHash::from(U256::from(99).to_be_bytes::<32>()),
+            )
+            .unwrap();
+    }
+
+    fn aa_transient_call(target: ShellAddress, value: Option<u64>) -> shell_core::InnerCall {
+        shell_core::InnerCall {
+            to: Some(target),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            data: value
+                .map(|value| {
+                    shell_primitives::Bytes::from(U256::from(value).to_be_bytes::<32>().to_vec())
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn aa_transient_persisted(evm: &ShellPqvm<MemoryDb>, target: ShellAddress) -> ShellHash {
+        evm.state_db()
+            .world_state()
+            .get_storage(&target, &ShellHash::from(U256::from(1).to_be_bytes::<32>()))
+            .unwrap()
+    }
+
+    #[test]
+    fn aa_transient_storage_outer_lifetime_activation_and_tracing() {
+        for activation in [None, Some(5)] {
+            for number in [1, 4, 5, 6] {
+                for reconciled in [false, true] {
+                    for native in [false, true] {
+                        for traced in [false, true] {
+                            let (mut evm, sender, target) =
+                                aa_transient_fixture(activation, reconciled, native);
+                            if traced {
+                                evm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+                            }
+                            let mut header = sample_header();
+                            header.number = number;
+                            let tx = make_aa_signed(
+                                sender,
+                                0,
+                                300_000,
+                                10,
+                                vec![
+                                    aa_transient_call(target, Some(7)),
+                                    aa_transient_call(target, None),
+                                ],
+                                None,
+                            );
+                            let result = evm.execute_aa_bundle(&tx, &header, 0, 0).unwrap();
+                            assert!(result.receipt.succeeded());
+                            let expected = if activation.is_some_and(|height| number >= height) {
+                                7
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                aa_transient_persisted(&evm, target),
+                                ShellHash::from(U256::from(expected).to_be_bytes::<32>())
+                            );
+                            assert_eq!(get_nonce(&mut evm, &sender), 1);
+                            let next = make_aa_signed(
+                                sender,
+                                1,
+                                300_000,
+                                10,
+                                vec![aa_transient_call(target, None)],
+                                None,
+                            );
+                            assert!(evm
+                                .execute_aa_bundle(&next, &header, 1, result.gas_used)
+                                .unwrap()
+                                .receipt
+                                .succeeded());
+                            assert_eq!(
+                                aa_transient_persisted(&evm, target),
+                                ShellHash::ZERO,
+                                "new outer transaction starts empty"
+                            );
+                            assert_eq!(get_nonce(&mut evm, &sender), 2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aa_transient_storage_legacy_direct_native_identity() {
+        for clear_first in [false, true] {
+            let (mut evm, sender, target) = aa_transient_fixture(Some(0), true, false);
+            let mut bytes = [0x35; 32];
+            bytes[..12].fill(0x36);
+            let other = ShellAddress::from(bytes);
+            install_aa_transient_code(
+                &mut evm,
+                other,
+                &hex::decode("3615600a575f355f5d005b5f5c806001555f5260205ff3").unwrap(),
+            );
+            let mut calls = vec![
+                aa_transient_call(target, Some(7)),
+                aa_transient_call(other, Some(9)),
+            ];
+            if clear_first {
+                calls.push(aa_transient_call(target, Some(0)));
+            }
+            calls.extend([
+                aa_transient_call(other, None),
+                aa_transient_call(target, None),
+            ]);
+            let tx = make_aa_signed(sender, 0, 600_000, 10, calls, None);
+            assert!(evm
+                .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            let expected = if clear_first { 0 } else { 7 };
+            assert_eq!(
+                aa_transient_persisted(&evm, target),
+                ShellHash::from(U256::from(expected).to_be_bytes::<32>())
+            );
+            assert_eq!(
+                aa_transient_persisted(&evm, other),
+                ShellHash::from(U256::from(9).to_be_bytes::<32>())
+            );
+        }
+    }
+
+    #[test]
+    fn aa_transient_storage_native_identity_and_delegate_ownership() {
+        let (mut evm, sender, target) = aa_transient_fixture(Some(0), true, true);
+        let mut bytes = [0x35; 32];
+        bytes[..12].fill(0x36);
+        let proxy = ShellAddress::from(bytes);
+        // The delegate executes target's code with proxy's transient and persistent owner.
+        let proxy_code = hex::decode(format!(
+            "3615600a575f355f5d005b60205f5f5f7f{}620186a0f45060205ff3",
+            hex::encode(target.as_bytes())
+        ))
+        .unwrap();
+        install_aa_transient_code(&mut evm, proxy, &proxy_code);
+        let tx = make_aa_signed(
+            sender,
+            0,
+            500_000,
+            10,
+            vec![
+                aa_transient_call(target, Some(7)),
+                aa_transient_call(proxy, Some(9)),
+                aa_transient_call(proxy, None),
+                aa_transient_call(target, None),
+            ],
+            None,
+        );
+        assert!(evm
+            .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+            .unwrap()
+            .receipt
+            .succeeded());
+        assert_eq!(
+            aa_transient_persisted(&evm, target),
+            ShellHash::from(U256::from(7).to_be_bytes::<32>())
+        );
+        assert_eq!(
+            aa_transient_persisted(&evm, proxy),
+            ShellHash::from(U256::from(9).to_be_bytes::<32>())
+        );
+    }
+
+    #[test]
+    fn aa_transient_storage_nested_revert_and_static_rejection() {
+        let (mut evm, sender, target) = aa_transient_fixture(Some(0), true, true);
+        let reverter = ShellAddress::from([0x37; 32]);
+        let writer = ShellAddress::from([0x38; 32]);
+        install_aa_transient_code(&mut evm, reverter, &hex::decode("60635f5d5f5ffd").unwrap());
+        install_aa_transient_code(&mut evm, writer, &hex::decode("60635f5d00").unwrap());
+        // A reverted delegate must restore target's 7. The nonreverting writer
+        // must fail under STATICCALL, rather than returning successful STOP.
+        let code = hex::decode(format!(
+            "3615600a575f355f5d005b5f5f5f5f7f{}612710f46002555f5f5f5f7f{}6103e8fa6003555f5c60015500",
+            hex::encode(reverter.as_bytes()), hex::encode(writer.as_bytes()),
+        )).unwrap();
+        install_aa_transient_code(&mut evm, target, &code);
+        let tx = make_aa_signed(
+            sender,
+            0,
+            300_000,
+            10,
+            vec![
+                aa_transient_call(target, Some(7)),
+                aa_transient_call(target, None),
+            ],
+            None,
+        );
+        assert!(evm
+            .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+            .unwrap()
+            .receipt
+            .succeeded());
+        assert_eq!(
+            aa_transient_persisted(&evm, target),
+            ShellHash::from(U256::from(7).to_be_bytes::<32>())
+        );
+        for slot in [2, 3] {
+            assert_eq!(
+                evm.state_db()
+                    .world_state()
+                    .get_storage(
+                        &target,
+                        &ShellHash::from(U256::from(slot).to_be_bytes::<32>())
+                    )
+                    .unwrap(),
+                ShellHash::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn aa_transient_storage_batch_failure_rolls_back_and_does_not_leak() {
+        for traced in [false, true] {
+            let (mut evm, sender, target) = aa_transient_fixture(Some(0), true, true);
+            if traced {
+                evm.tracer = Some(ExecutionTracer::new(TraceConfig::default()));
+            }
+            let reverter = ShellAddress::from([0x37; 32]);
+            install_aa_transient_code(&mut evm, reverter, &[0x5f, 0x5f, 0xfd]);
+            let tx = make_aa_signed(
+                sender,
+                0,
+                400_000,
+                10,
+                vec![
+                    aa_transient_call(target, Some(9)),
+                    aa_transient_call(target, None),
+                    aa_transient_call(reverter, None),
+                ],
+                None,
+            );
+            assert!(!evm
+                .execute_aa_bundle(&tx, &sample_header(), 0, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            assert_eq!(
+                aa_transient_persisted(&evm, target),
+                ShellHash::from(U256::from(99).to_be_bytes::<32>())
+            );
+            assert_eq!(get_nonce(&mut evm, &sender), 1);
+            let next = make_aa_signed(
+                sender,
+                1,
+                300_000,
+                10,
+                vec![aa_transient_call(target, None)],
+                None,
+            );
+            assert!(evm
+                .execute_aa_bundle(&next, &sample_header(), 1, 0)
+                .unwrap()
+                .receipt
+                .succeeded());
+            assert_eq!(aa_transient_persisted(&evm, target), ShellHash::ZERO);
+        }
     }
 
     #[test]

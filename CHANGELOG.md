@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve transient storage between inner calls of one AA batch after the
+  configured `aa_transient_storage_height`. Retain VM frame rollback and discard
+  transient values at outer transaction boundaries. The rule defaults to legacy
+  behavior and uses persisted, immutable activation scheduling and trusted snapshot checks.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

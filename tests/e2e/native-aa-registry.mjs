@@ -28,11 +28,14 @@ const {
   validatorRegistryAddress,
   encodeSetGuardiansCalldata,
   encodeSubmitRecoveryCalldata,
+  encodeSetValidationCodeCalldata,
 } = await import(pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)).href);
 const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const aaTransientLegacy = process.argv.includes("--aa-transient-storage-legacy-address");
+const aaTransientScenario = aaTransientLegacy || process.argv.includes("--aa-transient-storage");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -81,7 +84,12 @@ async function unusedPort() {
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
-const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+const outsider = aaTransientScenario ? await (async () => {
+  const path = join(out, "owner.json");
+  const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", path], { encoding: "utf8" });
+  assert.equal(generated.status, 0, generated.stderr);
+  return decryptKeystore(JSON.parse(await readFile(path, "utf8")), password);
+})() : new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
 const pruneFollower = prunedEpochScenario || blockSignersScenario;
@@ -105,7 +113,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: aaTransientScenario ? (aaTransientLegacy ? "aa-transient-storage-legacy-address" : "aa-transient-storage") : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +158,10 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (aaTransientScenario) {
+    (result.exits ??= []).push({ label: nodeLogLabels[i], pid: child.pid, code: child.exitCode, signal: child.signalCode });
+    assert.equal(child.exitCode, 0);
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -478,6 +490,32 @@ async function runScenario() {
       epoch_length: epochScenario ? 5 : 0,
     },
   };
+  const transientTarget = "0x" + "35".repeat(32);
+  const transientProxy = "0x" + "36".repeat(12) + "35".repeat(20);
+  const transientReverter = "0x" + "37".repeat(32);
+  const transientWriter = "0x" + "38".repeat(32);
+  const transientNested = "0x" + "39".repeat(32);
+  const transientPolicy = "0x" + "3a".repeat(32);
+  const transientRuntime = "0x3615600a575f355f5d005b5f5c806001555f5260205ff3";
+  const word = value => "0x" + BigInt(value).toString(16).padStart(64, "0");
+  if (aaTransientScenario) {
+    genesis.aa_transient_storage_height = 3;
+    if (!aaTransientLegacy) genesis.native_address_context_height = 0;
+    const code = (runtime) => ({ balance: "0x0", nonce: 1, code: runtime, storage: { [word(1)]: word(99) } });
+    genesis.alloc[transientTarget] = code(transientRuntime);
+    genesis.alloc[transientProxy] = code(aaTransientLegacy ? transientRuntime : "0x3615600a575f355f5d005b60205f5f5f7f" + transientTarget.slice(2) + "620186a0f45060205ff3");
+    genesis.alloc[transientReverter] = code("0x60635f5d5f5ffd");
+    genesis.alloc[transientWriter] = code("0x60635f5d00");
+    genesis.alloc[transientNested] = code("0x3615600a575f355f5d005b5f5f5f5f7f" + transientReverter.slice(2) + "612710f46002555f5f5f5f7f" + transientWriter.slice(2) + "6103e8fa6003555f5c60015500");
+    genesis.alloc[transientPolicy] = code("0x5f5f5260205ff3");
+    if (aaTransientLegacy) {
+      // Legacy CALL operands resolve to their canonical low-20 aliases; direct
+      // AA targets still name their distinct complete native identities.
+      for (const address of [transientReverter, transientWriter])
+        genesis.alloc["0x" + "00".repeat(12) + address.slice(-40)] = genesis.alloc[address];
+    }
+    result.adaptations.push("Raw predeployed opcode fixtures isolate AA transaction lifetime from CREATE address activation. Transient sharing activates only on this isolated chain at block 3; current live networks are unchanged.");
+  }
   for (const signer of signers)
     genesis.alloc[signer.getAddress()] = {
       balance: "0x3635c9adc5dea00000",
@@ -608,6 +646,68 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (aaTransientScenario) {
+    const call = (target, value) => buildInnerCall(target, value === undefined ? "0x" : word(value), 100000);
+    const slot = (index, address, key = 1) => rpc(index, "eth_getStorageAt", [address, "0x" + BigInt(key).toString(16), "latest"]);
+    async function batch(label, calls, expected, status = "0x1") {
+      const transaction = await confirmed(label, outsider, calls, status);
+      assert.equal(await slot(0, transientTarget), word(expected), label + " committed business result");
+      assert.equal(await slot(1, transientTarget), word(expected));
+      return transaction;
+    }
+    await batch("before activation at 1", [call(transientTarget, 7), call(transientTarget)], 0);
+    await batch("before activation at 2", [call(transientTarget, 7), call(transientTarget)], 0);
+    await batch("activation boundary at 3", [call(transientTarget, 7), call(transientTarget)], 7);
+    await batch("next outer transaction starts empty", [call(transientTarget)], 0);
+    await batch(aaTransientLegacy ? "distinct direct native identities in legacy address profile" : "native identity and delegate ownership", [call(transientTarget, 7), call(transientProxy, 9), call(transientProxy), call(transientTarget)], 7);
+    assert.equal(await slot(0, transientProxy), word(9));
+    assert.equal(await slot(1, transientProxy), word(9));
+    const { keccak256 } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+    const policyHash = keccak256(genesis.alloc[transientPolicy].code);
+    const pubkeyBefore = await rpc(0, "shell_getPqPubkey", [outsider.getAddress()]);
+    const reverted = await batch("native policy and storage roll back with failed batch", [call(transientTarget, 8), call(transientTarget), buildInnerCall(accountManagerAddress, encodeSetValidationCodeCalldata(policyHash), 100000), call(transientReverter)], 7, "0x0");
+    assert.equal(reverted.trace.calls.length, 4);
+    assert.equal(reverted.trace.calls[1].output, word(8), "earlier inner call observes transient value before rollback");
+    assert.equal(reverted.trace.calls[2].to, accountManagerAddress);
+    assert.equal(reverted.trace.calls[2].error, undefined, "native policy update runs before the revert");
+    assert.equal(reverted.trace.calls[2].output, word(1));
+    assert.equal(reverted.trace.calls[3].error, "execution reverted");
+    assert.deepEqual(await rpc(0, "shell_getPqPubkey", [outsider.getAddress()]), pubkeyBefore);
+    assert.equal(await slot(0, transientProxy), word(9));
+    await batch("root remains authorized and failed transient cannot leak", [call(transientTarget)], 0);
+    await batch("nested revert and static TSTORE rejection", [call(transientNested, 7), call(transientNested)], 0);
+    for (const index of [0, 1]) {
+      assert.equal(await slot(index, transientNested), word(7));
+      assert.equal(await slot(index, transientNested, 2), word(0));
+      assert.equal(await slot(index, transientNested, 3), word(0));
+    }
+    const observed = async index => ({ head: await rpc(index, "eth_getBlockByNumber", ["latest", false]), ownerNonce: await rpc(index, "eth_getTransactionCount", [outsider.getAddress(), "latest"]), ownerBalance: await rpc(index, "eth_getBalance", [outsider.getAddress(), "latest"]), minerBalance: await rpc(index, "eth_getBalance", [miner.getAddress(), "latest"]), target: await slot(index, transientTarget), proxy: await slot(index, transientProxy), nested: await slot(index, transientNested) });
+    const expected = await observed(0);
+    assert.deepEqual(await observed(1), expected);
+    assert.equal(BigInt(expected.ownerNonce), 8n);
+    const histories = [];
+    for (const tag of ["0x2", "0x3", "0x4", "0x5", "0x6", "0x7"]) {
+      const value = word(({ "0x2": 0, "0x3": 7, "0x4": 0, "0x5": 7, "0x6": 7, "0x7": 0 })[tag]);
+      for (const index of [0, 1]) assert.equal(await rpc(index, "eth_getStorageAt", [transientTarget, "0x1", tag]), value);
+      histories.push({ tag, value });
+    }
+    for (const index of [0, 1]) assert.deepEqual(await observed(index), expected, "historical calls do not alter current state");
+    await stop(1); await stop(0);
+    await start(0, dirs[0], keyPath, "transient-reopened-producer");
+    await start(1, dirs[1], followerKey, "transient-reopened-follower");
+    for (const index of [0, 1]) {
+      assert.deepEqual(await observed(index), expected);
+      for (const entry of result.transactions) {
+        assert.deepEqual(await rpc(index, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+        assert.deepEqual(await rpc(index, "debug_traceTransaction", [entry.hash, { tracer: "callTracer" }]), entry.trace);
+      }
+      for (const entry of histories) assert.equal(await rpc(index, "eth_getStorageAt", [transientTarget, "0x1", entry.tag]), entry.value);
+      assert.deepEqual(await observed(index), expected);
+    }
+    result.transientStorage = { expected, histories, activation: 3, originalFailure: "separate revm transactions returned 0 between calls instead of 7", reopened: true };
+    result.passed = true;
+    return;
+  }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

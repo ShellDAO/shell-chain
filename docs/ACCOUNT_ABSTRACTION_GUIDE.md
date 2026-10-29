@@ -630,3 +630,51 @@ The existing paymaster ABI and activation policies are unchanged, including its
 retained `address` argument mapping. No simulation writes are committed.
 Acceptance does not verify signatures, sender nonce, funding or full bundle
 validity, and cannot guarantee sponsorship at a later inclusion state or height.
+
+
+## Transient storage in AA batches
+
+The whitepaper retains Cancun `TSTORE` and `TLOAD` semantics. Transient storage
+belongs to an outer transaction: one inner call can set a contract's transient
+slot and a later call in that same batch can read it. `CALL` uses the callee's
+store; `DELEGATECALL` uses the caller's store. Nested frame reverts undo their
+writes, and `STATICCALL` rejects `TSTORE`. Every new outer transaction starts empty.
+
+The correction is in unreleased node source. Public v0.27.13 clears transient
+storage between AA inner calls: a batch that sets 7 and then persists the value
+can report success while committing 0. Set `aa_transient_storage_height` in the
+chain's genesis configuration to opt into the corrected rule. Omitting it retains
+legacy execution. An existing chain may add only a future height above its current
+head; an established height cannot be moved or removed. Restarts and trusted
+snapshot imports retain this schedule. Select deployed-network activation through
+the network's upgrade process; the local acceptance below activates only its own chain.
+
+Batch failure rolls back persistent writes and native account-policy changes.
+The outer nonce and existing gas accounting still apply. Transient values remain
+in execution memory and are discarded after success or failure; they are never
+stored in the account trie or restored by a process restart. Historical replay
+selects the rule for the original block height.
+
+With Node.js 24+, a compatible built SDK (`0.14.0-rc.3` tested), and a node source
+checkout containing this correction:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-transient-storage
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --aa-transient-storage-legacy-address
+```
+
+This creates temporary funded keys and two isolated RocksDB nodes. It signs real
+batches before, at and after local activation at block 3; checks committed values,
+outer nonce/fees, native identity and delegate ownership, nested revert/static
+rejection and failed account-policy rollback; compares an independent follower;
+then reopens both databases and checks receipts and historical replay. The second
+mode retains legacy CALL address operands while verifying that distinct full-width
+direct AA targets never share transient slots, even when their low 20 bytes match.
+Raw runtime
+fixtures in genesis isolate these semantics from contract creation and deployment.
+The correction's presence in source is not proof of a published binary or live activation.

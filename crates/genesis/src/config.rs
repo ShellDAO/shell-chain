@@ -213,6 +213,9 @@ pub struct GenesisConfig {
     /// First block using full native address identities in contract execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_address_context_height: Option<u64>,
+    /// First block sharing transient storage across calls of one outer AA transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_transient_storage_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
