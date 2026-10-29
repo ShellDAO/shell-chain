@@ -1700,6 +1700,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                         value: call.value.clone(),
                         gas: None,
                         access_list: None,
+                        ..Default::default()
                     };
                     let (_out, used) = self.execute_call(&call_req).map_err(|e| {
                         if e.code() == -32602 {

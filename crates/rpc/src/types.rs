@@ -364,7 +364,7 @@ pub struct RpcLogWithMeta {
 }
 
 /// Ethereum `eth_call` / `eth_estimateGas` request object.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRequest {
     /// Sender address (defaults to zero address if absent).
@@ -379,6 +379,12 @@ pub struct CallRequest {
     pub gas: Option<String>,
     /// EIP-2930 access list.
     pub access_list: Option<Vec<RpcAccessListItem>>,
+    /// Legacy gas price; mutually exclusive with dynamic fee fields.
+    pub gas_price: Option<String>,
+    /// Dynamic maximum fee per gas.
+    pub max_fee_per_gas: Option<String>,
+    /// Dynamic maximum priority fee per gas.
+    pub max_priority_fee_per_gas: Option<String>,
 }
 
 /// Request object for `shell_estimateBatch`.

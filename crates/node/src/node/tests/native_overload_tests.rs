@@ -77,6 +77,7 @@ fn verify<S: KvStore + 'static>(node: &Node<S>, steps: &[Step], derived: bool) {
                         value: None,
                         gas: Some("0x7a120".into()),
                         access_list: None,
+                        ..Default::default()
                     },
                     Some(format!("0x{:x}", step.block.number())),
                 ))

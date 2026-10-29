@@ -663,7 +663,7 @@ Executes a read-only call against the EVM (no state changes).
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Call request: `{from?, to, data?, value?, gas?}` |
+| 1 | `Object` | Yes | Call request: `{from?, to, data?, value?, gas?, accessList?, gasPrice?, maxFeePerGas?, maxPriorityFeePerGas?}` |
 | 2 | `String` | No | State block tag; historical calls require the unreleased source and retained canonical state described above |
 
 **Returns:** `String` — Hex-encoded return data.
@@ -673,6 +673,52 @@ curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"0xCONTRACT_ADDRESS","data":"0x..."},"latest"],"id":1}'
 ```
+
+#### Explicit simulation fees (unreleased)
+
+Unreleased source honors `gasPrice`, `maxFeePerGas` and `maxPriorityFeePerGas`
+across `eth_call`, `eth_estimateGas` and `eth_createAccessList`. Contracts observe
+the requested price through `GASPRICE`; estimates and discovered accesses follow
+the same price-dependent execution path. Published v0.27.13 ignores these request
+fields, which can produce an incorrect return value or an insufficient estimate.
+
+Use either legacy `gasPrice` or dynamic fee fields. Combining them is invalid.
+All quantities are hex-encoded u64 values. A missing dynamic priority fee is zero;
+when only a priority fee is supplied, the maximum defaults to the selected
+header's base fee plus that priority, with overflow rejected. Priority above the
+maximum is invalid. In the reconciled-fee profile, `GASPRICE` is
+`min(maxFeePerGas, baseFeePerGas + maxPriorityFeePerGas)`; existing legacy execution
+pricing remains unchanged before that profile's activation.
+
+Omitting all three fields preserves the zero-priced simulation default. Such a
+call can use an unfunded sender when `value` is zero. Nonzero value still requires
+funds. Explicit fees use normal balance checks on private execution state; calls
+do not charge the real account or commit writes. Use a funded sender for the
+example below, with a contract that returns its observed gas price:
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" --data-binary @- <<JSON
+{"jsonrpc":"2.0","method":"eth_call","params":[{"from":"${SENDER_ADDRESS}","to":"${CONTRACT_ADDRESS}","data":"0x","gas":"0x30d40","gasPrice":"0x77359400"},"latest"],"id":1}
+JSON
+```
+
+The response is the contract's return data. A returned 32-byte `GASPRICE` word
+for this legacy price is 2,000,000,000 wei. Dynamic prices depend on the selected
+header; the eventual inclusion block can have a different base fee. Simulation
+does not replace transaction admission checks.
+
+With a node built using `--features libp2p` and a compatible built SDK:
+
+```bash
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context-legacy-address
+```
+
+The signed regression checks legacy and dynamic prices, price-dependent storage
+and accesses, value, reverts, fee validation, independent import, historical
+calls and both nodes reopening. These isolated development profiles explicitly
+activate reconciled fees; they do not establish production activation or npm
+availability.
 
 ---
 
@@ -705,7 +751,9 @@ source; v0.27.13 can return an insufficient estimate for GAS-dependent contracts
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Call request: `{from?, to?, data?, value?, gas?, accessList?}` |
+| 1 | `Object` | Yes | Call request: `{from?, to?, data?, value?, gas?, accessList?, gasPrice?, maxFeePerGas?, maxPriorityFeePerGas?}` |
+
+Explicit fee fields use the [shared simulation rules](#explicit-simulation-fees-unreleased).
 
 **Returns:** `String` — Hex-encoded gas estimate.
 
@@ -754,6 +802,8 @@ Creates an EIP-2930 access list for a transaction.
 |---|------|----------|-------------|
 | 1 | `Object` | Yes | Call request |
 | 2 | `String` | No | Block tag or canonical hex block number (retained state required) |
+
+Explicit fee fields use the [shared simulation rules](#explicit-simulation-fees-unreleased).
 
 **Returns:** Object with `accessList` and `gasUsed`.
 

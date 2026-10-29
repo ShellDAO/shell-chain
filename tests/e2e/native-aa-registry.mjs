@@ -33,8 +33,9 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const gasEstimateScenario = process.argv.includes("--gas-estimate") || process.argv.includes("--gas-estimate-legacy-address");
-const gasEstimateLegacy = process.argv.includes("--gas-estimate-legacy-address");
+const feeContextScenario = process.argv.includes("--fee-context") || process.argv.includes("--fee-context-legacy-address");
+const gasEstimateScenario = feeContextScenario || process.argv.includes("--gas-estimate") || process.argv.includes("--gas-estimate-legacy-address");
+const gasEstimateLegacy = process.argv.includes("--gas-estimate-legacy-address") || process.argv.includes("--fee-context-legacy-address");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -112,7 +113,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: gasEstimateScenario ? "gas-dependent-estimate" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: feeContextScenario ? "explicit-fee-context" : gasEstimateScenario ? "gas-dependent-estimate" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -506,16 +507,23 @@ async function runScenario() {
     };
   if (gasEstimateScenario) {
     if (!gasEstimateLegacy) genesis.native_address_context_height = 0;
-    for (const [index, code] of [
+    const codes = feeContextScenario ? [
+      "3a805f555f5260205ff3", // Return and persist GASPRICE.
+      "3a15600a5760025450005b6001545000", // Read a price-selected slot.
+      "3a34015f5500", // Persist GASPRICE + CALLVALUE.
+      "3a5f555f5ffd", // Price-dependent write then revert.
+      "620186a05a10600e5760015f55005b5f5ffd", // Remaining-gas guard.
+    ] : [
       "620186a05a10600e5760015f55005b5f5ffd",
       "620249f05a10600c57601f565b620186a05a106025576201adb05a116025575b60015f55005b5f5ffd",
       "5f5f5500", // Refund after clearing a nonzero slot.
       "60015f555f5ffd", // Write then revert.
       "5f355f5500", // Change live state after the original receipts.
-    ].entries()) {
+    ];
+    for (const [index, code] of codes.entries()) {
       const address = "0x" + (0x35 + index).toString(16).repeat(32);
       genesis.alloc[address] = { balance: "0x0", nonce: 1, code: "0x" + code,
-        storage: { ["0x" + word(0)]: "0x" + word(index === 2 ? 1 : 0) } };
+        storage: { ["0x" + word(0)]: "0x" + word(!feeContextScenario && index === 2 ? 1 : 0) } };
     }
   }
   for (const dir of dirs)
@@ -543,6 +551,7 @@ async function runScenario() {
       miner: await rpc(i, "eth_getBalance", [miner.getAddress(), "latest"]),
       nonce: await rpc(i, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
       slots: await Promise.all([0, 1, 2, 3, 4].map((n) => rpc(i, "eth_getStorageAt", [address(n), "0x0", "latest"]))),
+      ...(feeContextScenario ? { contractBalances: await Promise.all([0, 1, 2, 3, 4].map((n) => rpc(i, "eth_getBalance", [address(n), "latest"]))) } : {}),
     });
     const request = (index, extra = {}) => ({ from: outsider.getAddress(), to: address(index), data: "0x", value: "0x0", ...extra });
     const estimate = async (input) => {
@@ -558,8 +567,11 @@ async function runScenario() {
     };
     const send = async (label, input, gas, expected, expectedSlot) => {
       const before = await stateAt(0);
+      const priority = input.gasPrice ?? input.maxPriorityFeePerGas ?? "0x0";
+      const maximum = input.gasPrice ?? input.maxFeePerGas ?? (feeContextScenario
+        ? "0x" + (BigInt(before.head.baseFeePerGas) + BigInt(priority)).toString(16) : "0x3b9aca00");
       const tx = buildTransaction({ chainId: 1337, nonce: Number(BigInt(before.nonce)), to: input.to,
-        data: input.data, value: BigInt(input.value), gasLimit: Number(BigInt(gas)), maxFeePerGas: 1000000000, maxPriorityFeePerGas: 0 });
+        data: input.data, value: BigInt(input.value), gasLimit: Number(BigInt(gas)), maxFeePerGas: Number(BigInt(maximum)), maxPriorityFeePerGas: Number(BigInt(priority)) });
       const signed = await outsider.buildSignedTransaction({ tx, includePublicKey: true });
       const hash = await paced(() => providers[0].sendTransaction(signed));
       const entry = { label, input, gas, signed, hash, before };
@@ -579,7 +591,8 @@ async function runScenario() {
       assert.equal(BigInt(before.balance) - BigInt(entry.after.balance), fee + (expected === "0x1" ? BigInt(input.value) : 0n));
       assert.equal(BigInt(entry.after.miner) - BigInt(before.miner), fee);
       assert.equal(BigInt(entry.after.nonce), BigInt(before.nonce) + 1n);
-      assert.equal(await rpc(0, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(expectedSlot));
+      const slot = typeof expectedSlot === "function" ? expectedSlot(entry.receipt) : expectedSlot;
+      assert.equal(await rpc(0, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(slot));
       for (let n = 0; n < 160; n++) {
         const block = await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false]);
         if (block?.hash === entry.receipt.blockHash) break;
@@ -587,9 +600,96 @@ async function runScenario() {
       }
       assert.equal((await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false])).hash, entry.receipt.blockHash);
       assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [hash]), entry.receipt);
-      assert.equal(await rpc(1, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(expectedSlot));
+      assert.equal(await rpc(1, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(slot));
       await save();
     };
+    if (feeContextScenario) {
+      const legacy = { gasPrice: "0x77359400" };
+      const dynamic = { maxFeePerGas: "0x77359400", maxPriorityFeePerGas: "0x2" };
+      const price = (input, head) => input.gasPrice !== undefined ? BigInt(input.gasPrice)
+        : [BigInt(input.maxFeePerGas ?? (BigInt(head.baseFeePerGas) + BigInt(input.maxPriorityFeePerGas ?? 0))),
+           BigInt(head.baseFeePerGas) + BigInt(input.maxPriorityFeePerGas ?? 0)].reduce((a, b) => a < b ? a : b);
+      for (const fees of [legacy, dynamic, { maxFeePerGas: "0x77359400" }, { maxPriorityFeePerGas: "0x2" }]) {
+        const input = request(0, { gas: "0x30d40", ...fees });
+        const before = await stateAt(0);
+        const expectedPrice = price(input, before.head);
+        assert.equal(await rpc(0, "eth_call", [input, "latest"]), "0x" + word(expectedPrice));
+        const quote = await estimate(input);
+        assert.ok(quote.value);
+        assert.deepEqual(await stateAt(0), before);
+        await send("estimated explicit fee " + JSON.stringify(fees), input, quote.value, "0x1", (receipt) => BigInt(receipt.effectiveGasPrice));
+      }
+      for (const fees of [{}, legacy, dynamic]) {
+        const input = request(1, { gas: "0x30d40", ...fees });
+        const before = await stateAt(0);
+        const access = await rpc(0, "eth_createAccessList", [input, "latest"]);
+        const expectedSlot = Object.keys(fees).length ? 2 : 1;
+        assert.deepEqual(access.accessList, [{ address: address(1), storageKeys: ["0x" + word(expectedSlot)] }]);
+        assert.deepEqual(await stateAt(0), before);
+        (result.feeContextAccessLists ??= []).push({ input, access });
+      }
+      const valueInput = request(2, { value: "0x7", ...legacy });
+      const valueQuote = await estimate(valueInput);
+      assert.ok(valueQuote.value);
+      await send("explicit fee and value", valueInput, valueQuote.value, "0x1", 2000000007n);
+      assert.equal(await rpc(0, "eth_getBalance", [address(2), "latest"]), "0x7");
+      const revertInput = request(3, { value: "0x7", ...legacy });
+      assert.ok((await estimate(revertInput)).error);
+      await send("explicit fee reverted state and value", revertInput, "0x30d40", "0x0", 0);
+      assert.equal(await rpc(0, "eth_getBalance", [address(3), "latest"]), "0x0");
+      const gasInput = request(4, { gas: "0x30d40", ...legacy });
+      const gasQuote = await estimate(gasInput);
+      assert.ok(gasQuote.value);
+      await send("explicit fee with remaining-gas guard", gasInput, gasQuote.value, "0x1", 1);
+      const zero = request(0, { from: "0x" + "00".repeat(32), gas: "0x30d40" });
+      const before = await stateAt(0);
+      assert.equal(await rpc(0, "eth_call", [zero, "latest"]), "0x" + word(0));
+      assert.ok((await estimate(zero)).value, "omitted fee defaults permit an unfunded zero-value sender");
+      await assert.rejects(() => rpc(0, "eth_call", [{ ...zero, value: "0x1" }, "latest"]));
+      await assert.rejects(() => rpc(0, "eth_call", [{ ...zero, ...legacy }, "latest"]));
+      for (const invalid of [
+        { gasPrice: "0x1", maxFeePerGas: "0x2" },
+        { gasPrice: "0x1", maxPriorityFeePerGas: "0x0" },
+        { maxFeePerGas: "0x1", maxPriorityFeePerGas: "0x2" },
+        { gasPrice: "0xzz" }, { maxFeePerGas: "0x10000000000000000" },
+        { maxPriorityFeePerGas: "0xffffffffffffffff" },
+      ]) {
+        for (const method of ["eth_call", "eth_estimateGas", "eth_createAccessList"]) {
+          const input = request(0, invalid);
+          const payload = { jsonrpc: "2.0", id: 1, method, params: method === "eth_estimateGas" ? [input] : [input, "latest"] };
+          const response = await paced(async () => (await fetch(`http://127.0.0.1:${ports[0]}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })).json());
+          assert.equal(response.error?.code, -32602);
+          result.feeRejections ??= [];
+          result.feeRejections.push({ payload, response });
+        }
+      }
+      assert.deepEqual(await stateAt(0), before);
+      const verify = async () => {
+        for (const i of [0, 1]) {
+          const before = await stateAt(i);
+          for (const entry of result.transactions) {
+            assert.deepEqual(await rpc(i, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+            assert.deepEqual(await rpc(i, "debug_traceTransaction", [entry.hash, { tracer: "callTracer" }]), entry.trace);
+          }
+          const first = result.transactions[0];
+          const input = request(0, { gas: "0x30d40", ...dynamic });
+          const header = await rpc(i, "eth_getBlockByNumber", [first.receipt.blockNumber, false]);
+          assert.equal(await rpc(i, "eth_call", [input, first.receipt.blockNumber]), "0x" + word(price(input, header)));
+          assert.deepEqual(await stateAt(i), before);
+        }
+      };
+      await verify();
+      await stop(1); await stop(0);
+      await start(0, dirs[0], keyPath, "fee-leader-reopen");
+      const log = await readFile(join(out, "fee-leader-reopen-node.log"), "utf8");
+      const peer = log.match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+      assert.ok(peer);
+      await start(1, dirs[1], followerKey, "fee-follower-reopen", peer);
+      await peerReady(); await verify();
+      result.feeContext = { legacyAddressContext: gasEstimateLegacy, finalHeight: height, historyAfterLivePriceAndStateChangeAndReopen: true };
+      result.passed = true;
+      return;
+    }
     assert.ok((await estimate(request(0, { gas: "0x186a0" }))).error, "explicit insufficient cap rejected");
     for (const index of [0, 1, 2]) {
       const input = request(index, { gas: "0x30d40" });

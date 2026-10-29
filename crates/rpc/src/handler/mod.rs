@@ -625,6 +625,42 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         self.execute_call_on_state(req, root, header, collect)
     }
 
+    fn call_fee_caps(
+        req: &crate::types::CallRequest,
+        base_fee: u64,
+    ) -> Result<(u64, u64), ErrorObjectOwned> {
+        if let Some(price) = &req.gas_price {
+            if req.max_fee_per_gas.is_some() || req.max_priority_fee_per_gas.is_some() {
+                return Err(invalid_params_err(
+                    "gasPrice cannot be combined with dynamic fee fields",
+                ));
+            }
+            let price = parse_hex_u64(price)?;
+            return Ok((price, price));
+        }
+        if req.max_fee_per_gas.is_none() && req.max_priority_fee_per_gas.is_none() {
+            return Ok((0, 0));
+        }
+        let priority = req
+            .max_priority_fee_per_gas
+            .as_deref()
+            .map(parse_hex_u64)
+            .transpose()?
+            .unwrap_or(0);
+        let maximum = match req.max_fee_per_gas.as_deref() {
+            Some(fee) => parse_hex_u64(fee)?,
+            None => base_fee
+                .checked_add(priority)
+                .ok_or_else(|| invalid_params_err("default maximum fee overflows u64"))?,
+        };
+        if priority > maximum {
+            return Err(invalid_params_err(
+                "maxPriorityFeePerGas exceeds maxFeePerGas",
+            ));
+        }
+        Ok((maximum, priority))
+    }
+
     fn execute_call_on_state(
         &self,
         req: &crate::types::CallRequest,
@@ -706,11 +742,18 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             })
             .transpose()?;
 
+        let (maximum_fee, priority_fee) = Self::call_fee_caps(
+            req,
+            head_header
+                .as_ref()
+                .map_or(0, |header| header.base_fee_per_gas),
+        )?;
+
         let tx = Transaction {
             chain_id: self.chain_id,
             nonce: u64::default(),
-            max_fee_per_gas: 0,
-            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: maximum_fee,
+            max_priority_fee_per_gas: priority_fee,
             gas_limit,
             to: req.to,
             value,
@@ -4888,6 +4931,7 @@ mod tests {
             value: None,
             gas: None,
             access_list: None,
+            ..Default::default()
         };
         let error = EthApiServer::call(&handler, request, None)
             .await
@@ -4926,6 +4970,7 @@ mod tests {
             value: None,
             gas: None,
             access_list: None,
+            ..Default::default()
         };
 
         let output = EthApiServer::call(&handler, request.clone(), Some("latest".into()))
@@ -4964,6 +5009,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             };
             for number in [1, 2, 3, 1] {
                 let mut block = make_genesis_block();
@@ -5217,6 +5263,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             };
             let output = EthApiServer::call(&handler, request, Some("latest".into()))
                 .await
@@ -5281,6 +5328,7 @@ mod tests {
             value: None,
             gas: None,
             access_list: None,
+            ..Default::default()
         };
         request.gas = Some(
             EthApiServer::estimate_gas(&handler, request.clone())
@@ -5320,6 +5368,7 @@ mod tests {
                 value: None,
                 gas: Some("0x186a0".into()),
                 access_list: None,
+                ..Default::default()
             };
 
             let call = EthApiServer::call(&handler, request.clone(), None).await;
@@ -5639,6 +5688,7 @@ mod tests {
                 value: None,
                 gas: Some("0x186a0".into()),
                 access_list: None,
+                ..Default::default()
             },
             Some("latest".into()),
         )
@@ -5712,6 +5762,7 @@ mod tests {
                     value: None,
                     gas: Some("0x7a120".into()),
                     access_list: supplied,
+                    ..Default::default()
                 },
                 Some("latest".into()),
             )
@@ -5895,6 +5946,7 @@ mod tests {
                 value: None,
                 gas: Some("0x186a0".into()),
                 access_list: None,
+                ..Default::default()
             },
             None,
         )
@@ -5944,6 +5996,7 @@ mod tests {
                 value: None,
                 gas: Some("0x989680".into()),
                 access_list: None,
+                ..Default::default()
             },
             None,
         )
@@ -5975,11 +6028,151 @@ mod tests {
             value: Some("0x3e8".into()), // 1000
             gas: Some("0x5208".into()),  // 21000
             access_list: None,
+            ..Default::default()
         };
         let result = EthApiServer::call(&handler, req, None).await;
         assert!(result.is_ok(), "eth_call failed: {:?}", result.err());
         // Transfer returns empty data.
         assert_eq!(result.unwrap(), "0x");
+    }
+
+    #[tokio::test]
+    async fn explicit_fee_simulations_preserve_price_and_snapshot_state() {
+        let handler = setup();
+        let address = test_address(b"rpc-fee-price-contract");
+        let from = test_address(b"rpc-fee-caller");
+        let code = hex::decode("3a805f555f5260205ff3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        let root = {
+            let mut ws = handler.world_state.write();
+            ws.set_code_hash(&address, hash).unwrap();
+            ws.set_balance(&from, U256::from(1_000_000_000_u64))
+                .unwrap();
+            ws.state_root().unwrap()
+        };
+        let config = serde_json::from_value(serde_json::json!({
+            "chain_id": 42, "genesis_hash": ShellHash::ZERO,
+            "fee_accounting_activation_height": 0,
+        }))
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        for (number, base) in [(0, 3), (1, 7)] {
+            let mut block = make_genesis_block();
+            block.header.number = number;
+            block.header.base_fee_per_gas = base;
+            block.header.state_root = root;
+            handler.chain_store.put_block(&block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(number, &block.hash())
+                .unwrap();
+            handler.chain_store.set_head(&block.hash()).unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for (fees, tag, price) in [
+            (serde_json::json!({}), "latest", 0),
+            (serde_json::json!({"gasPrice":"0xa"}), "latest", 10),
+            (
+                serde_json::json!({"maxFeePerGas":"0xa","maxPriorityFeePerGas":"0x2"}),
+                "latest",
+                9,
+            ),
+            (
+                serde_json::json!({"maxFeePerGas":"0x8","maxPriorityFeePerGas":"0x2"}),
+                "latest",
+                8,
+            ),
+            (serde_json::json!({"maxFeePerGas":"0xa"}), "latest", 7),
+            (
+                serde_json::json!({"maxPriorityFeePerGas":"0x2"}),
+                "latest",
+                9,
+            ),
+            (
+                serde_json::json!({"maxFeePerGas":"0xa","maxPriorityFeePerGas":"0x2"}),
+                "0x0",
+                5,
+            ),
+        ] {
+            let mut input = serde_json::json!({"from":from,"to":address,"gas":"0x30d40"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fees.as_object().unwrap().clone());
+            let request: crate::types::CallRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(
+                EthApiServer::call(&handler, request.clone(), Some(tag.into()))
+                    .await
+                    .unwrap(),
+                format!("0x{price:064x}")
+            );
+            let access =
+                EthApiServer::create_access_list(&handler, request.clone(), Some(tag.into()))
+                    .await
+                    .unwrap();
+            let spent = parse_hex_u64(access["gasUsed"].as_str().unwrap()).unwrap();
+            assert!(if price == 0 {
+                spent < 30_000
+            } else {
+                spent > 40_000
+            });
+            let estimated = EthApiServer::estimate_gas(&handler, request.clone())
+                .await
+                .unwrap();
+            let mut at_estimate = request;
+            at_estimate.gas = Some(estimated);
+            // Estimation uses latest, while eth_call/access-list also bind the selected historical header.
+            assert!(EthApiServer::call(&handler, at_estimate, None)
+                .await
+                .is_ok());
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_fee_simulations_reject_invalid_caps_without_writes() {
+        let handler = setup();
+        handler.world_state.write().state_root().unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for value in [
+            serde_json::json!({"gasPrice":"0x1","maxFeePerGas":"0x2"}),
+            serde_json::json!({"gasPrice":"0x1","maxPriorityFeePerGas":"0x0"}),
+            serde_json::json!({"maxFeePerGas":"0x1","maxPriorityFeePerGas":"0x2"}),
+            serde_json::json!({"gasPrice":"0xzz"}),
+            serde_json::json!({"maxFeePerGas":"0x10000000000000000"}),
+            serde_json::json!({"maxPriorityFeePerGas":"0xzz"}),
+        ] {
+            let request: crate::types::CallRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                EthApiServer::call(&handler, request.clone(), None)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                -32602
+            );
+            assert_eq!(
+                EthApiServer::estimate_gas(&handler, request.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                -32602
+            );
+            assert_eq!(
+                EthApiServer::create_access_list(&handler, request, None)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                -32602
+            );
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
     }
 
     #[tokio::test]
@@ -6009,7 +6202,8 @@ mod tests {
                 value: None,
                 gas: Some(hex_u64(200_000)),
                 access_list: None,
-            };
+            ..Default::default()
+};
             let estimate = EthApiServer::estimate_gas(&handler, request.clone())
                 .await
                 .unwrap();
@@ -6045,6 +6239,7 @@ mod tests {
             value: Some("0x3e8".into()),
             gas: None,
             access_list: None,
+            ..Default::default()
         };
         let result = EthApiServer::estimate_gas(&handler, req).await;
         assert!(result.is_ok(), "estimateGas failed: {:?}", result.err());
@@ -6065,6 +6260,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
             None,
         )
@@ -6087,6 +6283,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
             None,
         )
@@ -6110,6 +6307,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
             None,
         )
@@ -6139,6 +6337,7 @@ mod tests {
                     address: Address::ZERO,
                     storage_keys: vec!["00".repeat(32)],
                 }]),
+                ..Default::default()
             },
             None,
         )
@@ -6167,6 +6366,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: Some(access_list),
+                ..Default::default()
             },
             None,
         )
@@ -6190,6 +6390,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
         )
         .await
@@ -6211,6 +6412,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
         )
         .await
@@ -6233,6 +6435,7 @@ mod tests {
                 value: None,
                 gas: None,
                 access_list: None,
+                ..Default::default()
             },
         )
         .await
@@ -6261,6 +6464,7 @@ mod tests {
                     address: Address::ZERO,
                     storage_keys: vec!["00".repeat(32)],
                 }]),
+                ..Default::default()
             },
         )
         .await
@@ -6287,6 +6491,7 @@ mod tests {
                     address: Address::ZERO,
                     storage_keys,
                 }]),
+                ..Default::default()
             },
         )
         .await

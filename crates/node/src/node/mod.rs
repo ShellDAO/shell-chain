@@ -7307,6 +7307,7 @@ mod tests {
                     value: None,
                     gas: Some("0x7a120".into()),
                     access_list: None,
+                    ..Default::default()
                 },
                 Some("latest".into()),
             ));
@@ -8191,6 +8192,7 @@ mod tests {
                     value: None,
                     gas: Some("0x7a120".into()),
                     access_list: None,
+                    ..Default::default()
                 },
                 Some(format!("0x{:x}", step.block.number())),
             ));
@@ -8220,6 +8222,7 @@ mod tests {
                 value: None,
                 gas: Some("0x7a120".into()),
                 access_list: None,
+                ..Default::default()
             },
             Some("latest".into()),
         ));
@@ -10550,6 +10553,7 @@ mod tests {
                         value: None,
                         gas: Some("0x7a120".into()),
                         access_list: None,
+                        ..Default::default()
                     },
                     Some("latest".into()),
                 ))
@@ -11285,6 +11289,7 @@ mod tests {
                                     value: None,
                                     gas: Some("0x7a120".into()),
                                     access_list: None,
+                                    ..Default::default()
                                 },
                                 Some("latest".into()),
                             ))
@@ -12481,6 +12486,7 @@ mod tests {
                         value: None,
                         gas: Some("0x7a120".into()),
                         access_list: None,
+                        ..Default::default()
                     },
                     Some("latest".into()),
                 ));
