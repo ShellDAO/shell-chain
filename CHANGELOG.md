@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Include native gas and STARK reward senders in address history, cursor pages
+  and address-summary totals. Remove sender entries when canonical rewards are
+  removed. On startup, repair legacy reward address indexes in bounded batches
+  before serving RPC; retain block hashes, receipts, balances and nonces.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

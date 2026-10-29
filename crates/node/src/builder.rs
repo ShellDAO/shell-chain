@@ -187,6 +187,8 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
             }
         }
 
+        node.chain_store.ensure_system_sender_history()?;
+
         Ok((node, store))
     }
 }

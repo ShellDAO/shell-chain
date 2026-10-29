@@ -308,6 +308,7 @@ mod prefix {
     pub const HASH_BY_NUMBER: &[u8] = b"n/";
     pub const RECEIPTS_BY_HASH: &[u8] = b"r/";
     pub const SYSTEM_TXS_BY_HASH: &[u8] = b"sr/";
+    pub const SYSTEM_SENDER_HISTORY_HEAD: &[u8] = b"sys-sender-history/head";
     pub const TX_INDEX: &[u8] = b"t/";
     pub const HEAD_BLOCK: &[u8] = b"HEAD";
     pub const CHAIN_CONFIG: &[u8] = b"CFG";
@@ -795,7 +796,10 @@ impl<S: KvStore> ChainStore<S> {
 
         for tx in system_txs {
             batch.delete(Self::tx_index_key(&tx.hash()));
-            Self::delete_addr_tx_index(batch, &tx.to, block_number, tx.tx_index);
+            Self::delete_addr_tx_index(batch, &tx.from, block_number, tx.tx_index);
+            if tx.to != tx.from {
+                Self::delete_addr_tx_index(batch, &tx.to, block_number, tx.tx_index);
+            }
         }
     }
 
@@ -1530,10 +1534,129 @@ impl<S: KvStore> ChainStore<S> {
             let mut index_value = block_hash.as_bytes().to_vec();
             index_value.extend_from_slice(&tx.tx_index.to_be_bytes());
             batch.put(Self::tx_index_key(&tx_hash), index_value);
-            Self::append_addr_tx_index(batch, &tx.to, block_number, tx.tx_index, &tx_hash);
+            Self::append_addr_tx_index(batch, &tx.from, block_number, tx.tx_index, &tx_hash);
+            if tx.to != tx.from {
+                Self::append_addr_tx_index(batch, &tx.to, block_number, tx.tx_index, &tx_hash);
+            }
         }
 
         Ok(())
+    }
+
+    /// Repair reward sender history under exclusive startup ownership. Legacy
+    /// databases indexed only recipients. Batches are bounded and idempotent;
+    /// the completion head is recorded only after every canonical row succeeds.
+    pub fn ensure_system_sender_history(&self) -> Result<(), StorageError> {
+        let Some(head) = self.get_head_hash()? else {
+            return Ok(());
+        };
+        if self
+            .store
+            .get(prefix::SYSTEM_SENDER_HISTORY_HEAD)?
+            .as_deref()
+            == Some(head.as_bytes())
+        {
+            return Ok(());
+        }
+        // An older writer may have reorganized a previously repaired database.
+        // Remove stale zero-origin entries without disturbing canonical user
+        // transfers to/from zero or requiring block bodies and witnesses.
+        let zero_prefix = Self::addr_tx_prefix(&Address::ZERO);
+        let mut start = zero_prefix.clone();
+        loop {
+            let rows = self.system_sender_history_chunk(&zero_prefix, &start)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, value) in &rows {
+                let (height, index) = Self::addr_index_key_parts(zero_prefix.len(), key)?;
+                let canonical = if value.len() == 32 {
+                    match self.get_tx_location(&ShellHash::from_slice(value))? {
+                        Some((hash, tx_index)) => {
+                            tx_index == index
+                                && self.get_block_hash_by_number(height)? == Some(hash)
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !canonical {
+                    Self::delete_addr_tx_index(&mut batch, &Address::ZERO, height, index);
+                }
+            }
+            start = rows.last().unwrap().0.clone();
+            start.push(0);
+            if !batch.is_empty() {
+                self.store.write_batch(batch)?;
+            }
+        }
+        let mut start = prefix::SYSTEM_TXS_BY_HASH.to_vec();
+        loop {
+            let rows = self.system_sender_history_chunk(prefix::SYSTEM_TXS_BY_HASH, &start)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, value) in &rows {
+                let bytes = key
+                    .strip_prefix(prefix::SYSTEM_TXS_BY_HASH)
+                    .filter(|bytes| bytes.len() == 32)
+                    .ok_or_else(|| {
+                        StorageError::Serialization("invalid system transaction index key".into())
+                    })?;
+                let block_hash = ShellHash::from_slice(bytes);
+                let transactions: Vec<SystemTransaction> = serde_json::from_slice(value)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
+                for tx in transactions {
+                    if self.get_block_hash_by_number(tx.block_number)? != Some(block_hash) {
+                        continue;
+                    }
+                    let hash = tx.hash();
+                    Self::append_addr_tx_index(
+                        &mut batch,
+                        &tx.from,
+                        tx.block_number,
+                        tx.tx_index,
+                        &hash,
+                    );
+                    if tx.to != tx.from {
+                        Self::append_addr_tx_index(
+                            &mut batch,
+                            &tx.to,
+                            tx.block_number,
+                            tx.tx_index,
+                            &hash,
+                        );
+                    }
+                }
+            }
+            start = rows.last().unwrap().0.clone();
+            start.push(0);
+            if !batch.is_empty() {
+                self.store.write_batch(batch)?;
+            }
+        }
+        self.store
+            .put(prefix::SYSTEM_SENDER_HISTORY_HEAD, head.as_bytes())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn system_sender_history_chunk(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        self.store
+            .visit_prefix_range(prefix, start, None, false, &mut |key, value| {
+                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+                rows.push((key.to_vec(), value.to_vec()));
+                Ok(rows.len() < 128 && bytes < 4 * 1024 * 1024)
+            })?;
+        Ok(rows)
     }
 
     /// Build the batch containing all canonical block artifacts.
@@ -1561,6 +1684,16 @@ impl<S: KvStore> ChainStore<S> {
             block_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::HEAD_BLOCK.to_vec(), block_hash.as_bytes().to_vec());
+        if self
+            .store
+            .get(prefix::SYSTEM_SENDER_HISTORY_HEAD)?
+            .is_some()
+        {
+            batch.put(
+                prefix::SYSTEM_SENDER_HISTORY_HEAD.to_vec(),
+                block_hash.as_bytes().to_vec(),
+            );
+        }
 
         Ok(batch)
     }
@@ -9301,6 +9434,231 @@ mod tests {
         assert_eq!(
             ChainStore::<MemoryDb>::addr_tx_rev_key(&address, 1, 2).len(),
             prefix::ADDR_TX_INDEX_REV.len() + 32 + 8 + 4
+        );
+    }
+
+    #[test]
+    fn system_sender_history_indexes_new_rewards_and_reorg_removal() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(db);
+        let mut block = make_block_with_txs(1);
+        let recipient = Address::from([0x37; 32]);
+        let reward =
+            SystemTransaction::block_gas_reward(1, 1, 1, recipient, U256::from(7), ShellHash::ZERO);
+        let mut stark = SystemTransaction::block_gas_reward(
+            1,
+            1,
+            2,
+            Address::ZERO,
+            U256::from(9),
+            ShellHash::ZERO,
+        );
+        stark.kind = shell_core::SystemTxKind::StarkReward;
+        block.system_transactions = vec![reward.clone(), stark.clone()];
+        cs.commit_canonical_block(&block, None).unwrap();
+        assert_eq!(
+            cs.get_txs_by_address(&Address::ZERO, 1, 1, 0, 10).unwrap(),
+            vec![reward.hash(), stark.hash()]
+        );
+        assert_eq!(cs.count_txs_by_address(&Address::ZERO, 1, 1).unwrap(), 2);
+        assert_eq!(cs.count_txs_by_address(&recipient, 1, 1).unwrap(), 1);
+        cs.delete_block_transaction_indexes(&block.hash()).unwrap();
+        assert_eq!(
+            cs.count_txs_by_address(&Address::ZERO, 0, u64::MAX)
+                .unwrap(),
+            0
+        );
+        cs.index_block_transactions(&block).unwrap();
+        assert_eq!(cs.count_txs_by_address(&Address::ZERO, 1, 1).unwrap(), 2);
+    }
+
+    #[test]
+    fn system_sender_history_repairs_legacy_indexes_without_changing_chain() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let mut block = make_block_with_txs(1);
+        block.transactions[0].tx.to = Some(Address::ZERO);
+        let reward = SystemTransaction::block_gas_reward(
+            1,
+            1,
+            1,
+            Address::from([0x37; 32]),
+            U256::from(7),
+            ShellHash::ZERO,
+        );
+        block.system_transactions.push(reward.clone());
+        cs.commit_canonical_block(&block, None).unwrap();
+        // Existing writers indexed only the recipient of system records.
+        db.delete(&ChainStore::<MemoryDb>::addr_tx_key(&Address::ZERO, 1, 1))
+            .unwrap();
+        db.delete(&ChainStore::<MemoryDb>::addr_tx_rev_key(
+            &Address::ZERO,
+            1,
+            1,
+        ))
+        .unwrap();
+        let orphan = SystemTransaction::block_gas_reward(
+            1,
+            1,
+            2,
+            Address::from([0x38; 32]),
+            U256::from(11),
+            ShellHash::ZERO,
+        );
+        db.put(
+            &ChainStore::<MemoryDb>::system_txs_key(&ShellHash::from([0x99; 32])),
+            &serde_json::to_vec(&vec![orphan]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cs.count_txs_by_address(&Address::ZERO, 1, 1).unwrap(), 1);
+        let header_before = cs.get_header_by_hash(&block.hash()).unwrap();
+        let systems_before = cs.get_system_transactions(&block.hash()).unwrap();
+        cs.ensure_system_sender_history().unwrap();
+        assert_eq!(
+            cs.get_txs_by_address(&Address::ZERO, 1, 1, 0, 10).unwrap(),
+            vec![block.transactions[0].hash(), reward.hash()]
+        );
+        assert_eq!(cs.count_txs_by_address(&Address::ZERO, 1, 1).unwrap(), 2);
+        assert_eq!(cs.get_head_hash().unwrap(), Some(block.hash()));
+        assert_eq!(cs.get_header_by_hash(&block.hash()).unwrap(), header_before);
+        assert_eq!(
+            cs.get_system_transactions(&block.hash()).unwrap(),
+            systems_before
+        );
+        let unchanged = db.scan_prefix(b"").unwrap();
+        cs.ensure_system_sender_history().unwrap();
+        assert_eq!(db.scan_prefix(b"").unwrap(), unchanged);
+        // New canonical commits advance the checkpoint atomically.
+        let next = make_block_with_txs(2);
+        cs.commit_canonical_block(&next, None).unwrap();
+        assert_eq!(
+            db.get(prefix::SYSTEM_SENDER_HISTORY_HEAD).unwrap().unwrap(),
+            next.hash().as_bytes()
+        );
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn system_sender_history_legacy_repair_survives_rocksdb_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut block = make_block_with_txs(1);
+        let reward = SystemTransaction::block_gas_reward(
+            1,
+            1,
+            1,
+            Address::from([0x37; 32]),
+            U256::from(7),
+            ShellHash::ZERO,
+        );
+        block.system_transactions.push(reward.clone());
+        {
+            let stores = crate::RocksDbStore::open_all(directory.path(), None).unwrap();
+            let db = Arc::new(stores.chain);
+            let cs = ChainStore::new(Arc::clone(&db));
+            cs.commit_canonical_block(&block, None).unwrap();
+            let mut legacy = WriteBatch::new();
+            ChainStore::<crate::RocksDbStore>::delete_addr_tx_index(
+                &mut legacy,
+                &Address::ZERO,
+                1,
+                1,
+            );
+            db.write_batch(legacy).unwrap();
+            assert_eq!(cs.count_txs_by_address(&Address::ZERO, 1, 1).unwrap(), 0);
+        }
+        for _ in 0..2 {
+            let stores = crate::RocksDbStore::open_all(directory.path(), None).unwrap();
+            let cs = ChainStore::new(Arc::new(stores.chain));
+            cs.ensure_system_sender_history().unwrap();
+            assert_eq!(
+                cs.get_txs_by_address(&Address::ZERO, 1, 1, 0, 10).unwrap(),
+                vec![reward.hash()],
+            );
+            assert_eq!(cs.get_head_hash().unwrap(), Some(block.hash()));
+            assert_eq!(
+                cs.get_system_transactions(&block.hash()).unwrap(),
+                vec![reward.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn system_sender_history_failed_batches_retry_and_old_writer_reorg_is_repaired() {
+        let db = Arc::new(FailingBatchStore::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        for n in 1..=130 {
+            let mut block = make_block_with_txs(n);
+            let reward = SystemTransaction::block_gas_reward(
+                1,
+                n,
+                1,
+                Address::from([0x37; 32]),
+                U256::from(7),
+                block.header.parent_hash,
+            );
+            block.system_transactions.push(reward);
+            cs.commit_canonical_block(&block, None).unwrap();
+            db.delete(&ChainStore::<FailingBatchStore>::addr_tx_key(
+                &Address::ZERO,
+                n,
+                1,
+            ))
+            .unwrap();
+            db.delete(&ChainStore::<FailingBatchStore>::addr_tx_rev_key(
+                &Address::ZERO,
+                n,
+                1,
+            ))
+            .unwrap();
+        }
+        db.fail_batch_after(1);
+        assert!(cs.ensure_system_sender_history().is_err());
+        assert!(db
+            .get(prefix::SYSTEM_SENDER_HISTORY_HEAD)
+            .unwrap()
+            .is_none());
+        db.fail_batch_after(usize::MAX);
+        cs.ensure_system_sender_history().unwrap();
+        assert_eq!(
+            cs.count_txs_by_address(&Address::ZERO, 1, 130).unwrap(),
+            130
+        );
+        // Simulate an older writer replacing the tip without maintaining the
+        // new sender index or its checkpoint.
+        let old_hash = cs.get_block_hash_by_number(130).unwrap().unwrap();
+        let old_reward = cs.get_system_transactions(&old_hash).unwrap()[0].clone();
+        db.delete(&ChainStore::<FailingBatchStore>::tx_index_key(
+            &old_reward.hash(),
+        ))
+        .unwrap();
+        let mut replacement = make_block_with_txs(130);
+        replacement.header.extra_data = Bytes::from_static(b"replacement");
+        let reward = SystemTransaction::block_gas_reward(
+            1,
+            130,
+            1,
+            Address::from([0x38; 32]),
+            U256::from(13),
+            ShellHash::ZERO,
+        );
+        replacement.system_transactions.push(reward.clone());
+        cs.put_block(&replacement).unwrap();
+        db.put(
+            &ChainStore::<FailingBatchStore>::system_txs_key(&replacement.hash()),
+            &serde_json::to_vec(&replacement.system_transactions).unwrap(),
+        )
+        .unwrap();
+        cs.set_canonical(130, &replacement.hash()).unwrap();
+        cs.set_head(&replacement.hash()).unwrap();
+        cs.ensure_system_sender_history().unwrap();
+        assert_eq!(
+            cs.get_txs_by_address(&Address::ZERO, 130, 130, 0, 10)
+                .unwrap(),
+            vec![reward.hash()]
+        );
+        assert_eq!(
+            cs.count_txs_by_address(&Address::ZERO, 1, 130).unwrap(),
+            130
         );
     }
 

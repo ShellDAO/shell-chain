@@ -41,6 +41,7 @@ const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
+const rewardHistoryScenario = process.argv.includes("--reward-history");
 const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: rewardHistoryScenario ? "reward-history" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +151,10 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (rewardHistoryScenario) {
+    (result.exits ??= []).push({ label: nodeLogLabels[i], pid: child.pid, code: child.exitCode, signal: child.signalCode });
+    assert.equal(child.exitCode, 0, "reward acceptance node exits cleanly");
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -608,6 +613,95 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (rewardHistoryScenario) {
+    const zero = "0x" + "00".repeat(32);
+    const initial = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+    const rewards = [];
+    for (const value of [10n, 11n]) {
+      const signed = await miner.buildSignedTransaction({
+        tx: buildTransaction({ chainId: 1337, nonce: height, to: outsider.getAddress(), value, gasLimit: 100000 }),
+        includePublicKey: true,
+      });
+      const hash = await paced(() => providers[0].sendTransaction(signed));
+      let receipt;
+      for (let k = 0; k < 160; k++) {
+        receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        if (receipt) break;
+        await pause(250);
+      }
+      assert.equal(receipt?.status, "0x1");
+      height++;
+      assert.equal(Number(BigInt(receipt.blockNumber)), height);
+      result.transactions.push({ hash, receipt });
+      await compare(hash);
+      const block = await rpc(0, "eth_getBlockByNumber", [receipt.blockNumber, true]);
+      const reward = block.transactions.filter(tx => tx.shellType === "blockGasReward");
+      assert.equal(reward.length, 1);
+      assert.equal(block.transactions.filter(tx => tx.shellType !== "blockGasReward" && tx.shellType !== "starkReward").length, 1);
+      const user = await rpc(0, "eth_getTransactionByHash", [hash]);
+      const offered = BigInt(block.baseFeePerGas) + BigInt(user.maxPriorityFeePerGas);
+      const cap = BigInt(user.maxFeePerGas);
+      const price = offered < cap ? offered : cap;
+      assert.equal(BigInt(receipt.effectiveGasPrice), price);
+      assert.equal(BigInt(reward[0].value), BigInt(receipt.gasUsed) * price);
+      assert.equal(reward[0].from, zero);
+      assert.equal(reward[0].to, block.miner);
+      assert.equal(reward[0].rewardSourceHash, block.parentHash);
+      rewards.push(reward[0]);
+    }
+    async function qualify(index) {
+      const before = await state(index);
+      const head = await rpc(index, "eth_getBlockByNumber", ["latest", false]);
+      assert.equal(BigInt(before.outsiderBalance), initial + 21n);
+      assert.equal(BigInt(before.minerNonce), 2n);
+      for (const reward of rewards) {
+        assert.deepEqual(await rpc(index, "eth_getTransactionByHash", [reward.hash]), reward);
+        const receipt = await rpc(index, "eth_getTransactionReceipt", [reward.hash]);
+        assert.equal(receipt.status, "0x1");
+        assert.equal(BigInt(receipt.gasUsed), 0n);
+        assert.equal(receipt.blockHash, reward.blockHash);
+        assert.equal(receipt.transactionHash, reward.hash);
+        const summary = await rpc(index, "shell_getTransactionSummary", [reward.hash, { includeReceipt: true }]);
+        assert.deepEqual(summary.receipt, receipt);
+        for (const address of [reward.from, reward.to]) {
+          const history = await rpc(index, "shell_getTransactionsByAddress", [address, Number(BigInt(reward.blockNumber)), Number(BigInt(reward.blockNumber)), 0, 100]);
+          assert.equal(history.transactions.filter(tx => tx.hash === reward.hash).length, 1);
+        }
+      }
+      const history = await rpc(index, "shell_getTransactionsByAddress", [zero, 0, null, 0, 20]);
+      assert.equal(history.total, 2);
+      assert.deepEqual(new Set(history.transactions.map(tx => tx.hash)), new Set(rewards.map(tx => tx.hash)));
+      const found = [];
+      let cursor;
+      do {
+        const page = await rpc(index, "shell_getTransactionsByAddressV2", [zero, { limit: 1, includeTotal: true, ...(cursor ? { cursor } : {}) }]);
+        assert.equal(page.total, 2);
+        assert.equal(page.items.length, 1);
+        found.push(page.items[0].hash);
+        cursor = page.nextCursor;
+      } while (cursor && found.length < 3);
+      assert.equal(cursor, null);
+      assert.equal(found.length, 2);
+      assert.deepEqual(new Set(found), new Set(rewards.map(tx => tx.hash)));
+      const summary = await rpc(index, "shell_getAddressSummary", [zero, { recentLimit: 10, includeTotal: true }]);
+      assert.equal(summary.totalTransactions, 2);
+      assert.deepEqual(new Set(summary.recentTransactions.items.map(tx => tx.hash)), new Set(found));
+      assert.deepEqual(await state(index), before, "reward discovery preserves balances, nonces and policy");
+      assert.deepEqual(await rpc(index, "eth_getBlockByNumber", ["latest", false]), head);
+      return { head, before, history, found, summary };
+    }
+    const expected = await qualify(0);
+    assert.deepEqual(await qualify(1), expected, "independent import shares canonical reward history");
+    await stop(1);
+    await stop(0);
+    await start(0, dirs[0], keyPath, "reward-reopened-producer");
+    await start(1, dirs[1], followerKey, "reward-reopened-follower");
+    assert.deepEqual(await qualify(0), expected);
+    assert.deepEqual(await qualify(1), expected);
+    result.rewardHistory = { rewards, expected, reopened: true };
+    result.passed = true;
+    return;
+  }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

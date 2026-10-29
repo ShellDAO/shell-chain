@@ -1621,6 +1621,34 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
 
 ### shell_getTransactionsByAddress
 
+Unreleased node source includes native reward records for both their `from`
+(system origin, currently the zero address) and `to` addresses. A reward appears
+once when both addresses are equal. This also applies to v2 cursor history and
+address-summary totals. Published v0.27.13 indexes only reward recipients;
+querying its zero-address history can omit rewards otherwise visible by hash.
+Upgrading repairs retained canonical reward indexes before RPC starts. Queries
+remain read-only; chain identity, reward amounts, receipts and account state are
+unchanged. The repair retries safely after failure and skips completed work at an
+unchanged head. This source correction is not a published-version guarantee.
+
+Run the isolated native reward regression with a node built with RocksDB and
+libp2p and a compatible SDK (`0.14.0-rc.3` tested):
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --reward-history
+cargo test -p shell-storage --features rocksdb system_sender_history -- --nocapture
+```
+
+The native run creates temporary keys and funded local accounts, signs two
+transfers, checks rewards against actual charged fees, compares producer and
+independent follower history, then reopens both databases. It also checks cursor
+pages, summaries and unchanged balances/nonces after reads. Storage regressions
+cover legacy-index repair, interrupted batches and orphan removal. This does not
+exercise real STARK proof settlement or activate a live network.
+
 Returns transactions sent from or received by an address. Supports pagination
 and inclusive block-range filters. There is no artificial deep-offset cap; under
 live load, clients should pin `toBlock` from the first page and reuse it for
@@ -1630,8 +1658,9 @@ Unreleased node source accepts legacy offsets above 10,000 and exact totals over
 ranges spanning more than 10,000 blocks, including the default `0` through latest
 range. Pages past the exact range total return an empty `transactions` list while
 retaining pagination metadata. Overflowing `page * limit` remains invalid. Counts
-and pages use the existing retained address index without query writes or an index
-migration. The v2 address-history and address-summary methods use the same exact
+and pages use the existing retained address index without query writes. These
+range and offset corrections require no index migration; the reward repair above
+is separate. The v2 address-history and address-summary methods use the same exact
 counter when `includeTotal` is enabled. Published node versions must be checked
 before relying on these corrections.
 
