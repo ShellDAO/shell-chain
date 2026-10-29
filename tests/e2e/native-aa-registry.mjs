@@ -8,7 +8,7 @@ import { openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { createServer } from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -33,9 +33,10 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
-const feeContextScenario = process.argv.includes("--fee-context") || process.argv.includes("--fee-context-legacy-address");
+const affordableFeeScenario = process.argv.includes("--fee-context-affordable") || process.argv.includes("--fee-context-affordable-legacy-address");
+const feeContextScenario = affordableFeeScenario || process.argv.includes("--fee-context") || process.argv.includes("--fee-context-legacy-address");
 const gasEstimateScenario = feeContextScenario || process.argv.includes("--gas-estimate") || process.argv.includes("--gas-estimate-legacy-address");
-const gasEstimateLegacy = process.argv.includes("--gas-estimate-legacy-address") || process.argv.includes("--fee-context-legacy-address");
+const gasEstimateLegacy = process.argv.includes("--gas-estimate-legacy-address") || process.argv.includes("--fee-context-legacy-address") || process.argv.includes("--fee-context-affordable-legacy-address");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -217,7 +218,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   nodes[i] = child;
   if (gasEstimateScenario) {
     result.opens ??= [];
-    result.opens.push({ pid: child.pid, argv: args, startedAt: new Date().toISOString() });
+    result.opens.push({ pid: child.pid, argv: args, binarySha256: createHash("sha256").update(await readFile(binary)).digest("hex"), startedAt: new Date().toISOString() });
     await save();
   }
   nodeLogLabels[i] = label;
@@ -545,12 +546,14 @@ async function runScenario() {
     await start(1, dirs[1], followerKey, "follower", bootnode);
     await peerReady();
     const address = (index) => "0x" + (0x35 + index).toString(16).repeat(32);
+    let affordableSigner;
     const stateAt = async (i) => ({
       head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
       balance: await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"]),
       miner: await rpc(i, "eth_getBalance", [miner.getAddress(), "latest"]),
       nonce: await rpc(i, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
       slots: await Promise.all([0, 1, 2, 3, 4].map((n) => rpc(i, "eth_getStorageAt", [address(n), "0x0", "latest"]))),
+      ...(affordableSigner ? { affordableBalance: await rpc(i, "eth_getBalance", [affordableSigner.getAddress(), "latest"]), affordableNonce: await rpc(i, "eth_getTransactionCount", [affordableSigner.getAddress(), "latest"]) } : {}),
       ...(feeContextScenario ? { contractBalances: await Promise.all([0, 1, 2, 3, 4].map((n) => rpc(i, "eth_getBalance", [address(n), "latest"]))) } : {}),
     });
     const request = (index, extra = {}) => ({ from: outsider.getAddress(), to: address(index), data: "0x", value: "0x0", ...extra });
@@ -565,16 +568,18 @@ async function runScenario() {
       await save();
       return { value, error };
     };
-    const send = async (label, input, gas, expected, expectedSlot) => {
+    const send = async (label, input, gas, expected, expectedSlot, signer = outsider) => {
       const before = await stateAt(0);
+      const payerBefore = await rpc(0, "eth_getBalance", [signer.getAddress(), "latest"]);
+      const payerNonce = await rpc(0, "eth_getTransactionCount", [signer.getAddress(), "latest"]);
       const priority = input.gasPrice ?? input.maxPriorityFeePerGas ?? "0x0";
       const maximum = input.gasPrice ?? input.maxFeePerGas ?? (feeContextScenario
         ? "0x" + (BigInt(before.head.baseFeePerGas) + BigInt(priority)).toString(16) : "0x3b9aca00");
-      const tx = buildTransaction({ chainId: 1337, nonce: Number(BigInt(before.nonce)), to: input.to,
+      const tx = buildTransaction({ chainId: 1337, nonce: Number(BigInt(payerNonce)), to: input.to,
         data: input.data, value: BigInt(input.value), gasLimit: Number(BigInt(gas)), maxFeePerGas: Number(BigInt(maximum)), maxPriorityFeePerGas: Number(BigInt(priority)) });
-      const signed = await outsider.buildSignedTransaction({ tx, includePublicKey: true });
+      const signed = await signer.buildSignedTransaction({ tx, includePublicKey: true });
       const hash = await paced(() => providers[0].sendTransaction(signed));
-      const entry = { label, input, gas, signed, hash, before };
+      const entry = { label, input, gas, signed, hash, before, payerBefore, payerNonce };
       result.transactions.push(entry);
       await save();
       for (let n = 0; n < 160; n++) {
@@ -588,9 +593,10 @@ async function runScenario() {
       entry.after = await stateAt(0);
       entry.trace = await rpc(0, "debug_traceTransaction", [hash, { tracer: "callTracer" }]);
       const fee = BigInt(entry.receipt.gasUsed) * BigInt(entry.receipt.effectiveGasPrice);
-      assert.equal(BigInt(before.balance) - BigInt(entry.after.balance), fee + (expected === "0x1" ? BigInt(input.value) : 0n));
+      entry.payerAfter = await rpc(0, "eth_getBalance", [signer.getAddress(), "latest"]);
+      assert.equal(BigInt(payerBefore) - BigInt(entry.payerAfter), fee + (expected === "0x1" ? BigInt(input.value) : 0n));
       assert.equal(BigInt(entry.after.miner) - BigInt(before.miner), fee);
-      assert.equal(BigInt(entry.after.nonce), BigInt(before.nonce) + 1n);
+      assert.equal(BigInt(await rpc(0, "eth_getTransactionCount", [signer.getAddress(), "latest"])), BigInt(payerNonce) + 1n);
       const slot = typeof expectedSlot === "function" ? expectedSlot(entry.receipt) : expectedSlot;
       assert.equal(await rpc(0, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(slot));
       for (let n = 0; n < 160; n++) {
@@ -609,6 +615,7 @@ async function runScenario() {
       const price = (input, head) => input.gasPrice !== undefined ? BigInt(input.gasPrice)
         : [BigInt(input.maxFeePerGas ?? (BigInt(head.baseFeePerGas) + BigInt(input.maxPriorityFeePerGas ?? 0))),
            BigInt(head.baseFeePerGas) + BigInt(input.maxPriorityFeePerGas ?? 0)].reduce((a, b) => a < b ? a : b);
+      if (!affordableFeeScenario) {
       for (const fees of [legacy, dynamic, { maxFeePerGas: "0x77359400" }, { maxPriorityFeePerGas: "0x2" }]) {
         const input = request(0, { gas: "0x30d40", ...fees });
         const before = await stateAt(0);
@@ -664,6 +671,29 @@ async function runScenario() {
         }
       }
       assert.deepEqual(await stateAt(0), before);
+      } else {
+        const key = join(out, "affordable-owner.json");
+        const generated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", key], { encoding: "utf8" });
+        assert.equal(generated.status, 0, generated.stderr);
+        affordableSigner = await decryptKeystore(JSON.parse(await readFile(key, "utf8")), password);
+        signers.push(affordableSigner);
+        const budget = 200000000000000n;
+        await send("fund affordable fee sender", { to: affordableSigner.getAddress(), data: "0x", value: "0x" + budget.toString(16), ...legacy }, "0x5208", "0x1", 0);
+        for (const value of [0n, 11n]) {
+          const input = request(0, { from: affordableSigner.getAddress(), value: "0x" + value.toString(16), ...legacy });
+          const balance = BigInt(await rpc(0, "eth_getBalance", [affordableSigner.getAddress(), "latest"]));
+          const maximum = (balance - value) / 2000000000n;
+          const quote = await estimate(input);
+          assert.ok(quote.value, "default gas cap must not reject an affordable transaction");
+          assert.ok(BigInt(quote.value) <= maximum, "reserve transfer value before allocating gas");
+          await send("affordable estimate with value " + value, input, quote.value, "0x1", 2000000000n, affordableSigner);
+        }
+        const balance = BigInt(await rpc(0, "eth_getBalance", [affordableSigner.getAddress(), "latest"]));
+        const base = request(0, { from: affordableSigner.getAddress(), ...legacy });
+        assert.ok((await estimate({ ...base, value: "0x" + (balance + 1n).toString(16) })).error);
+        assert.ok((await estimate({ ...base, gasPrice: "0xffffffffffffffff" })).error);
+        assert.equal(await rpc(0, "eth_getBalance", [address(0), "latest"]), "0xb");
+      }
       const verify = async () => {
         for (const i of [0, 1]) {
           const before = await stateAt(i);
@@ -686,7 +716,7 @@ async function runScenario() {
       assert.ok(peer);
       await start(1, dirs[1], followerKey, "fee-follower-reopen", peer);
       await peerReady(); await verify();
-      result.feeContext = { legacyAddressContext: gasEstimateLegacy, finalHeight: height, historyAfterLivePriceAndStateChangeAndReopen: true };
+      result.feeContext = { affordableOnly: affordableFeeScenario, legacyAddressContext: gasEstimateLegacy, finalHeight: height, historyAfterLivePriceAndStateChangeAndReopen: true };
       result.passed = true;
       return;
     }

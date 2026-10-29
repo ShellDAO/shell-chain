@@ -690,6 +690,13 @@ maximum is invalid. In the reconciled-fee profile, `GASPRICE` is
 `min(maxFeePerGas, baseFeePerGas + maxPriorityFeePerGas)`; existing legacy execution
 pricing remains unchanged before that profile's activation.
 
+For estimation with an explicit nonzero maximum fee, the search cap also respects
+`floor((senderBalance - value) / maximumFeePerGas)` at the captured state root.
+This reserves transfer value and prevents an unaffordable default block-sized
+probe from rejecting a transaction that the account can actually pay for. A
+budget below the required execution gas remains an error; no balance is added
+to the simulated account.
+
 Omitting all three fields preserves the zero-priced simulation default. Such a
 call can use an unfunded sender when `value` is zero. Nonzero value still requires
 funds. Explicit fees use normal balance checks on private execution state; calls
@@ -712,6 +719,8 @@ With a node built using `--features libp2p` and a compatible built SDK:
 ```bash
 SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context
 SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context-legacy-address
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context-affordable
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js node tests/e2e/native-aa-registry.mjs --fee-context-affordable-legacy-address
 ```
 
 The signed regression checks legacy and dynamic prices, price-dependent storage

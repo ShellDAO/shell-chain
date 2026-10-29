@@ -556,7 +556,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
     fn estimate_call_gas(&self, req: &crate::types::CallRequest) -> Result<u64, ErrorObjectOwned> {
         let (root, header) = self.capture_call_state(None)?;
-        let upper = req
+        let mut upper = req
             .gas
             .as_deref()
             .map(parse_hex_u64)
@@ -564,6 +564,32 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             .unwrap_or_else(|| header.as_ref().map_or(30_000_000, |h| h.gas_limit))
             .min(50_000_000)
             .min(header.as_ref().map_or(30_000_000, |h| h.gas_limit));
+        let (maximum_fee, _) = Self::call_fee_caps(
+            req,
+            header.as_ref().map_or(0, |header| header.base_fee_per_gas),
+        )?;
+        if maximum_fee != 0 {
+            let state = WorldState::at_root(self.chain_store.store().clone(), &root)
+                .map_err(internal_err)?;
+            let balance = state
+                .get_balance(&req.from.unwrap_or(Address::ZERO))
+                .map_err(internal_err)?;
+            let value = req
+                .value
+                .as_deref()
+                .map(parse_hex_u256)
+                .transpose()?
+                .unwrap_or(U256::ZERO);
+            if value > balance {
+                return Err(ErrorObjectOwned::owned(
+                    crate::error::SERVER_ERROR,
+                    "insufficient funds for transfer value",
+                    None::<String>,
+                ));
+            }
+            let allowance = (balance - value) / U256::from(maximum_fee);
+            upper = upper.min(u64::try_from(allowance).unwrap_or(u64::MAX));
+        }
         // Every probe uses fresh private state at the same root/header. Bound
         // cumulative work too; a failed probe is charged its entire gas cap.
         let mut remaining = 50_000_000_u64;
@@ -6131,6 +6157,55 @@ mod tests {
                 before
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_fee_estimation_uses_affordable_limit_after_value() {
+        let handler = setup();
+        let from = test_address(b"affordable-fee-caller");
+        let to = test_address(b"affordable-fee-contract");
+        let code = hex::decode("3a805f555f5260205ff3").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        {
+            let mut state = handler.world_state.write();
+            state.set_code_hash(&to, hash).unwrap();
+            state.set_balance(&from, U256::from(600_000)).unwrap();
+            state.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let mut request = crate::types::CallRequest {
+            from: Some(from),
+            to: Some(to),
+            gas_price: Some("0xa".into()),
+            value: Some("0x1".into()),
+            ..Default::default()
+        };
+        for cap in [None, Some(hex_u64(200_000))] {
+            request.gas = cap;
+            let estimate = EthApiServer::estimate_gas(&handler, request.clone())
+                .await
+                .unwrap();
+            let gas = parse_hex_u64(&estimate).unwrap();
+            assert!(gas <= 59_999, "reserve value before allocating gas");
+            let mut actual = request.clone();
+            actual.gas = Some(estimate);
+            assert_eq!(
+                EthApiServer::call(&handler, actual, None).await.unwrap(),
+                format!("0x{:064x}", 10)
+            );
+        }
+        request.value = Some(hex_u64(600_001));
+        assert!(EthApiServer::estimate_gas(&handler, request.clone())
+            .await
+            .is_err());
+        request.value = None;
+        request.gas_price = Some(hex_u64(u64::MAX));
+        assert!(EthApiServer::estimate_gas(&handler, request).await.is_err());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

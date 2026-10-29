@@ -9,7 +9,9 @@ All notable changes to this project will be documented in this file.
 - Honor explicit legacy gas prices and dynamic fee caps in read-only calls,
   gas estimates and access-list discovery. Preserve the requested `GASPRICE`
   execution path and reject conflicting or invalid fee fields; omitted fees
-  retain the zero-price default and canonical state remains unchanged.
+  retain the zero-price default and canonical state remains unchanged. Limit
+  estimation probes to affordable gas after reserving transfer value, so a
+  block-sized default does not reject a transaction the sender can pay for.
 
 - Return a simulated passing gas limit for contracts that branch on remaining
   gas. Preserve the usual 20% gross-consumption recommendation when it succeeds;

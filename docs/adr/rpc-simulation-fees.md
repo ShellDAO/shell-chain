@@ -19,6 +19,12 @@ defaults to zero; a priority-only request derives its maximum from the captured
 header's base fee plus priority, using checked u64 arithmetic. Reject mixed
 legacy/dynamic fields, invalid quantities and priority above maximum.
 
+For gas estimation, cap probes by available balance after reserving value,
+divided by the explicit nonzero maximum fee. Read that balance from the captured
+root, preserving the same snapshot across all probes. A caller can afford the
+actual transaction even when it cannot reserve a full block's gas. Do not add
+artificial balance to make such a probe pass.
+
 Keep zero caps when all fee fields are omitted. Preserve existing execution
 profiles, fee accounting, nonce handling and block-header selection. Supplied
 fees use the existing execution balance checks; no artificial balance top-up,
