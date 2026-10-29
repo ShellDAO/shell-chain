@@ -630,3 +630,46 @@ The existing paymaster ABI and activation policies are unchanged, including its
 retained `address` argument mapping. No simulation writes are committed.
 Acceptance does not verify signatures, sender nonce, funding or full bundle
 validity, and cannot guarantee sponsorship at a later inclusion state or height.
+
+
+## Sequential AA batch gas estimation
+
+`shell_estimateBatch` accepts `from` and an ordered `inner_calls` list. With the
+unreleased sequential simulation correction, omitting any `gas_limit` executes
+the entire batch on private state. For example, a first call can store a value
+that a later call requires. Explicit-cap calls also execute in that mode, so
+mixed requests retain the same dependencies and reject a restrictive supplied cap.
+
+Missing caps use gross execution gas plus 20% (minimum 21,000); a storage refund
+cannot finance execution. All-explicit requests retain structural budget-only
+behavior. Inspect `simulation_status` (`simulated` or `budget_only`) and the
+existing per-inner flags. Published v0.27.13 simulates missing caps separately;
+a dependent batch may succeed on chain while estimation rejects a later call.
+
+Simulation uses one current-state snapshot and the next candidate height, with
+other block fields from the selected head. Its cumulative work is bounded by the
+block gas limit and 50,000,000 gas ceiling. State, native metadata, runtime
+algorithm policy, balances and nonce are never published by the request.
+Signatures, custom authentication, sponsorship, admission and future inclusion
+are not guaranteed; the structural total is not an exact fee quote. This change
+does not alter signing domains, transaction execution or validation-gas policy.
+
+Use Node.js 24 or newer and a built compatible SDK (`0.14.0-rc.3`), with that
+checkout's `dist/index.js` available. From the node repository:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --batch-estimate
+NODE_BIN=target/debug/shell-node \
+  SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --batch-estimate-legacy-address
+```
+
+The entry creates fresh keys and two isolated RocksDB nodes. It checks dependent
+and reversed batches, mixed caps, gross gas under refunds, private native policy,
+actual signed batches using estimated inner caps, failed-batch rollback, fees and
+nonce, independent import, changed-state history and both databases reopened.
+Raw genesis runtimes isolate execution from CREATE; one authority and a follower
+do not establish production quorum or all algorithm/profile combinations.

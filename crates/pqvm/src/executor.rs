@@ -78,6 +78,12 @@ pub struct TxExecutionResult {
     pub system_contract_effects: SystemContractEffects,
 }
 
+struct AaGasMeter {
+    limit: u64,
+    spent: u64,
+    per_inner: Vec<u64>,
+}
+
 /// High-level PQVM/revm execution adapter for shell-chain.
 ///
 /// Wraps revm and provides:
@@ -87,6 +93,7 @@ pub struct ShellPqvm<S: KvStore + 'static> {
     state_db: ShellStateDb<S>,
     chain_id: u64,
     tracer: Option<ExecutionTracer>,
+    aa_gas_meter: Option<AaGasMeter>,
 }
 
 const OPCODE_CALLCODE: u8 = 0xF2;
@@ -186,6 +193,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             state_db,
             chain_id,
             tracer: None,
+            aa_gas_meter: None,
         }
     }
 
@@ -598,6 +606,25 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         &mut self.state_db
     }
 
+    /// Execute prevalidated AA on caller-owned private state, collecting gross
+    /// inner gas without opcode tracing. The aggregate work cap includes outer
+    /// intrinsic gas. Normal execution never installs this meter.
+    pub fn execute_aa_bundle_metered(
+        &mut self,
+        tx: &shell_core::SignedTransaction,
+        header: &BlockHeader,
+        gas_cap: u64,
+    ) -> Result<(TxExecutionResult, Vec<u64>), ExecutorError> {
+        self.aa_gas_meter = Some(AaGasMeter {
+            limit: gas_cap,
+            spent: 0,
+            per_inner: Vec::new(),
+        });
+        let result = self.execute_aa_bundle(tx, header, 0, 0);
+        let meter = self.aa_gas_meter.take().expect("AA gas meter installed");
+        result.map(|result| (result, meter.per_inner))
+    }
+
     /// Execute an AA bundle (`tx_type == 0x7E`) atomically.
     ///
     /// Pre-conditions: the caller MUST have already run
@@ -724,6 +751,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             self.chain_id,
         );
         staged.tracer = self.tracer.take();
+        staged.aa_gas_meter = self.aa_gas_meter.take();
         let result = staged.execute_aa_bundle_inner(
             signed_tx,
             header,
@@ -733,6 +761,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             native_validator_registry,
         );
         self.tracer = staged.tracer.take();
+        self.aa_gas_meter = staged.aa_gas_meter.take();
         let result = result?;
         if result.receipt.succeeded() {
             let root = staged.state_db.world_state_mut().state_root()?;
@@ -919,6 +948,14 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 .checked_add(bundle.intrinsic_gas_surcharge())
                 .ok_or_else(|| ExecutorError::Revm("aa bundle intrinsic gas overflow".into()))?;
         let mut total_gas_spent = total_gas_used;
+        if let Some(meter) = self.aa_gas_meter.as_mut() {
+            meter.spent = total_gas_spent;
+            if meter.spent >= meter.limit {
+                return Err(ExecutorError::Revm(
+                    "AA simulation gas cap exhausted".into(),
+                ));
+            }
+        }
         let indexed_native_events = self
             .state_db
             .chain_store()
@@ -931,6 +968,16 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut native_effects = SystemContractEffects::default();
 
         for inner in &bundle.inner_calls {
+            let mut limited;
+            let inner = if let Some(meter) = self.aa_gas_meter.as_ref() {
+                limited = inner.clone();
+                limited.gas_limit = limited
+                    .gas_limit
+                    .min(meter.limit.saturating_sub(meter.spent));
+                &limited
+            } else {
+                inner
+            };
             if let Some(target) = inner.to.filter(|target| {
                 (native_account_manager && *target == system_contracts::account_manager_address())
                     || (native_validator_registry
@@ -962,6 +1009,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     .map_or(SYSTEM_CALL_BASE_GAS, |result| result.gas_used);
                 let used = required_gas.min(budget);
                 total_gas_used = total_gas_used.saturating_add(used);
+                if let Some(meter) = self.aa_gas_meter.as_mut() {
+                    meter.spent = meter.spent.saturating_add(used);
+                    meter.per_inner.push(used);
+                }
                 total_gas_spent = total_gas_spent.saturating_add(used);
                 let (output, failed) = match outcome {
                     Ok(outcome) if required_gas <= budget => {
@@ -1108,6 +1159,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
             }
             let inner_gas = exec_result.gas().used();
             total_gas_spent = total_gas_spent.saturating_add(exec_result.gas().spent());
+            if let Some(meter) = self.aa_gas_meter.as_mut() {
+                meter.spent = meter.spent.saturating_add(exec_result.gas().spent());
+                meter.per_inner.push(exec_result.gas().spent());
+            }
             total_gas_used = total_gas_used.saturating_add(inner_gas);
 
             match &exec_result {

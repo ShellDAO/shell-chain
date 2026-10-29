@@ -384,14 +384,14 @@ pub struct CallRequest {
 /// Request object for `shell_estimateBatch`.
 ///
 /// Estimates gas for a Native-AA bundle (tx_type = `0x7E`) without requiring
-/// the caller to sign or assemble the full `AaBundle`. Structural only: the
-/// return value reflects admission-layer arithmetic
-/// (`outer_intrinsic + Σ inner.gas_limit + (n-1) × AA_INNER_CALL_INTRINSIC_GAS`)
-/// plus, when an inner call's `gas_limit` is omitted, a per-inner simulation
-/// using `eth_call`-style execution (with a 20% buffer, minimum 21,000).
+/// the caller to sign or assemble the full `AaBundle`. All-explicit caps retain
+/// structural arithmetic. If any cap is omitted, execute the whole ordered AA
+/// batch on one private snapshot, including explicit-cap prefixes. Missing caps
+/// use gross inner gas plus 20% (minimum 21,000); refunds do not fund execution.
+/// Authentication and sponsorship are not validated by this unsigned simulation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchEstimateRequest {
-    /// Nominal sender (caller) for per-inner simulation. Defaults to zero.
+    /// Sender for ordered private simulation. Defaults to zero.
     pub from: Option<Address>,
     /// Optional paymaster address. Purely informational for the estimate; the
     /// returned gas bound does not change based on paymaster presence.

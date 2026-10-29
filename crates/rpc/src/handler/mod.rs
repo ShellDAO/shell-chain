@@ -712,6 +712,97 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         ))
     }
 
+    /// Run the real AA executor against one root and private metadata overlay.
+    /// No signatures or paymaster policy are validated by this unsigned request.
+    fn simulate_batch(
+        &self,
+        from: Address,
+        calls: Vec<shell_core::InnerCall>,
+    ) -> Result<Vec<u64>, ErrorObjectOwned> {
+        let (root, mut header) = {
+            let mut state = self.world_state.write();
+            let header = match self.chain_store.get_head_hash().map_err(internal_err)? {
+                Some(hash) => self
+                    .chain_store
+                    .get_header_by_hash(&hash)
+                    .map_err(internal_err)?
+                    .ok_or_else(|| internal_err("canonical head header is missing"))?,
+                None => BlockHeader {
+                    gas_limit: 30_000_000,
+                    ..BlockHeader::default()
+                },
+            };
+            (state.state_root().map_err(internal_err)?, header)
+        };
+        // Bind the current root to the next candidate's activation height. Time
+        // and other block fields retain the selected head's values.
+        header.number = header
+            .number
+            .checked_add(1)
+            .ok_or_else(|| server_error("candidate height overflow"))?;
+        let gas_cap = header.gas_limit.min(50_000_000);
+        let gas_limit = calls
+            .iter()
+            .try_fold(gas_cap, |total, call| total.checked_add(call.gas_limit))
+            .ok_or_else(|| invalid_params_err("estimateBatch: inner gas total overflow"))?;
+        let value = calls
+            .iter()
+            .try_fold(U256::ZERO, |total, call| total.checked_add(call.value))
+            .ok_or_else(|| invalid_params_err("estimateBatch: inner value total overflow"))?;
+        let overlay = Arc::new(shell_storage::OverlayStore::new(
+            self.chain_store.store().clone(),
+        ));
+        let state = WorldState::at_root(overlay.clone(), &root).map_err(internal_err)?;
+        let nonce = state.get_nonce(&from).map_err(internal_err)?;
+        let registry = shell_pqvm::load_algorithm_registry(&state).map_err(internal_err)?;
+        let tx = Transaction {
+            chain_id: self.chain_id,
+            nonce,
+            gas_limit,
+            value,
+            tx_type: shell_core::AA_BUNDLE_TX_TYPE,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            to: None,
+            data: Bytes::new(),
+            access_list: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signed = SignedTransaction::with_aa_bundle(
+            from,
+            tx,
+            shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+            shell_core::PubkeyMode::Reference,
+            shell_core::AaBundle {
+                inner_calls: calls,
+                ..Default::default()
+            },
+        )
+        .map_err(invalid_params_err)?;
+        let mut executor = ShellPqvm::new(
+            ShellStateDb::new(state, ChainStore::new(overlay)),
+            self.chain_id,
+        );
+        // Native governance calls may update runtime policy. Confine those
+        // changes to this synchronous branch as well as isolating store writes.
+        let (result, per_inner) = shell_crypto::with_algorithm_registry_override(&registry, || {
+            executor.execute_aa_bundle_metered(&signed, &header, gas_cap)
+        })
+        .map_err(|error| server_error(format!("estimateBatch: simulation failed: {error}")))?;
+        if !result.receipt.succeeded() {
+            return Err(ErrorObjectOwned::owned(
+                crate::error::SERVER_ERROR,
+                format!(
+                    "estimateBatch: simulation for inner[{}] failed",
+                    per_inner.len().saturating_sub(1)
+                ),
+                Some(hex_bytes(&result.output)),
+            ));
+        }
+        Ok(per_inner)
+    }
+
     /// Parse a block number string with finality awareness.
     /// Returns `None` for "latest"/"pending" (= head), `Some(n)` for specific numbers.
     /// "finalized" and "safe" resolve to the shared finalized block number.
@@ -11212,6 +11303,298 @@ mod tests {
             data: None,
             gas_limit: gas_limit.map(|g| format!("{:#x}", g)),
         }
+    }
+
+    fn estimate_sequence_fixture(native: bool) -> (RpcHandler<MemoryDb>, Address, Address) {
+        let handler = setup();
+        let sender = Address::from([0x42; 32]);
+        let target = Address::from([0x35; 32]);
+        let code = hex::decode("3615600a575f355f55005b5f546009146016575f5ffd5b00").unwrap();
+        let hash = shell_primitives::keccak256(&code);
+        handler.chain_store.put_code(&hash, &code).unwrap();
+        {
+            let mut state = handler.world_state.write();
+            state.add_balance(&sender, U256::from(1_000_000)).unwrap();
+            let mut account = state.get_account(&sender).unwrap().unwrap();
+            account.nonce = 4;
+            state.set_account(&sender, &account).unwrap();
+            state.set_code_hash(&target, hash).unwrap();
+            state.state_root().unwrap();
+        }
+        let config = serde_json::from_value(
+            serde_json::json!({"chain_id":42,"genesis_hash":ShellHash::ZERO,
+            "native_address_context_height": native.then_some(1),
+            "aa_account_manager_height":0,"aa_validator_registry_height":1}),
+        )
+        .unwrap();
+        handler.chain_store.put_chain_config(&config).unwrap();
+        (handler, sender, target)
+    }
+
+    fn estimate_sequence_call(
+        target: Address,
+        write: bool,
+        gas: Option<&str>,
+    ) -> BatchInnerCallRequest {
+        BatchInnerCallRequest {
+            to: Some(target),
+            value: Some("0x0".into()),
+            data: Some(if write {
+                format!("0x{:064x}", 9)
+            } else {
+                "0x".into()
+            }),
+            gas_limit: gas.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_sequential_dependency_mixed_caps_and_private_rollback() {
+        for native in [false, true] {
+            let (handler, sender, target) = estimate_sequence_fixture(native);
+            let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+            for first_cap in [None, Some("0x186a0")] {
+                let result = ShellApiServer::estimate_batch(
+                    &handler,
+                    BatchEstimateRequest {
+                        from: Some(sender),
+                        paymaster: None,
+                        inner_calls: vec![
+                            estimate_sequence_call(target, true, first_cap),
+                            estimate_sequence_call(target, false, None),
+                        ],
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result["simulation_status"], "simulated");
+                assert_eq!(result["per_inner"][0]["simulated"], first_cap.is_none());
+                assert_eq!(result["per_inner"][1]["simulated"], true);
+                assert_eq!(
+                    handler.chain_store.store().scan_prefix(b"").unwrap(),
+                    before
+                );
+            }
+            let error = ShellApiServer::estimate_batch(
+                &handler,
+                BatchEstimateRequest {
+                    from: Some(sender),
+                    paymaster: None,
+                    inner_calls: vec![
+                        estimate_sequence_call(target, false, None),
+                        estimate_sequence_call(target, true, None),
+                    ],
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), -32000);
+            let error = ShellApiServer::estimate_batch(
+                &handler,
+                BatchEstimateRequest {
+                    from: Some(sender),
+                    paymaster: None,
+                    inner_calls: vec![
+                        estimate_sequence_call(target, true, None),
+                        estimate_sequence_call(target, false, Some("0x5208")),
+                    ],
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), -32000);
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+            let result = ShellApiServer::estimate_batch(
+                &handler,
+                BatchEstimateRequest {
+                    from: Some(sender),
+                    paymaster: None,
+                    inner_calls: vec![estimate_sequence_call(target, false, Some("0x5208"))],
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["simulation_status"], "budget_only");
+            assert_eq!(
+                handler.chain_store.store().scan_prefix(b"").unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_sequential_uses_gross_gas_and_aggregate_work_cap() {
+        let (handler, sender, target) = estimate_sequence_fixture(false);
+        let clear = hex::decode("5f5f5500").unwrap();
+        let hash = shell_primitives::keccak256(&clear);
+        handler.chain_store.put_code(&hash, &clear).unwrap();
+        {
+            let mut state = handler.world_state.write();
+            state.set_code_hash(&target, hash).unwrap();
+            state
+                .set_storage(
+                    &target,
+                    &ShellHash::ZERO,
+                    &ShellHash::from(U256::from(7).to_be_bytes::<32>()),
+                )
+                .unwrap();
+            state.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let result = ShellApiServer::estimate_batch(
+            &handler,
+            BatchEstimateRequest {
+                from: Some(sender),
+                paymaster: None,
+                inner_calls: vec![estimate_sequence_call(target, false, None)],
+            },
+        )
+        .await
+        .unwrap();
+        let cap = u64::from_str_radix(
+            result["per_inner"][0]["gas_limit"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        // 21000 intrinsic + two PUSH0 (2 each) + cold nonzero clear (5000).
+        // Refunds must not make the advisory execution cap less than gross gas.
+        assert!(cap >= 26004);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        let loop_code = hex::decode("5b600056").unwrap();
+        let hash = shell_primitives::keccak256(&loop_code);
+        handler.chain_store.put_code(&hash, &loop_code).unwrap();
+        handler
+            .world_state
+            .write()
+            .set_code_hash(&target, hash)
+            .unwrap();
+        let root = handler.world_state.write().state_root().unwrap();
+        let mut block = make_genesis_block();
+        block.header.gas_limit = 50000;
+        block.header.state_root = root;
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &block.hash()).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert_eq!(
+            ShellApiServer::estimate_batch(
+                &handler,
+                BatchEstimateRequest {
+                    from: Some(sender),
+                    paymaster: None,
+                    inner_calls: vec![
+                        estimate_sequence_call(target, false, None),
+                        estimate_sequence_call(target, false, None)
+                    ]
+                }
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            -32000
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_batch_sequential_native_metadata_is_private() {
+        let (handler, sender, _) = estimate_sequence_fixture(true);
+        let hash = ShellHash::from([0x55; 32]);
+        {
+            let mut state = handler.world_state.write();
+            let mut account = state.get_account(&sender).unwrap().unwrap();
+            account.validation_code_hash = Some(hash);
+            state.set_account(&sender, &account).unwrap();
+            state.state_root().unwrap();
+        }
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let request = BatchEstimateRequest {
+            from: Some(sender),
+            paymaster: None,
+            inner_calls: vec![BatchInnerCallRequest {
+                to: Some(shell_pqvm::account_manager_address()),
+                value: None,
+                data: Some(format!(
+                    "0x{}",
+                    hex::encode(shell_pqvm::encode_clear_validation_code_calldata())
+                )),
+                gas_limit: None,
+            }],
+        };
+        let result = ShellApiServer::estimate_batch(&handler, request)
+            .await
+            .unwrap();
+        assert_eq!(result["simulation_status"], "simulated");
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn estimate_batch_sequential_registry_policy_does_not_escape() {
+        use shell_crypto::{
+            algorithm_status, with_algorithm_registry_override, AlgorithmRegistry, AlgorithmStatus,
+            SignatureType,
+        };
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (handler, sender, target) = estimate_sequence_fixture(true);
+                handler
+                    .world_state
+                    .write()
+                    .set_validators(&[sender])
+                    .unwrap();
+                handler.world_state.write().state_root().unwrap();
+                let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+                let algorithm = SignatureType::SphincsSha2256f;
+                for fail in [false, true] {
+                    let mut calls = vec![BatchInnerCallRequest {
+                        to: Some(shell_pqvm::registry_address()),
+                        value: None,
+                        data: Some(format!(
+                            "0x{}",
+                            hex::encode(
+                                shell_pqvm::system_contracts::encode_deprecate_algorithm_calldata(
+                                    algorithm
+                                )
+                            )
+                        )),
+                        gas_limit: None,
+                    }];
+                    if fail {
+                        calls.push(estimate_sequence_call(target, false, None));
+                    }
+                    let result = ShellApiServer::estimate_batch(
+                        &handler,
+                        BatchEstimateRequest {
+                            from: Some(sender),
+                            paymaster: None,
+                            inner_calls: calls,
+                        },
+                    )
+                    .await;
+                    assert_eq!(result.is_ok(), !fail);
+                    assert_eq!(algorithm_status(algorithm), Some(AlgorithmStatus::Active));
+                    assert_eq!(
+                        handler.chain_store.store().scan_prefix(b"").unwrap(),
+                        before
+                    );
+                }
+            });
+        });
     }
 
     #[tokio::test]

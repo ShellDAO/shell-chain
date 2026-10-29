@@ -1678,53 +1678,61 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             )));
         }
 
-        const PER_INNER_DEFAULT_FLOOR: u64 = 21_000;
-        let from = req.from.unwrap_or(Address::ZERO);
-
-        let mut per_inner = Vec::with_capacity(req.inner_calls.len());
-        let mut inner_sum: u64 = 0;
+        let simulate = req.inner_calls.iter().any(|call| call.gas_limit.is_none());
+        let mut parsed = Vec::with_capacity(req.inner_calls.len());
+        let mut declared_sum = 0_u64;
         for (idx, call) in req.inner_calls.iter().enumerate() {
-            let _ = call.value.as_deref().map(parse_hex_u256).transpose()?;
-            let _ = parse_optional_hex_bytes(
+            let value = call
+                .value
+                .as_deref()
+                .map(parse_hex_u256)
+                .transpose()?
+                .unwrap_or(U256::ZERO);
+            let data = parse_optional_hex_bytes(
                 call.data.as_deref(),
                 &format!("estimateBatch: inner[{idx}] data"),
                 shell_mempool::MAX_TX_SIZE,
             )?;
-            let (gas_limit, simulated) = match call.gas_limit.as_deref() {
-                Some(hex) => (parse_hex_u64(hex)?, false),
-                None => {
-                    let call_req = crate::types::CallRequest {
-                        from: Some(from),
-                        to: call.to,
-                        data: call.data.clone(),
-                        value: call.value.clone(),
-                        gas: None,
-                        access_list: None,
-                    };
-                    let (_out, used) = self.execute_call(&call_req).map_err(|e| {
-                        if e.code() == -32602 {
-                            e
-                        } else {
-                            server_error(format!(
-                                "estimateBatch: simulation for inner[{idx}] failed: {e}"
-                            ))
-                        }
-                    })?;
-                    (buffered_gas_estimate(used, PER_INNER_DEFAULT_FLOOR), true)
-                }
-            };
+            let gas_limit = call
+                .gas_limit
+                .as_deref()
+                .map(parse_hex_u64)
+                .transpose()?
+                .unwrap_or(50_000_000);
             if gas_limit == 0 {
                 return Err(invalid_params(format!(
                     "estimateBatch: inner[{idx}] gas_limit must be > 0"
                 )));
             }
+            declared_sum = declared_sum
+                .checked_add(gas_limit)
+                .ok_or_else(|| invalid_params("estimateBatch: inner gas total overflow"))?;
+            parsed.push(shell_core::InnerCall {
+                to: call.to,
+                value,
+                data: Bytes::from(data),
+                gas_limit,
+            });
+        }
+        let measured = if simulate {
+            self.simulate_batch(req.from.unwrap_or(Address::ZERO), parsed)?
+        } else {
+            Vec::new()
+        };
+        if simulate && measured.len() != req.inner_calls.len() {
+            return Err(server_error("estimateBatch: incomplete simulation"));
+        }
+        let mut per_inner = Vec::with_capacity(req.inner_calls.len());
+        let mut inner_sum = 0_u64;
+        for (idx, call) in req.inner_calls.iter().enumerate() {
+            let gas_limit = match call.gas_limit.as_deref() {
+                Some(hex) => parse_hex_u64(hex)?,
+                None => buffered_gas_estimate(measured[idx], 21_000),
+            };
             inner_sum = inner_sum
                 .checked_add(gas_limit)
                 .ok_or_else(|| invalid_params("estimateBatch: inner gas total overflow"))?;
-            per_inner.push(serde_json::json!({
-                "gas_limit": hex_u64(gas_limit),
-                "simulated": simulated,
-            }));
+            per_inner.push(serde_json::json!({ "gas_limit": hex_u64(gas_limit), "simulated": call.gas_limit.is_none() }));
         }
 
         let outer_intrinsic: u64 = 21_000;
@@ -1742,6 +1750,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             "intrinsic_surcharge": hex_u64(intrinsic_surcharge),
             "per_inner": per_inner,
             "paymaster": req.paymaster,
+            "simulation_status": if simulate { "simulated" } else { "budget_only" },
         }))
     }
 

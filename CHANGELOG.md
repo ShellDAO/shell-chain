@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `shell_estimateBatch` can simulate dependent AA calls on one private snapshot
+  when any inner cap is omitted. Mixed requests execute supplied-cap prefixes,
+  missing caps use gross gas, and aggregate work is bounded. All-explicit caps
+  retain budget-only semantics. Native state and runtime policy stay private.
+
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -33,6 +33,8 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const estimateLegacy = process.argv.includes("--batch-estimate-legacy-address");
+const estimateScenario = estimateLegacy || process.argv.includes("--batch-estimate");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -81,7 +83,9 @@ async function unusedPort() {
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
 const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
-const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+const outsider = estimateScenario ? await (async () => {
+  const path=join(out,"owner.json");const result=spawnSync(binary,["--password-file",passwordPath,"key","generate","--algorithm","mldsa65","--output",path],{encoding:"utf8"});assert.equal(result.status,0,result.stderr);return decryptKeystore(JSON.parse(await readFile(path,"utf8")),password);
+})() : new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
 const pruneFollower = prunedEpochScenario || blockSignersScenario;
@@ -105,7 +109,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: estimateScenario ? (estimateLegacy ? "batch-estimate-legacy-address" : "batch-estimate") : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +154,7 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if(estimateScenario) { (result.exits??=[]).push({label:nodeLogLabels[i],pid:child.pid,code:child.exitCode,signal:child.signalCode});await save();assert.equal(child.exitCode,0); }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -422,6 +427,7 @@ async function confirmed(
     { tracer: "callTracer" },
   ]);
   const entry = { label, hash, receipt, trace };
+  if(estimateScenario)entry.feeCaps={maxFee:tx.max_fee_per_gas,tip:tx.max_priority_fee_per_gas};
   result.transactions.push(entry);
   if (sync) entry.synchronization = await compare(hash);
   await save();
@@ -478,6 +484,15 @@ async function runScenario() {
       epoch_length: epochScenario ? 5 : 0,
     },
   };
+  const estimateTarget="0x"+"35".repeat(32), estimateOther="0x"+"36".repeat(12)+"35".repeat(20), estimateClear="0x"+"37".repeat(32);
+  const estimateWord=n=>"0x"+BigInt(n).toString(16).padStart(64,"0");
+  if(estimateScenario) {
+    if(!estimateLegacy) genesis.native_address_context_height=0;
+    const code="0x3615600a575f355f55005b5f546009146016575f5ffd5b00";
+    for(const address of [estimateTarget,estimateOther])genesis.alloc[address]={balance:"0x0",nonce:1,code,storage:{[estimateWord(0)]:estimateWord(0)}};
+    genesis.alloc[estimateClear]={balance:"0x0",nonce:1,code:"0x5f5f5500",storage:{[estimateWord(0)]:estimateWord(7)}};
+    result.adaptations.push("Raw genesis runtime isolates sequential execution from CREATE. Capless/mixed simulation uses current isolated state; supplied-only caps are budgets. No signature, sponsorship or final fee guarantee is inferred from an unsigned estimate.");
+  }
   for (const signer of signers)
     genesis.alloc[signer.getAddress()] = {
       balance: "0x3635c9adc5dea00000",
@@ -608,6 +623,48 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if(estimateScenario) {
+    const request=(to,data,gas)=>({to,value:"0x0",data,...(gas?{gas_limit:gas}:{})});
+    const set=(to,value,gas)=>request(to,estimateWord(value),gas), get=(to,gas)=>request(to,"0x",gas);
+    const observe=async index=>({head:await rpc(index,"eth_getBlockByNumber",["latest",false]),nonce:await rpc(index,"eth_getTransactionCount",[outsider.getAddress(),"latest"]),balance:await rpc(index,"eth_getBalance",[outsider.getAddress(),"latest"]),miner:await rpc(index,"eth_getBalance",[miner.getAddress(),"latest"]),a:await rpc(index,"eth_getStorageAt",[estimateTarget,"0x0","latest"]),b:await rpc(index,"eth_getStorageAt",[estimateOther,"0x0","latest"]),clear:await rpc(index,"eth_getStorageAt",[estimateClear,"0x0","latest"]),algorithms:await rpc(index,"shell_getAlgorithmRegistry")});
+    result.estimates=[];
+    async function estimate(label,inner_calls,ok=true,from=outsider.getAddress()) {
+      const before=await observe(0);
+      const input={jsonrpc:"2.0",id:result.estimates.length+1,method:"shell_estimateBatch",params:[{from,inner_calls}]};
+      const output=await paced(async()=> (await fetch(`http://127.0.0.1:${ports[0]}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(input),signal:AbortSignal.timeout(10000)})).json());
+      result.estimates.push({label,input,output});await save();
+      assert.equal(!output.error,ok,label);if(!ok)assert.equal(output.error.code,-32000,label);const response=output.result;assert.deepEqual(await observe(0),before,label+" must preserve producer state and runtime policy");assert.deepEqual(await observe(1),before,label+" must preserve independent follower state");return response;
+    }
+    const calls=[set(estimateTarget,9),get(estimateTarget)];
+    const measured=await estimate("dependent capless batch",calls);const sdkEstimate=await paced(()=>providers[0].estimateBatch({from:outsider.getAddress(),inner_calls:calls}));assert.deepEqual(sdkEstimate,measured,"public SDK helper preserves the actual server result");assert.equal(measured.simulation_status,"simulated");assert(measured.per_inner.every(x=>x.simulated));
+    await estimate("reversed order rejects",[get(estimateTarget),set(estimateTarget,9)],false);
+    await estimate("explicit prefix executes before omitted cap",[set(estimateTarget,9,"0x186a0"),get(estimateTarget)]);
+    await estimate("explicit restrictive suffix rejects",[set(estimateTarget,9),get(estimateTarget,"0x5208")],false);
+    await estimate("same low20 is a distinct original state",[set(estimateTarget,9),get(estimateOther)],false);
+    const structural=await estimate("supplied-only mode remains structural",[get(estimateTarget,"0x5208")]);assert.equal(structural.simulation_status,"budget_only");assert.equal(structural.per_inner[0].simulated,false);
+    const clear=await estimate("clear cap uses gross gas before refund",[get(estimateClear)]);assert(BigInt(clear.per_inner[0].gas_limit)>=26004n);
+    const first=await confirmed("actual dependent batch using estimated inner caps",outsider,calls.map((x,i)=>buildInnerCall(x.to,x.data,Number(BigInt(measured.per_inner[i].gas_limit)))));
+    assert.equal((await observe(0)).a,estimateWord(9));
+    await estimate("write prefix before failing dependent suffix",[set(estimateTarget,0),get(estimateOther)],false);
+    await confirmed("actual failed batch restores earlier write",outsider,[buildInnerCall(estimateTarget,estimateWord(0),100000),buildInnerCall(estimateOther,"0x",100000)],"0x0");
+    await estimate("native registry policy stays private on success",[request(validatorRegistryAddress,deprecate)],true,miner.getAddress());
+    await estimate("native registry policy stays private on failure",[request(validatorRegistryAddress,deprecate),get(estimateOther)],false,miner.getAddress());
+    const second=await estimate("dependent batch for second full identity",[set(estimateOther,9),get(estimateOther)]);
+    await confirmed("actual second identity",outsider,[buildInnerCall(estimateOther,estimateWord(9),Number(BigInt(second.per_inner[0].gas_limit))),buildInnerCall(estimateOther,"0x",Number(BigInt(second.per_inner[1].gas_limit)))]);
+    await confirmed("later state distinguishes history",outsider,[buildInnerCall(estimateTarget,estimateWord(11),100000)]);
+    await confirmed("actual clear using gross estimated cap",outsider,[buildInnerCall(estimateClear,"0x",Number(BigInt(clear.per_inner[0].gas_limit)))]);
+    const expected=await observe(0);assert.equal(expected.a,estimateWord(11));assert.equal(expected.b,estimateWord(9));assert.equal(expected.clear,estimateWord(0));assert.equal(BigInt(expected.nonce),5n);assert.deepEqual(await observe(1),expected);
+    async function history(index) {
+      for(const [tag,value]of [["0x0",0],["0x1",9],["0x2",9],["0x3",9]])assert.equal(await rpc(index,"eth_getStorageAt",[estimateTarget,"0x0",tag]),estimateWord(value));
+      for(const entry of result.transactions) {const block=await rpc(index,"eth_getBlockByHash",[entry.receipt.blockHash,false]);const max=BigInt(entry.feeCaps.maxFee),offer=BigInt(block.baseFeePerGas)+BigInt(entry.feeCaps.tip);assert.equal(BigInt(entry.receipt.effectiveGasPrice),max<offer?max:offer);assert.deepEqual(await rpc(index,"eth_getTransactionReceipt",[entry.hash]),entry.receipt);assert.deepEqual(await rpc(index,"debug_traceTransaction",[entry.hash,{tracer:"callTracer"}]),entry.trace);}
+      assert.deepEqual(await observe(index),expected);
+    }
+    for(const index of [0,1])await history(index);
+    await stop(1);await stop(0);await start(0,dirs[0],keyPath,"estimate-reopened-producer");await start(1,dirs[1],followerKey,"estimate-reopened-follower");
+    for(const index of [0,1])await history(index);
+    await estimate("same dependent private state after physical reopen",[set(estimateTarget,9),get(estimateTarget)]);assert.deepEqual(await observe(0),expected);
+    result.batchEstimate={reopened:true,expected,estimatedCapsUsedByActualBatch:true};result.passed=true;return;
+  }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

@@ -1910,14 +1910,35 @@ Returns the STARK proof amendment for a block if one has been generated asynchro
 
 ### shell_estimateBatch
 
-Estimates gas for an AA batch transaction.
+Estimates an AA batch from an object containing `from`, `inner_calls` and an
+optional informational `paymaster`. Inner calls accept `to`, `value`, `data`
+and optional hex `gas_limit` fields. At most 16 calls are accepted.
 
-**Parameters:**
-| # | Type | Required | Description |
-|---|------|----------|-------------|
-| 1 | `Object` | Yes | Batch transaction object |
+The unreleased sequential simulation correction returns an **object**, including
+`total_gas`, `outer_intrinsic`, `inner_sum`, `intrinsic_surcharge`, `per_inner`
+and `paymaster`. It adds `simulation_status`:
 
-**Returns:** `String` — Hex-encoded gas estimate.
+- `budget_only`: every inner cap was supplied. These are structural budgets;
+  no call was executed and success is not implied.
+- `simulated`: at least one cap was omitted. The actual AA executor runs the
+  entire ordered batch on one private state/metadata snapshot, including calls
+  with supplied caps. Later calls can use earlier state and value changes.
+  A failed call returns `-32000` without publishing state or runtime policy.
+
+A missing cap uses gross inner execution gas plus 20%, with a 21,000 minimum.
+Refunds do not reduce execution caps. Supplied caps stay unchanged and their
+`per_inner.simulated` remains false. Total simulation work, including the outer
+intrinsic, is bounded by the block gas limit and a 50,000,000 gas ceiling.
+
+The snapshot uses current state and the next candidate height, while other block
+fields retain the selected head's values. This unsigned request does not validate
+signatures, custom authentication, nonce admission, funding reservations or
+paymaster authorization. `total_gas` retains the structural envelope formula;
+it is not a fee quote or a guarantee of future inclusion. Check the signed receipt.
+
+Published v0.27.13 simulates omitted caps independently, so a valid dependent batch
+can fail estimation. Source availability does not establish a released correction.
+See [the runnable source acceptance](ACCOUNT_ABSTRACTION_GUIDE.md#sequential-aa-batch-gas-estimation).
 
 ---
 
