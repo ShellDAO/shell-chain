@@ -241,6 +241,35 @@ bound instance and explicitly install its code hash with the current policy's
 authorization. Clearing validation restores the account's native registered-root
 rules. Other custom validators retain their own authorization semantics.
 
+To move both this policy and the native root to a new ML-DSA key while keeping
+the same account address:
+
+1. With the currently authorized key, deploy another corrected reference
+   instance using the new public key as its constructor argument. Hash its
+   actual `eth_getCode` result.
+2. With the old policy key, submit `encodeSetValidationCodeCalldata(newCodeHash)`
+   to AccountManager and wait for its successful receipt. The new key can now
+   authorize the custom policy; the native registered root is still the old key.
+3. Bind the new signer to the existing account address and use it to submit
+   `encodeRotateKeyCalldata(newSigner.getPublicKey(), newSigner.algorithmId)`. Wait for its
+   receipt and check `shell_getPqPubkey` at the original address against the new
+   public key.
+4. If returning to built-in validation, use the new policy key to submit
+   `encodeClearValidationCodeCalldata()`. After its receipt, sign ordinary
+   transactions with the new key at the original account address.
+
+For a decrypted replacement `freshKey`, construct
+`new ShellSigner(freshKey.signatureType, freshKey.adapter, accountAddress)` with
+the original account address. Keep both encrypted keystores available until the
+policy and registered-root receipts have been checked.
+
+Clearing the policy before step 3 restores the old native root's authority.
+Changing a policy hash alone does not migrate that root. The new key must be
+refused before step 2, and the obsolete key must be refused after step 2 under
+this reference policy and after step 4 under built-in validation. This sequence
+has been exercised with ML-DSA on both sides; it does not establish cross-algorithm
+migration for this ML-DSA reference contract.
+
 Run the independent acceptance from a checkout containing the correction with
 the public node v0.27.13, `shell-sdk@0.14.0-rc.3` and its optional Solidity compiler
 installed. Node.js 25.3.0 and solc 0.8.37 were used for this public-package run;
@@ -255,7 +284,10 @@ NODE_BIN=/path/to/shell-node \
 This mode deploys the actual constructor with a fresh ML-DSA owner's public key,
 installs its runtime, verifies owner writes, rejects a different valid key,
 tampered signatures/payloads and stale nonces, then clears and reinstalls the
-policy. A separate full RocksDB observer imports the same receipts and state;
+policy, then deploys a new-key-bound instance, explicitly replaces the policy,
+rotates the native root and clears back to built-in validation. All eleven
+accepted calls check nonce increments and exact receipt fees; refused calls
+leave the account and chain state unchanged. A separate full RocksDB observer imports the same receipts and state;
 historical tracing is read-only, and both databases reopen with the same
 binding. The script retains an encrypted temporary owner keystore and node data,
 records child commands/exits, and stops all children. Its isolated development

@@ -502,6 +502,7 @@ async function runReferenceValidatorScenario() {
     tx: buildTransaction({ chainId: 1337, nonce, to, value: 0n, data, gasLimit: 800000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 }), includePublicKey: true,
   });
   const confirm = async (label, packet) => {
+    const before = await snapshot();
     const row = { label, packet };
     result.transactions.push(row); await save();
     row.hash = await paced(() => providers[0].sendTransaction(packet));
@@ -510,6 +511,9 @@ async function runReferenceValidatorScenario() {
     for (let attempt = 0; attempt < 120; attempt++) { if (await rpc(1, "eth_getTransactionReceipt", [row.hash])) break; await pause(250); }
     assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [row.hash]), row.receipt);
     assert.deepEqual(await snapshot(1), await snapshot(), "independent import agrees on canonical root and account state");
+    const after = await snapshot();
+    assert.equal(BigInt(after.nonce), BigInt(before.nonce) + 1n);
+    assert.equal(BigInt(before.balance) - BigInt(after.balance), BigInt(row.receipt.gasUsed) * BigInt(row.receipt.effectiveGasPrice));
     await save(); return row;
   };
   const deny = async (label, packet, pattern = /validation contract rejected|SignatureInvalid|signature.*invalid|signature verification|nonce.*(?:mismatch|too low)/i) => {
@@ -541,6 +545,48 @@ async function runReferenceValidatorScenario() {
   await deny("foreign key after clear", await sign(foreign, 4, target, word(99)), /pubkey.*conflict|pubkey hash mismatch|public key.*mismatch|signature.*invalid/i);
   await confirm("built-in owner after clear", await sign(ownerSigner, 4, target, word(52)));
   await confirm("reinstall same bound validator", await sign(ownerSigner, 5, accountManagerAddress, sdk.encodeSetValidationCodeCalldata(hash)));
+  const beforeMigration = await snapshot();
+  await stop(0); await stop(1);
+  await start(0, dirs[0], keyPath, "reference-bound-leader-restart");
+  for (let attempt = 0; attempt < 40; attempt++) {
+    bootnode = (await readFile(join(out, "reference-bound-leader-restart-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    if (bootnode) break;
+    await pause(100);
+  }
+  assert.ok(bootnode);
+  await start(1, dirs[1], followerKey, "reference-bound-observer-restart", bootnode);
+  await peerReady();
+  assert.deepEqual(await snapshot(), beforeMigration); assert.deepEqual(await snapshot(1), beforeMigration);
+  await deny("foreign key still rejected after bound-policy reopen", await sign(foreign, 6, target, word(99)));
+  const replacementKey = join(out, "reference-replacement-key.json");
+  const replacementGenerated = spawnSync(binary, ["--password-file", passwordPath, "key", "generate", "--algorithm", "mldsa65", "--output", replacementKey], { encoding: "utf8" });
+  assert.equal(replacementGenerated.status, 0, replacementGenerated.stderr);
+  const fresh = await decryptKeystore(JSON.parse(await readFile(replacementKey, "utf8")), password);
+  const replacement = new ShellSigner(fresh.signatureType, fresh.adapter, owner);
+  signers.push(fresh, replacement);
+  result.replacementKeystore = replacementKey;
+  const replacementPubkey = "0x" + Buffer.from(replacement.getPublicKey()).toString("hex");
+  assert.notEqual(replacementPubkey, (await snapshot()).pubkey);
+  const replacementDeploy = buildDeployTransaction({ artifact, chainId: 1337, nonce: 6, constructorArgs: [replacementPubkey], gasLimit: 2000000, maxFeePerGas: 1000000000000, maxPriorityFeePerGas: 0 });
+  const replacementDeployed = await confirm("old owner deploys replacement-key policy", await ownerSigner.buildSignedTransaction({ tx: replacementDeploy, includePublicKey: true }));
+  const replacementRuntime = await rpc(0, "eth_getCode", [replacementDeployed.receipt.contractAddress, "latest"]);
+  const replacementHash = keccak256(replacementRuntime);
+  assert.notEqual(replacementHash, hash, "constructor key binding changes deployed runtime hash");
+  await deny("new key cannot clear before policy change", await sign(replacement, 7, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+  const originalRoot = (await snapshot()).pubkey;
+  await confirm("old policy authorizes replacement policy", await sign(ownerSigner, 7, accountManagerAddress, sdk.encodeSetValidationCodeCalldata(replacementHash)));
+  assert.equal((await snapshot()).pubkey, originalRoot, "policy update alone does not rotate native root");
+  const rotate = sdk.encodeRotateKeyCalldata(replacement.getPublicKey(), replacement.algorithmId);
+  await deny("old policy key cannot rotate after policy change", await sign(ownerSigner, 8, accountManagerAddress, rotate));
+  await confirm("replacement policy rotates native root", await sign(replacement, 8, accountManagerAddress, rotate));
+  assert.equal((await snapshot()).pubkey, replacementPubkey);
+  await deny("old key cannot clear replacement policy", await sign(ownerSigner, 9, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+  await confirm("replacement key clears to its native root", await sign(replacement, 9, accountManagerAddress, sdk.encodeClearValidationCodeCalldata()));
+  assert.equal((await snapshot()).pubkey, replacementPubkey);
+  await deny("old key cannot use native root after clear", await sign(ownerSigner, 10, target, word(99)), /pubkey.*conflict|pubkey hash mismatch|public key.*mismatch|signature.*invalid/i);
+  await confirm("replacement native root writes at stable account", await sign(replacement, 10, target, word(53)));
+  assert.equal((await snapshot()).slot, word(53));
+  assert.equal((await snapshot()).nonce, "0xb");
   const beforeHistory = await snapshot();
   result.historicalTraces = [];
   for (const row of result.transactions) {
@@ -557,7 +603,7 @@ async function runReferenceValidatorScenario() {
     for (const node of [0, 1]) assert.deepEqual(await rpc(node, "eth_getTransactionReceipt", [row.hash]), row.receipt);
     assert.deepEqual(await rpc(1, "debug_traceTransaction", [row.hash, { tracer: "callTracer" }]), result.historicalTraces[i]);
   }
-  await deny("foreign key still rejected after physical reopen", await sign(foreign, 6, target, word(99)));
+  await deny("obsolete key still rejected after physical reopen", await sign(ownerSigner, 11, target, word(99)), /pubkey.*conflict|pubkey hash mismatch|public key.*mismatch|signature.*invalid/i);
   await stop(0); await stop(1);
   assert.ok(result.nativeCommands.every((command) => command.exitCode === 0));
   result.independentImportAndRestart = true;
