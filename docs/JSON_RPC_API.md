@@ -686,6 +686,19 @@ test inputs, not a data-availability or contract-deployment demonstration.
 
 Submits a signed transaction. Accepts RLP-encoded or JSON-encoded transaction bytes.
 
+**Unreleased size correction:** the single-transaction limit is 128 KiB of
+canonical native RLP, including signatures, public keys and the AA bundle.
+JSON byte arrays and hex fields expand the same transaction; the raw endpoint
+allows up to 512 KiB of decoded input bytes before parsing, then applies the
+canonical transaction limit during admission. The pool's total byte budget
+continues to charge its expanded JSON representation. Oversized canonical
+transactions and input above the parsing budget are rejected.
+
+Public node v0.27.13 applies the single-transaction limit to the JSON
+representation, and its raw endpoint also caps decoded input at 128 KiB. This
+can reject an SLH-DSA session bundle even though its native RLP fits. The
+correction above requires a release containing this change.
+
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|

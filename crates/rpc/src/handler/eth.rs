@@ -898,10 +898,14 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 "raw transaction data must be 0x-prefixed",
             ));
         };
-        if raw.len() > shell_mempool::MAX_TX_SIZE.saturating_mul(2) {
+        // JSON arrays and hex fields expand the same bounded RLP transaction.
+        // Keep a separate parsing budget; submit_tx enforces the canonical
+        // transaction cap for both encodings before signature verification.
+        let max_encoded_bytes = shell_mempool::MAX_TX_SIZE.saturating_mul(4);
+        if raw.len() > max_encoded_bytes.saturating_mul(2) {
             return Err(invalid_params_err(format!(
                 "raw transaction exceeds maximum size of {} bytes",
-                shell_mempool::MAX_TX_SIZE
+                max_encoded_bytes
             )));
         }
         let bytes =

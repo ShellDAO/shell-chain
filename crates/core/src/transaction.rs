@@ -1745,6 +1745,12 @@ impl SignedTransaction {
     pub fn sender(&self) -> Address {
         self.from
     }
+
+    /// Canonical RLP wire size, including the witness and optional AA bundle.
+    /// JSON byte/hex expansion does not change the transaction's wire size.
+    pub fn encoded_size(&self) -> usize {
+        self.length()
+    }
 }
 
 impl Encodable for SignedTransaction {

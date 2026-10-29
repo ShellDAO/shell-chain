@@ -21,6 +21,12 @@ const {
   decryptKeystore,
   ShellSigner,
   MlDsa65Adapter,
+  SlhDsaAdapter,
+  deriveSessionKey,
+  createSessionAuth,
+  finalizeSessionAuth,
+  hashBatchTransaction,
+  buildSignedTransaction,
   buildTransaction,
   buildBatchTransaction,
   buildInnerCall,
@@ -44,6 +50,7 @@ const blockSignersScenario =
 const syncStatusScenario = process.argv.includes("--sync-status");
 const receiptLogsScenario = process.argv.includes("--receipt-logs");
 const blobReceiptsScenario = process.argv.includes("--blob-receipts");
+const slhSessionScenario = process.argv.includes("--slh-session-size");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -107,7 +114,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: blobReceiptsScenario ? "blob-receipt-fees" : receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: slhSessionScenario ? "slh-session-wire-size" : blobReceiptsScenario ? "blob-receipt-fees" : receiptLogsScenario ? "receipt-log-context" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -126,7 +133,9 @@ const result = {
   },
   adaptations: [
     "Compatible source SDK with transaction wire format v2 is required; this does not prove public npm availability.",
-    receiptLogsScenario
+    slhSessionScenario
+      ? "One isolated native node; ML-DSA root authorizes an SLH-DSA session, submits JSON and RLP, and reopens RocksDB."
+      : receiptLogsScenario
       ? "One isolated loopback dev/wPoA/RocksDB authority; a small genesis-allocated LOG1 runtime is called with three genuinely signed transfers."
       : sameHeightForkScenario
       ? "Two isolated full RocksDB ML-DSA authority nodes with unequal weights and loopback libp2p. Mixed-algorithm recovery is covered separately."
@@ -506,12 +515,94 @@ async function runScenario() {
   const blobReverter = "0x" + "00".repeat(12) + "d8".repeat(20);
   if (blobReceiptsScenario)
     genesis.alloc[blobReverter] = {balance: "0x0", nonce: 0, code: "0x60006000fd", storage: null};
+  if (slhSessionScenario)
+    genesis.alloc[blobRecipient] = {balance: "0x0", nonce: 0, code: "0x60003560005500", storage: null};
   for (const dir of dirs)
     await writeFile(
       join(dir, "genesis.json"),
       JSON.stringify(genesis, null, 2),
     );
   await start(0, dirs[0], keyPath, "leader");
+  if (slhSessionScenario) {
+    const {toRlp} = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+    const uint = (value) => BigInt(value) === 0n ? "0x" : "0x" + BigInt(value).toString(16);
+    const hex = (bytes) => "0x" + Buffer.from(bytes ?? []).toString("hex");
+    const word = (value) => "0x" + BigInt(value).toString(16).padStart(64, "0");
+    const encode = (signed) => {
+      const t = signed.tx, b = signed.aa_bundle, a = b.session_auth;
+      return toRlp([signed.from, [uint(t.chain_id), uint(t.nonce), t.to ?? "0x", uint(t.value),
+        t.data, uint(t.gas_limit), uint(t.max_fee_per_gas), uint(t.max_priority_fee_per_gas),
+        [], uint(t.tx_type), "0x", "0x", []], [uint(2), hex(signed.signature.data)],
+        hex(signed.sender_pubkey), "0x01", [b.inner_calls.map((call) => [call.to,
+          uint(call.value), call.data, uint(call.gas_limit)]), "0x", "0x", "0x",
+        [hex(a.session_pubkey), uint(a.session_algo), a.target, uint(a.value_cap),
+          uint(a.expiry_block), hex(a.root_signature), hex(a.session_signature)]]]);
+    };
+    const snapshot = async () => ({
+      head: await rpc(0, "eth_getBlockByNumber", ["latest", false]),
+      balance: await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]),
+      nonce: await rpc(0, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
+      slot: await rpc(0, "eth_getStorageAt", [blobRecipient, "0x0", "latest"]),
+      pending: await rpc(0, "shell_pendingCount"),
+    });
+    const initial = await snapshot(), seed = randomBytes(64);
+    const account = deriveSessionKey(seed, "slh-dsa-sha2-256f", 0); seed.fill(0);
+    const adapter = SlhDsaAdapter.fromKeyPair(account.publicKey, account.secretKey);
+    signers.push(adapter);
+    const auth = await createSessionAuth(outsider.adapter, account.publicKey, 2,
+      {chainId: 1337n, expiryBlock: 40, valueCap: 2n, target: blobRecipient});
+    const pubkey = outsider.getPublicKey(); outsider.dispose();
+    result.prepared = [];
+    for (const [nonce, value] of [207, 208].entries()) {
+      const draft = buildBatchTransaction({chainId: 1337, nonce,
+        innerCalls: [buildInnerCall(blobRecipient, word(value), 100000, 0n)],
+        gasLimit: 3000000, maxFeePerGas: 1000000000, maxPriorityFeePerGas: 2});
+      draft.aa_bundle.session_auth = structuredClone(auth);
+      const final = await finalizeSessionAuth(auth, adapter,
+        hashBatchTransaction(draft.tx, draft.aa_bundle, "SphincsSha2256f"));
+      draft.aa_bundle.session_auth = final;
+      const signed = buildSignedTransaction({from: outsider.getAddress(), tx: draft.tx,
+        aaBundle: draft.aa_bundle, signature: final.session_signature,
+        signatureType: "SphincsSha2256f", senderPubkey: pubkey});
+      const json = hex(Buffer.from(JSON.stringify(signed))), rlp = encode(signed);
+      assert.equal(final.session_signature.length, 49856);
+      assert.ok((json.length - 2) / 2 > 131072);
+      assert.ok((rlp.length - 2) / 2 < 131072);
+      result.prepared.push({value, signed, json, rlp});
+    }
+    adapter.dispose(); account.secretKey.fill(0); await save();
+    const changed = structuredClone(result.prepared[0].signed);
+    changed.aa_bundle.inner_calls[0].data = word(209);
+    await assert.rejects(rpc(0, "eth_sendRawTransaction", [encode(changed)]), /signature/i);
+    assert.deepEqual(await snapshot(), initial);
+    let previous = initial;
+    for (const [index, entry] of result.prepared.entries()) {
+      entry.hash = await rpc(0, "eth_sendRawTransaction", [index === 0 ? entry.json : entry.rlp]);
+      result.transactions.push(entry); await save();
+      for (let k = 0; k < 120; k++) {
+        entry.receipt = await rpc(0, "eth_getTransactionReceipt", [entry.hash]);
+        if (entry.receipt) break;
+        await pause(100);
+      }
+      assert.equal(entry.receipt?.status, "0x1");
+      const block = await rpc(0, "eth_getBlockByHash", [entry.receipt.blockHash, false]);
+      const offered = BigInt(block.baseFeePerGas) + 2n;
+      const price = offered < 1000000000n ? offered : 1000000000n;
+      assert.equal(BigInt(entry.receipt.effectiveGasPrice), price);
+      const after = await snapshot();
+      assert.equal(BigInt(previous.balance) - BigInt(after.balance), BigInt(entry.receipt.gasUsed) * price);
+      assert.equal(BigInt(after.nonce), BigInt(index + 1));
+      assert.equal(after.slot, word(entry.value));
+      previous = after; await save();
+    }
+    await stop(0); await start(0, dirs[0], keyPath, "slh-session-reopen");
+    assert.deepEqual(await snapshot(), previous);
+    for (const entry of result.transactions)
+      assert.deepEqual(await rpc(0, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+    assert.deepEqual(await snapshot(), previous);
+    await stop(0); result.slhSession = {initial, final: previous, reopenVerified: true};
+    result.passed = true; return;
+  }
   if (blobReceiptsScenario) {
     const snapshot = async () => ({
       head: await rpc(0, "eth_getBlockByNumber", ["latest", false]),

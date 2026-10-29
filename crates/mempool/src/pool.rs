@@ -18,7 +18,7 @@ use shell_storage::{ChainStore, KvStore, WorldState};
 
 use crate::{MempoolConfig, MempoolError};
 
-/// Maximum serialized transaction size accepted by the mempool (128 KB).
+/// Maximum canonical RLP transaction size accepted by the mempool (128 KiB).
 ///
 /// Protects against oversized SPHINCS+ signatures (~49 KB) and large
 /// access lists flooding the pool.
@@ -853,17 +853,18 @@ impl TxPool {
             });
         }
 
-        // Per-tx serialized size limit — protects against oversized PQ
-        // signatures and access lists.
+        // Admission measures the wire payload; aggregate pool accounting below
+        // still charges the expanded JSON size retained for each transaction.
+        let wire_size = tx.encoded_size();
+        if wire_size > MAX_TX_SIZE {
+            return Err(MempoolError::InvalidTransaction(format!(
+                "transaction too large: {} bytes (max {})",
+                wire_size, MAX_TX_SIZE
+            )));
+        }
         let tx_size = serialized_transaction_size(tx).map_err(|e| {
             MempoolError::InvalidTransaction(format!("tx serialization failed: {e}"))
         })?;
-        if tx_size > MAX_TX_SIZE {
-            return Err(MempoolError::InvalidTransaction(format!(
-                "transaction too large: {} bytes (max {})",
-                tx_size, MAX_TX_SIZE
-            )));
-        }
 
         let validation = validate_aa_tx(tx, world_state, chain_store, verifier)
             .map_err(|err| map_aa_validation_error(tx, err))?;
@@ -2945,6 +2946,37 @@ mod tests {
         cs.put_pubkey(&from, &pubkey).unwrap();
         let result = insert_rich(&pool, signed, &verifier, &mut ws, &cs);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn wire_size_admission_preserves_json_memory_accounting() {
+        let signer = DilithiumSigner::generate();
+        let pubkey = signer.public_key().to_vec();
+        let mut tx = make_signed_value_tx_with_signer(&signer, &pubkey, 0, 50, U256::ZERO);
+        tx.tx.data = Bytes::from(vec![0xff; 70_000]);
+        tx.tx.gas_limit = compute_intrinsic_gas(tx.tx.data.as_ref(), false, &None);
+        tx.signature = signer.sign(tx.tx.hash().as_bytes()).unwrap();
+        let json_size = serde_json::to_vec(&tx).unwrap().len();
+        assert!(json_size > MAX_TX_SIZE);
+        let verifier = DilithiumVerifier;
+        let (mut ws, cs) = setup_validation_ctx();
+        let pool = TxPool::new(make_config());
+        insert_rich(&pool, tx.clone(), &verifier, &mut ws, &cs).unwrap();
+        assert_eq!(pool.size_bytes(), json_size);
+
+        let constrained = TxPool::new(MempoolConfig {
+            max_pool_bytes: json_size - 1,
+            ..make_config()
+        });
+        assert!(insert_rich(&constrained, tx.clone(), &verifier, &mut ws, &cs).is_err());
+        assert_eq!(constrained.size_bytes(), 0);
+
+        tx.tx.data = Bytes::from(vec![0xff; MAX_TX_SIZE]);
+        tx.tx.gas_limit = compute_intrinsic_gas(tx.tx.data.as_ref(), false, &None);
+        tx.signature = signer.sign(tx.tx.hash().as_bytes()).unwrap();
+        let err = insert_rich(&constrained, tx, &verifier, &mut ws, &cs).unwrap_err();
+        assert!(err.to_string().contains("transaction too large"));
+        assert_eq!(constrained.size_bytes(), 0);
     }
 
     #[test]

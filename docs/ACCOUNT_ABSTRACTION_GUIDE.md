@@ -603,6 +603,38 @@ keys, recipient value, read-only queries and a subsequent process reopen are
 checked. Nodes stop on exit. This does not establish Byzantine recovery,
 unequal-weight policies, other storage profiles or a live-network upgrade.
 
+## SLH-DSA session transaction size
+
+A delegated session may use a different supported algorithm from its root
+account. The root signs the session authorization with its own algorithm;
+the outer transaction signature and sender/paymaster signing domains use the
+session algorithm. For an ML-DSA root delegating to SLH-DSA-SHA2-256f, pass
+`SphincsSha2256f` when hashing and building the session-signed transaction,
+while retaining the root account's address and public key.
+
+An SLH-DSA session signature appears in both the outer envelope and
+`session_auth`. The native RLP can fit within 128 KiB while its JSON
+representation exceeds that size. The unreleased admission correction measures
+the per-transaction cap using canonical RLP; aggregate pool byte accounting
+still charges expanded JSON. Public v0.27.13 does not include this correction.
+See [raw transaction limits](JSON_RPC_API.md#eth_sendrawtransaction).
+
+Reproduce first-use ML-DSA-root/SLH-DSA-session signing, tamper rejection, both
+raw encodings, actual storage writes and fees, and database reopen with:
+
+```bash
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  NODE_BIN=./target/debug/shell-node \
+  node tests/e2e/native-aa-registry.mjs --slh-session-size
+```
+
+Build the node with `cargo build --locked -p shell-cli --bin shell-node
+--features libp2p` first. The regression works with SDK v0.14.0-rc.3 and its
+installed dependencies. It creates temporary accounts and a development
+database, clears signing secrets before submission, and retains its report and
+database for inspection. It uses a genesis-allocated storage contract and does
+not claim a contract-deployment or production-activation test.
+
 ## Contract-paymaster gas simulation
 
 `shell_estimatePaymasterGas` can execute the same bounded STATICCALL used by

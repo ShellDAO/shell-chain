@@ -4395,9 +4395,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_wire_size_admission_is_independent_of_json_expansion() {
+        let handler = setup();
+        let signer = DilithiumSigner::generate();
+        let addr = signer_address(&signer);
+        handler
+            .world_state
+            .write()
+            .add_balance(&addr, U256::from(1_000_000_000_000_000_000u64))
+            .unwrap();
+        handler
+            .chain_store
+            .put_pubkey(&addr, signer.public_key())
+            .unwrap();
+        let mut tx = Transaction {
+            chain_id: 42,
+            nonce: 0,
+            to: Some(test_address(b"wire-size-recipient")),
+            value: U256::ZERO,
+            data: Bytes::from(vec![0xff; 70_000]),
+            gas_limit: 3_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signed =
+            SignedTransaction::new(addr, tx.clone(), signer.sign(tx.hash().as_bytes()).unwrap());
+        let json = serde_json::to_vec(&signed).unwrap();
+        let rlp = alloy_rlp::encode(&signed);
+        assert!(json.len() > shell_mempool::MAX_TX_SIZE);
+        assert!(rlp.len() < shell_mempool::MAX_TX_SIZE);
+        let hash =
+            EthApiServer::send_raw_transaction(&handler, format!("0x{}", hex::encode(&json)))
+                .await
+                .unwrap();
+        assert_eq!(hash, signed.hash());
+        assert_eq!(handler.tx_pool.size_bytes(), json.len());
+        let err = EthApiServer::send_raw_transaction(&handler, format!("0x{}", hex::encode(rlp)))
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("duplicate"));
+        assert_eq!(handler.tx_pool.len(), 1);
+
+        tx.data = Bytes::from(vec![0xff; shell_mempool::MAX_TX_SIZE]);
+        let oversized =
+            SignedTransaction::new(addr, tx.clone(), signer.sign(tx.hash().as_bytes()).unwrap());
+        for bytes in [
+            serde_json::to_vec(&oversized).unwrap(),
+            alloy_rlp::encode(&oversized),
+        ] {
+            let err =
+                EthApiServer::send_raw_transaction(&handler, format!("0x{}", hex::encode(bytes)))
+                    .await
+                    .unwrap_err();
+            assert!(err.message().contains("transaction too large"));
+            assert_eq!(handler.tx_pool.len(), 1);
+            assert_eq!(handler.tx_pool.size_bytes(), json.len());
+        }
+    }
+
+    #[tokio::test]
     async fn send_raw_transaction_rejects_oversized_payload_before_decode() {
         let handler = setup();
-        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE + 1));
+        let oversized = format!("0x{}", "00".repeat(shell_mempool::MAX_TX_SIZE * 4 + 1));
         let result = EthApiServer::send_raw_transaction(&handler, oversized).await;
         let err = result.unwrap_err();
         assert!(err.message().contains("maximum size"));

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Apply the 128 KiB single-transaction cap to canonical native RLP instead of
+  expanded JSON, allowing valid SLH-DSA session bundles. Keep aggregate pool
+  memory accounting unchanged and bound raw JSON parsing separately at 512 KiB.
+
 - Include `blobGasUsed` and `blobGasPrice` in type-3 receipts returned by both
   Ethereum receipt methods and nested Shell summaries. Reconstruct the charged
   blob price from the mined block, including failed execution; ordinary and
