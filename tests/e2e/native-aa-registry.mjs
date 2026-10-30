@@ -8,7 +8,7 @@ import { openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { createServer } from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -33,6 +33,7 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const receiptEventsScenario = process.argv.includes("--receipt-events");
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -105,7 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: receiptEventsScenario ? "receipt-events" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +151,13 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (receiptEventsScenario) {
+    const opened = result.opens.findLast((entry) => entry.pid === child.pid);
+    opened.exitCode = child.exitCode;
+    opened.signal = child.signalCode;
+    opened.endedAt = new Date().toISOString();
+    assert.equal(child.exitCode, 0, "clean receipt-event service exit");
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -200,6 +208,13 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
   nodes[i] = child;
+  if (receiptEventsScenario) {
+    result.opens ??= [];
+    result.opens.push({ pid: child.pid, argv: args,
+      binarySha256: createHash("sha256").update(await readFile(binary)).digest("hex"),
+      startedAt: new Date().toISOString() });
+    await save();
+  }
   nodeLogLabels[i] = label;
   let spawnError;
   child.once("error", (error) => {
@@ -485,6 +500,31 @@ async function runScenario() {
       code: null,
       storage: null,
     };
+  if (receiptEventsScenario) {
+    genesis.native_address_context_height = 0;
+    genesis.fee_accounting_activation_height = 0;
+    const native = (index) => (0x35 + index).toString(16).repeat(32);
+    // LOG2 reads exactly four bytes from memory and indexes the full native ADDRESS.
+    const emit = (signature) => "63deadbeef5f52307f" + signature.repeat(32) + "6004601ca2";
+    const delegate = (index) => "5f5f5f5f7f" + native(index) + "5af4";
+    const codes = [
+      delegate(1) + "60055500",
+      emit("11") + "00",
+      emit("11") + "5f5ffd",
+      emit("22") + delegate(2) + "600555" + emit("33") + "00",
+      "5f5f5f5f7f" + native(1) + "62013880fa600555" + emit("44") + "00",
+      delegate(1) + "505f5ffd",
+    ];
+    for (const [index, code] of codes.entries()) {
+      const address = "0x" + (0x35 + index).toString(16).repeat(32);
+      genesis.alloc[address] = { balance: "0x0", nonce: 1, code: "0x" + code,
+        storage: { ["0x" + word(0)]: "0x" + word(0) } };
+    }
+    genesis.alloc["0xabababababababababababab3636363636363636363636363636363636363636"] = {
+      balance: "0x0", nonce: 1, code: "0x" + emit("55") + "00",
+      storage: { ["0x" + word(0)]: "0x" + word(9) },
+    };
+  }
   for (const dir of dirs)
     await writeFile(
       join(dir, "genesis.json"),
@@ -500,6 +540,146 @@ async function runScenario() {
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (receiptEventsScenario) {
+    await start(1, dirs[1], followerKey, "follower", bootnode);
+    await peerReady();
+    const address = (index) => "0x" + (0x35 + index).toString(16).repeat(32);
+    const stateAt = async (i) => ({
+      head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+      balance: await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"]),
+      miner: await rpc(i, "eth_getBalance", [miner.getAddress(), "latest"]),
+      nonce: await rpc(i, "eth_getTransactionCount", [outsider.getAddress(), "latest"]),
+      slots: await Promise.all([0, 1, 2, 3, 4, 5].map((n) => rpc(i, "eth_getStorageAt", [address(n), "0x0", "latest"]))),
+      delegateSlots: await Promise.all([1, 2, 3, 5].map((n) => rpc(i, "eth_getStorageAt", [address(0), "0x" + n.toString(16), "latest"]))),
+      contractBalances: await Promise.all([0, 1, 2, 3, 4, 5].map((n) => rpc(i, "eth_getBalance", [address(n), "latest"]))),
+    });
+    const request = (index, extra = {}) => ({ from: outsider.getAddress(), to: address(index), data: "0x", value: "0x0", ...extra });
+    const send = async (label, input, gas, expected, expectedSlot, signer = outsider) => {
+      const before = await stateAt(0);
+      const payerBefore = await rpc(0, "eth_getBalance", [signer.getAddress(), "latest"]);
+      const payerNonce = await rpc(0, "eth_getTransactionCount", [signer.getAddress(), "latest"]);
+      const priority = input.gasPrice ?? input.maxPriorityFeePerGas ?? "0x0";
+      const maximum = input.gasPrice ?? input.maxFeePerGas ?? "0x3b9aca00";
+      const tx = buildTransaction({ chainId: 1337, nonce: Number(BigInt(payerNonce)), to: input.to,
+        data: input.data, value: BigInt(input.value), gasLimit: Number(BigInt(gas)), maxFeePerGas: Number(BigInt(maximum)), maxPriorityFeePerGas: Number(BigInt(priority)) });
+      const signed = await signer.buildSignedTransaction({ tx, includePublicKey: true });
+      const hash = await paced(() => providers[0].sendTransaction(signed));
+      const entry = { label, input, gas, signed, hash, before, payerBefore, payerNonce };
+      result.transactions.push(entry);
+      await save();
+      for (let n = 0; n < 160; n++) {
+        entry.receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+        if (entry.receipt) break;
+        await pause(200);
+      }
+      assert.equal(entry.receipt?.status, expected);
+      height++;
+      assert.equal(BigInt(entry.receipt.blockNumber), BigInt(height));
+      entry.after = await stateAt(0);
+      entry.trace = await rpc(0, "debug_traceTransaction", [hash, { tracer: "callTracer" }]);
+      const fee = BigInt(entry.receipt.gasUsed) * BigInt(entry.receipt.effectiveGasPrice);
+      entry.payerAfter = await rpc(0, "eth_getBalance", [signer.getAddress(), "latest"]);
+      assert.equal(BigInt(payerBefore) - BigInt(entry.payerAfter), fee + (expected === "0x1" ? BigInt(input.value) : 0n));
+      assert.equal(BigInt(entry.after.miner) - BigInt(before.miner), fee);
+      assert.equal(BigInt(await rpc(0, "eth_getTransactionCount", [signer.getAddress(), "latest"])), BigInt(payerNonce) + 1n);
+      const slot = typeof expectedSlot === "function" ? expectedSlot(entry.receipt) : expectedSlot;
+      assert.equal(await rpc(0, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(slot));
+      for (let n = 0; n < 160; n++) {
+        const block = await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false]);
+        if (block?.hash === entry.receipt.blockHash) break;
+        await pause(200);
+      }
+      assert.equal((await rpc(1, "eth_getBlockByNumber", [entry.receipt.blockNumber, false])).hash, entry.receipt.blockHash);
+      assert.deepEqual(await rpc(1, "eth_getTransactionReceipt", [hash]), entry.receipt);
+      assert.equal(await rpc(1, "eth_getStorageAt", [input.to, "0x0", "latest"]), "0x" + word(slot));
+      await save();
+    };
+    const alias = "0xabababababababababababab3636363636363636363636363636363636363636";
+    const topic = (v) => "0x" + v.repeat(32);
+    const expectedEvent = (receipt, addr, signature, index) => ({ address: addr,
+      topics: [topic(signature), addr], data: "0xdeadbeef", blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash, transactionHash: receipt.transactionHash,
+      transactionIndex: receipt.transactionIndex, logIndex: "0x" + index.toString(16), removed: false });
+    const liveFilter = await rpc(0, "eth_newFilter", [{ fromBlock: "0x0", address: address(0) }]);
+    const initial = await stateAt(0);
+    await rpc(0, "eth_call", [request(0, { value: "0x7", gas: "0x7a120" }), "latest"]);
+    assert.deepEqual(await stateAt(0), initial);
+    assert.deepEqual(await rpc(0, "eth_getLogs", [{ fromBlock: "0x0", toBlock: "latest" }]), []);
+    await send("delegate emits proxy full32 event", request(0, { value: "0x7" }), "0x7a120", "0x1", 0);
+    const first = result.transactions[0];
+    assert.deepEqual(first.receipt.logs, [expectedEvent(first.receipt, address(0), "11", 0)]);
+    assert.deepEqual(await rpc(0, "eth_getFilterChanges", [liveFilter]), first.receipt.logs);
+    assert.deepEqual(await rpc(0, "eth_getFilterChanges", [liveFilter]), []);
+    await send("child reverted logs discarded parent logs survive", request(3, { value: "0xd" }), "0x7a120", "0x1", 0);
+    const second = result.transactions[1];
+    assert.deepEqual(second.receipt.logs, [expectedEvent(second.receipt, address(3), "22", 0), expectedEvent(second.receipt, address(3), "33", 1)]);
+    assert.ok(second.trace.calls[0].error);
+    await send("static log forbidden parent log survives", request(4), "0x7a120", "0x1", 0);
+    const third = result.transactions[2];
+    assert.deepEqual(third.receipt.logs, [expectedEvent(third.receipt, address(4), "44", 0)]);
+    assert.ok(third.trace.calls[0].error);
+    assert.equal(third.trace.calls[0].type, "STATICCALL");
+    await send("outer revert discards child log and value", request(5, { value: "0x5" }), "0x7a120", "0x0", 0);
+    assert.deepEqual(result.transactions[3].receipt.logs, []);
+    assert.equal(result.transactions[3].trace.calls[0].error, undefined);
+    assert.ok(result.transactions[3].trace.structLogs.some((step) => step.op === "LOG2" && step.depth === 2));
+    assert.equal(await rpc(0, "eth_getBalance", [address(5), "latest"]), "0x0");
+    await send("same low20 alias retains distinct full32 emitter", { ...request(1), to: alias }, "0x7a120", "0x1", 9);
+    const last = result.transactions[4];
+    assert.deepEqual(last.receipt.logs, [expectedEvent(last.receipt, alias, "55", 0)]);
+    const expected = result.transactions.flatMap((x) => x.receipt.logs);
+    const verify = async () => {
+      for (const i of [0, 1]) {
+        const before = await stateAt(i);
+        await rpc(i, "eth_call", [request(0, { value: "0x7", gas: "0x7a120" }), first.receipt.blockNumber]);
+        assert.deepEqual(await rpc(i, "eth_getLogs", [{ fromBlock: "0x0", toBlock: "latest" }]), expected);
+        for (const entry of result.transactions) {
+          assert.deepEqual(await rpc(i, "eth_getTransactionReceipt", [entry.hash]), entry.receipt);
+          const blockReceipts = await rpc(i, "eth_getBlockReceipts", [entry.receipt.blockNumber]);
+          assert.deepEqual(blockReceipts.find((receipt) => receipt.transactionHash === entry.hash), entry.receipt);
+          const summary = await rpc(i, "shell_getTransactionSummary", [entry.hash, { includeReceipt: true }]);
+          assert.deepEqual(summary.receipt, entry.receipt);
+          assert.deepEqual(await rpc(i, "debug_traceTransaction", [entry.hash, { tracer: "callTracer" }]), entry.trace);
+          assert.deepEqual(await rpc(i, "eth_getLogs", [{ fromBlock: entry.receipt.blockNumber, toBlock: entry.receipt.blockNumber }]), entry.receipt.logs);
+        }
+        const queries = [
+          [{ address: address(0) }, first.receipt.logs],
+          [{ address: alias }, last.receipt.logs],
+          [{ address: [address(0), alias] }, [...first.receipt.logs, ...last.receipt.logs]],
+          [{ address: [] }, []],
+          [{ topics: [null, [address(0), alias]] }, [...first.receipt.logs, ...last.receipt.logs]],
+          [{ topics: [topic("11"), address(1)] }, []],
+          [{ topics: [[]] }, []],
+          [{ topics: [topic("33")] }, [second.receipt.logs[1]]],
+        ];
+        for (const [filter, found] of queries) assert.deepEqual(await rpc(i, "eth_getLogs", [{ fromBlock: "0x0", toBlock: "latest", ...filter }]), found);
+        assert.equal(await rpc(i, "eth_getStorageAt", [address(0), "0x5", "latest"]), "0x" + word(1));
+        assert.equal(await rpc(i, "eth_getStorageAt", [address(3), "0x5", "latest"]), "0x" + word(0));
+        assert.equal(await rpc(i, "eth_getStorageAt", [address(4), "0x5", "latest"]), "0x" + word(0));
+        assert.deepEqual(await stateAt(i), before);
+      }
+    };
+    await verify();
+    assert.deepEqual(await rpc(0, "eth_getFilterChanges", [liveFilter]), []);
+    assert.deepEqual(await rpc(0, "eth_getFilterLogs", [liveFilter]), first.receipt.logs);
+    assert.equal(await rpc(0, "eth_uninstallFilter", [liveFilter]), true);
+    await stop(1); await stop(0);
+    await start(0, dirs[0], keyPath, "events-leader-reopen");
+    let peer;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const readyLog = await readFile(join(out, "events-leader-reopen-node.log"), "utf8");
+      peer = readyLog.match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+      if (peer) break;
+      await pause(250);
+    }
+    assert.ok(peer, "reopened leader publishes its libp2p multiaddr");
+    await start(1, dirs[1], followerKey, "events-follower-reopen", peer);
+    await peerReady(); await verify();
+    result.nativeEvents = { expected, liveFilter, queriesPerNode: 8, passed: true };
+    result.passed = true;
+    return;
+  }
+
   if (syncStatusScenario) {
     // Create the backlog through the existing real signed transaction path.
     for (let block = 1; block <= 21; block++)

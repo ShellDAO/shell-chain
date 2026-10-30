@@ -8048,6 +8048,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_event_metadata_matches_indexed_logs_across_transactions() {
+        let handler = setup();
+        let (seed_hash, _) = store_block_with_tx(&handler, 0, true);
+        let seed = handler
+            .chain_store
+            .get_block_by_hash(&seed_hash)
+            .unwrap()
+            .unwrap()
+            .transactions
+            .remove(0);
+        let emitter = Address::from([0x73; 32]);
+        let log = || {
+            shell_core::Log::new(
+                emitter,
+                vec![ShellHash::from([0x42; 32])],
+                Bytes::from(vec![0xde, 0xad]),
+            )
+            .unwrap()
+        };
+        let hash = store_block_with_logs(
+            &handler,
+            1,
+            vec![vec![log(), log()], vec![], vec![log(), log()]],
+        );
+        let mut block = handler
+            .chain_store
+            .get_block_by_hash(&hash)
+            .unwrap()
+            .unwrap();
+        block.transactions = (0..3)
+            .map(|nonce| {
+                let mut tx = seed.tx.clone();
+                tx.nonce = nonce;
+                SignedTransaction::new(seed.from, tx, seed.signature.clone())
+            })
+            .collect();
+        handler.chain_store.put_block(&block).unwrap();
+        handler
+            .chain_store
+            .index_block_transactions(&block)
+            .unwrap();
+        let mut receipts = handler.chain_store.get_receipts(&hash).unwrap().unwrap();
+        for (receipt, tx) in receipts.iter_mut().zip(&block.transactions) {
+            receipt.tx_hash = tx.hash();
+        }
+        receipts[1].status = 0;
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        let logs = serde_json::to_value(
+            EthApiServer::get_logs(
+                &handler,
+                serde_json::from_value(serde_json::json!({"fromBlock":"0x1","toBlock":"0x1"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(logs.as_array().unwrap().len(), 4);
+        let all = EthApiServer::get_block_receipts(&handler, "0x1".into())
+            .await
+            .unwrap();
+        let mut offset = 0;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            let single = EthApiServer::get_transaction_receipt(&handler, tx.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            let summary = ShellApiServer::get_transaction_summary(
+                &handler,
+                tx.hash(),
+                Some(RpcTransactionSummaryOptions {
+                    include_receipt: Some(true),
+                }),
+            )
+            .await
+            .unwrap()
+            .receipt
+            .unwrap();
+            let expected = &logs.as_array().unwrap()[offset..offset + receipts[index].logs.len()];
+            for receipt in [&single, &all[index], &summary] {
+                assert_eq!(
+                    serde_json::to_value(&receipt.logs).unwrap(),
+                    serde_json::json!(expected)
+                );
+            }
+            for event in &single.logs {
+                assert_eq!(event.transaction_hash, tx.hash());
+                assert_eq!(event.transaction_index, hex_u64(index as u64));
+                assert_eq!(event.log_index, hex_u64(offset as u64));
+                assert_eq!(event.block_hash, hash);
+                assert_eq!(event.block_number, "0x1");
+                assert_eq!(event.address, emitter);
+                assert!(!event.removed);
+                offset += 1;
+            }
+        }
+        assert_eq!(offset, 4);
+    }
+
+    #[tokio::test]
     async fn get_block_receipts_rejects_invalid_hash_as_invalid_params() {
         let handler = setup();
         let invalid_hash = format!("0x{}zz", "00".repeat(31));

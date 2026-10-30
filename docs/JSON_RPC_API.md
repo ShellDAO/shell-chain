@@ -624,7 +624,24 @@ Returns the receipt of a mined transaction.
 
 **Parameters:**
 | # | Type | Required | Description |
-|---|------|----------|-------------|
+|#### Mined event locations (unreleased)
+
+Unreleased source includes `transactionHash`, `transactionIndex`, `blockHash`,
+`blockNumber`, `logIndex`, and `removed: false` on every mined receipt log, in
+addition to `address`, `topics`, and `data`. `logIndex` counts all committed logs
+from earlier transactions in the same block; it does not restart for each
+receipt or filtered address. These fields agree across `eth_getTransactionReceipt`,
+`eth_getBlockReceipts`, `shell_getTransactionSummary` with `includeReceipt: true`,
+and `eth_getLogs`. Emitter addresses and address-valued topics retain all 32 bytes.
+
+Released v0.27.13 receipts omit the location fields, while indexed log queries
+already provide them. Use a rebuilt node containing this repair until a release
+with the repair is published. No protocol activation or stored receipt migration
+is required. Reverted execution contributes no committed logs. The manual
+`node tests/e2e/native-aa-registry.mjs --receipt-events` regression also checks
+child rollback, static rejection, filters, import, and persistence after restart.
+
+---|------|----------|-------------|
 | 1 | `String` | Yes | Transaction hash |
 
 **Returns:** `Object|null` — Receipt object (includes `status`, `gasUsed`, `logs`, `blockNumber`, `shellType`, `rewardKind`, etc.) or `null` if not yet mined.

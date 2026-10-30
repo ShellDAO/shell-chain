@@ -237,9 +237,20 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         block_hash: ShellHash,
         tx_index: u32,
     ) -> Result<Option<RpcReceipt>, shell_storage::StorageError> {
-        let Some(receipt) = self.chain_store.get_receipt_by_tx_hash(hash)? else {
+        let Some(receipts) = self.chain_store.get_receipts(&block_hash)? else {
             return Ok(None);
         };
+        let Some(receipt) = receipts.get(tx_index as usize) else {
+            return Ok(None);
+        };
+        if receipt.tx_hash != *hash {
+            return Ok(None);
+        }
+        let first_log_index = receipts
+            .iter()
+            .take(tx_index as usize)
+            .map(|prior| prior.logs.len() as u64)
+            .sum();
         let (from, to, effective_gas_price, tx_type, shell_type, reward_kind) =
             if let Some(tx) = block.transactions.get(tx_index as usize) {
                 let shell_type = if tx.is_aa_bundle() {
@@ -287,15 +298,12 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
             effective_gas_price: hex_u64(effective_gas_price),
             contract_address: receipt.contract_address,
-            logs: receipt
-                .logs
-                .into_iter()
-                .map(|log| RpcLog {
-                    address: log.address,
-                    topics: log.topics,
-                    data: hex_bytes(log.data.as_ref()),
-                })
-                .collect(),
+            logs: super::eth::receipt_logs_with_meta(
+                receipt,
+                block_hash,
+                tx_index as u64,
+                first_log_index,
+            ),
             logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
             tx_type: format!("{:#x}", tx_type),
             shell_type,

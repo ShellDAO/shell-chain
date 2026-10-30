@@ -630,3 +630,24 @@ The existing paymaster ABI and activation policies are unchanged, including its
 retained `address` argument mapping. No simulation writes are committed.
 Acceptance does not verify signatures, sender nonce, funding or full bundle
 validity, and cannot guarantee sponsorship at a later inclusion state or height.
+
+
+### Receipt event metadata regression
+
+The receipt metadata repair is available in source and requires a rebuilt node;
+released 0.27.13 receipts omit the event location fields. This RPC-only change
+does not require a protocol activation. With a compatible V2 SDK build and a
+node built with the `libp2p` feature, run:
+
+```sh
+NODE_BIN=./target/debug/shell-node \
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+node tests/e2e/native-aa-registry.mjs --receipt-events
+```
+
+The script creates temporary accounts, two isolated full RocksDB nodes and
+contract runtime fixtures. It checks native 32-byte event identity, reverted and
+static child logs, receipt/query/filter agreement, independent import, and
+history after both databases reopen. It reports failures with a nonzero exit
+code and stops its node processes. The fixtures avoid contract deployment, so
+this does not qualify the compiler or CREATE address derivation.

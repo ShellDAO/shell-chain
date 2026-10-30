@@ -328,7 +328,7 @@ pub struct RpcReceipt {
     pub cumulative_gas_used: String,
     pub effective_gas_price: String,
     pub contract_address: Option<Address>,
-    pub logs: Vec<RpcLog>,
+    pub logs: Vec<RpcLogWithMeta>,
     pub logs_bloom: String,
     #[serde(rename = "type")]
     pub tx_type: String,

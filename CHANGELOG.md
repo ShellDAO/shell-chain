@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Include mined event transaction/block metadata and block-wide log indexes in
+  transaction receipts, block receipts, and transaction summaries, matching
+  indexed log queries while preserving native 32-byte emitter addresses.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
