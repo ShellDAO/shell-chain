@@ -624,7 +624,13 @@ Returns the receipt of a mined transaction.
 
 **Parameters:**
 | # | Type | Required | Description |
-|#### Mined event locations (unreleased)
+|---|------|----------|-------------|
+| 1 | `String` | Yes | Transaction hash |
+
+**Returns:** `Object|null` — Receipt object (includes `status`, `gasUsed`, `logs`, `blockNumber`, `shellType`, `rewardKind`, etc.) or `null` if not yet mined.
+
+
+#### Mined event locations (unreleased)
 
 Unreleased source includes `transactionHash`, `transactionIndex`, `blockHash`,
 `blockNumber`, `logIndex`, and `removed: false` on every mined receipt log, in
@@ -640,11 +646,6 @@ with the repair is published. No protocol activation or stored receipt migration
 is required. Reverted execution contributes no committed logs. The manual
 `node tests/e2e/native-aa-registry.mjs --receipt-events` regression also checks
 child rollback, static rejection, filters, import, and persistence after restart.
-
----|------|----------|-------------|
-| 1 | `String` | Yes | Transaction hash |
-
-**Returns:** `Object|null` — Receipt object (includes `status`, `gasUsed`, `logs`, `blockNumber`, `shellType`, `rewardKind`, etc.) or `null` if not yet mined.
 
 ---
 
