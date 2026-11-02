@@ -8,6 +8,7 @@
 // Add --aa-revert to check rollback when its second inner call reverts.
 // Add --reference-validator to deploy/install the key-bound ML-DSA reference policy first.
 // Add --session-work for a real target/value/expiry-constrained ML-DSA session.
+// Add --paymaster-work for genuine registered EOA gas sponsorship.
 // Add --full for 100 real misses, epoch suspension and authenticated recovery.
 // The full run takes about 30–60 minutes; no threshold or clock is shortened.
 import assert from 'node:assert/strict';
@@ -26,6 +27,8 @@ const aaWork = process.argv.includes('--aa-work');
 const aaRevert = process.argv.includes('--aa-revert');
 const referenceValidator = process.argv.includes('--reference-validator');
 const sessionWork = process.argv.includes('--session-work');
+const paymasterWork = process.argv.includes('--paymaster-work');
+assert.ok(!paymasterWork || (aaWork && !referenceValidator && !sessionWork && !aaRevert), '--paymaster-work requires plain --aa-work');
 assert.ok(!sessionWork || (aaWork && !referenceValidator), '--session-work requires --aa-work without reference policy');
 assert.ok(!referenceValidator || aaWork, '--reference-validator requires --aa-work');
 assert.ok(!aaRevert || aaWork, '--aa-revert requires --aa-work');
@@ -35,10 +38,11 @@ assert.ok(!aaWork || process.env.SHELL_SDK_ENTRY, 'Set SHELL_SDK_ENTRY to a comp
 const algorithms = process.argv.slice(2).filter(arg => arg.startsWith('--algorithm='));
 assert.ok(algorithms.length <= 1, 'Select one algorithm');
 const algorithm = algorithms[0]?.slice('--algorithm='.length) ?? 'mldsa65';
+assert.ok(!paymasterWork || algorithm === 'mldsa65', 'This EOA sponsored Work entry tests ML-DSA sender/paymaster');
 assert.ok(!sessionWork || algorithm === 'mldsa65', 'This session Work entry tests ML-DSA root and session');
 assert.ok(!referenceValidator || algorithm === 'mldsa65', 'The reference policy supports the ML-DSA family; select mldsa65');
 assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg === '--session-work' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --session-work, --algorithm=mldsa65|slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg === '--session-work' || arg === '--paymaster-work' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --session-work, --paymaster-work, --algorithm=mldsa65|slhdsa');
 const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
@@ -49,11 +53,13 @@ result.aaWork = aaWork;
 result.aaRevert = aaRevert;
 result.referenceValidator = referenceValidator;
 result.sessionWork = sessionWork;
+result.paymasterWork = paymasterWork;
 const initial = '0xd3c21bcecceda1000000';
 let workBaseHeight = 0, senderStartNonce = 0, recipientStartBalance = BigInt(initial);
 result.toolchain = { node: process.version, platform: process.platform, arch: process.arch };
 const sdkEntry = aaWork ? pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)) : undefined;
 const sdk = sdkEntry ? await import(sdkEntry.href) : undefined;
+const unregisteredPaymaster = paymasterWork ? new sdk.ShellSigner('MlDsa65', sdk.MlDsa65Adapter.generate()) : undefined;
 if (sdkEntry) result.sdkVersion = JSON.parse(await readFile(new URL('../package.json', sdkEntry), 'utf8')).version;
 result.interruptWork = interruptWork;
 result.certificates = [];
@@ -72,6 +78,10 @@ for (let i = 0; i < 3; i++) {
 const genesis = { chain_id: 1337, chain_name: 'offline-network-acceptance', network_type: 'Dev', timestamp: Math.floor(Date.now() / 1000), gas_limit: 50000000, extra_data: 'offline-network-acceptance', alloc: Object.fromEntries(keys.map(key => [key.address, { balance: initial, nonce: 0, code: null, storage: null }])), boot_nodes: [], consensus: { engine: 'wpoa', authorities: keys.map(key => key.address), authority_pubkeys: keys.map(key => key.publicKey), weights: [1, 1, 3], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 10 }, offline_enforcement: { activation_height: 1, epoch_length: 10, block_time_secs: 2, heartbeat_interval_secs: 600 } };
 // Exercise the native AccountManager error path only in this new isolated mode.
 if (sessionWork && aaRevert) genesis.aa_account_manager_height = 0;
+if (paymasterWork) {
+  genesis.fee_accounting_activation_height = 0;
+  genesis.alloc[unregisteredPaymaster.getAddress()] = { balance: initial, nonce: 0, code: null, storage: null };
+}
 for (const i of [0, 1, 2]) {
   await mkdir(join(directory, `node-${i}`));
   await writeFile(join(directory, `node-${i}`, 'genesis.json'), JSON.stringify(genesis));
@@ -90,7 +100,7 @@ const children = [];
 let requestId = 0;
 async function rpc(i, method, params = []) {
   // Session rejection snapshots add reads; retain the normal server rate limit.
-  if (sessionWork) await pause(100);
+  if (sessionWork || paymasterWork) await pause(100);
   const response = await fetch(urls[i], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++requestId, method, params }), signal: AbortSignal.timeout(10000) });
   assert.ok(response.ok, `${method}: HTTP ${response.status}`);
   const body = await response.json();
@@ -163,6 +173,7 @@ async function send(i, nonce, to = keys[1].address, data) {
       const provider = sdk.createShellProvider({ rpcHttpUrl: urls[i] });
       const gasPrice = Number(BigInt(await rpc(i, 'eth_gasPrice')));
       if (sessionWork) return await sendSessionWork(i, signer, provider, nonce, to, gasPrice);
+      if (paymasterWork) return await sendPaymasterWork(i, signer, provider, nonce, to, gasPrice);
       const { tx, aa_bundle } = sdk.buildBatchTransaction({ chainId: 1337, nonce, innerCalls: [sdk.buildInnerTransfer(to, 1n), aaRevert ? sdk.buildInnerCall(sdk.accountManagerAddress, '0xffffffff', 100000) : sdk.buildInnerTransfer(to, 2n)], gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0 });
       const signed = await signer.buildSignedTransaction({ tx, aaBundle: aa_bundle, includePublicKey: true });
       const hash = await provider.sendTransaction(signed);
@@ -242,6 +253,85 @@ async function sendSessionWork(i, root, provider, nonce, to, gasPrice) {
     return hash;
   } finally { session.dispose(); other.dispose(); }
 }
+async function sendPaymasterWork(i, root, provider, nonce, to, gasPrice) {
+  const passwordText = (await readFile(password, 'utf8')).trim();
+  const payer = await sdk.decryptKeystore(JSON.parse(await readFile(keys[0].path, 'utf8')), passwordText);
+  const other = await sdk.decryptKeystore(JSON.parse(await readFile(keys[1].path, 'utf8')), passwordText);
+  const options = { chainId: 1337, nonce,
+    innerCalls: [sdk.buildInnerTransfer(to, 1n), sdk.buildInnerTransfer(to, 2n)],
+    gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0 };
+  const snapshot = async () => {
+    const state = {};
+    for (const address of [root.getAddress(), payer.getAddress(), to, unregisteredPaymaster.getAddress()]) {
+      state[address] = {
+        nonce: await rpc(i, 'eth_getTransactionCount', [address, 'latest']),
+        balance: await rpc(i, 'eth_getBalance', [address, 'latest']),
+        key: await rpc(i, 'shell_getPqPubkey', [address]),
+      };
+    }
+    return state;
+  };
+  async function signed({ targetPayer = payer, authorizer = targetPayer, boundSender = root.getAddress() } = {}) {
+    const draft = sdk.buildBatchTransaction(options);
+    draft.aa_bundle.paymaster = targetPayer.getAddress();
+    const signature = await authorizer.sign(sdk.hashPaymasterTransaction(boundSender, draft.tx, draft.aa_bundle, 'MlDsa65'));
+    const batch = sdk.buildSponsoredTransaction({ ...options, paymaster: targetPayer.getAddress(), paymasterSignature: signature });
+    return root.buildSignedTransaction({ tx: batch.tx, aaBundle: batch.aa_bundle, includePublicKey: true });
+  }
+  result.paymaster = { sender: root.getAddress(), payer: payer.getAddress(), unregistered: unregisteredPaymaster.getAddress(),
+    beforeWork: await snapshot(), rejectionControls: [] };
+  try {
+    assert.equal(result.paymaster.beforeWork[payer.getAddress()].key, keys[0].publicKey, 'real genesis authority key is registered');
+    assert.equal(result.paymaster.beforeWork[unregisteredPaymaster.getAddress()].key, null);
+    for (const [label, constraints, expected] of [
+      ['missing registered payer key', { targetPayer: unregisteredPaymaster }, /paymaster pubkey not found/i],
+      ['payer signing identity', { authorizer: other }, /paymaster signature invalid/i],
+      ['sender binding', { boundSender: other.getAddress() }, /paymaster signature invalid/i],
+      ['batch binding', {}, /paymaster signature invalid/i],
+    ]) {
+      const before = await snapshot();
+      let packet = await signed(constraints);
+      if (label === 'batch binding') {
+        packet = structuredClone(packet);
+        packet.tx.value = '0x4';
+        packet.aa_bundle.inner_calls[1].value = '0x3';
+        packet = await root.buildSignedTransaction({ tx: packet.tx, aaBundle: packet.aa_bundle, includePublicKey: true });
+      }
+      let error;
+      try { await provider.sendTransaction(packet); } catch (e) { error = String(e); }
+      assert.match(error ?? '', expected, label);
+      assert.deepEqual(await snapshot(), before, label + ': no account mutation');
+      result.paymaster.rejectionControls.push({ label, error, stateUnchanged: true });
+      await save();
+    }
+    const packet = await signed();
+    assert.deepEqual(packet.aa_bundle.inner_calls.map(call => BigInt(call.value)), [1n, 2n], 'positive input retains the two promised transfers');
+    assert.equal(BigInt(packet.tx.value), 3n);
+    const hash = await provider.sendTransaction(packet);
+    result.transaction = { hash, submittedAt: new Date().toISOString(), nonce, innerValues: ['1', '2'],
+      entry: 'SDK genuine EOA paymaster sender/batch-bound sponsorship' };
+    return hash;
+  } finally { payer.dispose(); other.dispose(); unregisteredPaymaster.dispose(); }
+}
+async function checkSponsoredState(i, receipt, hash) {
+  const fee = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
+  assert.ok(fee > 0n);
+  const { sender, payer, beforeWork } = result.paymaster;
+  assert.equal(BigInt(await rpc(i, 'eth_getBalance', [payer, receipt.blockNumber])), BigInt(beforeWork[payer].balance) - fee, 'payer pays exactly actual gas fee');
+  assert.equal(await rpc(i, 'eth_getTransactionCount', [payer, receipt.blockNumber]), beforeWork[payer].nonce, 'sponsorship consumes no payer nonce');
+  const block = await rpc(i, 'eth_getBlockByNumber', [receipt.blockNumber, false]);
+  assert.equal(block.miner, sender, 'the restored weighted view assigns C as proposer');
+  // Shell pays the full billed fee once through its deterministic gas reward.
+  assert.equal(BigInt(await rpc(i, 'eth_getBalance', [sender, receipt.blockNumber])), BigInt(beforeWork[sender].balance) + fee - 3n, 'sender funds only value and earns its proposer reward');
+  assert.equal(await rpc(i, 'shell_getPqPubkey', [sender]), keys[2].publicKey);
+  assert.equal(await rpc(i, 'shell_getPqPubkey', [payer]), keys[0].publicKey);
+  const sponsored = await rpc(i, 'shell_isSponsored', [hash]);
+  assert.equal(sponsored.sponsored, true);
+  assert.equal(sponsored.sender, sender);
+  assert.equal(sponsored.paymaster, payer);
+  assert.equal(sponsored.inner_call_count, 2);
+  result.paymaster.fee = '0x' + fee.toString(16);
+}
 async function confirmed(i, to = keys[1].address, data) {
   const authority = [0, 2, 1][i];
   const nonce = Number(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[authority].address, 'latest'])));
@@ -277,6 +367,7 @@ async function evidenceViews(i, block) {
       assert.equal(proof.opportunity.Work.transaction.tx.tx_type, 126);
       assert.equal(proof.opportunity.Work.transaction.aa_bundle.inner_calls.length, 2);
       if (sessionWork) assert.equal(proof.opportunity.Work.transaction.aa_bundle.session_auth.session_pubkey, result.session.publicKey);
+      if (paymasterWork) assert.equal(proof.opportunity.Work.transaction.aa_bundle.paymaster, result.paymaster.payer);
     }
     assert.equal(proof.context.proposer, keys[1].address);
     if (interruptWork) assert.deepEqual(proof.opportunity.Work.transaction, result.pendingVote.opportunity.Work.transaction, 'the original signed work, without resubmission');
@@ -562,6 +653,7 @@ try {
   assert.equal(evidenceCount, 1, 'one genuine timeout certificate before the transfer');
   assert.ok(Date.now() - Date.parse(result.transaction.submittedAt) >= 10000, 'no shortened timeout');
   const tag = receipt.blockNumber;
+  if (paymasterWork) for (const i of [0, 1]) await checkSponsoredState(i, receipt, hash);
   const before = await Promise.all([0, 1].map(i => offline(i, tag)));
   assert.deepEqual(before, [[1, 0, 0, 0], [1, 0, 0, 0]], 'only the absent assigned validator acquires one miss');
   for (const i of [0, 1]) {
@@ -594,6 +686,7 @@ try {
     if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), BigInt(senderStartNonce + 1));
     if (sessionWork) assert.equal(await rpc(i, 'shell_getPqPubkey', [keys[2].address]), keys[2].publicKey, 'session does not replace persisted root key');
     if (sessionWork && aaRevert) assert.deepEqual(await rpc(i, 'debug_traceTransaction', [hash]), result.session.nativeFailureTrace, 'native failed session history after reopen');
+    if (paymasterWork) await checkSponsoredState(i, receipt, hash);
     assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }
   result.phases.push({ phase: full ? 'all three physical processes restarted' : 'both physical processes restarted', height, offline: [1, 0, 0, 0] });
@@ -603,6 +696,7 @@ try {
   result.error = error.stack;
 } finally {
   await stop();
+  unregisteredPaymaster?.dispose();
   result.finishedAt = new Date().toISOString();
   await save();
   console.log(JSON.stringify({ exitCode: result.exitCode, result: join(directory, 'result.json'), error: result.error }));

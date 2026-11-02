@@ -473,6 +473,24 @@ and root-key metadata, and retains the independently certified miss through
 quorum and physical reopening. Reference-policy, paymaster and SLH-DSA session
 combinations remain separate work.
 
+The `--paymaster-work` variant uses a genuine ML-DSA EOA sponsor whose key
+is registered by the validator genesis. The sponsor differs from the sender
+and recipient. A separately funded ordinary account without a registered key,
+an unrelated signing key, wrong sender binding and changed batch value must
+all be rejected without account mutation. The original sponsored two-transfer
+bundle then follows the same minority-vote crash and quorum path. On both peers
+and after physical reopening, the sponsor pays exactly receipt gas used times
+effective gas price, consumes no additional nonce, and the sender funds only
+transferred value. In this weighted view the sender is also proposer, so its
+expected balance includes the full deterministic gas reward once. Registered keys and sponsorship metadata must remain correct.
+Only this fresh isolated mode enables reconciled fee accounting at height 0.
+Shell pays the full billed fee through its deterministic reward; zero priority
+fee does not imply Ethereum base-fee burning. The sponsor differs from the
+proposer, allowing its exact debit to be checked independently.
+No deployed activation changes. Use a compatible V2 source SDK and add
+`--paymaster-work` to `--interrupt-work --aa-work`; session/reference policies,
+late-call failure, SLH-DSA and contract sponsorship remain separate combinations.
+
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and
