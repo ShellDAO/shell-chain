@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### In development
 
+- Bind the reference `DefaultPQValidator` to an explicit authorized public-key
+  hash before verifying signatures. Export constructor creation bytecode and
+  cover signed deployment, unrelated-key rejection, policy replacement with
+  root rotation, rollback and restart. Existing deployed unbound reference
+  runtimes require replacement or clearing; a source update does not migrate
+  installed policies.
+
 - Restore original signed work from independently verified durable timeout
   certificates through normal mempool admission. After a voter restarts before
   quorum, a returning peer can confirm the original transfer without client

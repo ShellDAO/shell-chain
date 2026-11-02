@@ -1,7 +1,10 @@
 mod common;
 
 use alloy_primitives::U256;
-use common::{apply_tx, deploy_runtime_contract, fund_account, setup, sign_tx, CHAIN_ID};
+use common::{
+    apply_tx, deploy_creation_contract, deploy_runtime_contract, fund_account, setup, sign_tx,
+    CHAIN_ID,
+};
 use shell_core::{SignedTransaction, Transaction};
 use shell_crypto::{DilithiumSigner, MultiVerifier, PQSignature, SignatureType, Signer};
 use shell_pqvm::{
@@ -44,9 +47,11 @@ fn account_manager_tx(nonce: u64, calldata: Vec<u8>) -> Transaction {
     }
 }
 
-fn default_pq_validator_runtime() -> Vec<u8> {
-    hex::decode(include_str!("../../../contracts/DefaultPQValidator.bin-runtime").trim())
-        .expect("default validator runtime hex should decode")
+fn default_pq_validator_creation(owner: &impl Signer) -> Vec<u8> {
+    let mut code = hex::decode(include_str!("../../../contracts/DefaultPQValidator.bin").trim())
+        .expect("creation bytecode");
+    code.extend_from_slice(shell_primitives::blake3_hash(owner.public_key()).as_bytes());
+    code
 }
 
 fn validator_returns_false() -> Vec<u8> {
@@ -55,6 +60,98 @@ fn validator_returns_false() -> Vec<u8> {
 
 fn validator_loops_forever() -> Vec<u8> {
     vec![0x5B, 0x60, 0x00, 0x56]
+}
+
+#[test]
+fn default_pq_validator_rejects_an_unrelated_signing_key() {
+    use shell_crypto::MlDsaSigner;
+    let (mut evm, chain_store) = setup();
+    let verifier = MultiVerifier;
+    let owner = MlDsaSigner::generate();
+    let attacker = MlDsaSigner::generate();
+    let owner_addr = ShellAddress::from_public_key(owner.public_key(), owner.sig_type().as_u8());
+    let receiver = ShellAddress::from([0x37; 32]);
+    fund_account(&mut evm, &owner_addr, U256::from(10_000_000_000u64));
+    let (_, validator_hash) = deploy_creation_contract(
+        &mut evm,
+        &chain_store,
+        &verifier,
+        &owner,
+        owner_addr,
+        0,
+        1,
+        &default_pq_validator_creation(&owner),
+    );
+    let install = sign_tx(
+        owner_addr,
+        &owner,
+        account_manager_tx(1, encode_set_validation_code_calldata(&validator_hash)),
+        false,
+    );
+    assert_eq!(
+        apply_tx(&mut evm, &chain_store, &verifier, &install, 2, 0, 0)
+            .receipt
+            .status,
+        1
+    );
+    let valid = sign_tx(owner_addr, &owner, transfer_tx(2, receiver, 11), false);
+    assert_eq!(
+        apply_tx(&mut evm, &chain_store, &verifier, &valid, 3, 0, 0)
+            .receipt
+            .status,
+        1
+    );
+    let before = evm
+        .state_db()
+        .world_state()
+        .get_account(&owner_addr)
+        .unwrap()
+        .unwrap();
+    let mut corrupted = sign_tx(owner_addr, &owner, transfer_tx(3, receiver, 7), true);
+    corrupted.signature = attacker
+        .sign(corrupted.sender_signing_hash().as_bytes())
+        .unwrap();
+    assert!(validate_tx(
+        &corrupted,
+        evm.state_db_mut().world_state_mut(),
+        &chain_store,
+        &verifier,
+        CHAIN_ID
+    )
+    .is_err());
+    let forged = sign_tx(owner_addr, &attacker, transfer_tx(3, receiver, 7), true);
+    let admitted = validate_tx(
+        &forged,
+        evm.state_db_mut().world_state_mut(),
+        &chain_store,
+        &verifier,
+        CHAIN_ID,
+    );
+    if admitted.is_ok() {
+        let result = apply_tx(&mut evm, &chain_store, &verifier, &forged, 4, 0, 0);
+        eprintln!(
+            "UNRELATED_KEY_BUSINESS_RESULT status={} owner_nonce={} recipient_balance={}",
+            result.receipt.status,
+            evm.state_db().world_state().get_nonce(&owner_addr).unwrap(),
+            evm.state_db().world_state().get_balance(&receiver).unwrap()
+        );
+    }
+    assert!(
+        admitted.is_err(),
+        "default policy must reject an unrelated valid signer claiming the owner"
+    );
+    assert_eq!(
+        evm.state_db()
+            .world_state()
+            .get_account(&owner_addr)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        evm.state_db().world_state().get_balance(&receiver).unwrap(),
+        U256::from(11)
+    );
 }
 
 #[test]
@@ -68,7 +165,7 @@ fn set_validation_code_allows_custom_validator_and_clear_restores_builtin_rules(
 
     fund_account(&mut evm, &owner_addr, U256::from(10_000_000_000u64));
 
-    let (_validator_addr, validator_hash) = deploy_runtime_contract(
+    let (_validator_addr, validator_hash) = deploy_creation_contract(
         &mut evm,
         &chain_store,
         &verifier,
@@ -76,7 +173,7 @@ fn set_validation_code_allows_custom_validator_and_clear_restores_builtin_rules(
         owner_addr,
         0,
         1,
-        &default_pq_validator_runtime(),
+        &default_pq_validator_creation(&owner),
     );
 
     let set_signed = sign_tx(

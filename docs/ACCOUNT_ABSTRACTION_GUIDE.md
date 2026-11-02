@@ -205,6 +205,64 @@ This call path is implemented in:
 
 ## 5. Key rotation and validator upgrades
 
+### Deploying the key-bound reference policy
+
+The updated `DefaultPQValidator` source requires one `bytes32` constructor
+argument: **BLAKE3-256 of the authorized raw public key bytes**. The policy
+checks this binding before invoking the ML-DSA-family signature precompile.
+A valid signature from another key does not authorize spending this account.
+This source change is pending release; it does not replace deployed policies.
+
+Use `contracts/DefaultPQValidator.bin` as creation bytecode and append the
+32-byte constructor argument using the accompanying ABI. Deploy it through a
+signed contract-creation transaction, fetch its actual deployed runtime, compute
+that runtime's Keccak-256 code hash, and install the hash with
+`setValidationCode(code_hash)`. The constructor embeds the authorized hash into
+runtime, so the deployed code hash differs between keys.
+`DefaultPQValidator.bin-runtime` is the compiler's runtime template with
+unpatched immutable slots; wrapping that template in generic init code bypasses
+the constructor and does not create a usable key-bound policy.
+
+Generate or verify all three artifacts with the pinned compiler:
+
+```bash
+scripts/default-pq-validator-artifacts.sh --write
+scripts/default-pq-validator-artifacts.sh --check
+```
+
+The reference policy retains the legacy V1 validation ABI and the existing
+validation gas cap. It supports the ML-DSA-65 and legacy Dilithium3 paths handled
+by the ML-DSA-family precompile; it is not an SLH-DSA or multisignature policy.
+Custom policies remain responsible for their own authorization rules.
+
+An installed key-bound policy does not follow `rotateKey` automatically. Deploy
+a replacement policy bound to the new key first. Then sign an atomic AA batch
+with the current authorized key containing `rotateKey(new_pubkey, algo_id)`
+and `setValidationCode(new_policy_hash)`, in that order. Both changes must
+succeed together. Alternatively, clear the custom policy while the current
+key is still authorized, then use built-in validation for rotation. Rotating
+only the root leaves the old policy's key authorized until the policy is changed.
+
+Older reference runtimes that only verify the supplied signature without a
+key binding must be replaced or cleared. Updating a node or these source
+artifacts does not migrate an installed runtime.
+
+Run the signed deployment, unrelated-key rejection, failed-batch rollback,
+atomic rotation, history and restart acceptance on an isolated node:
+
+```bash
+cargo build --locked -p shell-cli --features libp2p
+SHELL_SDK_ENTRY=/path/to/compatible-sdk/dist/index.js \
+  node tests/e2e/native-aa-lifecycle.mjs --reference-validator
+```
+
+This entry requires a built SDK with transaction wire format V2 (source SDK
+0.14.0-rc.3 tested), including its installed hashing dependency. It creates
+fresh test keys and funds, uses an isolated RocksDB directory and loopback RPC,
+and enables AccountManager only in its own development genesis. Public package
+availability and network activation remain separate delivery requirements.
+
+
 The long-term AA model includes a protocol-managed account controller for:
 
 - `rotateKey(pubkey, algo_id)`

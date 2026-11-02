@@ -117,12 +117,36 @@ pub fn deploy_runtime_contract<S: Signer, V: Verifier>(
     block_number: u64,
     runtime: &[u8],
 ) -> (ShellAddress, ShellHash) {
+    deploy_creation_contract(
+        evm,
+        chain_store,
+        verifier,
+        signer,
+        from,
+        nonce,
+        block_number,
+        &make_init_code(runtime),
+    )
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn deploy_creation_contract<S: Signer, V: Verifier>(
+    evm: &mut ShellPqvm<MemoryDb>,
+    chain_store: &ChainStore<MemoryDb>,
+    verifier: &V,
+    signer: &S,
+    from: ShellAddress,
+    nonce: u64,
+    block_number: u64,
+    creation: &[u8],
+) -> (ShellAddress, ShellHash) {
     let tx = Transaction {
         chain_id: CHAIN_ID,
         nonce,
         to: None,
         value: U256::ZERO,
-        data: ShellBytes::from(make_init_code(runtime)),
+        data: ShellBytes::from(creation.to_vec()),
         gas_limit: 5_000_000,
         max_fee_per_gas: 10,
         max_priority_fee_per_gas: 1,

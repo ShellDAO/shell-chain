@@ -318,6 +318,117 @@ async function runScenario() {
     );
     return height;
   }
+  if (process.argv.includes("--reference-validator")) {
+    result.scenario = "reference-validator-key-authorization";
+    result.adaptations[2] = "Reference policy constructor binds the raw public-key BLAKE3 hash. Actual signed deployment, installation, atomic root/policy rotation, rollback, historical replay and RocksDB reopen; isolated activation only.";
+    const { createRequire } = await import("node:module");
+    const sdkRequire = createRequire(pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)));
+    const { blake3 } = await import(pathToFileURL(sdkRequire.resolve("@noble/hashes/blake3")).href);
+    const { keccak_256 } = await import(pathToFileURL(sdkRequire.resolve("@noble/hashes/sha3")).href);
+    const hex = (bytes) => Buffer.from(bytes).toString("hex");
+    const account = old.getAddress();
+    const attacker = new ShellSigner("MlDsa65", MlDsa65Adapter.generate(), account);
+    const creation = (await readFile(new URL("../../contracts/DefaultPQValidator.bin", import.meta.url), "utf8")).trim();
+    const current = async () => ({
+      nonce: await rpc("eth_getTransactionCount", [account, "latest"]),
+      balance: await rpc("eth_getBalance", [account, "latest"]),
+      key: await rpc("shell_getPqPubkey", [account]),
+      recipient: await rpc("eth_getBalance", [outsider.getAddress(), "latest"]),
+    });
+    async function execute(label, signer, tx, aaBundle, expected = "0x1") {
+      const hash = await send(await signer.buildSignedTransaction({ tx, aaBundle, includePublicKey: true }));
+      await mine();
+      const receipt = await rpc("eth_getTransactionReceipt", [hash]);
+      assert.ok(receipt, label + ": receipt available");
+      assert.ok(BigInt(receipt.gasUsed) > 0n);
+      nonces.set(signer.getAddress(), (nonces.get(signer.getAddress()) ?? 0) + 1);
+      const trace = await rpc("debug_traceTransaction", [hash]);
+      result.transactions.push({ label, hash, receipt, trace });
+      assert.equal(receipt.status, expected, label);
+      return receipt;
+    }
+    async function deploy(signer, label) {
+      const tx = buildTransaction({ chainId: 1337, nonce: nonces.get(miner.getAddress()) ?? 0,
+        to: null, value: 0n, data: "0x" + creation + hex(blake3(signer.getPublicKey())), gasLimit: 3000000 });
+      const receipt = await execute(label, miner, tx);
+      const code = await rpc("eth_getCode", [receipt.contractAddress, "latest"]);
+      assert.ok(code.length > 2, "constructor persisted runtime");
+      return "0x" + hex(keccak_256(Buffer.from(code.slice(2), "hex")));
+    }
+    const policyA = await deploy(old, "deploy-owner-bound-policy");
+    const policyB = await deploy(replacement, "deploy-replacement-bound-policy");
+    assert.notEqual(policyA, policyB, "constructor produces a distinct key-bound runtime");
+    const direct = (signer, data, value = 0n, to = accountManagerAddress) => buildTransaction({
+      chainId: 1337, nonce: nonces.get(signer.getAddress()) ?? 0, to, value, data, gasLimit: 3000000,
+    });
+    const transfer = (signer) => direct(signer, "0x", 7n, outsider.getAddress());
+    async function rejected(label, signer) {
+      const before = await current();
+      let error;
+      try { await send(await signer.buildSignedTransaction({ tx: transfer(signer), includePublicKey: true })); }
+      catch (e) { error = String(e); }
+      assert.match(error ?? "", /validation contract rejected|pubkey|signature/i, label);
+      assert.deepEqual(await current(), before, label + ": no balance, nonce or key mutation");
+      result.rejections.push({ label, error, stateUnchanged: true });
+    }
+    async function allowed(label, signer) {
+      const before = BigInt(await rpc("eth_getBalance", [outsider.getAddress(), "latest"]));
+      await execute(label, signer, transfer(signer));
+      assert.equal(BigInt(await rpc("eth_getBalance", [outsider.getAddress(), "latest"])) - before, 7n);
+    }
+    try {
+      await execute("install-reference-policy", old, direct(old, encodeSetValidationCodeCalldata(policyA)));
+      await allowed("owner-valid-signature", old);
+      await rejected("unrelated-real-key-rejected", attacker);
+      const rotateCalls = [
+        buildInnerCall(accountManagerAddress, encodeRotateKeyCalldata(replacement.getPublicKey(), replacement.algorithmId), 500000),
+        buildInnerCall(accountManagerAddress, encodeSetValidationCodeCalldata(policyB), 500000),
+      ];
+      const rotation = (calls) => buildBatchTransaction({ chainId: 1337, nonce: nonces.get(account) ?? 0,
+        innerCalls: calls, gasLimit: 3000000 });
+      const beforeFailure = await current();
+      const failed = rotation([...rotateCalls, buildInnerCall(accountManagerAddress, "0xffffffff", 100000)]);
+      await execute("failed-root-policy-batch", old, failed.tx, failed.aa_bundle, "0x0");
+      const afterFailure = await current();
+      assert.equal(BigInt(afterFailure.nonce), BigInt(beforeFailure.nonce) + 1n);
+      assert.deepEqual(afterFailure.key, beforeFailure.key);
+      assert.equal(afterFailure.recipient, beforeFailure.recipient);
+      await rejected("replacement-rejected-after-rollback", replacement);
+      await allowed("original-policy-retained-after-rollback", old);
+      const batch = rotation(rotateCalls);
+      await execute("atomic-root-policy-rotation", old, batch.tx, batch.aa_bundle);
+      await rejected("old-key-rejected-after-rotation", old);
+      await allowed("replacement-key-authorized", replacement);
+      // Deliberately keep a policy key distinct from the registered root to
+      // distinguish persisted custom authorization from built-in validation.
+      await execute("install-explicit-old-key-policy", replacement,
+        direct(replacement, encodeSetValidationCodeCalldata(policyA)));
+      await rejected("root-alone-does-not-override-policy", replacement);
+      await allowed("explicit-policy-key-authorized", old);
+      const state = await current();
+      await stop();
+      await start(data, "reference-policy-restart");
+      assert.deepEqual(await current(), state);
+      await rejected("unrelated-key-rejected-after-reopen", attacker);
+      await rejected("root-rejected-by-persisted-policy", replacement);
+      await allowed("explicit-policy-key-after-reopen", old);
+      await execute("replace-persisted-policy", old,
+        direct(old, encodeSetValidationCodeCalldata(policyB)));
+      await rejected("old-key-rejected-after-policy-replacement", old);
+      await allowed("replacement-after-reopen", replacement);
+      const beforeHistory = await current();
+      for (const t of result.transactions)
+        assert.deepEqual(await rpc("debug_traceTransaction", [t.hash]), t.trace, t.label + " historical replay");
+      assert.deepEqual(await current(), beforeHistory, "history does not mutate current state");
+      await execute("clear-reference-policy", replacement, direct(replacement, encodeClearValidationCodeCalldata()));
+      await allowed("builtin-replacement-after-clear", replacement);
+      await rejected("builtin-old-key-rejected", old);
+      result.referencePolicyAuthorizationAndRotationVerified = true;
+      result.finalHeight = height;
+      result.passed = true;
+    } finally { attacker.dispose(); }
+    return;
+  }
   if (process.argv.includes("--fee-history-rewards")) {
     result.scenario = "fee-history-positive-tips";
     const q = (n) => "0x" + BigInt(n).toString(16);

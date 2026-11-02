@@ -16,6 +16,7 @@ new_fixture() {
     > "$fixture/contracts/DefaultPQValidator.sol"
   printf '%s\n' '[]' > "$fixture/contracts/DefaultPQValidator.abi.json"
   printf '%s' '00' > "$fixture/contracts/DefaultPQValidator.bin-runtime"
+  printf '%s' '00' > "$fixture/contracts/DefaultPQValidator.bin"
   printf '%s\n' '{}' > "$fixture/tools/default-pq-validator-artifacts/package.json"
   printf '%s\n' '{}' > "$fixture/tools/default-pq-validator-artifacts/package-lock.json"
   git -C "$fixture" init -q -b main
@@ -48,6 +49,13 @@ rm "$RUNTIME_FIXTURE/contracts/DefaultPQValidator.bin-runtime"
 ln -s "$VICTIM" "$RUNTIME_FIXTURE/contracts/DefaultPQValidator.bin-runtime"
 expect_rejected "$RUNTIME_FIXTURE" \
   'contracts/DefaultPQValidator.bin-runtime must be a regular file or absent, not a symlink'
+grep -Fxq 'preserve me' "$VICTIM"
+
+CREATION_FIXTURE=$(new_fixture creation-symlink)
+rm "$CREATION_FIXTURE/contracts/DefaultPQValidator.bin"
+ln -s "$VICTIM" "$CREATION_FIXTURE/contracts/DefaultPQValidator.bin"
+expect_rejected "$CREATION_FIXTURE" \
+  'contracts/DefaultPQValidator.bin must be a regular file or absent, not a symlink'
 grep -Fxq 'preserve me' "$VICTIM"
 
 SOURCE_FIXTURE=$(new_fixture source-symlink)
