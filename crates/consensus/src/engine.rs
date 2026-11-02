@@ -83,6 +83,10 @@ pub trait ConsensusEngine: Send + Sync {
         self.set_authorities(authorities);
     }
 
+    /// Keep certified offline participation separate from economic/base weights.
+    /// Disabled profiles preserve legacy selection and weight accounting.
+    fn set_certified_participation(&mut self, _enabled: bool, _suspended: Vec<Address>) {}
+
     /// Sign a block header with the proposer's key.
     fn sign_block(&self, block: &mut Block, signer: &dyn Signer) -> Result<(), ConsensusError>;
 
@@ -110,6 +114,18 @@ pub trait ConsensusEngine: Send + Sync {
     /// Record a view-change vote and return true when quorum advances the view.
     fn handle_view_change_message(&mut self, _msg: ViewChangeMessage, _total_weight: u64) -> bool {
         false
+    }
+
+    /// Whether this validator has already voted in the current view.
+    fn has_view_change_vote(&self, _validator: &Address) -> bool {
+        false
+    }
+
+    /// Install a node-verified contiguous durable timeout-certificate view.
+    fn set_certified_view(&mut self, _view: u64) -> Result<(), ConsensusError> {
+        Err(ConsensusError::InvalidLifecycleTransition(
+            "certified view requires wPoA".into(),
+        ))
     }
 
     /// Return the active view for the next in-flight block.

@@ -21,6 +21,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
 ) -> Result<Block, GenesisError> {
     config.validate_economics()?;
     config.algorithm_voting_window()?;
+    config.offline_enforcement_profile()?;
     let fallback_commitment = config.governance_fallback_commitment()?;
 
     let mut world_state = WorldState::new(std::sync::Arc::clone(&store));
@@ -156,6 +157,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
                 native_registry_view_height: config.native_registry_view_height,
                 pq_address_bounds_height: config.pq_address_bounds_height,
                 native_address_context_height: config.native_address_context_height,
+                offline_enforcement: config.offline_enforcement_profile()?,
                 native_validator_events_height: config.native_validator_events_height,
                 prover_registry_height: config.prover_registry_height,
                 algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
@@ -453,6 +455,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

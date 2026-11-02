@@ -588,22 +588,116 @@ headers from the same authority.
 
 ### Offline
 
-Detected by `detect_offline(addr, last_proposed, current_block, config)` —
-triggered when a validator hasn't proposed a block for more than
-`SlashingConfig::offline_threshold` slots.
+The scheduled offline rule suspends a validator after **100 consecutive assigned
+proposal misses**, each confirmed by a verified weighted-quorum timeout
+certificate. Another validator's slot, an idle mempool, a local clock or low
+proposal frequency is not evidence of a miss. A valid proposal resets that
+validator's consecutive counter. Joining starts a fresh counter.
 
-```
-SlashType::Offline
-```
+The threshold schedules suspension at the next common epoch boundary. Reaching
+it does not deduct account balances or stake principal, and does not add an
+economic weight penalty. A subsequent proposal resets the counter but does not
+cancel an already triggered suspension; restoration requires authenticated
+governance at the recovery epoch.
+
+This is **unreleased development behavior**. Forward production and import now
+bind admitted certificates to their enclosing block and restore the durable
+in-flight view. Accepted canonical bodies replay with the ordered effective
+authorities committed in their native root, preserving historical penalties.
+Competing branches with a trusted same-parent slot anchor or independently
+verified epoch input history replay and adopt atomically. Pending raw registry
+changes do not substitute for that base or erase the still-active parent
+context. Known surviving and returning identities retain their authenticated
+base-minus-effective economic reduction across governed base updates, clamped
+at zero. Returning input comes from its last positive sealed epoch context,
+not its new raw registry entry or the observer's later penalty map. New identities,
+missing eligible economic history and new penalty transitions
+still need independent reconstruction. Governed reload order follows the
+verified native roster while economic reductions follow validator identities;
+remove and re-add before the same reload does not itself reset a counter.
+A proposal assigned by the new order resets that proposer's counter normally.
+Native quorum recovery can also restore an unanchored branch from its last
+eligible sealed economic input. Historical absence is skipped only when the
+verified input parent proves native suspension for that epoch. Recovery lifts
+the mask at the scheduled common epoch; it does not erase economic reductions.
+Real recovery votes and later weight updates are qualified for historical
+base 1/input 1 and base 2/input 1 with an inherited reduction of 1. Recovery
+preserves that reduction; a governed native base 1 after recovery yields zero
+effective input while membership and the cleared native suspension remain.
+The zero-weight key cannot propose or contribute to quorum. Atomic failure,
+history and restart retain both inherited and observer reductions. Missing
+ancestry refuses. Trusted snapshots at 496 and 500 also restore the real
+base 2/input 1 prefix, its inherited reduction, stake 50 and balance 123 into
+independent stores; forward import and native recovery preserve effective
+input 1. This qualification includes the existing trusted persisted journal,
+not authentication of arbitrary economic metadata. Missing eligible input and
+other mixed histories remain open.
+First-member admission is separately
+qualified for chains initialized with a prover registry required from genesis
+and offline enforcement active from block 1,
+with complete retained roots proving no prior validator or prover role.
+Legacy pre-activation intervals, unrestricted prover history and prior prover roles still need authenticated
+economic provenance. Activated profiles bind signed equivocation evidence to
+historical validator membership; pubkey availability or later membership does
+not authorize an earlier proposal slot. Committed pending suspension is applied
+to the prospective block epoch through a separate participation mask; balances,
+stake and base weights remain intact. Startup and snapshots preserve that mask
+even after a returning proposal resets the consecutive counter. Authenticated recovery now accepts root-signed weighted governance votes through
+`recoverValidator(address,uint64,bytes32)`. The three native ABI words contain
+the suspended identity, its suspension epoch and the active ordered committee
+hash. Votes are scoped to chain, current epoch, incident and effective committee;
+a strict weight greater than two thirds schedules recovery at the next epoch.
+Unsigned calls, custom account policy alone, duplicate votes and stale contexts
+do not authorize recovery. The validator remains suspended until that epoch,
+when its consecutive counter resets. Native AA inner calls additionally require
+the independent native registry activation.
+
+Native counter membership now follows the existing epoch base-authority reload.
+A pending raw registry removal retains the active member's counter and permits
+its still-assigned proposals and certified misses. Removing and readding before
+actual consensus exit does not reset that counter. Once the boundary block
+commits the base reload, exit removes its native entry; an actual later rejoin
+starts fresh when the new base roster activates. Snapshot and startup recovery
+use the same boundary roster. First activation now initializes from the verified
+base roster on the authenticated parent branch, rather than pending raw edits.
+Ancestor hashes, heights, genesis identity and boundary state are checked;
+missing or mismatched history is rejected. The first native prefix is distinct
+from subsequent epoch membership updates. Unanchored effective-weight admission,
+broader committee transitions and other historical compatibility combinations
+remain in development. The implemented native kernels
+verify parent-, epoch-, ordered-set-, assignment- and opportunity-bound timeout
+signatures, check weighted quorum, preserve a proof transcript, and store counters
+in ordinary validator-registry trie storage. The `timeoutEvidence` system envelope
+has zero value; its RPC type is `0x82` and it is not a reward. Current unconfigured
+node import rejects that evidence instead of applying a penalty.
+
+A portable [physical acceptance](adr/certified-offline-enforcement.md) also runs
+real CLI/libp2p/RocksDB nodes with ML-DSA weights A1/B1/C3. It covers 100 actual
+certified assigned misses, epoch suspension, minority and quorum recovery votes,
+an offline node catching up and proposing after recovery, earned transaction
+fees, finality, and all-process restart with historical state intact. Run
+`node tests/e2e/native-offline-network.mjs --full` after building the CLI with
+`--features libp2p`. This is an isolated development profile, not public-network
+activation; other signature/account combinations and in-flight crash cases
+still need their own acceptance.
+
+The `SHELL_VIEWCHG_V1` journal retains legacy authenticated votes for observation.
+Those signatures do not bind the observed parent or membership epoch and must
+not feed offline counters. The `detect_offline` block-gap helper is also not the
+scheduled rule and is not a live enforcement entry point. See the
+[certified offline design](adr/certified-offline-enforcement.md).
 
 ### SlashingConfig defaults
 
+These are the actual `SlashingConfig` helper fields, separate from the fixed
+100-assigned-opportunity offline rule above. In particular, the prototype offline
+percentage and global block window must not be wired into that rule.
+
 | Field | Default | Description |
 |-------|---------|-------------|
-| `offline_threshold` | 100 | Slots without a proposal before offline detection |
-| `slash_on_double_sign` | true | Slash immediately on equivocation |
-| `slash_on_offline` | false | Offline triggers suspension, not slash (configurable) |
-| `slash_weight_bps` | 1000 | Reduce effective validator weight by 10% per slash, capped at the validator's base weight |
+| `double_sign_slash_bps` | 1000 | Double-sign helper fraction in basis points |
+| `offline_slash_bps` | 100 | Prototype offline helper fraction; not the scheduled suspension policy |
+| `offline_window_blocks` | 50 | Prototype global block-gap helper window; not an assigned-opportunity threshold |
 
 ### SlashRecord
 
@@ -617,7 +711,7 @@ SlashRecord {
 }
 ```
 
-Slash records are written to `ValidatorSet`. Equivocation still marks the validator as slashed for epoch-boundary removal, while the economic penalty is applied immediately by reducing effective proposer/finality weight according to `slash_weight_bps`. Offline detection defaults to suspension-only until `slash_on_offline` is enabled.
+Slash records are written to `ValidatorSet`. Equivocation still marks the validator as slashed for epoch-boundary removal, while the economic penalty is applied immediately by reducing effective proposer/finality weight according to `slash_weight_bps`. The scheduled offline rule above uses suspension and authenticated recovery, separately from equivocation penalties.
 
 ---
 

@@ -78,6 +78,8 @@ pub struct WPoaEngine {
     validator_set: ValidatorSet,
     validator_set_config: ValidatorSetConfig,
     slash_weights: HashMap<Address, u64>,
+    certified_participation: bool,
+    suspended: std::collections::HashSet<Address>,
     view_change_state: Mutex<ViewChangeState>,
     signer: Option<Arc<dyn Signer>>,
 }
@@ -122,6 +124,8 @@ impl WPoaEngine {
             validator_set,
             validator_set_config: config.validator_set_config,
             slash_weights: HashMap::new(),
+            certified_participation: false,
+            suspended: std::collections::HashSet::new(),
             view_change_state: Mutex::new(view_change_state),
             signer: None,
         }
@@ -149,13 +153,31 @@ impl WPoaEngine {
         self.proposer_for_block_in_view(block_number, view)
     }
 
+    fn certified_proposer_for_block(&self, block_number: u64, view: u64) -> Address {
+        let weights = self.validator_weights();
+        let authorities = self
+            .inner
+            .config()
+            .authorities
+            .iter()
+            .filter_map(|a| weights.get(a).copied().filter(|w| *w > 0).map(|w| (*a, w)))
+            .collect::<Vec<_>>();
+        crate::timeout::timeout_proposer(block_number, view, &authorities).unwrap_or(Address::ZERO)
+    }
+
     fn base_proposer_for_block(&self, block_number: u64) -> Address {
+        if self.certified_participation {
+            return self.certified_proposer_for_block(block_number, 0);
+        }
         self.validator_set
             .weighted_proposer(block_number)
             .unwrap_or_else(|| self.inner.config().proposer_for_block(block_number))
     }
 
     fn proposer_for_block_in_view(&self, block_number: u64, view: u64) -> Address {
+        if self.certified_participation {
+            return self.certified_proposer_for_block(block_number, view);
+        }
         if view == 0 {
             return self.base_proposer_for_block(block_number);
         }
@@ -180,7 +202,15 @@ impl WPoaEngine {
     }
 
     fn first_view_for_proposer(&self, block_number: u64, proposer: Address) -> Option<u64> {
-        if !self.validator_set.is_active(&proposer) {
+        if !self.validator_set.is_active(&proposer)
+            || (self.certified_participation
+                && self
+                    .validator_weights()
+                    .get(&proposer)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0)
+        {
             return None;
         }
 
@@ -217,6 +247,14 @@ impl WPoaEngine {
 
     fn reset_view_change_state(&mut self, now_ms: u64) {
         self.view_change_state().reset_for_block(now_ms);
+    }
+
+    fn has_view_change_vote(&self, validator: &Address) -> bool {
+        let state = self.view_change_state();
+        state
+            .pending_view_changes
+            .get(&state.current_view)
+            .is_some_and(|votes| votes.iter().any(|vote| vote.validator == *validator))
     }
 
     fn current_view(&self) -> u64 {
@@ -271,7 +309,15 @@ impl WPoaEngine {
 impl ConsensusEngine for WPoaEngine {
     fn verify_header(&self, header: &BlockHeader) -> Result<(), ConsensusError> {
         // Check proposer is in the active set.
-        if !self.validator_set.is_active(&header.proposer) {
+        if !self.validator_set.is_active(&header.proposer)
+            || (self.certified_participation
+                && self
+                    .validator_weights()
+                    .get(&header.proposer)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0)
+        {
             return Err(ConsensusError::UnknownProposer(header.proposer));
         }
 
@@ -334,6 +380,16 @@ impl ConsensusEngine for WPoaEngine {
     async fn seal_block(&self, block: &mut Block) -> Result<(), ConsensusError> {
         let signer = self.signer.as_ref().ok_or(ConsensusError::NoSigner)?;
 
+        if self.certified_participation
+            && self
+                .validator_weights()
+                .get(&block.header.proposer)
+                .copied()
+                .unwrap_or(0)
+                == 0
+        {
+            return Err(ConsensusError::UnknownProposer(block.header.proposer));
+        }
         let expected = self.proposer_for_block(block.header.number);
         if block.header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
@@ -351,7 +407,9 @@ impl ConsensusEngine for WPoaEngine {
     }
 
     fn is_proposer(&self, block_number: u64, address: &Address) -> bool {
-        self.proposer_for_block(block_number) == *address
+        (!self.certified_participation
+            || self.validator_weights().get(address).copied().unwrap_or(0) > 0)
+            && self.proposer_for_block(block_number) == *address
     }
 
     fn engine_type(&self) -> EngineType {
@@ -367,6 +425,16 @@ impl ConsensusEngine for WPoaEngine {
     }
 
     fn sign_block(&self, block: &mut Block, signer: &dyn Signer) -> Result<(), ConsensusError> {
+        if self.certified_participation
+            && self
+                .validator_weights()
+                .get(&block.header.proposer)
+                .copied()
+                .unwrap_or(0)
+                == 0
+        {
+            return Err(ConsensusError::UnknownProposer(block.header.proposer));
+        }
         let expected = self.proposer_for_block(block.header.number);
         if block.header.proposer != expected {
             return Err(ConsensusError::InvalidProposer {
@@ -455,6 +523,9 @@ impl ConsensusEngine for WPoaEngine {
         self.validator_set
             .active_validators()
             .into_iter()
+            .filter(|validator| {
+                !self.certified_participation || !self.suspended.contains(&validator.address)
+            })
             .map(|validator| {
                 (
                     validator.address,
@@ -465,12 +536,32 @@ impl ConsensusEngine for WPoaEngine {
             .collect()
     }
 
+    fn set_certified_participation(&mut self, enabled: bool, suspended: Vec<Address>) {
+        self.certified_participation = enabled;
+        self.suspended = suspended.into_iter().collect();
+    }
+
     fn handle_view_change_message(&mut self, msg: ViewChangeMessage, total_weight: u64) -> bool {
         WPoaEngine::handle_view_change_message(self, msg, total_weight)
     }
 
+    fn has_view_change_vote(&self, validator: &Address) -> bool {
+        WPoaEngine::has_view_change_vote(self, validator)
+    }
+
     fn current_view(&self) -> u64 {
         WPoaEngine::current_view(self)
+    }
+    fn set_certified_view(&mut self, view: u64) -> Result<(), ConsensusError> {
+        let mut state = self.view_change_state();
+        if view < state.current_view {
+            return Err(ConsensusError::InvalidLifecycleTransition(
+                "certified view cannot regress".into(),
+            ));
+        }
+        state.current_view = view;
+        state.pending_view_changes.clear();
+        Ok(())
     }
 
     fn check_view_change_timeout(&self, now_ms: u64, block_time_ms: u64) -> bool {
@@ -775,5 +866,49 @@ mod tests {
         assert_eq!(e.current_view(), 0);
         assert!(!e.check_view_change_timeout(1, 1_000));
         e.note_block_progress(1);
+    }
+    #[test]
+    fn certified_participation_mask_preserves_base_penalties_and_legacy_selection() {
+        let a = addr(1);
+        let b = addr(2);
+        let c = addr(3);
+        let mut e = engine(vec![a, b, c], vec![10, 20, 100]);
+        e.slash_authority(&c);
+        let penalties = e.penalty_state();
+        assert_eq!(e.validator_weights()[&c], 90);
+        assert_eq!(e.proposer_for_block(10), b);
+        e.set_certified_participation(true, vec![b]);
+        assert_eq!(e.validator_weights(), HashMap::from([(a, 10), (c, 90)]));
+        for height in 0..300 {
+            let base = if height % 100 < 10 { a } else { c };
+            assert_eq!(e.first_view_for_proposer(height, base), Some(0));
+            assert_eq!(e.first_view_for_proposer(height, b), None);
+            for view in 0..4 {
+                let expected = if view % 2 == 0 {
+                    base
+                } else if base == a {
+                    c
+                } else {
+                    a
+                };
+                assert_eq!(e.proposer_for_block_in_view(height, view), expected);
+            }
+        }
+        assert_eq!(e.poa_config().authority_weights, vec![10, 20, 100]);
+        assert_eq!(e.penalty_state(), penalties);
+        e.set_authorities_with_weights(vec![a, b, c], vec![10, 20, 100]);
+        assert_eq!(e.validator_weights(), HashMap::from([(a, 10), (c, 90)]));
+        e.set_certified_participation(true, vec![a, b, c]);
+        assert!(e.validator_weights().is_empty());
+        for identity in [a, b, c, Address::ZERO] {
+            assert!(!e.is_proposer(100, &identity));
+        }
+        e.set_certified_participation(false, Vec::new());
+        assert_eq!(e.proposer_for_block(10), b);
+        assert_eq!(
+            e.validator_weights(),
+            HashMap::from([(a, 10), (b, 20), (c, 90)])
+        );
+        assert_eq!(e.penalty_state(), penalties);
     }
 }

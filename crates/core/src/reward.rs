@@ -7,6 +7,7 @@ use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub enum SystemTxKind {
     BlockGasReward,
     StarkReward,
+    TimeoutEvidence,
 }
 
 impl SystemTxKind {
@@ -14,6 +15,7 @@ impl SystemTxKind {
         match self {
             Self::BlockGasReward => 1,
             Self::StarkReward => 2,
+            Self::TimeoutEvidence => 3,
         }
     }
 
@@ -21,6 +23,7 @@ impl SystemTxKind {
         match self {
             Self::BlockGasReward => "blockGasReward",
             Self::StarkReward => "starkReward",
+            Self::TimeoutEvidence => "timeoutEvidence",
         }
     }
 }
@@ -108,6 +111,32 @@ impl SystemTransaction {
             original_size: Some(params.original_size),
             compressed_size: Some(params.compressed_size),
             proof_payload: Some(params.proof_payload),
+        }
+    }
+
+    /// Zero-value consensus evidence. Admission is verified by the activated
+    /// timeout rules; this constructor does not authorize a validator penalty.
+    pub fn timeout_evidence(
+        chain_id: u64,
+        block_number: u64,
+        tx_index: u32,
+        proposer: Address,
+        parent_hash: ShellHash,
+        proof_payload: Bytes,
+    ) -> Self {
+        Self {
+            kind: SystemTxKind::TimeoutEvidence,
+            chain_id,
+            block_number,
+            tx_index,
+            from: Address::ZERO,
+            to: proposer,
+            value: U256::ZERO,
+            source_hash: parent_hash,
+            layer: None,
+            original_size: None,
+            compressed_size: None,
+            proof_payload: Some(proof_payload),
         }
     }
 

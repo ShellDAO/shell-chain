@@ -106,7 +106,7 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let validator_weights = self.consensus.read().validator_weights();
+        let validator_weights = self.attestation_weights(&stored_block)?;
         let attester_weight = validator_weights.get(&validator).copied().ok_or_else(|| {
             NodeError::Startup(format!(
                 "unknown active attestation validator: {validator:?}"
@@ -643,7 +643,13 @@ impl<S: KvStore + 'static> Node<S> {
             warn!(block_number, %block_hash, "FF.7: invalid commit certificate encoding");
             return false;
         };
-        let weights = self.consensus.read().validator_weights();
+        let weights = match self.certificate_weights(block_number, block_hash) {
+            Ok(weights) => weights,
+            Err(error) => {
+                warn!(block_number, %block_hash, %error, "certificate target context unavailable");
+                return false;
+            }
+        };
         let total_weight = weights.values().copied().fold(0u64, u64::saturating_add);
         if total_weight == 0 {
             warn!(block_number, %block_hash, "FF.7: certificate cannot be verified without active validator weight");
@@ -739,7 +745,7 @@ impl<S: KvStore + 'static> Node<S> {
         let evidence = self.commit_signer_evidence(&signatures, block_hash);
         self.chain_store
             .set_commit_certificate_with_signers(&block_hash, cert, &evidence)?;
-        let weights = self.consensus.read().validator_weights();
+        let weights = self.certificate_weights(block_number, block_hash)?;
         let signed_weight = signatures
             .keys()
             .filter_map(|signer| weights.get(signer).copied())
@@ -896,11 +902,22 @@ impl<S: KvStore + 'static> Node<S> {
         // Reject view-change messages for heights other than the current
         // timed-out height (head + 1) to prevent stale / replayed messages
         // from incorrectly rotating proposer selection.
-        let expected_block = self
-            .chain_store
-            .get_head_block()?
-            .map(|b| ChainStateMachine::next_block_number(b.number()))
+        let head = self.chain_store.get_head_block()?;
+        let parent_hash = head.as_ref().map(|block| block.hash()).unwrap_or_default();
+        let expected_block = head
+            .as_ref()
+            .map(|block| ChainStateMachine::next_block_number(block.number()))
             .unwrap_or(Ok(1))?;
+        if self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|c| c.offline_enforcement)
+            .is_some_and(|p| p.is_active(expected_block))
+        {
+            return Err(NodeError::Startup(
+                "legacy view-change votes are disabled under certified offline rules".into(),
+            ));
+        }
         if msg.block_number != expected_block {
             return Err(NodeError::Startup(format!(
                 "view-change block_number {} does not match expected height {}",
@@ -951,16 +968,32 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let total_weight: u64 = self
-            .consensus
-            .read()
-            .validator_weights()
+        let mut consensus = self.consensus.write();
+        let weights = consensus.validator_weights();
+        if consensus.engine_type() != EngineType::WPoA
+            || msg.view != consensus.current_view()
+            || consensus.has_view_change_vote(&msg.validator)
+            || weights.get(&msg.validator).copied().unwrap_or_default() == 0
+        {
+            return Ok(false);
+        }
+        let total_weight = weights
             .values()
-            .copied()
-            .sum();
-        Ok(self
-            .consensus
-            .write()
-            .handle_view_change_message(msg, total_weight))
+            .try_fold(0u64, |sum, weight| sum.checked_add(*weight))
+            .ok_or_else(|| NodeError::Startup("view-change validator weight overflow".into()))?;
+        // Failure must precede in-memory quorum/view mutation. Duplicate voter keys
+        // are idempotent; different signed QC payloads are retained separately.
+        self.chain_store.put_view_change_vote(
+            &parent_hash,
+            msg.block_number,
+            msg.view,
+            &msg.highest_qc_hash,
+            &shell_core::BlockSignerEvidence {
+                address: msg.validator,
+                public_key: pubkey,
+                signature: sig,
+            },
+        )?;
+        Ok(consensus.handle_view_change_message(msg, total_weight))
     }
 }

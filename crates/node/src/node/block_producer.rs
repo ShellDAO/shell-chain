@@ -33,6 +33,8 @@ impl<S: KvStore + 'static> Node<S> {
         let head_hash = head.hash();
         let next_number = ChainStateMachine::next_block_number(head.number())?;
 
+        self.refresh_certified_participation(head.number())?;
+        self.recover_certified_timeout_view()?;
         let proposer_addr = self.config.proposer_address.ok_or(NodeError::NotProposer)?;
         consensus.ensure_local_proposer(next_number, proposer_addr)?;
 
@@ -71,7 +73,21 @@ impl<S: KvStore + 'static> Node<S> {
         let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
         let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
 
-        let now = self.current_block_timestamp(head.header.timestamp);
+        let mut now = self.current_block_timestamp(head.header.timestamp);
+        if let Some(profile) = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|c| c.offline_enforcement)
+            .filter(|p| p.is_active(next_number))
+        {
+            now = now.max(
+                head.header
+                    .timestamp
+                    .checked_add(profile.block_time_secs)
+                    .ok_or_else(|| NodeError::Startup("offline block timestamp overflow".into()))?,
+            );
+        }
+        let offline_policy = AlgorithmRegistry::global().clone();
 
         // Build a preliminary header for EVM context.
         let mut header = BlockHeader {
@@ -94,6 +110,11 @@ impl<S: KvStore + 'static> Node<S> {
             excess_blob_gas,
             witness_root: None,
         };
+
+        let offline_plan = self.offline_plan_for_production(&head.header, &header)?;
+        if let Some(plan) = &offline_plan {
+            plan.execute(evm.state_db_mut().world_state_mut())?;
+        }
 
         let candidate_capacity = candidates.len();
         let mut included_txs: Vec<SignedTransaction> = Vec::with_capacity(candidate_capacity);
@@ -449,6 +470,16 @@ impl<S: KvStore + 'static> Node<S> {
             settled_stark_artifacts.push((amendment, reward_hash));
             // settled_stark_proofs already holds the amendment (optimistic push above).
         }
+        if let Some(plan) = &offline_plan {
+            plan.append_receipts(
+                self.config.chain_id,
+                next_number,
+                included_txs.len(),
+                cumulative_gas,
+                &mut system_txs,
+                &mut receipts,
+            )?;
+        }
         header.extra_data = Bytes::default();
 
         // Compute block-level logs bloom by OR-ing all receipt blooms.
@@ -476,6 +507,13 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Compute state root from the updated world state (includes any activations above).
+        if let Some(plan) = &offline_plan {
+            plan.sync_membership(evm.state_db_mut().world_state_mut())?;
+        }
+        let authority_transition = offline_plan
+            .as_ref()
+            .map(|plan| plan.stage_authorities(evm.state_db_mut().world_state_mut()))
+            .transpose()?;
         header.state_root = evm.state_db_mut().world_state_mut().state_root()?;
 
         let mut block = Block {
@@ -484,6 +522,12 @@ impl<S: KvStore + 'static> Node<S> {
             system_transactions: system_txs,
             proposer_seal: None,
         };
+
+        if offline_plan.is_some() {
+            with_algorithm_registry_override(&offline_policy, || {
+                self.offline_plan_for_import(&head.header, &block)
+            })?;
+        }
 
         // C3: If STARK aggregation is enabled, collect sig batch entries and
         // compute the 32-byte commitment synchronously so it can be embedded
@@ -625,7 +669,18 @@ impl<S: KvStore + 'static> Node<S> {
         self.last_proposed_by
             .lock()
             .insert(block.header.proposer, block.number());
-        self.reload_authorities_if_boundary(block.number())?;
+        if let Some(transition) = authority_transition {
+            transition.apply(&mut *self.consensus.write());
+        } else {
+            self.consensus_manager()
+                .reload_base_authorities_if_boundary(block.number())?;
+        }
+
+        if offline_plan.is_some() {
+            self.consensus
+                .write()
+                .note_block_progress(Self::wall_clock_millis());
+        }
         if self.config.node_role.runs_prover() {
             let queued = self.enqueue_stark_frontier_backlog(8)?;
             if queued > 0 {

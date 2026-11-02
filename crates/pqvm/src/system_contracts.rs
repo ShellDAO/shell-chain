@@ -29,6 +29,7 @@
 //! | AccountManager | `cancelRecovery(address)` | account owner |
 
 mod algorithm_proposals;
+mod offline_recovery;
 pub use algorithm_proposals::{
     GET_ALGORITHM_PROPOSAL_SELECTOR, SUBMIT_ALGORITHM_PROPOSAL_SELECTOR,
     VOTE_ALGORITHM_PROPOSAL_SELECTOR,
@@ -98,6 +99,9 @@ pub const PROPOSE_ALGORITHM_ACTIVATION_SELECTOR: [u8; 4] =
     compute_selector(b"proposeAlgorithmActivation(uint8,uint64,bytes32)");
 /// keccak256("deprecateAlgorithm(uint8)")[..4]
 pub const DEPRECATE_ALGORITHM_SELECTOR: [u8; 4] = compute_selector(b"deprecateAlgorithm(uint8)");
+/// keccak256("recoverValidator(address,uint64,bytes32)")[..4]
+pub const RECOVER_VALIDATOR_SELECTOR: [u8; 4] =
+    compute_selector(b"recoverValidator(address,uint64,bytes32)");
 /// keccak256("getValidators()")[..4]
 pub const GET_VALIDATORS_SELECTOR: [u8; 4] = compute_selector(b"getValidators()");
 /// keccak256("isValidator(address)")[..4]
@@ -339,6 +343,9 @@ pub(crate) fn execute_signed_system_contract_call<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
     block_number: u64,
 ) -> Result<SystemContractOutcome, SystemContractError> {
+    if *target == registry_address() && decode_selector(input)? == RECOVER_VALIDATOR_SELECTOR {
+        return offline_recovery::execute(signed_tx, input, world_state, chain_store, block_number);
+    }
     if *target == registry_address()
         && chain_store
             .emergency_governance_active(block_number)
@@ -3678,6 +3685,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -3768,6 +3776,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -3877,6 +3886,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: Some(0),
@@ -3951,6 +3961,7 @@ mod tests {
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
                     native_address_context_height: None,
+                    offline_enforcement: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: activation,
@@ -4106,6 +4117,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,

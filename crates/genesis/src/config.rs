@@ -213,6 +213,9 @@ pub struct GenesisConfig {
     /// First block using full native address identities in contract execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_address_context_height: Option<u64>,
+    /// Optional certified offline rule; absent preserves legacy consensus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_enforcement: Option<shell_storage::OfflineEnforcement>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
@@ -536,6 +539,27 @@ impl GenesisConfig {
         }
         Ok(Some(shell_primitives::blake3_hash(&bytes)))
     }
+    /// Validate the optional immutable offline rule against the genesis consensus.
+    pub fn offline_enforcement_profile(
+        &self,
+    ) -> Result<Option<shell_storage::OfflineEnforcement>, GenesisError> {
+        if let Some(profile) = self.offline_enforcement {
+            profile
+                .validate()
+                .map_err(|error| GenesisError::Validation(error.to_string()))?;
+            if !matches!(self.consensus, ConsensusConfig::WPoA { .. })
+                || profile.epoch_length != self.consensus.epoch_length()
+                || profile.block_time_secs != self.effective_block_time_secs()
+            {
+                return Err(GenesisError::Validation(
+                    "offline enforcement requires matching wPoA epoch and nominal block interval"
+                        .into(),
+                ));
+            }
+        }
+        Ok(self.offline_enforcement)
+    }
+
     /// Freeze the consensus interval with the optional voting-window schedule.
     pub fn algorithm_voting_window(
         &self,
@@ -1110,6 +1134,41 @@ mod tests {
         }"#;
         let config = GenesisConfig::from_json(json).unwrap();
         assert_eq!(config.effective_block_time_secs(), 5);
+    }
+
+    #[test]
+    fn offline_enforcement_requires_matching_wpoa_consensus() {
+        let base = serde_json::json!({"chain_id":1337,"network_type":"Dev","timestamp":0,"consensus":{"engine":"wpoa","authorities":[],"block_time_secs":2,"epoch_length":10}});
+        let legacy: GenesisConfig = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.offline_enforcement_profile().unwrap(), None);
+        let p = shell_storage::OfflineEnforcement {
+            activation_height: 0,
+            epoch_length: 10,
+            block_time_secs: 2,
+            heartbeat_interval_secs: 600,
+        };
+        let mut value = base.clone();
+        value["offline_enforcement"] = serde_json::to_value(p).unwrap();
+        let good: GenesisConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(good.offline_enforcement_profile().unwrap(), Some(p));
+        for (field, bad) in [
+            ("epoch_length", 0),
+            ("epoch_length", 11),
+            ("block_time_secs", 3),
+            ("heartbeat_interval_secs", 1),
+        ] {
+            let mut invalid = value.clone();
+            invalid["offline_enforcement"][field] = bad.into();
+            assert!(serde_json::from_value::<GenesisConfig>(invalid)
+                .unwrap()
+                .offline_enforcement_profile()
+                .is_err());
+        }
+        value["consensus"]["engine"] = "poa".into();
+        assert!(serde_json::from_value::<GenesisConfig>(value)
+            .unwrap()
+            .offline_enforcement_profile()
+            .is_err());
     }
 
     #[test]

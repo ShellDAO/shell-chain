@@ -213,6 +213,45 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
     verifier: &V,
     expected_chain_id: u64,
 ) -> Result<Vec<u8>, TxValidationError> {
+    validate_tx_inner(
+        signed_tx,
+        world_state,
+        chain_store,
+        verifier,
+        expected_chain_id,
+        None,
+    )
+}
+
+/// Full transaction admission against an explicit block environment, including
+/// affordability and AA policy checks. Historical callers supply isolated parent
+/// state and its corresponding metadata overlay; this does not execute the tx.
+pub fn validate_tx_at_block<S: KvStore + 'static, V: Verifier>(
+    signed_tx: &SignedTransaction,
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    verifier: &V,
+    expected_chain_id: u64,
+    header: &BlockHeader,
+) -> Result<Vec<u8>, TxValidationError> {
+    validate_tx_inner(
+        signed_tx,
+        world_state,
+        chain_store,
+        verifier,
+        expected_chain_id,
+        Some(header),
+    )
+}
+
+fn validate_tx_inner<S: KvStore + 'static, V: Verifier>(
+    signed_tx: &SignedTransaction,
+    world_state: &mut WorldState<S>,
+    chain_store: &ChainStore<S>,
+    verifier: &V,
+    expected_chain_id: u64,
+    validation_header: Option<&BlockHeader>,
+) -> Result<Vec<u8>, TxValidationError> {
     let tx = &signed_tx.tx;
 
     // 1. Chain ID check
@@ -247,7 +286,11 @@ pub fn validate_tx<S: KvStore + 'static, V: Verifier>(
         return Err(TxValidationError::GasTooLow(tx.gas_limit));
     }
 
-    let validation = validate_aa_tx(signed_tx, world_state, chain_store, verifier)?;
+    let validation = if let Some(header) = validation_header {
+        validate_aa_tx_at_block(signed_tx, world_state, chain_store, verifier, header)?
+    } else {
+        validate_aa_tx(signed_tx, world_state, chain_store, verifier)?
+    };
     let pubkey = validation.pubkey;
 
     // 7. Nonce check

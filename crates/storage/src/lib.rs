@@ -4,6 +4,7 @@ mod error;
 mod kv_store;
 mod memory_db;
 mod merkle_trie;
+mod offline_state;
 mod overlay_store;
 mod prover_registry;
 mod snapshot;
@@ -18,9 +19,9 @@ mod rocks_db;
 pub use body_pruner::{BodyPruneResult, BodyPruner, DEFAULT_BODY_RETENTION};
 pub use chain_store::{
     AlgorithmVotingWindow, BlockAvailability, ChainConfig, ChainStore, GuardianConfig,
-    L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, ProofAmendmentStore, RecoveryProposal,
-    SettledSourceIndex, WitnessStore, ADDRESS_METADATA_HISTORY_BLOCKS, MAX_GUARDIANS,
-    MIN_RECOVERY_TIMELOCK,
+    L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, OfflineEnforcement,
+    ProofAmendmentStore, RecoveryProposal, SettledSourceIndex, WitnessStore,
+    ADDRESS_METADATA_HISTORY_BLOCKS, MAX_GUARDIANS, MIN_RECOVERY_TIMELOCK,
 };
 pub use error::StorageError;
 pub use kv_store::{EntryVisitor, KvStore, RangeEntryVisitor, WriteBatch, WriteBatchOp};

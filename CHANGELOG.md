@@ -4,6 +4,105 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### In development
+
+- Add authenticated timeout evidence kernels binding the canonical parent,
+  membership epoch, ordered effective authority set, assigned proposer and
+  admitted opportunity. Legacy view-change votes remain separate observations.
+- Implement the fixed 100-assigned-miss counter and root-backed native registry
+  state, with zero-value proof envelopes, failed-write isolation and historical
+  reads. An optional immutable activation/timing profile now persists through
+  genesis, future scheduling, startup and trusted snapshots. Unanchored historical
+  committee transitions remain in progress; this does
+  not enable offline enforcement on a running network.
+
+- Validate witnessed work with full explicit-header transaction admission in an
+  isolated parent state. Retain separately authenticated bound peer votes and
+  weighted certificates durably, and execute witnessed evidence through the
+  native counter pipeline. The event loop waits a full monotonic observation
+  interval, rechecks work expiry, persists before broadcast and reuses a durable
+  signature after restart. Independently witnessed contexts collect separate
+  quorums while canonical execution permits one miss per assigned slot.
+  A durable contiguous certificate chain now advances and restores the live
+  view. Forward production and import bind its proof tail to the sealed proposer
+  and publish counters, transaction execution, receipts and head atomically.
+  Historical transition coverage remains in development; peer quorum alone does not change canonical state.
+- Persist the effective ordered authority context in native state and use its
+  sealed commitment when replaying accepted canonical bodies. Historical
+  witness restoration includes timeout evidence and preserves current state
+  after later nonce and penalty changes. Unaccepted fork authority admission
+  remains incomplete.
+- Admit and atomically replay competing branches from a trusted same-parent slot
+  or independently verified epoch input history. Restore historical policy in a
+  trial overlay and preserve authenticated economic reductions for returning
+  and governed reweighted known identities, including zero effective weight.
+  Reject forged timeout authority sets and derive attestation and stored-target
+  certificate quorums from the target committee. Atomic adoption restores the
+  new head's effective roster while retaining current economic penalties.
+  First-member admission also supports complete economic-role absence proofs
+  on chains whose prover registry is required from genesis and whose offline
+  enforcement starts at block 1. Activated profiles
+  reject pre-membership equivocation evidence while preserving valid historical
+  member penalties. Unrestricted or prior prover economic history, missing
+  effective input and new penalty provenance remain in development. Governed survivor reorder
+  follows the verified native reload order while retaining per-identity economic
+  reductions and counter history until a valid assigned proposal.
+
+- Reconstruct unanchored native recovery from verified suspension history and
+  the last eligible economic input. Restore participation at the scheduled
+  epoch without granting an assumed raw weight. Qualify real recovery and
+  governed reweight votes, post-recovery target quorum, historical counter
+  reads, failed publication and restart for base 1/input 1 and inherited
+  base 2/input 1 controls. Preserve the reduction across recovery and a later
+  governed base 1 update, with zero effective proposal/quorum weight and intact
+  native membership, cleared suspension and stake.
+
+- Qualify trusted economic snapshots before and during suspension, retaining
+  inherited reduction, native base, stake and funds through import and recovery.
+  Add a portable real CLI/TCP/RocksDB acceptance entry for 100 certified assigned
+  misses, common-epoch suspension, authenticated recovery, a returning proposer
+  and all-process restart. This local ML-DSA profile does not activate a network
+  or complete the remaining historical economic-provenance cases.
+
+- Apply committed offline suspension at the next common epoch through a separate
+  participation mask. Preserve balances, stake, base weights and economic
+  penalties, including across startup, snapshots and fork adoption. A returning
+  proposal resets its counter without cancelling triggered suspension.
+
+- Accept root-signed, incident- and committee-bound offline recovery votes in
+  ValidatorRegistry. A strict weighted supermajority schedules next-epoch
+  recovery; native state retains suspension until that epoch. First-use embedded
+  keys remain identity-bound, minority/duplicate votes do not lift suspension,
+  and failed native AA batches or block publication preserve the prior state.
+  Dynamic membership, recovery-specific fork transitions and public delivery
+  remain in development.
+
+- Align native offline counter membership with the existing epoch base reload.
+  Pending raw removals retain active history and valid assignments; remove/readd
+  before actual exit cannot reset a counter. True exit followed by an activated
+  rejoin initializes fresh history. Preserve these transitions through snapshot,
+  startup and failed boundary publication. Broader activation/fork combinations
+  remain in development.
+
+- Initialize the first active offline counter roster from verified parent-branch
+  epoch state, preserving pending legacy registry changes. Reject missing or
+  mismatched ancestry and bind the initial boundary to trusted genesis. Qualify
+  activation before/on/after a boundary, snapshots and accepted body restoration;
+  unanchored effective-weight admission remains in development.
+
+- Admit an unanchored competing child while raw registry removal is pending and
+  the verified effective epoch base is unchanged. Preserve historical parent
+  weights, committed suspension and current observer penalties; reject forged
+  input committees before publishing trial state. Genuine weighted attestations
+  drive atomic replacement with matching receipts and counters. Actual base,
+  recovery-weight and new penalty transitions remain in development.
+
+### Fixed
+
+- Import valid content-addressed trie keys whose leading bytes coincide with the
+  contract-code namespace. Actual code hashes and malformed keys still fail
+  validation before snapshot entries are published.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -49,6 +49,44 @@ impl AlgorithmVotingWindow {
     }
 }
 
+/// Immutable consensus schedule for certified assigned-proposer misses.
+/// Operational polling intervals do not alter these nominal protocol timings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineEnforcement {
+    pub activation_height: u64,
+    pub epoch_length: u64,
+    pub block_time_secs: u64,
+    pub heartbeat_interval_secs: u64,
+}
+
+impl OfflineEnforcement {
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.epoch_length == 0
+            || self.block_time_secs == 0
+            || self.block_time_secs > u64::MAX / 1_000
+            || self.heartbeat_interval_secs < self.block_time_secs
+            || self.heartbeat_interval_secs > u64::MAX / 1_000
+        {
+            return Err(StorageError::State("offline enforcement requires a positive epoch, nominal block interval and heartbeat interval no shorter than the block interval".into()));
+        }
+        Ok(())
+    }
+
+    pub fn is_active(&self, height: u64) -> bool {
+        height >= self.activation_height && height > 0
+    }
+
+    pub fn epoch_at(&self, height: u64) -> Result<u64, StorageError> {
+        self.validate()?;
+        Ok(height / self.epoch_length)
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.block_time_secs.max(10)
+    }
+}
+
 /// Persistent chain identity and its explicitly scheduled protocol rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -114,6 +152,9 @@ pub struct ChainConfig {
     /// First block using full native address identities in contract execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_address_context_height: Option<u64>,
+    /// Optional certified offline rule; absent preserves legacy consensus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_enforcement: Option<OfflineEnforcement>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
@@ -133,6 +174,9 @@ pub struct ChainConfig {
 
 impl ChainConfig {
     pub fn validate_algorithm_governance(&self) -> Result<(), StorageError> {
+        if let Some(profile) = self.offline_enforcement {
+            profile.validate()?;
+        }
         if let Some(window) = self.algorithm_voting_window {
             window.validate(self.algorithm_proposal_staging_height)?;
         }
@@ -2093,6 +2137,22 @@ impl<S: KvStore> ChainStore<S> {
         let head = self
             .get_head_block()?
             .ok_or_else(|| StorageError::State("activation requires a canonical head".into()))?;
+        if stored.offline_enforcement != desired.offline_enforcement {
+            if stored.offline_enforcement.is_some() || desired.offline_enforcement.is_none() {
+                return Err(StorageError::State(
+                    "stored offline enforcement profile cannot be changed".into(),
+                ));
+            }
+            if desired
+                .offline_enforcement
+                .is_some_and(|profile| profile.activation_height <= head.number())
+            {
+                return Err(StorageError::State(
+                    "offline enforcement activation must be above the existing canonical head"
+                        .into(),
+                ));
+            }
+        }
         if stored.algorithm_voting_window != desired.algorithm_voting_window {
             if stored.algorithm_voting_window.is_some() || desired.algorithm_voting_window.is_none()
             {
@@ -2596,6 +2656,9 @@ impl<S: KvStore> ChainStore<S> {
             pq_address_bounds_height: self
                 .get_chain_config()?
                 .and_then(|config| config.pq_address_bounds_height),
+            offline_enforcement: self
+                .get_chain_config()?
+                .and_then(|config| config.offline_enforcement),
             native_address_context_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_address_context_height),
@@ -2654,6 +2717,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_bloom_activation = trusted.bloom_activation_height;
         let trusted_log_address_activation = trusted.log_address_activation_height;
         let trusted_algorithm_voting_window = trusted.algorithm_voting_window;
+        let trusted_offline_enforcement = trusted.offline_enforcement;
         let trusted_algorithm_proposal_identity = trusted.algorithm_proposal_identity_height;
         let trusted_algorithm_deprecation = trusted.algorithm_deprecation_height;
         let trusted_algorithm_session_deprecation = trusted.algorithm_session_deprecation_height;
@@ -2821,6 +2885,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.bloom_activation_height != trusted_bloom_activation
                     || config.log_address_activation_height != trusted_log_address_activation
                     || config.algorithm_voting_window != trusted_algorithm_voting_window
+                    || config.offline_enforcement != trusted_offline_enforcement
                     || config.algorithm_proposal_identity_height
                         != trusted_algorithm_proposal_identity
                     || config.algorithm_deprecation_height != trusted_algorithm_deprecation
@@ -2856,6 +2921,13 @@ impl<S: KvStore> ChainStore<S> {
                 }
                 snapshot_chain_config = Some(config);
             } else if let Some(encoded_hash) = entry.key.strip_prefix(prefix::CODE_BY_HASH) {
+                // Trie node keys are raw hashes of32 bytes. Their first bytes can
+                // equal the code namespace; actual code keys carry32 more bytes.
+                if entry.key.len() == 32
+                    && shell_primitives::keccak256(&entry.value).as_bytes() == entry.key.as_slice()
+                {
+                    continue;
+                }
                 let code_hash = ShellHash::try_from_slice(encoded_hash).map_err(|_| {
                     StorageError::State("snapshot contract code key has invalid length".into())
                 })?;
@@ -3154,6 +3226,16 @@ impl<S: KvStore> ChainStore<S> {
             ));
         }
 
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.offline_enforcement)
+            != trusted_offline_enforcement
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted offline enforcement profile".into(),
+            ));
+        }
+
         if snapshot_metadata_undo_pruned_finalized.unwrap_or(0)
             > snapshot_finalized_number.unwrap_or(0)
         {
@@ -3355,6 +3437,7 @@ impl<S: KvStore> ChainStore<S> {
             native_registry_view_height: trusted_native_registry_view,
             pq_address_bounds_height: trusted_pq_address_bounds,
             native_address_context_height: trusted_native_address_context,
+            offline_enforcement: trusted_offline_enforcement,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
@@ -3624,6 +3707,245 @@ impl<S: KvStore> ChainStore<S> {
                 Ok(signer)
             })
             .collect()
+    }
+
+    fn view_change_vote_prefix(
+        parent_hash: &ShellHash,
+        block_number: u64,
+        view: u64,
+        highest_qc_hash: &ShellHash,
+    ) -> Vec<u8> {
+        let mut key = b"VCV1".to_vec();
+        key.extend_from_slice(parent_hash.as_bytes());
+        key.extend_from_slice(&block_number.to_be_bytes());
+        key.extend_from_slice(&view.to_be_bytes());
+        key.extend_from_slice(highest_qc_hash.as_bytes());
+        key
+    }
+
+    /// Retain a verified legacy view-change vote before its quorum admission.
+    /// Parent is observation context, not a field authenticated by the V1 signature.
+    /// These sidecars alone must never authorize offline suspension or slashing.
+    pub fn put_view_change_vote(
+        &self,
+        parent_hash: &ShellHash,
+        block_number: u64,
+        view: u64,
+        highest_qc_hash: &ShellHash,
+        signer: &BlockSignerEvidence,
+    ) -> Result<(), StorageError> {
+        let mut key =
+            Self::view_change_vote_prefix(parent_hash, block_number, view, highest_qc_hash);
+        key.extend_from_slice(signer.address.as_bytes());
+        if self.store.get(&key)?.is_none() {
+            self.store.put(&key, &encode_rlp(signer))?;
+        }
+        // Retry the durability barrier even when a preceding flush failed after put.
+        self.store.flush()
+    }
+
+    /// Read separately keyed voters without coalescing views, forks or QC payloads.
+    pub fn get_view_change_votes(
+        &self,
+        parent_hash: &ShellHash,
+        block_number: u64,
+        view: u64,
+        highest_qc_hash: &ShellHash,
+    ) -> Result<Vec<BlockSignerEvidence>, StorageError> {
+        let prefix =
+            Self::view_change_vote_prefix(parent_hash, block_number, view, highest_qc_hash);
+        self.store
+            .scan_prefix(&prefix)?
+            .into_iter()
+            .map(|(key, value)| {
+                let signer: BlockSignerEvidence = decode_versioned(&value)?;
+                if key.strip_prefix(prefix.as_slice()) != Some(signer.address.as_bytes().as_slice())
+                {
+                    return Err(StorageError::Codec(
+                        "view-change evidence address mismatch".into(),
+                    ));
+                }
+                Ok(signer)
+            })
+            .collect()
+    }
+
+    fn timeout_vote_prefix(parent: &ShellHash, chain_id: u64, number: u64, view: u64) -> Vec<u8> {
+        let mut key = b"TCV2".to_vec();
+        key.extend_from_slice(&chain_id.to_be_bytes());
+        key.extend_from_slice(parent.as_bytes());
+        key.extend_from_slice(&number.to_be_bytes());
+        key.extend_from_slice(&view.to_be_bytes());
+        key
+    }
+
+    /// Retain one fully verified bound vote per voter and context, including the
+    /// work witness needed after mempool eviction or process restart. A second
+    /// payload cannot overwrite an earlier vote for the same voter and context.
+    pub fn put_timeout_vote(
+        &self,
+        message: &shell_core::TimeoutVoteMessage,
+    ) -> Result<(), StorageError> {
+        let c = &message.vote.context;
+        let mut key = Self::timeout_vote_prefix(&c.parent_hash, c.chain_id, c.block_number, c.view);
+        key.extend_from_slice(
+            shell_primitives::keccak256(&c.signing_message(&Address::ZERO)).as_bytes(),
+        );
+        key.extend_from_slice(message.vote.validator.as_bytes());
+        if let Some(bytes) = self.store.get(&key)? {
+            let prior: shell_core::TimeoutVoteMessage =
+                serde_json::from_slice(&bytes).map_err(|e| StorageError::Codec(e.to_string()))?;
+            if prior.vote.context != message.vote.context
+                || prior.vote.validator != message.vote.validator
+                || prior.public_key != message.public_key
+                || prior.opportunity != message.opportunity
+                || prior.vote.signature.sig_type != message.vote.signature.sig_type
+            {
+                return Err(StorageError::State(
+                    "timeout voter already bound to another payload in this context".into(),
+                ));
+            }
+        } else {
+            let bytes =
+                serde_json::to_vec(message).map_err(|e| StorageError::Codec(e.to_string()))?;
+            self.store.put(&key, &bytes)?;
+        }
+        self.store.flush()
+    }
+
+    /// Reload distinct context/voter records for an assigned slot. A validator
+    /// may attest different valid work witnesses for the same timeout; those
+    /// signatures never pool across contexts or authorize another canonical miss.
+    pub fn get_timeout_slot_votes(
+        &self,
+        parent: &ShellHash,
+        chain_id: u64,
+        number: u64,
+        view: u64,
+    ) -> Result<Vec<shell_core::TimeoutVoteMessage>, StorageError> {
+        let prefix = Self::timeout_vote_prefix(parent, chain_id, number, view);
+        let mut votes = Vec::new();
+        for (key, bytes) in self.store.scan_prefix(&prefix)? {
+            let m: shell_core::TimeoutVoteMessage =
+                serde_json::from_slice(&bytes).map_err(|e| StorageError::Codec(e.to_string()))?;
+            let c = &m.vote.context;
+            let mut suffix = shell_primitives::keccak256(&c.signing_message(&Address::ZERO))
+                .as_bytes()
+                .to_vec();
+            suffix.extend_from_slice(m.vote.validator.as_bytes());
+            if key.strip_prefix(prefix.as_slice()) != Some(suffix.as_slice())
+                || c.parent_hash != *parent
+                || c.chain_id != chain_id
+                || c.block_number != number
+                || c.view != view
+            {
+                return Err(StorageError::Codec(
+                    "timeout journal key/context mismatch".into(),
+                ));
+            }
+            votes.push(m);
+        }
+        Ok(votes)
+    }
+
+    /// Recheck canonical admission and every stored signature before counting.
+    pub fn get_timeout_votes(
+        &self,
+        context: &shell_core::TimeoutContext,
+    ) -> Result<Vec<shell_core::TimeoutVoteMessage>, StorageError> {
+        Ok(self
+            .get_timeout_slot_votes(
+                &context.parent_hash,
+                context.chain_id,
+                context.block_number,
+                context.view,
+            )?
+            .into_iter()
+            .filter(|m| m.vote.context == *context)
+            .collect())
+    }
+
+    fn timeout_certificate_key(context: &shell_core::TimeoutContext) -> Vec<u8> {
+        let mut key = b"TCC2".to_vec();
+        key.extend_from_slice(&context.chain_id.to_be_bytes());
+        key.extend_from_slice(context.parent_hash.as_bytes());
+        key.extend_from_slice(&context.block_number.to_be_bytes());
+        key.extend_from_slice(&context.view.to_be_bytes());
+        key.extend_from_slice(
+            shell_primitives::keccak256(&context.signing_message(&Address::ZERO)).as_bytes(),
+        );
+        key
+    }
+
+    /// Publish the first verified quorum only after a durability barrier. Later
+    /// voters do not replace the exact witness/signature transcript already kept.
+    pub fn retain_timeout_certificate(
+        &self,
+        certificate: &shell_core::TimeoutCertificate,
+    ) -> Result<shell_core::TimeoutCertificate, StorageError> {
+        let key = Self::timeout_certificate_key(&certificate.context);
+        let retained = if let Some(bytes) = self.store.get(&key)? {
+            let prior: shell_core::TimeoutCertificate =
+                serde_json::from_slice(&bytes).map_err(|e| StorageError::Codec(e.to_string()))?;
+            if prior.context != certificate.context {
+                return Err(StorageError::Codec(
+                    "timeout certificate context mismatch".into(),
+                ));
+            }
+            prior
+        } else {
+            self.store.put(
+                &key,
+                &serde_json::to_vec(certificate).map_err(|e| StorageError::Codec(e.to_string()))?,
+            )?;
+            certificate.clone()
+        };
+        self.store.flush()?;
+        Ok(retained)
+    }
+
+    pub fn get_timeout_certificate(
+        &self,
+        context: &shell_core::TimeoutContext,
+    ) -> Result<Option<shell_core::TimeoutCertificate>, StorageError> {
+        self.store
+            .get(&Self::timeout_certificate_key(context))?
+            .map(|bytes| {
+                let certificate: shell_core::TimeoutCertificate = serde_json::from_slice(&bytes)
+                    .map_err(|e| StorageError::Codec(e.to_string()))?;
+                if certificate.context != *context {
+                    return Err(StorageError::Codec(
+                        "timeout certificate context mismatch".into(),
+                    ));
+                }
+                Ok(certificate)
+            })
+            .transpose()
+    }
+
+    /// Enumerate a parent/height's durable certificates without scanning history.
+    pub fn get_timeout_certificates(
+        &self,
+        parent: &ShellHash,
+        chain_id: u64,
+        number: u64,
+    ) -> Result<Vec<shell_core::TimeoutCertificate>, StorageError> {
+        let mut prefix = b"TCC2".to_vec();
+        prefix.extend_from_slice(&chain_id.to_be_bytes());
+        prefix.extend_from_slice(parent.as_bytes());
+        prefix.extend_from_slice(&number.to_be_bytes());
+        let mut certificates = Vec::new();
+        for (key, bytes) in self.store.scan_prefix(&prefix)? {
+            let c: shell_core::TimeoutCertificate =
+                serde_json::from_slice(&bytes).map_err(|e| StorageError::Codec(e.to_string()))?;
+            if key != Self::timeout_certificate_key(&c.context) {
+                return Err(StorageError::Codec(
+                    "timeout certificate key/context mismatch".into(),
+                ));
+            }
+            certificates.push(c);
+        }
+        Ok(certificates)
     }
 
     /// Commit quorum signatures and their authenticated keys in the same write batch.
@@ -4978,6 +5300,45 @@ mod tests {
     }
 
     #[test]
+    fn view_change_votes_survive_store_reopen_and_keep_contexts_separate() {
+        let db = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(Arc::clone(&db));
+        let parent = ShellHash::from([1; 32]);
+        let other = ShellHash::from([2; 32]);
+        let signer = BlockSignerEvidence {
+            address: Address::from([3; 32]),
+            public_key: vec![4],
+            signature: shell_crypto::PQSignature::new(
+                shell_crypto::SignatureType::MlDsa65,
+                vec![5],
+            ),
+        };
+        cs.put_view_change_vote(&parent, 7, 0, &other, &signer)
+            .unwrap();
+        cs.put_view_change_vote(&parent, 7, 0, &other, &signer)
+            .unwrap();
+        drop(cs);
+        let reopened = ChainStore::new(db);
+        assert_eq!(
+            reopened
+                .get_view_change_votes(&parent, 7, 0, &other)
+                .unwrap(),
+            vec![signer]
+        );
+        for (p, height, view, qc) in [
+            (other, 7, 0, other),
+            (parent, 8, 0, other),
+            (parent, 7, 1, other),
+            (parent, 7, 0, parent),
+        ] {
+            assert!(reopened
+                .get_view_change_votes(&p, height, view, &qc)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn put_and_get_by_hash() {
         let store = Arc::new(MemoryDb::new());
         let cs = ChainStore::new(store);
@@ -5290,6 +5651,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5343,6 +5705,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5382,6 +5745,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5411,6 +5775,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5472,6 +5837,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5501,6 +5867,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5562,6 +5929,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5591,6 +5959,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5651,6 +6020,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5680,6 +6050,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5716,6 +6087,228 @@ mod tests {
             }));
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
         }
+    }
+
+    fn offline_profile() -> OfflineEnforcement {
+        OfflineEnforcement {
+            activation_height: 5,
+            epoch_length: 10,
+            block_time_secs: 2,
+            heartbeat_interval_secs: 600,
+        }
+    }
+
+    fn offline_config(profile: Option<OfflineEnforcement>, genesis_hash: ShellHash) -> ChainConfig {
+        serde_json::from_value(serde_json::json!({"chain_id":1337, "genesis_hash":genesis_hash, "offline_enforcement":profile})).unwrap()
+    }
+
+    #[test]
+    fn offline_enforcement_profile_bounds_and_legacy_encoding() {
+        let legacy: ChainConfig = serde_json::from_value(
+            serde_json::json!({"chain_id":1337,"genesis_hash":ShellHash::ZERO}),
+        )
+        .unwrap();
+        assert_eq!(legacy.offline_enforcement, None);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("offline_enforcement")
+            .is_none());
+        let p = offline_profile();
+        assert!(p.validate().is_ok());
+        assert!(!p.is_active(0));
+        assert!(!p.is_active(4));
+        assert!(p.is_active(5));
+        assert_eq!(p.epoch_at(9).unwrap(), 0);
+        assert_eq!(p.epoch_at(10).unwrap(), 1);
+        assert_eq!(p.timeout_secs(), 10);
+        assert_eq!(
+            OfflineEnforcement {
+                block_time_secs: 30,
+                ..p
+            }
+            .timeout_secs(),
+            30
+        );
+        for invalid in [
+            OfflineEnforcement {
+                epoch_length: 0,
+                ..p
+            },
+            OfflineEnforcement {
+                block_time_secs: 0,
+                ..p
+            },
+            OfflineEnforcement {
+                heartbeat_interval_secs: 1,
+                ..p
+            },
+            OfflineEnforcement {
+                heartbeat_interval_secs: u64::MAX,
+                ..p
+            },
+            OfflineEnforcement {
+                block_time_secs: u64::MAX,
+                ..p
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        let mut value = serde_json::to_value(p).unwrap();
+        value["miss_threshold"] = 50.into();
+        assert!(serde_json::from_value::<OfflineEnforcement>(value).is_err());
+    }
+
+    #[test]
+    fn offline_enforcement_schedule_is_future_only_immutable_and_reopenable() {
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store.clone());
+        let b = empty_block(4);
+        put_canonical(&cs, &b);
+        let legacy = offline_config(None, ShellHash::ZERO);
+        cs.put_chain_config(&legacy).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        for height in [0, 3, 4] {
+            let desired = offline_config(
+                Some(OfflineEnforcement {
+                    activation_height: height,
+                    ..offline_profile()
+                }),
+                ShellHash::ZERO,
+            );
+            assert!(cs.schedule_protocol_activations(&desired).is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        let desired = offline_config(Some(offline_profile()), ShellHash::ZERO);
+        cs.schedule_protocol_activations(&desired).unwrap();
+        cs.schedule_protocol_activations(&desired).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        for profile in [
+            None,
+            Some(OfflineEnforcement {
+                activation_height: 6,
+                ..offline_profile()
+            }),
+            Some(OfflineEnforcement {
+                epoch_length: 20,
+                ..offline_profile()
+            }),
+            Some(OfflineEnforcement {
+                block_time_secs: 3,
+                ..offline_profile()
+            }),
+            Some(OfflineEnforcement {
+                heartbeat_interval_secs: 601,
+                ..offline_profile()
+            }),
+        ] {
+            assert!(cs
+                .schedule_protocol_activations(&offline_config(profile, ShellHash::ZERO))
+                .is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        drop(cs);
+        let reopened = ChainStore::new(store);
+        assert_eq!(reopened.get_chain_config().unwrap(), Some(desired));
+    }
+
+    #[test]
+    fn offline_enforcement_snapshot_profile_mismatch_is_atomic() {
+        for trusted_profile in [None, Some(offline_profile())] {
+            for include_config in [false, true] {
+                let store = Arc::new(MemoryDb::new());
+                let cs = ChainStore::new(store.clone());
+                let trusted = offline_config(trusted_profile, ShellHash::ZERO);
+                cs.put_chain_config(&trusted).unwrap();
+                let before = store.scan_prefix(b"").unwrap();
+                let metadata = crate::SnapshotMetadata::new(
+                    1337,
+                    0,
+                    ShellHash::ZERO,
+                    ShellHash::ZERO,
+                    ShellHash::ZERO,
+                );
+                for other in [
+                    None,
+                    Some(offline_profile()),
+                    Some(OfflineEnforcement {
+                        activation_height: 6,
+                        ..offline_profile()
+                    }),
+                    Some(OfflineEnforcement {
+                        epoch_length: 11,
+                        ..offline_profile()
+                    }),
+                    Some(OfflineEnforcement {
+                        block_time_secs: 3,
+                        ..offline_profile()
+                    }),
+                    Some(OfflineEnforcement {
+                        heartbeat_interval_secs: 601,
+                        ..offline_profile()
+                    }),
+                ] {
+                    if other == trusted_profile || (!include_config && trusted_profile.is_none()) {
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    let mut writer =
+                        crate::SnapshotWriter::new(&mut bytes, metadata.clone()).unwrap();
+                    writer.write_entry(b"untrusted-key", b"value").unwrap();
+                    if include_config {
+                        writer
+                            .write_entry(
+                                prefix::CHAIN_CONFIG,
+                                &serde_json::to_vec(&offline_config(other, ShellHash::ZERO))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    writer.finalize().unwrap();
+                    let err = cs
+                        .import_snapshot_with_config(std::io::Cursor::new(bytes), &trusted)
+                        .unwrap_err();
+                    assert!(
+                        err.to_string().contains(if include_config {
+                            "does not match the trusted chain"
+                        } else {
+                            "missing the trusted offline enforcement profile"
+                        }),
+                        "{err}"
+                    );
+                    assert_eq!(store.scan_prefix(b"").unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offline_enforcement_profile_survives_real_snapshot_roundtrip() {
+        let source = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(source);
+        let b = empty_block(0);
+        put_canonical(&cs, &b);
+        let config = offline_config(
+            Some(OfflineEnforcement {
+                activation_height: 0,
+                ..offline_profile()
+            }),
+            b.hash(),
+        );
+        cs.put_chain_config(&config).unwrap();
+        let metadata =
+            crate::SnapshotMetadata::new(1337, 0, b.hash(), b.header.state_root, b.hash());
+        let mut bytes = Vec::new();
+        cs.export_snapshot(metadata, &mut bytes).unwrap();
+        let dest = Arc::new(MemoryDb::new());
+        let restored = ChainStore::new(dest.clone());
+        restored
+            .import_snapshot_with_config(std::io::Cursor::new(bytes), &config)
+            .unwrap();
+        assert_eq!(restored.get_chain_config().unwrap(), Some(config.clone()));
+        assert_eq!(restored.get_head_hash().unwrap(), Some(b.hash()));
+        drop(restored);
+        let reopened = ChainStore::new(dest);
+        assert_eq!(reopened.get_chain_config().unwrap(), Some(config));
     }
 
     #[test]
@@ -5785,6 +6378,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5819,6 +6413,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5885,6 +6480,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: trusted_height,
@@ -5914,6 +6510,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(6),
@@ -5983,6 +6580,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6015,6 +6613,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6083,6 +6682,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6115,6 +6715,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6183,6 +6784,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6215,6 +6817,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6329,6 +6932,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6361,6 +6965,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6430,6 +7035,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6462,6 +7068,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6531,6 +7138,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6563,6 +7171,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6627,6 +7236,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6659,6 +7269,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6727,6 +7338,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: trusted_height,
@@ -6759,6 +7371,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: Some(6),
@@ -7140,6 +7753,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7172,6 +7786,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7246,6 +7861,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7275,6 +7891,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7613,6 +8230,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7642,6 +8260,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7713,6 +8332,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -7849,6 +8469,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7925,6 +8546,84 @@ mod tests {
         assert!(error.to_string().contains("injected batch failure"));
         assert_eq!(failed_chain.get_head_hash().unwrap(), Some(old_head));
         assert_eq!(failed_chain.get_total_tx_count().unwrap(), 7);
+    }
+
+    #[test]
+    fn snapshot_import_accepts_content_addressed_trie_root_with_code_prefix() {
+        let address = Address::from([0x44; 32]);
+        let mut compact = vec![0x20];
+        compact.extend_from_slice(shell_primitives::keccak256(address.as_bytes()).as_bytes());
+        // This valid account leaf has a deterministic content hash starting c/.
+        let balance = 14_859u64;
+        let account = shell_core::Account::new_user_account(ShellHash::ZERO, U256::from(balance));
+        let encoded = alloy_rlp::encode(&account);
+        let mut rlp = rlp::RlpStream::new_list(2);
+        rlp.append(&compact.as_slice());
+        rlp.append(&encoded.as_slice());
+        let raw = rlp.out().to_vec();
+        let root = shell_primitives::keccak256(&raw);
+        assert_eq!(
+            hex::encode(root.as_bytes()),
+            "632fe29a1b64ef52daf4324b01bf1e3ea3a1a0b33f8991cd7e5675578a2696d9"
+        );
+        eprintln!("snapshot trie/code prefix collision balance={balance} root={root}");
+        let source = Arc::new(MemoryDb::new());
+        source.put(root.as_bytes(), &raw).unwrap();
+        crate::WorldState::validate_snapshot_nodes(source.as_ref(), root).unwrap();
+        let state = crate::WorldState::at_root(source.clone(), &root).unwrap();
+        assert_eq!(state.get_balance(&address).unwrap(), U256::from(balance));
+        let chain = ChainStore::new(source);
+        let mut genesis = empty_block(0);
+        genesis.header.state_root = root;
+        put_canonical(&chain, &genesis);
+        let config: ChainConfig = serde_json::from_value(
+            serde_json::json!({"chain_id":1337,"genesis_hash":genesis.hash()}),
+        )
+        .unwrap();
+        chain.put_chain_config(&config).unwrap();
+        let meta = crate::SnapshotMetadata::new(1337, 0, genesis.hash(), root, genesis.hash());
+        let mut bytes = Vec::new();
+        chain
+            .export_snapshot(meta, std::io::Cursor::new(&mut bytes))
+            .unwrap();
+        if let Ok(path) = std::env::var("SHELL_SNAPSHOT_COLLISION_FIXTURE_OUT") {
+            std::fs::write(path, &bytes).unwrap();
+        }
+        let target = Arc::new(MemoryDb::new());
+        let restored = ChainStore::new(target.clone());
+        restored.put_chain_config(&config).unwrap();
+        restored
+            .import_snapshot(std::io::Cursor::new(bytes), 1337, &genesis.hash())
+            .unwrap();
+        let state = crate::WorldState::at_root(target, &root).unwrap();
+        assert_eq!(state.get_balance(&address).unwrap(), U256::from(balance));
+        assert_eq!(restored.get_head_hash().unwrap(), Some(genesis.hash()));
+        // A malformed code-like key without a valid raw content hash remains
+        // rejected before any destination publication.
+        let mut malformed = prefix::CODE_BY_HASH.to_vec();
+        malformed.resize(32, 0xff);
+        chain
+            .store()
+            .put(&malformed, b"not a content-addressed trie node")
+            .unwrap();
+        let mut bytes = Vec::new();
+        chain
+            .export_snapshot(
+                crate::SnapshotMetadata::new(1337, 0, genesis.hash(), root, genesis.hash()),
+                std::io::Cursor::new(&mut bytes),
+            )
+            .unwrap();
+        let target = Arc::new(MemoryDb::new());
+        let rejected = ChainStore::new(target.clone());
+        rejected.put_chain_config(&config).unwrap();
+        let before = target.scan_prefix(b"").unwrap();
+        let error = rejected
+            .import_snapshot(std::io::Cursor::new(bytes), 1337, &genesis.hash())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot contract code key has invalid length"));
+        assert_eq!(target.scan_prefix(b"").unwrap(), before);
     }
 
     #[test]
@@ -8788,6 +9487,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9413,6 +10113,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
@@ -9679,6 +10380,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9753,6 +10455,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11099,6 +11802,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11145,6 +11849,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

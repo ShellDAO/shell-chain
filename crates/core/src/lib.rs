@@ -2,8 +2,10 @@ mod account;
 mod block;
 pub mod fee;
 mod log;
+mod offline;
 mod receipt;
 mod reward;
+mod timeout;
 mod transaction;
 mod witness;
 
@@ -15,8 +17,15 @@ pub use fee::{
     MIN_BLOB_BASE_FEE, TARGET_BLOB_GAS_PER_BLOCK,
 };
 pub use log::{Log, LogError, MAX_LOG_TOPICS};
+pub use offline::{
+    OfflineCursor, OfflineState, OfflineValidatorState, OFFLINE_ASSIGNED_MISS_THRESHOLD,
+};
 pub use receipt::TransactionReceipt;
 pub use reward::{StarkRewardParams, SystemTransaction, SystemTxKind};
+pub use timeout::{
+    timeout_authority_set_hash, TimeoutCertificate, TimeoutContext, TimeoutOpportunity,
+    TimeoutVote, TimeoutVoteMessage,
+};
 pub use transaction::{
     AaBundle, AccessListItem, InnerCall, PubkeyMode, SessionAuth, SignedTransaction, Transaction,
     AA_BUNDLE_PRESENCE_FLAG, AA_BUNDLE_TX_TYPE, AA_INNER_CALL_INTRINSIC_GAS,

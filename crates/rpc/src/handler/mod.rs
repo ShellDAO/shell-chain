@@ -1077,6 +1077,7 @@ fn ordered_system_txs(system_txs: &[SystemTransaction]) -> Vec<&SystemTransactio
         let priority = match tx.kind {
             shell_core::SystemTxKind::BlockGasReward => 0u8,
             shell_core::SystemTxKind::StarkReward => 1u8,
+            shell_core::SystemTxKind::TimeoutEvidence => 2u8,
         };
         (priority, tx.tx_index)
     });
@@ -1087,6 +1088,7 @@ fn system_tx_type_hex(kind: shell_core::SystemTxKind) -> &'static str {
     match kind {
         shell_core::SystemTxKind::BlockGasReward => "0x80",
         shell_core::SystemTxKind::StarkReward => "0x81",
+        shell_core::SystemTxKind::TimeoutEvidence => "0x82",
     }
 }
 
@@ -1334,9 +1336,11 @@ pub(crate) fn system_tx_to_rpc(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
         shell_type: Some(tx.kind.as_str().into()),
-        reward_kind: Some(tx.kind.as_str().into()),
+        reward_kind: (tx.kind != shell_core::SystemTxKind::TimeoutEvidence)
+            .then(|| tx.kind.as_str().into()),
         reward_layer: tx.layer.map(|l| hex_u64(l as u64)),
-        reward_source_hash: Some(tx.source_hash),
+        reward_source_hash: (tx.kind != shell_core::SystemTxKind::TimeoutEvidence)
+            .then_some(tx.source_hash),
         original_size: tx.original_size.map(hex_u64),
         compressed_size: tx.compressed_size.map(hex_u64),
         decoded_input,
@@ -5115,6 +5119,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5186,6 +5191,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -9839,6 +9845,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                offline_enforcement: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -11944,5 +11951,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
+    }
+}
+
+#[cfg(test)]
+mod timeout_evidence_tests {
+    use super::*;
+    #[test]
+    fn timeout_evidence_rpc_is_zero_value_and_has_no_reward_metadata() {
+        let tx = shell_core::SystemTransaction::timeout_evidence(
+            1337,
+            7,
+            4,
+            Address::from([1; 32]),
+            ShellHash::from([2; 32]),
+            vec![1, 2, 3].into(),
+        );
+        let rpc = system_tx_to_rpc(&tx, None);
+        assert_eq!(rpc.tx_type, "0x82");
+        assert_eq!(rpc.shell_type.as_deref(), Some("timeoutEvidence"));
+        assert_eq!(rpc.value, "0x0");
+        assert_eq!(rpc.input, "0x010203");
+        assert!(rpc.reward_kind.is_none());
+        assert!(rpc.reward_source_hash.is_none());
+        assert!(rpc.reward_layer.is_none());
+        assert!(rpc.decoded_input.is_none());
     }
 }

@@ -136,6 +136,22 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
                 Arc::new(shell_crypto::MultiVerifier),
             ))),
         };
+        if let Some(profile) = chain_store
+            .get_chain_config()?
+            .and_then(|config| config.offline_enforcement)
+        {
+            profile.validate()?;
+            let engine = consensus.read();
+            let nominal = engine.poa_config();
+            if !matches!(self.config.consensus, ConsensusEngineConfig::WPoa(_))
+                || nominal.epoch_length != profile.epoch_length
+                || nominal.block_time_secs != profile.block_time_secs
+            {
+                return Err(NodeError::Startup(
+                    "offline enforcement profile conflicts with consensus configuration".into(),
+                ));
+            }
+        }
         let tx_pool = Arc::new(TxPool::new(self.config.mempool.clone()));
 
         let node = Node::new(
@@ -187,6 +203,9 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
             }
         }
 
+        if let Some(height) = head_number {
+            node.refresh_certified_participation(height)?;
+        }
         Ok((node, store))
     }
 }
@@ -234,6 +253,50 @@ mod tests {
 
         assert_eq!(node.config.chain_id, 1337);
         assert_eq!(node.tx_pool.len(), 0);
+    }
+
+    #[test]
+    fn offline_enforcement_startup_uses_immutable_consensus_not_polling_hints() {
+        let authority = Address::from_public_key(b"test-authority", 0);
+        let store = Arc::new(MemoryDb::new());
+        let cs = ChainStore::new(store.clone());
+        let profile = shell_storage::OfflineEnforcement {
+            activation_height: 5,
+            epoch_length: 10,
+            block_time_secs: 2,
+            heartbeat_interval_secs: 600,
+        };
+        cs.put_chain_config(&serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":shell_primitives::ShellHash::ZERO,"offline_enforcement":profile})).unwrap()).unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        for (epoch, seconds) in [(0, 2), (11, 2), (10, 3)] {
+            let mut config = NodeConfig::dev(authority);
+            config.consensus = ConsensusEngineConfig::WPoa(shell_consensus::WPoaConfig::from_poa(
+                shell_consensus::PoaConfig::new(vec![authority], seconds).with_epoch_length(epoch),
+            ));
+            assert!(NodeBuilder::new(config, store.clone()).build().is_err());
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        let mut config = NodeConfig::dev(authority);
+        config.consensus = ConsensusEngineConfig::WPoa(shell_consensus::WPoaConfig::from_poa(
+            shell_consensus::PoaConfig::new(vec![authority], 2).with_epoch_length(10),
+        ));
+        config.block_time_ms = 1;
+        config.max_idle_interval_ms = 1;
+        let (node, _) = NodeBuilder::new(config.clone(), store.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            node.chain_store
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .offline_enforcement,
+            Some(profile)
+        );
+        config.consensus = ConsensusEngineConfig::Poa(
+            shell_consensus::PoaConfig::new(vec![authority], 2).with_epoch_length(10),
+        );
+        assert!(NodeBuilder::new(config, store).build().is_err());
     }
 
     #[test]

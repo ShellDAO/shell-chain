@@ -170,6 +170,8 @@ pub enum NetworkMessage {
     },
     /// W.5: Signed wPoA view-change vote for a timed-out proposer view.
     WPoaViewChange(Box<ViewChangeMessage>),
+    /// Parent/assignment-bound timeout vote with durable work evidence.
+    CertifiedTimeoutVote(Box<shell_core::TimeoutVoteMessage>),
 }
 
 /// High-level topic classification for network message propagation.
@@ -204,6 +206,7 @@ impl NetworkMessage {
             | Self::ProofChallengeResponse(_)
             | Self::WPoaVote { .. }
             | Self::WPoaViewChange(_)
+            | Self::CertifiedTimeoutVote(_)
             | Self::CommitCertificate { .. } => MAX_CONSENSUS_MESSAGE_SIZE,
             Self::BlockRequest { .. }
             | Self::BodyRequest { .. }
@@ -228,6 +231,7 @@ impl NetworkMessage {
             Self::NewAttestation(_)
             | Self::WPoaVote { .. }
             | Self::WPoaViewChange(_)
+            | Self::CertifiedTimeoutVote(_)
             | Self::CommitCertificate { .. } => NetworkTopic::Attestation,
             Self::ProofAmendment { .. }
             | Self::ProofAck { .. }
@@ -504,6 +508,7 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
         | "ProofChallengeResponse"
         | "WPoaVote"
         | "WPoaViewChange"
+        | "CertifiedTimeoutVote"
         | "CommitCertificate" => MAX_CONSENSUS_MESSAGE_SIZE,
         "BlockRequest" | "BodyRequest" | "Ping" | "Pong" | "StorageCapability" => {
             MAX_CONTROL_MESSAGE_SIZE

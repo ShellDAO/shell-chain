@@ -499,6 +499,7 @@ impl<S: KvStore + 'static> Node<S> {
             ))
         })?;
         *AlgorithmRegistry::global_mut() = registry;
+        self.recover_certified_timeout_view()?;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
@@ -633,6 +634,8 @@ impl<S: KvStore + 'static> Node<S> {
         let mut tx_rebroadcast_timer = interval(Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS));
         let mut sync_retry_attempts_without_progress = 0u32;
         let mut fork_adoption_retry = ForkAdoptionRetry::default();
+        let mut timeout_observation = super::offline_enforcement::TimeoutObservation::default();
+        let mut timeout_peer_count = 0usize;
         let startup_sync_grace = Self::startup_sync_grace(self.config.block_time_ms);
         let catch_up_timeout = Self::catch_up_timeout(self.config.block_time_ms);
 
@@ -906,12 +909,29 @@ impl<S: KvStore + 'static> Node<S> {
                 }
                 _ = block_timer.tick() => {
                     let peers = network.peer_count().await;
+                    if peers>timeout_peer_count {timeout_observation.request_rebroadcast();}timeout_peer_count=peers;
                     production_readiness.refresh(
                         peers,
                         sync_requested,
                         self.head_number(),
                         std::time::Instant::now(),
                     );
+                    let certified_profile_active = match self.certified_timeout_profile_active() {
+                        Ok(active) => active,
+                        Err(error) => {warn!(%error,"cannot determine certified timeout activation");continue;}
+                    };
+                    if certified_profile_active && can_produce_blocks && production_readiness.can_produce() {
+                        let message=tokio::task::block_in_place(||self.prepare_certified_timeout_vote(&*signer,&mut timeout_observation,Self::wall_clock_secs(),std::time::Instant::now()));
+                        match message {
+                            Ok(Some(message))=>{
+                                if let Err(error)=self.recover_certified_timeout_view(){warn!(%error,"cannot advance certified timeout view");continue;}
+                                let context=message.vote.context.clone();
+                                if network.broadcast(NetworkMessage::CertifiedTimeoutVote(Box::new(message))).await.is_ok(){timeout_observation.note_broadcast(&context);}
+                            }
+                            Ok(None)=>{},
+                            Err(error)=>warn!(%error,"cannot prepare certified timeout vote"),
+                        }
+                    }
                     // Periodically reseed the STARK backlog so the prover is never
                     // starved of historical tasks.  Reseed when:
                     //   a) the backlog is completely empty, OR
@@ -1043,10 +1063,12 @@ impl<S: KvStore + 'static> Node<S> {
                             }
                         };
                         let now_secs = Self::wall_clock_secs();
+                        let offline_timing=self.chain_store.get_chain_config()?.and_then(|c|c.offline_enforcement).filter(|p|p.is_active(head.number().saturating_add(1)));
+                        let cadence_ms=offline_timing.map(|p|p.block_time_secs*1_000).unwrap_or(self.config.block_time_ms);
                         if !Self::block_time_elapsed(
                             head.header.timestamp,
                             now_secs,
-                            self.config.block_time_ms,
+                            cadence_ms,
                         ) {
                             tracing::trace!(
                                 head = head.number(),
@@ -1060,12 +1082,14 @@ impl<S: KvStore + 'static> Node<S> {
 
                         // Idle-block-skip: when mempool is empty and we haven't
                         // exceeded max_idle_interval, skip block production.
-                        let max_idle_ms = self.config.max_idle_interval_ms;
+                        let max_idle_ms=offline_timing.map(|p|p.heartbeat_interval_secs*1_000).unwrap_or(self.config.max_idle_interval_ms);
+                        let has_pending_timeout=offline_timing.is_some() && self.consensus.read().current_view()>0;
                         let has_pending_stark_settlement =
                             !self.pending_stark_settlements.lock().is_empty();
                         if max_idle_ms > 0
                             && self.tx_pool.is_empty()
                             && !has_pending_stark_settlement
+                            && !has_pending_timeout
                             && !Self::block_time_elapsed(head.header.timestamp, now_secs, max_idle_ms)
                         {
                             continue;
@@ -1175,7 +1199,7 @@ impl<S: KvStore + 'static> Node<S> {
 
                     // W.5: If the proposer fails to produce within the timeout,
                     // broadcast a signed view-change vote for the current height.
-                    if self.consensus.read().engine_type() == EngineType::WPoA && can_produce_blocks {
+                    if !certified_profile_active && self.consensus.read().engine_type() == EngineType::WPoA && can_produce_blocks {
                         let now_ms = Self::wall_clock_millis();
                         let timed_out = self
                             .consensus
@@ -1222,17 +1246,13 @@ impl<S: KvStore + 'static> Node<S> {
                                         validator,
                                         signature.data,
                                     );
-                                    let total_weight: u64 = self
-                                        .consensus
-                                        .read()
-                                        .validator_weights()
-                                        .values()
-                                        .copied()
-                                        .sum();
-                                    let quorum = self
-                                        .consensus
-                                        .write()
-                                        .handle_view_change_message(msg.clone(), total_weight);
+                                    let quorum = match self.handle_wpoa_view_change(msg.clone(), &MultiVerifier) {
+                                        Ok(quorum) => quorum,
+                                        Err(error) => {
+                                            warn!(%error, view, block_number, "W.5: cannot retain local view-change vote");
+                                            continue;
+                                        }
+                                    };
                                     warn!(
                                         view,
                                         block_number,
@@ -1987,6 +2007,14 @@ impl<S: KvStore + 'static> Node<S> {
                                         );
                                         continue;
                                     }
+                                    match self.admits_equivocation_authority(&equivocation, &pubkey) {
+                                        Ok(None) | Ok(Some(true)) => {}
+                                        result => {
+                                            warn!(%peer, offender = %equivocation.offender, ?result,
+                                                "equivocation evidence lacks historical validator authority");
+                                            continue;
+                                        }
+                                    }
                                     warn!(
                                         offender = %equivocation.offender,
                                         block_number = equivocation.header_a.number,
@@ -2330,6 +2358,13 @@ impl<S: KvStore + 'static> Node<S> {
                                         early_commit_certificate.retain(
                                             &self, block_number, block_hash, certificate,
                                         );
+                                    }
+                                }
+                                NetworkMessage::CertifiedTimeoutVote(message) => {
+                                    match self.handle_certified_timeout_vote(*message, &MultiVerifier) {
+                                        Ok(Some(certificate)) => {debug!(view=certificate.context.view, "certified timeout quorum retained");if let Err(error)=self.recover_certified_timeout_view(){warn!(%error,"cannot advance certified timeout view");}},
+                                        Ok(None) => {},
+                                        Err(error) => warn!(%error, %peer, "rejected certified timeout vote"),
                                     }
                                 }
                                 // W.5: Receive a signed wPoA view-change vote from a peer validator.
@@ -3237,14 +3272,14 @@ impl<S: KvStore + 'static> Node<S> {
             .map_err(NodeError::from)
     }
 
-    fn wall_clock_millis() -> u64 {
+    pub(super) fn wall_clock_millis() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     }
 
-    fn wall_clock_secs() -> u64 {
+    pub(super) fn wall_clock_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

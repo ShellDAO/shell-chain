@@ -2,11 +2,13 @@
 
 mod block_importer;
 mod block_producer;
+mod canonical_offline;
 mod chain_state_machine;
 mod challenge_lifecycle;
 mod dev_rpc;
 mod event_loop;
 mod invariants;
+pub mod offline_enforcement;
 mod p2p_handlers;
 mod readiness;
 pub(crate) mod stark_sources;
@@ -498,6 +500,7 @@ impl<'a, S: KvStore + 'static> BlockStoreBoundary<'a, S> {
 }
 
 struct ConsensusManagerBoundary<'a, S: KvStore + 'static> {
+    chain_store: &'a Arc<ChainStore<S>>,
     consensus: &'a Arc<RwLock<dyn ConsensusEngine>>,
     known_authorities: &'a Arc<RwLock<HashMap<Address, Vec<u8>>>>,
     finality: &'a Arc<RwLock<FinalityState>>,
@@ -557,7 +560,7 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
         )
     }
 
-    fn reload_authorities_if_boundary(&self, block_number: u64) -> Result<(), NodeError> {
+    fn reload_base_authorities_if_boundary(&self, block_number: u64) -> Result<(), NodeError> {
         let should_reload = {
             let consensus = self.consensus.read();
             let config = consensus.poa_config();
@@ -587,6 +590,21 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
         self.consensus
             .write()
             .set_authorities_with_weights(validators, weights);
+        Ok(())
+    }
+    fn reload_authorities_if_boundary(&self, block_number: u64) -> Result<(), NodeError> {
+        self.reload_base_authorities_if_boundary(block_number)?;
+        self.refresh_certified_participation(block_number)
+    }
+    fn refresh_certified_participation(&self, head: u64) -> Result<(), NodeError> {
+        let (enabled, suspended) = canonical_offline::certified_participation(
+            self.chain_store,
+            &self.world_state.read(),
+            head,
+        )?;
+        self.consensus
+            .write()
+            .set_certified_participation(enabled, suspended);
         Ok(())
     }
 }
@@ -1078,6 +1096,7 @@ impl<S: KvStore + 'static> Node<S> {
 
     fn consensus_manager(&self) -> ConsensusManagerBoundary<'_, S> {
         ConsensusManagerBoundary {
+            chain_store: &self.chain_store,
             consensus: &self.consensus,
             known_authorities: &self.known_authorities,
             finality: &self.finality,
@@ -1219,6 +1238,11 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
 
+    pub(crate) fn refresh_certified_participation(&self, head: u64) -> Result<(), NodeError> {
+        self.consensus_manager()
+            .refresh_certified_participation(head)
+    }
+
     pub(crate) fn reload_authorities_if_boundary(
         &self,
         block_number: u64,
@@ -1307,14 +1331,14 @@ impl<S: KvStore + 'static> Node<S> {
             .ok_or(NodeError::NoGenesis)?;
         let canonical_number = canonical_head.number();
         let canonical_hash = canonical_head.hash();
-        let total_weight = self
-            .consensus
-            .read()
-            .validator_weights()
-            .values()
-            .copied()
-            .fold(0u64, u64::saturating_add);
-        let (preferred_hash, preferred_number, ancestor_hash, old_hashes, new_hashes) = {
+        let (
+            preferred_hash,
+            preferred_number,
+            ancestor_hash,
+            old_hashes,
+            new_hashes,
+            attested_weight,
+        ) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
             let score = fork_choice.score(&preferred_hash).ok_or_else(|| {
@@ -1325,7 +1349,9 @@ impl<S: KvStore + 'static> Node<S> {
             if preferred_hash == canonical_hash || score.block_number < canonical_number {
                 return Ok(None);
             }
-            if !FinalityState::has_weighted_quorum(score.attested_weight, total_weight) {
+            // With no votes there is no quorum on any committee. In particular,
+            // an initial empty fork-choice sentinel has no stored ancestry.
+            if score.attested_weight == 0 {
                 return Ok(None);
             }
             let ancestor_hash = fork_choice
@@ -1341,8 +1367,25 @@ impl<S: KvStore + 'static> Node<S> {
                 ancestor_hash,
                 fork_choice.chain_between(&canonical_hash, &ancestor_hash),
                 fork_choice.chain_between(&preferred_hash, &ancestor_hash),
+                score.attested_weight,
             )
         };
+        let preferred = self
+            .chain_store
+            .get_block_by_hash(&preferred_hash)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "preferred fork head block not found: {preferred_hash}"
+                ))
+            })?;
+        let total_weight = self
+            .attestation_weights(&preferred)?
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        if !FinalityState::has_weighted_quorum(attested_weight, total_weight) {
+            return Ok(None);
+        }
         if new_hashes.is_empty() {
             return Err(NodeError::Startup(format!(
                 "fork-choice path from ancestor {ancestor_hash} to preferred block {preferred_hash} is empty"
@@ -2009,6 +2052,19 @@ mod tests {
                 fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
             }
+        }
+
+        pub(super) fn arm_canonical_head_failure(&self) {
+            self.fail_head_batch.store(true, Ordering::SeqCst);
+        }
+        pub(super) fn clear_canonical_head_failure(&self) {
+            self.fail_head_batch.store(false, Ordering::SeqCst);
+        }
+        pub(super) fn arm_timeout_put_failure(&self) {
+            self.fail_next_put.store(true, Ordering::SeqCst);
+        }
+        pub(super) fn arm_timeout_flush_failure(&self) {
+            self.fail_next_flush.store(true, Ordering::SeqCst);
         }
 
         fn fail_next_batch(&self) {
@@ -3777,6 +3833,7 @@ mod tests {
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
                         native_address_context_height: None,
+                        offline_enforcement: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -5652,6 +5709,7 @@ mod tests {
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
                             native_address_context_height: None,
+                            offline_enforcement: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5817,6 +5875,7 @@ mod tests {
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
                             native_address_context_height: None,
+                            offline_enforcement: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5931,6 +5990,7 @@ mod tests {
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
                         native_address_context_height: None,
+                        offline_enforcement: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -22625,6 +22685,7 @@ mod tests {
             node.config.rpc_enabled = false;
             node.config.metrics.enabled = false;
             store_consistent_genesis(&node);
+            let observed_parent = node.chain_store.get_head_block().unwrap().unwrap().hash();
             let node = Arc::new(node);
             let pubkey = signer.public_key().to_vec();
             let sig_type = signer.sig_type();
@@ -22663,6 +22724,23 @@ mod tests {
             let message = received
                 .expect("signed timeout vote reaches the peer")
                 .unwrap();
+            let retained = node
+                .chain_store
+                .get_view_change_votes(
+                    &observed_parent,
+                    message.block_number,
+                    message.view,
+                    &message.highest_qc_hash,
+                )
+                .unwrap();
+            assert_eq!(
+                retained.len(),
+                1,
+                "local timeout vote is retained before broadcast"
+            );
+            assert_eq!(retained[0].address, authority);
+            assert_eq!(retained[0].public_key, pubkey);
+            assert_eq!(retained[0].signature.data, message.signature);
             assert!(MultiVerifier
                 .verify(
                     &pubkey,
@@ -23139,6 +23217,234 @@ mod tests {
                 }
                 _ => panic!("expected CommitCertificate after deserialization"),
             }
+        }
+
+        #[test]
+        fn authenticated_view_change_votes_are_retained_before_weighted_quorum() {
+            use shell_crypto::MlDsaSigner;
+            let (node, signer) = setup_wpoa_node();
+            let parent = store_genesis_wpoa(&node);
+            let authority = node.config.proposer_address.unwrap();
+            let low = MlDsaSigner::generate();
+            let low_address = Address::from_public_key(low.public_key(), low.sig_type().as_u8());
+            node.consensus
+                .write()
+                .set_authorities_with_weights(vec![authority, low_address], vec![3, 1]);
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            node.register_authority_pubkey(low_address, low.public_key().to_vec());
+            let qc = *node.finality.read().last_finalized_hash();
+            let payload = ViewChangeMessage::signing_message(1337, 1, 0, &qc);
+            let vote = ViewChangeMessage::new(
+                1337,
+                1,
+                0,
+                qc,
+                low_address,
+                low.sign(&payload).unwrap().data,
+            );
+            assert!(!node
+                .handle_wpoa_view_change(vote.clone(), &MultiVerifier)
+                .unwrap());
+            assert!(!node
+                .handle_wpoa_view_change(vote.clone(), &MultiVerifier)
+                .unwrap());
+            assert_eq!(node.consensus.read().current_view(), 0);
+            let retained = node
+                .chain_store
+                .get_view_change_votes(&parent, 1, 0, &qc)
+                .unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].address, low_address);
+            assert_eq!(retained[0].public_key, low.public_key());
+            assert_eq!(retained[0].signature.data, vote.signature);
+            let mut corrupt = vote.clone();
+            corrupt.highest_qc_hash = ShellHash::from([9; 32]);
+            assert!(node
+                .handle_wpoa_view_change(corrupt, &MultiVerifier)
+                .is_err());
+            assert!(node
+                .chain_store
+                .get_view_change_votes(&parent, 1, 0, &ShellHash::from([9; 32]))
+                .unwrap()
+                .is_empty());
+            let mut duplicate_qc = vote.clone();
+            duplicate_qc.highest_qc_hash = ShellHash::from([8; 32]);
+            duplicate_qc.signature = low.sign(&duplicate_qc.own_signing_message()).unwrap().data;
+            assert!(!node
+                .handle_wpoa_view_change(duplicate_qc, &MultiVerifier)
+                .unwrap());
+            assert!(node
+                .chain_store
+                .get_view_change_votes(&parent, 1, 0, &ShellHash::from([8; 32]))
+                .unwrap()
+                .is_empty());
+            let mut future = vote.clone();
+            future.view = 1;
+            future.signature = low.sign(&future.own_signing_message()).unwrap().data;
+            assert!(!node
+                .handle_wpoa_view_change(future, &MultiVerifier)
+                .unwrap());
+            assert!(node
+                .chain_store
+                .get_view_change_votes(&parent, 1, 1, &qc)
+                .unwrap()
+                .is_empty());
+            let high = ViewChangeMessage::new(
+                1337,
+                1,
+                0,
+                qc,
+                authority,
+                signer.sign(&payload).unwrap().data,
+            );
+            assert!(node.handle_wpoa_view_change(high, &MultiVerifier).unwrap());
+            assert_eq!(node.consensus.read().current_view(), 1);
+            assert_eq!(
+                node.chain_store
+                    .get_view_change_votes(&parent, 1, 0, &qc)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(!node.handle_wpoa_view_change(vote, &MultiVerifier).unwrap());
+        }
+
+        #[test]
+        fn view_change_vote_storage_failure_does_not_advance_quorum() {
+            let (node, signer, db) = setup_failing_wpoa_node();
+            let parent = store_genesis_wpoa(&node);
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let qc = *node.finality.read().last_finalized_hash();
+            let payload = ViewChangeMessage::signing_message(1337, 1, 0, &qc);
+            let vote = ViewChangeMessage::new(
+                1337,
+                1,
+                0,
+                qc,
+                authority,
+                signer.sign(&payload).unwrap().data,
+            );
+            db.fail_next_put();
+            assert!(node
+                .handle_wpoa_view_change(vote.clone(), &MultiVerifier)
+                .is_err());
+            assert_eq!(node.consensus.read().current_view(), 0);
+            assert!(node
+                .chain_store
+                .get_view_change_votes(&parent, 1, 0, &qc)
+                .unwrap()
+                .is_empty());
+            assert!(node.handle_wpoa_view_change(vote, &MultiVerifier).unwrap());
+            assert_eq!(node.consensus.read().current_view(), 1);
+            assert_eq!(
+                node.chain_store
+                    .get_view_change_votes(&parent, 1, 0, &qc)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn view_change_flush_failure_retries_before_quorum_admission() {
+            let (node, signer, db) = setup_failing_wpoa_node();
+            let parent = store_genesis_wpoa(&node);
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let qc = *node.finality.read().last_finalized_hash();
+            let payload = ViewChangeMessage::signing_message(1337, 1, 0, &qc);
+            let vote = ViewChangeMessage::new(
+                1337,
+                1,
+                0,
+                qc,
+                authority,
+                signer.sign(&payload).unwrap().data,
+            );
+            db.fail_next_flush
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(node
+                .handle_wpoa_view_change(vote.clone(), &MultiVerifier)
+                .is_err());
+            assert_eq!(node.consensus.read().current_view(), 0);
+            // Put may have reached memory before the flush error; it is still not a vote.
+            assert_eq!(
+                node.chain_store
+                    .get_view_change_votes(&parent, 1, 0, &qc)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            db.fail_next_flush
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(node
+                .handle_wpoa_view_change(vote.clone(), &MultiVerifier)
+                .is_err());
+            assert_eq!(node.consensus.read().current_view(), 0);
+            assert!(node.handle_wpoa_view_change(vote, &MultiVerifier).unwrap());
+            assert_eq!(node.consensus.read().current_view(), 1);
+        }
+
+        #[test]
+        fn timeout_evidence_is_rejected_without_activation_and_keeps_canonical_state() {
+            let (producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(authority);
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                store_consistent_genesis(node);
+            }
+            let parent = producer
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .hash();
+            let set = vec![(authority, 1)];
+            let context = shell_core::TimeoutContext {
+                chain_id: 1337,
+                block_number: 1,
+                view: 0,
+                parent_hash: parent,
+                epoch: 0,
+                authority_set_hash: shell_consensus::timeout::timeout_authority_set_hash(&set)
+                    .unwrap(),
+                proposer: authority,
+                opportunity_hash: ShellHash::from([7; 32]),
+            };
+            let evidence = shell_core::BlockSignerEvidence {
+                address: authority,
+                public_key: signer.public_key().to_vec(),
+                signature: signer.sign(&context.signing_message(&authority)).unwrap(),
+            };
+            let proof = shell_core::TimeoutCertificate {
+                opportunity: None,
+                context: context.clone(),
+                signers: vec![evidence],
+            };
+            shell_consensus::timeout::verify_timeout_certificate(
+                &proof,
+                &context,
+                &set,
+                &MultiVerifier,
+            )
+            .unwrap();
+            let mut block = producer.produce_block(&signer, 10).unwrap();
+            block.system_transactions.push(
+                proof
+                    .system_transaction(block.transactions.len() as u32)
+                    .unwrap(),
+            );
+            let before = current_state_root(&follower);
+            let error = follower.import_block(block, &MultiVerifier).unwrap_err();
+            assert!(error.to_string().contains("system transactions"), "{error}");
+            assert_eq!(follower.head_number(), 0);
+            assert_eq!(current_state_root(&follower), before);
+            assert_eq!(
+                follower.world_state.read().load_offline_state().unwrap(),
+                shell_core::OfflineState::default()
+            );
         }
 
         // ── 7. Serde: NetworkMessage::WPoaViewChange roundtrip ────────────────

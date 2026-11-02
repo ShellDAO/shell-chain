@@ -182,6 +182,17 @@ impl<S: KvStore + 'static> Node<S> {
         parent: &Block,
         finalized_import: bool,
     ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
+        self.verify_import_transaction_count(block)?;
+        let offline_plan = self.offline_plan_for_import(&parent.header, block)?;
+        self.verify_import_consensus_with_plan(
+            block,
+            parent,
+            finalized_import,
+            offline_plan.as_ref(),
+        )
+    }
+
+    fn verify_import_transaction_count(&self, block: &Block) -> Result<(), NodeError> {
         let max_transactions = self.config.network_type.default_params().max_tx_per_block;
         if block.transactions.len() > max_transactions {
             return Err(NodeError::Startup(format!(
@@ -191,6 +202,17 @@ impl<S: KvStore + 'static> Node<S> {
                 max_transactions,
             )));
         }
+        Ok(())
+    }
+
+    fn verify_import_consensus_with_plan(
+        &self,
+        block: &Block,
+        parent: &Block,
+        finalized_import: bool,
+        offline_plan: Option<&super::canonical_offline::OfflineBlockPlan>,
+    ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
+        self.verify_import_transaction_count(block)?;
 
         let seal = block.proposer_seal.as_ref().ok_or_else(|| {
             NodeError::Startup(format!("block {} missing proposer seal", block.number()))
@@ -198,10 +220,22 @@ impl<S: KvStore + 'static> Node<S> {
 
         {
             let consensus = self.consensus.read();
-            if finalized_import {
-                consensus.verify_header_for_finalized_import(&block.header, &parent.header)?;
-            } else {
-                consensus.verify_header(&block.header)?;
+            let certified_profile = self
+                .chain_store
+                .get_chain_config()?
+                .and_then(|c| c.offline_enforcement)
+                .is_some_and(|p| p.is_active(block.number()));
+            if certified_profile && offline_plan.is_none() {
+                return Err(NodeError::Startup(
+                    "active offline import lacks admitted context".into(),
+                ));
+            }
+            if !certified_profile {
+                if finalized_import {
+                    consensus.verify_header_for_finalized_import(&block.header, &parent.header)?;
+                } else {
+                    consensus.verify_header(&block.header)?;
+                }
             }
             let cfg = consensus.poa_config();
             let max_allowed =
@@ -383,7 +417,7 @@ impl<S: KvStore + 'static> Node<S> {
 
     /// Reconstruct only the retained, unfinalized branch prefix in a disposable overlay.
     /// Provisional validation must not publish branch state or governance policy.
-    fn side_fork_parent_store(
+    pub(super) fn side_fork_parent_store(
         &self,
         parent: &Block,
     ) -> Result<Arc<shell_storage::OverlayStore<S>>, NodeError> {
@@ -477,6 +511,26 @@ impl<S: KvStore + 'static> Node<S> {
         block: &Block,
         parent: &Block,
     ) -> Result<(), NodeError> {
+        let active = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|c| c.offline_enforcement)
+            .is_some_and(|p| p.is_active(block.number()));
+        if active {
+            let store = self.side_fork_parent_store(parent)?;
+            let chain = ChainStore::new(store.clone());
+            chain.set_head(&parent.hash())?;
+            let state = WorldState::at_root(store.clone(), &parent.header.state_root)?;
+            let mut registry = load_algorithm_registry(&state)
+                .map_err(|e| NodeError::Startup(format!("offline fork execution policy: {e}")))?;
+            self.replay_fork_block_with_registry(
+                block,
+                parent.header.state_root,
+                store,
+                &mut registry,
+            )?;
+            return Ok(());
+        }
         if block.transactions.is_empty() {
             return Ok(());
         }
@@ -873,6 +927,25 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
         let replay_cs = ChainStore::new(replay_store.clone());
         let metadata_checkpoint = replay_cs.address_metadata_checkpoint()?;
+        let offline_plan = if replay_cs
+            .get_chain_config()?
+            .and_then(|c| c.offline_enforcement)
+            .is_some_and(|p| p.is_active(block.number()))
+        {
+            let parent = replay_cs
+                .get_header_by_hash(&block.header.parent_hash)?
+                .ok_or_else(|| {
+                    NodeError::Startup("historical timeout parent unavailable".into())
+                })?;
+            if parent.state_root != parent_state_root {
+                return Err(NodeError::Startup(
+                    "historical timeout parent root mismatch".into(),
+                ));
+            }
+            super::canonical_offline::replay_plan(&replay_cs, &parent, block)?
+        } else {
+            None
+        };
         if !Self::decode_system_extra(&block.header.extra_data)
             .map_err(|error| Self::classify_fork_error(block.hash(), error))?
             .is_empty()
@@ -931,7 +1004,9 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut receipts = Vec::new();
         let mut new_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
-        let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
+        let imported_state_root = if !block.transactions.is_empty()
+            || !stark_settlements.is_empty()
+            || offline_plan.is_some()
         {
             let mut block_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
             let batch_verifier = MultiVerifier;
@@ -1029,6 +1104,9 @@ impl<S: KvStore + 'static> Node<S> {
             let replay_ws = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
             let state_db = ShellStateDb::new(replay_ws, ChainStore::new(replay_store.clone()));
             let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
+            if let Some(plan) = &offline_plan {
+                plan.execute(evm.state_db_mut().world_state_mut())?;
+            }
             let pre_verified = PreVerified;
             let mut validation_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
             let mut validation_nonces: HashMap<Address, u64> = HashMap::new();
@@ -1212,6 +1290,16 @@ impl<S: KvStore + 'static> Node<S> {
                 });
                 system_txs.push(reward_tx);
             }
+            if let Some(plan) = &offline_plan {
+                plan.append_receipts(
+                    self.config.chain_id,
+                    block.number(),
+                    block.transactions.len(),
+                    cumulative_gas,
+                    &mut system_txs,
+                    &mut receipts,
+                )?;
+            }
             if system_txs != block.system_transactions {
                 return Err(Self::invalid_fork(
                     block.hash(),
@@ -1226,6 +1314,9 @@ impl<S: KvStore + 'static> Node<S> {
                     "preferred-fork replay",
                 )
             })?;
+            if let Some(plan) = &offline_plan {
+                plan.sync_membership(evm.state_db_mut().world_state_mut())?;
+            }
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 || !block.system_transactions.is_empty() {
@@ -1448,6 +1539,11 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     pub(super) fn adopt_preferred_fork(&self, plan: &ForkAdoptionPlan) -> Result<(), NodeError> {
+        let offline_active = self
+            .chain_store
+            .get_chain_config()?
+            .and_then(|c| c.offline_enforcement)
+            .is_some_and(|p| p.is_active(plan.preferred_number));
         let current_head = self
             .chain_store
             .get_head_block()?
@@ -1529,6 +1625,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut parent_state_root = ancestor_state_root;
         let mut receipts = Vec::with_capacity(plan.new_chain.len());
         let mut settlements = Vec::with_capacity(plan.new_chain.len());
+        let mut preferred_weights = None;
         for block in &plan.new_chain {
             let block_hash = block.hash();
             // A synchronized certificate may authenticate a proposer selected in
@@ -1540,8 +1637,12 @@ impl<S: KvStore + 'static> Node<S> {
                 .is_some_and(|cert| {
                     self.verify_commit_certificate(block.number(), block_hash, &cert)
                 });
+            overlay_chain_store.set_head(&parent.hash())?;
+            let offline_plan =
+                super::canonical_offline::replay_plan(&overlay_chain_store, &parent.header, block)?;
+            preferred_weights = offline_plan.as_ref().map(|p| p.authorities().to_vec());
             let signer = self
-                .verify_import_consensus(block, &parent, certified)
+                .verify_import_consensus_with_plan(block, &parent, certified, offline_plan.as_ref())
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_economics(block, &parent)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
@@ -1552,6 +1653,7 @@ impl<S: KvStore + 'static> Node<S> {
             let (block_receipts, block_settlements) =
                 self.replay_preferred_fork_block(block, parent_state_root, overlay.clone())?;
             overlay_chain_store.put_block_signers(&block_hash, &[signer])?;
+            overlay_chain_store.set_canonical(block.number(), &block_hash)?;
             parent_state_root = block.header.state_root;
             receipts.push(block_receipts);
             settlements.push(block_settlements);
@@ -1563,6 +1665,27 @@ impl<S: KvStore + 'static> Node<S> {
                 reason: "preferred-fork plan does not terminate at the selected head".into(),
             });
         }
+        // Trial ancestry mappings admit the next replayed parent. Restore the
+        // original mapping/head before the atomic reorg builder checks rollback
+        // preconditions and constructs the final replacement batch.
+        for block in &plan.old_chain {
+            overlay_chain_store.set_canonical(block.number(), &block.hash())?;
+        }
+        for block in &plan.new_chain {
+            if block.number() > plan.canonical_number {
+                overlay_chain_store.delete_canonical(block.number())?;
+            }
+        }
+        overlay_chain_store.set_head(&current_head.hash())?;
+        let participation_state = WorldState::at_root(overlay.clone(), &parent_state_root)?;
+        let (participation_enabled, participation_suspended) =
+            super::canonical_offline::certified_participation(
+                &overlay_chain_store,
+                &participation_state,
+                plan.preferred_number,
+            )?;
+        let adopted_base =
+            super::canonical_offline::fork_head_base(&overlay_chain_store, &parent.header)?;
         let reverted_settlements = plan
             .old_chain
             .iter()
@@ -1574,13 +1697,21 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             Vec::new()
         };
-        let total_weight = self
-            .consensus
-            .read()
-            .validator_weights()
-            .values()
-            .copied()
-            .fold(0u64, u64::saturating_add);
+        let total_weight = preferred_weights
+            .map(|weights| {
+                weights
+                    .into_iter()
+                    .map(|(_, w)| w)
+                    .fold(0u64, u64::saturating_add)
+            })
+            .unwrap_or_else(|| {
+                self.consensus
+                    .read()
+                    .validator_weights()
+                    .values()
+                    .copied()
+                    .fold(0u64, u64::saturating_add)
+            });
         let mut finality = self.finality.write();
         let finalizes_preferred = finality.can_finalize_weighted(
             &plan.preferred_hash,
@@ -1625,6 +1756,22 @@ impl<S: KvStore + 'static> Node<S> {
         state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
         let block_store = self.block_store();
         block_store.replace_world_state(state);
+        {
+            let mut consensus = self.consensus.write();
+            if let Some(base) = adopted_base {
+                let (validators, weights): (Vec<_>, Vec<_>) = base.into_iter().unzip();
+                let config = consensus.poa_config();
+                if config.authorities != validators || config.authority_weights != weights {
+                    consensus.set_authorities_with_weights(validators, weights);
+                }
+            }
+            consensus.set_certified_participation(participation_enabled, participation_suspended);
+        }
+        if offline_active {
+            self.consensus
+                .write()
+                .note_block_progress(Self::wall_clock_millis());
+        }
         for block_settlements in &reverted_settlements {
             block_store.cancel_settled_witness_deletes(block_settlements);
         }
@@ -1720,6 +1867,8 @@ impl<S: KvStore + 'static> Node<S> {
         let mem_pool = self.mem_pool();
 
         let head = block_store.head_block()?.ok_or(NodeError::NoGenesis)?;
+
+        self.refresh_certified_participation(head.number())?;
 
         let incoming = block.number();
         let incoming_hash = block.hash();
@@ -1824,6 +1973,7 @@ impl<S: KvStore + 'static> Node<S> {
         // and proposer seal.
         let parent = self.parent_for_import(&block)?;
         let proposer_evidence = self.verify_import_consensus(&block, &parent, finalized_import)?;
+        let offline_plan = self.offline_plan_for_import(&parent.header, &block)?;
         self.verify_import_economics(&block, &parent)?;
         self.verify_incoming_witness_root(&block)?;
         self.verify_import_sig_aggregate_proof(&block)?;
@@ -1891,7 +2041,10 @@ impl<S: KvStore + 'static> Node<S> {
 
         let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
         let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
-        let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
+        let mut authority_transition = None;
+        let imported_state_root = if !block.transactions.is_empty()
+            || !stark_settlements.is_empty()
+            || offline_plan.is_some()
         {
             // Validate all transactions before execution (F-181):
             // security-critical checks (sig, algorithm, access list, pubkey)
@@ -2001,6 +2154,9 @@ impl<S: KvStore + 'static> Node<S> {
             let import_ws = WorldState::at_root(import_store.clone(), &current_root)?;
             let state_db = ShellStateDb::new(import_ws, ChainStore::new(import_store.clone()));
             let mut evm = ShellPqvm::new(state_db, self.config.chain_id);
+            if let Some(plan) = &offline_plan {
+                plan.execute(evm.state_db_mut().world_state_mut())?;
+            }
 
             // Complete transaction-policy validation (chain-id, gas, sender
             // binding, AA restrictions, and custom validation contracts).
@@ -2196,6 +2352,16 @@ impl<S: KvStore + 'static> Node<S> {
                 });
                 system_txs.push(reward_tx);
             }
+            if let Some(plan) = &offline_plan {
+                plan.append_receipts(
+                    self.config.chain_id,
+                    block.number(),
+                    block.transactions.len(),
+                    cumulative_gas,
+                    &mut system_txs,
+                    &mut receipts,
+                )?;
+            }
             if system_txs != block.system_transactions {
                 return Err(NodeError::Startup(format!(
                     "block {} system transactions mismatch: expected {:?}, got {:?}",
@@ -2215,6 +2381,13 @@ impl<S: KvStore + 'static> Node<S> {
                     "import",
                 )?;
             }
+            if let Some(plan) = &offline_plan {
+                plan.sync_membership(evm.state_db_mut().world_state_mut())?;
+            }
+            authority_transition = offline_plan
+                .as_ref()
+                .map(|plan| plan.stage_authorities(evm.state_db_mut().world_state_mut()))
+                .transpose()?;
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 {
@@ -2329,7 +2502,18 @@ impl<S: KvStore + 'static> Node<S> {
 
         // Track the imported state root for pruning decisions.
         self.record_canonical_state_root(block.number(), block.header.state_root);
-        self.reload_authorities_if_boundary(block.number())?;
+        if let Some(transition) = authority_transition {
+            transition.apply(&mut *self.consensus.write());
+        } else {
+            self.consensus_manager()
+                .reload_base_authorities_if_boundary(block.number())?;
+        }
+
+        if offline_plan.is_some() {
+            self.consensus
+                .write()
+                .note_block_progress(Self::wall_clock_millis());
+        }
 
         // I4: Advance the proof window manager to the new block height.
         // This expires any stale claim timeouts and updates prover reliability counters.

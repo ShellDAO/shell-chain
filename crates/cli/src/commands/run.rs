@@ -387,6 +387,7 @@ async fn initialize_chain<S: KvStore + 'static>(
                 native_registry_view_height: genesis_config.native_registry_view_height,
                 pq_address_bounds_height: genesis_config.pq_address_bounds_height,
                 native_address_context_height: genesis_config.native_address_context_height,
+                offline_enforcement: genesis_config.offline_enforcement_profile()?,
                 native_validator_events_height: genesis_config.native_validator_events_height,
                 prover_registry_height: genesis_config.prover_registry_height,
                 algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
@@ -455,6 +456,10 @@ async fn initialize_chain<S: KvStore + 'static>(
             .as_ref()
             .and_then(|config| config.algorithm_voting_window)
             != genesis_config.algorithm_voting_window()?
+        || stored
+            .as_ref()
+            .and_then(|config| config.offline_enforcement)
+            != genesis_config.offline_enforcement_profile()?
         || stored
             .as_ref()
             .and_then(|config| config.algorithm_proposal_identity_height)
@@ -564,6 +569,7 @@ async fn initialize_chain<S: KvStore + 'static>(
             native_registry_view_height: genesis_config.native_registry_view_height,
             pq_address_bounds_height: genesis_config.pq_address_bounds_height,
             native_address_context_height: genesis_config.native_address_context_height,
+            offline_enforcement: genesis_config.offline_enforcement_profile()?,
             native_validator_events_height: genesis_config.native_validator_events_height,
             prover_registry_height: genesis_config.prover_registry_height,
             algorithm_proposal_staging_height: genesis_config.algorithm_proposal_staging_height,
@@ -798,6 +804,7 @@ async fn run_with_store<S: KvStore + 'static>(
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1379,6 +1386,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1699,6 +1707,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            offline_enforcement: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -1872,6 +1881,83 @@ mod tests {
             .is_err());
             assert_eq!(store.scan_prefix(b"").unwrap(), before);
         }
+    }
+
+    #[tokio::test]
+    async fn offline_enforcement_schedule_persists_and_rejects_conflicts_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryDb::new());
+        let authority = Address::from([7u8; 20]);
+        let mut config = test_genesis(authority);
+        config.consensus=serde_json::from_value(serde_json::json!({"engine":"wpoa","authorities":[authority],"block_time_secs":2,"epoch_length":10})).unwrap();
+        initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+            .await
+            .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let profile = shell_storage::OfflineEnforcement {
+            activation_height: 0,
+            epoch_length: 10,
+            block_time_secs: 2,
+            heartbeat_interval_secs: 600,
+        };
+        config.offline_enforcement = Some(profile);
+        assert!(
+            initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        let scheduled = shell_storage::OfflineEnforcement {
+            activation_height: 9,
+            ..profile
+        };
+        config.offline_enforcement = Some(scheduled);
+        for _ in 0..2 {
+            initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ChainStore::new(store.clone())
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .offline_enforcement,
+            Some(scheduled)
+        );
+        let before = store.scan_prefix(b"").unwrap();
+        for change in [
+            None,
+            Some(shell_storage::OfflineEnforcement {
+                activation_height: 10,
+                ..scheduled
+            }),
+            Some(shell_storage::OfflineEnforcement {
+                heartbeat_interval_secs: 601,
+                ..scheduled
+            }),
+        ] {
+            config.offline_enforcement = change;
+            assert!(
+                initialize_chain(store.clone(), &config, dir.path(), config.chain_id, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+        let fresh = Arc::new(MemoryDb::new());
+        config.offline_enforcement = Some(profile);
+        initialize_chain(fresh.clone(), &config, dir.path(), config.chain_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ChainStore::new(fresh)
+                .get_chain_config()
+                .unwrap()
+                .unwrap()
+                .offline_enforcement,
+            Some(profile)
+        );
     }
 
     #[tokio::test]
@@ -2984,6 +3070,7 @@ mod tests {
                     native_registry_view_height: None,
                     pq_address_bounds_height: None,
                     native_address_context_height: None,
+                    offline_enforcement: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
                     algorithm_proposal_staging_height: None,

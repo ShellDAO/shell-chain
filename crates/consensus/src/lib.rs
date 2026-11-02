@@ -8,6 +8,7 @@ mod poa;
 pub mod prover_registry;
 pub mod rate_limiter;
 pub mod slashing;
+pub mod timeout;
 pub mod validator;
 pub mod view_change;
 pub mod window;
