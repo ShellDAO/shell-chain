@@ -2,6 +2,7 @@
 // Real TCP/RocksDB acceptance for certified offline enforcement and restart.
 // Requires Node 20+ and `cargo build -p shell-cli --features libp2p`.
 // Run: node tests/e2e/native-offline-network.mjs
+// Add --algorithm=slhdsa for the existing SLH-DSA-SHA2-256f fallback.
 // Add --full for 100 real misses, epoch suspension and authenticated recovery.
 // The full run takes about 30–60 minutes; no threshold or clock is shortened.
 import assert from 'node:assert/strict';
@@ -15,20 +16,28 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const full = process.argv.includes('--full');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full'), 'Only --full is supported');
+const algorithms = process.argv.slice(2).filter(arg => arg.startsWith('--algorithm='));
+assert.ok(algorithms.length <= 1, 'Select one algorithm');
+const algorithm = algorithms[0]?.slice('--algorithm='.length) ?? 'mldsa65';
+assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg.startsWith('--algorithm=')), 'Supported options: --full, --algorithm=mldsa65|slhdsa');
+const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
 const result = { startedAt: new Date().toISOString(), directory, binarySha256: createHash('sha256').update(await readFile(binary)).digest('hex'), processes: [], blocks: [], phases: [], scope: full ? '100 real assigned misses, native epoch suspension/recovery, TCP quorum, new peer catch-up and physical RocksDB restart.' : 'One real assigned miss, TCP weighted quorum, RocksDB import and physical restart; threshold remains 100 and is not exercised here.' };
 const pause = ms => new Promise(done => setTimeout(done, ms));
+result.algorithm = algorithm;
+result.certificates = [];
 const save = () => writeFile(join(directory, 'result.json'), JSON.stringify(result, null, 2));
 const password = join(directory, 'password.txt');
 await writeFile(password, randomBytes(24).toString('hex'), { mode: 0o600 });
 const keys = [];
 for (let i = 0; i < 3; i++) {
   const path = join(directory, `validator-${i}.json`);
-  const generated = spawnSync(binary, ['--password-file', password, 'key', 'generate', '--algorithm', 'mldsa65', '--output', path], { encoding: 'utf8' });
+  const generated = spawnSync(binary, ['--password-file', password, 'key', 'generate', '--algorithm', algorithm, '--output', path], { encoding: 'utf8' });
   assert.equal(generated.status, 0, generated.stderr);
   const key = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(key.key_type, algorithm === 'slhdsa' ? 'sphincs-sha2-256f' : algorithm);
   keys.push({ path, address: key.address, publicKey: '0x' + key.public_key });
 }
 const initial = '0xd3c21bcecceda1000000';
@@ -161,6 +170,16 @@ async function confirmed(i, to = keys[1].address, data) {
 }
 async function evidenceViews(i, block) {
   for (const tx of block.transactions.filter(tx => tx.shellType === 'timeoutEvidence')) {
+    const proof = JSON.parse(Buffer.from(tx.input.slice(2), 'hex').toString('utf8'));
+    assert.equal(proof.context.proposer, keys[1].address);
+    assert.deepEqual(proof.signers.map(signer => signer.address).sort(), [keys[0].address, keys[2].address].sort());
+    for (const signer of proof.signers) {
+      assert.equal(signer.signature.sig_type, signatureType);
+      const key = keys.find(key => key.address === signer.address);
+      assert.equal('0x' + Buffer.from(signer.public_key).toString('hex'), key.publicKey);
+      if (algorithm === 'slhdsa') assert.equal(signer.signature.data.length, 49856);
+    }
+    result.certificates.push({ peer: i, hash: tx.hash, algorithm, signatures: proof.signers.map(signer => ({ address: signer.address, bytes: signer.signature.data.length })), payloadBytes: (tx.input.length - 2) / 2 });
     const receipts = await rpc(i, 'eth_getBlockReceipts', [block.number]);
     const single = await rpc(i, 'eth_getTransactionReceipt', [tx.hash]);
     const summary = await rpc(i, 'shell_getTransactionSummary', [tx.hash, { includeReceipt: true }]);

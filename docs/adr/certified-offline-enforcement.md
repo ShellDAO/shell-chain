@@ -381,17 +381,24 @@ Run from a compatible source checkout with Rust and Node.js 20 or newer:
 ```bash
 cargo build --locked -p shell-cli --features libp2p
 node tests/e2e/native-offline-network.mjs
+node tests/e2e/native-offline-network.mjs --algorithm=slhdsa
 node tests/e2e/native-offline-network.mjs --full
 ```
 
-The short command covers one real miss and both-process restart. `--full` covers
+The short commands cover one real miss and both-process restart with ML-DSA-65
+(default) or SLH-DSA-SHA2-256f. Both algorithms have passed the short flow;
+the SLH-DSA evidence carries two genuine 49,856-byte signatures and is imported
+with identical state roots and historical receipts after restart. This verifies
+the existing transport budget for this three-validator fixture, not arbitrary
+committee sizes. `--full` has been verified with ML-DSA-65 and covers
 the complete 100-miss sequence and three-process recovery/restart; allow about
 one to two hours. The script creates private temporary keys, isolated loopback
 ports and its own local genesis, checks business state and exits nonzero on
 failure. It prints the result artifact path and retains data for diagnosis.
 It neither shortens the fixed threshold nor activates a deployed network.
 The local profile uses epoch length 10, nominal blocks of two seconds and a
-600-second heartbeat. Other signature/account combinations, partitions and
+600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
+combinations, partitions and
 crashes during in-flight voting remain separate acceptance cases.
 
 Before release, complete unanchored effective authority and new challenge-penalty
