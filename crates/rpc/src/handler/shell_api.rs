@@ -268,9 +268,9 @@ impl<S: KvStore + 'static> RpcHandler<S> {
                     system_tx.from,
                     Some(system_tx.to),
                     0,
-                    0x80u8,
+                    system_tx_type(system_tx.kind),
                     Some(system_tx.kind.as_str().into()),
-                    Some(system_tx.kind.as_str().into()),
+                    system_tx_reward_kind(system_tx.kind),
                 )
             } else {
                 (Address::ZERO, None, 0, 2u8, None, None)

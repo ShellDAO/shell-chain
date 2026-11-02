@@ -40,6 +40,17 @@ hash commits the payload; the native offline-state transcript commits each
 accepted payload into the account-trie state root. No header `extra_data` carrier
 or economic reward is used.
 
+Full and summary transaction views, single and block receipt queries, and the
+receipt embedded in a transaction summary identify evidence consistently as
+`type: "0x82"` and `shellType: "timeoutEvidence"`. Evidence has no `rewardKind`
+or `rewardSourceHash`; it must not be classified as a block reward. Genuine gas
+and STARK rewards retain their reward metadata and tags `0x80` and `0x81`.
+The published SDK 0.13.0 `getBlockReceipts` entry is verified against all 100
+retained certificates on the local development profile, including historical
+state after recovery. This does not mean the backend correction is released
+or activated on a public network.
+
+
 The native ledger uses ordinary validator-registry storage words for membership,
 counters, pending suspension epochs, the ordered opportunity cursor and the
 proof transcript. Final proposals also store the ordered effective authorities

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### In development
 
+- Align system transaction receipt types with their full/summary views across
+  single, block and embedded receipt queries. Timeout evidence uses `0x82`
+  without reward metadata; genuine gas and STARK rewards retain `0x80` and
+  `0x81` respectively. Cover real published-SDK historical reads and the
+  native-node restart acceptance entry.
+
 - Add authenticated timeout evidence kernels binding the canonical parent,
   membership epoch, ordered effective authority set, assigned proposer and
   admitted opportunity. Legacy view-change votes remain separate observations.

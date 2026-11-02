@@ -108,7 +108,7 @@ async function connect(phase) {
 const registry = '0x' + '0'.repeat(63) + '1';
 let validatorSlot;
 async function offline(i, tag = 'latest') {
-  const raw = await rpc(i, 'eth_getStorageAt', [registry, validatorSlot, tag]);
+  const raw = await rpc(i, 'eth_getStorageAt', [registry, '0x' + BigInt(validatorSlot).toString(16), tag]);
   const padded = raw.slice(2).padStart(64, '0');
   return [0, 1, 2, 3].map(index => Number(BigInt('0x' + padded.slice(index * 16, (index + 1) * 16))));
 }
@@ -158,6 +158,20 @@ async function confirmed(i, to = keys[1].address, data) {
   result.blocks.push(record);
   await save();
   return record;
+}
+async function evidenceViews(i, block) {
+  for (const tx of block.transactions.filter(tx => tx.shellType === 'timeoutEvidence')) {
+    const receipts = await rpc(i, 'eth_getBlockReceipts', [block.number]);
+    const single = await rpc(i, 'eth_getTransactionReceipt', [tx.hash]);
+    const summary = await rpc(i, 'shell_getTransactionSummary', [tx.hash, { includeReceipt: true }]);
+    for (const view of [tx, receipts.find(receipt => receipt.transactionHash === tx.hash), single, summary.transaction, summary.receipt]) {
+      assert.ok(view, 'evidence remains queryable');
+      assert.equal(view.type, '0x82');
+      assert.equal(view.shellType, 'timeoutEvidence');
+      assert.equal(view.rewardKind ?? null, null, 'consensus evidence is not a reward');
+      assert.equal(view.rewardSourceHash ?? null, null);
+    }
+  }
 }
 async function fullLifecycle() {
   let last = result.blocks.at(-1);
@@ -265,6 +279,7 @@ try {
     const blocks = await Promise.all([0, 1].map(i => rpc(i, 'eth_getBlockByNumber', ['0x' + number.toString(16), true])));
     assert.equal(blocks[1].hash, blocks[0].hash);
     assert.equal(blocks[1].stateRoot, blocks[0].stateRoot);
+    for (const i of [0, 1]) await evidenceViews(i, blocks[i]);
     evidenceCount += blocks[0].transactions.filter(tx => tx.shellType === 'timeoutEvidence').length;
     result.blocks.push({ height: number, hash: blocks[0].hash, stateRoot: blocks[0].stateRoot });
   }
@@ -293,7 +308,8 @@ try {
     }
   }
   for (const i of [0, 1]) {
-    const block = await rpc(i, 'eth_getBlockByNumber', [tag, false]);
+    const block = await rpc(i, 'eth_getBlockByNumber', [tag, true]);
+    await evidenceViews(i, block);
     const original = result.blocks.find(block => block.height === height);
     assert.equal(block.hash, original.hash);
     assert.equal(block.stateRoot, original.stateRoot);

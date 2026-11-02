@@ -1084,11 +1084,24 @@ fn ordered_system_txs(system_txs: &[SystemTransaction]) -> Vec<&SystemTransactio
     ordered
 }
 
-fn system_tx_type_hex(kind: shell_core::SystemTxKind) -> &'static str {
+fn system_tx_type(kind: shell_core::SystemTxKind) -> u8 {
     match kind {
-        shell_core::SystemTxKind::BlockGasReward => "0x80",
-        shell_core::SystemTxKind::StarkReward => "0x81",
-        shell_core::SystemTxKind::TimeoutEvidence => "0x82",
+        shell_core::SystemTxKind::BlockGasReward => 0x80,
+        shell_core::SystemTxKind::StarkReward => 0x81,
+        shell_core::SystemTxKind::TimeoutEvidence => 0x82,
+    }
+}
+
+fn system_tx_type_hex(kind: shell_core::SystemTxKind) -> String {
+    hex_u64(u64::from(system_tx_type(kind)))
+}
+
+fn system_tx_reward_kind(kind: shell_core::SystemTxKind) -> Option<String> {
+    match kind {
+        shell_core::SystemTxKind::BlockGasReward | shell_core::SystemTxKind::StarkReward => {
+            Some(kind.as_str().into())
+        }
+        shell_core::SystemTxKind::TimeoutEvidence => None,
     }
 }
 
@@ -1309,6 +1322,8 @@ pub(crate) fn system_tx_to_rpc(
         .as_ref()
         .filter(|_| tx.kind == shell_core::SystemTxKind::StarkReward)
         .and_then(|payload| decode_proof_amendment_input(payload.as_ref()));
+    let reward_kind = system_tx_reward_kind(tx.kind);
+    let reward_source_hash = reward_kind.as_ref().map(|_| tx.source_hash);
     RpcTransaction {
         hash: tx.hash(),
         block_hash,
@@ -1328,7 +1343,7 @@ pub(crate) fn system_tx_to_rpc(
             .map(|payload| hex_bytes(payload.as_ref()))
             .unwrap_or_else(|| "0x".into()),
         chain_id: hex_u64(tx.chain_id),
-        tx_type: system_tx_type_hex(tx.kind).into(),
+        tx_type: system_tx_type_hex(tx.kind),
         v: "0x0".into(),
         r: "0x0".into(),
         s: "0x0".into(),
@@ -1336,11 +1351,9 @@ pub(crate) fn system_tx_to_rpc(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
         shell_type: Some(tx.kind.as_str().into()),
-        reward_kind: (tx.kind != shell_core::SystemTxKind::TimeoutEvidence)
-            .then(|| tx.kind.as_str().into()),
+        reward_kind,
         reward_layer: tx.layer.map(|l| hex_u64(l as u64)),
-        reward_source_hash: (tx.kind != shell_core::SystemTxKind::TimeoutEvidence)
-            .then_some(tx.source_hash),
+        reward_source_hash,
         original_size: tx.original_size.map(hex_u64),
         compressed_size: tx.compressed_size.map(hex_u64),
         decoded_input,
@@ -1387,6 +1400,8 @@ pub(crate) fn system_tx_to_rpc_summary(
     tx: &SystemTransaction,
     block_hash: Option<ShellHash>,
 ) -> RpcTransactionSummary {
+    let reward_kind = system_tx_reward_kind(tx.kind);
+    let reward_source_hash = reward_kind.as_ref().map(|_| tx.source_hash);
     RpcTransactionSummary {
         hash: tx.hash(),
         block_hash,
@@ -1395,12 +1410,12 @@ pub(crate) fn system_tx_to_rpc_summary(
         from: tx.from,
         to: Some(tx.to),
         value: hex_u256(tx.value),
-        tx_type: system_tx_type_hex(tx.kind).into(),
+        tx_type: system_tx_type_hex(tx.kind),
         has_input: tx.proof_payload.as_ref().is_some_and(|p| !p.is_empty()),
         shell_type: Some(tx.kind.as_str().into()),
-        reward_kind: Some(tx.kind.as_str().into()),
+        reward_kind,
         reward_layer: tx.layer.map(|l| hex_u64(l as u64)),
-        reward_source_hash: Some(tx.source_hash),
+        reward_source_hash,
         original_size: tx.original_size.map(hex_u64),
         compressed_size: tx.compressed_size.map(hex_u64),
     }
@@ -3076,6 +3091,125 @@ mod tests {
         assert_eq!(page.blocks.len(), 1);
         assert_eq!(page.blocks[0].number, format!("0x{:x}", u64::MAX));
         assert_eq!(page.next_start, None);
+    }
+
+    #[tokio::test]
+    async fn system_transaction_kinds_match_all_rpc_views() {
+        let handler = setup();
+        let mut block = make_genesis_block();
+        let recipient = test_address(b"system-kind-recipient");
+        let system = vec![
+            SystemTransaction::block_gas_reward(
+                42,
+                0,
+                0,
+                recipient,
+                U256::from(10),
+                block.header.parent_hash,
+            ),
+            SystemTransaction::stark_reward(shell_core::StarkRewardParams {
+                chain_id: 42,
+                block_number: 0,
+                tx_index: 1,
+                recipient,
+                value: U256::from(20),
+                source_hash: block.header.parent_hash,
+                layer: 1,
+                original_size: 100,
+                compressed_size: 10,
+                proof_payload: vec![1, 2, 3].into(),
+            }),
+            SystemTransaction::timeout_evidence(
+                42,
+                0,
+                2,
+                recipient,
+                block.header.parent_hash,
+                vec![1, 2, 3].into(),
+            ),
+        ];
+        block.system_transactions = system.clone();
+        let hash = block.hash();
+        let receipts = system
+            .iter()
+            .map(|tx| TransactionReceipt {
+                tx_hash: tx.hash(),
+                block_number: 0,
+                tx_index: tx.tx_index,
+                status: 1,
+                gas_used: 0,
+                cumulative_gas_used: 0,
+                contract_address: None,
+                logs_bloom: Bytes::default(),
+                logs: vec![],
+            })
+            .collect::<Vec<_>>();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        handler
+            .chain_store
+            .put_system_transactions(&hash, 0, &system)
+            .unwrap();
+        handler.chain_store.put_receipts(&hash, &receipts).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let batch = EthApiServer::get_block_receipts(&handler, "0x0".into())
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        for (index, (tx, (wire_type, reward_kind))) in system
+            .iter()
+            .zip([
+                ("0x80", Some("blockGasReward")),
+                ("0x81", Some("starkReward")),
+                ("0x82", None),
+            ])
+            .enumerate()
+        {
+            let full = EthApiServer::get_transaction_by_hash(&handler, tx.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(full.tx_type, wire_type);
+            assert_eq!(full.reward_kind.as_deref(), reward_kind);
+            let single = EthApiServer::get_transaction_receipt(&handler, tx.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            let summary = ShellApiServer::get_transaction_summary(
+                &handler,
+                tx.hash(),
+                Some(RpcTransactionSummaryOptions {
+                    include_receipt: Some(true),
+                }),
+            )
+            .await
+            .unwrap();
+            for receipt in [&single, &batch[index], summary.receipt.as_ref().unwrap()] {
+                assert_eq!(receipt.tx_type, wire_type);
+                assert_eq!(receipt.shell_type.as_deref(), Some(tx.kind.as_str()));
+                assert_eq!(receipt.reward_kind.as_deref(), reward_kind);
+                assert_eq!(receipt.transaction_hash, tx.hash());
+                assert_eq!(receipt.gas_used, "0x0");
+            }
+            let summary_tx = summary.transaction.unwrap();
+            assert_eq!(summary_tx["type"], wire_type);
+            assert_eq!(summary_tx["shellType"], tx.kind.as_str());
+            if let Some(kind) = reward_kind {
+                assert_eq!(summary_tx["rewardKind"], kind);
+                assert_eq!(
+                    summary_tx["rewardSourceHash"],
+                    serde_json::json!(tx.source_hash)
+                );
+            } else {
+                assert!(summary_tx["rewardKind"].is_null());
+                assert!(summary_tx["rewardSourceHash"].is_null());
+            }
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
     }
 
     #[tokio::test]
