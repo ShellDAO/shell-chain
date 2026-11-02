@@ -3,6 +3,7 @@
 // Requires Node 20+ and `cargo build -p shell-cli --features libp2p`.
 // Run: node tests/e2e/native-offline-network.mjs
 // Add --algorithm=slhdsa for the existing SLH-DSA-SHA2-256f fallback.
+// Add --interrupt-work to crash/reopen a voter before quorum and recover its original work.
 // Add --full for 100 real misses, epoch suspension and authenticated recovery.
 // The full run takes about 30–60 minutes; no threshold or clock is shortened.
 import assert from 'node:assert/strict';
@@ -16,17 +17,19 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const full = process.argv.includes('--full');
+const interruptWork = process.argv.includes('--interrupt-work');
 const algorithms = process.argv.slice(2).filter(arg => arg.startsWith('--algorithm='));
 assert.ok(algorithms.length <= 1, 'Select one algorithm');
 const algorithm = algorithms[0]?.slice('--algorithm='.length) ?? 'mldsa65';
 assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg.startsWith('--algorithm=')), 'Supported options: --full, --algorithm=mldsa65|slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --algorithm=mldsa65|slhdsa');
 const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
 const result = { startedAt: new Date().toISOString(), directory, binarySha256: createHash('sha256').update(await readFile(binary)).digest('hex'), processes: [], blocks: [], phases: [], scope: full ? '100 real assigned misses, native epoch suspension/recovery, TCP quorum, new peer catch-up and physical RocksDB restart.' : 'One real assigned miss, TCP weighted quorum, RocksDB import and physical restart; threshold remains 100 and is not exercised here.' };
 const pause = ms => new Promise(done => setTimeout(done, ms));
 result.algorithm = algorithm;
+result.interruptWork = interruptWork;
 result.certificates = [];
 const save = () => writeFile(join(directory, 'result.json'), JSON.stringify(result, null, 2));
 const password = join(directory, 'password.txt');
@@ -172,6 +175,7 @@ async function evidenceViews(i, block) {
   for (const tx of block.transactions.filter(tx => tx.shellType === 'timeoutEvidence')) {
     const proof = JSON.parse(Buffer.from(tx.input.slice(2), 'hex').toString('utf8'));
     assert.equal(proof.context.proposer, keys[1].address);
+    if (interruptWork) assert.deepEqual(proof.opportunity.Work.transaction, result.pendingVote.opportunity.Work.transaction, 'the original signed work, without resubmission');
     assert.deepEqual(proof.signers.map(signer => signer.address).sort(), [keys[0].address, keys[2].address].sort());
     for (const signer of proof.signers) {
       assert.equal(signer.signature.sig_type, signatureType);
@@ -274,8 +278,59 @@ async function fullLifecycle() {
   result.phases.push({ phase: 'returning B proposes after epoch recovery', recoveryBoundary, proposedHeight: last.height, hash: last.hash });
   await save();
 }
+async function exportPending(label) {
+  const output = join(directory, `${label}.jsonl`);
+  const argv = ['--datadir', join(directory, 'node-2'), 'export-state', '--output', output];
+  const exported = spawnSync(binary, argv, { encoding: 'utf8' });
+  result.exports ??= [];
+  result.exports.push({ argv, exitCode: exported.status, stdout: exported.stdout, stderr: exported.stderr });
+  assert.equal(exported.status, 0, exported.stderr);
+  const entries = (await readFile(output, 'utf8')).trim().split('\n').filter(line => !line.startsWith('META:')).map(line => JSON.parse(line));
+  const votes = entries.filter(row => Buffer.from(row.key, 'base64').subarray(0, 4).toString() === 'TCV2').map(row => JSON.parse(Buffer.from(row.value, 'base64').toString()));
+  const certificates = entries.filter(row => Buffer.from(row.key, 'base64').subarray(0, 4).toString() === 'TCC2');
+  assert.equal(votes.length, 1, 'one actually durable pre-quorum vote');
+  assert.equal(certificates.length, 0, 'C3 alone cannot certify the total weight5');
+  assert.equal(votes[0].vote.validator, keys[2].address);
+  assert.equal(votes[0].vote.context.proposer, keys[1].address);
+  assert.equal(votes[0].vote.context.block_number, 1);
+  assert.equal(votes[0].vote.context.view, 0);
+  result.pendingVote = votes[0];
+  await save();
+}
+async function inflightStart() {
+  await start(1, 'pending-before-crash');
+  const raw = Buffer.concat([Buffer.from('shell:offline-state:v1:validator:'), Buffer.from(keys[1].address.slice(2), 'hex')]);
+  validatorSlot = await rpc(1, 'web3_sha3', ['0x' + raw.toString('hex')]);
+  result.pendingTransferHash = await send(1, 0);
+  await save();
+  for (let n = 0; n < 20; n++) {
+    assert.equal(await rpc(1, 'eth_blockNumber'), '0x0', 'minority cannot produce a certified miss');
+    assert.deepEqual(await offline(1), [0, 0, 0, 0]);
+    await pause(1000);
+  }
+  const child = children[1];
+  assert.ok(child.kill('SIGKILL'));
+  await new Promise(done => child.once('exit', done));
+  const record = result.processes.find(record => record.pid === child.pid);
+  Object.assign(record, { stoppedAt: new Date().toISOString(), exitCode: child.exitCode, signal: child.signalCode, expectedCrash: true });
+  assert.equal(record.signal, 'SIGKILL');
+  children.length = 0;
+  await exportPending('pending-after-crash');
+  const bootnode = await start(1, 'pending-reopened');
+  assert.equal(await rpc(1, 'eth_getTransactionByHash', [result.pendingTransferHash]), null, 'volatile mempool is gone, original work is only in durable witness');
+  for (let n = 0; n < 12; n++) {
+    assert.equal(await rpc(1, 'eth_blockNumber'), '0x0');
+    assert.deepEqual(await offline(1), [0, 0, 0, 0]);
+    await pause(1000);
+  }
+  await start(0, 'quorum-peer-joined', bootnode);
+  await until('peer reconnect', async () => BigInt(await rpc(0, 'net_peerCount')) > 0n && BigInt(await rpc(1, 'net_peerCount')) > 0n);
+  result.phases.push({ phase: 'durable minority vote survives SIGKILL/reopen; genuine second signer joined without resubmitting original transfer' });
+  await save();
+}
 try {
-  await connect('initial');
+  if (interruptWork) await inflightStart();
+  else await connect('initial');
   // Standard hashing RPC only derives the published native storage key; the
   // expected counter comes from the assigned-miss rule, not a runtime helper.
   const keyBytes = Buffer.concat([Buffer.from('shell:offline-state:v1:validator:'), Buffer.from(keys[1].address.slice(2), 'hex')]);
@@ -283,7 +338,7 @@ try {
   assert.deepEqual(await offline(0), [0, 0, 0, 0]);
   result.initialValidator = await rpc(0, 'shell_getValidatorStatus', [keys[1].address]);
   assert.equal(result.initialValidator.weight, 1);
-  const hash = await send(1, 0);
+  const hash = interruptWork ? result.pendingTransferHash : await send(1, 0);
   await save();
   const receipt = await until('transfer confirmation on both peers', async () => {
     const receipts = await Promise.all([0, 1].map(i => rpc(i, 'eth_getTransactionReceipt', [hash])));

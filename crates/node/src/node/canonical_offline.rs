@@ -954,6 +954,22 @@ impl<S: KvStore + 'static> Node<S> {
         if view > engine.current_view() {
             engine.set_certified_view(view)?;
         }
+        drop(engine);
+        // The work witness outlives the volatile pool. Restore its original
+        // signed transaction through ordinary admission after verifying quorum;
+        // advancing the view alone would commit a miss but strand the work.
+        for certificate in chain {
+            if let Some(shell_core::TimeoutOpportunity::Work { transaction, .. }) =
+                certificate.opportunity
+            {
+                let hash = transaction.hash();
+                if !self.tx_pool.contains(&hash) {
+                    if let Err(error) = self.handle_incoming_tx(*transaction, &MultiVerifier) {
+                        tracing::warn!(%hash, %error, "cannot restore certified timeout work to mempool");
+                    }
+                }
+            }
+        }
         Ok(())
     }
     pub(super) fn offline_plan_for_production(

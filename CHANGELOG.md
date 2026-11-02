@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### In development
 
+- Restore original signed work from independently verified durable timeout
+  certificates through normal mempool admission. After a voter restarts before
+  quorum, a returning peer can confirm the original transfer without client
+  resubmission; view recovery also retains the work needed for execution.
+
 - Align system transaction receipt types with their full/summary views across
   single, block and embedded receipt queries. Timeout evidence uses `0x82`
   without reward metadata; genuine gas and STARK rewards retain `0x80` and

@@ -91,6 +91,14 @@ in-flight view from the same journal. The shared admitted-evidence executor
 requires the durable witness, verifies its eligibility and quorum, then publishes
 the native counter/transcript atomically; missing witnesses and replays fail.
 
+View recovery also returns each certificate's original signed work to ordinary
+mempool admission after releasing the engine lock. A certificate alone must not
+strand its transfer after the volatile pool is lost. Existing pool entries are
+not duplicated; a partial vote does not restore work, and a new parent does not
+requeue already committed work. Admission failures retain the durable witness
+and report the failure without disabling the verified view. This is recovery of
+certificate-carried work, not general persistence of every pending transaction.
+
 The event loop now observes eligible work or heartbeat using a monotonic timer
 and the frozen timeout interval. Parent age cannot replace that interval when
 work arrives late. It rechecks fresh work eligibility while waiting; expiry or a
@@ -382,6 +390,7 @@ Run from a compatible source checkout with Rust and Node.js 20 or newer:
 cargo build --locked -p shell-cli --features libp2p
 node tests/e2e/native-offline-network.mjs
 node tests/e2e/native-offline-network.mjs --algorithm=slhdsa
+node tests/e2e/native-offline-network.mjs --interrupt-work
 node tests/e2e/native-offline-network.mjs --full
 ```
 
@@ -396,6 +405,11 @@ one to two hours. The script creates private temporary keys, isolated loopback
 ports and its own local genesis, checks business state and exits nonzero on
 failure. It prints the result artifact path and retains data for diagnosis.
 It neither shortens the fixed threshold nor activates a deployed network.
+`--interrupt-work` kills the isolated C3 process after it retains a minority
+vote and the original signed transfer. An offline snapshot export verifies that
+the vote exists without a quorum certificate. After reopening, C alone still
+cannot advance; reconnecting A1 must confirm that original transfer without
+resubmission, followed by the usual receipt, funds, history and restart checks.
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and

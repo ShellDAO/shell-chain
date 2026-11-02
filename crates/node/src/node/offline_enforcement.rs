@@ -2251,6 +2251,96 @@ mod opportunity_tests {
         assert_eq!(node.consensus.read().current_view(), 0);
     }
     #[test]
+    fn canonical_offline_work_certificate_restores_transaction_after_rebuild() {
+        let keys = [MlDsaSigner::generate(), MlDsaSigner::generate()];
+        let sender = MlDsaSigner::generate();
+        let store = Arc::new(MemoryDb::new());
+        let node = setup(store.clone(), &keys, &sender, false);
+        let config = node.config.clone();
+        let witness = work(&sender);
+        let TimeoutOpportunity::Work { transaction, .. } = &witness else {
+            unreachable!()
+        };
+        let hash = transaction.hash();
+        let low = message(&node, &keys, &witness, 0, 112);
+        node.handle_certified_timeout_vote_at(low, 112, &MultiVerifier)
+            .unwrap();
+        drop(node);
+        let node = NodeBuilder::new(config.clone(), store.clone())
+            .build()
+            .unwrap()
+            .0;
+        node.recover_certified_timeout_view().unwrap();
+        assert_eq!(node.consensus.read().current_view(), 0);
+        assert!(
+            node.tx_pool.is_empty(),
+            "a partial vote is not a certificate"
+        );
+        let high = message(&node, &keys, &witness, 1, 112);
+        node.handle_certified_timeout_vote_at(high, 112, &MultiVerifier)
+            .unwrap()
+            .unwrap();
+        drop(node);
+        let node = NodeBuilder::new(config.clone(), store.clone())
+            .build()
+            .unwrap()
+            .0;
+        let head = node.chain_store.get_head_hash().unwrap();
+        let root = node.world_state.write().state_root().unwrap();
+        for _ in 0..2 {
+            node.recover_certified_timeout_view().unwrap();
+            assert_eq!(node.consensus.read().current_view(), 1);
+            assert!(node.tx_pool.contains(&hash));
+            assert_eq!(node.tx_pool.len(), 1);
+            assert_eq!(node.chain_store.get_head_hash().unwrap(), head);
+            assert_eq!(node.world_state.write().state_root().unwrap(), root);
+            assert_eq!(
+                node.world_state
+                    .read()
+                    .get_nonce(&address(&sender))
+                    .unwrap(),
+                0
+            );
+        }
+        let block = node.produce_block(&keys[0], 500).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].hash(), hash);
+        assert!(!node.tx_pool.contains(&hash));
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_balance(&Address::from([9; 32]))
+                .unwrap(),
+            U256::from(5)
+        );
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_nonce(&address(&sender))
+                .unwrap(),
+            1
+        );
+        drop(node);
+        let node = NodeBuilder::new(config, store).build().unwrap().0;
+        node.recover_certified_timeout_view().unwrap();
+        assert_eq!(node.consensus.read().current_view(), 0);
+        assert!(
+            node.tx_pool.is_empty(),
+            "committed work is not requeued at a new parent"
+        );
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(block.hash())
+        );
+        assert_eq!(
+            node.world_state
+                .read()
+                .get_nonce(&address(&sender))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
     fn canonical_offline_heartbeat_only_block_restores_durable_view_after_rebuild() {
         let keys = [MlDsaSigner::generate(), MlDsaSigner::generate()];
         let sender = MlDsaSigner::generate();
