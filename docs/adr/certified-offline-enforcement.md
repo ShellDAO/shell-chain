@@ -489,7 +489,13 @@ fee does not imply Ethereum base-fee burning. The sponsor differs from the
 proposer, allowing its exact debit to be checked independently.
 No deployed activation changes. Use a compatible V2 source SDK and add
 `--paymaster-work` to `--interrupt-work --aa-work`; session/reference policies,
-late-call failure, SLH-DSA and contract sponsorship remain separate combinations.
+SLH-DSA and contract sponsorship remain separate combinations. Adding
+`--aa-revert` exercises a later native AccountManager failure after an inner
+transfer. Both inner effects must roll back while the root nonce advances and
+the sponsor pays the actual billed fee. The proposer receives the full gas
+reward without a committed value debit. This combination enables native
+AccountManager dispatch only in its fresh isolated genesis and verifies the
+same native failure trace and sponsorship metadata on both peers after reopening.
 
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
