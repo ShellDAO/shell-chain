@@ -397,6 +397,8 @@ SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --aa-revert
 SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --reference-validator
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --session-work
 node tests/e2e/native-offline-network.mjs --full
 ```
 
@@ -444,6 +446,19 @@ the timeout nor the fixed 100-miss threshold. This mode requires the updated
 reference creation artifact and compatible V2 source SDK; it does not migrate
 installed old policies or imply public release availability. The reference
 ML-DSA-family policy is not an SLH-DSA policy.
+
+The `--session-work` variant uses genuine ML-DSA root and session keys through
+the existing SDK authorization helpers. The root authorizes the recipient target,
+a total per-transaction value cap of 3 and exclusive expiry at height 2. Signed
+cap-2, wrong-target, expiry-1, unrelated-root and unrelated-session controls must
+be rejected at candidate height 1 without changing balances, nonce or the stored
+root key. The valid original two-call session bundle must survive the same
+minority-vote crash, quorum and physical reopening with recipient credit 3 and
+one root-account nonce; the session key must not replace the registered root.
+The script paces its additional snapshot reads under the normal RPC rate limit
+and disposes client signing material before interruption. This mode currently
+covers ML-DSA root/session on the built-in account path; combining it with
+reference policies, late-call rollback, paymasters or SLH-DSA is separate work.
 
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account

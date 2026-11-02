@@ -7,6 +7,7 @@
 // Add --aa-work with --interrupt-work and SHELL_SDK_ENTRY for a two-call AA batch.
 // Add --aa-revert to check rollback when its second inner call reverts.
 // Add --reference-validator to deploy/install the key-bound ML-DSA reference policy first.
+// Add --session-work for a real target/value/expiry-constrained ML-DSA session.
 // Add --full for 100 real misses, epoch suspension and authenticated recovery.
 // The full run takes about 30–60 minutes; no threshold or clock is shortened.
 import assert from 'node:assert/strict';
@@ -24,6 +25,8 @@ const interruptWork = process.argv.includes('--interrupt-work');
 const aaWork = process.argv.includes('--aa-work');
 const aaRevert = process.argv.includes('--aa-revert');
 const referenceValidator = process.argv.includes('--reference-validator');
+const sessionWork = process.argv.includes('--session-work');
+assert.ok(!sessionWork || (aaWork && !referenceValidator && !aaRevert), '--session-work requires --aa-work without reference policy or late-revert mode');
 assert.ok(!referenceValidator || aaWork, '--reference-validator requires --aa-work');
 assert.ok(!aaRevert || aaWork, '--aa-revert requires --aa-work');
 const receivedValue = aaWork ? (aaRevert ? 0n : 3n) : 1n;
@@ -32,9 +35,10 @@ assert.ok(!aaWork || process.env.SHELL_SDK_ENTRY, 'Set SHELL_SDK_ENTRY to a comp
 const algorithms = process.argv.slice(2).filter(arg => arg.startsWith('--algorithm='));
 assert.ok(algorithms.length <= 1, 'Select one algorithm');
 const algorithm = algorithms[0]?.slice('--algorithm='.length) ?? 'mldsa65';
+assert.ok(!sessionWork || algorithm === 'mldsa65', 'This session Work entry tests ML-DSA root and session');
 assert.ok(!referenceValidator || algorithm === 'mldsa65', 'The reference policy supports the ML-DSA family; select mldsa65');
 assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --algorithm=mldsa65|slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg === '--session-work' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --session-work, --algorithm=mldsa65|slhdsa');
 const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
@@ -44,6 +48,7 @@ result.algorithm = algorithm;
 result.aaWork = aaWork;
 result.aaRevert = aaRevert;
 result.referenceValidator = referenceValidator;
+result.sessionWork = sessionWork;
 const initial = '0xd3c21bcecceda1000000';
 let workBaseHeight = 0, senderStartNonce = 0, recipientStartBalance = BigInt(initial);
 result.toolchain = { node: process.version, platform: process.platform, arch: process.arch };
@@ -82,6 +87,8 @@ const urls = ports.map(port => `http://127.0.0.1:${port}`);
 const children = [];
 let requestId = 0;
 async function rpc(i, method, params = []) {
+  // Session rejection snapshots add reads; retain the normal server rate limit.
+  if (sessionWork) await pause(100);
   const response = await fetch(urls[i], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++requestId, method, params }), signal: AbortSignal.timeout(10000) });
   assert.ok(response.ok, `${method}: HTTP ${response.status}`);
   const body = await response.json();
@@ -153,6 +160,7 @@ async function send(i, nonce, to = keys[1].address, data) {
       assert.equal(signer.getAddress(), keys[authority].address);
       const provider = sdk.createShellProvider({ rpcHttpUrl: urls[i] });
       const gasPrice = Number(BigInt(await rpc(i, 'eth_gasPrice')));
+      if (sessionWork) return await sendSessionWork(i, signer, provider, nonce, to, gasPrice);
       const { tx, aa_bundle } = sdk.buildBatchTransaction({ chainId: 1337, nonce, innerCalls: [sdk.buildInnerTransfer(to, 1n), aaRevert ? sdk.buildInnerCall(sdk.accountManagerAddress, '0xffffffff', 100000) : sdk.buildInnerTransfer(to, 2n)], gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0 });
       const signed = await signer.buildSignedTransaction({ tx, aaBundle: aa_bundle, includePublicKey: true });
       const hash = await provider.sendTransaction(signed);
@@ -177,6 +185,58 @@ async function send(i, nonce, to = keys[1].address, data) {
       done(hash);
     });
   });
+}
+async function sendSessionWork(i, root, provider, nonce, to, gasPrice) {
+  const session = sdk.MlDsa65Adapter.generate();
+  const other = sdk.MlDsa65Adapter.generate();
+  const before = async () => ({
+    nonce: await rpc(i, 'eth_getTransactionCount', [root.getAddress(), 'latest']),
+    balance: await rpc(i, 'eth_getBalance', [root.getAddress(), 'latest']),
+    recipient: await rpc(i, 'eth_getBalance', [to, 'latest']),
+    rootKey: await rpc(i, 'shell_getPqPubkey', [root.getAddress()]),
+  });
+  const options = { chainId: 1337, nonce,
+    innerCalls: [sdk.buildInnerTransfer(to, 1n), sdk.buildInnerTransfer(to, 2n)],
+    gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0 };
+  async function signed({ valueCap = 3n, target = to, expiryBlock = 2,
+    authorizer = root, sessionSigner = session } = {}) {
+    const draft = sdk.buildBatchTransaction(options);
+    const auth = await sdk.createSessionAuth(authorizer, session.getPublicKey(), 1,
+      { chainId: 1337n, expiryBlock, valueCap, target });
+    draft.aa_bundle.session_auth = auth;
+    const hash = sdk.hashBatchTransaction(draft.tx, draft.aa_bundle, 'MlDsa65');
+    const final = await sdk.finalizeSessionAuth(auth, sessionSigner, hash);
+    const batch = sdk.buildSessionKeyTransaction({ ...options, sessionAuth: final });
+    return sdk.buildSignedTransaction({ from: root.getAddress(), tx: batch.tx,
+      signatureType: 'MlDsa65', signature: final.session_signature,
+      senderPubkey: root.getPublicKey(), aaBundle: batch.aa_bundle });
+  }
+  result.session = { root: root.getAddress(), publicKey: '0x' + Buffer.from(session.getPublicKey()).toString('hex'),
+    target: to, valueCap: '3', exclusiveExpiry: 2, rejectionControls: [] };
+  try {
+    for (const [label, constraints, expected] of [
+      ['value cap', { valueCap: 2n }, /session.*value cap/i],
+      ['target', { target: keys[0].address }, /session.*target mismatch/i],
+      ['exclusive expiry', { expiryBlock: 1 }, /session.*expired/i],
+      ['root identity', { authorizer: other }, /session.*root authorization signature invalid/i],
+      ['session identity', { sessionSigner: other }, /session.*tx signature invalid/i],
+    ]) {
+      const state = await before();
+      const packet = await signed(constraints);
+      let error;
+      try { await provider.sendTransaction(packet); }
+      catch (e) { error = String(e); }
+      assert.match(error ?? '', expected, label);
+      assert.deepEqual(await before(), state, label + ': no account mutation');
+      result.session.rejectionControls.push({ label, error, stateUnchanged: true });
+      await save();
+    }
+    const packet = await signed();
+    const hash = await provider.sendTransaction(packet);
+    result.transaction = { hash, submittedAt: new Date().toISOString(),
+      entry: 'SDK genuine root/session authorization and V2 session batch', nonce, innerValues: ['1', '2'] };
+    return hash;
+  } finally { session.dispose(); other.dispose(); }
 }
 async function confirmed(i, to = keys[1].address, data) {
   const authority = [0, 2, 1][i];
@@ -212,6 +272,7 @@ async function evidenceViews(i, block) {
     if (aaWork) {
       assert.equal(proof.opportunity.Work.transaction.tx.tx_type, 126);
       assert.equal(proof.opportunity.Work.transaction.aa_bundle.inner_calls.length, 2);
+      if (sessionWork) assert.equal(proof.opportunity.Work.transaction.aa_bundle.session_auth.session_pubkey, result.session.publicKey);
     }
     assert.equal(proof.context.proposer, keys[1].address);
     if (interruptWork) assert.deepEqual(proof.opportunity.Work.transaction, result.pendingVote.opportunity.Work.transaction, 'the original signed work, without resubmission');
@@ -519,6 +580,7 @@ try {
     assert.deepEqual(await offline(i, tag), [1, 0, 0, 0]);
     assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
     if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), BigInt(senderStartNonce + 1));
+    if (sessionWork) assert.equal(await rpc(i, 'shell_getPqPubkey', [keys[2].address]), keys[2].publicKey, 'session does not replace persisted root key');
     assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }
   result.phases.push({ phase: full ? 'all three physical processes restarted' : 'both physical processes restarted', height, offline: [1, 0, 0, 0] });
