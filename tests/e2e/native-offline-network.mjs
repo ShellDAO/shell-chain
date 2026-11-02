@@ -29,7 +29,7 @@ const referenceValidator = process.argv.includes('--reference-validator');
 const sessionWork = process.argv.includes('--session-work');
 const paymasterWork = process.argv.includes('--paymaster-work');
 const contractPaymasterWork = process.argv.includes('--contract-paymaster-work');
-assert.ok(!contractPaymasterWork || (aaWork && !paymasterWork && !sessionWork && !referenceValidator && !aaRevert), '--contract-paymaster-work requires plain --aa-work');
+assert.ok(!contractPaymasterWork || (aaWork && !paymasterWork && !sessionWork && !referenceValidator), '--contract-paymaster-work requires --aa-work without other policy options');
 assert.ok(!paymasterWork || (aaWork && !referenceValidator && !sessionWork), '--paymaster-work requires --aa-work without session/reference policy');
 assert.ok(!sessionWork || (aaWork && !referenceValidator), '--session-work requires --aa-work without reference policy');
 assert.ok(!referenceValidator || aaWork, '--reference-validator requires --aa-work');
@@ -80,7 +80,7 @@ for (let i = 0; i < 3; i++) {
 }
 const genesis = { chain_id: 1337, chain_name: 'offline-network-acceptance', network_type: 'Dev', timestamp: Math.floor(Date.now() / 1000), gas_limit: 50000000, extra_data: 'offline-network-acceptance', alloc: Object.fromEntries(keys.map(key => [key.address, { balance: initial, nonce: 0, code: null, storage: null }])), boot_nodes: [], consensus: { engine: 'wpoa', authorities: keys.map(key => key.address), authority_pubkeys: keys.map(key => key.publicKey), weights: [1, 1, 3], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 10 }, offline_enforcement: { activation_height: 1, epoch_length: 10, block_time_secs: 2, heartbeat_interval_secs: 600 } };
 // Exercise the native AccountManager error path only in this new isolated mode.
-if ((sessionWork || paymasterWork) && aaRevert) genesis.aa_account_manager_height = 0;
+if ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) genesis.aa_account_manager_height = 0;
 if (paymasterWork || contractPaymasterWork) genesis.fee_accounting_activation_height = 0;
 if (paymasterWork) {
   genesis.fee_accounting_activation_height = 0;
@@ -144,7 +144,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
 async function start(i, phase, bootnode) {
   const authority = [0, 2, 1][i];
   const log = join(directory, `${phase}-${i}.log`);
-  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator || ((sessionWork || paymasterWork) && aaRevert) ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
+  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator || ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
   if (bootnode) args.push('--bootnode', bootnode);
   const fd = openSync(log, 'wx', 0o600);
   const child = spawn(binary, args, { stdio: ['ignore', fd, fd] });
@@ -338,7 +338,7 @@ async function sendContractPaymasterWork(i, root, provider, nonce, to, gasPrice)
   async function signed(signer = root, payerContext = context, price = gasPrice * 2) {
     const batch = sdk.buildContractPaymasterTransaction({ chainId: 1337,
       nonce: signer === root ? nonce : 0,
-      innerCalls: [sdk.buildInnerTransfer(to, 1n), sdk.buildInnerTransfer(to, 2n)],
+      innerCalls: [sdk.buildInnerTransfer(to, 1n), aaRevert ? sdk.buildInnerCall(sdk.accountManagerAddress, '0xffffffff', 100000) : sdk.buildInnerTransfer(to, 2n)],
       gasLimit: 300000, maxFeePerGas: price, maxPriorityFeePerGas: 0,
       paymaster: payer, paymasterContext: payerContext });
     assert.equal(batch.aa_bundle.paymaster_signature, null, 'contract policy uses context, not an EOA signature');
@@ -365,10 +365,10 @@ async function sendContractPaymasterWork(i, root, provider, nonce, to, gasPrice)
       await save();
     }
     const packet = await signed();
-    assert.deepEqual(packet.aa_bundle.inner_calls.map(call => BigInt(call.value)), [1n, 2n]);
-    assert.equal(BigInt(packet.tx.value), 3n);
+    assert.deepEqual(packet.aa_bundle.inner_calls.map(call => BigInt(call.value)), aaRevert ? [1n, 0n] : [1n, 2n]);
+    assert.equal(BigInt(packet.tx.value), aaRevert ? 1n : 3n);
     const hash = await provider.sendTransaction(packet);
-    result.transaction = { hash, submittedAt: new Date().toISOString(), nonce, innerValues: ['1', '2'],
+    result.transaction = { hash, submittedAt: new Date().toISOString(), nonce, innerValues: aaRevert ? ['1', '0'] : ['1', '2'],
       entry: 'SDK buildContractPaymasterTransaction with real conditional on-chain policy' };
     return hash;
   } finally { other.dispose(); }
@@ -753,7 +753,7 @@ try {
     return receipts[0];
   });
   const height = Number(BigInt(receipt.blockNumber));
-  if ((sessionWork || paymasterWork) && aaRevert) {
+  if ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) {
     const traces = await Promise.all([0, 1].map(i => rpc(i, 'debug_traceTransaction', [hash])));
     assert.deepEqual(traces[1], traces[0], 'independent native failure replay');
     assert.equal(traces[0].failed, true);
@@ -811,7 +811,7 @@ try {
     assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
     if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), BigInt(senderStartNonce + 1));
     if (sessionWork) assert.equal(await rpc(i, 'shell_getPqPubkey', [keys[2].address]), keys[2].publicKey, 'session does not replace persisted root key');
-    if ((sessionWork || paymasterWork) && aaRevert) assert.deepEqual(await rpc(i, 'debug_traceTransaction', [hash]), (sessionWork ? result.session : result.paymaster).nativeFailureTrace, 'native failed AA history after reopen');
+    if ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) assert.deepEqual(await rpc(i, 'debug_traceTransaction', [hash]), (sessionWork ? result.session : result.paymaster).nativeFailureTrace, 'native failed AA history after reopen');
     if (paymasterWork || contractPaymasterWork) await checkSponsoredState(i, receipt, hash);
     assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }

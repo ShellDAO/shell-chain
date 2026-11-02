@@ -507,7 +507,13 @@ weighted quorum, independent import and both-store reopening. The contract
 pays the receipt-derived fee without consuming its nonce; code and sponsorship
 metadata must persist. Use this option with `--interrupt-work --aa-work` and
 a compatible source SDK. Its retained `address` ABI maps the last 20 bytes;
-this case does not establish a full 32-byte policy identity boundary.
+this case does not establish a full 32-byte policy identity boundary. Adding
+`--aa-revert` makes the second call fail in native AccountManager dispatch,
+enabled only for that fresh isolated combination. Both inner effects must
+roll back while the sender nonce and contract-paid actual fee remain consumed.
+The proposer receives its full gas reward without a value debit. The native
+failure trace, unchanged payer nonce/code and sponsorship metadata must agree
+on both peers before and after physical reopening.
 
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
