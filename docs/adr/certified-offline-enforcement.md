@@ -399,6 +399,8 @@ SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --reference-validator
 SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --session-work
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --session-work --aa-revert
 node tests/e2e/native-offline-network.mjs --full
 ```
 
@@ -457,8 +459,19 @@ minority-vote crash, quorum and physical reopening with recipient credit 3 and
 one root-account nonce; the session key must not replace the registered root.
 The script paces its additional snapshot reads under the normal RPC rate limit
 and disposes client signing material before interruption. This mode currently
-covers ML-DSA root/session on the built-in account path; combining it with
-reference policies, late-call rollback, paymasters or SLH-DSA is separate work.
+covers ML-DSA root/session on the built-in account path. Adding `--aa-revert`
+uses a genuine authorization with target `null` (both targets allowed), cap 1
+and expiry 2 for a transfer followed by an invalid AccountManager call. Only
+this isolated mode sets `aa_account_manager_height` to 0 in its fresh genesis,
+so the later error is the native unknown-selector rejection. Both peers must
+replay that same error before and after reopening. No deployed activation
+schedule changes. A
+target restricted to the first recipient must reject the later system-contract
+call before execution. The valid original bundle instead reaches execution,
+reverts atomically, consumes gas and one root nonce, preserves recipient funds
+and root-key metadata, and retains the independently certified miss through
+quorum and physical reopening. Reference-policy, paymaster and SLH-DSA session
+combinations remain separate work.
 
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account

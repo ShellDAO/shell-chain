@@ -26,7 +26,7 @@ const aaWork = process.argv.includes('--aa-work');
 const aaRevert = process.argv.includes('--aa-revert');
 const referenceValidator = process.argv.includes('--reference-validator');
 const sessionWork = process.argv.includes('--session-work');
-assert.ok(!sessionWork || (aaWork && !referenceValidator && !aaRevert), '--session-work requires --aa-work without reference policy or late-revert mode');
+assert.ok(!sessionWork || (aaWork && !referenceValidator), '--session-work requires --aa-work without reference policy');
 assert.ok(!referenceValidator || aaWork, '--reference-validator requires --aa-work');
 assert.ok(!aaRevert || aaWork, '--aa-revert requires --aa-work');
 const receivedValue = aaWork ? (aaRevert ? 0n : 3n) : 1n;
@@ -70,6 +70,8 @@ for (let i = 0; i < 3; i++) {
   keys.push({ path, address: key.address, publicKey: '0x' + key.public_key });
 }
 const genesis = { chain_id: 1337, chain_name: 'offline-network-acceptance', network_type: 'Dev', timestamp: Math.floor(Date.now() / 1000), gas_limit: 50000000, extra_data: 'offline-network-acceptance', alloc: Object.fromEntries(keys.map(key => [key.address, { balance: initial, nonce: 0, code: null, storage: null }])), boot_nodes: [], consensus: { engine: 'wpoa', authorities: keys.map(key => key.address), authority_pubkeys: keys.map(key => key.publicKey), weights: [1, 1, 3], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 10 }, offline_enforcement: { activation_height: 1, epoch_length: 10, block_time_secs: 2, heartbeat_interval_secs: 600 } };
+// Exercise the native AccountManager error path only in this new isolated mode.
+if (sessionWork && aaRevert) genesis.aa_account_manager_height = 0;
 for (const i of [0, 1, 2]) {
   await mkdir(join(directory, `node-${i}`));
   await writeFile(join(directory, `node-${i}`, 'genesis.json'), JSON.stringify(genesis));
@@ -128,7 +130,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
 async function start(i, phase, bootnode) {
   const authority = [0, 2, 1][i];
   const log = join(directory, `${phase}-${i}.log`);
-  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
+  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator || (sessionWork && aaRevert) ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
   if (bootnode) args.push('--bootnode', bootnode);
   const fd = openSync(log, 'wx', 0o600);
   const child = spawn(binary, args, { stdio: ['ignore', fd, fd] });
@@ -196,13 +198,15 @@ async function sendSessionWork(i, root, provider, nonce, to, gasPrice) {
     rootKey: await rpc(i, 'shell_getPqPubkey', [root.getAddress()]),
   });
   const options = { chainId: 1337, nonce,
-    innerCalls: [sdk.buildInnerTransfer(to, 1n), sdk.buildInnerTransfer(to, 2n)],
+    innerCalls: [sdk.buildInnerTransfer(to, 1n), aaRevert ? sdk.buildInnerCall(sdk.accountManagerAddress, '0xffffffff', 100000) : sdk.buildInnerTransfer(to, 2n)],
     gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0 };
-  async function signed({ valueCap = 3n, target = to, expiryBlock = 2,
+  const valueCap = aaRevert ? 1n : 3n;
+  const target = aaRevert ? null : to;
+  async function signed({ valueCap: cap = valueCap, target: allowedTarget = target, expiryBlock = 2,
     authorizer = root, sessionSigner = session } = {}) {
     const draft = sdk.buildBatchTransaction(options);
     const auth = await sdk.createSessionAuth(authorizer, session.getPublicKey(), 1,
-      { chainId: 1337n, expiryBlock, valueCap, target });
+      { chainId: 1337n, expiryBlock, valueCap: cap, target: allowedTarget });
     draft.aa_bundle.session_auth = auth;
     const hash = sdk.hashBatchTransaction(draft.tx, draft.aa_bundle, 'MlDsa65');
     const final = await sdk.finalizeSessionAuth(auth, sessionSigner, hash);
@@ -212,11 +216,11 @@ async function sendSessionWork(i, root, provider, nonce, to, gasPrice) {
       senderPubkey: root.getPublicKey(), aaBundle: batch.aa_bundle });
   }
   result.session = { root: root.getAddress(), publicKey: '0x' + Buffer.from(session.getPublicKey()).toString('hex'),
-    target: to, valueCap: '3', exclusiveExpiry: 2, rejectionControls: [] };
+    target, valueCap: valueCap.toString(), exclusiveExpiry: 2, beforeWork: await before(), rejectionControls: [] };
   try {
     for (const [label, constraints, expected] of [
-      ['value cap', { valueCap: 2n }, /session.*value cap/i],
-      ['target', { target: keys[0].address }, /session.*target mismatch/i],
+      ['value cap', { valueCap: valueCap - 1n }, /session.*value cap/i],
+      ['target', { target: aaRevert ? to : keys[0].address }, /session.*target mismatch/i],
       ['exclusive expiry', { expiryBlock: 1 }, /session.*expired/i],
       ['root identity', { authorizer: other }, /session.*root authorization signature invalid/i],
       ['session identity', { sessionSigner: other }, /session.*tx signature invalid/i],
@@ -234,7 +238,7 @@ async function sendSessionWork(i, root, provider, nonce, to, gasPrice) {
     const packet = await signed();
     const hash = await provider.sendTransaction(packet);
     result.transaction = { hash, submittedAt: new Date().toISOString(),
-      entry: 'SDK genuine root/session authorization and V2 session batch', nonce, innerValues: ['1', '2'] };
+      entry: 'SDK genuine root/session authorization and V2 session batch', nonce, innerValues: aaRevert ? ['1', '0'] : ['1', '2'] };
     return hash;
   } finally { session.dispose(); other.dispose(); }
 }
@@ -533,6 +537,14 @@ try {
     return receipts[0];
   });
   const height = Number(BigInt(receipt.blockNumber));
+  if (sessionWork && aaRevert) {
+    const traces = await Promise.all([0, 1].map(i => rpc(i, 'debug_traceTransaction', [hash])));
+    assert.deepEqual(traces[1], traces[0], 'independent native failure replay');
+    assert.equal(traces[0].failed, true);
+    assert.match(Buffer.from(traces[0].output.slice(2), 'hex').toString(), /unknown function selector/i);
+    result.session.nativeFailureTrace = traces[0];
+    result.session.accountManagerActivationHeight = 0;
+  }
   if (aaRevert) assert.ok(BigInt(receipt.gasUsed) > 0n, 'reverting outer transaction still consumes gas');
   if (aaWork) for (const i of [0, 1]) {
     assert.equal((await rpc(i, 'eth_getTransactionByHash', [hash])).type, '0x7e');
@@ -581,6 +593,7 @@ try {
     assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
     if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), BigInt(senderStartNonce + 1));
     if (sessionWork) assert.equal(await rpc(i, 'shell_getPqPubkey', [keys[2].address]), keys[2].publicKey, 'session does not replace persisted root key');
+    if (sessionWork && aaRevert) assert.deepEqual(await rpc(i, 'debug_traceTransaction', [hash]), result.session.nativeFailureTrace, 'native failed session history after reopen');
     assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }
   result.phases.push({ phase: full ? 'all three physical processes restarted' : 'both physical processes restarted', height, offline: [1, 0, 0, 0] });
