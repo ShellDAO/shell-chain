@@ -391,6 +391,10 @@ cargo build --locked -p shell-cli --features libp2p
 node tests/e2e/native-offline-network.mjs
 node tests/e2e/native-offline-network.mjs --algorithm=slhdsa
 node tests/e2e/native-offline-network.mjs --interrupt-work
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --aa-revert
 node tests/e2e/native-offline-network.mjs --full
 ```
 
@@ -410,6 +414,19 @@ vote and the original signed transfer. An offline snapshot export verifies that
 the vote exists without a quorum certificate. After reopening, C alone still
 cannot advance; reconnecting A1 must confirm that original transfer without
 resubmission, followed by the usual receipt, funds, history and restart checks.
+The short `--aa-work` variant uses the matching V2 source SDK's batch builder,
+signer and provider to submit two inner transfers of 1 and 2 base units. Both must
+survive the crash as the original type `0x7E` bundle, credit the recipient by
+3, and consume one sender nonce. It also checks that a partial vote executes
+neither call. Use a compatible built source SDK (`0.14.0-rc.3` tested);
+the npm `0.13.0` V1 signing path is incompatible with the current V2 node source.
+This case covers built-in account validation; custom policies, session keys and
+paymasters remain separate combinations.
+With `--aa-revert`, a deliberately invalid AccountManager call follows the first
+transfer. Recovery must preserve the original reverting bundle: its receipt has
+status `0x0` and consumes gas and one outer nonce, the recipient gains nothing,
+and the independently certified miss remains committed. Both peers must retain
+that failed receipt and the same account state after reopening their stores.
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and
