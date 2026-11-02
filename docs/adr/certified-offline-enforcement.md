@@ -395,6 +395,8 @@ SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work
 SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
 node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --aa-revert
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+node tests/e2e/native-offline-network.mjs --interrupt-work --aa-work --reference-validator
 node tests/e2e/native-offline-network.mjs --full
 ```
 
@@ -427,6 +429,22 @@ transfer. Recovery must preserve the original reverting bundle: its receipt has
 status `0x0` and consumes gas and one outer nonce, the recipient gains nothing,
 and the independently certified miss remains committed. Both peers must retain
 that failed receipt and the same account state after reopening their stores.
+The `--reference-validator` ML-DSA variant deploys the actual key-bound
+`DefaultPQValidator` creation bytecode and installs its deployed code hash through
+a signed AccountManager call. Three online validators first confirm deployment,
+installation and three owner transfers, including stored-public-key-reference
+and embedded-key authorization. An unrelated real signer must be rejected
+without changing account state. Only then does the minority-vote crash begin,
+from that finalized five-block prefix: the original AA bundle must consume
+exactly one additional nonce and credit the recipient by 3 (or zero with
+`--aa-revert`), while both peers retain the same original hash, receipt, state
+root and historical results after reopening. The five-block prefix spans one full weight cycle (1 + 1 + 3), keeping the
+next assigned proposer the deliberately absent validator; it changes neither
+the timeout nor the fixed 100-miss threshold. This mode requires the updated
+reference creation artifact and compatible V2 source SDK; it does not migrate
+installed old policies or imply public release availability. The reference
+ML-DSA-family policy is not an SLH-DSA policy.
+
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and

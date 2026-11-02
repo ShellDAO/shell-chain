@@ -6,6 +6,7 @@
 // Add --interrupt-work to crash/reopen a voter before quorum and recover its original work.
 // Add --aa-work with --interrupt-work and SHELL_SDK_ENTRY for a two-call AA batch.
 // Add --aa-revert to check rollback when its second inner call reverts.
+// Add --reference-validator to deploy/install the key-bound ML-DSA reference policy first.
 // Add --full for 100 real misses, epoch suspension and authenticated recovery.
 // The full run takes about 30–60 minutes; no threshold or clock is shortened.
 import assert from 'node:assert/strict';
@@ -22,6 +23,8 @@ const full = process.argv.includes('--full');
 const interruptWork = process.argv.includes('--interrupt-work');
 const aaWork = process.argv.includes('--aa-work');
 const aaRevert = process.argv.includes('--aa-revert');
+const referenceValidator = process.argv.includes('--reference-validator');
+assert.ok(!referenceValidator || aaWork, '--reference-validator requires --aa-work');
 assert.ok(!aaRevert || aaWork, '--aa-revert requires --aa-work');
 const receivedValue = aaWork ? (aaRevert ? 0n : 3n) : 1n;
 assert.ok(!aaWork || (interruptWork && !full), '--aa-work requires the short --interrupt-work mode');
@@ -29,8 +32,9 @@ assert.ok(!aaWork || process.env.SHELL_SDK_ENTRY, 'Set SHELL_SDK_ENTRY to a comp
 const algorithms = process.argv.slice(2).filter(arg => arg.startsWith('--algorithm='));
 assert.ok(algorithms.length <= 1, 'Select one algorithm');
 const algorithm = algorithms[0]?.slice('--algorithm='.length) ?? 'mldsa65';
+assert.ok(!referenceValidator || algorithm === 'mldsa65', 'The reference policy supports the ML-DSA family; select mldsa65');
 assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --algorithm=mldsa65|slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --algorithm=mldsa65|slhdsa');
 const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
@@ -39,6 +43,9 @@ const pause = ms => new Promise(done => setTimeout(done, ms));
 result.algorithm = algorithm;
 result.aaWork = aaWork;
 result.aaRevert = aaRevert;
+result.referenceValidator = referenceValidator;
+const initial = '0xd3c21bcecceda1000000';
+let workBaseHeight = 0, senderStartNonce = 0, recipientStartBalance = BigInt(initial);
 result.toolchain = { node: process.version, platform: process.platform, arch: process.arch };
 const sdkEntry = aaWork ? pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)) : undefined;
 const sdk = sdkEntry ? await import(sdkEntry.href) : undefined;
@@ -57,7 +64,6 @@ for (let i = 0; i < 3; i++) {
   assert.equal(key.key_type, algorithm === 'slhdsa' ? 'sphincs-sha2-256f' : algorithm);
   keys.push({ path, address: key.address, publicKey: '0x' + key.public_key });
 }
-const initial = '0xd3c21bcecceda1000000';
 const genesis = { chain_id: 1337, chain_name: 'offline-network-acceptance', network_type: 'Dev', timestamp: Math.floor(Date.now() / 1000), gas_limit: 50000000, extra_data: 'offline-network-acceptance', alloc: Object.fromEntries(keys.map(key => [key.address, { balance: initial, nonce: 0, code: null, storage: null }])), boot_nodes: [], consensus: { engine: 'wpoa', authorities: keys.map(key => key.address), authority_pubkeys: keys.map(key => key.publicKey), weights: [1, 1, 3], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 10 }, offline_enforcement: { activation_height: 1, epoch_length: 10, block_time_secs: 2, heartbeat_interval_secs: 600 } };
 for (const i of [0, 1, 2]) {
   await mkdir(join(directory, `node-${i}`));
@@ -115,7 +121,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
 async function start(i, phase, bootnode) {
   const authority = [0, 2, 1][i];
   const log = join(directory, `${phase}-${i}.log`);
-  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
+  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
   if (bootnode) args.push('--bootnode', bootnode);
   const fd = openSync(log, 'wx', 0o600);
   const child = spawn(binary, args, { stdio: ['ignore', fd, fd] });
@@ -311,6 +317,89 @@ async function fullLifecycle() {
   result.phases.push({ phase: 'returning B proposes after epoch recovery', recoveryBoundary, proposedHeight: last.height, hash: last.hash });
   await save();
 }
+async function referencePrefix() {
+  const bootnode = await start(0, 'reference-prefix');
+  await start(1, 'reference-prefix', bootnode);
+  await start(2, 'reference-prefix', bootnode);
+  await until('all prefix peers connected', async () =>
+    (await Promise.all([0, 1, 2].map(i => rpc(i, 'net_peerCount')))).every(n => BigInt(n) >= 1n));
+  const signer = await sdk.decryptKeystore(JSON.parse(await readFile(keys[2].path, 'utf8')),
+    (await readFile(password, 'utf8')).trim());
+  const provider = sdk.createShellProvider({ rpcHttpUrl: urls[1] });
+  const { createRequire } = await import('node:module');
+  const sdkRequire = createRequire(sdkEntry);
+  const { blake3 } = await import(pathToFileURL(sdkRequire.resolve('@noble/hashes/blake3')).href);
+  const { keccak_256 } = await import(pathToFileURL(sdkRequire.resolve('@noble/hashes/sha3')).href);
+  const hex = bytes => Buffer.from(bytes).toString('hex');
+  const snapshot = async () => ({
+    nonce: await rpc(1, 'eth_getTransactionCount', [keys[2].address, 'latest']),
+    owner: await rpc(1, 'eth_getBalance', [keys[2].address, 'latest']),
+    recipient: await rpc(1, 'eth_getBalance', [keys[1].address, 'latest']),
+    publicKey: await rpc(1, 'shell_getPqPubkey', [keys[2].address]),
+  });
+  async function direct(label, nonce, to, data, value = 0n, includePublicKey = true) {
+    const tx = sdk.buildTransaction({ chainId: 1337, nonce, to, data, value, gasLimit: 3000000 });
+    const hash = await provider.sendTransaction(await signer.buildSignedTransaction({ tx, includePublicKey }));
+    const receipt = await until(label, async () => {
+      const receipts = await Promise.all([0, 1, 2].map(i => rpc(i, 'eth_getTransactionReceipt', [hash])));
+      if (!receipts.every(Boolean)) return false;
+      for (const other of receipts.slice(1)) assert.deepEqual(other, receipts[0]);
+      assert.equal(receipts[0].status, '0x1', label);
+      return receipts[0];
+    });
+    result.referencePrefix.transactions.push({ label, hash, receipt });
+    await save();
+    return receipt;
+  }
+  result.referencePrefix = { transactions: [] };
+  try {
+    const creation = (await readFile(new URL('../../contracts/DefaultPQValidator.bin', import.meta.url), 'utf8')).trim();
+    const deployed = await direct('deploy real key-bound reference policy', 0, null,
+      '0x' + creation + hex(blake3(signer.getPublicKey())));
+    const code = await rpc(1, 'eth_getCode', [deployed.contractAddress, 'latest']);
+    assert.ok(code.length > 2);
+    const policyHash = '0x' + hex(keccak_256(Buffer.from(code.slice(2), 'hex')));
+    await direct('install deployed reference policy', 1, sdk.accountManagerAddress,
+      sdk.encodeSetValidationCodeCalldata(policyHash));
+    await direct('real reference owner success', 2, keys[1].address, '0x', 11n);
+    // A full weight cycle (1+1+3), not the three-member count, keeps the next
+    // weighted slot assigned to absent B. Use real owner-authorized transfers.
+    const recipientBefore = BigInt(await rpc(1, 'eth_getBalance', [keys[1].address, 'latest']));
+    await direct('registered-key-reference policy control', 3, keys[1].address, '0x', 1n, false);
+    await direct('embedded-key policy control', 4, keys[1].address, '0x', 2n);
+    assert.equal(BigInt(await rpc(1, 'eth_getBalance', [keys[1].address, 'latest'])) - recipientBefore, 3n);
+
+    const before = await snapshot();
+    const attacker = new sdk.ShellSigner('MlDsa65', sdk.MlDsa65Adapter.generate(), keys[2].address);
+    let error;
+    try {
+      const tx = sdk.buildTransaction({ chainId: 1337, nonce: 5, to: keys[1].address,
+        value: 7n, data: '0x', gasLimit: 3000000 });
+      try { await provider.sendTransaction(await attacker.buildSignedTransaction({ tx, includePublicKey: true })); }
+      catch (e) { error = String(e); }
+    } finally { attacker.dispose(); }
+    assert.match(error ?? '', /validation contract rejected/i);
+    assert.deepEqual(await snapshot(), before, 'unrelated true signer changes no account state');
+    workBaseHeight = Number(BigInt(await rpc(1, 'eth_blockNumber')));
+    assert.equal(workBaseHeight, 5, 'one full weighted cycle; five actual signed prefix transactions');
+    senderStartNonce = Number(BigInt(before.nonce));
+    assert.equal(senderStartNonce, 5);
+    recipientStartBalance = BigInt(before.recipient);
+    const raw = Buffer.concat([Buffer.from('shell:offline-state:v1:validator:'), Buffer.from(keys[1].address.slice(2), 'hex')]);
+    validatorSlot = await rpc(1, 'web3_sha3', ['0x' + raw.toString('hex')]);
+    const tip = await rpc(1, 'eth_getBlockByNumber', ['latest', false]);
+    for (const i of [0, 1, 2]) {
+      await until('prefix finalized on every peer', async () =>
+        Number(BigInt((await rpc(i, 'eth_getBlockByNumber', ['finalized', false])).number)) === workBaseHeight);
+      assert.equal((await rpc(i, 'eth_getBlockByNumber', ['latest', false])).hash, tip.hash);
+      assert.deepEqual(await offline(i), [0, 0, 0, 0]);
+    }
+    Object.assign(result.referencePrefix, { contract: deployed.contractAddress, code, policyHash,
+      wrongKeyError: error, beforeWork: before, baseHeight: workBaseHeight, baseHash: tip.hash,
+      nextWorkNonce: senderStartNonce, recipientStartBalance: before.recipient });
+    await save();
+  } finally { signer.dispose(); await stop(); }
+}
 async function exportPending(label) {
   const output = join(directory, `${label}.jsonl`);
   const argv = ['--datadir', join(directory, 'node-2'), 'export-state', '--output', output];
@@ -325,7 +414,7 @@ async function exportPending(label) {
   assert.equal(certificates.length, 0, 'C3 alone cannot certify the total weight5');
   assert.equal(votes[0].vote.validator, keys[2].address);
   assert.equal(votes[0].vote.context.proposer, keys[1].address);
-  assert.equal(votes[0].vote.context.block_number, 1);
+  assert.equal(votes[0].vote.context.block_number, workBaseHeight + 1);
   assert.equal(votes[0].vote.context.view, 0);
   result.pendingVote = votes[0];
   await save();
@@ -334,11 +423,11 @@ async function inflightStart() {
   await start(1, 'pending-before-crash');
   const raw = Buffer.concat([Buffer.from('shell:offline-state:v1:validator:'), Buffer.from(keys[1].address.slice(2), 'hex')]);
   validatorSlot = await rpc(1, 'web3_sha3', ['0x' + raw.toString('hex')]);
-  result.pendingTransferHash = await send(1, 0);
+  result.pendingTransferHash = await send(1, senderStartNonce);
   await save();
   for (let n = 0; n < 20; n++) {
-    assert.equal(await rpc(1, 'eth_blockNumber'), '0x0', 'minority cannot produce a certified miss');
-    if (aaWork) assert.equal(BigInt(await rpc(1, 'eth_getBalance', [keys[1].address, 'latest'])), BigInt(initial), 'partial vote cannot execute either inner call');
+    assert.equal(Number(BigInt(await rpc(1, 'eth_blockNumber'))), workBaseHeight, 'minority cannot produce a certified miss');
+    if (aaWork) assert.equal(BigInt(await rpc(1, 'eth_getBalance', [keys[1].address, 'latest'])), recipientStartBalance, 'partial vote cannot execute either inner call');
     assert.deepEqual(await offline(1), [0, 0, 0, 0]);
     await pause(1000);
   }
@@ -353,7 +442,7 @@ async function inflightStart() {
   const bootnode = await start(1, 'pending-reopened');
   assert.equal(await rpc(1, 'eth_getTransactionByHash', [result.pendingTransferHash]), null, 'volatile mempool is gone, original work is only in durable witness');
   for (let n = 0; n < 12; n++) {
-    assert.equal(await rpc(1, 'eth_blockNumber'), '0x0');
+    assert.equal(Number(BigInt(await rpc(1, 'eth_blockNumber'))), workBaseHeight);
     assert.deepEqual(await offline(1), [0, 0, 0, 0]);
     await pause(1000);
   }
@@ -363,6 +452,7 @@ async function inflightStart() {
   await save();
 }
 try {
+  if (referenceValidator) await referencePrefix();
   if (interruptWork) await inflightStart();
   else await connect('initial');
   // Standard hashing RPC only derives the published native storage key; the
@@ -385,10 +475,10 @@ try {
   if (aaRevert) assert.ok(BigInt(receipt.gasUsed) > 0n, 'reverting outer transaction still consumes gas');
   if (aaWork) for (const i of [0, 1]) {
     assert.equal((await rpc(i, 'eth_getTransactionByHash', [hash])).type, '0x7e');
-    assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, receipt.blockNumber])), 1n, 'one nonce for two inner calls');
+    assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, receipt.blockNumber])), BigInt(senderStartNonce + 1), 'one nonce for two inner calls');
   }
   let evidenceCount = 0;
-  for (let number = 1; number <= height; number++) {
+  for (let number = workBaseHeight + 1; number <= height; number++) {
     const blocks = await Promise.all([0, 1].map(i => rpc(i, 'eth_getBlockByNumber', ['0x' + number.toString(16), true])));
     assert.equal(blocks[1].hash, blocks[0].hash);
     assert.equal(blocks[1].stateRoot, blocks[0].stateRoot);
@@ -402,7 +492,7 @@ try {
   const before = await Promise.all([0, 1].map(i => offline(i, tag)));
   assert.deepEqual(before, [[1, 0, 0, 0], [1, 0, 0, 0]], 'only the absent assigned validator acquires one miss');
   for (const i of [0, 1]) {
-    assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), BigInt(initial) + receivedValue);
+    assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
     await until('finality', async () => Number(BigInt((await rpc(i, 'eth_getBlockByNumber', ['finalized', false])).number)) >= height);
   }
   result.receipt = receipt;
@@ -428,8 +518,8 @@ try {
     assert.equal(block.stateRoot, original.stateRoot);
     assert.deepEqual(await offline(i, tag), [1, 0, 0, 0]);
     assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
-    if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), 1n);
-    assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), BigInt(initial) + receivedValue);
+    if (aaWork) assert.equal(BigInt(await rpc(i, 'eth_getTransactionCount', [keys[2].address, tag])), BigInt(senderStartNonce + 1));
+    assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }
   result.phases.push({ phase: full ? 'all three physical processes restarted' : 'both physical processes restarted', height, offline: [1, 0, 0, 0] });
   result.exitCode = 0;
