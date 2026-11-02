@@ -497,6 +497,18 @@ reward without a committed value debit. This combination enables native
 AccountManager dispatch only in its fresh isolated genesis and verifies the
 same native failure trace and sponsorship metadata on both peers after reopening.
 
+The `--contract-paymaster-work` variant deploys and funds an actual conditional
+paymaster with five signed prefix transactions, completing one weighted cycle.
+Its read-only policy accepts only the retained ABI sender address, a matching
+32-byte context and a bounded maximum fee. Different genuine senders, changed
+or short context and excess maximum cost must reject without state changes.
+The original two-transfer packet then survives vote-only crash recovery,
+weighted quorum, independent import and both-store reopening. The contract
+pays the receipt-derived fee without consuming its nonce; code and sponsorship
+metadata must persist. Use this option with `--interrupt-work --aa-work` and
+a compatible source SDK. Its retained `address` ABI maps the last 20 bytes;
+this case does not establish a full 32-byte policy identity boundary.
+
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and
