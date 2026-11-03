@@ -30,7 +30,7 @@ const sessionWork = process.argv.includes('--session-work');
 const paymasterWork = process.argv.includes('--paymaster-work');
 const contractPaymasterWork = process.argv.includes('--contract-paymaster-work');
 const contractPaymasterHistory = process.argv.includes('--contract-paymaster-history');
-assert.ok(!contractPaymasterHistory || (contractPaymasterWork && !aaRevert), '--contract-paymaster-history requires successful --contract-paymaster-work');
+assert.ok(!contractPaymasterHistory || contractPaymasterWork, '--contract-paymaster-history requires --contract-paymaster-work');
 assert.ok(!contractPaymasterWork || (aaWork && !paymasterWork && !sessionWork && !referenceValidator), '--contract-paymaster-work requires --aa-work without other policy options');
 assert.ok(!paymasterWork || (aaWork && !referenceValidator && !sessionWork), '--paymaster-work requires --aa-work without session/reference policy');
 assert.ok(!sessionWork || (aaWork && !referenceValidator), '--session-work requires --aa-work without reference policy');
@@ -640,7 +640,8 @@ async function checkContractPaymasterHistory(receipt, hash) {
     }
     assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
     const trace = await rpc(i, 'debug_traceTransaction', [hash]);
-    assert.equal(trace.failed, false);
+    assert.equal(trace.failed, aaRevert);
+    if (aaRevert) assert.match(Buffer.from(trace.output.slice(2), 'hex').toString(), /unknown function selector/i);
     assert.deepEqual(trace, result.contractHistory.originalTrace, 'old transaction replays against enabled parent state');
     await checkSponsoredState(i, receipt, hash);
     assert.deepEqual(await contractHistorySnapshot(i), before, 'history does not write latest accounts, policy or head');
@@ -651,7 +652,8 @@ async function checkContractPaymasterHistory(receipt, hash) {
 async function disableContractPaymaster(receipt, hash) {
   const traces = await Promise.all([0, 1].map(i => rpc(i, 'debug_traceTransaction', [hash])));
   assert.deepEqual(traces[1], traces[0]);
-  assert.equal(traces[0].failed, false);
+  assert.equal(traces[0].failed, aaRevert);
+  if (aaRevert) assert.match(Buffer.from(traces[0].output.slice(2), 'hex').toString(), /unknown function selector/i);
   result.contractHistory = { originalTrace: traces[0] };
   const signer = await sdk.decryptKeystore(JSON.parse(await readFile(keys[2].path, 'utf8')),
     (await readFile(password, 'utf8')).trim());

@@ -522,7 +522,11 @@ it, and a fresh otherwise authorized batch must reject without state changes.
 Historical storage, code, receipt, fees and trace must still reflect the old
 enabled policy. Queries must preserve the latest disabled state, balances,
 nonces and head, including after both stores reopen. The owner mutator uses
-the retained caller mapping and is a test fixture, not a production paymaster.
+the retained caller mapping and is a test fixture, not a production paymaster. Combine
+this history option with `--aa-revert` to replay an original native failure
+after the latest policy has been disabled. Its failed trace and inner rollback
+must remain correct alongside the committed outer nonce and contract-paid fee;
+historical queries must preserve the latest disabled state after reopening.
 
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
