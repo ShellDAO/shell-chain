@@ -89,6 +89,25 @@ All metrics are prefixed `shell_`.
 | `shell_last_finalized_number` | Gauge | — | Latest finalized block number |
 | `shell_finality_lag_blocks` | Gauge | — | Difference between canonical head and latest finalized block |
 
+
+### Live validator roster gauges (unreleased)
+
+The unreleased node collects `shell_validator_active_count` and
+`shell_validator_weight{validator}` from its live consensus committee on each
+scrape. The count includes validators with positive effective proposer weight;
+weight labels describe the current committee, including a zero effective weight
+when applicable. Removed members no longer retain stale labels. A pending
+registry proposal does not change these signals before the committee reloads.
+After restart the signals reflect the committee restored from canonical state.
+
+Public v0.27.13 leaves the active count at zero and does not populate the weight
+series. These live roster signals require a release containing the roster
+metrics integration. Build that node and run
+`python3 tests/e2e/consensus-roster-metrics.py` for real local governance,
+producer/follower and restart acceptance. This version note applies to these
+two signals; epoch and other consensus telemetry require their own verification.
+
+
 ### STARK prover (K4)
 
 | Metric | Type | Description |

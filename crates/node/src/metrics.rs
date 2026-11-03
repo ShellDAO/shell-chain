@@ -140,6 +140,7 @@ pub struct Metrics {
     /// Record via [`Metrics::record_rpc_call`].
     pub rpc_request_duration_seconds: HistogramVec,
     registry: Registry,
+    consensus: Option<Arc<parking_lot::RwLock<dyn shell_consensus::ConsensusEngine>>>,
     tx_pool: Option<Arc<shell_mempool::TxPool>>,
     proof_backlog: Option<Arc<parking_lot::Mutex<shell_stark_prover::ProofBacklog>>>,
     collection_lock: parking_lot::Mutex<()>,
@@ -375,6 +376,7 @@ impl Metrics {
             storage_cf_size,
             rpc_request_duration_seconds,
             registry,
+            consensus: None,
             tx_pool: None,
             proof_backlog: None,
             collection_lock: parking_lot::Mutex::new(()),
@@ -396,6 +398,15 @@ impl Metrics {
         self
     }
 
+    /// Bind roster gauges to the same effective committee used for consensus.
+    pub(crate) fn with_consensus(
+        mut self,
+        consensus: Arc<parking_lot::RwLock<dyn shell_consensus::ConsensusEngine>>,
+    ) -> Self {
+        self.consensus = Some(consensus);
+        self
+    }
+
     /// Encode all collected metrics into Prometheus text exposition format.
     pub fn gather(&self) -> String {
         // Serialize refresh and encoding so concurrent scrapes cannot double-count
@@ -409,6 +420,18 @@ impl Metrics {
         }
         if let Some(backlog) = &self.proof_backlog {
             self.stark_backlog_depth.set(backlog.lock().len() as i64);
+        }
+        if let Some(consensus) = &self.consensus {
+            // Snapshot the engine rather than pending registry writes or genesis
+            // configuration. Serialization also bounds label retention to the
+            // current committee and keeps concurrent scrapes coherent.
+            let weights = consensus.read().validator_weights();
+            self.validator_active_count
+                .set(weights.values().filter(|weight| **weight > 0).count() as i64);
+            self.validator_weight.reset();
+            for (validator, weight) in weights {
+                self.set_validator_weight(&validator.to_string(), weight as f64);
+            }
         }
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
@@ -1045,5 +1068,50 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["ready"], false);
+    }
+    #[test]
+    fn live_roster_metrics_track_both_consensus_engines_and_remove_stale_labels() {
+        use shell_consensus::{ConsensusEngine, PoaConfig, PoaEngine, WPoaConfig, WPoaEngine};
+        use shell_crypto::MultiVerifier;
+        use shell_primitives::Address;
+        let a = Address::from([1u8; 32]);
+        let b = Address::from([2u8; 32]);
+        let mut config = PoaConfig::new(vec![a, b], 1).with_weights(vec![3, 1]);
+        config.slash_weight_bps = 10_000;
+        let engines: Vec<Arc<parking_lot::RwLock<dyn ConsensusEngine>>> = vec![
+            Arc::new(parking_lot::RwLock::new(PoaEngine::new(config.clone()))),
+            Arc::new(parking_lot::RwLock::new(WPoaEngine::new(
+                WPoaConfig::with_weights(config, vec![3, 1]),
+                Arc::new(MultiVerifier),
+            ))),
+        ];
+        for engine in engines {
+            let metrics = Arc::new(Metrics::new().unwrap().with_consensus(Arc::clone(&engine)));
+            let text = metrics.gather();
+            assert!(text.contains("shell_validator_active_count 2"));
+            assert!(text.contains(&format!("shell_validator_weight{{validator=\"{a}\"}} 3")));
+            assert!(text.contains(&format!("shell_validator_weight{{validator=\"{b}\"}} 1")));
+            engine
+                .write()
+                .set_authorities_with_weights(vec![a], vec![5]);
+            // PoA uses config weights; wPoA additionally owns its weighted set.
+            engine.write().poa_config_mut().authority_weights = vec![5];
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let metrics = Arc::clone(&metrics);
+                    std::thread::spawn(move || metrics.gather())
+                })
+                .collect();
+            for worker in workers {
+                let text = worker.join().unwrap();
+                assert!(text.contains("shell_validator_active_count 1"));
+                assert!(text.contains(&format!("shell_validator_weight{{validator=\"{a}\"}} 5")));
+                assert!(!text.contains(&b.to_string()));
+            }
+            engine.write().slash_authority(&a);
+            let text = metrics.gather();
+            assert!(text.contains("shell_validator_active_count 0"));
+            assert!(text.contains(&format!("shell_validator_weight{{validator=\"{a}\"}} 0")));
+        }
     }
 }

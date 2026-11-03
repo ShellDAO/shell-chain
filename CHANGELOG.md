@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Collect validator count and effective-weight metrics from the live consensus
+  committee, update them after canonical changes/restart, and remove stale labels.
+
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

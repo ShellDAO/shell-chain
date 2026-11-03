@@ -941,6 +941,7 @@ impl<S: KvStore + 'static> Node<S> {
             Metrics::new()
                 .expect("failed to register Prometheus metrics")
                 .with_tx_pool(Arc::clone(&tx_pool))
+                .with_consensus(Arc::clone(&consensus))
                 .with_proof_backlog(Arc::clone(&proof_backlog)),
         );
         let amendment_store = ProofAmendmentStore::new(store.clone());
