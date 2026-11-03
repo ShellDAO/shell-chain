@@ -29,6 +29,8 @@ const referenceValidator = process.argv.includes('--reference-validator');
 const sessionWork = process.argv.includes('--session-work');
 const paymasterWork = process.argv.includes('--paymaster-work');
 const contractPaymasterWork = process.argv.includes('--contract-paymaster-work');
+const contractPaymasterHistory = process.argv.includes('--contract-paymaster-history');
+assert.ok(!contractPaymasterHistory || (contractPaymasterWork && !aaRevert), '--contract-paymaster-history requires successful --contract-paymaster-work');
 assert.ok(!contractPaymasterWork || (aaWork && !paymasterWork && !sessionWork && !referenceValidator), '--contract-paymaster-work requires --aa-work without other policy options');
 assert.ok(!paymasterWork || (aaWork && !referenceValidator && !sessionWork), '--paymaster-work requires --aa-work without session/reference policy');
 assert.ok(!sessionWork || (aaWork && !referenceValidator), '--session-work requires --aa-work without reference policy');
@@ -44,7 +46,7 @@ assert.ok(!(paymasterWork || contractPaymasterWork) || algorithm === 'mldsa65', 
 assert.ok(!sessionWork || algorithm === 'mldsa65', 'This session Work entry tests ML-DSA root and session');
 assert.ok(!referenceValidator || algorithm === 'mldsa65', 'The reference policy supports the ML-DSA family; select mldsa65');
 assert.ok(['mldsa65', 'slhdsa'].includes(algorithm), 'Supported algorithms: mldsa65, slhdsa');
-assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg === '--session-work' || arg === '--paymaster-work' || arg === '--contract-paymaster-work' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --session-work, --paymaster-work, --contract-paymaster-work, --algorithm=mldsa65|slhdsa');
+assert.ok(process.argv.slice(2).every(arg => arg === '--full' || arg === '--interrupt-work' || arg === '--aa-work' || arg === '--aa-revert' || arg === '--reference-validator' || arg === '--session-work' || arg === '--paymaster-work' || arg === '--contract-paymaster-work' || arg === '--contract-paymaster-history' || arg.startsWith('--algorithm=')), 'Supported options: --full, --interrupt-work, --aa-work, --aa-revert, --reference-validator, --session-work, --paymaster-work, --contract-paymaster-work, --contract-paymaster-history, --algorithm=mldsa65|slhdsa');
 const signatureType = algorithm === 'slhdsa' ? 'SphincsSha2256f' : 'MlDsa65';
 const binary = resolve(process.env.NODE_BIN ?? fileURLToPath(new URL('../../target/debug/shell-node', import.meta.url)));
 const directory = await mkdtemp(join(tmpdir(), 'shell-offline-network-'));
@@ -57,6 +59,7 @@ result.referenceValidator = referenceValidator;
 result.sessionWork = sessionWork;
 result.paymasterWork = paymasterWork;
 result.contractPaymasterWork = contractPaymasterWork;
+result.contractPaymasterHistory = contractPaymasterHistory;
 const initial = '0xd3c21bcecceda1000000';
 let workBaseHeight = 0, senderStartNonce = 0, recipientStartBalance = BigInt(initial);
 result.toolchain = { node: process.version, platform: process.platform, arch: process.arch };
@@ -144,7 +147,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
 async function start(i, phase, bootnode) {
   const authority = [0, 2, 1][i];
   const log = join(directory, `${phase}-${i}.log`);
-  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator || ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
+  const args = ['run', '--datadir', join(directory, `node-${authority}`), '--keystore', keys[authority].path, '--password-file', password, '--rpc-addr', `127.0.0.1:${ports[i]}`, '--metrics-addr', '127.0.0.1:0', '--network', 'dev', '--chain-id', '1337', '--consensus-engine', 'wpoa', '--block-time', '2000', '--max-idle-interval', '600', '--node-role', 'validator', '--db', 'rocksdb', '--storage-profile', 'full', '--rpc-api', referenceValidator || contractPaymasterHistory || ((sessionWork || paymasterWork || contractPaymasterWork) && aaRevert) ? 'eth,net,web3,shell,debug' : 'eth,net,web3,shell', '--p2p', '--p2p-addr', '127.0.0.1:0', '--log-level', 'info'];
   if (bootnode) args.push('--bootnode', bootnode);
   const fd = openSync(log, 'wx', 0o600);
   const child = spawn(binary, args, { stdio: ['ignore', fd, fd] });
@@ -549,11 +552,24 @@ async function contractPaymasterPrefix() {
   // maximum cost at68, dynamic context offset at100. The address argument maps
   // the last20 bytes; this fixture makes no full32-byte ABI identity claim.
   // Return senderMatch AND costWithinCap AND contextLength32 AND contextMatch.
-  const code = '6004357f' + keys[2].address.slice(-40).padStart(64, '0') + '14'
+  const policy = '6004357f' + keys[2].address.slice(-40).padStart(64, '0') + '14'
     + '7f' + costCap.toString(16).padStart(64, '0') + '604435111516'
-    + '606435600401803560201490602001357f' + context + '14161660005260206000f3';
+    + '606435600401803560201490602001357f' + context + '141616';
+  let code = policy + '60005260206000f3';
+  if (contractPaymasterHistory) {
+    // Only this history fixture adds an owner-callable disable path and a
+    // storage gate. Normal validation remains a read-only conditional policy.
+    const validation = policy + '6000546001141660005260206000f3';
+    const clear = 8 + validation.length / 2;
+    const allowed = clear + 33;
+    code = '3660041461' + clear.toString(16).padStart(4, '0') + '57' + validation
+      + '5b3373' + keys[2].address.slice(-40) + '1461' + allowed.toString(16).padStart(4, '0')
+      + '5760006000fd5b600060005560006000f3';
+  }
   const size = (code.length / 2).toString(16).padStart(4, '0');
-  const creation = '0x61' + size + '61000f60003961' + size + '6000f3' + code;
+  const creation = contractPaymasterHistory
+    ? '0x600160005561' + size + '61001460003961' + size + '6000f3' + code
+    : '0x61' + size + '61000f60003961' + size + '6000f3' + code;
   result.contractPrefix = { context: '0x' + context, costCap: costCap.toString(), code: '0x' + code, transactions: [] };
   async function direct(label, nonce, to, data, value = 0n) {
     const tx = sdk.buildTransaction({ chainId: 1337, nonce, to, data, value, gasLimit: 3000000 });
@@ -575,6 +591,7 @@ async function contractPaymasterPrefix() {
     for (const i of [0, 1, 2]) {
       assert.equal(await rpc(i, 'eth_getCode', [deployed.contractAddress, 'latest']), '0x' + code);
       assert.equal(BigInt(await rpc(i, 'eth_getBalance', [deployed.contractAddress, 'latest'])), 1000000000000000000000n);
+      if (contractPaymasterHistory) assert.equal(BigInt(await rpc(i, 'eth_getStorageAt', [deployed.contractAddress, '0x0', 'latest'])), 1n);
     }
     // Five genuine transactions, not member count3, complete weights1+1+3.
     for (let nonce = 1; nonce < 5; nonce++) await direct('complete weighted prefix cycle ' + nonce, nonce, keys[2].address, '0x');
@@ -596,6 +613,81 @@ async function contractPaymasterPrefix() {
       nextWorkNonce: senderStartNonce, recipientStartBalance: '0x' + recipientStartBalance.toString(16) });
     await save();
   } finally { signer.dispose(); await stop(); }
+}
+async function contractHistorySnapshot(i) {
+  const state = {};
+  for (const address of [keys[2].address, keys[1].address, result.paymaster.payer]) {
+    state[address] = {
+      nonce: await rpc(i, 'eth_getTransactionCount', [address, 'latest']),
+      pendingNonce: await rpc(i, 'eth_getTransactionCount', [address, 'pending']),
+      balance: await rpc(i, 'eth_getBalance', [address, 'latest']),
+      key: await rpc(i, 'shell_getPqPubkey', [address]),
+      code: await rpc(i, 'eth_getCode', [address, 'latest']),
+    };
+  }
+  const block = await rpc(i, 'eth_getBlockByNumber', ['latest', false]);
+  return { accounts: state, slot: await rpc(i, 'eth_getStorageAt', [result.paymaster.payer, '0x0', 'latest']),
+    head: { number: block.number, hash: block.hash, stateRoot: block.stateRoot } };
+}
+async function checkContractPaymasterHistory(receipt, hash) {
+  for (const i of [0, 1]) {
+    const before = await contractHistorySnapshot(i);
+    assert.deepEqual(before, result.contractHistory.current[i], 'latest disabled policy survives historical reads and reopen');
+    assert.equal(BigInt(before.slot), 0n);
+    for (const tag of ['0x' + workBaseHeight.toString(16), receipt.blockNumber]) {
+      assert.equal(BigInt(await rpc(i, 'eth_getStorageAt', [result.paymaster.payer, '0x0', tag])), 1n, 'old block retains enabled policy');
+      assert.equal(await rpc(i, 'eth_getCode', [result.paymaster.payer, tag]), result.contractPrefix.code);
+    }
+    assert.deepEqual(await rpc(i, 'eth_getTransactionReceipt', [hash]), receipt);
+    const trace = await rpc(i, 'debug_traceTransaction', [hash]);
+    assert.equal(trace.failed, false);
+    assert.deepEqual(trace, result.contractHistory.originalTrace, 'old transaction replays against enabled parent state');
+    await checkSponsoredState(i, receipt, hash);
+    assert.deepEqual(await contractHistorySnapshot(i), before, 'history does not write latest accounts, policy or head');
+  }
+  result.contractHistory.verified = true;
+  await save();
+}
+async function disableContractPaymaster(receipt, hash) {
+  const traces = await Promise.all([0, 1].map(i => rpc(i, 'debug_traceTransaction', [hash])));
+  assert.deepEqual(traces[1], traces[0]);
+  assert.equal(traces[0].failed, false);
+  result.contractHistory = { originalTrace: traces[0] };
+  const signer = await sdk.decryptKeystore(JSON.parse(await readFile(keys[2].path, 'utf8')),
+    (await readFile(password, 'utf8')).trim());
+  const provider = sdk.createShellProvider({ rpcHttpUrl: urls[1] });
+  try {
+    const nonce = senderStartNonce + 1;
+    const tx = sdk.buildTransaction({ chainId: 1337, nonce, to: result.paymaster.payer,
+      data: '0xffffffff', value: 0n, gasLimit: 3000000 });
+    const disableHash = await provider.sendTransaction(await signer.buildSignedTransaction({ tx, includePublicKey: true }));
+    const disableReceipt = await until('signed owner disables contract sponsorship on both peers', async () => {
+      const receipts = await Promise.all([0, 1].map(i => rpc(i, 'eth_getTransactionReceipt', [disableHash])));
+      if (!receipts.every(Boolean)) return false;
+      assert.deepEqual(receipts[1], receipts[0]);
+      assert.equal(receipts[0].status, '0x1');
+      return receipts[0];
+    });
+    assert.ok(BigInt(disableReceipt.blockNumber) > BigInt(receipt.blockNumber));
+    result.contractHistory.disable = { hash: disableHash, receipt: disableReceipt };
+    result.contractHistory.current = await Promise.all([0, 1].map(i => contractHistorySnapshot(i)));
+    assert.deepEqual(result.contractHistory.current[1], result.contractHistory.current[0]);
+    for (const state of result.contractHistory.current) {
+      assert.equal(BigInt(state.slot), 0n);
+      assert.equal(BigInt(state.accounts[keys[2].address].nonce), BigInt(nonce + 1));
+    }
+    const gasPrice = Number(BigInt(await rpc(1, 'eth_gasPrice')));
+    const batch = sdk.buildContractPaymasterTransaction({ chainId: 1337, nonce: nonce + 1,
+      innerCalls: [sdk.buildInnerTransfer(keys[1].address, 1n), sdk.buildInnerTransfer(keys[1].address, 2n)],
+      gasLimit: 300000, maxFeePerGas: gasPrice * 2, maxPriorityFeePerGas: 0,
+      paymaster: result.paymaster.payer, paymasterContext: Buffer.from(result.contractPrefix.context.slice(2), 'hex') });
+    let error;
+    try { await provider.sendTransaction(await signer.buildSignedTransaction({ tx: batch.tx, aaBundle: batch.aa_bundle, includePublicKey: true })); }
+    catch (e) { error = String(e); }
+    assert.match(error ?? '', /contract paymaster rejected/i, 'a fresh authorized packet is rejected by disabled policy');
+    result.contractHistory.disabledRejection = error;
+    await checkContractPaymasterHistory(receipt, hash);
+  } finally { signer.dispose(); }
 }
 async function referencePrefix() {
   const bootnode = await start(0, 'reference-prefix');
@@ -790,6 +882,7 @@ try {
   result.phases.push({ phase: 'TCP certificate and transfer', height, evidenceCount, offline: before });
   await save();
   if (full) await fullLifecycle();
+  if (contractPaymasterHistory) await disableContractPaymaster(receipt, hash);
   await stop();
   await connect('restart');
   if (full) {
@@ -815,6 +908,7 @@ try {
     if (paymasterWork || contractPaymasterWork) await checkSponsoredState(i, receipt, hash);
     assert.equal(BigInt(await rpc(i, 'eth_getBalance', [keys[1].address, tag])), recipientStartBalance + receivedValue);
   }
+  if (contractPaymasterHistory) await checkContractPaymasterHistory(receipt, hash);
   result.phases.push({ phase: full ? 'all three physical processes restarted' : 'both physical processes restarted', height, offline: [1, 0, 0, 0] });
   result.exitCode = 0;
 } catch (error) {

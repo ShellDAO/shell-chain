@@ -515,6 +515,15 @@ The proposer receives its full gas reward without a value debit. The native
 failure trace, unchanged payer nonce/code and sponsorship metadata must agree
 on both peers before and after physical reopening.
 
+Add `--contract-paymaster-history` to the successful contract-payer case to
+exercise historical replay after current policy changes. This isolated policy
+starts with sponsorship enabled in storage. A later signed owner call disables
+it, and a fresh otherwise authorized batch must reject without state changes.
+Historical storage, code, receipt, fees and trace must still reflect the old
+enabled policy. Queries must preserve the latest disabled state, balances,
+nonces and head, including after both stores reopen. The owner mutator uses
+the retained caller mapping and is a test fixture, not a production paymaster.
+
 The local profile uses epoch length 10, nominal blocks of two seconds and a
 600-second heartbeat. SLH-DSA's full lifecycle, mixed signature/account
 combinations, partitions and
