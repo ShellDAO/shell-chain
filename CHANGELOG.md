@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Record actual RPC request counts and handler latency in node metrics, with
+  observed HTTP status, WebSocket upgrade status and bounded method labels.
+  Preserve the original latency histogram and correct observability commands.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

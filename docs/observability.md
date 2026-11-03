@@ -14,8 +14,16 @@ it in `node.toml`:
 ```toml
 [metrics]
 enabled  = true
-listen_addr = "0.0.0.0:9000"   # default
+listen_addr = "0.0.0.0:9000"   # explicit example address
 ```
+
+Load the file with `shell-node run --config node.toml`, or set the address:
+
+```bash
+shell-node run --metrics-addr 0.0.0.0:9000
+```
+
+The CLI default address is `127.0.0.1:9090`.
 
 ### Endpoints
 
@@ -111,8 +119,22 @@ All metrics are prefixed `shell_`.
 |--------|------|--------|-------------|
 | `shell_rpc_request_duration_seconds` | Histogram | `method` | Request latency per JSON-RPC method |
 
-Use `record_rpc_call(method, duration_secs)` on the `Metrics` handle to record
-a completed call. Integration with jsonrpsee middleware is planned for a future release.
+Automatic recording requires a node containing the Unreleased RPC instrumentation
+fix; public node `v0.27.13` does not populate these series. The server records
+completed calls, one sample per dispatched batch element, with actual HTTP response codes
+or the `101` WebSocket upgrade status. JSON-RPC errors can have HTTP status
+`200`. Unknown methods use `__unknown__`, and HTTP exchanges without dispatch
+use `__transport__`, so arbitrary method text cannot expand metric labels.
+
+`shell_rpc_requests_total{method,status}` counts those observations.
+`shell_rpc_duration_seconds{method}` exposes per-call latency; the existing
+`shell_rpc_request_duration_seconds` histogram remains available. Counters reset
+at process startup. `record_rpc_call(method, duration_secs)` remains available
+for manual HTTP-200 observations.
+
+From this source checkout, build `shell-node` and run
+`python3 tests/e2e/rpc-metrics.py` for real calls, errors, batches, notifications,
+authentication, rate limits, read-only state and restart-counter checks.
 
 ### Storage
 
@@ -133,13 +155,13 @@ levelled diagnostics. Control verbosity via the `RUST_LOG` environment variable
 
 ```bash
 # Show info-level logs for all crates
-RUST_LOG=info shell-chain-node
+RUST_LOG=info shell-node run
 
 # Verbose RPC + consensus, info elsewhere
-RUST_LOG=info,shell_rpc=debug,shell_consensus=debug shell-chain-node
+RUST_LOG=info,shell_rpc=debug,shell_consensus=debug shell-node run
 
 # JSON output (for log aggregators)
-RUST_LOG=info SHELL_LOG_FORMAT=json shell-chain-node
+RUST_LOG=info shell-node run --log-format json
 ```
 
 Key spans and log fields:

@@ -122,6 +122,8 @@ pub struct RpcConfig {
     /// When set, every HTTP request must include `Authorization: Bearer <key>`.
     /// `None` disables authentication (open access).
     pub api_key: Option<String>,
+    /// Optional per-call instrumentation; never receives parameters or credentials.
+    pub metrics_observer: Option<crate::metrics::RpcMetricsObserver>,
 }
 
 impl Default for RpcConfig {
@@ -139,6 +141,7 @@ impl Default for RpcConfig {
             max_request_body_size: 5 * 1024 * 1024,
             max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
             api_key: None,
+            metrics_observer: None,
         }
     }
 }
@@ -400,11 +403,12 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     //   2. Optional Bearer API key authentication
     //   3. Optional request rate limit keyed by bearer token/public bucket
     let middleware = tower::ServiceBuilder::new()
+        .layer(crate::metrics::HttpMetricsLayer(
+            config.metrics_observer.clone(),
+        ))
         .layer(cors)
         .layer(ApiKeyLayer::new(config.api_key.clone()))
         .layer(RateLimitLayer::from_config(config.rate_limit_per_sec));
-    let rpc_middleware =
-        RpcServiceBuilder::new().layer(RpcRateLimitLayer::new(config.rate_limit_per_sec));
 
     // Conditionally merge RPC modules based on enabled namespaces.
     let ns = &config.api_namespaces;
@@ -466,6 +470,11 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         }
         module.merge(AdminApiServer::into_rpc(handler))?;
     }
+
+    let methods = Arc::new(module.method_names().map(str::to_owned).collect());
+    let rpc_middleware = RpcServiceBuilder::new()
+        .layer(crate::metrics::RpcMetricsLayer(methods))
+        .layer(RpcRateLimitLayer::new(config.rate_limit_per_sec));
 
     if let Some(ws_listen) = internal_ws {
         // Separate ports: HTTP-only + WS-only.
@@ -574,7 +583,7 @@ mod tests {
     use shell_crypto::DilithiumSigner;
     use shell_mempool::{MempoolConfig, TxPool};
     use shell_primitives::{Address, ShellHash};
-    use shell_storage::{ChainStore, MemoryDb, WorldState};
+    use shell_storage::{ChainStore, KvStore, MemoryDb, WorldState};
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -1104,6 +1113,122 @@ mod tests {
         server.http_handle.stop().unwrap();
         server.http_handle.stopped().await;
         assert_eq!(received, hash);
+    }
+
+    #[tokio::test]
+    async fn rpc_metrics_observe_http_ws_batch_errors_and_bound_labels() {
+        for dedicated_ws in [false, true] {
+            let db = Arc::new(MemoryDb::new());
+            let chain_store = Arc::new(ChainStore::new(db.clone()));
+            let before = chain_store.store().scan_prefix(b"").unwrap();
+            let world_state = Arc::new(parking_lot::RwLock::new(WorldState::new(db)));
+            let tx_pool = Arc::new(TxPool::new(MempoolConfig::default()));
+            let (block_events, _) = tokio::sync::broadcast::channel(16);
+            let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let capture = Arc::clone(&observed);
+            let config = RpcConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ws_addr: dedicated_ws.then(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+                rate_limit_per_sec: None,
+                metrics_observer: Some(crate::RpcMetricsObserver::new(
+                    move |method, status, elapsed| {
+                        capture.lock().push((method.to_owned(), status, elapsed));
+                    },
+                )),
+                ..RpcConfig::default()
+            };
+            let server = start_rpc_server(
+                config,
+                Arc::clone(&chain_store),
+                world_state,
+                Arc::clone(&tx_pool),
+                42,
+                None,
+                block_events,
+                None,
+                None,
+                Arc::new(parking_lot::RwLock::new(0)),
+                Arc::new(parking_lot::RwLock::new(FinalityState::new())),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let http = HttpClientBuilder::default()
+                .build(format!("http://{}", server.http_addr))
+                .unwrap();
+            for _ in 0..3 {
+                let id: String = http.request("eth_chainId", rpc_params![]).await.unwrap();
+                assert_eq!(id, "0x2a");
+            }
+            for index in 0..5 {
+                assert!(http
+                    .request::<String, _>(&format!("untrusted-secret-{index}"), rpc_params![])
+                    .await
+                    .is_err());
+            }
+            assert!(http
+                .request::<String, _>("eth_getBalance", rpc_params![])
+                .await
+                .is_err());
+            let mut batch = BatchRequestBuilder::new();
+            batch.insert("eth_chainId", rpc_params![]).unwrap();
+            batch.insert("eth_chainId", rpc_params![]).unwrap();
+            let response = http.batch_request::<String>(batch).await.unwrap();
+            assert_eq!(response.num_successful_calls(), 2);
+            let ws = WsClientBuilder::default()
+                .build(format!(
+                    "ws://{}",
+                    server.ws_addr.unwrap_or(server.http_addr)
+                ))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let id: String = ws.request("eth_chainId", rpc_params![]).await.unwrap();
+                assert_eq!(id, "0x2a");
+            }
+            let rows = observed.lock().clone();
+            assert_eq!(
+                rows.iter()
+                    .filter(|(m, s, _)| m == "eth_chainId" && *s == 200)
+                    .count(),
+                5
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|(m, s, _)| m == "eth_chainId" && *s == 101)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|(m, s, _)| m == "__unknown__" && *s == 200)
+                    .count(),
+                5
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|(m, s, _)| m == "eth_getBalance" && *s == 200)
+                    .count(),
+                1
+            );
+            assert_eq!(rows.len(), 13);
+            assert!(!format!("{rows:?}").contains("untrusted-secret"));
+            assert_eq!(chain_store.store().scan_prefix(b"").unwrap(), before);
+            assert!(tx_pool.is_empty());
+            drop(ws);
+            server.http_handle.stop().unwrap();
+            server.http_handle.stopped().await;
+            if let Some(ws) = server.ws_handle {
+                ws.stop().unwrap();
+                ws.stopped().await;
+            }
+        }
     }
 
     #[tokio::test]

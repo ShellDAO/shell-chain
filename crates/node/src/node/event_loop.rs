@@ -565,10 +565,17 @@ impl<S: KvStore + 'static> Node<S> {
             "core chain invariants satisfied"
         );
 
+        let rpc_metrics = Arc::clone(&self.metrics);
+        let mut rpc_config = self.config.rpc.clone();
+        rpc_config.metrics_observer = Some(shell_rpc::RpcMetricsObserver::new(
+            move |method, status, elapsed| {
+                rpc_metrics.record_rpc_request(method, status, elapsed.as_secs_f64());
+            },
+        ));
         let rpc_handle = if self.config.rpc_enabled {
             Some(
                 start_rpc_server(
-                    self.config.rpc.clone(),
+                    rpc_config,
                     self.chain_store.clone(),
                     self.world_state.clone(),
                     self.tx_pool.clone(),

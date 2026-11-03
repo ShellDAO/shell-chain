@@ -14,6 +14,8 @@ use prometheus::{
     Opts, Registry, TextEncoder,
 };
 
+const RPC_DURATION_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
 const STORAGE_SIZE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Cached storage size estimates belonging to one node run.
@@ -139,6 +141,10 @@ pub struct Metrics {
     /// Label: `method` — JSON-RPC method name (e.g. `"shell_getBlock"`).
     /// Record via [`Metrics::record_rpc_call`].
     pub rpc_request_duration_seconds: HistogramVec,
+    /// Completed RPC calls, labelled by bounded method and actual transport status.
+    pub rpc_requests_total: CounterVec,
+    /// Published per-method latency name; the original name remains available.
+    pub rpc_duration_seconds: HistogramVec,
     registry: Registry,
     tx_pool: Option<Arc<shell_mempool::TxPool>>,
     proof_backlog: Option<Arc<parking_lot::Mutex<shell_stark_prover::ProofBacklog>>>,
@@ -294,14 +300,27 @@ impl Metrics {
         )?;
 
         // OPS-3: RPC latency per method
+        let rpc_requests_total = CounterVec::new(
+            Opts::new(
+                "shell_rpc_requests_total",
+                "RPC calls by method and transport status",
+            ),
+            &["method", "status"],
+        )?;
+        let rpc_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "shell_rpc_duration_seconds",
+                "RPC handler duration by method",
+            )
+            .buckets(RPC_DURATION_BUCKETS.to_vec()),
+            &["method"],
+        )?;
         let rpc_request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "shell_rpc_request_duration_seconds",
                 "RPC request duration by method",
             )
-            .buckets(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-            ]),
+            .buckets(RPC_DURATION_BUCKETS.to_vec()),
             &["method"],
         )?;
 
@@ -338,6 +357,8 @@ impl Metrics {
         registry.register(Box::new(stark_l2_proofs_generated.clone()))?;
         registry.register(Box::new(storage_cf_size.clone()))?;
         registry.register(Box::new(rpc_request_duration_seconds.clone()))?;
+        registry.register(Box::new(rpc_requests_total.clone()))?;
+        registry.register(Box::new(rpc_duration_seconds.clone()))?;
 
         Ok(Self {
             block_height,
@@ -374,6 +395,8 @@ impl Metrics {
             uptime_start: Instant::now(),
             storage_cf_size,
             rpc_request_duration_seconds,
+            rpc_requests_total,
+            rpc_duration_seconds,
             registry,
             tx_pool: None,
             proof_backlog: None,
@@ -448,6 +471,17 @@ impl Metrics {
     /// `method` is the JSON-RPC method name (e.g. `"shell_getBlock"`).
     /// `duration_secs` is the wall-clock time from request start to response.
     pub fn record_rpc_call(&self, method: &str, duration_secs: f64) {
+        self.record_rpc_request(method, StatusCode::OK.as_u16(), duration_secs);
+    }
+
+    /// Record a completed handler with its HTTP response or WS upgrade status.
+    pub fn record_rpc_request(&self, method: &str, status: u16, duration_secs: f64) {
+        self.rpc_requests_total
+            .with_label_values(&[method, &status.to_string()])
+            .inc();
+        self.rpc_duration_seconds
+            .with_label_values(&[method])
+            .observe(duration_secs);
         self.rpc_request_duration_seconds
             .with_label_values(&[method])
             .observe(duration_secs);
@@ -993,6 +1027,10 @@ mod tests {
         m.record_rpc_call("eth_getBalance", 0.002);
 
         let output = m.gather();
+        assert!(
+            output.contains("shell_rpc_requests_total{method=\"shell_getBlock\",status=\"200\"} 2")
+        );
+        assert!(output.contains("shell_rpc_duration_seconds_count{method=\"shell_getBlock\"} 2"));
         assert!(
             output.contains("shell_rpc_request_duration_seconds"),
             "should contain rpc duration metric"

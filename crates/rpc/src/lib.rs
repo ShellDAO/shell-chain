@@ -15,6 +15,7 @@ pub mod error;
 pub mod filter;
 pub mod filter_registry;
 pub mod handler;
+pub mod metrics;
 pub mod middleware;
 pub mod server;
 // jsonrpsee generates async_trait methods with redundant must_use on boxed futures.
@@ -27,6 +28,7 @@ pub mod types;
 pub use admin::{AdminApiServer, NodeInfo, PeerInfo};
 pub use dev_control::{DevRpcControl, DynDevRpcControl};
 pub use handler::RpcHandler;
+pub use metrics::RpcMetricsObserver;
 pub use server::{start_rpc_server, RpcConfig, RpcServerHandle};
 pub use subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
 pub use tls::TlsConfig;
