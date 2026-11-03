@@ -235,6 +235,9 @@ pub struct NodeConfig {
     pub state_cache_size_mb: usize,
     /// Parallel-PQVM PoC configuration. Disabled by default until promoted.
     pub parallel_pqvm: ParallelPqvmConfig,
+    /// Commit the existing optional witness root on newly produced user blocks.
+    /// Off by default; legacy headers without a commitment remain valid.
+    pub commit_witness_root: bool,
     /// Enable STARK aggregate proof generation during block production.
     /// When true, `produce_block` calls `prove_sig_batch()` over all transaction
     /// entries and stores the result in `BlockHeader::sig_aggregate_proof`.
@@ -305,6 +308,7 @@ impl NodeConfig {
             max_idle_interval_ms: 600_000,
             state_cache_size_mb: 64,
             parallel_pqvm: ParallelPqvmConfig::default(),
+            commit_witness_root: false,
             enable_stark_aggregation: params.stark_aggregation,
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,

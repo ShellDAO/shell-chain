@@ -70,6 +70,8 @@ pub struct RunArgs {
     pub state_cache_size_mb: Option<usize>,
     /// Enable the parallel-PQVM conflict-graph scheduler.
     pub parallel_pqvm: bool,
+    /// Opt in to witness commitments on newly produced user-transaction blocks.
+    pub commit_witness_root: bool,
     /// Number of worker threads for the parallel-PQVM scheduler (default: logical CPUs).
     pub parallel_pqvm_workers: Option<usize>,
     /// Override witness bundle retention from the storage profile.
@@ -981,6 +983,7 @@ async fn run_with_store<S: KvStore + 'static>(
             ..shell_node::config::ParallelPqvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
+        commit_witness_root: args.commit_witness_root,
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         prover_priority: args.prover_priority,
         l2_stark_mode: args
@@ -1201,6 +1204,7 @@ mod tests {
             mempool_price_bump: None,
             state_cache_size_mb: None,
             parallel_pqvm: true,
+            commit_witness_root: false,
             parallel_pqvm_workers: Some(4),
             witness_retention: Some(DEFAULT_WITNESS_RETENTION),
             body_retention: Some(DEFAULT_BODY_RETENTION),

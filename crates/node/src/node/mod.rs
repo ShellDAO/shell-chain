@@ -19733,6 +19733,77 @@ mod tests {
     }
 
     #[test]
+    fn producer_witness_root_is_opt_in_and_sealed_with_retained_witnesses() {
+        let (mut node, signer) = setup_node();
+        store_genesis(&node);
+        assert!(!node.config.commit_witness_root);
+        let (sender_signer, sender, pubkey) = make_stark_account(&node);
+        let mut committed = None;
+        for (nonce, enabled) in [false, true, false].into_iter().enumerate() {
+            node.config.commit_witness_root = enabled;
+            let tx = make_embedded_tx(&sender_signer, sender, pubkey.clone(), nonce as u64, 1);
+            let receiver = tx.tx.to.unwrap();
+            node.tx_pool
+                .insert(
+                    tx,
+                    &mut node.world_state.write(),
+                    node.chain_store.as_ref(),
+                    &MultiVerifier,
+                )
+                .unwrap();
+            let block = node.produce_block(&signer, 100).unwrap();
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(
+                node.world_state.read().get_balance(&receiver).unwrap(),
+                U256::from(nonce + 1)
+            );
+            let stored = node
+                .chain_store
+                .get_block_by_hash(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.header, block.header);
+            assert!(MultiVerifier
+                .verify(
+                    signer.public_key(),
+                    block.header.hash().as_bytes(),
+                    block.proposer_seal.as_ref().unwrap()
+                )
+                .unwrap());
+            let bundle = node
+                .witness_store
+                .get_bundle(&block.hash())
+                .unwrap()
+                .unwrap();
+            assert_eq!(bundle.len(), 1);
+            if enabled {
+                assert_eq!(block.header.witness_root, Some(bundle.compute_root()));
+                committed = Some((block.hash(), block.header.witness_root));
+            } else {
+                assert_eq!(block.header.witness_root, None);
+            }
+        }
+        let (hash, root) = committed.unwrap();
+        assert_eq!(
+            node.chain_store
+                .get_header_by_hash(&hash)
+                .unwrap()
+                .unwrap()
+                .witness_root,
+            root
+        );
+        node.config.commit_witness_root = true;
+        let empty = node.produce_block(&signer, 0).unwrap();
+        assert!(empty.transactions.is_empty());
+        assert_eq!(empty.header.witness_root, None);
+        assert!(node
+            .witness_store
+            .get_bundle(&empty.hash())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn produce_block_with_tx_stores_receipts() {
         let (node, signer) = setup_node();
         store_genesis(&node);

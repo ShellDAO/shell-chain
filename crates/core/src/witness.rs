@@ -323,9 +323,8 @@ impl WitnessBundle {
     /// Each leaf = `keccak256(rlp(witness[i]))`. The root is built pairwise
     /// in the same way as the transaction root. Returns all-zeros for empty bundles.
     ///
-    /// **Note**: This is a placeholder implementation using sequential hashing.
-    /// Phase B2 will replace it with a proper Merkle trie compatible with
-    /// the block header's `witness_root` field.
+    /// Pairwise parents hash the concatenated 32-byte children with Keccak-256.
+    /// An odd final child is duplicated at that level.
     pub fn compute_root(&self) -> ShellHash {
         Self::compute_root_from_parts(
             self.witnesses

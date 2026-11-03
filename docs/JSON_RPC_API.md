@@ -1676,7 +1676,15 @@ curl -s http://localhost:8545 -H "Content-Type: application/json" \
 
 ### shell_getBlockWitnesses
 
-Returns the PQ witness bundle for a block — the individual Dilithium3 signatures stored separately from TX bodies. Returns `null` when witnesses have been pruned (STARK proof received) or the block predates B3 storage.
+Returns the PQ witness bundle for a block — the individual PQ signatures stored separately from TX bodies. Returns `null` when witnesses have been pruned (STARK proof received) or the block predates B3 storage.
+
+**Producer commitment (unreleased):** `shell-node run --commit-witness-root`
+opts in to the existing optional header commitment for newly produced blocks
+containing user transactions. Supply the flag again on restart to keep producing
+commitments. The default is off; earlier headers, empty blocks and blocks from
+other producers can still have no root. This option does not require commitments
+from other producers or change witness retention. A retained bundle alone does
+not imply that its header has a commitment.
 
 **Parameters:**
 
@@ -1689,7 +1697,8 @@ Returns the PQ witness bundle for a block — the individual Dilithium3 signatur
 | Field | Type | Description |
 |-------|------|-------------|
 | `blockHash` | string | Block hash |
-| `witnessRoot` | string | `witness_root` from block header |
+| `witnessRoot` | string or null | `witness_root` from block header, when committed |
+| `witnessRootVerified` | boolean or null | Whether a retained bundle matches a committed header root; null without a root |
 | `witnessCount` | number | Number of witnesses in bundle |
 | `witnesses` | array | `[{ txIndex, sigType, signature, pubkey? }, ...]` |
 
@@ -1699,6 +1708,39 @@ Returns `null` when no witness bundle is stored (pruned or not applicable).
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"shell_getBlockWitnesses","params":["latest"],"id":1}'
 ```
+
+### shell_verifyWitnessRoot
+
+Recomputes the retained witness bundle's commitment and compares it with the
+selected header's `witness_root`. Accepts a block hash, hexadecimal block number,
+`"latest"` or `"earliest"`. A matching root returns `verified: true`; a mismatch
+returns `verified: false`, with `expectedRoot` and `computedRoot`. When the block,
+header commitment or witness bundle is unavailable, `verified` is null and
+`reason` explains what is missing. Genesis and legacy headers without a root
+return `"block header has no witness_root (pre-B2 block or genesis)"`; an unknown
+block returns `"block not found"`.
+
+This comparison establishes witness commitment integrity. It does not by itself
+verify transaction signatures, block consensus or a STARK proof.
+
+```bash
+curl -s http://localhost:8545 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_verifyWitnessRoot","params":["latest"],"id":1}'
+```
+
+Native acceptance uses temporary keys and two isolated RocksDB nodes:
+
+```bash
+cargo build --locked -p shell-cli --features libp2p --bin shell-node
+SHELL_SDK_ENTRY=/path/to/shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --witness-root
+```
+
+Use a compatible SDK with transaction wire format v2. Optionally set
+`PEER_NODE_BIN` to a previously released compatible node binary to check its
+import and restart behavior. The test covers default-off production, opt-in real
+signed transfers, an independent RLP/Keccak root calculation, process restarts,
+opt-out, legacy headers, unknown blocks, receipts and account state on both nodes.
 
 ### shell_setBalance *(dev/testnet only)*
 

@@ -33,6 +33,8 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const witnessRootScenario = process.argv.includes("--witness-root");
+let commitWitnessRoot = false;
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -105,7 +107,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: witnessRootScenario ? "witness-root" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -150,6 +152,10 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (witnessRootScenario) {
+    const record = result.processes.findLast((entry) => entry.pid === child.pid);
+    Object.assign(record, { exitCode: child.exitCode, signal: child.signalCode, stoppedAt: new Date().toISOString() });
+  }
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -195,10 +201,18 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   ];
   if (pruneFollower && i === 1)
     args.push("--pruning", "1", "--body-retention", "1");
+  if (witnessRootScenario && i === 0 && commitWitnessRoot) args.push("--commit-witness-root");
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
-  const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
+  const nodeBinary = witnessRootScenario && i === 1 && process.env.PEER_NODE_BIN
+    ? resolve(process.env.PEER_NODE_BIN) : binary;
+  const child = spawn(nodeBinary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
+  if (witnessRootScenario) {
+    result.processes ??= [];
+    result.processes.push({ pid: child.pid, binary: nodeBinary, argv: args, log: label + "-node.log", startedAt: new Date().toISOString() });
+    await save();
+  }
   nodes[i] = child;
   nodeLogLabels[i] = label;
   let spawnError;
@@ -608,6 +622,136 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (witnessRootScenario) {
+    const { keccak256, toRlp, concatHex, numberToHex } = createRequire(resolve(process.env.SHELL_SDK_ENTRY))("viem");
+    const sigType = { Dilithium3: 0, MlDsa65: 1, SphincsSha2256f: 2 };
+    // Independent canonical RLP/Keccak implementation, using RPC witness bytes.
+    const witnessRoot = (witnesses) => {
+      let level = witnesses.map((w) => {
+        assert.ok(Object.hasOwn(sigType, w.sigType), `known witness algorithm ${w.sigType}`);
+        const tag = sigType[w.sigType] === 0 ? "0x" : numberToHex(sigType[w.sigType]);
+        return keccak256(toRlp([[tag, w.signature], w.pubkey ?? "0x"]));
+      });
+      if (!level.length) return "0x" + "00".repeat(32);
+      while (level.length > 1) {
+        const next = [];
+        for (let j = 0; j < level.length; j += 2)
+          next.push(keccak256(concatHex([level[j], level[j + 1] ?? level[j]])));
+        level = next;
+      }
+      return level[0];
+    };
+    result.witnessRoot = { blocks: [], peerBinary: spawnSync(process.env.PEER_NODE_BIN ?? binary, ["--version"], { encoding: "utf8" }).stdout?.trim() };
+    async function transfer(label, count = 1) {
+      const firstNonce = await nonce(miner);
+      const before = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+      const hashes = [];
+      for (let n = 0; n < count; n++) {
+        const signed = await miner.buildSignedTransaction({ tx: buildTransaction({
+          chainId: 1337, nonce: firstNonce + n, to: outsider.getAddress(), value: 1n,
+          gasLimit: 21000,
+        }), includePublicKey: true });
+        hashes.push(await providers[0].sendTransaction(signed));
+      }
+      const records = [];
+      for (const hash of hashes) {
+        let receipt;
+        for (let attempt = 0; attempt < 160; attempt++) {
+          receipt = await rpc(1, "eth_getTransactionReceipt", [hash]);
+          if (receipt) break;
+          await pause(250);
+        }
+        assert.equal(receipt?.status, "0x1", label);
+        assert.deepEqual(await rpc(0, "eth_getTransactionReceipt", [hash]), receipt);
+        const block = await rpc(0, "eth_getBlockByHash", [receipt.blockHash, false]);
+        assert.deepEqual(await rpc(1, "eth_getBlockByHash", [receipt.blockHash, false]), block);
+        records.push({ hash, receipt, block });
+      }
+      for (let i = 0; i < 2; i++) {
+        assert.equal(BigInt(await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"])), before + BigInt(count));
+        assert.equal(BigInt(await rpc(i, "eth_getTransactionCount", [miner.getAddress(), "latest"])), BigInt(firstNonce + count));
+      }
+      return records;
+    }
+    async function check(record, enabled) {
+      const { block } = record;
+      for (let i = 0; i < 2; i++) {
+        const observe = async () => ({
+          head: await rpc(i, "eth_getBlockByNumber", ["latest", false]),
+          balance: await rpc(i, "eth_getBalance", [outsider.getAddress(), "latest"]),
+          nonce: await rpc(i, "eth_getTransactionCount", [miner.getAddress(), "latest"]),
+        });
+        const before = await observe();
+        const bundle = await rpc(i, "shell_getBlockWitnesses", [block.hash]);
+        assert.ok(bundle.witnessCount > 0);
+        assert.equal(bundle.witnesses.length, bundle.witnessCount);
+        const verification = await rpc(i, "shell_verifyWitnessRoot", [block.hash]);
+        assert.equal(verification.blockHash, block.hash);
+        if (enabled) {
+          const root = witnessRoot(bundle.witnesses);
+          assert.equal(bundle.witnessRoot, root, "independent commitment from real PQ signatures");
+          assert.equal(bundle.witnessRootVerified, true);
+          assert.equal(verification.verified, true);
+          assert.equal(verification.expectedRoot, root);
+          assert.equal(verification.computedRoot, root);
+          const altered = structuredClone(bundle.witnesses);
+          altered[0].signature = "0x" + (altered[0].signature.slice(2, 4) === "00" ? "01" : "00") + altered[0].signature.slice(4);
+          assert.notEqual(witnessRoot(altered), root, "signature tampering changes commitment");
+        } else {
+          assert.equal(bundle.witnessRoot, null);
+          assert.equal(verification.verified, null);
+          assert.equal(verification.reason, "block header has no witness_root (pre-B2 block or genesis)");
+        }
+        assert.deepEqual(await rpc(i, "shell_verifyWitnessRoot", [block.number]), verification);
+        if (before.head.hash === block.hash)
+          assert.deepEqual(await rpc(i, "shell_verifyWitnessRoot", ["latest"]), verification);
+        assert.deepEqual(await observe(), before, "reads preserve head and account state");
+        result.witnessRoot.blocks.push({ node: i, blockHash: block.hash, witnessCount: bundle.witnessCount, verification });
+      }
+    }
+    const legacy = (await transfer("default-off transfer"))[0];
+    await check(legacy, false);
+    await stop(0);
+    commitWitnessRoot = true;
+    await start(0, dirs[0], keyPath, "witness-enabled-leader");
+    bootnode = (await readFile(join(out, "witness-enabled-leader-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    assert.ok(bootnode);
+    await stop(1);
+    await start(1, dirs[1], followerKey, "witness-enabled-follower", bootnode);
+    await peerReady();
+    const committed = await transfer("committed transfers", 3);
+    for (const record of committed) await check(record, true);
+    await check(legacy, false);
+    await stop(0);
+    commitWitnessRoot = false;
+    await start(0, dirs[0], keyPath, "witness-disabled-leader");
+    bootnode = (await readFile(join(out, "witness-disabled-leader-node.log"), "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    assert.ok(bootnode);
+    await stop(1);
+    await start(1, dirs[1], followerKey, "witness-reopened-follower", bootnode);
+    await peerReady();
+    for (const record of committed) await check(record, true);
+    const disabled = (await transfer("disabled transfer"))[0];
+    await check(disabled, false);
+    for (let i = 0; i < 2; i++) {
+      const genesisResult = await rpc(i, "shell_verifyWitnessRoot", ["earliest"]);
+      assert.equal(genesisResult.verified, null);
+      assert.equal(genesisResult.reason, "block header has no witness_root (pre-B2 block or genesis)");
+      const missing = await rpc(i, "shell_verifyWitnessRoot", ["0xffffff"]);
+      assert.equal(missing.verified, null);
+      assert.equal(missing.reason, "block not found");
+      let finalized;
+      for (let n = 0; n < 80; n++) {
+        finalized = await rpc(i, "eth_getBlockByNumber", ["finalized", false]);
+        if (finalized?.hash === disabled.block.hash) break;
+        await pause(250);
+      }
+      assert.equal(finalized?.hash, disabled.block.hash);
+    }
+    result.witnessRoot.transactions = [...[legacy], ...committed, disabled].map(({ hash, receipt }) => ({ hash, receipt }));
+    result.passed = true;
+    return;
+  }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

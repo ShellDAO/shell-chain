@@ -4207,6 +4207,36 @@ mod tests {
             serde_json::to_value(correct_root).unwrap()
         );
 
+        // Changing retained signature bytes must fail against the original
+        // immutable header. The query must not repair or overwrite the bundle.
+        let mut tampered = bundle.clone();
+        tampered.witnesses[0].signature.data[0] ^= 1;
+        let store = handler.witness_store.as_ref().unwrap();
+        store.put_bundle(&hash_match, &tampered).unwrap();
+        let res = ShellApiServer::verify_witness_root(&handler, "latest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(res["verified"], false);
+        assert_eq!(
+            res["expectedRoot"],
+            serde_json::to_value(correct_root).unwrap()
+        );
+        assert_ne!(res["computedRoot"], res["expectedRoot"]);
+        assert_eq!(store.get_bundle(&hash_match).unwrap().unwrap(), tampered);
+        assert_eq!(
+            handler.chain_store.get_head_hash().unwrap(),
+            Some(hash_match)
+        );
+        assert_eq!(
+            handler
+                .chain_store
+                .get_header_by_hash(&hash_match)
+                .unwrap()
+                .unwrap(),
+            block_match.header
+        );
+        store.put_bundle(&hash_match, &bundle).unwrap();
+
         // --- mismatch case: wrong root in header ---
         let wrong_root = ShellHash::from([0xff; 32]);
         let mut block_bad = make_genesis_block();

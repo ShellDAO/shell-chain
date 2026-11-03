@@ -478,6 +478,13 @@ impl<S: KvStore + 'static> Node<S> {
         // Compute state root from the updated world state (includes any activations above).
         header.state_root = evm.state_db_mut().world_state_mut().state_root()?;
 
+        // Commit retained user witnesses before computing the block hash and
+        // proposer seal. Empty heartbeat/system-only blocks have no bundle.
+        if self.config.commit_witness_root && !included_txs.is_empty() {
+            header.witness_root =
+                Some(WitnessBundle::compute_root_from_transactions(&included_txs));
+        }
+
         let mut block = Block {
             header,
             transactions: included_txs,

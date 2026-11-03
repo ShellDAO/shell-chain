@@ -243,6 +243,11 @@ enum Commands {
         #[arg(long, default_value = "false", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
         enable_stark_aggregation: bool,
 
+        /// Commit the optional witness root on newly produced user blocks.
+        /// Off by default; existing headers and other producers are unchanged.
+        #[arg(long, default_value = "false", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
+        commit_witness_root: bool,
+
         /// L2 STARK aggregation mode: disabled, scaffold, or active.
         ///
         /// disabled — no L2 scheduler/input/job activity.
@@ -671,6 +676,7 @@ async fn main() {
             witness_retention,
             body_retention,
             enable_stark_aggregation,
+            commit_witness_root,
             l2_stark_mode,
             consensus_engine,
             node_role,
@@ -852,6 +858,7 @@ async fn main() {
                 witness_retention,
                 body_retention,
                 enable_stark_aggregation: effective_stark_aggregation,
+                commit_witness_root,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,
                 node_role: effective_node_role,
@@ -1089,6 +1096,26 @@ mod tests {
                     assert_eq!(max_idle_interval, seconds);
                     assert!(max_idle_interval.checked_mul(1000).is_some());
                 }
+                _ => panic!("expected run command"),
+            }
+        }
+    }
+
+    #[test]
+    fn witness_root_commitment_requires_explicit_opt_in() {
+        for (args, expected) in [
+            (vec!["shell-node", "run"], false),
+            (vec!["shell-node", "run", "--commit-witness-root"], true),
+            (
+                vec!["shell-node", "run", "--commit-witness-root=false"],
+                false,
+            ),
+        ] {
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Run {
+                    commit_witness_root,
+                    ..
+                } => assert_eq!(commit_witness_root, expected),
                 _ => panic!("expected run command"),
             }
         }

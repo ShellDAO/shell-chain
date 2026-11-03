@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Opt in to witness commitments with `shell-node run --commit-witness-root`.
+  New blocks containing user transactions commit their retained PQ witnesses
+  before proposer signing and storage. Existing headers and default production
+  remain unchanged; supporting peers verify the same optional commitment.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
