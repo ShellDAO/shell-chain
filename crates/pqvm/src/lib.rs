@@ -32,7 +32,8 @@ pub use aa_validation::{
     PaymasterValidationInput, PAYMASTER_VALIDATE_GAS_CAP, VALIDATION_GAS_CAP,
 };
 pub use executor::{
-    commit_pqvm_state, commit_pqvm_state_raw, ExecutorError, ShellPqvm, TxExecutionResult,
+    commit_pqvm_state, commit_pqvm_state_raw, AaExecutionStats, ExecutorError, ShellPqvm,
+    TxExecutionResult,
 };
 pub use parallel::{
     ConflictMetric, ConflictReason, ExecutionWave, ParallelExecutionPlan, ParallelPqvmConfig,

@@ -24,6 +24,8 @@ const {
   buildTransaction,
   buildBatchTransaction,
   buildInnerCall,
+  buildSponsoredTransaction,
+  hashPaymasterTransaction,
   accountManagerAddress,
   validatorRegistryAddress,
   encodeSetGuardiansCalldata,
@@ -41,6 +43,7 @@ const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
+const aaMetricsScenario = process.argv.includes("--aa-metrics");
 const syncStatusScenario = process.argv.includes("--sync-status");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
@@ -80,8 +83,14 @@ async function unusedPort() {
 }
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
-const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
-const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
+const metricsPorts = (syncStatusScenario || aaMetricsScenario) ? [await unusedPort(), await unusedPort()] : [];
+let outsider;
+if (aaMetricsScenario) {
+  const paymasterKey = join(out, "metrics-paymaster.json");
+  const generatedPaymaster = spawnSync(binary, ["--password-file",passwordPath,"key","generate","--algorithm","mldsa65","--output",paymasterKey], {encoding:"utf8"});
+  assert.equal(generatedPaymaster.status,0,generatedPaymaster.stderr);
+  outsider = await decryptKeystore(JSON.parse(await readFile(paymasterKey,"utf8")),password);
+} else outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
 const pruneFollower = prunedEpochScenario || blockSignersScenario;
@@ -105,8 +114,9 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: aaMetricsScenario ? "aa-metrics" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
+  processes: [],
   versions: {
     node: process.version,
     sdk: JSON.parse(
@@ -150,6 +160,7 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  if (aaMetricsScenario) assert.equal(child.exitCode, 0, "AA metrics node stops cleanly");
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -170,7 +181,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--rpc-addr",
     `127.0.0.1:${ports[i]}`,
     "--metrics-addr",
-    syncStatusScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
+    (syncStatusScenario || aaMetricsScenario) ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
     "--block-time",
     "2000",
     "--max-idle-interval",
@@ -199,6 +210,9 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   const fd = openSync(join(out, label + "-node.log"), "w");
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
   closeSync(fd);
+  const processRecord = { pid: child.pid, label, args, startedAt: new Date().toISOString() };
+  result.processes.push(processRecord);
+  child.once("exit", (exitCode, signal) => Object.assign(processRecord, { exitCode, signal, endedAt: new Date().toISOString() }));
   nodes[i] = child;
   nodeLogLabels[i] = label;
   let spawnError;
@@ -427,6 +441,118 @@ async function confirmed(
   await save();
   return entry;
 }
+async function aaMetricsAcceptance(dirs, followerKey, bootnode) {
+  const names = ["aa_bundles_received", "aa_bundles_executed", "aa_inner_calls", "aa_sponsored_txs"];
+  const observations = result.aaMetrics = [];
+  const recipient = "0x" + "47".repeat(32);
+  async function counters(label, expected) {
+    const values = [];
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(`http://127.0.0.1:${metricsPorts[i]}/metrics`);
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      await writeFile(join(out, `${label}-${i}.prom`), text);
+      const counts = names.map((name) => {
+        const match = text.match(new RegExp(`^shell_${name}_total ([0-9]+)$`, "m"));
+        assert.ok(match, name);
+        return Number(match[1]);
+      });
+      assert.deepEqual(counts.slice(1), expected.slice(1), `${label} node ${i}`);
+      // The follower may also admit transactions relayed before their blocks.
+      if (i === 0) assert.equal(counts[0], expected[0]);
+      else assert.ok(counts[0] >= 0 && counts[0] <= expected[0]);
+      values.push(counts);
+    }
+    observations.push({ label, expected, values });
+    await save();
+    return values;
+  }
+  async function sendTx(label, signer, tx, bundle, sponsor, status = "0x1") {
+    const beforeNonce = await nonce(signer);
+    const signed = await signer.buildSignedTransaction({ tx, ...(bundle ? { aaBundle: bundle } : {}), includePublicKey: true });
+    if (sponsor) signed.aa_bundle.paymaster_signature = Array.from(await sponsor.sign(
+      hashPaymasterTransaction(signer.getAddress(), tx, bundle, signer.algorithmId)));
+    const hash = await paced(() => providers[0].sendTransaction(signed));
+    let receipt;
+    for (let k = 0; k < 100; k++) {
+      receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+      if (receipt) break;
+      await pause(200);
+    }
+    assert.equal(receipt?.status, status, label);
+    height++;
+    assert.equal(Number(BigInt(receipt.blockNumber)), height);
+    assert.equal(await nonce(signer), beforeNonce + 1);
+    const snapshot = await compare(hash);
+    result.transactions.push({ label, hash, signed, receipt, snapshot });
+    await save();
+    return { hash, signed, receipt, snapshot };
+  }
+  const transfer = (value) => buildInnerCall(recipient, "0x", 100000, value);
+  async function bundle(label, calls, sponsored = false, status = "0x1") {
+    const options = { chainId: 1337, nonce: await nonce(miner), innerCalls: calls, gasLimit: 1000000 };
+    const built = sponsored ? buildSponsoredTransaction({ ...options, paymaster: outsider.getAddress(), paymasterSignature: [1] }) : buildBatchTransaction(options);
+    return sendTx(label, miner, built.tx, built.aa_bundle, sponsored ? outsider : null, status);
+  }
+  await counters("initial", [0, 0, 0, 0]);
+  await sendTx("register paymaster key", outsider, buildTransaction({chainId:1337, nonce:await nonce(outsider), to:recipient, value:0n, gasLimit:21000}));
+  const deployed = await sendTx("deploy real reverting contract", miner, buildTransaction({chainId:1337, nonce:await nonce(miner), to:null, data:"0x6003600c60003960036000f35f5ffd", gasLimit:500000}));
+  const reverter = deployed.receipt.contractAddress;
+  assert.equal(await rpc(0, "eth_getCode", [reverter, "latest"]), "0x5f5ffd");
+  await counters("ordinary transactions excluded", [0, 0, 0, 0]);
+  const first = await bundle("successful two-call bundle", [transfer(3n), transfer(4n)]);
+  assert.equal(BigInt(await rpc(0,"eth_getBalance",[recipient,"latest"])),7n);
+  const once = await counters("successful bundle", [1, 1, 2, 0]);
+  await assert.rejects(paced(() => providers[0].sendTransaction(first.signed)));
+  await rpc(0,"debug_traceTransaction",[first.hash,{tracer:"callTracer"}]);
+  assert.equal(BigInt(await rpc(0,"eth_getBalance",[recipient,"latest"])),7n);
+  assert.deepEqual(await counters("duplicate and historical trace excluded", [1, 1, 2, 0]), once);
+  const failureCalls = [transfer(1n), buildInnerCall(reverter,"0x",100000,0n), transfer(99n)];
+  const failed = await bundle("atomic revert stops before third call", failureCalls, false, "0x0");
+  assert.deepEqual(failed.receipt.logs, []);
+  assert.equal(BigInt(await rpc(0,"eth_getBalance",[recipient,"latest"])),7n);
+  await counters("reverted bundle", [2, 2, 4, 0]);
+  for (const [label,calls,status,expected,expectedBalance] of [
+    ["paymaster pays successful bundle",[transfer(5n)],"0x1",[3,3,5,1],12n],
+    ["paymaster pays reverted bundle",failureCalls,"0x0",[4,4,7,2],12n],
+  ]) {
+    const payerBefore = BigInt(await rpc(0,"eth_getBalance",[outsider.getAddress(),"latest"]));
+    const item = await bundle(label,calls,true,status);
+    const payerAfter = BigInt(await rpc(0,"eth_getBalance",[outsider.getAddress(),"latest"]));
+    const cost = BigInt(item.receipt.gasUsed)*BigInt(item.receipt.effectiveGasPrice);
+    assert.ok(cost > 0n);
+    assert.equal(payerBefore-payerAfter,cost,"actual paymaster gas debit");
+    assert.equal(BigInt(await rpc(0,"eth_getBalance",[recipient,"latest"])),expectedBalance);
+    await counters(label,expected);
+  }
+  const tip = await rpc(0,"eth_getBlockByNumber",["latest",false]);
+  const stored = result.transactions.map((item) => [item.hash,item.receipt]);
+  const balance = await rpc(0,"eth_getBalance",[recipient,"latest"]);
+  const senderNonce = await nonce(miner);
+  for (const i of [0,1]) assert.equal((await rpc(i,"shell_getNodeInfo")).txPoolSize,0);
+  await stop(1); await stop(0);
+  await start(0,dirs[0],keyPath,"aa-reopened-producer");
+  let address;
+  for (let k = 0; k < 80; k++) {
+    address = (await readFile(join(out,"aa-reopened-producer-node.log"),"utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    if (address) break;
+    await pause(250);
+  }
+  assert.ok(address,"reopened complete multiaddr");
+  await start(1,dirs[1],followerKey,"aa-reopened-follower",address); await peerReady();
+  for (const i of [0,1]) {
+    assert.deepEqual(await rpc(i,"eth_getBlockByNumber",["latest",false]),tip);
+    for (const [hash,receipt] of stored) assert.deepEqual(await rpc(i,"eth_getTransactionReceipt",[hash]),receipt);
+    assert.equal(await rpc(i,"eth_getBalance",[recipient,"latest"]),balance);
+  }
+  assert.equal(await nonce(miner),senderNonce);
+  await counters("reopened process counters reset",[0,0,0,0]);
+  await bundle("new post-restart bundle",[transfer(1n)]);
+  await counters("post-restart execution",[1,1,1,0]);
+  assert.equal(BigInt(await rpc(0,"eth_getBalance",[recipient,"latest"])),13n);
+  result.passed = true;
+}
+
 async function runScenario() {
   const dirs = [join(out, "leader"), join(out, "follower")];
   for (const dir of dirs) await mkdir(dir);
@@ -608,6 +734,7 @@ async function runScenario() {
   }
   await start(1, dirs[1], followerKey, "follower", bootnode);
   await peerReady();
+  if (aaMetricsScenario) { await aaMetricsAcceptance(dirs, followerKey, bootnode); return; }
   if (forkSyncScenario) {
     result.adaptations.push(weightedForkScenario
       ? "Two temporary authorities with weights [1, 3], quorum 3, and two observers. One high-weight authority can finalize alone; one low-weight authority cannot."

@@ -72,6 +72,11 @@ pub struct Metrics {
     pub blocks_imported: IntCounter,
     /// Successful pool admissions in this process, including replacements/reinsertions.
     pub txs_received: IntCounter,
+    pub aa_bundles_received: IntCounter,
+    pub aa_bundles_executed: IntCounter,
+    pub aa_inner_calls: IntCounter,
+    pub aa_sponsored_txs: IntCounter,
+
     /// Current epoch number (wPoA).
     pub epoch_number: IntGauge,
     /// Number of currently active validators.
@@ -192,6 +197,23 @@ impl Metrics {
             "shell_txs_received_total",
             "Successful transaction pool admissions in this process",
         ))?;
+        let aa_bundles_received = IntCounter::with_opts(Opts::new(
+            "shell_aa_bundles_received_total",
+            "AA bundles admitted to the mempool in this process",
+        ))?;
+        let aa_bundles_executed = IntCounter::with_opts(Opts::new(
+            "shell_aa_bundles_executed_total",
+            "AA bundles canonically executed in this process, including reverted bundles",
+        ))?;
+        let aa_inner_calls = IntCounter::with_opts(Opts::new(
+            "shell_aa_inner_calls_total",
+            "AA inner calls attempted in canonical execution, including failed calls",
+        ))?;
+        let aa_sponsored_txs = IntCounter::with_opts(Opts::new(
+            "shell_aa_sponsored_txs_total",
+            "Canonical AA transactions where a distinct paymaster paid gas",
+        ))?;
+
         let epoch_number =
             IntGauge::with_opts(Opts::new("shell_epoch_number", "Current wPoA epoch"))?;
         let validator_active_count = IntGauge::with_opts(Opts::new(
@@ -315,6 +337,11 @@ impl Metrics {
         registry.register(Box::new(block_production_ms.clone()))?;
         registry.register(Box::new(blocks_imported.clone()))?;
         registry.register(Box::new(txs_received.clone()))?;
+        registry.register(Box::new(aa_bundles_received.clone()))?;
+        registry.register(Box::new(aa_bundles_executed.clone()))?;
+        registry.register(Box::new(aa_inner_calls.clone()))?;
+        registry.register(Box::new(aa_sponsored_txs.clone()))?;
+
         registry.register(Box::new(epoch_number.clone()))?;
         registry.register(Box::new(validator_active_count.clone()))?;
         registry.register(Box::new(validator_weight.clone()))?;
@@ -350,6 +377,11 @@ impl Metrics {
             block_production_ms,
             blocks_imported,
             txs_received,
+            aa_bundles_received,
+            aa_bundles_executed,
+            aa_inner_calls,
+            aa_sponsored_txs,
+
             epoch_number,
             validator_active_count,
             validator_weight,
@@ -402,8 +434,10 @@ impl Metrics {
         // admissions or overwrite a newer pool snapshot with an older one.
         let _collection = self.collection_lock.lock();
         if let Some(pool) = &self.tx_pool {
-            let (pending, accepted) = pool.admission_stats();
+            let (pending, accepted, aa_accepted) = pool.admission_counts();
             self.tx_pool_size.set(pending as i64);
+            self.aa_bundles_received
+                .inc_by(aa_accepted.saturating_sub(self.aa_bundles_received.get()));
             self.txs_received
                 .inc_by(accepted.saturating_sub(self.txs_received.get()));
         }
@@ -418,6 +452,17 @@ impl Metrics {
             return String::new();
         }
         String::from_utf8(buffer).unwrap_or_default()
+    }
+
+    /// Publish only observations from successfully committed canonical execution.
+    pub(crate) fn record_aa_executions(&self, executions: &[shell_pqvm::AaExecutionStats]) {
+        self.aa_bundles_executed.inc_by(executions.len() as u64);
+        for execution in executions {
+            self.aa_inner_calls.inc_by(execution.inner_calls);
+            if execution.paymaster_paid {
+                self.aa_sponsored_txs.inc();
+            }
+        }
     }
 
     /// Update finality gauges from the current canonical head/finality pair.

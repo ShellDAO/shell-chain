@@ -459,6 +459,7 @@ mod tests {
         let gas_used = result.result.gas_used();
         drop(evm);
         let execution = TxExecutionResult {
+            aa_execution: None,
             receipt: TransactionReceipt {
                 tx_hash: ShellHash::ZERO,
                 block_number: 1,

@@ -80,6 +80,7 @@ struct PoolInner {
     total_bytes: usize,
     /// Successful admissions over this pool instance, including replacements/reinsertions.
     accepted_total: u64,
+    aa_accepted_total: u64,
     /// Aggregate balance reserved by retained transactions for each sender or
     /// paymaster. This keeps admission checks independent of total pool size.
     reserved_by_account: HashMap<Address, ReservationTotal>,
@@ -155,6 +156,7 @@ impl TxPool {
                 seq: 0,
                 total_bytes: 0,
                 accepted_total: 0,
+                aa_accepted_total: 0,
                 reserved_by_account: HashMap::new(),
             }),
         }
@@ -373,6 +375,9 @@ impl TxPool {
         );
         inner.total_bytes = projected_bytes;
         inner.accepted_total = inner.accepted_total.saturating_add(1);
+        if inner.by_hash[&hash].tx.is_aa_bundle() {
+            inner.aa_accepted_total = inner.aa_accepted_total.saturating_add(1);
+        }
 
         Ok(hash)
     }
@@ -546,8 +551,18 @@ impl TxPool {
     /// Consistent snapshot of pending count and lifetime successful admissions.
     /// Rejected submissions do not count; removal and clearing do not reset admissions.
     pub fn admission_stats(&self) -> (usize, u64) {
+        let (pending, accepted, _) = self.admission_counts();
+        (pending, accepted)
+    }
+
+    /// Consistent pending, total admission and AA admission counters for this pool.
+    pub fn admission_counts(&self) -> (usize, u64, u64) {
         let inner = self.inner.read();
-        (inner.by_hash.len(), inner.accepted_total)
+        (
+            inner.by_hash.len(),
+            inner.accepted_total,
+            inner.aa_accepted_total,
+        )
     }
 
     /// Aggregate serialized size of transactions currently retained by the pool.
@@ -3211,7 +3226,10 @@ mod tests {
         ws.set_balance(&sender, value).unwrap();
         ws.set_balance(&paymaster, gas_budget).unwrap();
 
-        pool.insert(tx, &mut ws, &cs, &verifier).unwrap();
+        pool.insert(tx.clone(), &mut ws, &cs, &verifier).unwrap();
+        assert_eq!(pool.admission_counts(), (1, 1, 1));
+        assert!(pool.insert(tx, &mut ws, &cs, &verifier).is_err());
+        assert_eq!(pool.admission_counts(), (1, 1, 1));
 
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&hash));
@@ -3225,6 +3243,9 @@ mod tests {
         );
 
         assert!(pool.remove(&hash));
+        assert_eq!(pool.admission_counts(), (0, 1, 1));
+        pool.clear();
+        assert_eq!(pool.admission_counts(), (0, 1, 1));
         assert!(indexed_reservation(&pool, &sender).is_none());
         assert!(indexed_reservation(&pool, &paymaster).is_none());
     }

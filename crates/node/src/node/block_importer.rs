@@ -1,4 +1,10 @@
 use super::*;
+
+type ReplayedForkBlock = (
+    Vec<TransactionReceipt>,
+    Vec<ProofAmendment>,
+    Vec<shell_pqvm::AaExecutionStats>,
+);
 use std::borrow::Cow;
 
 pub(super) struct LegacyReplay<S: KvStore> {
@@ -599,7 +605,7 @@ impl<S: KvStore + 'static> Node<S> {
         block: &Block,
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
-    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+    ) -> Result<ReplayedForkBlock, NodeError> {
         let mut registry = AlgorithmRegistry::global().clone();
         let result = self.replay_fork_block_with_registry(
             block,
@@ -856,7 +862,7 @@ impl<S: KvStore + 'static> Node<S> {
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
         registry: &mut AlgorithmRegistry,
-    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+    ) -> Result<ReplayedForkBlock, NodeError> {
         let validation_registry = registry.clone();
         with_algorithm_registry_override(&validation_registry, || {
             let result = self.replay_fork_block_inner(block, parent_state_root, replay_store);
@@ -870,7 +876,7 @@ impl<S: KvStore + 'static> Node<S> {
         block: &Block,
         parent_state_root: ShellHash,
         replay_store: Arc<shell_storage::OverlayStore<S>>,
-    ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+    ) -> Result<ReplayedForkBlock, NodeError> {
         let replay_cs = ChainStore::new(replay_store.clone());
         let metadata_checkpoint = replay_cs.address_metadata_checkpoint()?;
         if !Self::decode_system_extra(&block.header.extra_data)
@@ -930,6 +936,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let mut receipts = Vec::new();
+        let mut aa_executions = Vec::new();
         let mut new_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
@@ -1149,6 +1156,7 @@ impl<S: KvStore + 'static> Node<S> {
                 }
                 total_effective_fees = total_effective_fees
                     .saturating_add(U256::from(result.gas_used).saturating_mul(U256::from(price)));
+                aa_executions.extend(result.aa_execution);
                 receipts.push(result.receipt);
             }
             if cumulative_gas != block.header.gas_used {
@@ -1278,7 +1286,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
         replay_cs.stage_address_metadata_undo(&block.hash(), &metadata_checkpoint)?;
 
-        Ok((receipts, stark_settlements))
+        Ok((receipts, stark_settlements, aa_executions))
     }
 
     pub(super) fn reinsert_reverted_transactions(
@@ -1528,6 +1536,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut parent = ancestor;
         let mut parent_state_root = ancestor_state_root;
         let mut receipts = Vec::with_capacity(plan.new_chain.len());
+        let mut aa_executions = Vec::new();
         let mut settlements = Vec::with_capacity(plan.new_chain.len());
         for block in &plan.new_chain {
             let block_hash = block.hash();
@@ -1549,10 +1558,11 @@ impl<S: KvStore + 'static> Node<S> {
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
             self.verify_import_sig_aggregate_proof(block)
                 .map_err(|error| Self::classify_fork_error(block_hash, error))?;
-            let (block_receipts, block_settlements) =
+            let (block_receipts, block_settlements, block_aa_executions) =
                 self.replay_preferred_fork_block(block, parent_state_root, overlay.clone())?;
             overlay_chain_store.put_block_signers(&block_hash, &[signer])?;
             parent_state_root = block.header.state_root;
+            aa_executions.extend(block_aa_executions);
             receipts.push(block_receipts);
             settlements.push(block_settlements);
             parent = block.clone();
@@ -1615,6 +1625,7 @@ impl<S: KvStore + 'static> Node<S> {
             drop(finality);
         }
         let resulting_finalized_number = self.finality.read().last_finalized_number();
+        self.metrics.record_aa_executions(&aa_executions);
         self.metrics.block_height.set(plan.preferred_number as i64);
         self.metrics
             .update_finality(plan.preferred_number, resulting_finalized_number);
@@ -1834,6 +1845,7 @@ impl<S: KvStore + 'static> Node<S> {
         // The live WorldState is only swapped to the imported root after the
         // computed state_root matches the block header.
         let mut receipts = Vec::new();
+        let mut aa_executions = Vec::new();
         let mut new_pubkeys: HashMap<Address, Vec<u8>> = HashMap::new();
         if !Self::decode_system_extra(&block.header.extra_data)?.is_empty() {
             return Err(NodeError::Startup(format!(
@@ -2128,6 +2140,7 @@ impl<S: KvStore + 'static> Node<S> {
                         total_effective_fees = total_effective_fees.saturating_add(
                             U256::from(result.gas_used).saturating_mul(U256::from(price)),
                         );
+                        aa_executions.extend(result.aa_execution);
                         receipts.push(result.receipt);
                     }
                     Err(e) => {
@@ -2278,6 +2291,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
         import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
+        self.metrics.record_aa_executions(&aa_executions);
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;

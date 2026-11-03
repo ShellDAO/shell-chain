@@ -98,6 +98,7 @@ impl<S: KvStore + 'static> Node<S> {
         let candidate_capacity = candidates.len();
         let mut included_txs: Vec<SignedTransaction> = Vec::with_capacity(candidate_capacity);
         let mut receipts = Vec::with_capacity(candidate_capacity);
+        let mut aa_executions = Vec::new();
         let mut cumulative_gas: u64 = 0;
         let mut total_effective_fees = U256::ZERO;
 
@@ -271,6 +272,7 @@ impl<S: KvStore + 'static> Node<S> {
                     total_effective_fees = total_effective_fees.saturating_add(
                         U256::from(result.gas_used).saturating_mul(U256::from(price)),
                     );
+                    aa_executions.extend(result.aa_execution);
                     receipts.push(result.receipt);
                     included_txs.push(tx.as_ref().clone());
                 }
@@ -566,6 +568,8 @@ impl<S: KvStore + 'static> Node<S> {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
             return Err(err.into());
         }
+        self.metrics.record_aa_executions(&aa_executions);
+
         algorithm_registry_rollback.commit();
         let committed_world_state =
             WorldState::at_root(self.store.clone(), &block.header.state_root)?;

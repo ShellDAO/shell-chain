@@ -53,8 +53,19 @@ pub enum ExecutorError {
     NonceOverflow,
 }
 
+/// Local execution observations, excluded from transaction receipts and state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AaExecutionStats {
+    /// Inner calls attempted before the bundle stopped, including a failing call.
+    pub inner_calls: u64,
+    /// Whether a distinct paymaster was actually debited for gas.
+    pub paymaster_paid: bool,
+}
+
 /// Result of executing a single transaction.
 pub struct TxExecutionResult {
+    /// AA observations for callers that commit this execution canonically.
+    pub aa_execution: Option<AaExecutionStats>,
     /// Transaction receipt for inclusion in the block.
     pub receipt: TransactionReceipt,
     /// State changes produced by this transaction (for committing).
@@ -576,6 +587,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         };
 
         Ok(TxExecutionResult {
+            aa_execution: None,
             receipt,
             state_changes: state,
             sender_shell_addr,
@@ -885,6 +897,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 logs: vec![],
             };
             return Ok(TxExecutionResult {
+                aa_execution: Some(AaExecutionStats::default()),
                 receipt,
                 state_changes: EvmState::default(),
                 sender_shell_addr: ShellAddress::default(),
@@ -930,7 +943,9 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         let mut last_revert_data: Vec<u8> = Vec::new();
         let mut native_effects = SystemContractEffects::default();
 
+        let mut inner_calls = 0;
         for inner in &bundle.inner_calls {
+            inner_calls += 1;
             if let Some(target) = inner.to.filter(|target| {
                 (native_account_manager && *target == system_contracts::account_manager_address())
                     || (native_validator_registry
@@ -1168,6 +1183,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                     // Commit with this inner call's address mappings. The
                     // outer bundle advances the sender nonce exactly once.
                     let inner_result = TxExecutionResult {
+                        aa_execution: None,
                         receipt: empty_receipt(),
                         state_changes: state,
                         sender_shell_addr: ShellAddress::default(),
@@ -1337,6 +1353,10 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
         };
 
         Ok(TxExecutionResult {
+            aa_execution: Some(AaExecutionStats {
+                inner_calls,
+                paymaster_paid: is_sponsored && !gas_cost.is_zero() && !payer_pre_bal.is_zero(),
+            }),
             receipt,
             state_changes: EvmState::default(),
             sender_shell_addr: ShellAddress::default(),
@@ -1457,6 +1477,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 };
 
                 Ok(TxExecutionResult {
+                    aa_execution: None,
                     receipt,
                     state_changes: EvmState::default(),
                     sender_shell_addr: ShellAddress::default(),
@@ -1494,6 +1515,7 @@ impl<S: KvStore + 'static> ShellPqvm<S> {
                 };
 
                 Ok(TxExecutionResult {
+                    aa_execution: None,
                     receipt,
                     state_changes: EvmState::default(),
                     sender_shell_addr: ShellAddress::default(),
@@ -4210,6 +4232,7 @@ mod tests {
 
     fn commit_state(evm: &mut ShellPqvm<MemoryDb>, state: &EvmState) {
         let fake_result = TxExecutionResult {
+            aa_execution: None,
             receipt: empty_receipt(),
             state_changes: state.clone(),
             sender_shell_addr: ShellAddress::default(),
@@ -7608,6 +7631,8 @@ mod tests {
         let mut header = sample_header();
         header.proposer = ShellAddress::from([0x99; 32]);
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+        assert_eq!(res.aa_execution.unwrap().inner_calls, 2);
+        assert!(!res.aa_execution.unwrap().paymaster_paid);
 
         assert_eq!(get_balance(&mut evm, &dst1), U256::from(1u64));
         assert_eq!(get_balance(&mut evm, &dst2), U256::from(1u64));
@@ -7735,12 +7760,20 @@ mod tests {
                 // → revm halts with OutOfGas.
                 gas_limit: 100,
             },
+            InnerCall {
+                to: Some(dst1),
+                value: U256::from(9),
+                data: PBytes::new(),
+                gas_limit: 50_000,
+            },
         ];
         let signed = make_aa_signed(sender, 0, 200_000, 10, inner_calls, None);
 
         let pre_bal = get_balance(&mut evm, &sender);
         let header = sample_header();
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+        assert_eq!(res.aa_execution.unwrap().inner_calls, 2);
+        assert!(!res.aa_execution.unwrap().paymaster_paid);
 
         assert_eq!(get_balance(&mut evm, &dst1), U256::ZERO);
         assert_eq!(get_balance(&mut evm, &dst2), U256::ZERO);
@@ -7781,6 +7814,8 @@ mod tests {
         let mut header = sample_header();
         header.proposer = ShellAddress::from([0x99; 32]);
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+        assert_eq!(res.aa_execution.unwrap().inner_calls, 1);
+        assert!(res.aa_execution.unwrap().paymaster_paid);
 
         assert_eq!(res.receipt.status, 1);
         assert!(evm.state_db().address_registry_snapshot().is_empty());
@@ -7876,6 +7911,8 @@ mod tests {
 
         let header = sample_header();
         let res = evm.execute_aa_bundle(&signed, &header, 0, 0).unwrap();
+        assert_eq!(res.aa_execution.unwrap().inner_calls, 0);
+        assert!(!res.aa_execution.unwrap().paymaster_paid);
 
         assert_eq!(res.receipt.status, 0);
         assert_eq!(get_balance(&mut evm, &dst), U256::ZERO);

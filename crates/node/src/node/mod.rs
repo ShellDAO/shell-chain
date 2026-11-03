@@ -7128,9 +7128,18 @@ mod tests {
                         .unwrap();
                     let block = leader.produce_block(&proposer_signer, 100).unwrap();
                     assert_eq!(block.transactions.len(), 1);
+                    leader.metrics.gather();
+                    assert_eq!(leader.metrics.aa_bundles_received.get(), nonce + 1);
+                    assert_eq!(leader.metrics.aa_bundles_executed.get(), nonce + 1);
+                    assert_eq!(leader.metrics.aa_inner_calls.get(), (nonce + 1) * 2);
+                    assert_eq!(leader.metrics.aa_sponsored_txs.get(), 0);
                     follower
                         .import_block(block.clone(), &MultiVerifier)
                         .unwrap();
+                    follower.metrics.gather();
+                    assert_eq!(follower.metrics.aa_bundles_received.get(), 0);
+                    assert_eq!(follower.metrics.aa_bundles_executed.get(), nonce + 1);
+                    assert_eq!(follower.metrics.aa_inner_calls.get(), (nonce + 1) * 2);
                     let receipts = leader
                         .chain_store
                         .get_receipts(&block.hash())
@@ -7194,7 +7203,13 @@ mod tests {
                     blocks.push(block);
                 }
                 for block in &blocks {
+                    let observed = follower.metrics.aa_bundles_executed.get();
                     assert_pruned_genesis_witness_recovery(&follower, block);
+                    assert_eq!(
+                        follower.metrics.aa_bundles_executed.get(),
+                        observed,
+                        "historical validation must not count canonical execution"
+                    );
                 }
             }
         }
@@ -23166,5 +23181,94 @@ mod tests {
                 _ => panic!("expected WPoaViewChange after deserialization"),
             }
         }
+    }
+    #[test]
+    fn aa_metrics_do_not_publish_failed_canonical_batches() {
+        let (failed, signer, db) = setup_failing_batch_node();
+        let sender = failed.config.proposer_address.unwrap();
+        let recipient = Address::from([0x47; 32]);
+        let balance = U256::from(1_000_000_000_000_000_000u64);
+        fund_account(&failed, &sender, balance);
+        store_consistent_genesis(&failed);
+        let tx = Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: None,
+            value: U256::from(7),
+            data: Bytes::new(),
+            gas_limit: 200_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 0,
+            access_list: None,
+            tx_type: shell_core::AA_BUNDLE_TX_TYPE,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let mut signed = SignedTransaction::with_aa_bundle(
+            sender,
+            tx,
+            PQSignature::new(signer.sig_type(), vec![]),
+            PubkeyMode::Embedded(signer.public_key().to_vec()),
+            AaBundle {
+                inner_calls: vec![InnerCall {
+                    to: Some(recipient),
+                    value: U256::from(7),
+                    data: Bytes::new(),
+                    gas_limit: 50_000,
+                }],
+                ..AaBundle::default()
+            },
+        )
+        .unwrap();
+        signed.signature = signer
+            .sign(signed.sender_signing_hash().as_bytes())
+            .unwrap();
+        failed
+            .tx_pool
+            .insert(
+                signed.clone(),
+                &mut failed.world_state.write(),
+                &failed.chain_store,
+                &MultiVerifier,
+            )
+            .unwrap();
+        db.fail_head_batch();
+        assert!(failed.produce_block(&signer, 100).is_err());
+        failed.metrics.gather();
+        assert_eq!(failed.metrics.aa_bundles_received.get(), 1);
+        assert_eq!(failed.metrics.aa_bundles_executed.get(), 0);
+        assert_eq!(failed.metrics.aa_inner_calls.get(), 0);
+        assert_eq!(failed.world_state.read().get_nonce(&sender).unwrap(), 0);
+        assert_eq!(
+            failed.world_state.read().get_balance(&recipient).unwrap(),
+            U256::ZERO
+        );
+        let good = setup_node_with_authority(sender);
+        fund_account(&good, &sender, balance);
+        store_consistent_genesis(&good);
+        good.tx_pool
+            .insert(
+                signed,
+                &mut good.world_state.write(),
+                &good.chain_store,
+                &MultiVerifier,
+            )
+            .unwrap();
+        let block = good.produce_block(&signer, 100).unwrap();
+        assert_eq!(good.metrics.aa_bundles_executed.get(), 1);
+        let db = Arc::new(FailingBatchDb::new());
+        let follower = setup_node_with_store(sender, db.clone());
+        fund_account(&follower, &sender, balance);
+        store_consistent_genesis(&follower);
+        follower.register_authority_pubkey(sender, signer.public_key().to_vec());
+        db.fail_head_batch();
+        assert!(follower.import_block(block, &MultiVerifier).is_err());
+        assert_eq!(follower.metrics.aa_bundles_executed.get(), 0);
+        assert_eq!(follower.metrics.aa_inner_calls.get(), 0);
+        assert_eq!(follower.world_state.read().get_nonce(&sender).unwrap(), 0);
+        assert_eq!(
+            follower.world_state.read().get_balance(&recipient).unwrap(),
+            U256::ZERO
+        );
     }
 }

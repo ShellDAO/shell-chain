@@ -89,6 +89,43 @@ All metrics are prefixed `shell_`.
 | `shell_last_finalized_number` | Gauge | — | Latest finalized block number |
 | `shell_finality_lag_blocks` | Gauge | — | Difference between canonical head and latest finalized block |
 
+### Account abstraction (unreleased)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `shell_aa_bundles_received_total` | Counter | Successful AA mempool admissions in this process |
+| `shell_aa_bundles_executed_total` | Counter | Canonically committed AA bundle executions, including reverted receipts |
+| `shell_aa_inner_calls_total` | Counter | Inner calls attempted before execution stops, including the failing call |
+| `shell_aa_sponsored_txs_total` | Counter | Canonical AA transactions whose distinct paymaster was actually charged gas |
+
+These counters are wired in the unreleased node; the public v0.27.13 binary
+omits these metric families. Admission totals include successful replacements
+and reinsertions, but exclude duplicate/rejected submissions. Mining or removing
+a transaction does not erase its admission. Execution observations publish only
+after the canonical storage batch succeeds, on production, import or adoption
+of a preferred fork. They do not count historical validation, tracing or other
+read-only simulations. A later reorganization does not subtract prior process
+observations. A paymaster field without an actual gas charge does not count as
+paid sponsorship. All four counters restart at zero with a new node process;
+confirmed transactions and account state remain in the database.
+
+The native acceptance uses real signed private batches, independent producer
+and follower nodes, an atomic revert before a third call, real paymaster gas
+debits, historical tracing and physical restart. Build the unreleased CLI with
+libp2p and use the published compatible SDK:
+
+```sh
+cargo build -p shell-cli --bin shell-node --features libp2p
+sdk_dir=$(mktemp -d)
+npm install --prefix "$sdk_dir" --no-save shell-sdk@0.14.0-rc.3
+SHELL_SDK_ENTRY="$sdk_dir/node_modules/shell-sdk/dist/index.js" \
+  node tests/e2e/native-aa-registry.mjs --aa-metrics
+```
+
+This is an isolated Dev network acceptance; its local activation settings do
+not change any public network. Other algorithm, role and contract-paymaster
+combinations require their own validation.
+
 ### STARK prover (K4)
 
 | Metric | Type | Description |

@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Wire AA bundle admission, committed execution, attempted inner-call and paid
+  sponsorship counters to the real pool and executor. Exclude rejected storage
+  batches and historical simulation; counters reset on process restart.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
