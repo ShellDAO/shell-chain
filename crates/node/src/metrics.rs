@@ -421,8 +421,10 @@ impl Metrics {
     }
 
     /// Publish gauges after a canonical head change has committed to storage.
-    pub(crate) fn update_canonical_head(&self, current_head: u64, finalized: u64) {
+    pub(crate) fn update_canonical_head(&self, current_head: u64, finalized: u64, epoch: u64) {
         self.block_height.set(current_head as i64);
+        self.epoch_number
+            .set(i64::try_from(epoch).unwrap_or(i64::MAX));
         self.update_finality(current_head, finalized);
     }
 

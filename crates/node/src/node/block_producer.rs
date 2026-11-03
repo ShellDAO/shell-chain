@@ -566,8 +566,12 @@ impl<S: KvStore + 'static> Node<S> {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
             return Err(err.into());
         }
-        self.metrics
-            .update_canonical_head(block.number(), self.finality.read().last_finalized_number());
+        let epoch = self.consensus.read().poa_config().epoch_of(block.number());
+        self.metrics.update_canonical_head(
+            block.number(),
+            self.finality.read().last_finalized_number(),
+            epoch,
+        );
 
         algorithm_registry_rollback.commit();
         let committed_world_state =

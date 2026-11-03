@@ -4,10 +4,16 @@
 Build shell-node with libp2p, or set SHELL_NODE_BIN. Python 3 standard library
 only. Creates fresh MLDSA65 keys, private Dev1337/RocksDB state and loopback
 listeners. Keeps test data and exact receipts. Existing sync/production readiness
-gates apply; no public network, transfers, database reset or activation changes.
+gates apply; all transfers use private test funds. No public network, database
+reset or activation changes. --epoch-only checks epoch boundaries without
+repeating the default canonical-head sequence.
 """
 from pathlib import Path
-import datetime, json, os, re, secrets, socket, subprocess, tempfile, time, urllib.error, urllib.request
+import argparse, datetime, json, os, re, secrets, socket, subprocess, tempfile, time, urllib.error, urllib.request
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--epoch-only", action="store_true")
+parser.add_argument("--epoch-length", type=int, choices=[0, 1, 3], default=3)
+options = parser.parse_args()
 repo = Path(__file__).resolve().parents[2]
 binary = Path(os.environ.get('SHELL_NODE_BIN', repo / 'target/debug/shell-node')).resolve()
 out = Path(tempfile.mkdtemp(prefix='shell-canonical-head-metrics-'))
@@ -35,6 +41,8 @@ def port():
 rpc_port, metrics_port = port(), port()
 
 def rpc(method, params=None, rejected=False):
+    # Keep observational traffic below the node's default 50 requests/second.
+    time.sleep(.04)
     body = {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or []}
     req = urllib.request.Request(f'http://127.0.0.1:{rpc_port}', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=10) as response:
@@ -124,6 +132,13 @@ def stage(label, expected):
     assert sample(metrics['body'], 'shell_block_height') == expected
     assert sample(metrics['body'], 'shell_last_finalized_number') == finalized
     assert sample(metrics['body'], 'shell_finality_lag_blocks') == max(0, expected - finalized)
+    if options.epoch_only:
+        epoch = 0 if options.epoch_length == 0 else expected // options.epoch_length
+        assert sample(metrics['body'], 'shell_epoch_number') == epoch, (label, expected, epoch)
+        info = rpc('shell_getEpochInfo')
+        assert info['currentEpoch'] == epoch and info['epochLength'] == options.epoch_length, info
+        # Repeated observation must not advance the epoch or canonical state.
+        assert sample(get('metrics')['body'], 'shell_epoch_number') == epoch
     assert rpc('eth_getBlockByNumber', ['latest', False]) == block
     j['stages'][label] = {'expected': expected, 'block': block, 'finality': finality, 'probes': probes}
     save()
@@ -138,60 +153,117 @@ try:
     genesis = {'chain_id': 1337, 'chain_name': 'head-metrics', 'network_type': 'Dev', 'timestamp': int(time.time()),
         'gas_limit': 30000000, 'extra_data': 'head-metrics', 'consensus': {'engine': 'wpoa',
             'authorities': [key['address']], 'authority_pubkeys': ['0x' + key['public_key'].removeprefix('0x')],
-            'weights': [3], 'block_time_secs': 1, 'max_future_secs': 60, 'epoch_length': 3},
+            'weights': [3], 'block_time_secs': 1, 'max_future_secs': 60, 'epoch_length': options.epoch_length},
         'alloc': {key['address']: {'balance': '0x3635c9adc5dea00000'}}, 'boot_nodes': []}
     (out / 'genesis.json').write_text(json.dumps(genesis))
     cli('init', ['--datadir', out / 'data', 'init', '--genesis', out / 'genesis.json', '--network', 'dev', '--chain-id', '1337'])
     start()
-    stage('initial', 0)
-    genesis_snapshot = rpc('evm_snapshot')
-    rpc('evm_mine', [1])
-    block1 = stage('mined-one', 1)
-    snapshot = rpc('evm_snapshot')
-    rpc('evm_mine', [2])
-    stage('mined-three', 3)
-    assert rpc('evm_mine', [257], rejected=True)['code'] == -32602
-    stage('rejected-mine', 3)
-    assert rpc('evm_revert', [snapshot]) is True
-    assert stage('rewound-one', 1) == block1
-    assert rpc('evm_revert', [snapshot]) is False
-    stage('rejected-rewind', 1)
-    assert rpc('evm_revert', [genesis_snapshot]) is True
-    stage('rewound-genesis', 0)
-    stop()
-    start()
-    stage('reopened-genesis', 0)
-    rpc('evm_mine', [3])
-    head = stage('mined-after-reopen', 3)
-    stop()
-    start()
-    # WPoA dev-mined blocks have no quorum certificate. Existing startup
-    # recovery discards that unfinalized suffix; probes must show its new tip.
-    stage('recovered-unfinalized', 0)
-    recipient = '0x' + '47' * 32
-    text = cli('finalized-transfer', ['tx', 'send', '--keystore', out / 'key.json',
-        '--password-file', pw, '--to', recipient, '--value', '7', '--chain-id', '1337',
-        '--rpc-url', f'http://127.0.0.1:{rpc_port}'])
-    tx_hash = re.findall(r'0x[0-9a-f]{64}', text)[-1]
-    for _ in range(150):
-        receipt = rpc('eth_getTransactionReceipt', [tx_hash])
-        fin = rpc('shell_getFinalityInfo')
-        if receipt and int(fin['lastFinalizedBlock'], 16) >= int(receipt['blockNumber'], 16):
-            break
-        time.sleep(.1)
-    assert receipt and receipt['status'] == '0x1', receipt
-    assert int(fin['lastFinalizedBlock'], 16) >= int(receipt['blockNumber'], 16), fin
-    assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 7
-    assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x1'
-    head = stage('finalized-tip', 1)
-    j['finalized_receipt'] = receipt
-    save()
-    stop()
-    start()
-    assert stage('reopened-finalized-tip', 1) == head
-    assert rpc('eth_getTransactionReceipt', [tx_hash]) == receipt
-    assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 7
-    assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x1'
+    if options.epoch_only:
+        j['epoch_length'] = options.epoch_length
+        stage('epoch-initial', 0)
+        zero = rpc('evm_snapshot')
+        rpc('evm_mine', [2])
+        block2 = stage('epoch-below', 2)
+        below = rpc('evm_snapshot')
+        rpc('evm_mine', [1])
+        stage('epoch-boundary', 3)
+        rpc('evm_mine', [1])
+        stage('epoch-after', 4)
+        rpc('evm_mine', [2])
+        stage('epoch-second-boundary', 6)
+        assert rpc('evm_mine', [257], rejected=True)['code'] == -32602
+        stage('epoch-rejected-mine', 6)
+        assert rpc('evm_revert', [below]) is True
+        assert stage('epoch-rewound-below', 2) == block2
+        assert rpc('evm_revert', [below]) is False
+        stage('epoch-rejected-rewind', 2)
+        assert rpc('evm_revert', [zero]) is True
+        stage('epoch-rewound-zero', 0)
+        rpc('evm_mine', [3])
+        stage('epoch-unfinalized', 3)
+        stop()
+        start()
+        stage('epoch-recovered-zero', 0)
+        recipient = '0x' + '47' * 32
+        receipts = []
+        for value in [1, 2, 3]:
+            text = cli(f'epoch-transfer-{value}', ['tx', 'send', '--keystore', out / 'key.json',
+                '--password-file', pw, '--to', recipient, '--value', str(value), '--chain-id', '1337',
+                '--rpc-url', f'http://127.0.0.1:{rpc_port}'])
+            tx_hash = re.findall(r'0x[0-9a-f]{64}', text)[-1]
+            for _ in range(150):
+                receipt = rpc('eth_getTransactionReceipt', [tx_hash])
+                fin = rpc('shell_getFinalityInfo')
+                if receipt and int(fin['lastFinalizedBlock'], 16) >= int(receipt['blockNumber'], 16):
+                    break
+                time.sleep(.1)
+            assert receipt and receipt['status'] == '0x1', receipt
+            assert int(receipt['blockNumber'], 16) == value, receipt
+            assert int(fin['lastFinalizedBlock'], 16) >= value, fin
+            stage(f'epoch-finalized-{value}', value)
+            receipts.append(receipt)
+        assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 6
+        assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x3'
+        head = stage('epoch-finalized-tip', 3)
+        j['finalized_receipts'] = receipts
+        save()
+        stop()
+        start()
+        assert stage('epoch-reopened-finalized-tip', 3) == head
+        for receipt in receipts:
+            assert rpc('eth_getTransactionReceipt', [receipt['transactionHash']]) == receipt
+        assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 6
+        assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x3'
+    else:
+        stage('initial', 0)
+        genesis_snapshot = rpc('evm_snapshot')
+        rpc('evm_mine', [1])
+        block1 = stage('mined-one', 1)
+        snapshot = rpc('evm_snapshot')
+        rpc('evm_mine', [2])
+        stage('mined-three', 3)
+        assert rpc('evm_mine', [257], rejected=True)['code'] == -32602
+        stage('rejected-mine', 3)
+        assert rpc('evm_revert', [snapshot]) is True
+        assert stage('rewound-one', 1) == block1
+        assert rpc('evm_revert', [snapshot]) is False
+        stage('rejected-rewind', 1)
+        assert rpc('evm_revert', [genesis_snapshot]) is True
+        stage('rewound-genesis', 0)
+        stop()
+        start()
+        stage('reopened-genesis', 0)
+        rpc('evm_mine', [3])
+        head = stage('mined-after-reopen', 3)
+        stop()
+        start()
+        # WPoA dev-mined blocks have no quorum certificate. Existing startup
+        # recovery discards that unfinalized suffix; probes must show its new tip.
+        stage('recovered-unfinalized', 0)
+        recipient = '0x' + '47' * 32
+        text = cli('finalized-transfer', ['tx', 'send', '--keystore', out / 'key.json',
+            '--password-file', pw, '--to', recipient, '--value', '7', '--chain-id', '1337',
+            '--rpc-url', f'http://127.0.0.1:{rpc_port}'])
+        tx_hash = re.findall(r'0x[0-9a-f]{64}', text)[-1]
+        for _ in range(150):
+            receipt = rpc('eth_getTransactionReceipt', [tx_hash])
+            fin = rpc('shell_getFinalityInfo')
+            if receipt and int(fin['lastFinalizedBlock'], 16) >= int(receipt['blockNumber'], 16):
+                break
+            time.sleep(.1)
+        assert receipt and receipt['status'] == '0x1', receipt
+        assert int(fin['lastFinalizedBlock'], 16) >= int(receipt['blockNumber'], 16), fin
+        assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 7
+        assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x1'
+        head = stage('finalized-tip', 1)
+        j['finalized_receipt'] = receipt
+        save()
+        stop()
+        start()
+        assert stage('reopened-finalized-tip', 1) == head
+        assert rpc('eth_getTransactionReceipt', [tx_hash]) == receipt
+        assert int(rpc('eth_getBalance', [recipient, 'latest']), 16) == 7
+        assert rpc('eth_getTransactionCount', [key['address'], 'latest']) == '0x1'
     j['passed'] = True
 except BaseException as error:
     j['failure'] = repr(error)

@@ -1432,9 +1432,14 @@ impl<S: KvStore + 'static> Node<S> {
         }
         let reverted_txs = unique_reverted_transactions(&old_chain, &[]);
         let (reinserted, rejected) = self.reinsert_reverted_transactions(&reverted_txs);
-        self.metrics.block_height.set(finalized_number as i64);
-        self.metrics
-            .update_finality(finalized_number, finalized_number);
+        self.metrics.update_canonical_head(
+            finalized_number,
+            finalized_number,
+            self.consensus
+                .read()
+                .poa_config()
+                .epoch_of(finalized_number),
+        );
 
         warn!(
             old_head = head.number(),
@@ -1615,9 +1620,14 @@ impl<S: KvStore + 'static> Node<S> {
             drop(finality);
         }
         let resulting_finalized_number = self.finality.read().last_finalized_number();
-        self.metrics.block_height.set(plan.preferred_number as i64);
-        self.metrics
-            .update_finality(plan.preferred_number, resulting_finalized_number);
+        self.metrics.update_canonical_head(
+            plan.preferred_number,
+            resulting_finalized_number,
+            self.consensus
+                .read()
+                .poa_config()
+                .epoch_of(plan.preferred_number),
+        );
 
         self.prover_orchestrator()
             .rewind_settled_frontiers(plan.ancestor_number);
@@ -2279,8 +2289,12 @@ impl<S: KvStore + 'static> Node<S> {
         import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
-        self.metrics
-            .update_canonical_head(block.number(), self.finality.read().last_finalized_number());
+        let epoch = self.consensus.read().poa_config().epoch_of(block.number());
+        self.metrics.update_canonical_head(
+            block.number(),
+            self.finality.read().last_finalized_number(),
+            epoch,
+        );
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;

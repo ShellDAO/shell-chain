@@ -981,7 +981,11 @@ impl<S: KvStore + 'static> Node<S> {
             .flatten()
             .map(|b| b.number())
             .unwrap_or(0);
-        metrics.update_canonical_head(current_head, finality_state.last_finalized_number());
+        metrics.update_canonical_head(
+            current_head,
+            finality_state.last_finalized_number(),
+            consensus.read().poa_config().epoch_of(current_head),
+        );
         let fork_choice = restore_fork_choice(&chain_store, fin_number, fin_hash, current_head);
 
         // Startup rechecks errors before serving network traffic.
@@ -1659,8 +1663,14 @@ impl<S: KvStore + 'static> Node<S> {
             shell_consensus::FinalityState::new()
         };
 
-        self.metrics
-            .update_canonical_head(snapshot.head_number, snapshot.finalized_number);
+        self.metrics.update_canonical_head(
+            snapshot.head_number,
+            snapshot.finalized_number,
+            self.consensus
+                .read()
+                .poa_config()
+                .epoch_of(snapshot.head_number),
+        );
 
         self.tx_pool.clear();
         let mut world_state = self.world_state.write();
@@ -6281,6 +6291,7 @@ mod tests {
     #[test]
     fn startup_recovery_rewinds_unfinalized_canonical_suffix() {
         let (node, signer) = setup_node();
+        node.consensus.write().poa_config_mut().epoch_length = 2;
         store_genesis(&node);
         let finalized = node.produce_block(&signer, 100).unwrap();
         let finalized_hash = finalized.hash();
@@ -6293,7 +6304,9 @@ mod tests {
         let block_two = node.produce_block(&signer, 100).unwrap();
         let block_three = node.produce_block(&signer, 100).unwrap();
 
+        assert_eq!(node.metrics.epoch_number.get(), 1);
         assert_eq!(node.recover_unfinalized_head().unwrap(), 2);
+        assert_eq!(node.metrics.epoch_number.get(), 0);
         let recovered_head = node.chain_store.get_head_block().unwrap().unwrap();
         assert_eq!(recovered_head.hash(), finalized_hash);
         assert_eq!(recovered_head.number(), finalized.number());
@@ -23170,6 +23183,48 @@ mod tests {
         }
     }
     #[test]
+    fn canonical_epoch_metrics_follow_boundaries_import_and_restore() {
+        for (length, expected) in [
+            (0, [0, 0, 0, 0, 0, 0]),
+            (1, [1, 2, 3, 4, 5, 6]),
+            (3, [0, 0, 1, 1, 1, 2]),
+        ] {
+            let (producer, signer) = setup_node();
+            producer.consensus.write().poa_config_mut().epoch_length = length;
+            store_consistent_genesis(&producer);
+            let authority = producer.config.proposer_address.unwrap();
+            let follower = setup_node_with_authority(authority);
+            follower.consensus.write().poa_config_mut().epoch_length = length;
+            follower.register_authority_pubkey(authority, signer.public_key().to_vec());
+            store_consistent_genesis(&follower);
+            for epoch in expected {
+                let block = producer.produce_block(&signer, 100).unwrap();
+                follower.import_block(block, &MultiVerifier).unwrap();
+                assert_eq!(producer.metrics.epoch_number.get(), epoch);
+                assert_eq!(follower.metrics.epoch_number.get(), epoch);
+            }
+            let restored = Node::new(
+                producer.config.clone(),
+                producer.store.clone(),
+                producer.chain_store.clone(),
+                producer.world_state.clone(),
+                producer.tx_pool.clone(),
+                producer.consensus.clone(),
+            );
+            assert_eq!(
+                restored
+                    .chain_store
+                    .get_head_block()
+                    .unwrap()
+                    .unwrap()
+                    .number(),
+                6
+            );
+            assert_eq!(restored.metrics.epoch_number.get(), expected[5]);
+        }
+    }
+
+    #[test]
     fn canonical_head_metrics_follow_direct_publication_and_failed_batches() {
         let (producer, signer) = setup_node();
         store_consistent_genesis(&producer);
@@ -23190,6 +23245,11 @@ mod tests {
 
         let (failed_producer, other_signer, db) = setup_failing_batch_node();
         store_consistent_genesis(&failed_producer);
+        failed_producer
+            .consensus
+            .write()
+            .poa_config_mut()
+            .epoch_length = 1;
         db.fail_head_batch();
         assert!(failed_producer.produce_block(&other_signer, 100).is_err());
         assert_eq!(
@@ -23201,6 +23261,7 @@ mod tests {
                 .number(),
             0
         );
+        assert_eq!(failed_producer.metrics.epoch_number.get(), 0);
         assert_eq!(failed_producer.metrics.block_height.get(), 0);
         assert_eq!(failed_producer.metrics.finality_lag_blocks.get(), 0);
 
@@ -23208,6 +23269,11 @@ mod tests {
         let failed_follower = setup_node_with_store(authority, Arc::clone(&db));
         failed_follower.register_authority_pubkey(authority, signer.public_key().to_vec());
         store_consistent_genesis(&failed_follower);
+        failed_follower
+            .consensus
+            .write()
+            .poa_config_mut()
+            .epoch_length = 1;
         db.fail_head_batch();
         assert!(failed_follower.import_block(block, &MultiVerifier).is_err());
         assert_eq!(
@@ -23219,6 +23285,7 @@ mod tests {
                 .number(),
             0
         );
+        assert_eq!(failed_follower.metrics.epoch_number.get(), 0);
         assert_eq!(failed_follower.metrics.block_height.get(), 0);
         assert_eq!(failed_follower.metrics.finality_lag_blocks.get(), 0);
     }

@@ -79,6 +79,27 @@ verifies that a real finalized transaction and its canonical state survive resta
 
 All metrics are prefixed `shell_`.
 
+### Canonical epoch after boundaries (unreleased)
+
+`shell_epoch_number` follows the canonical head and the configured consensus
+`epoch_length`: with length 3, heights 2, 3 and 6 expose epochs 0, 1 and 2.
+A continuous epoch (`epoch_length = 0`) remains epoch 0. Successful canonical
+rewinds and startup recovery restore the corresponding epoch; rejected inputs
+and failed storage batches do not advance it. The public v0.27.13 binary leaves
+this gauge at zero even after a boundary.
+
+Build the unreleased node with libp2p, then run the focused native acceptance:
+
+```sh
+python3 tests/e2e/canonical-head-metrics.py --epoch-only --epoch-length 3
+python3 tests/e2e/canonical-head-metrics.py --epoch-only --epoch-length 0
+```
+
+The private test crosses boundaries through dev mining, rewinds a snapshot,
+then finalizes real signed transfers and physically restarts the database.
+It preserves the existing recovery policy for uncertified dev blocks. The
+short epoch is a test setting; no public-network epoch or activation changes.
+
 ### Chain
 
 | Metric | Type | Description |

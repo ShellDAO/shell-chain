@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Restore the current consensus epoch metric at startup and after committed
+  canonical production, import, rewind and reorganization, including continuous epochs.
+
 - Publish canonical head/finality metrics from direct production, import and dev
   rewind commits so health and readiness probes observe the actual chain tip.
 
